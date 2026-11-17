@@ -19,7 +19,7 @@ use super::*;
 use crate::{FunctionArgument, FunctionBindingRequest, PreparedPureKernel};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, EvaluationDomainId, ExpressionUseId,
+    CallProofScope, CompileControlError, EvaluationRegionId, ExpressionUseId,
 };
 use std::sync::Mutex;
 #[derive(Default)]
@@ -64,12 +64,12 @@ impl Source {
         }];
         let call = ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(17),
+            region: EvaluationRegionId::new(17),
             demand: EvaluationDemand::Value,
         };
         let input = ExpressionEffectContext {
             use_id: ExpressionUseId::new(42),
-            domain: EvaluationDomainId::new(18),
+            region: EvaluationRegionId::new(18),
             demand: EvaluationDemand::Value,
         };
         let parameters = SemanticParameters::try_new([]).unwrap();
@@ -103,7 +103,7 @@ impl Source {
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    proof_scope: CallProofScope::Domain(call.domain),
+                    proof_scope: CallProofScope::Region(call.region),
                 },
                 selected.clone(),
                 PureCallPreparation::Aggregate {
@@ -179,7 +179,7 @@ fn frozen_writer_uses_actual_installed_call_and_rejects_context_or_effect_drift(
         Err(FunctionSpecializationFailure::InvalidInput(_))
     ));
     let mut effects = source.frozen.clone();
-    effects.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+    effects.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
     let mut wrong = source.loan();
     wrong.frozen_effects = &effects;
     assert!(prepare_frozen_writer_aggregate(&source.catalog, wrong, &Control::default()).is_err());
@@ -406,7 +406,7 @@ fn frozen_writer_checked_preserves_phase_nullability_and_foreign_namespace_refus
         )
     ));
     let mut foreign = source.frozen.clone();
-    foreign.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+    foreign.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
     let mut wrong = source.loan();
     wrong.frozen_effects = &foreign;
     assert!(

@@ -1409,7 +1409,7 @@ fn p05_timestamp_decimal_overflow_selected_cases() {
 fn p05_timestamp_decimal_preparation_contract() {
     let context = ExpressionEffectContext {
         use_id: novarocks_type_contract::ExpressionUseId::new(805),
-        domain: novarocks_type_contract::EvaluationDomainId::new(5),
+        region: novarocks_type_contract::EvaluationRegionId::new(5),
         demand: novarocks_type_contract::EvaluationDemand::Value,
     };
     for target in [DataType::Decimal128(5, 2), DataType::Decimal256(5, 2)] {

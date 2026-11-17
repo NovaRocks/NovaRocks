@@ -117,12 +117,12 @@ fn caller_owned_publication_retains_dead_type_only_none_and_original_typed_null(
     let source = fragment(u32::MAX, vec![parent, child], values());
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(100),
-        domain: EvaluationDomainId::new(3),
+        region: EvaluationRegionId::new(3),
         demand: EvaluationDemand::Value,
     };
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: context.domain,
+        vec![ExpressionEvaluationRegion {
+            id: context.region,
             parent: None,
             guard: None,
         }],

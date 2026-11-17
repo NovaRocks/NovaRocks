@@ -58,7 +58,7 @@ fn literal_package(ty: FunctionValueType, literal: LiteralValue) -> Arc<Fragment
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(17);
+    let domain = EvaluationRegionId::new(17);
     let mut invocations = vec![];
     let bindings = roots
         .sites()
@@ -69,7 +69,7 @@ fn literal_package(ty: FunctionValueType, literal: LiteralValue) -> Arc<Fragment
             invocations.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain,
+                    region: domain,
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -80,7 +80,7 @@ fn literal_package(ty: FunctionValueType, literal: LiteralValue) -> Arc<Fragment
         })
         .collect();
     let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

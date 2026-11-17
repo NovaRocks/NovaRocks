@@ -591,11 +591,11 @@ fn package_input(
     constants: ConstantPools,
 ) -> crate::FragmentPackageInput {
     use novarocks_type_contract::{
-        ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-        ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+        ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+        ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     };
     let roots = crate::PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();
-    let domain = EvaluationDomainId::new(17);
+    let domain = EvaluationRegionId::new(17);
     let mut invocations = Vec::new();
     let bindings = roots
         .sites()
@@ -606,7 +606,7 @@ fn package_input(
             invocations.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain,
+                    region: domain,
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -617,7 +617,7 @@ fn package_input(
         })
         .collect();
     let flow = ExpressionControlFlow::<crate::ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

@@ -196,7 +196,7 @@ fn second_cell_becomes_is_null(source: &Fragment) -> Fragment {
 type Bindings = Vec<(ExpressionRootSite, ExpressionUseId)>;
 fn checked_flow(source: &Fragment) -> (ExpressionControlFlow<ExprId>, Bindings) {
     let roots = PhysicalExpressionRoots::try_new(source, &control()).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut bindings = Vec::new();
     let mut invocations = Vec::new();
     for (index, (site, root)) in roots.sites().iter().enumerate() {
@@ -205,7 +205,7 @@ fn checked_flow(source: &Fragment) -> (ExpressionControlFlow<ExprId>, Bindings) 
         invocations.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id,
-                domain,
+                region: domain,
                 demand: root.demand,
             },
             definition: root.expr,
@@ -214,7 +214,7 @@ fn checked_flow(source: &Fragment) -> (ExpressionControlFlow<ExprId>, Bindings) 
         });
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -229,11 +229,11 @@ fn checked_flow(source: &Fragment) -> (ExpressionControlFlow<ExprId>, Bindings) 
 }
 
 fn forged_second_literal_argument(source: &Fragment) -> ExpressionControlFlow<ExprId> {
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let invocation = |id, definition, arguments| ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain,
+            region: domain,
             demand: EvaluationDemand::Value,
         },
         definition,
@@ -243,7 +243,7 @@ fn forged_second_literal_argument(source: &Fragment) -> ExpressionControlFlow<Ex
     // The flow itself is a valid acyclic tree. Its second root's child is
     // nevertheless absent from the actual literal definition.
     ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

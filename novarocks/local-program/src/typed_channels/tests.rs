@@ -1018,7 +1018,7 @@ impl novarocks_functions::KernelEvaluationControl for RuntimeControl {
 fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_separate_channel() {
     use novarocks_functions::*;
     use novarocks_type_contract::{
-        CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+        CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
         ExpressionEffectContext, ExpressionUseId, SemanticParameters,
     };
     let owner = Arc::new(OrderedOwner::new());
@@ -1049,7 +1049,7 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
     let parameters = SemanticParameters::default();
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(u32::MAX),
-        domain: EvaluationDomainId::new(1),
+        region: EvaluationRegionId::new(1),
         demand: EvaluationDemand::Value,
     };
     let input = CallEffectInput {

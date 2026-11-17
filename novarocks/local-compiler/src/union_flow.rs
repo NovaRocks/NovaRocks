@@ -36,7 +36,7 @@ use novarocks_local_program::{
 use novarocks_physical_plan::FragmentPackage;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionUseId,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionUseId,
     MAX_CONTROL_DEFINITIONS, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
 };
 use std::{alloc::Layout, collections::BTreeSet};
@@ -123,7 +123,7 @@ pub(crate) fn package_use_ids(
 pub(crate) fn append_union_roots<R: DerivedSlotRoot>(
     roots: &[R],
     minted: &BTreeSet<ExpressionUseId>,
-    domains: &mut Vec<ExpressionEvaluationDomain>,
+    regions: &mut Vec<ExpressionEvaluationRegion>,
     uses: &mut Vec<ProgramExpressionUse>,
     bindings: &mut Vec<ProgramRootUseBinding>,
     slots: &mut Vec<ProgramSlotBinding>,
@@ -131,7 +131,7 @@ pub(crate) fn append_union_roots<R: DerivedSlotRoot>(
 ) -> Result<(), FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let outcome = append::<R, std::convert::Infallible>(
-        roots, minted, domains, uses, bindings, slots, &mut work, None,
+        roots, minted, regions, uses, bindings, slots, &mut work, None,
     )
     .map_err(crate::FragmentCreationError::into_compile);
     if matches!(&outcome, Err(FragmentCompileError::Control(_))) {
@@ -144,7 +144,7 @@ pub(crate) fn append_union_roots<R: DerivedSlotRoot>(
 pub(crate) fn append_union_roots_with_creator<R: DerivedSlotRoot, H>(
     roots: &[R],
     minted: &BTreeSet<ExpressionUseId>,
-    domains: &mut Vec<ExpressionEvaluationDomain>,
+    regions: &mut Vec<ExpressionEvaluationRegion>,
     uses: &mut Vec<ProgramExpressionUse>,
     bindings: &mut Vec<ProgramRootUseBinding>,
     slots: &mut Vec<ProgramSlotBinding>,
@@ -155,7 +155,7 @@ pub(crate) fn append_union_roots_with_creator<R: DerivedSlotRoot, H>(
     let outcome = append(
         roots,
         minted,
-        domains,
+        regions,
         uses,
         bindings,
         slots,
@@ -167,14 +167,14 @@ pub(crate) fn append_union_roots_with_creator<R: DerivedSlotRoot, H>(
 fn append<R: DerivedSlotRoot, H>(
     roots: &[R],
     minted: &BTreeSet<ExpressionUseId>,
-    domains: &mut Vec<ExpressionEvaluationDomain>,
+    regions: &mut Vec<ExpressionEvaluationRegion>,
     uses: &mut Vec<ProgramExpressionUse>,
     bindings: &mut Vec<ProgramRootUseBinding>,
     slots: &mut Vec<ProgramSlotBinding>,
     work: &mut CompileCheckpoints<'_>,
     mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
 ) -> Result<(), crate::FragmentCreationError<H>> {
-    let domain_count = count(domains.len(), roots.len(), MAX_CONTROL_DEFINITIONS)?;
+    let region_count = count(regions.len(), roots.len(), MAX_CONTROL_DEFINITIONS)?;
     let use_count = count(uses.len(), roots.len(), MAX_CONTROL_USE_REFERENCES)?;
     let binding_count = count(bindings.len(), roots.len(), MAX_CONTROL_USE_REFERENCES)?;
     let slot_count = count(slots.len(), roots.len(), MAX_CONTROL_USE_REFERENCES)?;
@@ -194,11 +194,11 @@ fn append<R: DerivedSlotRoot, H>(
     // Gate every output and scratch request before the first reserve. The
     // count-bounded candidate ranges contain enough free IDs by pigeonhole,
     // regardless of sparse existing IDs, including u32::MAX.
-    layout::<ExpressionEvaluationDomain>(domain_count)?;
+    layout::<ExpressionEvaluationRegion>(region_count)?;
     layout::<ProgramExpressionUse>(use_count)?;
     layout::<ProgramRootUseBinding>(binding_count)?;
     layout::<ProgramSlotBinding>(slot_count)?;
-    layout::<bool>(domain_count)?;
+    layout::<bool>(region_count)?;
     layout::<bool>(use_candidates)?;
     if roots.is_empty() {
         return Ok(());
@@ -206,13 +206,13 @@ fn append<R: DerivedSlotRoot, H>(
 
     if let Some(c) = crate::creation::borrow_scope(&mut temporary) {
         crate::creation::request(
-            Layout::array::<bool>(domain_count)
+            Layout::array::<bool>(region_count)
                 .map_err(|_| CompileControlError::ResourceExhausted)?,
             c,
             work,
         )?;
     }
-    let mut occupied_domains = occupancy(domain_count, work)?;
+    let mut occupied_regions = occupancy(region_count, work)?;
     if let Some(c) = crate::creation::borrow_scope(&mut temporary) {
         crate::creation::request(
             Layout::array::<bool>(use_candidates)
@@ -222,9 +222,9 @@ fn append<R: DerivedSlotRoot, H>(
         )?;
     }
     let mut occupied_uses = occupancy(use_candidates, work)?;
-    for domain in domains.iter() {
-        if let Ok(index) = usize::try_from(domain.id.get())
-            && let Some(occupied) = occupied_domains.get_mut(index)
+    for region in regions.iter() {
+        if let Ok(index) = usize::try_from(region.id.get())
+            && let Some(occupied) = occupied_regions.get_mut(index)
         {
             *occupied = true;
         }
@@ -240,20 +240,20 @@ fn append<R: DerivedSlotRoot, H>(
         work.step()?;
     }
     if let Some(c) = crate::creation::borrow_scope(&mut temporary) {
-        let next = domains
+        let next = regions
             .len()
             .checked_add(roots.len())
             .ok_or(CompileControlError::ResourceExhausted)?;
-        if next > domains.capacity() {
+        if next > regions.capacity() {
             crate::creation::request(
-                Layout::array::<ExpressionEvaluationDomain>(next)
+                Layout::array::<ExpressionEvaluationRegion>(next)
                     .map_err(|_| CompileControlError::ResourceExhausted)?,
                 c,
                 work,
             )?;
         }
     }
-    reserve(domains, roots.len(), work)?;
+    reserve(regions, roots.len(), work)?;
     if let Some(c) = crate::creation::borrow_scope(&mut temporary) {
         let next = uses
             .len()
@@ -299,13 +299,13 @@ fn append<R: DerivedSlotRoot, H>(
         }
     }
     reserve(slots, roots.len(), work)?;
-    let mut next_domain = 0;
+    let mut next_region = 0;
     let mut next_use = 0;
     for root in roots {
-        let domain = EvaluationDomainId::new(fresh(&mut occupied_domains, &mut next_domain, work)?);
+        let region = EvaluationRegionId::new(fresh(&mut occupied_regions, &mut next_region, work)?);
         let use_id = ExpressionUseId::new(fresh(&mut occupied_uses, &mut next_use, work)?);
-        domains.push(ExpressionEvaluationDomain {
-            id: domain,
+        regions.push(ExpressionEvaluationRegion {
+            id: region,
             parent: None,
             guard: None,
         });
@@ -313,7 +313,7 @@ fn append<R: DerivedSlotRoot, H>(
         uses.push(ProgramExpressionUse {
             context: ExpressionEffectContext {
                 use_id,
-                domain,
+                region,
                 demand: EvaluationDemand::Value,
             },
             definition: root.definition(),

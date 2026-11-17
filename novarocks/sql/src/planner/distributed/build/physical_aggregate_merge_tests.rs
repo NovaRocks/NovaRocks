@@ -427,7 +427,7 @@ fn merge_state_summary_context_preserves_conservative_child_row_error() {
             .unwrap()
             .may_raise_row_error
     );
-    assert_ne!(result.frozen.context.domain, context.domain);
+    assert_ne!(result.frozen.context.region, context.region);
 }
 
 #[test]

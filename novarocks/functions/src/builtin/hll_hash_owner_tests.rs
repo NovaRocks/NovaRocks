@@ -27,7 +27,7 @@ use crate::{
 use arrow_array::{Array, ArrayRef, BinaryArray, Int32Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, SemanticParameters,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
@@ -48,7 +48,7 @@ fn owner() -> HllHashOwner {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     }
 }

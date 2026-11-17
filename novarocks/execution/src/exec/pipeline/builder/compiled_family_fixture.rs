@@ -42,8 +42,8 @@ use novarocks_physical_plan::{
     ResultField, ResultPort, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     FunctionValueType, PureCompileControl, SemanticParameters,
 };
 
@@ -225,7 +225,7 @@ pub(crate) fn package_with_sink_and_names(
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut uses = Vec::new();
     let mut bindings = Vec::new();
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
@@ -233,7 +233,7 @@ pub(crate) fn package_with_sink_and_names(
         uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain,
+                region: domain,
                 demand: root.demand,
             },
             definition: root.expr,
@@ -243,7 +243,7 @@ pub(crate) fn package_with_sink_and_names(
         bindings.push((*site, id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

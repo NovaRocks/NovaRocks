@@ -29,7 +29,7 @@ use crate::{
 use arrow_buffer::{Buffer, OffsetBuffer};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
     FunctionNullBehavior, FunctionVolatility, PureCompileControl, SemanticParameters,
 };
 use std::{sync::Mutex, time::Duration};
@@ -598,7 +598,7 @@ fn string_append_trailing_owner_preserves_exact_fresh_frozen_arc_effects_and_rej
         assert_eq!(selected.result_type, FunctionResultType::Scalar(target()));
         let context = ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         };
         let uses: Vec<_> = (0..arity)
@@ -615,7 +615,7 @@ fn string_append_trailing_owner_preserves_exact_fresh_frozen_arc_effects_and_rej
             environment: &[],
             parameters: &params,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         };
         let fresh = specialize_scalar(
             &owner,
@@ -851,7 +851,7 @@ fn string_append_trailing_constant_null_and_invalid_suffix_are_deferred_until_se
         );
         let context = ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         };
         let uses = [

@@ -868,7 +868,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             .ok_or(ExpressionLoweringError::Invalid(
                 "missing window argument occurrence",
             ))?;
-        let domain = flow.domains().get(&child_invocation.context.domain);
+        let domain = flow.regions().get(&child_invocation.context.region);
         work.step()?;
         let exact = child_invocation.definition == argument
             && child_invocation.context.demand == EvaluationDemand::Value

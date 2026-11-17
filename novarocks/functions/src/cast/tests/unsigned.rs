@@ -19,7 +19,7 @@ use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::{ArrayRef, BooleanArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array};
 use arrow_schema::Field;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -142,7 +142,7 @@ fn expected_successful_null(source: &DataType, target: &DataType, allow: bool) -
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(71),
-        domain: EvaluationDomainId::new(91),
+        region: EvaluationRegionId::new(91),
         demand: EvaluationDemand::Value,
     }
 }

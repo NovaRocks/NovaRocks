@@ -307,7 +307,7 @@ impl PredicateConjunctSource {
             if *child_definition != child.definition {
                 return Err(PredicateSourceError::WrongArguments);
             }
-            if child.context.domain != responsibility.context.domain {
+            if child.context.region != responsibility.context.region {
                 return Err(PredicateSourceError::InvalidScope);
             }
             if child.context.demand != EvaluationDemand::TruthOnly {

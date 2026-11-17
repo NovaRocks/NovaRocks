@@ -116,7 +116,7 @@ fn request(args: Box<[p::StaticFunctionArgument<p::ConstantReference>]>) -> p::P
 fn context(id: u32, domain: u32) -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(id),
-        domain: EvaluationDomainId::new(domain),
+        region: EvaluationRegionId::new(domain),
         demand: EvaluationDemand::Value,
     }
 }
@@ -147,7 +147,7 @@ fn effects(kind: FunctionKind, ctx: ExpressionEffectContext) -> CallEffects {
         },
         observable_effects: ObservableEffects::NONE,
         environment: Box::default(),
-        proof_scope: CallProofScope::Domain(ctx.domain),
+        proof_scope: CallProofScope::Region(ctx.region),
     }
 }
 fn node(
@@ -402,18 +402,18 @@ fn package() -> p::FragmentPackage {
     // Two actual rows invoke one definition separately; each lambda has the
     // guarded body domain required by the original HigherOrder author.
     let mut invocations = Vec::new();
-    let mut domains = vec![ExpressionEvaluationDomain {
-        id: EvaluationDomainId::new(0),
+    let mut domains = vec![ExpressionEvaluationRegion {
+        id: EvaluationRegionId::new(0),
         parent: None,
         guard: None,
     }];
     for row in 0..2 {
         let base = row * 3;
         let domain = row + 1;
-        domains.push(ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(domain),
-            parent: Some(EvaluationDomainId::new(0)),
-            guard: Some(DomainGuard {
+        domains.push(ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(domain),
+            parent: Some(EvaluationRegionId::new(0)),
+            guard: Some(RegionGuard {
                 owner: ExpressionUseId::new(base),
                 kind: GuardKind::LambdaInvocation,
             }),
@@ -1328,8 +1328,8 @@ fn wide_package() -> p::FragmentPackage {
         arguments: Box::default(),
     }));
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],

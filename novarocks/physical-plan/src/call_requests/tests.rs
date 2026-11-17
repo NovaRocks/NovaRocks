@@ -24,8 +24,8 @@ use crate::{
 };
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
-    AggregateStateArgumentContract, ControlShape, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    AggregateStateArgumentContract, ControlShape, EvaluationDemand, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, ExpressionUseId, FunctionArgumentEvaluation, FunctionFailureBehavior,
     FunctionId, FunctionIntrinsicRowError, FunctionKind, FunctionOverloadId, FunctionVolatility,
     ValueLogicalType,
@@ -321,12 +321,12 @@ fn static_requests_cover_dead_and_type_only_definitions_without_runtime_use_fall
     let source = fragment(0, vec![parent, child], values());
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(100),
-        domain: EvaluationDomainId::new(3),
+        region: EvaluationRegionId::new(3),
         demand: EvaluationDemand::Value,
     };
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: context.domain,
+        vec![ExpressionEvaluationRegion {
+            id: context.region,
             parent: None,
             guard: None,
         }],

@@ -17,10 +17,10 @@
 
 use super::*;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, DomainGuard, EvaluationDemand,
-    EvaluationDomainId, ExpressionControlFlow, ExpressionControlFlowError, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, GuardKind,
-    PureCompileControl, control_argument_semantics,
+    CompileControlError, CompilePhase, ControlShape, EvaluationDemand, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionControlFlowError, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, GuardKind,
+    PureCompileControl, RegionGuard, control_argument_semantics,
 };
 
 struct Control;
@@ -139,9 +139,9 @@ fn graph(
 ) -> Result<ExpressionControlFlow<ExprId>, ExpressionControlFlowError> {
     fn collect(
         tree: UseTree,
-        domain: EvaluationDomainId,
+        domain: EvaluationRegionId,
         demand: EvaluationDemand,
-        domains: &mut Vec<ExpressionEvaluationDomain>,
+        domains: &mut Vec<ExpressionEvaluationRegion>,
         uses: &mut Vec<ExpressionInvocation<ExprId>>,
     ) -> Result<(), ExpressionControlFlowError> {
         let children = tree.arguments.iter().map(|child| child.id).collect();
@@ -149,12 +149,12 @@ fn graph(
         for (ordinal, child) in tree.arguments.into_iter().enumerate() {
             let (child_demand, guard) =
                 control_argument_semantics(tree.control, count, ordinal, demand)?;
-            let child_domain = if let Some(kind) = guard {
-                let id = EvaluationDomainId::new(domains.len() as u32);
-                domains.push(ExpressionEvaluationDomain {
+            let child_region = if let Some(kind) = guard {
+                let id = EvaluationRegionId::new(domains.len() as u32);
+                domains.push(ExpressionEvaluationRegion {
                     id,
                     parent: Some(domain),
-                    guard: Some(DomainGuard {
+                    guard: Some(RegionGuard {
                         owner: tree.id,
                         kind,
                     }),
@@ -163,12 +163,12 @@ fn graph(
             } else {
                 domain
             };
-            collect(child, child_domain, child_demand, domains, uses)?;
+            collect(child, child_region, child_demand, domains, uses)?;
         }
         uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: tree.id,
-                domain,
+                region: domain,
                 demand,
             },
             definition: tree.definition,
@@ -177,8 +177,8 @@ fn graph(
         });
         Ok(())
     }
-    let domain = EvaluationDomainId::new(0);
-    let mut domains = vec![ExpressionEvaluationDomain {
+    let domain = EvaluationRegionId::new(0);
+    let mut domains = vec![ExpressionEvaluationRegion {
         id: domain,
         parent: None,
         guard: None,
@@ -339,7 +339,7 @@ fn repeated_definition_preserves_two_occurrences_and_cannot_share_one_use() {
         .arguments = Box::from([ExpressionUseId::new(1000), ExpressionUseId::new(1000)]);
     assert_eq!(
         ExpressionControlFlow::try_new(
-            flow.domains().values().copied().collect(),
+            flow.regions().values().copied().collect(),
             forged,
             fixture.fragment.expressions(),
             CompilePhase::Validate,
@@ -552,12 +552,12 @@ fn truth_only_lambda_wrapper_and_body_share_the_exact_invocation_guard_and_deman
     let bound = bind(&fixture, flow).unwrap();
     let lambda = &bound.flow().uses()[&ExpressionUseId::new(2000)];
     let body = &bound.flow().uses()[&ExpressionUseId::new(u32::MAX)];
-    assert_eq!(lambda.context.domain, body.context.domain);
+    assert_eq!(lambda.context.region, body.context.region);
     assert_eq!(lambda.context.demand, EvaluationDemand::TruthOnly);
     assert_eq!(body.context.demand, EvaluationDemand::TruthOnly);
     assert_eq!(
-        bound.flow().domains()[&lambda.context.domain].guard,
-        Some(DomainGuard {
+        bound.flow().regions()[&lambda.context.region].guard,
+        Some(RegionGuard {
             owner: ExpressionUseId::new(7),
             kind: GuardKind::LambdaInvocation
         })

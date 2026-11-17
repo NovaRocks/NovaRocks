@@ -211,7 +211,7 @@ pub(super) fn build_typed(
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut invocations = Vec::new();
     let bindings = roots
         .sites()
@@ -227,7 +227,7 @@ pub(super) fn build_typed(
             invocations.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain,
+                    region: domain,
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -238,7 +238,7 @@ pub(super) fn build_typed(
         })
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

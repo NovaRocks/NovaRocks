@@ -82,7 +82,7 @@ fn scopes<'a>(
                     source,
                     decimal_overflow_policy: captured.binding().decimal_overflow_policy(),
                     environment: &[],
-                    proof_scope: CallProofScope::Domain(invocation.context.domain),
+                    proof_scope: CallProofScope::Region(invocation.context.region),
                 },
             );
         }
@@ -107,7 +107,7 @@ fn scopes<'a>(
                 source,
                 decimal_overflow_policy: captured.binding().decimal_overflow_policy(),
                 environment: &[],
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             },
         );
     }
@@ -458,9 +458,9 @@ fn sql_if_fresh_composer_keeps_distinct_guarded_branch_domains_from_original_sou
             let call = &result.calls.entries()[&PhysicalCallSite::Expression(id)];
             let original = &occurrences.root_uses.flow().uses()[&id];
             assert_eq!(call.context, original.context);
-            assert!(domains.insert(call.context.domain));
+            assert!(domains.insert(call.context.region));
             assert!(definitions.insert(original.definition));
-            let domain = &occurrences.root_uses.flow().domains()[&call.context.domain];
+            let domain = &occurrences.root_uses.flow().regions()[&call.context.region];
             assert!(domain.guard.is_some());
             assert_eq!(result.summaries[&id].context(), call.context);
             branches += 1;

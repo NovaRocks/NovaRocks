@@ -138,8 +138,8 @@ fn frozen_property_formulas_use_complete_occurrences_despite_legacy_volatile_and
         ExpressionUseId::new(u32::MAX)
     );
     assert_ne!(
-        fixture.calls[0].context.domain,
-        fixture.calls[1].context.domain
+        fixture.calls[0].context.region,
+        fixture.calls[1].context.region
     );
     for call in &mut fixture.calls {
         call.effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
@@ -152,7 +152,7 @@ fn frozen_property_formulas_use_complete_occurrences_despite_legacy_volatile_and
         assert_eq!(calls.entries()[&call.site].effects, call.effects);
         assert_eq!(
             call.effects.proof_scope,
-            CallProofScope::Domain(call.context.domain)
+            CallProofScope::Region(call.context.region)
         );
     }
     assert_eq!(
@@ -288,7 +288,7 @@ fn table_fixture() -> Fixture {
             temporal_source: None,
             site: PhysicalCallSite::Table { node: table },
             context: current,
-            effects: effects(FunctionKind::Table, current.domain),
+            effects: effects(FunctionKind::Table, current.region),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         }],
     };

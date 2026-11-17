@@ -18,7 +18,7 @@
 //! Public trait calls on the original COUNT author, not a replacement refiner.
 use super::*;
 use novarocks_type_contract::{
-    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, SemanticParameterId, SemanticParameterKey,
     SemanticParameterRef, SemanticParameters,
 };
@@ -89,7 +89,7 @@ impl Fixture {
     fn input(&self) -> CallEffectInput<'_> {
         let context = ExpressionEffectContext {
             use_id: ExpressionUseId::new(0),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         };
         CallEffectInput {
@@ -106,7 +106,7 @@ impl Fixture {
             parameters: &self.parameters,
             environment: &[],
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         }
     }
     fn canonical(&self) -> Arc<AggregateCallContract> {
@@ -191,7 +191,7 @@ fn count_public_refiner_preserves_authored_identity_scope_and_environment_errors
             let mut wrong = fixture.input();
             match field {
                 0 => wrong.function_id = &foreign,
-                1 => wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99)),
+                1 => wrong.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99)),
                 _ => wrong.environment = &environment,
             }
             let selected_arcs = Arc::strong_count(&fixture.selected);

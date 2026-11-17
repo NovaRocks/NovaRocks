@@ -294,7 +294,7 @@ impl XxHash128Owner {
             }
             if !input.environment.is_empty()
                 || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                    && input.proof_scope != CallProofScope::Region(input.context.region)
             {
                 return Err(FunctionBindingError::InvalidBinding(
                     "xx_hash3_128 has no environment dependencies and requires an exact proof scope"

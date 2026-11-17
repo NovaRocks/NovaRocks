@@ -1785,8 +1785,8 @@ mod conditional_compiled_selection {
     };
     use novarocks_type_contract::{
         CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-        EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-        ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
+        EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+        ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
         PureCompileControl, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
         SemanticParameterValue, SemanticParameters,
     };
@@ -1824,7 +1824,7 @@ mod conditional_compiled_selection {
         ordered.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id,
-                domain: EvaluationDomainId::new(0),
+                region: EvaluationRegionId::new(0),
                 demand,
             },
             definition,
@@ -1939,8 +1939,8 @@ mod conditional_compiled_selection {
             })
             .collect();
         let flow = ExpressionControlFlow::try_new(
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
+            vec![ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(0),
                 parent: None,
                 guard: None,
             }],

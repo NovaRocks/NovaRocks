@@ -509,8 +509,8 @@ pub(crate) mod tests {
     ) -> Arc<FragmentArtifact> {
         use novarocks_physical_plan as p;
         use novarocks_type_contract::{
-            CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-            ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation,
+            CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+            ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation,
             ExpressionUseId, SemanticParameters,
         };
         let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
@@ -605,7 +605,7 @@ pub(crate) mod tests {
             .map(|(i, (_, root))| ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: ExpressionUseId::new(i as u32),
-                    domain: EvaluationDomainId::new(0),
+                    region: EvaluationRegionId::new(0),
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -614,8 +614,8 @@ pub(crate) mod tests {
             })
             .collect();
         let flow = ExpressionControlFlow::try_new(
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
+            vec![ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(0),
                 parent: None,
                 guard: None,
             }],

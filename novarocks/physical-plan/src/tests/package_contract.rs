@@ -25,8 +25,8 @@ use novarocks_connector_contract::{
 };
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase, ControlShape,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionInstanceState,
+    EvaluationDemand, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionInstanceState,
     FunctionNullBehavior, ObservableEffects, PureCompileControl, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
 };
@@ -42,7 +42,7 @@ impl PureCompileControl for Control {
 
 fn fixture_expression_uses(fragment: &Fragment) -> PhysicalRootUses {
     let roots = PhysicalExpressionRoots::try_new(fragment, &Control).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut uses = Vec::new();
     let mut bindings = Vec::new();
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
@@ -71,7 +71,7 @@ fn fixture_expression_uses(fragment: &Fragment) -> PhysicalRootUses {
         uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain,
+                region: domain,
                 demand: root.demand,
             },
             definition: root.expr,
@@ -81,7 +81,7 @@ fn fixture_expression_uses(fragment: &Fragment) -> PhysicalRootUses {
         bindings.push((*site, id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -461,11 +461,11 @@ fn binary_control_fixture() -> (Fragment, PhysicalRootUses, ExprId, ExprId, Expr
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let invocation = |id, definition, arguments| ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain,
+            region: domain,
             demand: EvaluationDemand::Value,
         },
         definition,
@@ -473,7 +473,7 @@ fn binary_control_fixture() -> (Fragment, PhysicalRootUses, ExprId, ExprId, Expr
         arguments,
     };
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -728,7 +728,7 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
 
 #[test]
 fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
-    use novarocks_type_contract::{DomainGuard, GuardKind};
+    use novarocks_type_contract::{GuardKind, RegionGuard};
     let (original, _, root, left, right) = binary_control_fixture();
     let mut expressions = original.expressions().clone();
     let mut condition = expressions.get(left).unwrap().clone();
@@ -762,13 +762,13 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
         call_requests: original.call_requests().clone(),
     });
     validate_fragment_definition(&fragment).unwrap();
-    let domain = EvaluationDomainId::new(0);
-    let when = EvaluationDomainId::new(1);
-    let then = EvaluationDomainId::new(2);
+    let domain = EvaluationRegionId::new(0);
+    let when = EvaluationRegionId::new(1);
+    let then = EvaluationRegionId::new(2);
     let invocation = |id, definition, domain, demand, control, arguments| ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain,
+            region: domain,
             demand,
         },
         definition,
@@ -777,23 +777,23 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
     };
     let flow = ExpressionControlFlow::try_new(
         vec![
-            ExpressionEvaluationDomain {
+            ExpressionEvaluationRegion {
                 id: domain,
                 parent: None,
                 guard: None,
             },
-            ExpressionEvaluationDomain {
+            ExpressionEvaluationRegion {
                 id: when,
                 parent: Some(domain),
-                guard: Some(DomainGuard {
+                guard: Some(RegionGuard {
                     owner: ExpressionUseId::new(0),
                     kind: GuardKind::CaseWhen { arm: 0 },
                 }),
             },
-            ExpressionEvaluationDomain {
+            ExpressionEvaluationRegion {
                 id: then,
                 parent: Some(domain),
-                guard: Some(DomainGuard {
+                guard: Some(RegionGuard {
                     owner: ExpressionUseId::new(0),
                     kind: GuardKind::CaseThen { arm: 0 },
                 }),
@@ -874,14 +874,14 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
     assert_eq!(package.expression_uses(), &uses);
     assert_eq!(package.expression_uses().flow(), &flow);
     assert_eq!(
-        package.expression_uses().flow().domains()[&when]
+        package.expression_uses().flow().regions()[&when]
             .guard
             .unwrap()
             .kind,
         GuardKind::CaseWhen { arm: 0 }
     );
     assert_eq!(
-        package.expression_uses().flow().domains()[&then]
+        package.expression_uses().flow().regions()[&then]
             .guard
             .unwrap()
             .kind,
@@ -2395,7 +2395,7 @@ fn intrinsic_package_fixture() -> FragmentPackageInput {
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let invocations = [
         (cast, vec![1]),
         (arithmetic, vec![2, 3]),
@@ -2407,7 +2407,7 @@ fn intrinsic_package_fixture() -> FragmentPackageInput {
     .map(|(id, (definition, arguments))| ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id as u32),
-            domain,
+            region: domain,
             demand: EvaluationDemand::Value,
         },
         definition,
@@ -2416,7 +2416,7 @@ fn intrinsic_package_fixture() -> FragmentPackageInput {
     })
     .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -2864,7 +2864,7 @@ fn exact_signature_without_legacy_metadata_uses_fresh_frozen_package_authority()
     // These are the explicit parameter fixture owner, including its own frozen
     // timezone; no missing legacy fields are promoted into effect facts.
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let invocations = roots
         .sites()
         .values()
@@ -2872,7 +2872,7 @@ fn exact_signature_without_legacy_metadata_uses_fresh_frozen_package_authority()
         .map(|(ordinal, root)| ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(u32::try_from(ordinal).unwrap()),
-                domain,
+                region: domain,
                 demand: root.demand,
             },
             definition: root.expr,
@@ -2887,7 +2887,7 @@ fn exact_signature_without_legacy_metadata_uses_fresh_frozen_package_authority()
         .map(|(ordinal, site)| (*site, ExpressionUseId::new(u32::try_from(ordinal).unwrap())))
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

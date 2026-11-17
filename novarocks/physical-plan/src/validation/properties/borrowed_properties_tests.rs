@@ -18,8 +18,8 @@
 use super::*;
 use crate::*;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEvaluationDomain, PureCompileControl,
+    CompileControlError, CompilePhase, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEvaluationRegion, PureCompileControl,
 };
 use std::sync::Mutex;
 
@@ -99,8 +99,8 @@ fn fixture() -> (Fragment, PhysicalRootUses, FrozenFragmentCalls) {
         .unwrap();
     let setup = SetupControl::default();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],

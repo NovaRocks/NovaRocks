@@ -27,9 +27,9 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     ArgumentControl, CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
-    DomainGuard, EvaluationDomainId, ExpressionControlFlow, ExpressionControlFlowError,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    MAX_CONTROL_DEFINITIONS, MAX_CONTROL_DEPTH, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionControlFlowError, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, MAX_CONTROL_DEFINITIONS,
+    MAX_CONTROL_DEPTH, MAX_CONTROL_USE_REFERENCES, PureCompileControl, RegionGuard,
     control_argument_semantics,
 };
 
@@ -71,7 +71,7 @@ impl From<FrozenCallError> for ExpressionOccurrenceError {
 }
 
 /// Expression and relational contexts authored from the same original source.
-/// These identities and domains are topology, not refined call-effect facts.
+/// These identities and regions are topology, not refined call-effect facts.
 #[derive(Clone, Debug)]
 pub(crate) struct AuthoredPhysicalOccurrences<'a> {
     pub root_uses: PhysicalRootUses,
@@ -81,7 +81,7 @@ pub(crate) struct AuthoredPhysicalOccurrences<'a> {
     pub(crate) temporal_sources: BTreeMap<ExpressionUseId, TemporalSourcePlan<ExprId>>,
 }
 
-/// Materialized values have actual use/domain facts, without expression
+/// Materialized values have actual use/region facts, without expression
 /// invocations or substituted expression roots. The original source is loaned.
 #[derive(Clone, Copy, Debug)]
 struct WriterValueUse<'a> {
@@ -173,7 +173,7 @@ fn author_physical_occurrences_in<'a>(
         source_owner,
         temporal_sources: BTreeMap::new(),
         work: CompileCheckpoints::try_new(control, CompilePhase::Validate)?,
-        domains: Vec::new(),
+        regions: Vec::new(),
         uses: Vec::new(),
         references: 0,
     };
@@ -194,18 +194,18 @@ fn author_physical_occurrences_in<'a>(
             .try_reserve_exact(roots.sites().len())
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         for (site, root) in roots.sites() {
-            let domain = author.domain(None, None)?;
-            let id = author.invocation(root.expr, domain, root.demand, 1)?;
+            let region = author.region(None, None)?;
+            let id = author.invocation(root.expr, region, root.demand, 1)?;
             bindings.push((*site, id));
             author.work.step()?;
         }
         let mut relational_contexts = Vec::new();
         let mut next_use = author.uses.len();
         let mut writer_values = Vec::new();
-        let domains = &mut author.domains;
+        let regions = &mut author.regions;
         visit_relational_calls_observed(fragment, &mut author.work, |site, binding, work| {
             if relational_contexts.len() == MAX_CONTROL_USE_REFERENCES
-                || domains.len() == MAX_CONTROL_DEFINITIONS
+                || regions.len() == MAX_CONTROL_DEFINITIONS
             {
                 return Err(ExpressionOccurrenceError::TooManyItems);
             }
@@ -236,7 +236,7 @@ fn author_physical_occurrences_in<'a>(
             append_relational_context_observed(
                 fragment,
                 site,
-                domains,
+                regions,
                 &mut relational_contexts,
                 &mut writer_values,
                 &mut next_use,
@@ -246,7 +246,7 @@ fn author_physical_occurrences_in<'a>(
         })?;
         author.work.flush()?;
         let flow = ExpressionControlFlow::try_new(
-            std::mem::take(&mut author.domains),
+            std::mem::take(&mut author.regions),
             std::mem::take(&mut author.uses),
             fragment.expressions(),
             CompilePhase::Validate,
@@ -281,18 +281,18 @@ fn author_physical_occurrences_in<'a>(
 fn append_relational_context_observed<'a>(
     fragment: &'a Fragment,
     site: PhysicalCallSite,
-    domains: &mut Vec<ExpressionEvaluationDomain>,
+    regions: &mut Vec<ExpressionEvaluationRegion>,
     relational_contexts: &mut Vec<(PhysicalCallSite, ExpressionEffectContext)>,
     writer_values: &mut Vec<WriterValueUse<'a>>,
     next_use: &mut usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ExpressionOccurrenceError> {
     if relational_contexts.len() == MAX_CONTROL_USE_REFERENCES
-        || domains.len() == MAX_CONTROL_DEFINITIONS
+        || regions.len() == MAX_CONTROL_DEFINITIONS
     {
         return Err(ExpressionOccurrenceError::TooManyItems);
     }
-    let domain = EvaluationDomainId::new(domains.len() as u32);
+    let region = EvaluationRegionId::new(regions.len() as u32);
     // Expression, relational and materialized channel counts are
     // bounded independently. Allocate every use in one checked namespace.
     let id = ExpressionUseId::new(
@@ -301,14 +301,14 @@ fn append_relational_context_observed<'a>(
     *next_use = (*next_use)
         .checked_add(1)
         .ok_or(CompileControlError::ResourceExhausted)?;
-    domains
+    regions
         .try_reserve(1)
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     relational_contexts
         .try_reserve(1)
         .map_err(|_| CompileControlError::ResourceExhausted)?;
-    domains.push(ExpressionEvaluationDomain {
-        id: domain,
+    regions.push(ExpressionEvaluationRegion {
+        id: region,
         parent: None,
         guard: None,
     });
@@ -316,7 +316,7 @@ fn append_relational_context_observed<'a>(
         site,
         ExpressionEffectContext {
             use_id: id,
-            domain,
+            region,
             demand: novarocks_type_contract::EvaluationDemand::Value,
         },
     ));
@@ -344,12 +344,12 @@ fn append_relational_context_observed<'a>(
         work.step()?;
         let value = value.ok_or(ExpressionOccurrenceError::InvalidRelationalControl(site))?;
         if writer_values.len() == MAX_CONTROL_USE_REFERENCES
-            || domains.len() == MAX_CONTROL_DEFINITIONS
+            || regions.len() == MAX_CONTROL_DEFINITIONS
         {
             return Err(ExpressionOccurrenceError::TooManyItems);
         }
-        let domain = EvaluationDomainId::new(
-            u32::try_from(domains.len()).map_err(|_| CompileControlError::ResourceExhausted)?,
+        let region = EvaluationRegionId::new(
+            u32::try_from(regions.len()).map_err(|_| CompileControlError::ResourceExhausted)?,
         );
         let use_id = ExpressionUseId::new(
             u32::try_from(*next_use).map_err(|_| CompileControlError::ResourceExhausted)?,
@@ -358,15 +358,15 @@ fn append_relational_context_observed<'a>(
             .checked_add(1)
             .ok_or(CompileControlError::ResourceExhausted)?;
         work.flush()?;
-        domains
+        regions
             .try_reserve(1)
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         writer_values
             .try_reserve(1)
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         work.flush()?;
-        domains.push(ExpressionEvaluationDomain {
-            id: domain,
+        regions.push(ExpressionEvaluationRegion {
+            id: region,
             parent: None,
             guard: None,
         });
@@ -375,7 +375,7 @@ fn append_relational_context_observed<'a>(
             value,
             context: ExpressionEffectContext {
                 use_id,
-                domain,
+                region,
                 demand: novarocks_type_contract::EvaluationDemand::Value,
             },
         });
@@ -423,8 +423,8 @@ impl WriterOccurrenceContexts<'_, '_> {
             .iter()
             .map(|entry| (entry.site, entry.value, entry.context))
     }
-    pub(crate) fn domain(&self, id: EvaluationDomainId) -> Option<&ExpressionEvaluationDomain> {
-        self.flow.domains().get(&id)
+    pub(crate) fn region(&self, id: EvaluationRegionId) -> Option<&ExpressionEvaluationRegion> {
+        self.flow.regions().get(&id)
     }
     pub(crate) fn contains_expression_use(&self, id: ExpressionUseId) -> bool {
         self.flow.uses().contains_key(&id)
@@ -451,7 +451,7 @@ struct Author<'a> {
     source_owner: Option<&'a SqlAuthoredPhysicalPlan>,
     temporal_sources: BTreeMap<ExpressionUseId, TemporalSourcePlan<ExprId>>,
     work: CompileCheckpoints<'a>,
-    domains: Vec<ExpressionEvaluationDomain>,
+    regions: Vec<ExpressionEvaluationRegion>,
     uses: Vec<ExpressionInvocation<ExprId>>,
     references: usize,
 }
@@ -464,27 +464,27 @@ impl Author<'_> {
         self.work.step()?;
         Ok(())
     }
-    fn domain(
+    fn region(
         &mut self,
-        parent: Option<EvaluationDomainId>,
-        guard: Option<DomainGuard>,
-    ) -> Result<EvaluationDomainId, ExpressionOccurrenceError> {
-        if self.domains.len() == MAX_CONTROL_DEFINITIONS {
+        parent: Option<EvaluationRegionId>,
+        guard: Option<RegionGuard>,
+    ) -> Result<EvaluationRegionId, ExpressionOccurrenceError> {
+        if self.regions.len() == MAX_CONTROL_DEFINITIONS {
             return Err(ExpressionOccurrenceError::TooManyItems);
         }
-        let id = EvaluationDomainId::new(self.domains.len() as u32);
-        self.domains
+        let id = EvaluationRegionId::new(self.regions.len() as u32);
+        self.regions
             .try_reserve(1)
             .map_err(|_| CompileControlError::ResourceExhausted)?;
-        self.domains
-            .push(ExpressionEvaluationDomain { id, parent, guard });
+        self.regions
+            .push(ExpressionEvaluationRegion { id, parent, guard });
         self.work.step()?;
         Ok(id)
     }
     fn invocation(
         &mut self,
         definition: ExprId,
-        domain: EvaluationDomainId,
+        region: EvaluationRegionId,
         demand: novarocks_type_contract::EvaluationDemand,
         depth: usize,
     ) -> Result<ExpressionUseId, ExpressionOccurrenceError> {
@@ -627,7 +627,7 @@ impl Author<'_> {
         self.uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain,
+                region,
                 demand,
             },
             definition,
@@ -665,12 +665,12 @@ impl Author<'_> {
             let (child_demand, guard) =
                 control_argument_semantics(shape, children.len(), ordinal, demand)
                     .map_err(ExpressionOccurrenceError::flow)?;
-            let child_domain = if let Some(kind) = guard {
-                self.domain(Some(domain), Some(DomainGuard { owner: id, kind }))?
+            let child_region = if let Some(kind) = guard {
+                self.region(Some(region), Some(RegionGuard { owner: id, kind }))?
             } else {
-                domain
+                region
             };
-            let child_use = self.invocation(*child, child_domain, child_demand, depth + 1)?;
+            let child_use = self.invocation(*child, child_region, child_demand, depth + 1)?;
             arguments.push(child_use);
             self.work.step()?;
         }

@@ -21,8 +21,8 @@ use novarocks_connector_contract as c;
 use novarocks_physical_plan as p;
 use novarocks_proto_models::plan;
 use novarocks_type_contract::{
-    ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -1478,7 +1478,7 @@ fn checked_writer_plan_packages_inner(
                 ExpressionInvocation {
                     context: ExpressionEffectContext {
                         use_id: ExpressionUseId::new(ordinal as u32),
-                        domain: EvaluationDomainId::new(0),
+                        region: EvaluationRegionId::new(0),
                         demand: root.demand,
                     },
                     definition: root.expr,
@@ -1490,8 +1490,8 @@ fn checked_writer_plan_packages_inner(
         let domains = if invocations.is_empty() {
             vec![]
         } else {
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
+            vec![ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(0),
                 parent: None,
                 guard: None,
             }]

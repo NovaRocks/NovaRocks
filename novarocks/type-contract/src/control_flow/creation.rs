@@ -102,7 +102,7 @@ fn visit<D, E: From<ControlResourceError>>(
 ) -> Result<(), E> {
     emit(
         CreationRetentionKind::Retained,
-        Geometry::Opaque(tree::<EvaluationDomainId, ExpressionEvaluationDomain>(n)?),
+        Geometry::Opaque(tree::<EvaluationRegionId, ExpressionEvaluationRegion>(n)?),
     )?;
     emit(
         CreationRetentionKind::Retained,
@@ -110,11 +110,11 @@ fn visit<D, E: From<ControlResourceError>>(
     )?;
     emit(
         CreationRetentionKind::Temporary,
-        Geometry::Opaque(tree::<EvaluationDomainId, Vec<EvaluationDomainId>>(n)?),
+        Geometry::Opaque(tree::<EvaluationRegionId, Vec<EvaluationRegionId>>(n)?),
     )?;
     emit(
         CreationRetentionKind::Temporary,
-        Geometry::Opaque(tree::<EvaluationDomainId, usize>(n)?),
+        Geometry::Opaque(tree::<EvaluationRegionId, usize>(n)?),
     )?;
     emit(
         CreationRetentionKind::Temporary,
@@ -122,7 +122,7 @@ fn visit<D, E: From<ControlResourceError>>(
     )?;
     emit(
         CreationRetentionKind::Temporary,
-        Geometry::Opaque(tree::<EvaluationDomainId, ()>(n)?),
+        Geometry::Opaque(tree::<EvaluationRegionId, ()>(n)?),
     )?;
     emit(
         CreationRetentionKind::Temporary,
@@ -131,7 +131,7 @@ fn visit<D, E: From<ControlResourceError>>(
     // Same locked original child-Vec growth allowance; not a guessed public
     // Layout or exact retained capacity for a private library operation.
     let mut children = ControlResourceCounter::default();
-    children.buffer::<EvaluationDomainId>(control_resource_mul(n, 16)?, 1)?;
+    children.buffer::<EvaluationRegionId>(control_resource_mul(n, 16)?, 1)?;
     if n > 0 {
         children.merge(ControlOwnedResourceFacts {
             allocation_requests_upper_bound: n - 1,
@@ -145,7 +145,7 @@ fn visit<D, E: From<ControlResourceError>>(
     if n > 0 {
         emit(
             CreationRetentionKind::Temporary,
-            Geometry::Exact(layout::<EvaluationDomainId>(n)?),
+            Geometry::Exact(layout::<EvaluationRegionId>(n)?),
         )?;
     }
     if u > 0 {
@@ -167,7 +167,7 @@ fn visit<D, E: From<ControlResourceError>>(
     emit(
         CreationRetentionKind::Retained,
         Geometry::Exact(arc::<
-            ControlFlowOwned<BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>>,
+            ControlFlowOwned<BTreeMap<EvaluationRegionId, ExpressionEvaluationRegion>>,
         >()?),
     )?;
     emit(

@@ -23,7 +23,7 @@
 use super::*;
 use crate::{
     BindingRequirements, CompileProfile, ControlShape, KernelAbiVersion, ProgramChannelLayoutRole,
-    ProgramChannelSite, ProgramChannelTypeError, ProgramEvaluationDomain, ProgramExpressionUse,
+    ProgramChannelSite, ProgramChannelTypeError, ProgramEvaluationRegion, ProgramExpressionUse,
     ProgramLexicalBindingError, ProgramLexicalBindings, ProgramLexicalSource, ProgramNode,
     ProgramResolvedCalls, ProgramRootInput, ProgramSlotBinding, ProgramTypedChannels,
     ProgramTypedExpressions, ProgramUseRef, StaticExprKind, StaticExprNode, StaticLayout,
@@ -32,7 +32,7 @@ use crate::{
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_functions::{FunctionArgumentType, FunctionValueType};
-use novarocks_type_contract::{EvaluationDomainId, ExpressionEffectContext};
+use novarocks_type_contract::{EvaluationRegionId, ExpressionEffectContext};
 use novarocks_types::SlotId;
 use std::{collections::HashMap, num::NonZeroUsize};
 
@@ -43,7 +43,7 @@ impl PureCompileControl for Control {
     }
 }
 
-const DOMAIN: EvaluationDomainId = EvaluationDomainId::new(u32::MAX);
+const DOMAIN: EvaluationRegionId = EvaluationRegionId::new(u32::MAX);
 const TRUE: usize = 0;
 const NOT: usize = 1;
 const SLOT: usize = 2;
@@ -131,7 +131,7 @@ fn invocation(id: u32, definition: usize, arguments: &[u32]) -> ProgramExpressio
     ProgramExpressionUse {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain: DOMAIN,
+            region: DOMAIN,
             demand: EvaluationDemand::Value,
         },
         definition: ProgramExprId::new(definition),
@@ -151,7 +151,7 @@ fn flow(definition: usize) -> BTreeMap<ProgramExpressionArena, ProgramControlFlo
         vec![invocation(0, definition, &[])]
     };
     let flow = ProgramControlFlow::try_new(
-        vec![ProgramEvaluationDomain {
+        vec![ProgramEvaluationRegion {
             id: DOMAIN,
             parent: None,
             guard: None,

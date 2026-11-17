@@ -56,7 +56,7 @@ impl Control {
 }
 fn limits() -> ControlProjectionLimits {
     ControlProjectionLimits {
-        max_domains: 1000,
+        max_regions: 1000,
         max_use_references: 10000,
         max_root_bindings: 1000,
         max_allocation_requests: 100000,
@@ -129,11 +129,11 @@ fn fixture() -> (Fragment, PhysicalRootUses) {
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let region = EvaluationRegionId::new(u32::MAX);
     let inv = |id, definition, args: &[ExpressionUseId]| ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain,
+            region,
             demand: EvaluationDemand::Value,
         },
         definition,
@@ -141,8 +141,8 @@ fn fixture() -> (Fragment, PhysicalRootUses) {
         arguments: args.into(),
     };
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
+        vec![ExpressionEvaluationRegion {
+            id: region,
             parent: None,
             guard: None,
         }],
@@ -237,7 +237,7 @@ fn complete_control_reuses_original_roots_and_sparse_independent_occurrences() {
     assert_eq!(input.roots[0].use_id, Some(9));
     assert_eq!(
         (
-            facts.domain_count,
+            facts.region_count,
             facts.use_reference_count,
             facts.root_binding_count
         ),
@@ -282,7 +282,7 @@ fn every_actual_control_success_and_ordinary_callback_preserves_caller_scope_fir
         if malformed {
             assert!(matches!(
                 baseline.0,
-                Err(ControlCodecError::InvalidShape("use domain is missing"))
+                Err(ControlCodecError::InvalidShape("use region is missing"))
             ));
         }
         for at in 0..baseline.1.len() {
@@ -300,12 +300,12 @@ fn original_owned_arc_geometry_and_all_seven_axes_have_independent_refusal_oracl
     // root slice. Independently compute the fields' Arc request geometry;
     // this does not read the model's answer or change any of the seven caps.
     use novarocks_type_contract::{
-        ExpressionEvaluationDomain, ExpressionInvocation, ValueTypeStorageLifetime,
+        ExpressionEvaluationRegion, ExpressionInvocation, ValueTypeStorageLifetime,
         owned_resources::layout::arc_layout,
     };
     use std::collections::BTreeMap;
-    let map_domains = arc_layout(Layout::new::<(
-        BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>,
+    let map_regions = arc_layout(Layout::new::<(
+        BTreeMap<EvaluationRegionId, ExpressionEvaluationRegion>,
         ValueTypeStorageLifetime,
     )>())
     .unwrap()
@@ -328,7 +328,7 @@ fn original_owned_arc_geometry_and_all_seven_axes_have_independent_refusal_oracl
             header.allocation_requests_upper_bound,
             header.allocation_request_bytes_upper_bound
         ),
-        (3, map_domains + map_uses + root_slice)
+        (3, map_regions + map_uses + root_slice)
     );
     let (f, r) = fixture();
     let (input, golden) = encode(&f, &r, None).0.unwrap();
@@ -336,7 +336,7 @@ fn original_owned_arc_geometry_and_all_seven_axes_have_independent_refusal_oracl
     for direction in [false, true] {
         let g = if direction { decoded } else { golden };
         let exact = ControlProjectionLimits {
-            max_domains: g.domain_count,
+            max_regions: g.region_count,
             max_use_references: g.use_reference_count,
             max_root_bindings: g.root_binding_count,
             max_allocation_requests: g.allocation_requests_upper_bound,
@@ -392,7 +392,7 @@ fn original_owned_arc_geometry_and_all_seven_axes_have_independent_refusal_oracl
         for axis in 0..7 {
             let mut l = limits();
             match axis {
-                0 => l.max_domains = g.domain_count - 1,
+                0 => l.max_regions = g.region_count - 1,
                 1 => l.max_use_references = g.use_reference_count - 1,
                 2 => l.max_root_bindings = g.root_binding_count - 1,
                 3 => l.max_allocation_requests = g.allocation_requests_upper_bound - 1,

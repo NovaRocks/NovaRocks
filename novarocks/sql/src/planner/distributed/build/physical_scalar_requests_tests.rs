@@ -30,7 +30,7 @@ use novarocks_physical_plan::{
     ConstantPoolId, ConstantReference, LiteralValue, NodeId, PlanLimits, ValueId,
 };
 use novarocks_type_contract::{
-    CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+    CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, FunctionArgumentEvaluation, FunctionFailureBehavior,
     FunctionIntrinsicRowError, FunctionVolatility, PureCompileControl, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameters, ValueLogicalType,
@@ -167,7 +167,7 @@ fn invoke<'a>(
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(u32::MAX),
-        domain: EvaluationDomainId::new(9),
+        region: EvaluationRegionId::new(9),
         demand: EvaluationDemand::Value,
     }
 }
@@ -192,7 +192,7 @@ fn prepare(
         environment: &[],
         parameters: &parameters,
         decimal_overflow_policy: policy,
-        proof_scope: CallProofScope::Domain(context().domain),
+        proof_scope: CallProofScope::Region(context().region),
     };
     let arguments = ScopedExpressionEffects::pure_value(context());
     let options = if control_intrinsic {

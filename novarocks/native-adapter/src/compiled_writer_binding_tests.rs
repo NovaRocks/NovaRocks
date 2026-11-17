@@ -281,8 +281,8 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
     use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
     use novarocks_spi::connector::write_stack::{root_write_result_schema, writer_output_schema};
     use novarocks_type_contract::{
-        ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-        ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+        ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+        ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     };
     use prost::Message;
     use std::collections::BTreeMap;
@@ -621,7 +621,7 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
                 invocations.push(ExpressionInvocation {
                     context: ExpressionEffectContext {
                         use_id,
-                        domain: EvaluationDomainId::new(0),
+                        region: EvaluationRegionId::new(0),
                         demand: root.demand,
                     },
                     definition: root.expr,
@@ -634,8 +634,8 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
         let domains = if invocations.is_empty() {
             vec![]
         } else {
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
+            vec![ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(0),
                 parent: None,
                 guard: None,
             }]

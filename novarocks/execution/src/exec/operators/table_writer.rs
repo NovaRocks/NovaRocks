@@ -2619,8 +2619,8 @@ pub(crate) mod tests {
         };
         use novarocks_physical_plan::*;
         use novarocks_type_contract::{
-            ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-            ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
+            ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+            ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
             SemanticParameters,
         };
         use std::collections::BTreeMap;
@@ -2828,7 +2828,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let roots = PhysicalExpressionRoots::try_new(&fragment, &control).unwrap();
-        let domain = EvaluationDomainId::new(0);
+        let domain = EvaluationRegionId::new(0);
         let mut invocations = vec![];
         let mut bindings = vec![];
         for (index, (site, root)) in roots.sites().iter().enumerate() {
@@ -2836,7 +2836,7 @@ pub(crate) mod tests {
             invocations.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain,
+                    region: domain,
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -2846,7 +2846,7 @@ pub(crate) mod tests {
             bindings.push((*site, use_id));
         }
         let flow = ExpressionControlFlow::try_new(
-            vec![ExpressionEvaluationDomain {
+            vec![ExpressionEvaluationRegion {
                 id: domain,
                 parent: None,
                 guard: None,
@@ -3067,7 +3067,7 @@ pub(crate) mod tests {
     ) -> LocalPreparedWriterPartial {
         use novarocks_functions::*;
         use novarocks_type_contract::{
-            CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+            CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
             ExpressionEffectContext, ExpressionUseId, SemanticParameters,
         };
         let original =
@@ -3137,7 +3137,7 @@ pub(crate) mod tests {
         for index in 0..count {
             let context = ExpressionEffectContext {
                 use_id: ExpressionUseId::new(index as u32),
-                domain: EvaluationDomainId::new(index as u32),
+                region: EvaluationRegionId::new(index as u32),
                 demand: EvaluationDemand::Value,
             };
             let input_use = [Some(ExpressionUseId::new(count as u32 + index as u32))];
@@ -3153,7 +3153,7 @@ pub(crate) mod tests {
                         environment: &[],
                         parameters: &parameters,
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(context.domain),
+                        proof_scope: CallProofScope::Region(context.region),
                     },
                     selected.clone(),
                     PureCallPreparation::Aggregate {

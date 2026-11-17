@@ -28,7 +28,7 @@ use crate::{
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
     FunctionNullBehavior, FunctionVolatility, PureCompileControl, SemanticParameters,
 };
 use std::{sync::Mutex, time::Duration};
@@ -518,7 +518,7 @@ fn date_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_sources
         assert_eq!(selected.result_type, FunctionResultType::Scalar(target()));
         let context = ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         };
         let uses = [Some(ExpressionUseId::new(42))];
@@ -533,7 +533,7 @@ fn date_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_sources
             environment: &[],
             parameters: &params,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         };
         let fresh = specialize_scalar(
             &owner,
@@ -792,7 +792,7 @@ fn date_invalid_and_null_constants_prepare_without_reading_payload() {
         );
         let context = ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         };
         let uses = [Some(ExpressionUseId::new(42))];

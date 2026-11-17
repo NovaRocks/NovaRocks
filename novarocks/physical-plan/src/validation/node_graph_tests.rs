@@ -18,8 +18,8 @@
 use super::{NodeGraphEvent, validate_node_graph, visit_node_graph_child_first};
 use crate::*;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEvaluationDomain, PureCompileControl, SemanticParameters,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionEvaluationRegion, PureCompileControl, SemanticParameters,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -290,8 +290,8 @@ fn node_graph_wide_real_events_reach_quantum_and_keep_child_first_order() {
 fn package_input(fragment: Fragment) -> FragmentPackageInput {
     let setup = Control::default();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],

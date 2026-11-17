@@ -23,7 +23,7 @@ use crate::{
     KernelFailure, PreparedCastRecipe, SelectedValues, Selection,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, EvaluationDemand, EvaluationDomainId,
+    CompileControlError, CompilePhase, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, FunctionValueType, PureCompileControl,
 };
 use std::{sync::Mutex, time::Duration};
@@ -236,7 +236,7 @@ fn integral_decimal128_recipe_exact_column_slice_selected_scalar_and_pool_ordina
 fn integral_decimal128_recipe_exact_policy_null_effects_and_wide_negative_scale_values() {
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(31),
-        domain: EvaluationDomainId::new(4),
+        region: EvaluationRegionId::new(4),
         demand: EvaluationDemand::Value,
     };
     for dtype in [

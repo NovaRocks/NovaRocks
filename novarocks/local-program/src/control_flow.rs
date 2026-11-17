@@ -18,11 +18,11 @@
 //! Dense local-program projection of the shared immutable control graph.
 use crate::ProgramExprId;
 use novarocks_type_contract::{
-    CompilePhase, EvaluationDomainId, ExpressionUseId, PureCompileControl,
+    CompilePhase, EvaluationRegionId, ExpressionUseId, PureCompileControl,
 };
 pub use novarocks_type_contract::{
-    ControlShape, DomainGuard, ExpressionControlFlowError as ProgramControlFlowError,
-    ExpressionEvaluationDomain as ProgramEvaluationDomain, GuardKind,
+    ControlShape, ExpressionControlFlowError as ProgramControlFlowError,
+    ExpressionEvaluationRegion as ProgramEvaluationRegion, GuardKind, RegionGuard,
 };
 use std::collections::BTreeMap;
 pub type ProgramExpressionUse = novarocks_type_contract::ExpressionInvocation<ProgramExprId>;
@@ -39,13 +39,13 @@ impl novarocks_type_contract::ExpressionDefinitionMembership<ProgramExprId> for 
 }
 impl ProgramControlFlow {
     pub fn try_new(
-        domains: Vec<ProgramEvaluationDomain>,
+        regions: Vec<ProgramEvaluationRegion>,
         uses: Vec<ProgramExpressionUse>,
         definition_count: usize,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramControlFlowError> {
         novarocks_type_contract::ExpressionControlFlow::try_new(
-            domains,
+            regions,
             uses,
             &DenseDefinitions(definition_count),
             CompilePhase::LowerProgram,
@@ -56,7 +56,7 @@ impl ProgramControlFlow {
     /// Same shared control author with independent actual validation scratch
     /// and immutable graph backing lifetimes.
     pub fn try_new_with_creator_in<H>(
-        domains: Vec<ProgramEvaluationDomain>,
+        regions: Vec<ProgramEvaluationRegion>,
         uses: Vec<ProgramExpressionUse>,
         definition_count: usize,
         temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
@@ -69,7 +69,7 @@ impl ProgramControlFlow {
         };
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
         let result = novarocks_type_contract::ExpressionControlFlow::try_new_with_creator_in(
-            domains,
+            regions,
             uses,
             &DenseDefinitions(definition_count),
             temporary,
@@ -102,8 +102,8 @@ impl ProgramControlFlow {
     pub fn root_use_ids(&self) -> &[ExpressionUseId] {
         self.0.root_use_ids()
     }
-    pub fn domains(&self) -> &BTreeMap<EvaluationDomainId, ProgramEvaluationDomain> {
-        self.0.domains()
+    pub fn regions(&self) -> &BTreeMap<EvaluationRegionId, ProgramEvaluationRegion> {
+        self.0.regions()
     }
     pub fn uses(&self) -> &BTreeMap<ExpressionUseId, ProgramExpressionUse> {
         self.0.uses()
@@ -128,18 +128,18 @@ mod tests {
             }
         }
     }
-    fn root() -> ProgramEvaluationDomain {
-        ProgramEvaluationDomain {
-            id: EvaluationDomainId::new(u32::MAX),
+    fn root() -> ProgramEvaluationRegion {
+        ProgramEvaluationRegion {
+            id: EvaluationRegionId::new(u32::MAX),
             parent: None,
             guard: None,
         }
     }
-    fn value(id: u32, domain: EvaluationDomainId) -> ProgramExpressionUse {
+    fn value(id: u32, region: EvaluationRegionId) -> ProgramExpressionUse {
         ProgramExpressionUse {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(id),
-                domain,
+                region,
                 demand: EvaluationDemand::Value,
             },
             definition: ProgramExprId::new(0),
@@ -147,11 +147,11 @@ mod tests {
             arguments: Box::default(),
         }
     }
-    fn branch(id: u32, kind: GuardKind) -> ProgramEvaluationDomain {
-        ProgramEvaluationDomain {
-            id: EvaluationDomainId::new(id),
+    fn branch(id: u32, kind: GuardKind) -> ProgramEvaluationRegion {
+        ProgramEvaluationRegion {
+            id: EvaluationRegionId::new(id),
             parent: Some(root().id),
-            guard: Some(DomainGuard {
+            guard: Some(RegionGuard {
                 owner: ExpressionUseId::new(0),
                 kind,
             }),
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn if_retains_distinct_occurrences_and_strong_branch_domains() {
+    fn if_retains_distinct_occurrences_and_strong_branch_regions() {
         let mut owner = value(0, root().id);
         owner.control = ControlShape::If;
         owner.arguments = vec![
@@ -206,7 +206,7 @@ mod tests {
         // All four uses share one immutable definition; no invocation is merged.
         assert_eq!(flow.uses().len(), 4);
         let mut invalid = uses;
-        invalid[2].context.domain = root().id;
+        invalid[2].context.region = root().id;
         assert_eq!(
             ProgramControlFlow::try_new(vec![root(), then, otherwise], invalid, 1, &Control(false))
                 .unwrap_err(),
@@ -368,21 +368,21 @@ mod tests {
                 ],
             ),
         ] {
-            let mut domains = vec![root()];
+            let mut regions = vec![root()];
             let mut owner = value(0, root().id);
             owner.control = shape;
             let mut uses = Vec::new();
             let mut arguments = Vec::new();
             for (ordinal, guard) in guards.iter().enumerate() {
-                let domain = if let Some(guard) = guard {
-                    let domain = branch(ordinal as u32, *guard);
-                    domains.push(domain);
-                    domain.id
+                let region = if let Some(guard) = guard {
+                    let region = branch(ordinal as u32, *guard);
+                    regions.push(region);
+                    region.id
                 } else {
                     root().id
                 };
                 arguments.push(ExpressionUseId::new(ordinal as u32 + 1));
-                let mut child = value(ordinal as u32 + 1, domain);
+                let mut child = value(ordinal as u32 + 1, region);
                 child.context.demand =
                     control_argument_semantics(shape, guards.len(), ordinal, owner.context.demand)
                         .unwrap()
@@ -391,7 +391,7 @@ mod tests {
             }
             owner.arguments = arguments.into_boxed_slice();
             uses.push(owner);
-            ProgramControlFlow::try_new(domains, uses, 1, &Control(false)).unwrap();
+            ProgramControlFlow::try_new(regions, uses, 1, &Control(false)).unwrap();
         }
     }
     #[test]

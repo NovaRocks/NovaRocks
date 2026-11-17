@@ -45,7 +45,7 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, ExpressionUseId, FunctionValueType, PureCompileControl,
     SemanticParameters,
 };
@@ -148,7 +148,7 @@ fn invocation(
     uses.push(ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: id,
-            domain: EvaluationDomainId::new(u32::MAX),
+            region: EvaluationRegionId::new(u32::MAX),
             demand,
         },
         definition: expression,
@@ -456,8 +456,8 @@ fn package_with_dictionary(
         })
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(u32::MAX),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(u32::MAX),
             parent: None,
             guard: None,
         }],
@@ -491,7 +491,7 @@ fn package_with_dictionary(
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    proof_scope: novarocks_type_contract::CallProofScope::Domain(context.domain),
+                    proof_scope: novarocks_type_contract::CallProofScope::Region(context.region),
                 },
                 selected.clone(),
                 PureCallPreparation::Scalar {

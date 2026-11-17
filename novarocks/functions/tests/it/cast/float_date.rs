@@ -31,7 +31,7 @@ use novarocks_type_contract::DecimalOverflowPolicy;
 use novarocks_type_contract::ExpressionEffectContext;
 use novarocks_type_contract::FunctionValueType;
 use novarocks_type_contract::PureCompileControl;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -159,7 +159,7 @@ fn float_date_exact_nullability_successful_null_effect_and_all_policy_profiles()
                         assert_eq!(r.policy(), policy);
                         let context = ExpressionEffectContext {
                             use_id: ExpressionUseId::new(31),
-                            domain: EvaluationDomainId::new(4),
+                            region: EvaluationRegionId::new(4),
                             demand: EvaluationDemand::Value,
                         };
                         assert!(

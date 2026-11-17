@@ -25,11 +25,11 @@ mod property_proof_tests;
 use crate::*;
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    AggregateStateFormatId, ControlShape, DomainGuard, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEvaluationDomain, ExpressionInvocation, FunctionArgumentEvaluation,
+    AggregateStateFormatId, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEvaluationRegion, ExpressionInvocation, FunctionArgumentEvaluation,
     FunctionFailureBehavior, FunctionId, FunctionInstanceState, FunctionIntrinsicRowError,
     FunctionNullBehavior, FunctionOverloadId, FunctionVolatility, GuardKind, ObservableEffects,
-    SemanticParameterId, SemanticParameterKey,
+    RegionGuard, SemanticParameterId, SemanticParameterKey,
 };
 use std::sync::Mutex;
 
@@ -94,7 +94,7 @@ fn function(kind: FunctionKind, result_type: ValueType) -> BoundFunction {
         }),
     }
 }
-fn effects(kind: FunctionKind, domain: EvaluationDomainId) -> CallEffects {
+fn effects(kind: FunctionKind, domain: EvaluationRegionId) -> CallEffects {
     CallEffects {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: match kind {
@@ -119,19 +119,19 @@ fn effects(kind: FunctionKind, domain: EvaluationDomainId) -> CallEffects {
         },
         observable_effects: ObservableEffects::NONE,
         environment: Box::default(),
-        proof_scope: CallProofScope::Domain(domain),
+        proof_scope: CallProofScope::Region(domain),
     }
 }
 fn context(id: u32, domain: u32, demand: EvaluationDemand) -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(id),
-        domain: EvaluationDomainId::new(domain),
+        region: EvaluationRegionId::new(domain),
         demand,
     }
 }
-fn domain(id: u32) -> ExpressionEvaluationDomain {
-    ExpressionEvaluationDomain {
-        id: EvaluationDomainId::new(id),
+fn domain(id: u32) -> ExpressionEvaluationRegion {
+    ExpressionEvaluationRegion {
+        id: EvaluationRegionId::new(id),
         parent: None,
         guard: None,
     }
@@ -331,7 +331,7 @@ fn scalar_fixture(count: usize, fragment_id: u32) -> Fixture {
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Expression(invocation.context.use_id),
             context: invocation.context,
-            effects: effects(FunctionKind::Scalar, invocation.context.domain),
+            effects: effects(FunctionKind::Scalar, invocation.context.region),
         })
         .collect();
     Fixture {
@@ -374,7 +374,7 @@ fn repeated_definition_preserves_complete_per_use_claims_and_exact_binding_borro
     let first = &fixture.uses.flow().uses()[&ExpressionUseId::new(0)];
     let second = &fixture.uses.flow().uses()[&ExpressionUseId::new(u32::MAX)];
     assert_eq!(first.definition, second.definition);
-    assert_ne!(first.context.domain, second.context.domain);
+    assert_ne!(first.context.region, second.context.region);
     let ExprKind::FunctionCall { function, .. } = &fixture
         .fragment
         .expressions()
@@ -423,10 +423,10 @@ fn missing_extra_duplicate_foreign_fragment_context_scope_and_control_fail_close
     calls[0].context.demand = EvaluationDemand::TruthOnly;
     assert_eq!(check(calls), Err(FrozenCallError::WrongContext));
     let mut calls = fixture.calls.clone();
-    calls[0].context.domain = EvaluationDomainId::new(123);
+    calls[0].context.region = EvaluationRegionId::new(123);
     assert_eq!(check(calls), Err(FrozenCallError::WrongContext));
     let mut calls = fixture.calls.clone();
-    calls[0].effects.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(123));
+    calls[0].effects.proof_scope = CallProofScope::Region(EvaluationRegionId::new(123));
     assert_eq!(check(calls), Err(FrozenCallError::WrongProofScope));
     let mut calls = fixture.calls.clone();
     calls[0].effects.argument_control = ArgumentControl::TypeOnly;
@@ -546,26 +546,26 @@ fn case_fixture() -> Fixture {
         .unwrap();
     let domains = vec![
         domain(0),
-        ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(12),
-            parent: Some(EvaluationDomainId::new(0)),
-            guard: Some(DomainGuard {
+        ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(12),
+            parent: Some(EvaluationRegionId::new(0)),
+            guard: Some(RegionGuard {
                 owner: ExpressionUseId::new(9),
                 kind: GuardKind::CaseWhen { arm: 0 },
             }),
         },
-        ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(10),
-            parent: Some(EvaluationDomainId::new(0)),
-            guard: Some(DomainGuard {
+        ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(10),
+            parent: Some(EvaluationRegionId::new(0)),
+            guard: Some(RegionGuard {
                 owner: ExpressionUseId::new(9),
                 kind: GuardKind::CaseThen { arm: 0 },
             }),
         },
-        ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(11),
-            parent: Some(EvaluationDomainId::new(0)),
-            guard: Some(DomainGuard {
+        ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(11),
+            parent: Some(EvaluationRegionId::new(0)),
+            guard: Some(RegionGuard {
                 owner: ExpressionUseId::new(9),
                 kind: GuardKind::CaseElse,
             }),
@@ -637,7 +637,7 @@ fn case_fixture() -> Fixture {
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(context.use_id),
                 context,
-                effects: effects(FunctionKind::Scalar, context.domain),
+                effects: effects(FunctionKind::Scalar, context.region),
             }
         })
         .to_vec();
@@ -657,10 +657,10 @@ fn one_scalar_definition_has_independent_truth_and_guarded_value_occurrences() {
     let then = &checked.entries()[&PhysicalCallSite::Expression(ExpressionUseId::new(u32::MAX))];
     assert_eq!(first.context.demand, EvaluationDemand::TruthOnly);
     assert_eq!(then.context.demand, EvaluationDemand::Value);
-    assert_ne!(first.context.domain, then.context.domain);
+    assert_ne!(first.context.region, then.context.region);
     assert_eq!(
         then.effects.proof_scope,
-        CallProofScope::Domain(then.context.domain)
+        CallProofScope::Region(then.context.region)
     );
     assert_eq!(
         then.effects.own_row_error,
@@ -845,7 +845,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
                 call,
             },
             context,
-            effects: effects(FunctionKind::Aggregate, context.domain),
+            effects: effects(FunctionKind::Aggregate, context.region),
         });
     }
     let window_use = uses
@@ -863,7 +863,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         site: PhysicalCallSite::Expression(window_use.use_id),
         context: window_use,
-        effects: effects(FunctionKind::Window, window_use.domain),
+        effects: effects(FunctionKind::Window, window_use.region),
     });
     let context = context(special_base + 2, u32::MAX, EvaluationDemand::Value);
     calls.push(FrozenPhysicalCall {
@@ -874,7 +874,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         site: PhysicalCallSite::Table { node: table },
         context,
-        effects: effects(FunctionKind::Table, context.domain),
+        effects: effects(FunctionKind::Table, context.region),
     });
     Fixture {
         fragment,
@@ -962,8 +962,8 @@ fn relational_occurrences_require_fresh_ids_value_demand_actual_domain_and_kind(
     wrong[0].context.demand = EvaluationDemand::TruthOnly;
     assert_eq!(check(wrong), Err(FrozenCallError::WrongContext));
     let mut wrong = fixture.calls.clone();
-    wrong[0].context.domain = EvaluationDomainId::new(123);
-    assert_eq!(check(wrong), Err(FrozenCallError::InvalidDomain));
+    wrong[0].context.region = EvaluationRegionId::new(123);
+    assert_eq!(check(wrong), Err(FrozenCallError::InvalidRegion));
     let mut wrong = fixture.calls.clone();
     wrong[0].effects.argument_control = ArgumentControl::Eager;
     assert_eq!(
@@ -1178,7 +1178,7 @@ fn type_only_parent_retains_static_child_binding_without_runtime_child_claim() {
         &Control::default(),
     )
     .unwrap();
-    let mut claimed = effects(FunctionKind::Scalar, current.domain);
+    let mut claimed = effects(FunctionKind::Scalar, current.region);
     claimed.argument_control = ArgumentControl::TypeOnly;
     let parent_call = FrozenPhysicalCall {
         materialized_writer_input: None,

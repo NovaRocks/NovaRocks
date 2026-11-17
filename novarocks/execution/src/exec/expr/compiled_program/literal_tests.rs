@@ -100,8 +100,8 @@ fn literal_program(cases: &[(FunctionValueType, LiteralValue)]) -> Arc<LocalProg
         })
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(u32::MAX),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(u32::MAX),
             parent: None,
             guard: None,
         }],

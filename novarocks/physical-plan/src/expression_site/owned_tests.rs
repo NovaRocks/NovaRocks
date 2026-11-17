@@ -104,12 +104,12 @@ fn fixture(id: u32) -> Fragment {
 }
 fn roots(f: &Fragment) -> PhysicalRootUses {
     let c = Control::default();
-    let domain = novarocks_type_contract::EvaluationDomainId::new(0);
+    let domain = novarocks_type_contract::EvaluationRegionId::new(0);
     let definition = *f.expressions().iter().next().unwrap().0;
     let inv = |id| novarocks_type_contract::ExpressionInvocation {
         context: novarocks_type_contract::ExpressionEffectContext {
             use_id: novarocks_type_contract::ExpressionUseId::new(id),
-            domain,
+            region: domain,
             demand: EvaluationDemand::Value,
         },
         definition,
@@ -117,7 +117,7 @@ fn roots(f: &Fragment) -> PhysicalRootUses {
         arguments: Box::default(),
     };
     let flow = novarocks_type_contract::ExpressionControlFlow::try_new(
-        vec![novarocks_type_contract::ExpressionEvaluationDomain {
+        vec![novarocks_type_contract::ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

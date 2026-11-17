@@ -25,7 +25,7 @@ use arrow_array::{Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float6
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     SemanticParameters, ValueLogicalType,
 };
 use std::{num::NonZeroUsize, time::Duration};
@@ -49,7 +49,7 @@ impl KernelEvaluationControl for RuntimeControl {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(0),
-        domain: EvaluationDomainId::new(u32::MAX),
+        region: EvaluationRegionId::new(u32::MAX),
         demand: EvaluationDemand::Value,
     }
 }
@@ -157,14 +157,14 @@ impl Fixture {
             parameters: &self.parameters,
             environment: &[],
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Domain(context().domain),
+            proof_scope: CallProofScope::Region(context().region),
         };
         if !phase.consumes_logical_arguments() {
             input.argument_uses = CallArgumentUses::AggregateMerge {
                 phase,
                 state_context: ExpressionEffectContext {
                     use_id: ExpressionUseId::new(u32::MAX),
-                    domain: EvaluationDomainId::new(u32::MAX - 1),
+                    region: EvaluationRegionId::new(u32::MAX - 1),
                     demand: EvaluationDemand::Value,
                 },
                 state_input_type: &self.state,

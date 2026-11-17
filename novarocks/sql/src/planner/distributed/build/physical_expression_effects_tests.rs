@@ -31,9 +31,9 @@ use novarocks_physical_plan::{
     PlanLimits, ValueOrigin, WindowExpression, WindowSpec,
 };
 use novarocks_type_contract::{
-    ControlShape, DomainGuard, ExpressionEffectContext, ExpressionEffects,
-    ExpressionEvaluationDomain, ExpressionInvocation, FunctionIntrinsicRowError, FunctionKind,
-    FunctionValueType, FunctionVolatility, GuardKind, SemanticParameterId, SemanticParameterKey,
+    ControlShape, ExpressionEffectContext, ExpressionEffects, ExpressionEvaluationRegion,
+    ExpressionInvocation, FunctionIntrinsicRowError, FunctionKind, FunctionValueType,
+    FunctionVolatility, GuardKind, RegionGuard, SemanticParameterId, SemanticParameterKey,
 };
 use std::sync::{Arc, Mutex};
 const PHASE: CompilePhase = CompilePhase::FunctionSpecialization;
@@ -243,7 +243,7 @@ fn source_scopes<'a>(
                     source,
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                     environment: &[],
-                    proof_scope: CallProofScope::Domain(item.context.domain),
+                    proof_scope: CallProofScope::Region(item.context.region),
                 },
             ))
         })
@@ -348,10 +348,10 @@ fn reordered(fragment: &Fragment, roots: &PhysicalRootUses) -> PhysicalRootUses 
         .collect();
     let domains = roots
         .flow()
-        .domains()
+        .regions()
         .values()
-        .map(|domain| ExpressionEvaluationDomain {
-            guard: domain.guard.map(|guard| DomainGuard {
+        .map(|domain| ExpressionEvaluationRegion {
+            guard: domain.guard.map(|guard| RegionGuard {
                 owner: ids[&guard.owner],
                 kind: guard.kind,
             }),
@@ -480,8 +480,8 @@ fn expression_effects_actual_edges_schedule_reordered_sparse_uses_and_shared_def
             .collect();
         assert_eq!(lower_uses.len(), 2);
         assert_ne!(
-            lower_uses[0].1.context.domain,
-            lower_uses[1].1.context.domain
+            lower_uses[0].1.context.region,
+            lower_uses[1].1.context.region
         );
         for (&id, item) in lower_uses {
             assert_eq!(result.summaries[&id].context(), item.context);
@@ -689,11 +689,11 @@ fn expression_effects_case_and_boolean_guards_keep_rand_state_and_errorful_cast_
         (2, GuardKind::CaseElse),
     ] {
         let child = &roots.flow().uses()[&case_use.arguments[ordinal]];
-        let domain = roots.flow().domains()[&child.context.domain];
-        assert_eq!(domain.parent, Some(case_use.context.domain));
+        let domain = roots.flow().regions()[&child.context.region];
+        assert_eq!(domain.parent, Some(case_use.context.region));
         assert_eq!(
             domain.guard,
-            Some(DomainGuard {
+            Some(RegionGuard {
                 owner: case_id,
                 kind
             })
@@ -865,7 +865,7 @@ fn expression_effects_missing_spurious_and_stale_same_id_scalar_source_scopes_re
             source: &foreign,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             environment: &[],
-            proof_scope: CallProofScope::Domain(roots.flow().uses()[&id].context.domain),
+            proof_scope: CallProofScope::Region(roots.flow().uses()[&id].context.region),
         },
     );
     assert!(matches!(
@@ -1076,7 +1076,7 @@ fn expression_effects_runtime_window_requires_explicit_scope_and_keeps_its_lifec
             source: fragment.expressions().get(root).unwrap(),
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             environment: &[],
-            proof_scope: CallProofScope::Domain(roots.flow().uses()[&id].context.domain),
+            proof_scope: CallProofScope::Region(roots.flow().uses()[&id].context.region),
         },
     );
     let result = run(

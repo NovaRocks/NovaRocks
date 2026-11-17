@@ -22,7 +22,7 @@ use crate::{
 };
 use arrow_schema::{DataType, Field, TimeUnit};
 use novarocks_type_contract::{
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionUseId, SemanticParameters, ValueLogicalType,
 };
 fn owner(name: &str) -> NullifOwner {
@@ -38,7 +38,7 @@ fn owner(name: &str) -> NullifOwner {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     }
 }

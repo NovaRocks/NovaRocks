@@ -144,7 +144,7 @@ fn inlist_signed_actual_source_definitions_ordered_uses_guards_and_exact_recipe(
             novarocks_type_contract::EvaluationDemand::Value
         );
         assert_eq!(
-            flow.domains()[&child.context.domain].guard.unwrap().kind,
+            flow.regions()[&child.context.region].guard.unwrap().kind,
             novarocks_type_contract::GuardKind::MembershipAfterSource {
                 ordinal: (ordinal - 1) as u32
             }
@@ -488,7 +488,7 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
                 novarocks_type_contract::EvaluationDemand::Value
             );
             assert_eq!(
-                flow.domains()[&case_use.context.domain].guard.unwrap().kind,
+                flow.regions()[&case_use.context.region].guard.unwrap().kind,
                 novarocks_type_contract::GuardKind::MembershipAfterSource { ordinal: 1 }
             );
             let definition = snapshot.roots().arenas()[&site.arena()]

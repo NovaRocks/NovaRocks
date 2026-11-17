@@ -105,7 +105,7 @@ fn finish_values(mut builder: FragmentBuilder, node: NodeId, roots: &[ExprId]) -
 fn invocation(
     id: u32,
     definition: ExprId,
-    domain: EvaluationDomainId,
+    region: EvaluationRegionId,
     demand: EvaluationDemand,
     control: ControlShape,
     arguments: &[u32],
@@ -113,7 +113,7 @@ fn invocation(
     ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain,
+            region,
             demand,
         },
         definition,
@@ -157,10 +157,10 @@ fn binary_fixture() -> (Fragment, PhysicalRootUses) {
         )
         .unwrap();
     let fragment = finish_values(builder, node, &[root]);
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let region = EvaluationRegionId::new(u32::MAX);
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
+        vec![ExpressionEvaluationRegion {
+            id: region,
             parent: None,
             guard: None,
         }],
@@ -168,7 +168,7 @@ fn binary_fixture() -> (Fragment, PhysicalRootUses) {
             invocation(
                 0,
                 root,
-                domain,
+                region,
                 EvaluationDemand::Value,
                 ControlShape::Eager,
                 &[u32::MAX, 7],
@@ -176,7 +176,7 @@ fn binary_fixture() -> (Fragment, PhysicalRootUses) {
             invocation(
                 u32::MAX,
                 left,
-                domain,
+                region,
                 EvaluationDemand::Value,
                 ControlShape::Eager,
                 &[],
@@ -184,7 +184,7 @@ fn binary_fixture() -> (Fragment, PhysicalRootUses) {
             invocation(
                 7,
                 right,
-                domain,
+                region,
                 EvaluationDemand::Value,
                 ControlShape::Eager,
                 &[],
@@ -254,7 +254,7 @@ fn boolean(builder: &mut FragmentBuilder, node: NodeId, value: bool) -> ExprId {
 }
 fn leaf_root_uses(fragment: &Fragment) -> PhysicalRootUses {
     let sites = PhysicalExpressionRoots::try_new(fragment, &Control::default()).unwrap();
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let region = EvaluationRegionId::new(u32::MAX);
     let mut bindings = Vec::new();
     let uses = sites
         .sites()
@@ -268,12 +268,12 @@ fn leaf_root_uses(fragment: &Fragment) -> PhysicalRootUses {
             ));
             let id = ordinal as u32;
             bindings.push((*site, ExpressionUseId::new(id)));
-            invocation(id, root.expr, domain, root.demand, ControlShape::Eager, &[])
+            invocation(id, root.expr, region, root.demand, ControlShape::Eager, &[])
         })
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
+        vec![ExpressionEvaluationRegion {
+            id: region,
             parent: None,
             guard: None,
         }],
@@ -442,16 +442,16 @@ fn branch_fixture(is_case: bool) -> (Fragment, PhysicalRootUses) {
     } else {
         ControlShape::If
     };
-    let domain = EvaluationDomainId::new(u32::MAX);
-    let mut domains = vec![ExpressionEvaluationDomain {
-        id: domain,
+    let region = EvaluationRegionId::new(u32::MAX);
+    let mut regions = vec![ExpressionEvaluationRegion {
+        id: region,
         parent: None,
         guard: None,
     }];
     let mut uses = vec![invocation(
         0,
         root,
-        domain,
+        region,
         EvaluationDemand::Value,
         shape,
         &[7, 8, u32::MAX],
@@ -459,31 +459,31 @@ fn branch_fixture(is_case: bool) -> (Fragment, PhysicalRootUses) {
     for (ordinal, (id, definition)) in [7, 8, u32::MAX].into_iter().zip(arguments).enumerate() {
         let (demand, guard) =
             control_argument_semantics(shape, 3, ordinal, EvaluationDemand::Value).unwrap();
-        let child_domain = if let Some(kind) = guard {
-            let child = EvaluationDomainId::new(ordinal as u32);
-            domains.push(ExpressionEvaluationDomain {
+        let child_region = if let Some(kind) = guard {
+            let child = EvaluationRegionId::new(ordinal as u32);
+            regions.push(ExpressionEvaluationRegion {
                 id: child,
-                parent: Some(domain),
-                guard: Some(DomainGuard {
+                parent: Some(region),
+                guard: Some(RegionGuard {
                     owner: ExpressionUseId::new(0),
                     kind,
                 }),
             });
             child
         } else {
-            domain
+            region
         };
         uses.push(invocation(
             id,
             definition,
-            child_domain,
+            child_region,
             demand,
             ControlShape::Eager,
             &[],
         ));
     }
     let flow = ExpressionControlFlow::try_new(
-        domains,
+        regions,
         uses,
         fragment.expressions(),
         CompilePhase::Validate,
@@ -510,13 +510,13 @@ fn actual_case_and_explicit_if_preserve_guard_owner_ordinal_and_demand() {
     for is_case in [false, true] {
         let (fragment, roots) = branch_fixture(is_case);
         let encoded = encode_expression_control(&roots, &Control::default()).unwrap();
-        for domain in encoded
+        for region in encoded
             .domains
             .iter()
-            .filter(|domain| domain.guard.is_some())
+            .filter(|region| region.guard.is_some())
         {
-            assert_eq!(domain.parent_domain_id, Some(u32::MAX));
-            assert_eq!(domain.guard.as_ref().unwrap().owner_use_id, Some(0));
+            assert_eq!(region.parent_domain_id, Some(u32::MAX));
+            assert_eq!(region.guard.as_ref().unwrap().owner_use_id, Some(0));
         }
         assert_eq!(
             encoded
@@ -652,7 +652,7 @@ fn every_control_and_guard_variant_roundtrips() {
             GuardKind::CaseWhen { arm: 0 },
             GuardKind::CaseThen { arm: u32::MAX },
         ] {
-            let guard = DomainGuard {
+            let guard = RegionGuard {
                 owner: ExpressionUseId::new(owner),
                 kind,
             };
@@ -667,7 +667,7 @@ fn absent_mandatory_ids_and_oneofs_never_default_to_zero_or_eager() {
     let encoded = encode_expression_control(&roots, &Control::default()).unwrap();
     type MissingFieldMutation = (&'static str, fn(&mut wire::ExpressionControl));
     let mutations: &[MissingFieldMutation] = &[
-        ("use domain is missing", |dto| dto.uses[0].domain_id = None),
+        ("use region is missing", |dto| dto.uses[0].domain_id = None),
         ("use definition is missing", |dto| {
             dto.uses[0].definition_id = None
         }),
@@ -702,7 +702,7 @@ fn absent_mandatory_ids_and_oneofs_never_default_to_zero_or_eager() {
         let guard = forged
             .domains
             .iter_mut()
-            .find_map(|domain| domain.guard.as_mut())
+            .find_map(|region| region.guard.as_mut())
             .unwrap();
         if missing_owner {
             guard.owner_use_id = None;
@@ -888,7 +888,7 @@ fn count_and_edge_limits_are_checked_before_malformed_dto_projection() {
         } else {
             assert_eq!(
                 error,
-                ControlCodecError::InvalidShape("use domain is missing")
+                ControlCodecError::InvalidShape("use region is missing")
             );
         }
     }
@@ -925,7 +925,7 @@ fn count_and_edge_limits_are_checked_before_malformed_dto_projection() {
     };
     assert_eq!(
         decode_expression_control(&fragment, &dto, &Control::default()).unwrap_err(),
-        ControlCodecError::InvalidShape("use domain is missing")
+        ControlCodecError::InvalidShape("use region is missing")
     );
 }
 
@@ -945,12 +945,12 @@ fn valid_reference_budget_boundary_roundtrips_and_one_more_edge_fails_before_pro
         )
         .unwrap();
     let fragment = finish_values(builder, node, &[root, leaf]);
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let region = EvaluationRegionId::new(u32::MAX);
     let arguments = (1..=count as u32).collect::<Vec<_>>();
     let mut uses = vec![invocation(
         0,
         root,
-        domain,
+        region,
         EvaluationDemand::Value,
         ControlShape::Conjunction,
         &arguments,
@@ -959,7 +959,7 @@ fn valid_reference_budget_boundary_roundtrips_and_one_more_edge_fails_before_pro
         invocation(
             *id,
             leaf,
-            domain,
+            region,
             EvaluationDemand::Value,
             ControlShape::Eager,
             &[],
@@ -969,15 +969,15 @@ fn valid_reference_budget_boundary_roundtrips_and_one_more_edge_fails_before_pro
     uses.push(invocation(
         u32::MAX,
         leaf,
-        domain,
+        region,
         EvaluationDemand::Value,
         ControlShape::Eager,
         &[],
     ));
     assert_eq!(uses.len() + arguments.len(), MAX_CONTROL_USE_REFERENCES);
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
+        vec![ExpressionEvaluationRegion {
+            id: region,
             parent: None,
             guard: None,
         }],
@@ -1036,7 +1036,7 @@ fn valid_reference_budget_boundary_roundtrips_and_one_more_edge_fails_before_pro
 }
 
 #[test]
-fn domain_and_root_count_equality_reaches_shape_checks_but_overflow_does_not_project() {
+fn region_and_root_count_equality_reaches_shape_checks_but_overflow_does_not_project() {
     let (fragment, _) = binary_fixture();
     let dto = wire::ExpressionControl {
         domains: vec![wire::EvaluationDomain::default(); MAX_CONTROL_DEFINITIONS],

@@ -23,7 +23,7 @@ use novarocks_type_contract::{
 };
 #[derive(Clone, Copy, Debug)]
 pub struct ControlProjectionLimits {
-    pub max_domains: usize,
+    pub max_regions: usize,
     pub max_use_references: usize,
     pub max_root_bindings: usize,
     pub max_allocation_requests: usize,
@@ -33,7 +33,7 @@ pub struct ControlProjectionLimits {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlProjectionFacts {
-    pub domain_count: usize,
+    pub region_count: usize,
     pub use_reference_count: usize,
     pub root_binding_count: usize,
     pub allocation_requests_upper_bound: usize,
@@ -92,7 +92,7 @@ impl Model {
         })?;
         let f = all.facts();
         Ok(ControlProjectionFacts {
-            domain_count: self.counts[0],
+            region_count: self.counts[0],
             use_reference_count: self.counts[1],
             root_binding_count: self.counts[2],
             allocation_requests_upper_bound: f.allocation_requests_upper_bound,
@@ -112,7 +112,7 @@ impl Model {
         let Some(l) = self.limits else {
             return Ok(f);
         };
-        if f.domain_count > l.max_domains
+        if f.region_count > l.max_regions
             || f.use_reference_count > l.max_use_references
             || f.root_binding_count > l.max_root_bindings
             || f.allocation_requests_upper_bound > l.max_allocation_requests
@@ -151,7 +151,7 @@ impl Model {
 }
 pub(super) fn unbounded() -> ControlProjectionLimits {
     ControlProjectionLimits {
-        max_domains: usize::MAX,
+        max_regions: usize::MAX,
         max_use_references: usize::MAX,
         max_root_bindings: usize::MAX,
         max_allocation_requests: usize::MAX,

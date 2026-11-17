@@ -335,7 +335,7 @@ impl PercentileHashOwner {
         }
         if !input.environment.is_empty()
             || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                && input.proof_scope != CallProofScope::Region(input.context.region)
         {
             return Err(FunctionBindingError::InvalidBinding(
                 "percentile_hash has no environment dependencies and requires an exact proof scope"

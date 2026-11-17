@@ -215,7 +215,7 @@ fn cast_package_with_cells(
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut invocations = Vec::new();
     let mut next = 3u32;
     let mut bindings = Vec::new();
@@ -231,7 +231,7 @@ fn cast_package_with_cells(
         bindings.push((site, use_id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -298,7 +298,7 @@ fn cast_package_with_cells(
 fn visit(
     fragment: &novarocks_physical_plan::Fragment,
     definition: ExprId,
-    domain: EvaluationDomainId,
+    domain: EvaluationRegionId,
     demand: EvaluationDemand,
     next: &mut u32,
     output: &mut Vec<ExpressionInvocation<ExprId>>,
@@ -326,7 +326,7 @@ fn visit(
     output.push(ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id,
-            domain,
+            region: domain,
             demand,
         },
         definition,

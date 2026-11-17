@@ -24,7 +24,7 @@ use arrow_array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase,
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionUseId, FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior,
     ObservableEffects, PureCompileControl, SemanticParameters,
 };
@@ -126,7 +126,7 @@ fn contract() -> Arc<AggregateCallContract> {
     ];
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(1),
-        domain: EvaluationDomainId::new(11),
+        region: EvaluationRegionId::new(11),
         demand: EvaluationDemand::Value,
     };
     let params = SemanticParameters::default();

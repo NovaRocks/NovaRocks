@@ -34,7 +34,7 @@ use novarocks_type_contract::ExpressionEffectContext;
 use novarocks_type_contract::FunctionValueType;
 use novarocks_type_contract::PureCompileControl;
 use novarocks_type_contract::ValueLogicalType;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -113,7 +113,7 @@ fn recipe(ty: DataType, nullable: bool) -> PreparedCastRecipe {
 fn decimal_float_complete_metadata_policy_nullability_and_effect_contract() {
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(1),
-        domain: EvaluationDomainId::new(2),
+        region: EvaluationRegionId::new(2),
         demand: EvaluationDemand::Value,
     };
     for wide in [false, true] {

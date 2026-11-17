@@ -17,16 +17,16 @@
 
 use super::*;
 use crate::{
-    BindingRequirements, CompileProfile, ControlShape, DomainGuard, ImmutableExpressions,
-    KernelAbiVersion, LocalProgramGraph, ProgramControlFlow, ProgramEvaluationDomain,
-    ProgramExpressionRootSite, ProgramExpressionUse, ProgramNode, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind, ProgramRootControlBindings, ProgramRootUseBinding,
-    StaticExprNode, StaticLayout, StaticValues,
+    BindingRequirements, CompileProfile, ControlShape, ImmutableExpressions, KernelAbiVersion,
+    LocalProgramGraph, ProgramControlFlow, ProgramEvaluationRegion, ProgramExpressionRootSite,
+    ProgramExpressionUse, ProgramNode, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind,
+    ProgramRootControlBindings, ProgramRootUseBinding, RegionGuard, StaticExprNode, StaticLayout,
+    StaticValues,
 };
 use arrow_array::{RecordBatch, new_empty_array};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_type_contract::{
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, GuardKind,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, GuardKind,
     control_argument_semantics,
 };
 use novarocks_types::SlotId;
@@ -154,15 +154,15 @@ fn assembled(
     )
     .unwrap();
     let mut uses = Vec::new();
-    let mut domains = vec![ProgramEvaluationDomain {
-        id: EvaluationDomainId::new(0),
+    let mut domains = vec![ProgramEvaluationRegion {
+        id: EvaluationRegionId::new(0),
         parent: None,
         guard: None,
     }];
     let root_use = add_use(
         root,
         demand,
-        EvaluationDomainId::new(0),
+        EvaluationRegionId::new(0),
         &arena,
         &mut uses,
         &mut domains,
@@ -189,10 +189,10 @@ fn assembled(
 fn add_use(
     definition: ProgramExprId,
     demand: EvaluationDemand,
-    domain: EvaluationDomainId,
+    domain: EvaluationRegionId,
     arena: &ImmutableExpressions,
     uses: &mut Vec<ProgramExpressionUse>,
-    domains: &mut Vec<ProgramEvaluationDomain>,
+    domains: &mut Vec<ProgramEvaluationRegion>,
 ) -> ExpressionUseId {
     let id = ExpressionUseId::new(uses.len() as u32);
     let (shape, children) = match arena.node(definition).unwrap().kind() {
@@ -215,7 +215,7 @@ fn add_use(
     uses.push(ProgramExpressionUse {
         context: ExpressionEffectContext {
             use_id: id,
-            domain,
+            region: domain,
             demand,
         },
         definition,
@@ -226,21 +226,21 @@ fn add_use(
     for (ordinal, child) in children.iter().enumerate() {
         let (child_demand, guard) =
             control_argument_semantics(shape, children.len(), ordinal, demand).unwrap();
-        let child_domain = if let Some(kind) = guard {
-            let child_domain = EvaluationDomainId::new(domains.len() as u32);
-            domains.push(ProgramEvaluationDomain {
-                id: child_domain,
+        let child_region = if let Some(kind) = guard {
+            let child_region = EvaluationRegionId::new(domains.len() as u32);
+            domains.push(ProgramEvaluationRegion {
+                id: child_region,
                 parent: Some(domain),
-                guard: Some(DomainGuard { owner: id, kind }),
+                guard: Some(RegionGuard { owner: id, kind }),
             });
-            child_domain
+            child_region
         } else {
             domain
         };
         arguments.push(add_use(
             *child,
             child_demand,
-            child_domain,
+            child_region,
             arena,
             uses,
             domains,
@@ -305,8 +305,8 @@ fn searched_case_value_and_truth_only_keep_actual_guarded_demands_and_nullable_r
                 _ => GuardKind::CaseElse,
             };
             assert_eq!(
-                flow.domains()[&child.context.domain].guard,
-                Some(DomainGuard {
+                flow.regions()[&child.context.region].guard,
+                Some(RegionGuard {
                     owner: root.context.use_id,
                     kind
                 })
@@ -346,8 +346,8 @@ fn simple_case_labels_ignore_only_outer_nullable_and_keep_actual_value_demand() 
             );
         }
         assert_eq!(
-            flow.uses()[&root.arguments[0]].context.domain,
-            root.context.domain
+            flow.uses()[&root.arguments[0]].context.region,
+            root.context.region
         );
     }
     assert!(

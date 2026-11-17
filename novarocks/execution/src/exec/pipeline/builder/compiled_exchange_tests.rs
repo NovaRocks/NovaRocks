@@ -45,8 +45,8 @@ use novarocks_physical_plan::{
     RowMultiplicity, ValueId, ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     FunctionValueType, PureCompileControl,
 };
 use novarocks_types::{SlotId, UniqueId};
@@ -298,7 +298,7 @@ fn plan_with_local_nullability(
 /// Literal cells are the only roots; each gets one eager use.
 fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
     let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut uses = Vec::new();
     let mut bindings = Vec::new();
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
@@ -306,7 +306,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain,
+                region: domain,
                 demand: root.demand,
             },
             definition: root.expr,
@@ -316,7 +316,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         bindings.push((*site, id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

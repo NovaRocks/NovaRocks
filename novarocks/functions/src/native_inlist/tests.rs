@@ -525,7 +525,7 @@ fn inlist_recipe_created_callbacks_keep_original_control_and_no_request_tail() {
 fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefix() {
     use crate::PreparedNativeInListRecipe;
     use novarocks_type_contract::{
-        CompileControlError, CompilePhase, EvaluationDemand, EvaluationDomainId,
+        CompileControlError, CompilePhase, EvaluationDemand, EvaluationRegionId,
         ExpressionEffectContext, ExpressionUseId, FunctionValueType, PureCompileControl,
     };
     struct Compile {
@@ -548,7 +548,7 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
     }
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(601),
-        domain: EvaluationDomainId::new(41),
+        region: EvaluationRegionId::new(41),
         demand: EvaluationDemand::Value,
     };
     let source = FunctionValueType::new(DataType::Int64, true);
@@ -727,12 +727,12 @@ fn inlist_json_profile_preserves_nominal_evidence_and_rejects_plain_text_mixing(
 #[test]
 fn json_inlist_required_data_effects_are_shared_by_owned_and_borrowed_profiles() {
     use novarocks_type_contract::{
-        EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
+        EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, ExpressionUseId,
         FunctionValueType, ValueLogicalType,
     };
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(760),
-        domain: EvaluationDomainId::new(14),
+        region: EvaluationRegionId::new(14),
         demand: EvaluationDemand::Value,
     };
     let result = FunctionValueType::new(DataType::Boolean, true);

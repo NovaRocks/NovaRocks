@@ -971,7 +971,7 @@ fn actual_prepared(
         PureCallPreparation, ScopedExpressionEffects,
     };
     use novarocks_type_contract::{
-        CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+        CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
         ExpressionEffectContext, ExpressionUseId, SemanticParameters,
     };
     let catalog = novarocks_functions::builtin::catalogue::builtin_engine_function_catalog();
@@ -998,7 +998,7 @@ fn actual_prepared(
         .collect::<Vec<_>>();
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(3),
-        domain: EvaluationDomainId::new(1),
+        region: EvaluationRegionId::new(1),
         demand: EvaluationDemand::Value,
     };
     let parameters = SemanticParameters::try_new([]).unwrap();

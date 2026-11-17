@@ -772,8 +772,8 @@ pub(super) fn compiled_fragment(
     use novarocks_functions::{ConstantPool, FunctionValueType};
     use novarocks_physical_plan::*;
     use novarocks_type_contract::{
-        CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-        ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+        CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+        ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
         PureCompileControl, SemanticParameters,
     };
     use prost::Message;
@@ -982,7 +982,7 @@ pub(super) fn compiled_fragment(
         )
         .expect("checked fragment");
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).expect("expression roots");
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut invocations = Vec::new();
     let mut bindings = Vec::new();
     for (ordinal, (site, expression)) in roots.sites().iter().enumerate() {
@@ -990,7 +990,7 @@ pub(super) fn compiled_fragment(
         invocations.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id,
-                domain,
+                region: domain,
                 demand: expression.demand,
             },
             definition: expression.expr,
@@ -1000,7 +1000,7 @@ pub(super) fn compiled_fragment(
         bindings.push((*site, use_id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

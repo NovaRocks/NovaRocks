@@ -30,7 +30,7 @@ use novarocks_physical_plan::{
 use novarocks_proto_models::{physical_control_v2 as control_wire, physical_semantics_v2 as wire};
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, DecimalOverflowPolicy,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionFailureBehavior,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionFailureBehavior,
     FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility,
     MAX_CONTROL_USE_REFERENCES, MAX_SEMANTIC_PARAMETERS, ObservableEffects, PureCompileControl,
 };
@@ -41,14 +41,14 @@ type E = SemanticsCodecError;
 pub(super) fn encode_context(context: &ExpressionEffectContext) -> wire::EffectContext {
     wire::EffectContext {
         use_id: Some(context.use_id.get()),
-        domain_id: Some(context.domain.get()),
+        domain_id: Some(context.region.get()),
         demand: encode_demand(context.demand),
     }
 }
 pub(super) fn decode_context(input: &wire::EffectContext) -> Result<ExpressionEffectContext, E> {
     Ok(ExpressionEffectContext {
         use_id: ExpressionUseId::new(required_id(input.use_id, "missing effect use ID")?),
-        domain: EvaluationDomainId::new(required_id(input.domain_id, "missing effect domain ID")?),
+        region: EvaluationRegionId::new(required_id(input.domain_id, "missing effect domain ID")?),
         demand: decode_demand(input.demand)?,
     })
 }
@@ -191,7 +191,7 @@ fn encode_proof(value: CallProofScope) -> wire::ProofScope {
     wire::ProofScope {
         kind: Some(match value {
             CallProofScope::Unconditional => Kind::Unconditional(control_wire::Empty {}),
-            CallProofScope::Domain(id) => Kind::DomainId(id.get()),
+            CallProofScope::Region(id) => Kind::DomainId(id.get()),
         }),
     }
 }
@@ -204,7 +204,7 @@ fn decode_proof(input: &wire::ProofScope) -> Result<CallProofScope, E> {
             .ok_or(E::InvalidShape("missing proof scope kind"))?
         {
             Kind::Unconditional(_) => CallProofScope::Unconditional,
-            Kind::DomainId(id) => CallProofScope::Domain(EvaluationDomainId::new(*id)),
+            Kind::DomainId(id) => CallProofScope::Region(EvaluationRegionId::new(*id)),
         },
     )
 }
@@ -883,7 +883,7 @@ fn validate_writer_source_shape(call: &FrozenPhysicalCall) -> Result<(), E> {
     ) || call.context.demand != novarocks_type_contract::EvaluationDemand::Value
         || input.demand != novarocks_type_contract::EvaluationDemand::Value
         || input.use_id == call.context.use_id
-        || input.domain == call.context.domain
+        || input.region == call.context.region
         || call.temporal_source.is_some()
         || call.regexp_count_pattern_source.is_some()
         || call.to_base64_byte_source.is_some()
@@ -894,7 +894,7 @@ fn validate_writer_source_shape(call: &FrozenPhysicalCall) -> Result<(), E> {
     }
     if call.effects.environment.len() > MAX_SEMANTIC_PARAMETERS
         || call.effects.proof_scope != CallProofScope::Unconditional
-            && call.effects.proof_scope != CallProofScope::Domain(call.context.domain)
+            && call.effects.proof_scope != CallProofScope::Region(call.context.region)
     {
         return Err(E::InvalidShape(
             "writer frozen call has an invalid effect scope",
@@ -910,7 +910,7 @@ mod tests {
     use novarocks_physical_plan::*;
     use novarocks_type_contract::{
         AggregateStateFormatId, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
-        ExpressionControlFlow, ExpressionEvaluationDomain, ExpressionInvocation,
+        ExpressionControlFlow, ExpressionEvaluationRegion, ExpressionInvocation,
         FunctionArgumentEvaluation, FunctionId, FunctionKind, FunctionOverloadId,
         SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
     };
@@ -977,7 +977,7 @@ mod tests {
             }),
         }
     }
-    fn effects(kind: FunctionKind, domain: EvaluationDomainId) -> CallEffects {
+    fn effects(kind: FunctionKind, domain: EvaluationRegionId) -> CallEffects {
         CallEffects {
             value_stability: FunctionVolatility::Immutable,
             own_row_error: match kind {
@@ -1002,19 +1002,19 @@ mod tests {
             },
             observable_effects: ObservableEffects::NONE,
             environment: Box::default(),
-            proof_scope: CallProofScope::Domain(domain),
+            proof_scope: CallProofScope::Region(domain),
         }
     }
     fn context(id: u32, domain: u32, demand: EvaluationDemand) -> ExpressionEffectContext {
         ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain: EvaluationDomainId::new(domain),
+            region: EvaluationRegionId::new(domain),
             demand,
         }
     }
-    fn domain(id: u32) -> ExpressionEvaluationDomain {
-        ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(id),
+    fn domain(id: u32) -> ExpressionEvaluationRegion {
+        ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(id),
             parent: None,
             guard: None,
         }
@@ -1155,7 +1155,7 @@ mod tests {
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(invocation.context.use_id),
                 context: invocation.context,
-                effects: effects(FunctionKind::Scalar, invocation.context.domain),
+                effects: effects(FunctionKind::Scalar, invocation.context.region),
             })
             .collect();
         Fixture {
@@ -1353,7 +1353,7 @@ mod tests {
                     call,
                 },
                 context,
-                effects: effects(FunctionKind::Aggregate, context.domain),
+                effects: effects(FunctionKind::Aggregate, context.region),
             });
         }
         let window_use = uses
@@ -1371,7 +1371,7 @@ mod tests {
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Expression(window_use.use_id),
             context: window_use,
-            effects: effects(FunctionKind::Window, window_use.domain),
+            effects: effects(FunctionKind::Window, window_use.region),
         });
         let context = context(special_base + 2, u32::MAX, EvaluationDemand::Value);
         calls.push(FrozenPhysicalCall {
@@ -1382,7 +1382,7 @@ mod tests {
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Table { node: table },
             context,
-            effects: effects(FunctionKind::Table, context.domain),
+            effects: effects(FunctionKind::Table, context.region),
         });
         Fixture {
             fragment,
@@ -1391,7 +1391,7 @@ mod tests {
         }
     }
 
-    fn rich_effects(domain: EvaluationDomainId) -> CallEffects {
+    fn rich_effects(domain: EvaluationRegionId) -> CallEffects {
         CallEffects {
             value_stability: FunctionVolatility::Stable,
             own_row_error: FunctionIntrinsicRowError::MayRaise,
@@ -1414,7 +1414,7 @@ mod tests {
                     expected_key: SemanticParameterKey::AllowThrowException,
                 },
             ]),
-            proof_scope: CallProofScope::Domain(domain),
+            proof_scope: CallProofScope::Region(domain),
         }
     }
 
@@ -1422,7 +1422,7 @@ mod tests {
     fn actual_scalar_occurrences_preserve_all_nine_fields_ordered_refs_and_independent_policies() {
         let mut fixture = scalar_fixture(2, u32::MAX);
         for (ordinal, call) in fixture.calls.iter_mut().enumerate() {
-            call.effects = rich_effects(call.context.domain);
+            call.effects = rich_effects(call.context.region);
             call.decimal_overflow_policy = if ordinal == 0 {
                 DecimalOverflowPolicy::ReportError
             } else {
@@ -1590,8 +1590,8 @@ mod tests {
         }
         for value in [
             CallProofScope::Unconditional,
-            CallProofScope::Domain(EvaluationDomainId::new(0)),
-            CallProofScope::Domain(EvaluationDomainId::new(u32::MAX)),
+            CallProofScope::Region(EvaluationRegionId::new(0)),
+            CallProofScope::Region(EvaluationRegionId::new(u32::MAX)),
         ] {
             assert_eq!(decode_proof(&encode_proof(value)).unwrap(), value);
         }
@@ -1714,7 +1714,7 @@ mod tests {
         );
         let mut bad = dto.clone();
         bad.entries[0].effects.as_mut().unwrap().proof_scope = Some(encode_proof(
-            CallProofScope::Domain(EvaluationDomainId::new(u32::MAX)),
+            CallProofScope::Region(EvaluationRegionId::new(u32::MAX)),
         ));
         assert_eq!(
             decode_checked(&fixture, &bad, &TestControl::default()),
@@ -1740,7 +1740,7 @@ mod tests {
     #[test]
     fn reference_presence_closed_key_uniqueness_and_same_snapshot_are_checked() {
         let mut fixture = scalar_fixture(1, 0);
-        fixture.calls[0].effects = rich_effects(fixture.calls[0].context.domain);
+        fixture.calls[0].effects = rich_effects(fixture.calls[0].context.region);
         let dto = encode_checked(&fixture.checked().unwrap(), &TestControl::default()).unwrap();
         for missing in [true, false] {
             let mut bad = dto.clone();
@@ -2126,7 +2126,7 @@ mod writer_projection_creator_tests {
     fn source() -> FrozenPhysicalCall {
         let context = ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(17),
+            region: EvaluationRegionId::new(17),
             demand: EvaluationDemand::Value,
         };
         FrozenPhysicalCall {
@@ -2137,7 +2137,7 @@ mod writer_projection_creator_tests {
             context,
             materialized_writer_input: Some(ExpressionEffectContext {
                 use_id: ExpressionUseId::new(42),
-                domain: EvaluationDomainId::new(18),
+                region: EvaluationRegionId::new(18),
                 demand: EvaluationDemand::Value,
             }),
             effects: CallEffects {
@@ -2152,7 +2152,7 @@ mod writer_projection_creator_tests {
                     id: SemanticParameterId::new(7),
                     expected_key: SemanticParameterKey::TimeZone,
                 }]),
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             },
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             temporal_source: None,

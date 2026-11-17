@@ -36,11 +36,11 @@ use novarocks_physical_plan::{
     RootUseBindingError, ValidationErrors, ValueOrigin,
 };
 use novarocks_type_contract::{
-    ArgumentControl, CallProofScope, ControlShape, DecimalOverflowPolicy, DomainGuard,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionControlFlowError,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    FunctionIntrinsicRowError, FunctionValueType, FunctionVolatility, GuardKind,
-    SemanticParameters, ValueLogicalType, control_argument_semantics,
+    ArgumentControl, CallProofScope, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionControlFlowError, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionIntrinsicRowError,
+    FunctionValueType, FunctionVolatility, GuardKind, RegionGuard, SemanticParameters,
+    ValueLogicalType, control_argument_semantics,
 };
 use std::{num::NonZeroUsize, sync::Mutex};
 
@@ -619,16 +619,16 @@ enum FlowError {
 fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<PhysicalRootUses, FlowError> {
     struct FlowAuthor {
         next_use: u32,
-        next_domain: u32,
+        next_region: u32,
         uses: Vec<ExpressionInvocation<ExprId>>,
-        domains: Vec<ExpressionEvaluationDomain>,
+        domains: Vec<ExpressionEvaluationRegion>,
     }
     impl FlowAuthor {
         fn visit(
             &mut self,
             fixture: &Fixture,
             expr: ExprId,
-            domain: EvaluationDomainId,
+            domain: EvaluationRegionId,
             demand: EvaluationDemand,
             claim: FlowClaim,
         ) -> ExpressionUseId {
@@ -675,24 +675,24 @@ fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<PhysicalRootUses, FlowErr
             for (ordinal, child) in args.iter().enumerate() {
                 let (child_demand, guard) =
                     control_argument_semantics(shape, args.len(), ordinal, demand).unwrap();
-                let child_domain = if let Some(kind) = guard {
-                    let child_domain = EvaluationDomainId::new(self.next_domain);
-                    self.next_domain += 13;
-                    self.domains.push(ExpressionEvaluationDomain {
-                        id: child_domain,
+                let child_region = if let Some(kind) = guard {
+                    let child_region = EvaluationRegionId::new(self.next_region);
+                    self.next_region += 13;
+                    self.domains.push(ExpressionEvaluationRegion {
+                        id: child_region,
                         parent: Some(domain),
-                        guard: Some(DomainGuard { owner: id, kind }),
+                        guard: Some(RegionGuard { owner: id, kind }),
                     });
-                    child_domain
+                    child_region
                 } else {
                     domain
                 };
-                children.push(self.visit(fixture, *child, child_domain, child_demand, claim));
+                children.push(self.visit(fixture, *child, child_region, child_demand, claim));
             }
             self.uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: id,
-                    domain,
+                    region: domain,
                     demand,
                 },
                 definition: expr,
@@ -702,12 +702,12 @@ fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<PhysicalRootUses, FlowErr
             id
         }
     }
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let domain = EvaluationRegionId::new(u32::MAX);
     let mut author = FlowAuthor {
         next_use: 7,
-        next_domain: 8,
+        next_region: 8,
         uses: vec![],
-        domains: vec![ExpressionEvaluationDomain {
+        domains: vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -819,7 +819,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
                         environment: &[],
                         parameters,
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(invocation.context.domain),
+                        proof_scope: CallProofScope::Region(invocation.context.region),
                     },
                     owner.selected.clone(),
                     preparation,
@@ -988,7 +988,7 @@ fn searched_and_simple_case_keep_ordered_children_flags_root_types_and_demands()
                     }
                 );
                 assert_eq!(invocation.context.demand, parent_demand);
-                assert_eq!(invocation.context.domain, EvaluationDomainId::new(u32::MAX));
+                assert_eq!(invocation.context.region, EvaluationRegionId::new(u32::MAX));
                 assert_eq!(
                     source.expression_uses().flow().uses()[&invocation.context.use_id].definition,
                     physical_case
@@ -1019,7 +1019,7 @@ fn searched_and_simple_case_keep_ordered_children_flags_root_types_and_demands()
                     );
                     if simple && ordinal == 0 {
                         assert_eq!(child.context.demand, EvaluationDemand::Value);
-                        assert_eq!(child.context.domain, invocation.context.domain);
+                        assert_eq!(child.context.region, invocation.context.region);
                         assert!(matches!(
                             arena.node(child_id).unwrap().kind(),
                             StaticExprKind::SlotId(_)
@@ -1049,16 +1049,16 @@ fn searched_and_simple_case_keep_ordered_children_flags_root_types_and_demands()
                         )
                     };
                     assert_eq!(child.context.demand, demand);
-                    let domain = &flow.domains()[&child.context.domain];
-                    assert_eq!(domain.parent, Some(invocation.context.domain));
+                    let domain = &flow.regions()[&child.context.region];
+                    assert_eq!(domain.parent, Some(invocation.context.region));
                     assert_eq!(
                         domain.guard,
-                        Some(DomainGuard {
+                        Some(RegionGuard {
                             owner: invocation.context.use_id,
                             kind: guard
                         })
                     );
-                    assert_ne!(child.context.domain, invocation.context.domain);
+                    assert_ne!(child.context.region, invocation.context.region);
                 }
                 assert_eq!(
                     typed.definition_type(ProgramExpressionArena::Main, invocation.definition),
@@ -1155,7 +1155,7 @@ fn case_as_actual_if_argument_is_nonconstant_and_preserves_rand_and_round_full_e
         let right = &flow.uses()[&parent.arguments[2]];
         assert_eq!(left.definition, right.definition);
         assert_ne!(left.context.use_id, right.context.use_id);
-        assert_ne!(left.context.domain, right.context.domain);
+        assert_ne!(left.context.region, right.context.region);
         for case in [left, right] {
             assert_eq!(
                 case.control,

@@ -22,7 +22,7 @@ use crate::{
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    ArgumentControl, CallProofScope, CompileControlError, EvaluationDemand, EvaluationDomainId,
+    ArgumentControl, CallProofScope, CompileControlError, EvaluationDemand, EvaluationRegionId,
     ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility,
     MAX_UNOBSERVED_COMPILE_WORK, ObservableEffects, SemanticParameterId, SemanticParameterRef,
@@ -132,7 +132,7 @@ impl Fixture {
         CallEffectInput {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(u32::MAX),
-                domain: EvaluationDomainId::new(0),
+                region: EvaluationRegionId::new(0),
                 demand: EvaluationDemand::Value,
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),

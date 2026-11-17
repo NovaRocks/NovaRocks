@@ -100,7 +100,7 @@ fn compile_arithmetic(
                 &fragment,
                 authors,
                 root.expr,
-                EvaluationDomainId::new(u32::MAX),
+                EvaluationRegionId::new(u32::MAX),
                 root.demand,
             ),
         ));
@@ -151,7 +151,7 @@ fn compile_arithmetic(
                         environment: &[],
                         parameters: &parameters,
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(context.domain),
+                        proof_scope: CallProofScope::Region(context.region),
                     },
                     owner.selected.clone(),
                     if matches!(owner.shape, ControlShape::If | ControlShape::Coalesce) {
@@ -201,7 +201,7 @@ fn compile_arithmetic(
             .unwrap();
             recipe
                 .own_effects(context)
-                .join_same_domain(children)
+                .join_same_region(children)
                 .unwrap()
         } else {
             children

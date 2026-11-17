@@ -21,7 +21,7 @@ use crate::opaque_memory::OpaqueAllocationHost;
 use arrow_array::{Int32Array, StringArray};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     SemanticParameters,
 };
 use std::{
@@ -181,12 +181,12 @@ fn kernel(types: &[DataType], phase: AggregateKernelPhase) -> TopKKernel {
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(1942),
-        domain: EvaluationDomainId::new(129),
+        region: EvaluationRegionId::new(129),
         demand: EvaluationDemand::Value,
     };
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(1946),
-        domain: EvaluationDomainId::new(130),
+        region: EvaluationRegionId::new(130),
         demand: EvaluationDemand::Value,
     };
     let state_type = FunctionValueType::new(DataType::Binary, true);
@@ -215,7 +215,7 @@ fn kernel(types: &[DataType], phase: AggregateKernelPhase) -> TopKKernel {
                 parameters: &params,
                 environment: &[],
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             },
             selected.clone(),
             PureCallPreparation::Aggregate {

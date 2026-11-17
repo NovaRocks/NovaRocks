@@ -3717,8 +3717,8 @@ fn writer_grouped_unpivot_source_gate_preserves_each_original_control_and_ordina
 fn package_parameter_closure_includes_writer_final_state_calls() {
     use novarocks_type_contract::{
         ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase,
-        ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-        ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionInstanceState,
+        ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+        ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionInstanceState,
         FunctionNullBehavior, ObservableEffects, PureCompileControl, SemanticParameterError,
         SemanticParameterId, SemanticParameterKey, SemanticParameterProjectionError,
         SemanticParameterRef, SemanticParameterValue, SemanticParameters,
@@ -3735,7 +3735,7 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         expected_key: SemanticParameterKey::TimeZone,
     };
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut invocations = Vec::new();
     let mut bindings = Vec::new();
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
@@ -3747,7 +3747,7 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         invocations.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain,
+                region: domain,
                 demand: root.demand,
             },
             definition: root.expr,
@@ -3758,13 +3758,13 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
     }
     let flow = ExpressionControlFlow::try_new(
         vec![
-            ExpressionEvaluationDomain {
+            ExpressionEvaluationRegion {
                 id: domain,
                 parent: None,
                 guard: None,
             },
-            ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(1),
+            ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(1),
                 parent: None,
                 guard: None,
             },
@@ -3786,7 +3786,7 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
     let call = FrozenPhysicalCall {
         materialized_writer_input: Some(ExpressionEffectContext {
             use_id: ExpressionUseId::new(u32::MAX - 1),
-            domain: EvaluationDomainId::new(1),
+            region: EvaluationRegionId::new(1),
             demand: novarocks_type_contract::EvaluationDemand::Value,
         }),
         regexp_count_pattern_source: None,
@@ -3796,7 +3796,7 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         site,
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(u32::MAX),
-            domain,
+            region: domain,
             demand: novarocks_type_contract::EvaluationDemand::Value,
         },
         effects: CallEffects {

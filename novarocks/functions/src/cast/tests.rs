@@ -19,7 +19,7 @@ use super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::{ArrayRef, Float64Array};
 use arrow_schema::Field;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -116,7 +116,7 @@ fn array(carrier: &DataType, values: &[Option<i64>]) -> ArrayRef {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(71),
-        domain: EvaluationDomainId::new(91),
+        region: EvaluationRegionId::new(91),
         demand: EvaluationDemand::Value,
     }
 }
@@ -197,7 +197,7 @@ fn all_twenty_four_profiles_freeze_types_nullable_and_inert_policies_without_row
                             ExpressionEffects::PURE_VALUE
                         );
                         let foreign = ExpressionEffectContext {
-                            domain: EvaluationDomainId::new(92),
+                            region: EvaluationRegionId::new(92),
                             ..context()
                         };
                         assert!(recipe.own_effects(context()).for_use(foreign).is_err());

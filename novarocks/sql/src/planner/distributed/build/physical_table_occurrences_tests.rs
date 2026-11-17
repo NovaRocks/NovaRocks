@@ -424,7 +424,7 @@ fn input<'a>(
         parameters: params,
         environment: &[],
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context(occ, fixture.owner).domain),
+        proof_scope: CallProofScope::Region(context(occ, fixture.owner).region),
     }
 }
 fn run(
@@ -641,12 +641,12 @@ fn table_occurrences_repeated_definition_keeps_independent_roots_and_operator_co
     assert_ne!(a, b);
     let flow = occ.root_uses.flow();
     assert_ne!(
-        flow.uses()[&a].context.domain,
-        flow.uses()[&b].context.domain
+        flow.uses()[&a].context.region,
+        flow.uses()[&b].context.region
     );
     let ctx = context(&occ, f.owner);
     assert!(!flow.uses().contains_key(&ctx.use_id));
-    assert_ne!(ctx.domain, flow.uses()[&a].context.domain);
+    assert_ne!(ctx.region, flow.uses()[&a].context.region);
     let req = request(f.source(), &f, &Control::default()).unwrap();
     let effects = summaries(&occ);
     let params = SemanticParameters::try_new([]).unwrap();
@@ -743,7 +743,7 @@ fn table_occurrences_missing_or_foreign_child_scope_environment_and_proof_refuse
         |c| {
             let mut call = input(&f, &req, &occ, &effects, &params);
             call.proof_scope =
-                CallProofScope::Domain(occ.root_uses.flow().uses()[&id].context.domain);
+                CallProofScope::Region(occ.root_uses.flow().uses()[&id].context.region);
             run(call, &f.catalog, c)
         },
         false,
@@ -928,7 +928,7 @@ fn fragment_scopes<'a>(
             source: fixture.source(),
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             environment: &[],
-            proof_scope: CallProofScope::Domain(context(occurrences, fixture.owner).domain),
+            proof_scope: CallProofScope::Region(context(occurrences, fixture.owner).region),
         },
     )])
 }
@@ -1117,7 +1117,7 @@ fn table_fragment_composer_missing_extra_and_equal_foreign_source_scopes_refuse_
             source: fixture.source(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             environment: &[],
-            proof_scope: CallProofScope::Domain(context(&occurrences, fixture.owner).domain),
+            proof_scope: CallProofScope::Region(context(&occurrences, fixture.owner).region),
         },
     );
     assert!(matches!(

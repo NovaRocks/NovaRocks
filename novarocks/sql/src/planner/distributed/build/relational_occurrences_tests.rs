@@ -272,16 +272,16 @@ fn assert_contexts(authored: &AuthoredPhysicalOccurrences) {
             context.demand,
             novarocks_type_contract::EvaluationDemand::Value
         );
-        let domain = authored.root_uses.flow().domains()[&context.domain];
+        let domain = authored.root_uses.flow().regions()[&context.region];
         assert!(domain.parent.is_none());
         assert!(domain.guard.is_none());
     }
     for pair in authored.relational_contexts.windows(2) {
         assert_ne!(pair[0].1.use_id, pair[1].1.use_id);
-        assert_ne!(pair[0].1.domain, pair[1].1.domain);
+        assert_ne!(pair[0].1.region, pair[1].1.region);
     }
 }
-fn effects(control: ArgumentControl, domain: EvaluationDomainId) -> CallEffects {
+fn effects(control: ArgumentControl, domain: EvaluationRegionId) -> CallEffects {
     // Explicit public structural claims for the ID-collision test. These do
     // not prove installed preparation or authorize an execution lifecycle.
     CallEffects {
@@ -305,7 +305,7 @@ fn effects(control: ArgumentControl, domain: EvaluationDomainId) -> CallEffects 
         },
         observable_effects: ObservableEffects::NONE,
         environment: Box::default(),
-        proof_scope: CallProofScope::Domain(domain),
+        proof_scope: CallProofScope::Region(domain),
     }
 }
 #[derive(Clone, Debug)]
@@ -383,7 +383,7 @@ fn relational_rootless_count_star_has_its_own_value_use_and_unguarded_domain() {
         authored.relational_contexts[0].1.use_id,
         ExpressionUseId::new(0)
     );
-    assert_eq!(authored.root_uses.flow().domains().len(), 1);
+    assert_eq!(authored.root_uses.flow().regions().len(), 1);
     assert_contexts(&authored);
     prefixes(&fragment, &catalog, true, false);
 }
@@ -437,7 +437,7 @@ fn relational_count_value_and_scalar_argument_uses_stay_disjoint_and_frozen_coll
     let scalar_context = authored.root_uses.flow().uses()[&scalar_use].context;
     let (site, context) = authored.relational_contexts[0];
     assert_eq!(context.use_id, ExpressionUseId::new(2));
-    assert_ne!(context.domain, scalar_context.domain);
+    assert_ne!(context.region, scalar_context.region);
     let scalar_call = FrozenPhysicalCall {
         materialized_writer_input: None,
         regexp_count_pattern_source: None,
@@ -445,7 +445,7 @@ fn relational_count_value_and_scalar_argument_uses_stay_disjoint_and_frozen_coll
         temporal_source: None,
         site: PhysicalCallSite::Expression(scalar_use),
         context: scalar_context,
-        effects: effects(ArgumentControl::Eager, scalar_context.domain),
+        effects: effects(ArgumentControl::Eager, scalar_context.region),
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
     };
     let aggregate_call = FrozenPhysicalCall {
@@ -455,7 +455,7 @@ fn relational_count_value_and_scalar_argument_uses_stay_disjoint_and_frozen_coll
         temporal_source: None,
         site,
         context,
-        effects: effects(ArgumentControl::Aggregate, context.domain),
+        effects: effects(ArgumentControl::Aggregate, context.region),
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
     };
     FrozenFragmentCalls::try_new(
@@ -653,7 +653,7 @@ fn relational_320_real_count_calls_observe_source_quantum_and_distinct_actual_co
     assert!(authored.root_uses.flow().uses().is_empty());
     assert!(authored.root_uses.bindings().is_empty());
     assert_eq!(authored.relational_contexts.len(), 320);
-    assert_eq!(authored.root_uses.flow().domains().len(), 320);
+    assert_eq!(authored.root_uses.flow().regions().len(), 320);
     assert_contexts(&authored);
     for (ordinal, (site, context)) in authored.relational_contexts.iter().enumerate() {
         assert_eq!(

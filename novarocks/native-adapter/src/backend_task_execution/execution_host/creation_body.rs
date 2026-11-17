@@ -25,8 +25,8 @@ use novarocks_functions::{ConstantPolicy, ConstantPool};
 use novarocks_physical_plan::*;
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     PureCompileControl, SemanticParameters,
 };
 use std::collections::BTreeMap;
@@ -135,7 +135,7 @@ fn finish(
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut invocations = Vec::new();
     let mut bindings = Vec::new();
     for (ordinal, (site, expression)) in roots.sites().iter().enumerate() {
@@ -143,7 +143,7 @@ fn finish(
         invocations.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id,
-                domain,
+                region: domain,
                 demand: expression.demand,
             },
             definition: expression.expr,
@@ -153,7 +153,7 @@ fn finish(
         bindings.push((*site, use_id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

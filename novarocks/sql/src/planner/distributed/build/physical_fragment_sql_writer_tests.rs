@@ -130,7 +130,7 @@ fn scopes<'a>(
                 decimal_overflow_policy: captured.binding().decimal_overflow_policy(),
                 // The installed original Theta declaration has no environment keys.
                 environment: &[],
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             },
         );
     }
@@ -229,7 +229,7 @@ fn assert_fresh(owner: &SqlAuthoredPhysicalPlan, expected: (usize, usize)) {
             assert_eq!(value_site, site);
             assert!(std::ptr::eq(value, &fragment.values()[&call.input]));
             assert_ne!(value_context.use_id, context.use_id);
-            assert_ne!(value_context.domain, context.domain);
+            assert_ne!(value_context.region, context.region);
             assert_eq!(
                 value_context.demand,
                 novarocks_type_contract::EvaluationDemand::Value
@@ -241,7 +241,7 @@ fn assert_fresh(owner: &SqlAuthoredPhysicalPlan, expected: (usize, usize)) {
                     .uses()
                     .contains_key(&value_context.use_id)
             );
-            let domain = &occurrences.root_uses.flow().domains()[&value_context.domain];
+            let domain = &occurrences.root_uses.flow().regions()[&value_context.region];
             assert!(domain.parent.is_none() && domain.guard.is_none());
             assert_eq!(
                 call.binding.state_format.as_str(),
@@ -263,7 +263,7 @@ fn assert_fresh(owner: &SqlAuthoredPhysicalPlan, expected: (usize, usize)) {
                     .uses()
                     .contains_key(&original.use_id)
             );
-            let root = &occurrences.root_uses.flow().domains()[&original.domain];
+            let root = &occurrences.root_uses.flow().regions()[&original.region];
             assert!(root.parent.is_none() && root.guard.is_none());
 
             assert_eq!(
@@ -295,7 +295,7 @@ fn assert_fresh(owner: &SqlAuthoredPhysicalPlan, expected: (usize, usize)) {
             assert!(frozen.effects.environment.is_empty());
             assert_eq!(
                 frozen.effects.proof_scope,
-                CallProofScope::Domain(context.domain)
+                CallProofScope::Region(context.region)
             );
         }
         result
@@ -977,17 +977,17 @@ fn real_writer_frozen_materialized_receipt_rejects_absence_foreign_domain_and_du
             .materialized_writer_input
             .as_mut()
             .unwrap()
-            .domain = novarocks_type_contract::EvaluationDomainId::new(u32::MAX);
+            .region = novarocks_type_contract::EvaluationRegionId::new(u32::MAX);
         assert!(
             !occurrences
                 .root_uses
                 .flow()
-                .domains()
-                .contains_key(&novarocks_type_contract::EvaluationDomainId::new(u32::MAX))
+                .regions()
+                .contains_key(&novarocks_type_contract::EvaluationRegionId::new(u32::MAX))
         );
         assert!(matches!(
             check(foreign),
-            Err(FrozenCallError::InvalidDomain)
+            Err(FrozenCallError::InvalidRegion)
         ));
         let mut duplicate = original.clone();
         duplicate[1]

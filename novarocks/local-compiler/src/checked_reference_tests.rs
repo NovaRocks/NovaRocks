@@ -26,7 +26,7 @@ use novarocks_physical_plan::{
     ResultField, ResultPort, ValueOrigin,
 };
 use novarocks_type_contract::{
-    EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, FunctionValueType, SemanticParameters,
 };
 use std::sync::Mutex;
@@ -206,7 +206,7 @@ fn checked_package(pool: &ConstantPool, ordinals: &[u32]) -> FragmentPackage {
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();
-    let domain = EvaluationDomainId::new(17);
+    let domain = EvaluationRegionId::new(17);
     let mut invocations = vec![];
     let bindings = roots
         .sites()
@@ -217,7 +217,7 @@ fn checked_package(pool: &ConstantPool, ordinals: &[u32]) -> FragmentPackage {
             invocations.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain,
+                    region: domain,
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -228,7 +228,7 @@ fn checked_package(pool: &ConstantPool, ordinals: &[u32]) -> FragmentPackage {
         })
         .collect();
     let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

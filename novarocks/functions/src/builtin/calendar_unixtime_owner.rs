@@ -419,7 +419,7 @@ pub(super) fn prepared_for_test(
 ) -> Result<Arc<dyn PreparedScalarKernel>, crate::FunctionSpecializationFailure> {
     use crate::{FunctionArgument, ScopedExpressionEffects, specialize_scalar};
     use novarocks_type_contract::{
-        EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
+        EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, ExpressionUseId,
         SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
         SemanticParameters,
     };
@@ -455,7 +455,7 @@ pub(super) fn prepared_for_test(
     let selected = Arc::new(owner.resolve(request, control)?);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     };
     let refs = zone
@@ -519,7 +519,7 @@ impl FromUnixtimeOwner {
             }
             if valid_environment(input).is_err()
                 || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                    && input.proof_scope != CallProofScope::Region(input.context.region)
             {
                 return Err(FunctionBindingError::InvalidBinding(
                 "from_unixtime requires its exact original frozen non-Local TimeZone author and proof scope".into(),

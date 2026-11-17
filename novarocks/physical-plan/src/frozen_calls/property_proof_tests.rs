@@ -98,8 +98,8 @@ fn occurrence_property_proof_preserves_each_shared_use_and_guarded_domain() {
         fixture.uses.flow().uses()[&ExpressionUseId::new(u32::MAX)].definition
     );
     assert_ne!(
-        fixture.calls[0].context.domain,
-        fixture.calls[1].context.domain
+        fixture.calls[0].context.region,
+        fixture.calls[1].context.region
     );
     assert!(
         safe(
@@ -128,7 +128,7 @@ fn occurrence_property_proof_preserves_each_shared_use_and_guarded_domain() {
     }
     let mut guarded = case_fixture();
     assert!(guarded.calls.iter().any(|call| {
-        guarded.uses.flow().domains()[&call.context.domain]
+        guarded.uses.flow().regions()[&call.context.region]
             .guard
             .is_some()
     }));
@@ -331,7 +331,7 @@ fn occurrence_property_proof_bounds_source_before_index_and_rechecks_call_corres
         .get_mut(&fixture.calls[0].site)
         .unwrap()
         .context
-        .domain = EvaluationDomainId::new(99);
+        .region = EvaluationRegionId::new(99);
     assert!(matches!(
         changed.property_proof(
             &fixture.fragment,

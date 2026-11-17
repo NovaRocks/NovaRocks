@@ -47,8 +47,8 @@ use novarocks_physical_plan::*;
 use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, PureCompileControl,
+    EvaluationDemand, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, PureCompileControl,
     control_argument_semantics,
 };
 
@@ -579,7 +579,7 @@ pub(crate) fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             self.uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: id,
-                    domain: EvaluationDomainId::new(0),
+                    region: EvaluationRegionId::new(0),
                     demand,
                 },
                 definition: expr,
@@ -601,8 +601,8 @@ pub(crate) fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         .map(|(&site, root)| (site, author.visit(root.expr, root.demand)))
         .collect();
     let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],

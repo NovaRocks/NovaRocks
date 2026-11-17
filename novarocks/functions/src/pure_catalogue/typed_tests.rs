@@ -24,7 +24,7 @@ use arrow_array::{ArrayRef, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, SemanticParameters, WindowBound,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, SemanticParameters, WindowBound,
     WindowFrame, WindowFrameExclusion, WindowFrameUnits,
 };
 use std::{
@@ -346,7 +346,7 @@ impl<'owner> Call<'owner> {
         CallEffectInput {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(1),
+                region: EvaluationRegionId::new(1),
                 demand: EvaluationDemand::Value,
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
@@ -1577,7 +1577,7 @@ fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
                     .unwrap();
                 let context = ExpressionEffectContext {
                     use_id: ExpressionUseId::new(7),
-                    domain: EvaluationDomainId::new(11),
+                    region: EvaluationRegionId::new(11),
                     demand: EvaluationDemand::Value,
                 };
                 let parameters = SemanticParameters::default();
@@ -1592,7 +1592,7 @@ fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
                     parameters: &parameters,
                     environment: &[],
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Region(context.region),
                 };
                 let effects = CallEffects {
                     value_stability: declaration.value_stability,

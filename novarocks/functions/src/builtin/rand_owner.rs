@@ -353,7 +353,7 @@ pub(super) fn prepared_for_test(
 fn test_context() -> novarocks_type_contract::ExpressionEffectContext {
     novarocks_type_contract::ExpressionEffectContext {
         use_id: novarocks_type_contract::ExpressionUseId::new(1),
-        domain: novarocks_type_contract::EvaluationDomainId::new(7),
+        region: novarocks_type_contract::EvaluationRegionId::new(7),
         demand: novarocks_type_contract::EvaluationDemand::Value,
     }
 }
@@ -374,7 +374,7 @@ impl RandOwner {
         }
         if !input.environment.is_empty()
             || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                && input.proof_scope != CallProofScope::Region(input.context.region)
         {
             return Err(FunctionBindingError::InvalidBinding(
                 "RAND/RANDOM has no environment dependencies and requires an exact proof scope"
@@ -449,7 +449,7 @@ mod tests {
         ScopedExpressionEffects, specialize_frozen_scalar, specialize_scalar,
     };
     use novarocks_type_contract::{
-        CompileControlError, DecimalOverflowPolicy, EvaluationDomainId, ExpressionUseId,
+        CompileControlError, DecimalOverflowPolicy, EvaluationRegionId, ExpressionUseId,
         SemanticParameterKey, SemanticParameterRef, SemanticParameters,
     };
 
@@ -798,7 +798,7 @@ mod tests {
         let uses = [Some(ExpressionUseId::new(2))];
         let input = input(&owner, &selected, &arguments, &parameters, &uses);
         let mut foreign = input;
-        foreign.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+        foreign.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
         assert!(matches!(
             owner.validate_and_refine(foreign, crate::binding_test_control()),
             Err(FunctionEffectOwnerError::Owner(

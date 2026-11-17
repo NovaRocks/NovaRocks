@@ -333,7 +333,7 @@ impl WindowValueOwner {
             }
             let exact_scope = input.environment.is_empty()
                 && (matches!(input.proof_scope, CallProofScope::Unconditional)
-                    || input.proof_scope == CallProofScope::Domain(input.context.domain));
+                    || input.proof_scope == CallProofScope::Region(input.context.region));
             work.step().map_err(FunctionEffectOwnerError::Control)?;
             if !exact_scope {
                 return Err(FunctionBindingError::InvalidBinding(

@@ -76,12 +76,12 @@ fn prepare_final() -> f::PreparedAggregateHandle {
     let selected = Arc::new(resolved.selected);
     let context = t::ExpressionEffectContext {
         use_id: t::ExpressionUseId::new(31),
-        domain: t::EvaluationDomainId::new(9),
+        region: t::EvaluationRegionId::new(9),
         demand: t::EvaluationDemand::Value,
     };
     let state_context = t::ExpressionEffectContext {
         use_id: t::ExpressionUseId::new(32),
-        domain: t::EvaluationDomainId::new(10),
+        region: t::EvaluationRegionId::new(10),
         demand: t::EvaluationDemand::Value,
     };
     let state_type = t::FunctionValueType::new(arrow::datatypes::DataType::Int64, true);
@@ -104,7 +104,7 @@ fn prepare_final() -> f::PreparedAggregateHandle {
         environment: &[],
         parameters: &parameters,
         decimal_overflow_policy: t::DecimalOverflowPolicy::OutputNull,
-        proof_scope: t::CallProofScope::Domain(context.domain),
+        proof_scope: t::CallProofScope::Region(context.region),
     };
     let result = catalog
         .prepare_fresh_selected(

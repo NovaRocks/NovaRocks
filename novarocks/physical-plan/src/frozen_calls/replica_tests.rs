@@ -256,8 +256,8 @@ fn replica_equivalence_shared_definition_checks_each_sparse_use_and_domain() {
         invocations[&ExpressionUseId::new(u32::MAX)].definition
     );
     assert_ne!(
-        fixture.calls[0].context.domain,
-        fixture.calls[1].context.domain
+        fixture.calls[0].context.region,
+        fixture.calls[1].context.region
     );
     assert!(check(&fixture, &ReplicaControl::default()).is_ok());
     for unsafe_at in [0, 1] {
@@ -362,7 +362,7 @@ fn replica_equivalence_keeps_same_occurrence_domain_proof_and_row_errors() {
     );
     assert_eq!(
         calls.entries()[&fixture.calls[0].site].effects.proof_scope,
-        CallProofScope::Domain(fixture.calls[0].context.domain)
+        CallProofScope::Region(fixture.calls[0].context.region)
     );
     assert_eq!(
         calls.entries()[&fixture.calls[1].site].effects.proof_scope,
@@ -417,7 +417,7 @@ fn replica_equivalence_revalidates_fragment_roots_and_context_before_claims() {
         .get_mut(&fixture.calls[0].site)
         .unwrap()
         .context
-        .domain = EvaluationDomainId::new(u32::MAX);
+        .region = EvaluationRegionId::new(u32::MAX);
     assert_eq!(
         invalid.validate_replica_equivalence(
             &fixture.fragment,
@@ -591,7 +591,7 @@ fn broadcast_table_fixture() -> Fixture {
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(scalar_context.use_id),
                 context: scalar_context,
-                effects: effects(FunctionKind::Scalar, scalar_context.domain),
+                effects: effects(FunctionKind::Scalar, scalar_context.region),
             },
             FrozenPhysicalCall {
                 materialized_writer_input: None,
@@ -601,7 +601,7 @@ fn broadcast_table_fixture() -> Fixture {
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Table { node: table },
                 context: table_context,
-                effects: effects(FunctionKind::Table, table_context.domain),
+                effects: effects(FunctionKind::Table, table_context.region),
             },
         ],
     }

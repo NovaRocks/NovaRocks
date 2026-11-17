@@ -983,7 +983,7 @@ impl PhysicalRootUses {
                 if root.demand != invocation.context.demand {
                     return Err(RootUseBindingError::WrongDemand);
                 }
-                let domain = &flow.domains()[&invocation.context.domain];
+                let domain = &flow.regions()[&invocation.context.region];
                 if domain.parent.is_some() || domain.guard.is_some() {
                     return Err(RootUseBindingError::GuardedRoot);
                 }
@@ -1021,9 +1021,9 @@ impl PhysicalRootUses {
         let mut n = size_of::<Self>();
         for (count, bytes) in [
             (
-                flow.domains().len(),
-                size_of::<novarocks_type_contract::EvaluationDomainId>()
-                    + size_of::<novarocks_type_contract::ExpressionEvaluationDomain>(),
+                flow.regions().len(),
+                size_of::<novarocks_type_contract::EvaluationRegionId>()
+                    + size_of::<novarocks_type_contract::ExpressionEvaluationRegion>(),
             ),
             (
                 flow.uses().len(),
@@ -1139,7 +1139,7 @@ fn root_binding_resources(
             .expressions()
             .len()
             .max(flow.uses().len())
-            .max(flow.domains().len())
+            .max(flow.regions().len())
             .max(bindings),
     )?;
     r.work(control_resource_mul(

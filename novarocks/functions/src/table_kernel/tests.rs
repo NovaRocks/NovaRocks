@@ -29,7 +29,7 @@ use arrow_array::{Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompileControlError,
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
     SemanticParameters,
@@ -188,7 +188,7 @@ impl Fixture {
         CallEffectInput {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(7),
+                region: EvaluationRegionId::new(7),
                 demand: EvaluationDemand::Value,
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),

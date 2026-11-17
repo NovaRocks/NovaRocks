@@ -25,7 +25,7 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     BucketLayoutAlgorithm, CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
-    EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
+    EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, ExpressionUseId,
     FunctionArgumentType, PartitionHashAlgorithm, PureCompileControl,
 };
 use novarocks_types::SlotId;
@@ -627,9 +627,9 @@ fn read_flow<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     for (definition, read) in reads.iter().enumerate() {
         let identity =
             u32::try_from(definition).map_err(|_| CompileControlError::ResourceExhausted)?;
-        let domain = EvaluationDomainId::new(identity);
+        let domain = EvaluationRegionId::new(identity);
         let use_id = ExpressionUseId::new(identity);
-        domains.push(ProgramEvaluationDomain {
+        domains.push(ProgramEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -637,7 +637,7 @@ fn read_flow<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         uses.push(ProgramExpressionUse {
             context: ExpressionEffectContext {
                 use_id,
-                domain,
+                region: domain,
                 demand: read.demand,
             },
             definition: ProgramExprId::new(definition),

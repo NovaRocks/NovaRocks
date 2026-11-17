@@ -273,7 +273,7 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                     && !phase.consumes_logical_arguments()
                     && state_context.demand == novarocks_type_contract::EvaluationDemand::Value
                     && state_context.use_id != input.context.use_id
-                    && state_context.domain != input.context.domain
+                    && state_context.region != input.context.region
                     && input.selected.aggregate.is_some()
                     && matches!(
                         input.selected.result_type,
@@ -292,7 +292,7 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
             ));
         }
         if input.proof_scope != CallProofScope::Unconditional
-            && input.proof_scope != CallProofScope::Domain(input.context.domain)
+            && input.proof_scope != CallProofScope::Region(input.context.region)
         {
             return Err(CallEffectRefinementError::Contract(
                 EffectContractError::ProofScopeMismatch,
@@ -469,7 +469,7 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                         || channel.context.use_id == input.context.use_id
                         || channel.context.demand
                             != novarocks_type_contract::EvaluationDemand::Value
-                        || (ordinal == 0) != (channel.context.domain == input.context.domain)
+                        || (ordinal == 0) != (channel.context.region == input.context.region)
                         || channels[..ordinal]
                             .iter()
                             .any(|other| other.context.use_id == channel.context.use_id)
@@ -831,7 +831,7 @@ impl ScopedExpressionEffects {
     }
     fn with_verified_call(self, call: &CallEffects) -> Result<Self, EffectContractError> {
         if !matches!(call.proof_scope, CallProofScope::Unconditional)
-            && call.proof_scope != CallProofScope::Domain(self.context.domain)
+            && call.proof_scope != CallProofScope::Region(self.context.region)
         {
             return Err(EffectContractError::ProofScopeMismatch);
         }
@@ -893,8 +893,8 @@ impl ScopedExpressionEffects {
     }
     /// Eager children must be in this same evaluation domain. Strong guarded
     /// children require the compiler's separate checked control-domain join.
-    pub fn join_same_domain(self, child: Self) -> Result<Self, EffectContractError> {
-        if self.context.domain != child.context.domain {
+    pub fn join_same_region(self, child: Self) -> Result<Self, EffectContractError> {
+        if self.context.region != child.context.region {
             return Err(EffectContractError::ProofScopeMismatch);
         }
         Ok(Self {
@@ -1074,7 +1074,7 @@ mod tests {
         let argument_uses = [Some(novarocks_type_contract::ExpressionUseId::new(1))];
         let context = novarocks_type_contract::ExpressionEffectContext {
             use_id: novarocks_type_contract::ExpressionUseId::new(0),
-            domain: novarocks_type_contract::EvaluationDomainId::new(0),
+            region: novarocks_type_contract::EvaluationRegionId::new(0),
             demand: novarocks_type_contract::EvaluationDemand::Value,
         };
         let input = CallEffectInput {
@@ -1339,7 +1339,7 @@ mod tests {
             },
         );
         let arguments = ScopedExpressionEffects::pure_value(context)
-            .join_same_domain(child)
+            .join_same_region(child)
             .unwrap();
         assert!(
             no_own_error
@@ -1351,9 +1351,9 @@ mod tests {
         );
         assert!(
             arguments
-                .join_same_domain(ScopedExpressionEffects::pure_value(
+                .join_same_region(ScopedExpressionEffects::pure_value(
                     novarocks_type_contract::ExpressionEffectContext {
-                        domain: novarocks_type_contract::EvaluationDomainId::new(1),
+                        region: novarocks_type_contract::EvaluationRegionId::new(1),
                         ..child_context
                     }
                 ))
@@ -1447,7 +1447,7 @@ mod tests {
         let argument_uses = [Some(novarocks_type_contract::ExpressionUseId::new(1))];
         let context = novarocks_type_contract::ExpressionEffectContext {
             use_id: novarocks_type_contract::ExpressionUseId::new(0),
-            domain: novarocks_type_contract::EvaluationDomainId::new(0),
+            region: novarocks_type_contract::EvaluationRegionId::new(0),
             demand: novarocks_type_contract::EvaluationDemand::Value,
         };
         let input = CallEffectInput {
@@ -1509,7 +1509,7 @@ mod tests {
         let uses = [Some(novarocks_type_contract::ExpressionUseId::new(1))];
         let context = novarocks_type_contract::ExpressionEffectContext {
             use_id: novarocks_type_contract::ExpressionUseId::new(0),
-            domain: novarocks_type_contract::EvaluationDomainId::new(0),
+            region: novarocks_type_contract::EvaluationRegionId::new(0),
             demand: novarocks_type_contract::EvaluationDemand::Value,
         };
         let input = CallEffectInput {

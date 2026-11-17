@@ -43,8 +43,8 @@ use novarocks_local_program::{
 };
 use novarocks_physical_plan::*;
 use novarocks_type_contract::{
-    CallProofScope, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects, ExpressionEvaluationDomain,
+    CallProofScope, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects, ExpressionEvaluationRegion,
     ExpressionInvocation, ExpressionUseId, SemanticParameters, ValueLogicalType,
 };
 use std::num::NonZeroU64;
@@ -1786,7 +1786,7 @@ fn freeze_counts(
         uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain: EvaluationDomainId::new(0),
+                region: EvaluationRegionId::new(0),
                 demand: root.demand,
             },
             definition: root.expr,
@@ -1796,8 +1796,8 @@ fn freeze_counts(
         bindings.push((*site, id));
     }
     let base = u32::try_from(uses.len()).unwrap();
-    let mut domains = vec![ExpressionEvaluationDomain {
-        id: EvaluationDomainId::new(0),
+    let mut domains = vec![ExpressionEvaluationRegion {
+        id: EvaluationRegionId::new(0),
         parent: None,
         guard: None,
     }];
@@ -1815,11 +1815,11 @@ fn freeze_counts(
             let k = u32::try_from(sites.len()).unwrap();
             let context = ExpressionEffectContext {
                 use_id: ExpressionUseId::new(base + k),
-                domain: EvaluationDomainId::new(k + 1),
+                region: EvaluationRegionId::new(k + 1),
                 demand: EvaluationDemand::Value,
             };
-            domains.push(ExpressionEvaluationDomain {
-                id: context.domain,
+            domains.push(ExpressionEvaluationRegion {
+                id: context.region,
                 parent: None,
                 guard: None,
             });
@@ -1939,7 +1939,7 @@ fn freeze_counts(
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Region(context.region),
                 },
                 Arc::clone(&selection),
                 PureCallPreparation::Aggregate {

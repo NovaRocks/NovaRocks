@@ -468,10 +468,10 @@ fn observed_visitor_keeps_guarded_shared_definition_occurrences_independent() {
     assert_eq!(first.definition, second.definition);
     assert_eq!(first.context.demand, EvaluationDemand::TruthOnly);
     assert_eq!(second.context.demand, EvaluationDemand::Value);
-    assert_ne!(first.context.domain, second.context.domain);
+    assert_ne!(first.context.region, second.context.region);
     assert_ne!(
-        fixture.uses.flow().domains()[&first.context.domain].guard,
-        fixture.uses.flow().domains()[&second.context.domain].guard
+        fixture.uses.flow().regions()[&first.context.region].guard,
+        fixture.uses.flow().regions()[&second.context.region].guard
     );
 }
 

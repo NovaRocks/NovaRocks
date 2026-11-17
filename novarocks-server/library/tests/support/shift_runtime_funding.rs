@@ -276,7 +276,7 @@ fn source_for_arguments(
     let (site, root) = roots.sites().iter().next().unwrap();
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(0),
-        domain: EvaluationDomainId::new(0),
+        region: EvaluationRegionId::new(0),
         demand: root.demand,
     };
     let child_ids = (1..=types.len())
@@ -298,8 +298,8 @@ fn source_for_arguments(
         arguments: child_ids.clone().into_boxed_slice(),
     });
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: context.domain,
+        vec![ExpressionEvaluationRegion {
+            id: context.region,
             parent: None,
             guard: None,
         }],
@@ -325,7 +325,7 @@ fn source_for_arguments(
                 environment: &[],
                 parameters: &parameters,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             },
             selected.clone(),
             PureCallPreparation::Scalar {

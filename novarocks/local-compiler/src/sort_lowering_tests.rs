@@ -148,7 +148,7 @@ pub(super) fn package(
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut uses = Vec::new();
     let bindings = roots
         .sites()
@@ -163,7 +163,7 @@ pub(super) fn package(
             uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain,
+                    region: domain,
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -174,7 +174,7 @@ pub(super) fn package(
         })
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

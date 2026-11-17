@@ -27,7 +27,7 @@ use crate::{
 use arrow_array::{Array, ArrayRef, StringArray, UInt32Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionUseId, SemanticParameters,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
@@ -75,7 +75,7 @@ fn prepared(
     );
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     };
     let uses = types
@@ -871,7 +871,7 @@ fn json_object_checked_creator_keeps_original_owner_and_primary_refusals() {
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     };
     let uses = [
@@ -889,7 +889,7 @@ fn json_object_checked_creator_keeps_original_owner_and_primary_refusals() {
         parameters: &parameters,
         environment: &[],
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context.domain),
+        proof_scope: CallProofScope::Region(context.region),
     };
     let options = || PureCallPreparation::Scalar {
         arguments: ScopedExpressionEffects::pure_value(context),

@@ -26,8 +26,8 @@ use novarocks_connector_contract::{
     ConnectorValueType, Domain, FrozenConnectorScan, StaticScanAssignment,
 };
 use novarocks_type_contract::{
-    ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, ExpressionUseId, SemanticParameters, control_argument_semantics,
 };
 use std::{
@@ -227,7 +227,7 @@ fn expression_uses(fragment: &Fragment) -> PhysicalRootUses {
         uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain: EvaluationDomainId::new(0),
+                region: EvaluationRegionId::new(0),
                 demand,
             },
             definition,
@@ -255,8 +255,8 @@ fn expression_uses(fragment: &Fragment) -> PhysicalRootUses {
         .map(|(site, root)| (*site, add(fragment, root.expr, root.demand, &mut uses)))
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],
@@ -753,7 +753,7 @@ fn selected_conjunct_context_rejects_wrong_use_domain_and_demand() {
             ..context
         },
         ExpressionEffectContext {
-            domain: EvaluationDomainId::new(u32::MAX),
+            region: EvaluationRegionId::new(u32::MAX),
             ..context
         },
         ExpressionEffectContext {

@@ -54,8 +54,8 @@ use novarocks_physical_plan::{
     extract_fragment_packages,
 };
 use novarocks_type_contract::{
-    ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
 };
 use novarocks_types::UniqueId;
 
@@ -470,7 +470,7 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
 /// Every root is a literal cell or a value read; each gets one eager use.
 fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
     let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut uses = Vec::new();
     let mut bindings = Vec::new();
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
@@ -478,7 +478,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain,
+                region: domain,
                 demand: root.demand,
             },
             definition: root.expr,
@@ -488,7 +488,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         bindings.push((*site, id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

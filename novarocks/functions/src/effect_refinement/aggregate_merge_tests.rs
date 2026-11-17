@@ -19,7 +19,7 @@ use super::*;
 use crate::*;
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
-    ArgumentControl, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    ArgumentControl, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionEffects, ExpressionUseId, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
 };
@@ -52,14 +52,14 @@ impl PureCompileControl for Control {
 fn operator() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(0),
-        domain: EvaluationDomainId::new(u32::MAX),
+        region: EvaluationRegionId::new(u32::MAX),
         demand: EvaluationDemand::Value,
     }
 }
 fn state_context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(u32::MAX),
-        domain: EvaluationDomainId::new(0),
+        region: EvaluationRegionId::new(0),
         demand: EvaluationDemand::Value,
     }
 }
@@ -194,7 +194,7 @@ impl StaticInput {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            proof_scope: CallProofScope::Domain(operator().domain),
+            proof_scope: CallProofScope::Region(operator().region),
         }
     }
 }
@@ -248,7 +248,7 @@ fn merge_refiner_rejects_phase_kind_context_and_complete_state_domain_before_own
         (
             AggregateKernelPhase::Final,
             ExpressionEffectContext {
-                domain: operator().domain,
+                region: operator().region,
                 ..state_context()
             },
             &data.state,
@@ -440,7 +440,7 @@ impl CountFixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            proof_scope: CallProofScope::Domain(operator().domain),
+            proof_scope: CallProofScope::Region(operator().region),
         }
     }
     fn options(&self, phase: AggregateKernelPhase) -> PureCallPreparation {

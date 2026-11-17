@@ -22,7 +22,7 @@ use arrow_array::StringArray;
 use arrow_schema::{Field, Fields};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     SemanticParameters,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
@@ -204,12 +204,12 @@ fn prepare_with_catalog(
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(431),
-        domain: EvaluationDomainId::new(29),
+        region: EvaluationRegionId::new(29),
         demand: EvaluationDemand::Value,
     };
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(434),
-        domain: EvaluationDomainId::new(30),
+        region: EvaluationRegionId::new(30),
         demand: EvaluationDemand::Value,
     };
     let state_type = FunctionValueType::new(DataType::Binary, true);
@@ -259,7 +259,7 @@ fn prepare_with_catalog(
             parameters: &parameters,
             environment: &[],
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         },
         selected.clone(),
         preparation,

@@ -26,10 +26,10 @@ use novarocks_physical_plan::{
 };
 use novarocks_proto_models::physical_control_v2 as wire;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, DomainGuard,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionControlFlowError,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    GuardKind, MAX_CONTROL_DEFINITIONS, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionControlFlowError, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, GuardKind,
+    MAX_CONTROL_DEFINITIONS, MAX_CONTROL_USE_REFERENCES, PureCompileControl, RegionGuard,
 };
 use std::{alloc::Layout, fmt};
 mod resources;
@@ -223,7 +223,7 @@ fn decode_shape(shape: &wire::ControlShape) -> Result<ControlShape, ControlCodec
         }),
     }
 }
-fn encode_guard(guard: DomainGuard) -> wire::DomainGuard {
+fn encode_guard(guard: RegionGuard) -> wire::DomainGuard {
     use wire::domain_guard::Kind;
     let kind = match guard.kind {
         GuardKind::IfThen => Kind::Simple(wire::SimpleGuard::IfThen as i32),
@@ -245,7 +245,7 @@ fn encode_guard(guard: DomainGuard) -> wire::DomainGuard {
         kind: Some(kind),
     }
 }
-fn decode_guard(guard: &wire::DomainGuard) -> Result<DomainGuard, ControlCodecError> {
+fn decode_guard(guard: &wire::DomainGuard) -> Result<RegionGuard, ControlCodecError> {
     use wire::domain_guard::Kind;
     let owner = ExpressionUseId::new(required(guard.owner_use_id, "guard owner is missing")?);
     let kind = match guard
@@ -280,7 +280,7 @@ fn decode_guard(guard: &wire::DomainGuard) -> Result<DomainGuard, ControlCodecEr
             GuardKind::TemporalAfterSource { ordinal: *ordinal }
         }
     };
-    Ok(DomainGuard { owner, kind })
+    Ok(RegionGuard { owner, kind })
 }
 pub(crate) fn encode_site(site: ExpressionRootSite) -> wire::RootSite {
     use wire::root_site::Role;
@@ -537,14 +537,14 @@ fn encode_model(
 ) -> Result<Model, ControlCodecError> {
     let f = roots.flow();
     let mut m = Model::new(
-        f.domains().len(),
+        f.regions().len(),
         f.use_reference_count(),
         roots.bindings().len(),
         b,
         limits,
     );
     m.resources
-        .buffer::<wire::EvaluationDomain>(f.domains().len(), 1)?;
+        .buffer::<wire::EvaluationDomain>(f.regions().len(), 1)?;
     m.resources
         .buffer::<wire::ExpressionUse>(f.uses().len(), 1)?;
     m.resources
@@ -561,7 +561,7 @@ fn encode_model(
     }
     m.resources.work(control_resource_mul(
         control_resource_add(
-            control_resource_add(f.domains().len(), f.use_reference_count())?,
+            control_resource_add(f.regions().len(), f.use_reference_count())?,
             roots.bindings().len(),
         )?,
         16,
@@ -577,13 +577,13 @@ fn encode_in(
 ) -> Result<(wire::ExpressionControl, ControlProjectionFacts), ControlCodecError> {
     m.gate(admit)?;
     let flow = roots.flow();
-    let mut domains = Vec::new();
-    reserve(&mut domains, flow.domains().len(), observed, work)?;
-    for domain in flow.domains().values() {
-        domains.push(wire::EvaluationDomain {
-            id: domain.id.get(),
-            parent_domain_id: domain.parent.map(EvaluationDomainId::get),
-            guard: domain.guard.map(encode_guard),
+    let mut regions = Vec::new();
+    reserve(&mut regions, flow.regions().len(), observed, work)?;
+    for region in flow.regions().values() {
+        regions.push(wire::EvaluationDomain {
+            id: region.id.get(),
+            parent_domain_id: region.parent.map(EvaluationRegionId::get),
+            guard: region.guard.map(encode_guard),
         });
         work.step()?;
     }
@@ -602,7 +602,7 @@ fn encode_in(
         uses.push(wire::ExpressionUse {
             id: invocation.context.use_id.get(),
             definition_id: Some(invocation.definition.get()),
-            domain_id: Some(invocation.context.domain.get()),
+            domain_id: Some(invocation.context.region.get()),
             demand: encode_demand(invocation.context.demand),
             control: Some(encode_shape(invocation.control)),
             argument_use_ids: arguments,
@@ -622,7 +622,7 @@ fn encode_in(
     let facts = m.gate(admit)?;
     Ok((
         wire::ExpressionControl {
-            domains,
+            domains: regions,
             uses,
             roots: bindings,
         },
@@ -649,9 +649,9 @@ pub fn decode_expression_control(
         return Err(c.clone().into());
     }
     work.finish()?;
-    let (domains, uses, bindings) = projected?;
+    let (regions, uses, bindings) = projected?;
     let flow = ExpressionControlFlow::try_new(
-        domains,
+        regions,
         uses,
         fragment.expressions(),
         CompilePhase::Validate,
@@ -724,7 +724,7 @@ fn decode_parts_model_core(
         None => Model::input_derived(input.domains.len(), input.uses.len(), input.roots.len(), b),
     };
     m.resources
-        .buffer::<ExpressionEvaluationDomain>(input.domains.len(), 1)?;
+        .buffer::<ExpressionEvaluationRegion>(input.domains.len(), 1)?;
     m.resources
         .buffer::<ExpressionInvocation<ExprId>>(input.uses.len(), 1)?;
     m.resources
@@ -774,7 +774,7 @@ pub fn decode_expression_control_observed(
         backing_floor,
     )?;
     m.floor(floor)?;
-    let (domains, uses, bindings) =
+    let (regions, uses, bindings) =
         project_decode_in(input, &mut m, admit, Some(floor), true, work)?;
     // Replace the known future geometry by this same author's actual prefix;
     // completed child contributions enter cumulative resources only once.
@@ -796,7 +796,7 @@ pub fn decode_expression_control_observed(
     let mut child = ControlOwnedResourceFacts::default();
     let mut ordinary = None;
     let flow = ExpressionControlFlow::try_new_in(
-        domains,
+        regions,
         uses,
         fragment.expressions(),
         &mut |f| {
@@ -853,7 +853,7 @@ pub fn decode_expression_control_observed(
     Ok((roots, facts))
 }
 type ControlProjectionParts = (
-    Vec<ExpressionEvaluationDomain>,
+    Vec<ExpressionEvaluationRegion>,
     Vec<ExpressionInvocation<ExprId>>,
     Vec<(ExpressionRootSite, ExpressionUseId)>,
 );
@@ -967,21 +967,21 @@ impl<H> ControlPartsProjection for CreatedControlProjection<'_, '_, H> {
 /// Native must map these exact definitions and run its full ProgramControlFlow
 /// and RootAttachment checks before publishing a LocalProgram.
 pub type ExpressionControlParts = (
-    Vec<ExpressionEvaluationDomain>,
+    Vec<ExpressionEvaluationRegion>,
     Vec<ExpressionInvocation<ExprId>>,
     Vec<(ExpressionRootSite, ExpressionUseId)>,
     novarocks_type_contract::ValueTypeStorageLifetime,
 );
 
 pub struct CreatedExpressionControlParts {
-    domains: Vec<ExpressionEvaluationDomain>,
+    regions: Vec<ExpressionEvaluationRegion>,
     uses: Vec<ExpressionInvocation<ExprId>>,
     roots: Vec<(ExpressionRootSite, ExpressionUseId)>,
     storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 impl CreatedExpressionControlParts {
-    pub fn domains(&self) -> &[ExpressionEvaluationDomain] {
-        &self.domains
+    pub fn regions(&self) -> &[ExpressionEvaluationRegion] {
+        &self.regions
     }
     pub fn uses(&self) -> &[ExpressionInvocation<ExprId>] {
         &self.uses
@@ -990,7 +990,7 @@ impl CreatedExpressionControlParts {
         &self.roots
     }
     pub fn into_parts(self) -> ExpressionControlParts {
-        (self.domains, self.uses, self.roots, self.storage)
+        (self.regions, self.uses, self.roots, self.storage)
     }
 }
 /// Receive from this actual input's sole checked model/grammar. There is no
@@ -1022,7 +1022,7 @@ fn decode_expression_control_parts_core<H>(
     projection.gate(&model)?;
     let floor = control_source_floor(input)?;
     model.floor(floor)?;
-    let (domains, uses, roots) =
+    let (regions, uses, roots) =
         project_decode_core(input, &mut model, &mut projection, Some(floor), true, work)?;
     // Graph/root constructor resources are admitted by the actual downstream
     // constructor. Parts do not allocate or claim those future owners.
@@ -1030,7 +1030,7 @@ fn decode_expression_control_parts_core<H>(
     let facts = model.check_with(ControlOwnedResourceFacts::default())?;
     Ok((
         CreatedExpressionControlParts {
-            domains,
+            regions,
             uses,
             roots,
             storage,
@@ -1113,13 +1113,13 @@ fn project_decode_core<P: ControlPartsProjection>(
             }
             work.step().map_err(ControlCodecError::from)?;
         }
-        let mut domains = Vec::new();
-        projection.reserve(&mut domains, input.domains.len(), observed, work)?;
-        for domain in &input.domains {
-            domains.push(ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(domain.id),
-                parent: domain.parent_domain_id.map(EvaluationDomainId::new),
-                guard: domain.guard.as_ref().map(decode_guard).transpose()?,
+        let mut regions = Vec::new();
+        projection.reserve(&mut regions, input.domains.len(), observed, work)?;
+        for region in &input.domains {
+            regions.push(ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(region.id),
+                parent: region.parent_domain_id.map(EvaluationRegionId::new),
+                guard: region.guard.as_ref().map(decode_guard).transpose()?,
             });
             work.step().map_err(ControlCodecError::from)?;
         }
@@ -1140,9 +1140,9 @@ fn project_decode_core<P: ControlPartsProjection>(
             uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: ExpressionUseId::new(invocation.id),
-                    domain: EvaluationDomainId::new(required(
+                    region: EvaluationRegionId::new(required(
                         invocation.domain_id,
-                        "use domain is missing",
+                        "use region is missing",
                     )?),
                     demand: decode_demand(invocation.demand)?,
                 },
@@ -1174,7 +1174,7 @@ fn project_decode_core<P: ControlPartsProjection>(
             ));
             work.step().map_err(ControlCodecError::from)?;
         }
-        Ok((domains, uses, roots))
+        Ok((regions, uses, roots))
     })()
 }
 
@@ -1276,10 +1276,10 @@ mod created_parts_tests {
             &mut work,
         )
         .unwrap();
-        assert_eq!(parts.domains()[0].id.get(), 0);
+        assert_eq!(parts.regions()[0].id.get(), 0);
         assert!(parts.uses().is_empty());
         assert!(parts.roots().is_empty());
-        assert_eq!(facts.domain_count, 1);
+        assert_eq!(facts.region_count, 1);
         drop(creation);
         drop(owner);
         assert_eq!(drops.load(Ordering::SeqCst), 0);

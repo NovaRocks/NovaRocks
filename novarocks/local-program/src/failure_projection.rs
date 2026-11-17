@@ -621,7 +621,7 @@ impl FailureProjection for ProgramResolvedCallsError {
                 FailureClass::Invariant,
                 ProgramReason::ProgramResolvedCallsWrongContext as u16,
             ),
-            Self::InvalidDomain => fact(
+            Self::InvalidRegion => fact(
                 FailureClass::Invariant,
                 ProgramReason::ProgramResolvedCallsInvalidDomain as u16,
             ),

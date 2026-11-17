@@ -27,7 +27,7 @@ use crate::{
 };
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompileControlError,
-    CompilePhase, DecimalOverflowPolicy, EffectContractError, EvaluationDemand, EvaluationDomainId,
+    CompilePhase, DecimalOverflowPolicy, EffectContractError, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, FunctionEffectDeclaration, FunctionKind,
     MAX_CONTROL_USE_REFERENCES, PureCompileControl, SemanticParameterRef,
 };
@@ -115,7 +115,7 @@ pub enum FrozenCallError {
     MissingSite(PhysicalCallSite),
     WrongContext,
     SharedUse,
-    InvalidDomain,
+    InvalidRegion,
     WrongProofScope,
     WrongControl,
     InvalidEffects(EffectContractError),
@@ -236,7 +236,7 @@ impl FrozenFragmentCalls {
             .map_err(resource_error)?;
         if writer_inputs != 0 {
             resources
-                .tree::<EvaluationDomainId, ()>(
+                .tree::<EvaluationRegionId, ()>(
                     count
                         .checked_add(writer_inputs)
                         .ok_or(FrozenCallError::TooManyItems)?,
@@ -400,7 +400,7 @@ impl FrozenFragmentCalls {
             }
             if writer_inputs != 0 && !special_precharged {
                 resources
-                    .tree::<EvaluationDomainId, ()>(
+                    .tree::<EvaluationRegionId, ()>(
                         self.entries
                             .len()
                             .checked_add(writer_inputs)
@@ -410,7 +410,7 @@ impl FrozenFragmentCalls {
             }
             if writer_inputs != 0 {
                 resources
-                    .tree::<EvaluationDomainId, ()>(uses.flow().uses().len())
+                    .tree::<EvaluationRegionId, ()>(uses.flow().uses().len())
                     .map_err(resource_error)?;
             }
             let lookups =
@@ -457,12 +457,12 @@ impl FrozenFragmentCalls {
         // relational calls. It does not multiply by an arena's maximum ID.
         let mut references = uses.flow().use_reference_count();
         let mut special_ids = BTreeSet::new();
-        let mut special_domains = BTreeSet::new();
-        let mut expression_domains = BTreeSet::new();
+        let mut special_regions = BTreeSet::new();
+        let mut expression_regions = BTreeSet::new();
         if writer_inputs != 0 {
             for invocation in uses.flow().uses().values() {
                 work.step()?;
-                expression_domains.insert(invocation.context.domain);
+                expression_regions.insert(invocation.context.region);
             }
         }
         // Reserve relational domains before validating writer Values so call
@@ -471,7 +471,7 @@ impl FrozenFragmentCalls {
             for call in self.entries.values() {
                 work.step()?;
                 if !matches!(call.site, PhysicalCallSite::Expression(_)) {
-                    special_domains.insert(call.context.domain);
+                    special_regions.insert(call.context.region);
                 }
             }
         }
@@ -683,11 +683,11 @@ impl FrozenFragmentCalls {
                     }
                     let domain = uses
                         .flow()
-                        .domains()
-                        .get(&call.context.domain)
-                        .ok_or(FrozenCallError::InvalidDomain)?;
+                        .regions()
+                        .get(&call.context.region)
+                        .ok_or(FrozenCallError::InvalidRegion)?;
                     if domain.parent.is_some() || domain.guard.is_some() {
-                        return Err(FrozenCallError::InvalidDomain);
+                        return Err(FrozenCallError::InvalidRegion);
                     }
                 }
             }
@@ -698,7 +698,7 @@ impl FrozenFragmentCalls {
             match (writer, call.materialized_writer_input) {
                 (true, Some(input)) => {
                     if input.demand != EvaluationDemand::Value
-                        || input.domain == call.context.domain
+                        || input.region == call.context.region
                         || input.use_id == call.context.use_id
                     {
                         return Err(FrozenCallError::WrongContext);
@@ -710,26 +710,26 @@ impl FrozenFragmentCalls {
                     }
                     let domain = uses
                         .flow()
-                        .domains()
-                        .get(&input.domain)
-                        .ok_or(FrozenCallError::InvalidDomain)?;
+                        .regions()
+                        .get(&input.region)
+                        .ok_or(FrozenCallError::InvalidRegion)?;
                     if domain.parent.is_some() || domain.guard.is_some() {
-                        return Err(FrozenCallError::InvalidDomain);
+                        return Err(FrozenCallError::InvalidRegion);
                     }
                     // Actual source domains are retained; their uses are not
                     // expression invocations. One indexed pass avoids a scan
                     // of the whole graph for each writer channel.
-                    if expression_domains.contains(&input.domain)
-                        || !special_domains.insert(input.domain)
+                    if expression_regions.contains(&input.region)
+                        || !special_regions.insert(input.region)
                     {
-                        return Err(FrozenCallError::InvalidDomain);
+                        return Err(FrozenCallError::InvalidRegion);
                     }
                 }
                 (false, None) => {}
                 _ => return Err(FrozenCallError::WrongContext),
             }
             if call.effects.proof_scope != CallProofScope::Unconditional
-                && call.effects.proof_scope != CallProofScope::Domain(call.context.domain)
+                && call.effects.proof_scope != CallProofScope::Region(call.context.region)
             {
                 return Err(FrozenCallError::WrongProofScope);
             }

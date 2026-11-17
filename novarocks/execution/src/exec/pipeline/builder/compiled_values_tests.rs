@@ -41,8 +41,8 @@ use novarocks_physical_plan::{
     ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, ExpressionUseId, FunctionValueType, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
     arithmetic_result_value_type_with_op,
@@ -304,7 +304,7 @@ fn visit(
     uses.push(ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id,
-            domain: EvaluationDomainId::new(0),
+            region: EvaluationRegionId::new(0),
             demand,
         },
         definition,
@@ -342,8 +342,8 @@ fn package_with_parameters(
         ));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],

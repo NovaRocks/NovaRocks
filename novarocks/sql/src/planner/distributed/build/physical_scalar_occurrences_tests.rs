@@ -32,8 +32,8 @@ use novarocks_physical_plan::{
     LiteralValue, NodeId, NodeKind, PhysicalRootUses, PipelineDopDomain, PlanLimits, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompilePhase, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionEffects,
-    ExpressionEvaluationDomain, ExpressionInvocation, FunctionArgumentEvaluation,
+    CompilePhase, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, ExpressionEffects,
+    ExpressionEvaluationRegion, ExpressionInvocation, FunctionArgumentEvaluation,
     FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError, FunctionValueType,
     FunctionVolatility, GuardKind, PureCompileControl, SemanticParameterId, SemanticParameterKey,
     SemanticParameterValue,
@@ -360,7 +360,7 @@ fn input<'a>(
         parameters,
         environment: &[],
         decimal_overflow_policy: policy,
-        proof_scope: CallProofScope::Domain(flow.uses()[&id].context.domain),
+        proof_scope: CallProofScope::Region(flow.uses()[&id].context.region),
     }
 }
 fn run(
@@ -499,8 +499,8 @@ fn scalar_occurrences_shared_if_keeps_two_demands_guards_policies_and_same_selec
         assert_eq!(invocation.context.demand, demand);
         for (ordinal, kind) in [(1, GuardKind::IfThen), (2, GuardKind::IfElse)] {
             let child = &roots.flow().uses()[&invocation.arguments[ordinal]];
-            let domain = roots.flow().domains()[&child.context.domain];
-            assert_eq!(domain.parent, Some(invocation.context.domain));
+            let domain = roots.flow().regions()[&child.context.region];
+            assert_eq!(domain.parent, Some(invocation.context.region));
             assert_eq!(domain.guard.unwrap().owner, id);
             assert_eq!(domain.guard.unwrap().kind, kind);
             assert_eq!(child.context.demand, demand);
@@ -534,7 +534,7 @@ fn scalar_occurrences_shared_if_keeps_two_demands_guards_policies_and_same_selec
         );
         assert_eq!(
             result.frozen.effects.proof_scope,
-            CallProofScope::Domain(invocation.context.domain)
+            CallProofScope::Region(invocation.context.region)
         );
         calls.push(result.frozen);
     }
@@ -703,7 +703,7 @@ fn scalar_occurrences_reject_foreign_static_source_missing_use_and_wrong_definit
         .unwrap()
         .definition = root;
     let wrong = ExpressionControlFlow::try_new(
-        flow.domains().values().copied().collect(),
+        flow.regions().values().copied().collect(),
         invocations,
         fragment.expressions(),
         PHASE,
@@ -896,7 +896,7 @@ fn scalar_occurrences_exact_environment_parameters_and_domain_proof_are_explicit
         &empty,
         DecimalOverflowPolicy::ReportError,
     );
-    call.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(u32::MAX));
+    call.proof_scope = CallProofScope::Region(EvaluationRegionId::new(u32::MAX));
     assert!(matches!(
         run(call, &catalog, &Control::default()),
         Err(PhysicalScalarOccurrenceError::Occurrence(
@@ -1138,14 +1138,14 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
     .unwrap();
     let source = arena.get(ExprId::new(17)).unwrap();
     let req = request_from(source, &arena);
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let context = |id| ExpressionEffectContext {
         use_id: ExpressionUseId::new(id),
-        domain,
+        region: domain,
         demand: EvaluationDemand::Value,
     };
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

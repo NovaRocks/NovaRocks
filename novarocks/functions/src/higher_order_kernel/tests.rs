@@ -25,7 +25,7 @@ use arrow_array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{ArgumentControl, EvaluationDemand, ExpressionUseId};
 use novarocks_type_contract::{
-    CallEffects, CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationDomainId,
+    CallEffects, CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationRegionId,
     ExpressionEffects, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
     SemanticParameters,
@@ -163,7 +163,7 @@ impl Owner {
         CallEffectInput {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(7),
+                region: EvaluationRegionId::new(7),
                 demand: EvaluationDemand::Value,
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
@@ -178,14 +178,14 @@ impl Owner {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(EvaluationDomainId::new(7)),
+            proof_scope: CallProofScope::Region(EvaluationRegionId::new(7)),
         }
     }
     fn options(&self) -> HigherOrderPreparationOptions {
         let outer = self.input().context;
         let inner = ExpressionEffectContext {
             use_id: ExpressionUseId::new(10),
-            domain: EvaluationDomainId::new(11),
+            region: EvaluationRegionId::new(11),
             demand: EvaluationDemand::Value,
         };
         HigherOrderPreparationOptions {

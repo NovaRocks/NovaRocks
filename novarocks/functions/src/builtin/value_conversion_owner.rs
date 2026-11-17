@@ -364,7 +364,7 @@ impl ValueConversionOwner {
                 return Err(FunctionBindingError::UnknownFunction.into());
             }
             let scope = matches!(input.proof_scope, CallProofScope::Unconditional)
-                || input.proof_scope == CallProofScope::Domain(input.context.domain);
+                || input.proof_scope == CallProofScope::Region(input.context.region);
             let environment = input.environment.is_empty();
             work.step().map_err(FunctionEffectOwnerError::Control)?;
             if !scope || !environment {

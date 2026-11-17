@@ -320,7 +320,7 @@ impl FrozenFragmentCalls {
             work.flush()?;
             for count in [
                 call_items,
-                uses.flow().domains().len(),
+                uses.flow().regions().len(),
                 uses.flow().use_reference_count(),
                 uses.bindings().len(),
                 uses.roots().sites().len(),

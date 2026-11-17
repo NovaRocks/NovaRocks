@@ -47,9 +47,9 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    DomainGuard, EvaluationDemand, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    FunctionValueType, PureCompileControl, SemanticParameters, control_argument_semantics,
+    EvaluationDemand, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
+    PureCompileControl, RegionGuard, SemanticParameters, control_argument_semantics,
 };
 use std::{
     collections::BTreeMap,
@@ -363,18 +363,18 @@ pub(crate) fn call(
 
 struct FlowAuthor {
     next_use: u32,
-    next_domain: u32,
+    next_region: u32,
     uses: Vec<ExpressionInvocation<ExprId>>,
-    domains: Vec<ExpressionEvaluationDomain>,
+    domains: Vec<ExpressionEvaluationRegion>,
 }
 impl FlowAuthor {
     fn new() -> Self {
         Self {
             next_use: 7,
-            next_domain: 8,
+            next_region: 8,
             uses: vec![],
-            domains: vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(u32::MAX),
+            domains: vec![ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(u32::MAX),
                 parent: None,
                 guard: None,
             }],
@@ -385,7 +385,7 @@ impl FlowAuthor {
         fragment: &Fragment,
         authors: &BTreeMap<ExprId, Author>,
         expr: ExprId,
-        domain: EvaluationDomainId,
+        domain: EvaluationRegionId,
         demand: EvaluationDemand,
     ) -> ExpressionUseId {
         let id = ExpressionUseId::new(self.next_use);
@@ -472,24 +472,24 @@ impl FlowAuthor {
         for (ordinal, &child) in args.iter().enumerate() {
             let (child_demand, guard) =
                 control_argument_semantics(shape, args.len(), ordinal, demand).unwrap();
-            let child_domain = if let Some(kind) = guard {
-                let child_domain = EvaluationDomainId::new(self.next_domain);
-                self.next_domain += 13;
-                self.domains.push(ExpressionEvaluationDomain {
-                    id: child_domain,
+            let child_region = if let Some(kind) = guard {
+                let child_region = EvaluationRegionId::new(self.next_region);
+                self.next_region += 13;
+                self.domains.push(ExpressionEvaluationRegion {
+                    id: child_region,
                     parent: Some(domain),
-                    guard: Some(DomainGuard { owner: id, kind }),
+                    guard: Some(RegionGuard { owner: id, kind }),
                 });
-                child_domain
+                child_region
             } else {
                 domain
             };
-            children.push(self.visit(fragment, authors, child, child_domain, child_demand));
+            children.push(self.visit(fragment, authors, child, child_region, child_demand));
         }
         self.uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain,
+                region: domain,
                 demand,
             },
             definition: expr,
@@ -756,7 +756,7 @@ pub(crate) fn compile_checked_fragment_with_parameters(
             &fragment,
             authors,
             root.expr,
-            EvaluationDomainId::new(u32::MAX),
+            EvaluationRegionId::new(u32::MAX),
             root.demand,
         );
         bindings.push((site, id));
@@ -786,7 +786,7 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                         .join_control_argument(summaries[child], &flow, ordinal)
                         .unwrap()
                 } else {
-                    children.join_same_domain(summaries[child]).unwrap()
+                    children.join_same_region(summaries[child]).unwrap()
                 };
             }
             let argument_uses = if owner.shape == ControlShape::NoArguments {
@@ -944,7 +944,7 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                         environment: &[],
                         parameters: &parameters,
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(context.domain),
+                        proof_scope: CallProofScope::Region(context.region),
                     },
                     owner.selected.clone(),
                     preparation,

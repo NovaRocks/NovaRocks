@@ -36,8 +36,8 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
+    EvaluationDemand, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
     PureCompileControl, SemanticParameters, ValueLogicalType,
 };
 use std::{
@@ -280,7 +280,7 @@ fn uses(fixture: &Fixture, style: Flow) -> Result<PhysicalRootUses, RootUseBindi
         output.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id,
-                domain: EvaluationDomainId::new(u32::MAX),
+                region: EvaluationRegionId::new(u32::MAX),
                 demand,
             },
             definition: id,
@@ -310,8 +310,8 @@ fn uses(fixture: &Fixture, style: Flow) -> Result<PhysicalRootUses, RootUseBindi
         bindings.push((site, id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(u32::MAX),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(u32::MAX),
             parent: None,
             guard: None,
         }],
@@ -423,7 +423,7 @@ fn ordered_nullable_nary_three_and_wide_320_lower_into_one_intrinsic_definition_
                     .unwrap();
                 let invocation = &flow.uses()[root_use];
                 assert_eq!(invocation.control, op.shape());
-                assert_eq!(invocation.context.domain, EvaluationDomainId::new(u32::MAX));
+                assert_eq!(invocation.context.region, EvaluationRegionId::new(u32::MAX));
                 let expected_demand = match mode {
                     Use::Value => EvaluationDemand::Value,
                     Use::TruthOnly => EvaluationDemand::TruthOnly,
@@ -475,7 +475,7 @@ fn ordered_nullable_nary_three_and_wide_320_lower_into_one_intrinsic_definition_
                     let child = &flow.uses()[child_use];
                     assert_eq!(child.definition, definition);
                     assert_eq!(child.context.demand, expected_demand);
-                    assert_eq!(child.context.domain, invocation.context.domain);
+                    assert_eq!(child.context.region, invocation.context.region);
                     assert_eq!(
                         source.expression_uses().flow().uses()[child_use].definition,
                         physical_args[ordinal]
@@ -585,7 +585,7 @@ fn a_frozen_function_call_cannot_be_attached_to_a_physical_nary_intrinsic() {
                 environment: &[],
                 parameters: &parameters,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                proof_scope: CallProofScope::Domain(invocation.context.domain),
+                proof_scope: CallProofScope::Region(invocation.context.region),
             },
             selected.clone(),
             PureCallPreparation::Scalar {

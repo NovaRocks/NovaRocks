@@ -47,10 +47,10 @@ use novarocks_physical_plan::{
     StaticFunctionArgument, TableFunctionOutput, ValueId, ValueOrigin, passthrough_requirement,
 };
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, DomainGuard,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEffects, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    FunctionValueType, PureCompileControl, SemanticParameters, control_argument_semantics,
+    CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
+    PureCompileControl, RegionGuard, SemanticParameters, control_argument_semantics,
 };
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
@@ -213,15 +213,15 @@ impl Shape {
 struct Author<'a> {
     fragment: &'a Fragment,
     next_use: u32,
-    next_domain: u32,
+    next_region: u32,
     uses: Vec<ExpressionInvocation<ExprId>>,
-    domains: Vec<ExpressionEvaluationDomain>,
+    domains: Vec<ExpressionEvaluationRegion>,
 }
 impl Author<'_> {
     fn visit(
         &mut self,
         expr: ExprId,
-        domain: EvaluationDomainId,
+        domain: EvaluationRegionId,
         demand: EvaluationDemand,
     ) -> ExpressionUseId {
         let id = ExpressionUseId::new(self.next_use);
@@ -241,25 +241,25 @@ impl Author<'_> {
         for (ordinal, child) in children.iter().enumerate() {
             let (child_demand, guard) =
                 control_argument_semantics(shape, children.len(), ordinal, demand).unwrap();
-            let child_domain = match guard {
+            let child_region = match guard {
                 Some(kind) => {
-                    let child_domain = EvaluationDomainId::new(self.next_domain);
-                    self.next_domain += 1;
-                    self.domains.push(ExpressionEvaluationDomain {
-                        id: child_domain,
+                    let child_region = EvaluationRegionId::new(self.next_region);
+                    self.next_region += 1;
+                    self.domains.push(ExpressionEvaluationRegion {
+                        id: child_region,
                         parent: Some(domain),
-                        guard: Some(DomainGuard { owner: id, kind }),
+                        guard: Some(RegionGuard { owner: id, kind }),
                     });
-                    child_domain
+                    child_region
                 }
                 None => domain,
             };
-            arguments.push(self.visit(*child, child_domain, child_demand));
+            arguments.push(self.visit(*child, child_region, child_demand));
         }
         self.uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain,
+                region: domain,
                 demand,
             },
             definition: expr,
@@ -531,13 +531,13 @@ fn package(
     request: &[FunctionArgument],
 ) -> Arc<FragmentPackage> {
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut author = Author {
         fragment: &fragment,
         next_use: 0,
-        next_domain: 2,
+        next_region: 2,
         uses: Vec::new(),
-        domains: vec![ExpressionEvaluationDomain {
+        domains: vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -550,13 +550,13 @@ fn package(
     // The table call owns its own relational use and unguarded domain.
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(RELATIONAL_USE),
-        domain: EvaluationDomainId::new(1),
+        region: EvaluationRegionId::new(1),
         demand: EvaluationDemand::Value,
     };
     let Author { uses, domains, .. } = author;
     let mut domains = domains;
-    domains.push(ExpressionEvaluationDomain {
-        id: context.domain,
+    domains.push(ExpressionEvaluationRegion {
+        id: context.region,
         parent: None,
         guard: None,
     });
@@ -609,7 +609,7 @@ fn package(
                 environment: &[],
                 parameters: &parameters,
                 decimal_overflow_policy: POLICY,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             },
             Arc::clone(&selection),
             PureCallPreparation::Table {

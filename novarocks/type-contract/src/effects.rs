@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Distinct implementation, call-site and expression/domain effects. These
+//! Distinct implementation, call-site and expression/region effects. These
 //! facts describe semantics; they never hold a mutable evaluation instance.
 use crate::{
     FunctionFailureBehavior, FunctionIntrinsicRowError, FunctionKind, FunctionVolatility,
@@ -24,8 +24,8 @@ use crate::{
 use std::{collections::BTreeSet, fmt};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct EvaluationDomainId(u32);
-impl EvaluationDomainId {
+pub struct EvaluationRegionId(u32);
+impl EvaluationRegionId {
     pub const fn new(id: u32) -> Self {
         Self(id)
     }
@@ -260,12 +260,12 @@ impl FunctionEffectDeclaration {
     }
 }
 
-/// Assumptions used by a refiner are local to one proven evaluation domain.
+/// Assumptions used by a refiner are local to one proven evaluation region.
 /// This identity is not an authorization to hoist a call outside its guard.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CallProofScope {
     Unconditional,
-    Domain(EvaluationDomainId),
+    Region(EvaluationRegionId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -375,7 +375,7 @@ pub struct ExpressionEffects {
     pub value_stability: FunctionVolatility,
     pub may_raise_row_error: bool,
     /// Whole invocation Data is atomic, cannot be masked as a row error, and
-    /// forbids reordering, replay or evaluation in an earlier domain.
+    /// forbids reordering, replay or evaluation in an earlier region.
     pub may_raise_invocation_data: bool,
     pub has_instance_state: bool,
     pub observable_effects: ObservableEffects,
@@ -408,7 +408,7 @@ impl ExpressionEffects {
             observable_effects: self.observable_effects.union(other.observable_effects),
         }
     }
-    /// Eligible only inside the already-proven pure Boolean region/domain.
+    /// Eligible only inside the already-proven pure Boolean region/region.
     /// Row errors are buffered there, rather than erased by this fact.
     pub const fn permits_boolean_reordering(self) -> bool {
         !matches!(self.value_stability, FunctionVolatility::Volatile)
@@ -422,18 +422,18 @@ impl ExpressionEffects {
         self.permits_boolean_reordering()
     }
     /// This is only an effect prerequisite. Relational, NULL-extension and
-    /// control-domain proofs are still required before earlier evaluation.
+    /// control-region proofs are still required before earlier evaluation.
     pub const fn permits_earlier_evaluation(self) -> bool {
         self.permits_boolean_reordering() && !self.may_raise_row_error
     }
 }
 
-/// A summary stays attached to its use and domain. Frozen facts must first be
+/// A summary stays attached to its use and region. Frozen facts must first be
 /// recomputed by the exact owner, including complete environment dependencies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExpressionEffectContext {
     pub use_id: ExpressionUseId,
-    pub domain: EvaluationDomainId,
+    pub region: EvaluationRegionId,
     pub demand: crate::EvaluationDemand,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -546,13 +546,13 @@ mod tests {
         assert!(!may_fail.permits_earlier_evaluation());
     }
     #[test]
-    fn refinement_cannot_escape_its_domain_or_erase_rng() {
+    fn refinement_cannot_escape_its_region_or_erase_rng() {
         let mut base = base();
         base.observable_effects.rng_sampling = true;
         base.instance_state = FunctionInstanceState::ScalarInstance;
         let mut call = call();
         call.observable_effects = base.observable_effects;
-        let scope = CallProofScope::Domain(EvaluationDomainId::new(u32::MAX));
+        let scope = CallProofScope::Region(EvaluationRegionId::new(u32::MAX));
         call.proof_scope = scope;
         call.validate_refinement(&base, scope).unwrap();
         assert_eq!(

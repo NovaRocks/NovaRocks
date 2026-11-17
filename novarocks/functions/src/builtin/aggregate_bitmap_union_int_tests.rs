@@ -20,7 +20,7 @@ use super::*;
 use crate::opaque_memory::OpaqueAllocationHost;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     SemanticParameters,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
@@ -170,7 +170,7 @@ fn kernel(name: &str, source: FunctionValueType, phase: AggregateKernelPhase) ->
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(331),
-        domain: EvaluationDomainId::new(19),
+        region: EvaluationRegionId::new(19),
         demand: EvaluationDemand::Value,
     };
     let parameters = SemanticParameters::try_new([]).unwrap();
@@ -183,7 +183,7 @@ fn kernel(name: &str, source: FunctionValueType, phase: AggregateKernelPhase) ->
     .unwrap();
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(333),
-        domain: EvaluationDomainId::new(20),
+        region: EvaluationRegionId::new(20),
         demand: EvaluationDemand::Value,
     };
     let argument_uses = if phase.consumes_logical_arguments() {
@@ -207,7 +207,7 @@ fn kernel(name: &str, source: FunctionValueType, phase: AggregateKernelPhase) ->
                 parameters: &parameters,
                 environment: &[],
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             },
             selected.clone(),
             PureCallPreparation::Aggregate {

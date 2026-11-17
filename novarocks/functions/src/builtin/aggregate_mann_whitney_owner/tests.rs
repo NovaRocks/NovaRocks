@@ -17,7 +17,7 @@
 
 use super::*;
 use novarocks_type_contract::{
-    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, SemanticParameters,
 };
 use std::sync::Mutex;
@@ -87,7 +87,7 @@ impl Fixture {
     fn context(&self) -> ExpressionEffectContext {
         ExpressionEffectContext {
             use_id: ExpressionUseId::new(17),
-            domain: EvaluationDomainId::new(19),
+            region: EvaluationRegionId::new(19),
             demand: EvaluationDemand::Value,
         }
     }
@@ -107,7 +107,7 @@ impl Fixture {
                 phase,
                 state_context: ExpressionEffectContext {
                     use_id: ExpressionUseId::new(71),
-                    domain: EvaluationDomainId::new(73),
+                    region: EvaluationRegionId::new(73),
                     demand: EvaluationDemand::Value,
                 },
                 state_input_type: &state_type,
@@ -188,7 +188,7 @@ fn mann_whitney_owner_original_any_profiles_and_four_phases_are_installed() {
                     .prepare(
                         phase,
                         false,
-                        CallProofScope::Domain(fixture.context().domain),
+                        CallProofScope::Region(fixture.context().region),
                         &Control::default(),
                     )
                     .unwrap();
@@ -217,7 +217,7 @@ fn mann_whitney_owner_rejects_foreign_scope_distinct_and_stale_full_result() {
             .prepare(
                 AggregateKernelPhase::Single,
                 false,
-                CallProofScope::Domain(EvaluationDomainId::new(999)),
+                CallProofScope::Region(EvaluationRegionId::new(999)),
                 &Control::default()
             )
             .is_err()
@@ -333,7 +333,7 @@ fn mann_whitney_checked_creator_preserves_four_phases_and_original_control() {
                 phase,
                 state_context: ExpressionEffectContext {
                     use_id: ExpressionUseId::new(71),
-                    domain: EvaluationDomainId::new(73),
+                    region: EvaluationRegionId::new(73),
                     demand: EvaluationDemand::Value,
                 },
                 state_input_type: &state_type,
@@ -353,7 +353,7 @@ fn mann_whitney_checked_creator_preserves_four_phases_and_original_control() {
             parameters: &fixture.params,
             environment: &[],
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         };
         let options = || PureCallPreparation::Aggregate {
             arguments: ScopedExpressionEffects::pure_value(context),
@@ -370,7 +370,7 @@ fn mann_whitney_checked_creator_preserves_four_phases_and_original_control() {
             .prepare(
                 phase,
                 false,
-                CallProofScope::Domain(context.domain),
+                CallProofScope::Region(context.region),
                 &Control::default(),
             )
             .unwrap();

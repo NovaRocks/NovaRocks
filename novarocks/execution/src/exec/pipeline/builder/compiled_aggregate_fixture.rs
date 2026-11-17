@@ -61,8 +61,8 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects,
-    ExpressionEvaluationDomain, ExpressionUseId, FunctionValueType, SemanticParameters,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects,
+    ExpressionEvaluationRegion, ExpressionUseId, FunctionValueType, SemanticParameters,
 };
 use novarocks_types::UniqueId;
 
@@ -560,7 +560,7 @@ fn freeze(
     parameters: &SemanticParameters,
 ) -> (PhysicalRootUses, FrozenFragmentCalls) {
     let expression_roots = crate::runtime::task::scan::compiled_fixture::root_uses(fragment);
-    let expression_domain = EvaluationDomainId::new(0);
+    let expression_region = EvaluationRegionId::new(0);
     let uses = expression_roots
         .flow()
         .uses()
@@ -572,8 +572,8 @@ fn freeze(
         .iter()
         .map(|(site, id)| (*site, *id))
         .collect();
-    let mut domains = vec![ExpressionEvaluationDomain {
-        id: expression_domain,
+    let mut domains = vec![ExpressionEvaluationRegion {
+        id: expression_region,
         parent: None,
         guard: None,
     }];
@@ -591,11 +591,11 @@ fn freeze(
             let k = u32::try_from(sites.len()).unwrap();
             let context = ExpressionEffectContext {
                 use_id: ExpressionUseId::new(RELATIONAL_USE_BASE + k),
-                domain: EvaluationDomainId::new(k + 1),
+                region: EvaluationRegionId::new(k + 1),
                 demand: EvaluationDemand::Value,
             };
-            domains.push(ExpressionEvaluationDomain {
-                id: context.domain,
+            domains.push(ExpressionEvaluationRegion {
+                id: context.region,
                 parent: None,
                 guard: None,
             });
@@ -730,7 +730,7 @@ fn freeze(
                     environment: &[],
                     parameters,
                     decimal_overflow_policy: POLICY,
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Region(context.region),
                 },
                 Arc::clone(&selection),
                 PureCallPreparation::Aggregate {

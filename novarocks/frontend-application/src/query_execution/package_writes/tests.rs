@@ -42,8 +42,8 @@ use novarocks_spi::connector::{
 };
 use novarocks_sql::compiler::SqlCompileControl;
 use novarocks_type_contract::{
-    CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
+    CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
 };
 
 use super::*;
@@ -549,7 +549,7 @@ fn root_uses(fragment: &p::Fragment) -> p::PhysicalRootUses {
             uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: id,
-                    domain: EvaluationDomainId::new(0),
+                    region: EvaluationRegionId::new(0),
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -560,8 +560,8 @@ fn root_uses(fragment: &p::Fragment) -> p::PhysicalRootUses {
         })
         .collect();
     let flow = ExpressionControlFlow::<p::ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],

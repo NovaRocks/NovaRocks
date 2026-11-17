@@ -123,7 +123,7 @@ fn between_actual_after_four_ordered_uses_original_three_definitions() {
     for ordinal in 1..4 {
         let child = &flow.uses()[&invocation.arguments[ordinal]];
         assert_eq!(
-            flow.domains()[&child.context.domain].guard.unwrap().kind,
+            flow.regions()[&child.context.region].guard.unwrap().kind,
             novarocks_type_contract::GuardKind::BetweenAfterSource {
                 ordinal: (ordinal - 1) as u32
             }

@@ -21,7 +21,7 @@ use arrow_array::{BinaryArray, Decimal128Array, Float64Array, Int64Array, ListAr
 use arrow_schema::{Field, Fields};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     SemanticParameters,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
@@ -145,12 +145,12 @@ fn kernel(
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(901),
-        domain: EvaluationDomainId::new(59),
+        region: EvaluationRegionId::new(59),
         demand: EvaluationDemand::Value,
     };
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(910),
-        domain: EvaluationDomainId::new(60),
+        region: EvaluationRegionId::new(60),
         demand: EvaluationDemand::Value,
     };
     let state_type = selected
@@ -184,7 +184,7 @@ fn kernel(
                 parameters: &parameters,
                 environment: &[],
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             },
             selected.clone(),
             PureCallPreparation::Aggregate {

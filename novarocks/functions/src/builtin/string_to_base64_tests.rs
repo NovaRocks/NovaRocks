@@ -27,7 +27,7 @@ use crate::{
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionNullBehavior,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionNullBehavior,
     PureCompileControl, SemanticParameters,
 };
 use std::{sync::Mutex, time::Duration};
@@ -467,7 +467,7 @@ fn string_to_base64_source_receipt_is_mandatory_and_frozen_source_cannot_be_subs
     );
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     };
     let params = SemanticParameters::try_new([]).unwrap();

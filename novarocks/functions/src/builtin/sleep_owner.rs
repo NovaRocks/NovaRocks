@@ -286,7 +286,7 @@ impl SleepOwner {
         }
         if !input.environment.is_empty()
             || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                && input.proof_scope != CallProofScope::Region(input.context.region)
         {
             return Err(FunctionBindingError::InvalidBinding(
                 "sleep has no environment dependencies and requires an exact proof scope".into(),
@@ -414,7 +414,7 @@ mod tests {
     };
     use arrow_schema::DataType;
     use novarocks_type_contract::{
-        CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+        CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
         ExpressionEffectContext, ExpressionUseId, SemanticParameters,
     };
 
@@ -434,7 +434,7 @@ mod tests {
     fn context() -> ExpressionEffectContext {
         ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         }
     }

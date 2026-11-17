@@ -33,8 +33,8 @@ use novarocks_physical_plan::{
     StagePlacementPolicy, ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     PureCompileControl, SemanticParameters,
 };
 use std::collections::BTreeMap;
@@ -77,7 +77,7 @@ fn uses(fragment: &Fragment) -> PhysicalRootUses {
             ordered.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain: EvaluationDomainId::new(0),
+                    region: EvaluationRegionId::new(0),
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -90,8 +90,8 @@ fn uses(fragment: &Fragment) -> PhysicalRootUses {
     let domains = if ordered.is_empty() {
         vec![]
     } else {
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }]

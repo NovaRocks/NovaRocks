@@ -58,7 +58,7 @@ fn causes() -> [CompileControlError; 3] {
     ]
 }
 fn assert_prefixes(
-    domains: &[ExpressionEvaluationDomain],
+    regions: &[ExpressionEvaluationRegion],
     uses: &[ExpressionInvocation<u32>],
     phase: CompilePhase,
     trace: &[(CompilePhase, u32)],
@@ -71,7 +71,7 @@ fn assert_prefixes(
             };
             assert_eq!(
                 ExpressionControlFlow::try_new(
-                    domains.to_vec(),
+                    regions.to_vec(),
                     uses.to_vec(),
                     &definitions(2),
                     phase,
@@ -97,7 +97,7 @@ fn malformed_flow_owners_observe_completed_tail_without_reclassifying_graph_erro
     let mut wrong_arity = invocation(0, 1000);
     wrong_arity.control = ControlShape::If;
     let mut invalid_guard = root();
-    invalid_guard.parent = Some(EvaluationDomainId::new(19));
+    invalid_guard.parent = Some(EvaluationRegionId::new(19));
     let mut cyclic_a = invocation(0, 1000);
     cyclic_a.arguments = Box::from([ExpressionUseId::new(1)]);
     let mut cyclic_b = invocation(1, u32::MAX);
@@ -128,11 +128,11 @@ fn malformed_flow_owners_observe_completed_tail_without_reclassifying_graph_erro
         ),
     ];
     for phase in phases() {
-        for (domains, uses, expected) in &cases {
+        for (regions, uses, expected) in &cases {
             let owner = PrefixControl::default();
             assert_eq!(
                 ExpressionControlFlow::try_new(
-                    domains.clone(),
+                    regions.clone(),
                     uses.clone(),
                     &definitions(2),
                     phase,
@@ -148,27 +148,27 @@ fn malformed_flow_owners_observe_completed_tail_without_reclassifying_graph_erro
             assert_eq!(trace[0], (phase, 0));
             assert!(trace[1].1 > 0);
             assert!(trace.iter().all(|(actual, _)| *actual == phase));
-            assert_prefixes(domains, uses, phase, &trace);
+            assert_prefixes(regions, uses, phase, &trace);
         }
     }
 }
 
 #[test]
-fn duplicate_domain_failure_observes_exact_255_256_257_completed_work_boundaries() {
+fn duplicate_region_failure_observes_exact_255_256_257_completed_work_boundaries() {
     for phase in phases() {
         for count in [255, 256, 257] {
-            let mut domains = (0..count)
-                .map(|id| ExpressionEvaluationDomain {
-                    id: EvaluationDomainId::new(id),
+            let mut regions = (0..count)
+                .map(|id| ExpressionEvaluationRegion {
+                    id: EvaluationRegionId::new(id),
                     parent: None,
                     guard: None,
                 })
                 .collect::<Vec<_>>();
-            domains.push(domains[0]);
+            regions.push(regions[0]);
             let owner = PrefixControl::default();
             assert_eq!(
                 ExpressionControlFlow::try_new(
-                    domains.clone(),
+                    regions.clone(),
                     vec![],
                     &definitions(2),
                     phase,
@@ -184,7 +184,7 @@ fn duplicate_domain_failure_observes_exact_255_256_257_completed_work_boundaries
                 vec![(phase, 0), (phase, 256), (phase, count - 256)]
             };
             assert_eq!(trace, expected);
-            assert_prefixes(&domains, &[], phase, &trace);
+            assert_prefixes(&regions, &[], phase, &trace);
         }
     }
 }
@@ -193,12 +193,12 @@ fn duplicate_domain_failure_observes_exact_255_256_257_completed_work_boundaries
 fn checked_flow_success_preserves_sparse_child_order_phase_and_primary_callback_prefixes() {
     let mut parent = invocation(u32::MAX, u32::MAX);
     parent.arguments = Box::from([ExpressionUseId::new(9), ExpressionUseId::new(0)]);
-    let domains = vec![root()];
+    let regions = vec![root()];
     let uses = vec![parent, invocation(0, 1000), invocation(9, 1000)];
     for phase in phases() {
         let owner = PrefixControl::default();
         let graph = ExpressionControlFlow::try_new(
-            domains.clone(),
+            regions.clone(),
             uses.clone(),
             &definitions(2),
             phase,
@@ -217,7 +217,7 @@ fn checked_flow_success_preserves_sparse_child_order_phase_and_primary_callback_
         assert_eq!(trace.len(), 2);
         assert_eq!(trace[0], (phase, 0));
         assert!(trace[1].1 > 0);
-        assert_prefixes(&domains, &uses, phase, &trace);
+        assert_prefixes(&regions, &uses, phase, &trace);
     }
 }
 

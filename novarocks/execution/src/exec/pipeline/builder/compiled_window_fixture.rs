@@ -55,8 +55,8 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompilePhase, ControlShape,
-    DecimalOverflowPolicy, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEffects, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    DecimalOverflowPolicy, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEffects, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError,
     FunctionNullBehavior, FunctionValueType, FunctionVolatility, ObservableEffects,
     SemanticParameters, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
@@ -724,10 +724,10 @@ pub(super) fn package_typed(
         .unwrap();
     // Root occurrences, then one leaf child per WindowCall reference.
     let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let context = |id: u32| ExpressionEffectContext {
         use_id: ExpressionUseId::new(id),
-        domain,
+        region: domain,
         demand: novarocks_type_contract::EvaluationDemand::Value,
     };
     let mut uses = Vec::new();
@@ -784,7 +784,7 @@ pub(super) fn package_typed(
         bindings.push((*site, ExpressionUseId::new(id)));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -865,7 +865,7 @@ pub(super) fn package_typed(
                 temporal_source: None,
                 site: PhysicalCallSite::Expression(use_id),
                 context: call_context,
-                effects: declared_aggregate_effects(CallProofScope::Domain(domain)),
+                effects: declared_aggregate_effects(CallProofScope::Region(domain)),
                 decimal_overflow_policy: POLICY,
             });
             continue;
@@ -927,7 +927,7 @@ pub(super) fn package_typed(
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: POLICY,
-                    proof_scope: CallProofScope::Domain(domain),
+                    proof_scope: CallProofScope::Region(domain),
                 },
                 Arc::clone(&selection),
                 options,

@@ -23,7 +23,7 @@ use novarocks_functions::{
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     SemanticParameters,
 };
 use std::sync::Mutex;
@@ -66,7 +66,7 @@ impl Control {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(u32::MAX),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     }
 }
@@ -109,7 +109,7 @@ fn input<'a>(
         environment: &[],
         parameters,
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context().domain),
+        proof_scope: CallProofScope::Region(context().region),
     }
 }
 fn options() -> PureCallPreparation {

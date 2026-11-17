@@ -22,7 +22,7 @@ use arrow_array::StringArray;
 
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
     SemanticParameters,
 };
@@ -156,12 +156,12 @@ fn kernel_with_source(
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(431),
-        domain: EvaluationDomainId::new(29),
+        region: EvaluationRegionId::new(29),
         demand: EvaluationDemand::Value,
     };
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(434),
-        domain: EvaluationDomainId::new(30),
+        region: EvaluationRegionId::new(30),
         demand: EvaluationDemand::Value,
     };
     let state_type = selected
@@ -215,7 +215,7 @@ fn kernel_with_source(
             parameters: &parameters,
             environment: &environment,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         },
         selected.clone(),
         PureCallPreparation::Aggregate {

@@ -152,7 +152,7 @@ fn prepare_frozen_writer_aggregate_core<H>(
         ) || source.call_context.demand != EvaluationDemand::Value
             || input.demand != EvaluationDemand::Value
             || input.use_id == source.call_context.use_id
-            || input.domain == source.call_context.domain
+            || input.region == source.call_context.region
             || source.original_request.logical_argument_count != 1
             || source.original_request.arguments.len() != 1
             || source.selected.argument_types.len() != 1

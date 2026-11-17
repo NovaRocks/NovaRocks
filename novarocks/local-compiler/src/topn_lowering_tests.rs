@@ -65,7 +65,7 @@ fn complete(
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good())?;
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut uses = Vec::new();
     let bindings = roots
         .sites()
@@ -80,7 +80,7 @@ fn complete(
             uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain,
+                    region: domain,
                     demand: source.demand,
                 },
                 definition: source.expr,
@@ -91,7 +91,7 @@ fn complete(
         })
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -904,8 +904,8 @@ mod scan_split {
     };
     use novarocks_physical_plan::*;
     use novarocks_type_contract::{
-        CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDomainId,
-        ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+        CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationRegionId,
+        ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
         ExpressionInvocation, ExpressionUseId, PureCompileControl,
     };
     use std::{
@@ -1016,7 +1016,7 @@ mod scan_split {
     /// Every root here is a value read; each gets one eager use.
     fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         let roots = PhysicalExpressionRoots::try_new(fragment, &Good).unwrap();
-        let domain = EvaluationDomainId::new(0);
+        let domain = EvaluationRegionId::new(0);
         let mut uses = Vec::new();
         let mut bindings = Vec::new();
         for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
@@ -1024,7 +1024,7 @@ mod scan_split {
             uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: id,
-                    domain,
+                    region: domain,
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -1034,7 +1034,7 @@ mod scan_split {
             bindings.push((*site, id));
         }
         let flow = ExpressionControlFlow::try_new(
-            vec![ExpressionEvaluationDomain {
+            vec![ExpressionEvaluationRegion {
                 id: domain,
                 parent: None,
                 guard: None,

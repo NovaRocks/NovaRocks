@@ -26,8 +26,8 @@ use novarocks_local_program::{
     ProgramUseRef,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDemand, EvaluationDomainId,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionUseId,
+    CompileControlError, CompilePhase, ControlShape, EvaluationDemand, EvaluationRegionId,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionUseId,
     MAX_CONTROL_USE_REFERENCES, PureCompileControl,
 };
 use std::{collections::BTreeSet, sync::Mutex};
@@ -56,7 +56,7 @@ impl Control {
 
 #[derive(Clone, Debug, PartialEq)]
 struct Records {
-    domains: Vec<ExpressionEvaluationDomain>,
+    domains: Vec<ExpressionEvaluationRegion>,
     uses: Vec<ProgramExpressionUse>,
     bindings: Vec<ProgramRootUseBinding>,
     slots: Vec<ProgramSlotBinding>,
@@ -95,8 +95,8 @@ impl Records {
     }
     fn sparse() -> Self {
         let domains = [0, u32::MAX, 3]
-            .map(|id| ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(id),
+            .map(|id| ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(id),
                 parent: None,
                 guard: None,
             })
@@ -105,7 +105,7 @@ impl Records {
             .map(|(id, domain)| ProgramExpressionUse {
                 context: ExpressionEffectContext {
                     use_id: ExpressionUseId::new(id),
-                    domain: EvaluationDomainId::new(domain),
+                    region: EvaluationRegionId::new(domain),
                     demand: EvaluationDemand::Value,
                 },
                 definition: ProgramExprId::new(0),
@@ -185,7 +185,7 @@ fn union_flow_sparse_max_ids_author_fresh_exact_root_contexts_and_channels() {
             invocation.context,
             ExpressionEffectContext {
                 use_id: ExpressionUseId::new(use_id),
-                domain: EvaluationDomainId::new(domain),
+                region: EvaluationRegionId::new(domain),
                 demand: EvaluationDemand::Value,
             }
         );
@@ -273,8 +273,8 @@ fn union_flow_duplicate_project_sources_keep_ordered_independent_occurrences() {
             ExpressionUseId::new(expected_id)
         );
         assert_eq!(
-            records.uses[index].context.domain,
-            EvaluationDomainId::new(expected_id)
+            records.uses[index].context.region,
+            EvaluationRegionId::new(expected_id)
         );
         assert_eq!(
             records.bindings[index].site,

@@ -612,7 +612,7 @@ fn lower_with_creation<
             .checked_add(derived_definitions)
             .is_none_or(|n| n > novarocks_type_contract::MAX_CONTROL_DEFINITIONS)
         || original_flow
-            .domains()
+            .regions()
             .len()
             .checked_add(derived_roots)
             .is_none_or(|n| n > novarocks_type_contract::MAX_CONTROL_DEFINITIONS)
@@ -2227,7 +2227,7 @@ fn lower_with_creation<
         None => None,
     };
     let mut domains = Vec::new();
-    for domain in package.expression_uses().flow().domains().values() {
+    for domain in package.expression_uses().flow().regions().values() {
         work.step()?;
         crate::creation::before_vec_push(
             &domains,

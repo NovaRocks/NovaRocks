@@ -75,7 +75,7 @@ fn four_ordered_operators_keep_exact_types_order_domain_and_consumer_demand() {
                     for (ordinal, definition) in [a, b].into_iter().enumerate() {
                         let child = &flow.uses()[&use_.arguments[ordinal]];
                         assert_eq!(child.definition, definition);
-                        assert_eq!(child.context.domain, use_.context.domain);
+                        assert_eq!(child.context.region, use_.context.region);
                         assert_eq!(child.context.demand, EvaluationDemand::Value);
                         assert_eq!(
                             source.expression_uses().flow().uses()[&child.context.use_id]
@@ -489,7 +489,7 @@ fn real_rand_operand_keeps_volatile_state_and_exact_frozen_effects_under_compari
             let call = calls.calls().values().next().unwrap();
             let context = call.call_contract().context();
             assert_eq!(context.use_id, invocation.arguments[0]);
-            assert_eq!(context.domain, invocation.context.domain);
+            assert_eq!(context.region, invocation.context.region);
             assert_eq!(context.demand, EvaluationDemand::Value);
             let summary = call.effects().for_use(context).unwrap();
             assert_eq!(summary.value_stability, FunctionVolatility::Volatile);

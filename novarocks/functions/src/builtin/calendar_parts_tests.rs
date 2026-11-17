@@ -29,7 +29,7 @@ use crate::{
 use arrow_array::{Int64Array, builder::FixedSizeBinaryBuilder};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
     FunctionNullBehavior, FunctionVolatility, PureCompileControl, SemanticParameters,
 };
 use std::{sync::Mutex, time::Duration};
@@ -231,7 +231,7 @@ fn calendar_parts_all_48_actual_records_preserve_fresh_frozen_selected_identity_
             );
             let context = ExpressionEffectContext {
                 use_id: ExpressionUseId::new(41),
-                domain: EvaluationDomainId::new(7),
+                region: EvaluationRegionId::new(7),
                 demand: EvaluationDemand::Value,
             };
             let parameters = SemanticParameters::try_new([]).unwrap();
@@ -246,7 +246,7 @@ fn calendar_parts_all_48_actual_records_preserve_fresh_frozen_selected_identity_
                 environment: &[],
                 parameters: &parameters,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             };
             let fresh = specialize_scalar(
                 &owner,
@@ -331,7 +331,7 @@ fn calendar_parts_all_48_actual_records_preserve_fresh_frozen_selected_identity_
                     .is_err()
             );
             stale = input;
-            stale.context.domain = EvaluationDomainId::new(999);
+            stale.context.region = EvaluationRegionId::new(999);
             assert!(
                 owner
                     .prepare_scalar(stale, canonical.clone(), crate::binding_test_control())

@@ -25,7 +25,7 @@ use arrow_array::{Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileCheckpoints, CompileControlError,
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
     SemanticParameters,
@@ -194,7 +194,7 @@ impl Owner {
         CallEffectInput {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(9),
+                region: EvaluationRegionId::new(9),
                 demand: EvaluationDemand::Value,
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
@@ -219,7 +219,7 @@ impl Owner {
                 phase,
                 state_context: ExpressionEffectContext {
                     use_id: ExpressionUseId::new(u32::MAX),
-                    domain: EvaluationDomainId::new(8),
+                    region: EvaluationRegionId::new(8),
                     demand: EvaluationDemand::Value,
                 },
                 state_input_type: &self.selected.aggregate.as_ref().unwrap().intermediate_type,

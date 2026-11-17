@@ -735,8 +735,8 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
     use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
     use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
     use novarocks_type_contract::{
-        ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-        ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+        ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
+        ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
         ExpressionInvocation, ExpressionUseId, control_argument_semantics,
     };
     use prost::Message;
@@ -1039,7 +1039,7 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
                 self.uses.push(ExpressionInvocation {
                     context: ExpressionEffectContext {
                         use_id: id,
-                        domain: EvaluationDomainId::new(0),
+                        region: EvaluationRegionId::new(0),
                         demand,
                     },
                     definition: expr,
@@ -1061,8 +1061,8 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
             .map(|(&site, root)| (site, author.visit(root.expr, root.demand)))
             .collect();
         let flow = ExpressionControlFlow::<ExprId>::try_new(
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
+            vec![ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(0),
                 parent: None,
                 guard: None,
             }],

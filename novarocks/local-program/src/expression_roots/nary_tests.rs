@@ -20,11 +20,11 @@
 use super::*;
 use crate::{
     BindingRequirements, CompileProfile, ExpressionsCompileError, KernelAbiVersion,
-    MAX_STATIC_EXPRESSION_DEPTH, ProgramControlFlowError, ProgramEvaluationDomain,
+    MAX_STATIC_EXPRESSION_DEPTH, ProgramControlFlowError, ProgramEvaluationRegion,
     ProgramExpressionUse, ProgramNode, StaticExprNode, StaticExpressionError, StaticLiteral,
 };
 use arrow_schema::DataType;
-use novarocks_type_contract::{EvaluationDomainId, ExpressionEffectContext};
+use novarocks_type_contract::{EvaluationRegionId, ExpressionEffectContext};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Mutex};
 
 #[derive(Default)]
@@ -78,7 +78,7 @@ fn invocation(use_id: u32, definition: usize, demand: EvaluationDemand) -> Progr
     ProgramExpressionUse {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(use_id),
-            domain: EvaluationDomainId::new(0),
+            region: EvaluationRegionId::new(0),
             demand,
         },
         definition: ProgramExprId::new(definition),
@@ -110,8 +110,8 @@ fn checked_flow(
     demand: EvaluationDemand,
 ) -> ProgramControlFlow {
     ProgramControlFlow::try_new(
-        vec![ProgramEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ProgramEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],
@@ -213,7 +213,7 @@ fn actual_nary_one_three_and_320_children_preserve_value_and_truth_only_occurren
                     assert!(seen.insert(*use_id));
                     assert_eq!(flow.uses()[use_id].definition, actual_args[ordinal]);
                     assert_eq!(flow.uses()[use_id].context.demand, demand);
-                    assert_eq!(flow.uses()[use_id].context.domain, root.context.domain);
+                    assert_eq!(flow.uses()[use_id].context.region, root.context.region);
                 }
             }
         }
@@ -235,8 +235,8 @@ fn nary_same_definition_repeats_keep_distinct_uses_and_reject_shared_invocation(
     shared[0].arguments[2] = first_use;
     assert_eq!(
         ProgramControlFlow::try_new(
-            vec![ProgramEvaluationDomain {
-                id: EvaluationDomainId::new(0),
+            vec![ProgramEvaluationRegion {
+                id: EvaluationRegionId::new(0),
                 parent: None,
                 guard: None
             }],
@@ -288,8 +288,8 @@ fn nary_child_demand_and_actual_root_site_demand_are_independently_checked() {
         wrong[2].context.demand = EvaluationDemand::Value;
         assert_eq!(
             ProgramControlFlow::try_new(
-                vec![ProgramEvaluationDomain {
-                    id: EvaluationDomainId::new(0),
+                vec![ProgramEvaluationRegion {
+                    id: EvaluationRegionId::new(0),
                     parent: None,
                     guard: None
                 }],

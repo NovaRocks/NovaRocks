@@ -339,7 +339,7 @@ impl NumericUnaryOwner {
         }
         if !input.environment.is_empty()
             || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                && input.proof_scope != CallProofScope::Region(input.context.region)
         {
             return Err(FunctionBindingError::InvalidBinding(
                 "numeric unary has no environment dependencies and requires an exact proof scope"
@@ -403,7 +403,7 @@ mod tests {
     };
     use arrow_schema::DataType;
     use novarocks_type_contract::{
-        CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+        CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
         ExpressionEffectContext, ExpressionUseId, SemanticParameterId, SemanticParameterKey,
         SemanticParameterRef, SemanticParameters, ValueLogicalType,
     };
@@ -424,7 +424,7 @@ mod tests {
     fn context() -> ExpressionEffectContext {
         ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         }
     }
@@ -717,7 +717,7 @@ mod tests {
         let uses = [Some(ExpressionUseId::new(42))];
         let input = input(&owner, &selected, &arguments, &parameters, &uses);
         let mut foreign = input;
-        foreign.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+        foreign.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
         assert!(matches!(
             owner.validate_and_refine(foreign, crate::binding_test_control()),
             Err(FunctionEffectOwnerError::Owner(
@@ -746,13 +746,13 @@ mod tests {
             ))
         ));
         let mut exact_domain = input;
-        exact_domain.proof_scope = CallProofScope::Domain(context().domain);
+        exact_domain.proof_scope = CallProofScope::Region(context().region);
         assert_eq!(
             owner
                 .validate_and_refine(exact_domain, crate::binding_test_control())
                 .unwrap()
                 .proof_scope,
-            CallProofScope::Domain(context().domain)
+            CallProofScope::Region(context().region)
         );
     }
 

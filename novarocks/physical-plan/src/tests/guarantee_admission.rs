@@ -22,8 +22,8 @@ use std::sync::{
 
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase, ControlShape,
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     FunctionInstanceState, FunctionNullBehavior, ObservableEffects, PureCompileControl,
 };
 
@@ -104,7 +104,7 @@ fn add_invocation(
     invocations.push(ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: id,
-            domain: EvaluationDomainId::new(0),
+            region: EvaluationRegionId::new(0),
             demand,
         },
         definition: expression,
@@ -139,8 +139,8 @@ fn fixture_uses_and_calls(fragment: &Fragment) -> (PhysicalRootUses, FrozenFragm
         ));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],

@@ -24,7 +24,7 @@ use crate::{
 use arrow_array::{ArrayRef, NullArray};
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
-    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, NR_LOGICAL_TYPE_KEY, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameters, ValueLogicalType,
 };
@@ -50,7 +50,7 @@ fn large(nullable: bool) -> FunctionValueType {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     }
 }
@@ -89,7 +89,7 @@ fn input<'a>(
         environment: &[],
         parameters,
         decimal_overflow_policy: policy,
-        proof_scope: CallProofScope::Domain(context().domain),
+        proof_scope: CallProofScope::Region(context().region),
     }
 }
 pub(super) fn prepare(
@@ -478,7 +478,7 @@ fn frozen_facts_and_prepare_cannot_replace_overload_owner_pointer_scope_context_
         ))
     ));
     wrong = exact;
-    wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+    wrong.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
     assert!(
         owner
             .validate_and_refine(wrong, crate::binding_test_control())
@@ -819,7 +819,7 @@ fn conversion_owner_captured_contract_and_nested_binding_errors_have_no_later_co
                 match mismatch {
                     0 => wrong.function_id = &foreign,
                     1 => wrong.kind = FunctionKind::Aggregate,
-                    2 => wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(999)),
+                    2 => wrong.proof_scope = CallProofScope::Region(EvaluationRegionId::new(999)),
                     _ => unreachable!(),
                 }
                 let control = compile_trace();
@@ -1074,7 +1074,7 @@ fn conversion_recipe_refuses_a_real_foreign_canonical_kernel_without_a_later_cal
         environment: &[],
         parameters: &parameters,
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context().domain),
+        proof_scope: CallProofScope::Region(context().region),
     };
     let foreign = catalog
         .prepare_fresh_selected(

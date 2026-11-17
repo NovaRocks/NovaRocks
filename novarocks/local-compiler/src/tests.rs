@@ -21,7 +21,7 @@ use bytes::Bytes;
 use novarocks_connector_contract::*;
 use novarocks_physical_plan::*;
 use novarocks_type_contract::{
-    EvaluationDomainId, ExpressionControlFlow, ExpressionEvaluationDomain, SemanticParameters,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionEvaluationRegion, SemanticParameters,
     ValueLogicalType,
 };
 use std::{
@@ -492,8 +492,8 @@ fn checked_package(
         )
         .unwrap();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],

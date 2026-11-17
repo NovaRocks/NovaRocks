@@ -21,7 +21,7 @@ use crate::{ConstantPolicy, ConstantPool, KernelDiagnostic, SelectedValues, Sele
 use arrow_array::{ArrayRef, ListArray, NullArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::Field;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -364,7 +364,7 @@ fn list_cast_recipe_no_new_row_error_and_explicit_unsupported_child_forms() {
     let r = recipe(&a, &ty, DecimalOverflowPolicy::OutputNull, false);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(1),
-        domain: EvaluationDomainId::new(2),
+        region: EvaluationRegionId::new(2),
         demand: EvaluationDemand::Value,
     };
     assert!(

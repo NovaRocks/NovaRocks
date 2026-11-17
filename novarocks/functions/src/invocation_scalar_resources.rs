@@ -619,7 +619,7 @@ mod tests {
     fn prepare_original_json(types: &[DataType]) -> Arc<dyn crate::PreparedInvocationScalarKernel> {
         use crate::*;
         use novarocks_type_contract::{
-            CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+            CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
             ExpressionEffectContext, ExpressionUseId, SemanticParameters,
         };
         let catalog = crate::builtin::catalogue::builtin_engine_function_catalog();
@@ -647,7 +647,7 @@ mod tests {
         );
         let context = ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         };
         let uses: Vec<_> = (0..types.len())

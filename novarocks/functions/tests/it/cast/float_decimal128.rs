@@ -28,7 +28,7 @@ use novarocks_type_contract::DecimalOverflowPolicy;
 use novarocks_type_contract::ExpressionEffectContext;
 use novarocks_type_contract::FunctionValueType;
 use novarocks_type_contract::PureCompileControl;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -83,7 +83,7 @@ fn recipe(p: u8, s: i8, nullable: bool) -> PreparedCastRecipe {
 fn float_decimal128_complete_metadata_effect_nullable_and_policy() {
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(1),
-        domain: EvaluationDomainId::new(2),
+        region: EvaluationRegionId::new(2),
         demand: EvaluationDemand::Value,
     };
     for p in 1..=38 {

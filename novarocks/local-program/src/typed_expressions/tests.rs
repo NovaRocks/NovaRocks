@@ -18,7 +18,7 @@
 use super::*;
 use crate::{
     BindingRequirement, BindingRequirements, CompileProfile, ControlShape, ImmutableExpressions,
-    KernelAbiVersion, LocalProgramGraph, ProgramControlFlow, ProgramEvaluationDomain,
+    KernelAbiVersion, LocalProgramGraph, ProgramControlFlow, ProgramEvaluationRegion,
     ProgramExpressionRootSite, ProgramExpressionUse, ProgramNode, ProgramNodeExpressionRole,
     ProgramNodeId, ProgramNodeKind, ProgramRootControlBindings, ProgramRootUseBinding,
     StaticExprNode, StaticLayout, StaticLiteral, StaticSinkProgram, StaticStreamBranch,
@@ -27,7 +27,7 @@ use crate::{
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_execution_contract::DataStreamPartitionType;
-use novarocks_type_contract::{EvaluationDomainId, ValueLogicalType};
+use novarocks_type_contract::{EvaluationRegionId, ValueLogicalType};
 use novarocks_types::SlotId;
 use std::{collections::HashMap, num::NonZeroUsize};
 
@@ -101,8 +101,8 @@ fn shared_truth_value_fixture(ty: DataType) -> ProgramResolvedCalls {
     )
     .unwrap();
     let flow = ProgramControlFlow::try_new(
-        vec![ProgramEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ProgramEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],
@@ -112,7 +112,7 @@ fn shared_truth_value_fixture(ty: DataType) -> ProgramResolvedCalls {
             .map(|(index, demand)| ProgramExpressionUse {
                 context: novarocks_type_contract::ExpressionEffectContext {
                     use_id: novarocks_type_contract::ExpressionUseId::new(index as u32),
-                    domain: EvaluationDomainId::new(0),
+                    region: EvaluationRegionId::new(0),
                     demand,
                 },
                 definition: ProgramExprId::new(0),
@@ -211,8 +211,8 @@ fn value(ty: DataType, nullable: bool) -> FunctionArgumentType {
 }
 fn empty_flow(count: usize) -> ProgramControlFlow {
     ProgramControlFlow::try_new(
-        vec![ProgramEvaluationDomain {
-            id: EvaluationDomainId::new(u32::MAX),
+        vec![ProgramEvaluationRegion {
+            id: EvaluationRegionId::new(u32::MAX),
             parent: None,
             guard: None,
         }],

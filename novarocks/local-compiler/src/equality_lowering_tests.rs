@@ -35,9 +35,9 @@ use novarocks_physical_plan::{
     ValueOrigin,
 };
 use novarocks_type_contract::{
-    CallProofScope, ControlShape, DecimalOverflowPolicy, DomainGuard, EvaluationDemand,
-    EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, FunctionValueType, FunctionVolatility,
+    CallProofScope, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
+    ExpressionInvocation, ExpressionUseId, FunctionValueType, FunctionVolatility, RegionGuard,
     SemanticParameters, ValueLogicalType, control_argument_semantics,
 };
 use std::{num::NonZeroUsize, sync::Mutex};
@@ -363,16 +363,16 @@ fn fixture(
 fn uses(fixture: &Fixture) -> PhysicalRootUses {
     struct Author {
         next_use: u32,
-        next_domain: u32,
+        next_region: u32,
         uses: Vec<ExpressionInvocation<ExprId>>,
-        domains: Vec<ExpressionEvaluationDomain>,
+        domains: Vec<ExpressionEvaluationRegion>,
     }
     impl Author {
         fn visit(
             &mut self,
             fixture: &Fixture,
             expr: ExprId,
-            domain: EvaluationDomainId,
+            domain: EvaluationRegionId,
             demand: EvaluationDemand,
         ) -> ExpressionUseId {
             let id = ExpressionUseId::new(self.next_use);
@@ -409,25 +409,25 @@ fn uses(fixture: &Fixture) -> PhysicalRootUses {
                 .map(|(ordinal, &child)| {
                     let (child_demand, guard) =
                         control_argument_semantics(shape, args.len(), ordinal, demand).unwrap();
-                    let child_domain = if let Some(kind) = guard {
-                        let child_domain = EvaluationDomainId::new(self.next_domain);
-                        self.next_domain += 13;
-                        self.domains.push(ExpressionEvaluationDomain {
-                            id: child_domain,
+                    let child_region = if let Some(kind) = guard {
+                        let child_region = EvaluationRegionId::new(self.next_region);
+                        self.next_region += 13;
+                        self.domains.push(ExpressionEvaluationRegion {
+                            id: child_region,
                             parent: Some(domain),
-                            guard: Some(DomainGuard { owner: id, kind }),
+                            guard: Some(RegionGuard { owner: id, kind }),
                         });
-                        child_domain
+                        child_region
                     } else {
                         domain
                     };
-                    self.visit(fixture, child, child_domain, child_demand)
+                    self.visit(fixture, child, child_region, child_demand)
                 })
                 .collect::<Vec<_>>();
             self.uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: id,
-                    domain,
+                    region: domain,
                     demand,
                 },
                 definition: expr,
@@ -437,12 +437,12 @@ fn uses(fixture: &Fixture) -> PhysicalRootUses {
             id
         }
     }
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let domain = EvaluationRegionId::new(u32::MAX);
     let mut author = Author {
         next_use: 7,
-        next_domain: 8,
+        next_region: 8,
         uses: vec![],
-        domains: vec![ExpressionEvaluationDomain {
+        domains: vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -569,7 +569,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    proof_scope: CallProofScope::Domain(invocation.context.domain),
+                    proof_scope: CallProofScope::Region(invocation.context.region),
                 },
                 selected.clone(),
                 PureCallPreparation::Scalar {
@@ -744,7 +744,7 @@ fn binary_eq_and_not_eq_have_mandatory_recipes_for_exact_ordered_child_uses() {
                         let child = &flow.uses()[&invocation.arguments[ordinal]];
                         assert_eq!(child.definition, definition);
                         assert_eq!(child.context.demand, EvaluationDemand::Value);
-                        assert_eq!(child.context.domain, invocation.context.domain);
+                        assert_eq!(child.context.region, invocation.context.region);
                         assert_eq!(
                             source.expression_uses().flow().uses()[&child.context.use_id]
                                 .definition,

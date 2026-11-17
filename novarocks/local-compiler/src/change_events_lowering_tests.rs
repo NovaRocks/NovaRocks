@@ -33,8 +33,8 @@ use novarocks_physical_plan::{
     RequiredContracts, ResultField, ResultPort, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     FunctionValueType, PureCompileControl, SemanticParameters,
 };
 use std::{
@@ -348,7 +348,7 @@ fn try_fixture(
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let domain = EvaluationRegionId::new(u32::MAX);
     let mut uses = Vec::new();
     let mut bindings = Vec::new();
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
@@ -356,7 +356,7 @@ fn try_fixture(
         uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain,
+                region: domain,
                 demand: root.demand,
             },
             definition: root.expr,
@@ -366,7 +366,7 @@ fn try_fixture(
         bindings.push((*site, id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

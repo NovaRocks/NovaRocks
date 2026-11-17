@@ -26,7 +26,7 @@ use arrow_schema::{DataType, Field, Schema};
 use novarocks_connector_contract::WriteTargetOrdinal;
 use novarocks_functions::*;
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CallProofScope, DecimalOverflowPolicy, EvaluationDomainId,
+    ArgumentControl, CallEffects, CallProofScope, DecimalOverflowPolicy, EvaluationRegionId,
     ExpressionEffectContext, FunctionEffectDeclaration, FunctionInstanceState,
     FunctionNullBehavior, ObservableEffects, SemanticParameters, WindowFrame as CommonWindowFrame,
 };
@@ -349,7 +349,7 @@ impl<'owner> Call<'owner> {
         CallEffectInput {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(self.context_id),
-                domain: EvaluationDomainId::new(1),
+                region: EvaluationRegionId::new(1),
                 demand: EvaluationDemand::Value,
             },
             argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&self.uses),
@@ -374,7 +374,7 @@ impl<'owner> Call<'owner> {
                 phase,
                 state_context: ExpressionEffectContext {
                     use_id: ExpressionUseId::new(0),
-                    domain: EvaluationDomainId::new(2),
+                    region: EvaluationRegionId::new(2),
                     demand: EvaluationDemand::Value,
                 },
                 state_input_type: &self.state_input_type,
@@ -897,7 +897,7 @@ pub(crate) fn snapshot(program: LocalProgramGraph) -> ProgramRootControlBindings
             uses.push(ProgramExpressionUse {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain: EvaluationDomainId::new(1),
+                    region: EvaluationRegionId::new(1),
                     demand: root.demand,
                 },
                 definition: root.definition,
@@ -912,8 +912,8 @@ pub(crate) fn snapshot(program: LocalProgramGraph) -> ProgramRootControlBindings
         flows.insert(
             *arena,
             ProgramControlFlow::try_new(
-                vec![ProgramEvaluationDomain {
-                    id: EvaluationDomainId::new(1),
+                vec![ProgramEvaluationRegion {
+                    id: EvaluationRegionId::new(1),
                     parent: None,
                     guard: None,
                 }],

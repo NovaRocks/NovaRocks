@@ -18,8 +18,8 @@
 use super::*;
 use crate::*;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEvaluationDomain, FunctionArgumentEvaluation, FunctionFailureBehavior,
+    CompileControlError, CompilePhase, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEvaluationRegion, FunctionArgumentEvaluation, FunctionFailureBehavior,
     FunctionIntrinsicRowError, FunctionVolatility, PureCompileControl,
 };
 use std::sync::Mutex;
@@ -323,8 +323,8 @@ fn structure_stage_defers_property_derivation_but_definition_and_package_still_r
     );
     let setup = Control::default();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],

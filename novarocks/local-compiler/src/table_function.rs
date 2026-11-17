@@ -835,7 +835,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             .ok_or(ExpressionLoweringError::Invalid(
                 "table argument root has no invocation",
             ))?;
-        let domain = flow.domains().get(&invocation.context.domain);
+        let domain = flow.regions().get(&invocation.context.region);
         work.step()?;
         let exact = invocation.definition == definition
             && invocation.context.use_id == use_id

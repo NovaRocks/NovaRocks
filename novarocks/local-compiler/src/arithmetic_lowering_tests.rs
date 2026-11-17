@@ -35,8 +35,8 @@ use novarocks_physical_plan::{
     ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    ArithmeticOperator, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    ArithmeticOperator, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, ExpressionUseId, FunctionValueType, SemanticParameterError,
     SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
     SemanticParameters, arithmetic_result_value_type_with_op,
@@ -305,7 +305,7 @@ fn uses(fragment: &Fragment) -> PhysicalRootUses {
     fn visit(
         fragment: &Fragment,
         definition: ExprId,
-        domain: EvaluationDomainId,
+        domain: EvaluationRegionId,
         demand: EvaluationDemand,
         next: &mut u32,
         output: &mut Vec<ExpressionInvocation<ExprId>>,
@@ -333,7 +333,7 @@ fn uses(fragment: &Fragment) -> PhysicalRootUses {
         output.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id,
-                domain,
+                region: domain,
                 demand,
             },
             definition,
@@ -342,7 +342,7 @@ fn uses(fragment: &Fragment) -> PhysicalRootUses {
         });
         use_id
     }
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let domain = EvaluationRegionId::new(u32::MAX);
     let mut next = 7;
     let mut invocations = Vec::new();
     let roots = PhysicalExpressionRoots::try_new(fragment, &Control).unwrap();
@@ -364,7 +364,7 @@ fn uses(fragment: &Fragment) -> PhysicalRootUses {
         })
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -561,7 +561,7 @@ fn signed_arithmetic_compiles_exact_ordered_types_policies_scopes_and_lexical_so
                 ] {
                     let child = &flow.uses()[&invocation.arguments[ordinal]];
                     assert_eq!(child.definition, local);
-                    assert_eq!(child.context.domain, invocation.context.domain);
+                    assert_eq!(child.context.region, invocation.context.region);
                     assert_eq!(child.context.demand, EvaluationDemand::Value);
                     assert_eq!(
                         source.expression_uses().flow().uses()[&child.context.use_id].definition,

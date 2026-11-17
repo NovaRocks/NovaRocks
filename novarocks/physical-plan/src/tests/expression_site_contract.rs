@@ -17,8 +17,8 @@
 
 use super::*;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    CompileControlError, CompilePhase, ControlShape, EvaluationDemand, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, ExpressionUseId, PureCompileControl,
 };
 use std::{collections::BTreeMap, sync::Mutex};
@@ -108,9 +108,9 @@ fn graph(
     fragment: &Fragment,
     definitions: &[(u32, ExprId, EvaluationDemand)],
 ) -> ExpressionControlFlow<ExprId> {
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let domain = EvaluationRegionId::new(u32::MAX);
     ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -120,7 +120,7 @@ fn graph(
             .map(|(id, definition, demand)| ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: ExpressionUseId::new(*id),
-                    domain,
+                    region: domain,
                     demand: *demand,
                 },
                 definition: *definition,
@@ -528,11 +528,11 @@ fn an_argument_use_cannot_replace_an_operator_root() {
     let fragment = fragment(NodeKind::Filter {
         predicates: Box::from([expr(), expr()]),
     });
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let invoke = |id, arguments| ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain,
+            region: domain,
             demand: EvaluationDemand::TruthOnly,
         },
         definition: expr(),
@@ -544,7 +544,7 @@ fn an_argument_use_cannot_replace_an_operator_root() {
     let mut other = invoke(u32::MAX, Box::default());
     other.control = ControlShape::Eager;
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -605,17 +605,17 @@ fn operator_roots_cannot_escape_from_a_lambda_lexical_scope() {
 
 #[test]
 fn a_guarded_disconnected_use_cannot_become_an_operator_root() {
-    use novarocks_type_contract::{DomainGuard, GuardKind};
+    use novarocks_type_contract::{GuardKind, RegionGuard};
     let fragment = fragment(NodeKind::Filter {
         predicates: Box::from([expr(), expr()]),
     });
-    let domain = EvaluationDomainId::new(0);
-    let branch = EvaluationDomainId::new(1);
-    let otherwise = EvaluationDomainId::new(2);
+    let domain = EvaluationRegionId::new(0);
+    let branch = EvaluationRegionId::new(1);
+    let otherwise = EvaluationRegionId::new(2);
     let invoke = |id, domain| ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain,
+            region: domain,
             demand: EvaluationDemand::TruthOnly,
         },
         definition: expr(),
@@ -629,17 +629,17 @@ fn a_guarded_disconnected_use_cannot_become_an_operator_root() {
         ExpressionUseId::new(92),
         ExpressionUseId::new(93),
     ]);
-    let guarded = |id, kind| ExpressionEvaluationDomain {
+    let guarded = |id, kind| ExpressionEvaluationRegion {
         id,
         parent: Some(domain),
-        guard: Some(DomainGuard {
+        guard: Some(RegionGuard {
             owner: owner.context.use_id,
             kind,
         }),
     };
     let flow = ExpressionControlFlow::try_new(
         vec![
-            ExpressionEvaluationDomain {
+            ExpressionEvaluationRegion {
                 id: domain,
                 parent: None,
                 guard: None,
@@ -713,7 +713,7 @@ fn conjunct_uses(
     eager_root: bool,
     swapped: bool,
 ) -> Result<PhysicalRootUses, RootUseBindingError> {
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let demand = if eager_root {
         EvaluationDemand::Value
     } else {
@@ -722,7 +722,7 @@ fn conjunct_uses(
     let invoke = |id, definition, control, arguments, demand| ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain,
+            region: domain,
             demand,
         },
         definition,
@@ -735,7 +735,7 @@ fn conjunct_uses(
         vec![ExpressionUseId::new(51), ExpressionUseId::new(52)]
     };
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -947,11 +947,11 @@ fn positive_conjunct_paths_do_not_cross_not_or_null_testing() {
             runtime_filters: source.runtime_filters().into(),
             call_requests: source.call_requests().clone(),
         });
-        let domain = EvaluationDomainId::new(0);
+        let domain = EvaluationRegionId::new(0);
         let invoke = |id, definition, demand, arguments| ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(id),
-                domain,
+                region: domain,
                 demand,
             },
             definition,
@@ -959,7 +959,7 @@ fn positive_conjunct_paths_do_not_cross_not_or_null_testing() {
             arguments,
         };
         let flow = ExpressionControlFlow::try_new(
-            vec![ExpressionEvaluationDomain {
+            vec![ExpressionEvaluationRegion {
                 id: domain,
                 parent: None,
                 guard: None,
@@ -1029,12 +1029,12 @@ fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
         runtime_filters: source.runtime_filters().into(),
         call_requests: source.call_requests().clone(),
     });
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let invocations = (0..depth as u32)
         .map(|index| ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(index),
-                domain,
+                region: domain,
                 demand: EvaluationDemand::TruthOnly,
             },
             definition: ExprId::new(index),
@@ -1051,7 +1051,7 @@ fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
         })
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

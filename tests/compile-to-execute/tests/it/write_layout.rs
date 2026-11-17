@@ -31,8 +31,8 @@ use novarocks_local_program::{
 use novarocks_physical_plan::*;
 use novarocks_test_compile_to_execute::compiler_results::compile_options;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     PureCompileControl, SemanticParameters,
 };
 use std::{collections::BTreeMap, sync::Arc};
@@ -134,7 +134,7 @@ fn sender_package() -> FragmentPackage {
 
     let control = &Control;
     let roots = PhysicalExpressionRoots::try_new(&fragment, control).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut invocations = Vec::new();
     let bindings = roots
         .sites()
@@ -145,7 +145,7 @@ fn sender_package() -> FragmentPackage {
             invocations.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain,
+                    region: domain,
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -156,7 +156,7 @@ fn sender_package() -> FragmentPackage {
         })
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

@@ -28,7 +28,7 @@ use arrow_array::{ArrayRef, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionEffectDeclaration,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionEffectDeclaration,
     FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError,
     FunctionNullBehavior, FunctionValueType, FunctionVolatility, ObservableEffects,
     SemanticParameters, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
@@ -125,7 +125,7 @@ impl Owner {
         CallEffectInput {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(7),
+                region: EvaluationRegionId::new(7),
                 demand: EvaluationDemand::Value,
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),

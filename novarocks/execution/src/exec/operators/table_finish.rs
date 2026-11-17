@@ -4823,8 +4823,8 @@ mod tests {
         };
         use novarocks_type_contract::{
             CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-            EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-            ExpressionEffects, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+            EvaluationDemand, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+            ExpressionEffects, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
             FunctionValueType, PureCompileControl, SemanticParameters,
         };
         use std::collections::BTreeMap;
@@ -5184,7 +5184,7 @@ mod tests {
                 uses.push(ExpressionInvocation {
                     context: ExpressionEffectContext {
                         use_id: id,
-                        domain: EvaluationDomainId::new(0),
+                        region: EvaluationRegionId::new(0),
                         demand: root.demand,
                     },
                     definition: root.expr,
@@ -5194,8 +5194,8 @@ mod tests {
                 bindings.push((*site, id));
             }
             let mut next_use = u32::try_from(uses.len()).unwrap();
-            let mut domains = vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
+            let mut domains = vec![ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(0),
                 parent: None,
                 guard: None,
             }];
@@ -5221,11 +5221,11 @@ mod tests {
                     let mut context = || {
                         let context = ExpressionEffectContext {
                             use_id: ExpressionUseId::new(next_use),
-                            domain: EvaluationDomainId::new(domains.len() as u32),
+                            region: EvaluationRegionId::new(domains.len() as u32),
                             demand: EvaluationDemand::Value,
                         };
-                        domains.push(ExpressionEvaluationDomain {
-                            id: context.domain,
+                        domains.push(ExpressionEvaluationRegion {
+                            id: context.region,
                             parent: None,
                             guard: None,
                         });
@@ -5310,7 +5310,7 @@ mod tests {
                                 environment: &[],
                                 parameters: &parameters,
                                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                                proof_scope: CallProofScope::Domain(context.domain),
+                                proof_scope: CallProofScope::Region(context.region),
                             },
                             Arc::clone(&selected),
                             PureCallPreparation::Aggregate {
@@ -6008,7 +6008,7 @@ mod tests {
             flows.insert(
                 lp::ProgramExpressionArena::Main,
                 lp::ProgramControlFlow::try_new(
-                    main.domains().values().cloned().collect(),
+                    main.regions().values().cloned().collect(),
                     uses,
                     graph.expressions().nodes().len(),
                     &FixtureControl,

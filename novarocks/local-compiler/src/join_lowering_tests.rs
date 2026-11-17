@@ -44,8 +44,8 @@ use novarocks_physical_plan::{
     ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, ExpressionUseId, FunctionValueType, PureCompileControl,
     SemanticParameters, control_argument_semantics,
 };
@@ -431,7 +431,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         fn visit(
             &mut self,
             expr: ExprId,
-            domain: EvaluationDomainId,
+            domain: EvaluationRegionId,
             demand: novarocks_type_contract::EvaluationDemand,
         ) -> ExpressionUseId {
             let id = ExpressionUseId::new(self.next);
@@ -459,7 +459,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             self.uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: id,
-                    domain,
+                    region: domain,
                     demand,
                 },
                 definition: expr,
@@ -469,7 +469,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             id
         }
     }
-    let domain = EvaluationDomainId::new(5);
+    let domain = EvaluationRegionId::new(5);
     let mut author = Author {
         fragment,
         next: 7,
@@ -482,7 +482,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         .map(|(&site, root)| (site, author.visit(root.expr, domain, root.demand)))
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

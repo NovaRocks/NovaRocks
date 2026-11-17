@@ -48,10 +48,10 @@ use novarocks_physical_plan::{
     passthrough_requirement,
 };
 use novarocks_type_contract::{
-    CallProofScope, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, DomainGuard,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEffects, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    FunctionValueType, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
+    CallProofScope, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
+    RegionGuard, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
     SemanticParameterValue, SemanticParameters, arithmetic_result_value_type_with_op,
     control_argument_semantics,
 };
@@ -509,15 +509,15 @@ fn finish(builder: FragmentBuilder, root: NodeId, sink: FragmentSink, max_dop: u
 struct Author<'a> {
     fragment: &'a Fragment,
     next_use: u32,
-    next_domain: u32,
+    next_region: u32,
     uses: Vec<ExpressionInvocation<ExprId>>,
-    domains: Vec<ExpressionEvaluationDomain>,
+    domains: Vec<ExpressionEvaluationRegion>,
 }
 impl Author<'_> {
     fn visit(
         &mut self,
         expr: ExprId,
-        domain: EvaluationDomainId,
+        domain: EvaluationRegionId,
         demand: EvaluationDemand,
     ) -> ExpressionUseId {
         let id = ExpressionUseId::new(self.next_use);
@@ -537,25 +537,25 @@ impl Author<'_> {
         for (ordinal, child) in children.iter().enumerate() {
             let (child_demand, guard) =
                 control_argument_semantics(shape, children.len(), ordinal, demand).unwrap();
-            let child_domain = match guard {
+            let child_region = match guard {
                 Some(kind) => {
-                    let child_domain = EvaluationDomainId::new(self.next_domain);
-                    self.next_domain += 1;
-                    self.domains.push(ExpressionEvaluationDomain {
-                        id: child_domain,
+                    let child_region = EvaluationRegionId::new(self.next_region);
+                    self.next_region += 1;
+                    self.domains.push(ExpressionEvaluationRegion {
+                        id: child_region,
                         parent: Some(domain),
-                        guard: Some(DomainGuard { owner: id, kind }),
+                        guard: Some(RegionGuard { owner: id, kind }),
                     });
-                    child_domain
+                    child_region
                 }
                 None => domain,
             };
-            arguments.push(self.visit(*child, child_domain, child_demand));
+            arguments.push(self.visit(*child, child_region, child_demand));
         }
         self.uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain,
+                region: domain,
                 demand,
             },
             definition: expr,
@@ -574,13 +574,13 @@ fn freeze(
     parameters: &SemanticParameters,
 ) -> (PhysicalRootUses, FrozenFragmentCalls) {
     let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut author = Author {
         fragment,
         next_use: 0,
-        next_domain: 1,
+        next_region: 1,
         uses: Vec::new(),
-        domains: vec![ExpressionEvaluationDomain {
+        domains: vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -599,11 +599,11 @@ fn freeze(
             let k = u32::try_from(sites.len()).unwrap();
             let context = ExpressionEffectContext {
                 use_id: ExpressionUseId::new(RELATIONAL_USE + k),
-                domain: EvaluationDomainId::new(RELATIONAL_DOMAIN + k),
+                region: EvaluationRegionId::new(RELATIONAL_DOMAIN + k),
                 demand: EvaluationDemand::Value,
             };
-            domains.push(ExpressionEvaluationDomain {
-                id: context.domain,
+            domains.push(ExpressionEvaluationRegion {
+                id: context.region,
                 parent: None,
                 guard: None,
             });
@@ -677,7 +677,7 @@ fn freeze(
                     environment: &[],
                     parameters,
                     decimal_overflow_policy: POLICY,
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Region(context.region),
                 },
                 Arc::clone(&selection),
                 PureCallPreparation::Table {

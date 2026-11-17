@@ -316,7 +316,7 @@ fn assert_case_domains(program: &LocalProgram, has_else: bool) {
                 EvaluationDemand::Value
             }
         );
-        assert_ne!(actual.context.domain, invocation.context.domain);
+        assert_ne!(actual.context.region, invocation.context.region);
         let expected = if ordinal == 4 {
             novarocks_type_contract::GuardKind::CaseElse
         } else if ordinal % 2 == 0 {
@@ -329,8 +329,8 @@ fn assert_case_domains(program: &LocalProgram, has_else: bool) {
             }
         };
         assert_eq!(
-            flow.domains()[&actual.context.domain].guard,
-            Some(DomainGuard {
+            flow.regions()[&actual.context.region].guard,
+            Some(RegionGuard {
                 owner: invocation.context.use_id,
                 kind: expected
             })

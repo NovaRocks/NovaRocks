@@ -25,7 +25,7 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, SemanticParameters, WindowBound, WindowFrame,
     WindowFrameExclusion, WindowFrameUnits,
 };
@@ -90,7 +90,7 @@ fn causes() -> [KernelFailure; 7] {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     }
 }
@@ -154,7 +154,7 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Domain(context().domain),
+            proof_scope: CallProofScope::Region(context().region),
         }
     }
     fn preparation(&self, ignore: bool) -> PureCallPreparation {

@@ -23,7 +23,7 @@ use crate::*;
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     SemanticParameters, ValueLogicalType,
 };
 use std::sync::Arc;
@@ -62,7 +62,7 @@ fn prepare(
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(51),
+        region: EvaluationRegionId::new(51),
         demand: EvaluationDemand::Value,
     };
     let parameters = SemanticParameters::default();
@@ -78,7 +78,7 @@ fn prepare(
             phase,
             state_context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(61),
-                domain: EvaluationDomainId::new(71),
+                region: EvaluationRegionId::new(71),
                 demand: EvaluationDemand::Value,
             },
             state_input_type: &state,
@@ -95,7 +95,7 @@ fn prepare(
             parameters: &parameters,
             environment: &[],
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         },
         Arc::clone(&selected),
         PureCallPreparation::Aggregate {

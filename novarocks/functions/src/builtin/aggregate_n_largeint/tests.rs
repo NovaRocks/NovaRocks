@@ -24,7 +24,7 @@ use crate::builtin::catalogue::builtin_engine_function_catalog;
 use arrow_array::{Int64Array, ListArray};
 use novarocks_type_contract::{
     CallEffects, CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionEffectDeclaration,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionEffectDeclaration,
     SemanticParameters,
 };
 
@@ -154,7 +154,7 @@ fn source_with(
     let parameters = SemanticParameters::default();
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(42),
-        domain: EvaluationDomainId::new(42),
+        region: EvaluationRegionId::new(42),
         demand: EvaluationDemand::Value,
     };
     let input = CallEffectInput {
@@ -167,7 +167,7 @@ fn source_with(
         parameters: &parameters,
         environment: &[],
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context.domain),
+        proof_scope: CallProofScope::Region(context.region),
     };
     let receipt = refine_call_effects(&fixture, input, &Compile).unwrap();
     Arc::new(

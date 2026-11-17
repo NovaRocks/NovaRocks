@@ -29,7 +29,7 @@ use arrow_array::{ArrayRef, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompileControlError,
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
     SemanticParameters, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
@@ -206,7 +206,7 @@ impl Fixture {
         CallEffectInput {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(9),
+                region: EvaluationRegionId::new(9),
                 demand: EvaluationDemand::Value,
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.argument_uses),
@@ -1290,7 +1290,7 @@ fn wrong_kind_frozen_scope_and_returned_contract_reject_at_correct_preparation_b
         Err(FunctionSpecializationFailure::InvalidInput(_))
     ));
     let mut context = input.context;
-    context.domain = EvaluationDomainId::new(99);
+    context.region = EvaluationRegionId::new(99);
     assert!(matches!(
         specialize_window(
             &owner,

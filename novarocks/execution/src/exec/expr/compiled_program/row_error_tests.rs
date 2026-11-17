@@ -45,8 +45,8 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
+    EvaluationDemand, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
     PureCompileControl, SemanticParameters,
 };
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
@@ -316,7 +316,7 @@ fn invocation(
     out.push(ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: id,
-            domain: EvaluationDomainId::new(91),
+            region: EvaluationRegionId::new(91),
             demand,
         },
         definition: expr,
@@ -516,8 +516,8 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         })
         .collect();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(91),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(91),
             parent: None,
             guard: None,
         }],
@@ -538,7 +538,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         let scoped = if let Some(author) = authors.get(&invocation.definition) {
             let mut children = ScopedExpressionEffects::pure_value(context);
             for child in &invocation.arguments {
-                children = children.join_same_domain(effects[child]).unwrap();
+                children = children.join_same_region(effects[child]).unwrap();
             }
             let argument_uses = invocation
                 .arguments
@@ -559,7 +559,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
                         environment: &[],
                         parameters: &parameters,
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(context.domain),
+                        proof_scope: CallProofScope::Region(context.region),
                     },
                     author.selected.clone(),
                     PureCallPreparation::Scalar {

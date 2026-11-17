@@ -582,10 +582,10 @@ fn p05_float32_precision_policy_and_date_epoch_extrema_are_independent() {
 
 #[test]
 fn p05_extended_preparation_types_nullability_and_effects_follow_each_semantic_branch() {
-    use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+    use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(1),
-        domain: EvaluationDomainId::new(0),
+        region: EvaluationRegionId::new(0),
         demand: EvaluationDemand::Value,
     };
     // A tag specifies the independently stated successful-NULL/error contract,

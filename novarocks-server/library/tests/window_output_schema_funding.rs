@@ -280,7 +280,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut invocations = Vec::new();
     let mut bindings = Vec::new();
     let mut frozen = Vec::new();
@@ -289,7 +289,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         let use_id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
         let context = ExpressionEffectContext {
             use_id,
-            domain,
+            region: domain,
             demand: root.demand,
         };
         invocations.push(ExpressionInvocation {
@@ -312,7 +312,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
                         environment: &[],
                         parameters: &parameters,
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(domain),
+                        proof_scope: CallProofScope::Region(domain),
                     },
                     Arc::clone(&selection),
                     PureCallPreparation::Window {
@@ -338,7 +338,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         }
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

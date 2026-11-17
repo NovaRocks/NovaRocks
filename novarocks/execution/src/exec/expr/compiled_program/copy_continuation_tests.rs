@@ -298,7 +298,7 @@ fn alias_prepared(ty: &FunctionValueType) -> Arc<dyn novarocks_functions::Prepar
     };
     use novarocks_type_contract::{
         ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase,
-        DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+        DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
         ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
         FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
         PureCompileControl, SemanticParameters,
@@ -369,7 +369,7 @@ fn alias_prepared(ty: &FunctionValueType) -> Arc<dyn novarocks_functions::Prepar
     let input = CallEffectInput {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(1),
-            domain: EvaluationDomainId::new(17),
+            region: EvaluationRegionId::new(17),
             demand: EvaluationDemand::Value,
         },
         argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),

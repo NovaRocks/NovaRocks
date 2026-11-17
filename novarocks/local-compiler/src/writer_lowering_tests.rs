@@ -38,8 +38,8 @@ use novarocks_local_program::{
 };
 use novarocks_physical_plan::*;
 use novarocks_type_contract::{
-    ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, control_argument_semantics,
+    ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, control_argument_semantics,
 };
 use std::num::NonZeroUsize;
 
@@ -603,7 +603,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: id,
-                    domain: EvaluationDomainId::new(0),
+                    region: EvaluationRegionId::new(0),
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -614,8 +614,8 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         })
         .collect();
     let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],
@@ -1783,7 +1783,7 @@ fn freeze_writer_calls(
         uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain: EvaluationDomainId::new(0),
+                region: EvaluationRegionId::new(0),
                 demand: root.demand,
             },
             definition: root.expr,
@@ -1793,8 +1793,8 @@ fn freeze_writer_calls(
         bindings.push((*site, id));
     }
     let mut next_use = u32::try_from(uses.len()).unwrap();
-    let mut domains = vec![ExpressionEvaluationDomain {
-        id: EvaluationDomainId::new(0),
+    let mut domains = vec![ExpressionEvaluationRegion {
+        id: EvaluationRegionId::new(0),
         parent: None,
         guard: None,
     }];
@@ -1820,11 +1820,11 @@ fn freeze_writer_calls(
             let mut context = || {
                 let context = ExpressionEffectContext {
                     use_id: ExpressionUseId::new(next_use),
-                    domain: EvaluationDomainId::new(domains.len() as u32),
+                    region: EvaluationRegionId::new(domains.len() as u32),
                     demand: EvaluationDemand::Value,
                 };
-                domains.push(ExpressionEvaluationDomain {
-                    id: context.domain,
+                domains.push(ExpressionEvaluationRegion {
+                    id: context.region,
                     parent: None,
                     guard: None,
                 });
@@ -1892,7 +1892,7 @@ fn freeze_writer_calls(
                         environment: &[],
                         parameters: &parameters,
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(context.domain),
+                        proof_scope: CallProofScope::Region(context.region),
                     },
                     Arc::clone(&selected),
                     PureCallPreparation::Aggregate {
@@ -2051,11 +2051,11 @@ fn a_writer_call_input_is_its_own_materialized_occurrence_and_the_frozen_prepara
                 package
                     .expression_uses()
                     .flow()
-                    .domains()
-                    .contains_key(&input.domain)
+                    .regions()
+                    .contains_key(&input.region)
             );
             assert_ne!(input.use_id, context.use_id);
-            assert_ne!(input.domain, context.domain);
+            assert_ne!(input.region, context.region);
             assert_eq!(input.demand, EvaluationDemand::Value);
             let flow = &resolved.snapshot().flows()
                 [&novarocks_local_program::ProgramExpressionArena::Main];

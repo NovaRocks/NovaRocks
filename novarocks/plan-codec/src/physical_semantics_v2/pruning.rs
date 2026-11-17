@@ -415,7 +415,7 @@ mod tests {
     use novarocks_physical_plan::{ExpressionRootRole, ExpressionRootSite};
     use novarocks_proto_models::physical_control_v2 as control_wire;
     use novarocks_type_contract::{
-        CompileControlError, CompilePhase, EvaluationDemand, EvaluationDomainId,
+        CompileControlError, CompilePhase, EvaluationDemand, EvaluationRegionId,
         ExpressionEffectContext,
     };
     use std::sync::Mutex;
@@ -439,7 +439,7 @@ mod tests {
             },
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(u32::MAX),
+                region: EvaluationRegionId::new(u32::MAX),
                 demand: EvaluationDemand::TruthOnly,
             },
             conjunct_path: Box::from([1, 0, 1]),

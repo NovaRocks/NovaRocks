@@ -23,7 +23,7 @@ use arrow_schema::{DataType, Field, Schema};
 use novarocks_connector_contract::*;
 use novarocks_functions::FunctionValueType;
 use novarocks_type_contract::{
-    CompilePhase, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
+    CompilePhase, EvaluationRegionId, ExpressionEffectContext, ExpressionUseId,
     FunctionArgumentType,
 };
 use novarocks_types::SlotId;
@@ -173,7 +173,7 @@ fn checked_with(writer: bool, sink: bool, legacy: bool, nullable: bool) -> Progr
                 ProgramExpressionUse {
                     context: ExpressionEffectContext {
                         use_id: id,
-                        domain: EvaluationDomainId::new(0),
+                        region: EvaluationRegionId::new(0),
                         demand: root.demand,
                     },
                     definition: root.definition,
@@ -185,8 +185,8 @@ fn checked_with(writer: bool, sink: bool, legacy: bool, nullable: bool) -> Progr
         flows.insert(
             *scope,
             ProgramControlFlow::try_new(
-                vec![ProgramEvaluationDomain {
-                    id: EvaluationDomainId::new(0),
+                vec![ProgramEvaluationRegion {
+                    id: EvaluationRegionId::new(0),
                     parent: None,
                     guard: None,
                 }],

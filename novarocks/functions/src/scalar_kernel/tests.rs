@@ -24,7 +24,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, EvaluationDemand, EvaluationDomainId, ExpressionUseId,
+    CallProofScope, CompileControlError, EvaluationDemand, EvaluationRegionId, ExpressionUseId,
     FunctionFailureBehavior, FunctionInstanceState, FunctionNullBehavior, FunctionVolatility,
     ObservableEffects,
 };
@@ -139,7 +139,7 @@ fn contract_with_argument_nullability(
     let input = CallEffectInput {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(7),
-            domain: EvaluationDomainId::new(9),
+            region: EvaluationRegionId::new(9),
             demand: EvaluationDemand::Value,
         },
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),

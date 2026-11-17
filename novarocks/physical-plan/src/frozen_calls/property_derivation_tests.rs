@@ -300,7 +300,7 @@ fn fixture(operator: Operator, ordered: bool) -> Fixture {
             temporal_source: None,
             site: PhysicalCallSite::Expression(invocation.context.use_id),
             context: invocation.context,
-            effects: effects(FunctionKind::Scalar, invocation.context.domain),
+            effects: effects(FunctionKind::Scalar, invocation.context.region),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::ReportError,
         })
         .collect();
@@ -313,7 +313,7 @@ fn fixture(operator: Operator, ordered: bool) -> Fixture {
             temporal_source: None,
             site: PhysicalCallSite::Table { node: target },
             context: current,
-            effects: effects(FunctionKind::Table, current.domain),
+            effects: effects(FunctionKind::Table, current.region),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::ReportError,
         });
     }

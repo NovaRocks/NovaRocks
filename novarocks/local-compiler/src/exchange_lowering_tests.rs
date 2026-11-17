@@ -45,8 +45,8 @@ use novarocks_physical_plan::{
     ValueOrigin, ValueType, extract_fragment_packages,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     PartitionCountParameterId, PartitionSpaceId, PureCompileControl,
 };
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
@@ -415,7 +415,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
 /// One eager root occurrence per physical root site in one root domain.
 fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
     let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut invocations = Vec::new();
     let bindings = roots
         .sites()
@@ -426,7 +426,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             invocations.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain,
+                    region: domain,
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -437,7 +437,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         })
         .collect();
     let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

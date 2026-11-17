@@ -22,7 +22,7 @@
 use super::*;
 use crate::{
     BindingRequirement, BindingRequirements, CompileProfile, ControlShape, KernelAbiVersion,
-    ProgramEvaluationDomain, ProgramExpressionUse, ProgramNode, StaticExprKind, StaticExprNode,
+    ProgramEvaluationRegion, ProgramExpressionUse, ProgramNode, StaticExprKind, StaticExprNode,
     StaticLayout, StaticLiteral, StaticSinkProgram, StaticStreamBranch, StaticValues,
     StaticWriterProjection,
 };
@@ -30,7 +30,7 @@ use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_connector_contract::WriteTargetOrdinal;
 use novarocks_execution_contract::DataStreamPartitionType;
-use novarocks_type_contract::{EvaluationDomainId, ExpressionEffectContext};
+use novarocks_type_contract::{EvaluationRegionId, ExpressionEffectContext};
 use novarocks_types::SlotId;
 use std::{collections::HashMap, num::NonZeroUsize, sync::Mutex};
 
@@ -134,7 +134,7 @@ fn invocation(id: u32, definition: usize, demand: EvaluationDemand) -> ProgramEx
     ProgramExpressionUse {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain: EvaluationDomainId::new(u32::MAX),
+            region: EvaluationRegionId::new(u32::MAX),
             demand,
         },
         definition: ProgramExprId::new(definition),
@@ -144,8 +144,8 @@ fn invocation(id: u32, definition: usize, demand: EvaluationDemand) -> ProgramEx
 }
 fn flow(uses: Vec<ProgramExpressionUse>, definition_count: usize) -> ProgramControlFlow {
     ProgramControlFlow::try_new(
-        vec![ProgramEvaluationDomain {
-            id: EvaluationDomainId::new(u32::MAX),
+        vec![ProgramEvaluationRegion {
+            id: EvaluationRegionId::new(u32::MAX),
             parent: None,
             guard: None,
         }],
@@ -682,13 +682,13 @@ fn guarded_case_flags_and_source_order_match_actual_flat_children() {
                 vec![DataType::Boolean; 3],
             );
             let mut root = invocation(10, 2, EvaluationDemand::Value);
-            root.context.domain = EvaluationDomainId::new(0);
+            root.context.region = EvaluationRegionId::new(0);
             root.control = shape;
             root.arguments = (0..definitions.len())
                 .map(|ordinal| ExpressionUseId::new(ordinal as u32))
                 .collect();
-            let mut domains = vec![ProgramEvaluationDomain {
-                id: EvaluationDomainId::new(0),
+            let mut domains = vec![ProgramEvaluationRegion {
+                id: EvaluationRegionId::new(0),
                 parent: None,
                 guard: None,
             }];
@@ -702,21 +702,21 @@ fn guarded_case_flags_and_source_order_match_actual_flat_children() {
                 )
                 .unwrap();
                 let domain = if let Some(kind) = guard {
-                    let id = EvaluationDomainId::new(ordinal as u32 + 1);
-                    domains.push(ProgramEvaluationDomain {
+                    let id = EvaluationRegionId::new(ordinal as u32 + 1);
+                    domains.push(ProgramEvaluationRegion {
                         id,
-                        parent: Some(EvaluationDomainId::new(0)),
-                        guard: Some(novarocks_type_contract::DomainGuard {
+                        parent: Some(EvaluationRegionId::new(0)),
+                        guard: Some(novarocks_type_contract::RegionGuard {
                             owner: ExpressionUseId::new(10),
                             kind,
                         }),
                     });
                     id
                 } else {
-                    EvaluationDomainId::new(0)
+                    EvaluationRegionId::new(0)
                 };
                 let mut child = invocation(ordinal as u32, *definition, demand);
-                child.context.domain = domain;
+                child.context.region = domain;
                 uses.push(child);
             }
             let valid =

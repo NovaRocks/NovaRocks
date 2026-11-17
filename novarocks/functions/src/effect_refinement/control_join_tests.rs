@@ -17,10 +17,10 @@
 
 use super::{EffectContractError, ScopedExpressionEffects};
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, DomainGuard, EvaluationDemand,
-    EvaluationDomainId, ExpressionControlFlow, ExpressionDefinitionMembership,
-    ExpressionEffectContext, ExpressionEffects, ExpressionEvaluationDomain, ExpressionInvocation,
-    ExpressionUseId, FunctionVolatility, GuardKind, ObservableEffects, PureCompileControl,
+    CompileControlError, CompilePhase, ControlShape, EvaluationDemand, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionDefinitionMembership, ExpressionEffectContext,
+    ExpressionEffects, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
+    FunctionVolatility, GuardKind, ObservableEffects, PureCompileControl, RegionGuard,
 };
 
 struct Control;
@@ -39,10 +39,10 @@ impl ExpressionDefinitionMembership<u32> for Definitions {
     }
 }
 
-fn context(use_id: u32, domain: u32, demand: EvaluationDemand) -> ExpressionEffectContext {
+fn context(use_id: u32, region: u32, demand: EvaluationDemand) -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(use_id),
-        domain: EvaluationDomainId::new(domain),
+        region: EvaluationRegionId::new(region),
         demand,
     }
 }
@@ -55,8 +55,8 @@ fn checked_flow(
     arguments: &[(EvaluationDemand, Option<GuardKind>)],
 ) -> ExpressionControlFlow<u32> {
     let owner = context(u32::MAX, 0, demand);
-    let mut domains = vec![ExpressionEvaluationDomain {
-        id: owner.domain,
+    let mut regions = vec![ExpressionEvaluationRegion {
+        id: owner.region,
         parent: None,
         guard: None,
     }];
@@ -69,12 +69,12 @@ fn checked_flow(
             .collect(),
     }];
     for (ordinal, &(child_demand, guard)) in arguments.iter().enumerate() {
-        let domain = if let Some(kind) = guard {
-            let id = EvaluationDomainId::new(100 + ordinal as u32);
-            domains.push(ExpressionEvaluationDomain {
+        let region = if let Some(kind) = guard {
+            let id = EvaluationRegionId::new(100 + ordinal as u32);
+            regions.push(ExpressionEvaluationRegion {
                 id,
-                parent: Some(owner.domain),
-                guard: Some(DomainGuard {
+                parent: Some(owner.region),
+                guard: Some(RegionGuard {
                     owner: owner.use_id,
                     kind,
                 }),
@@ -84,14 +84,14 @@ fn checked_flow(
             0
         };
         uses.push(ExpressionInvocation {
-            context: context(10 + ordinal as u32 * 10, domain, child_demand),
+            context: context(10 + ordinal as u32 * 10, region, child_demand),
             definition: 77,
             control: ControlShape::Eager,
             arguments: Box::default(),
         });
     }
     ExpressionControlFlow::try_new(
-        domains,
+        regions,
         uses,
         &Definitions,
         CompilePhase::Validate,
@@ -176,7 +176,7 @@ fn checked_if_and_coalesce_guards_join_conservatively_without_rebinding_children
             assert_eq!(argument.context(), child(&flow, ordinal));
             if guard.is_some() {
                 assert_eq!(
-                    parent.join_same_domain(argument),
+                    parent.join_same_region(argument),
                     Err(EffectContractError::ProofScopeMismatch)
                 );
                 assert!(joined.for_use(argument.context()).is_err());
@@ -247,7 +247,7 @@ fn higher_order_guard_and_lambda_body_keep_exact_body_demand_and_parent_context(
         );
         let mut uses: Vec<_> = basic.uses().values().cloned().collect();
         let wrapper = child(&basic, 1);
-        let body = context(0, wrapper.domain.get(), demand);
+        let body = context(0, wrapper.region.get(), demand);
         let lambda = uses
             .iter_mut()
             .find(|item| item.context == wrapper)
@@ -261,7 +261,7 @@ fn higher_order_guard_and_lambda_body_keep_exact_body_demand_and_parent_context(
             arguments: Box::default(),
         });
         let flow = ExpressionControlFlow::try_new(
-            basic.domains().values().copied().collect(),
+            basic.regions().values().copied().collect(),
             uses,
             &Definitions,
             CompilePhase::Validate,
@@ -288,7 +288,7 @@ fn higher_order_guard_and_lambda_body_keep_exact_body_demand_and_parent_context(
 }
 
 #[test]
-fn and_or_value_and_truth_only_join_matches_same_domain_and_preserves_each_signal() {
+fn and_or_value_and_truth_only_join_matches_same_region_and_preserves_each_signal() {
     use EvaluationDemand::{TruthOnly, Value};
     let parts = [
         ExpressionEffects {
@@ -335,7 +335,7 @@ fn and_or_value_and_truth_only_join_matches_same_domain_and_preserves_each_signa
                 actual = actual
                     .join_control_argument(argument, &flow, ordinal)
                     .unwrap();
-                legacy = legacy.join_same_domain(argument).unwrap();
+                legacy = legacy.join_same_region(argument).unwrap();
                 assert_eq!(actual, legacy);
             }
             assert_eq!(actual.for_use(owner(&flow)).unwrap(), signals());
@@ -344,7 +344,7 @@ fn and_or_value_and_truth_only_join_matches_same_domain_and_preserves_each_signa
 }
 
 #[test]
-fn exact_ordered_occurrences_reject_same_definition_sibling_wrong_owner_domain_and_demand() {
+fn exact_ordered_occurrences_reject_same_definition_sibling_wrong_owner_region_and_demand() {
     use EvaluationDemand::{TruthOnly, Value};
     let flow = checked_flow(
         ControlShape::If,
@@ -365,7 +365,7 @@ fn exact_ordered_occurrences_reject_same_definition_sibling_wrong_owner_domain_a
             ..owner(&flow)
         },
         ExpressionEffectContext {
-            domain: EvaluationDomainId::new(101),
+            region: EvaluationRegionId::new(101),
             ..owner(&flow)
         },
         ExpressionEffectContext {
@@ -387,7 +387,7 @@ fn exact_ordered_occurrences_reject_same_definition_sibling_wrong_owner_domain_a
             ..argument.context()
         },
         ExpressionEffectContext {
-            domain: owner(&flow).domain,
+            region: owner(&flow).region,
             ..argument.context()
         },
         ExpressionEffectContext {
@@ -402,11 +402,11 @@ fn exact_ordered_occurrences_reject_same_definition_sibling_wrong_owner_domain_a
             1,
         );
     }
-    let same_domain = checked_flow(ControlShape::Conjunction, Value, &[(Value, None); 2]);
-    let parent = ScopedExpressionEffects::pure_value(owner(&same_domain));
-    let sibling = ScopedExpressionEffects::primitive(child(&same_domain, 1), signals());
-    assert!(parent.join_same_domain(sibling).is_ok());
-    assert_rejected(parent, sibling, &same_domain, 0);
+    let same_region = checked_flow(ControlShape::Conjunction, Value, &[(Value, None); 2]);
+    let parent = ScopedExpressionEffects::pure_value(owner(&same_region));
+    let sibling = ScopedExpressionEffects::primitive(child(&same_region, 1), signals());
+    assert!(parent.join_same_region(sibling).is_ok());
+    assert_rejected(parent, sibling, &same_region, 0);
 }
 
 #[test]

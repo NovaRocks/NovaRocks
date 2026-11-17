@@ -226,11 +226,11 @@ fn assert_guard(
     let owner = invocation(uses, parent);
     let item = child(uses, parent, ordinal);
     assert_eq!(item.context.demand, demand);
-    let domain = uses.flow().domains()[&item.context.domain];
-    assert_eq!(domain.parent, Some(owner.context.domain));
+    let domain = uses.flow().regions()[&item.context.region];
+    assert_eq!(domain.parent, Some(owner.context.region));
     assert_eq!(
         domain.guard,
-        Some(DomainGuard {
+        Some(RegionGuard {
             owner: parent,
             kind: expected
         })
@@ -330,7 +330,7 @@ fn occurrence_shared_sparse_if_definition_keeps_value_truth_domains_and_ignores_
         assert_eq!(use_.definition, root);
         assert_eq!(use_.control, ControlShape::If);
         assert_eq!(use_.context.demand, demand);
-        assert_eq!(child(&uses, id, 0).context.domain, use_.context.domain);
+        assert_eq!(child(&uses, id, 0).context.region, use_.context.region);
         assert_eq!(
             child(&uses, id, 0).context.demand,
             EvaluationDemand::TruthOnly
@@ -343,8 +343,8 @@ fn occurrence_shared_sparse_if_definition_keeps_value_truth_domains_and_ignores_
         );
     }
     assert_ne!(
-        invocation(&uses, predicate).context.domain,
-        invocation(&uses, value_use).context.domain
+        invocation(&uses, predicate).context.region,
+        invocation(&uses, value_use).context.region
     );
     prefixes(&fragment, &catalog, true, false);
 }
@@ -403,8 +403,8 @@ fn occurrence_installed_coalesce_and_lower_have_exact_guarded_and_eager_edges() 
     let root = *uses.bindings().values().next().unwrap();
     assert_eq!(invocation(&uses, root).control, ControlShape::Coalesce);
     assert_eq!(
-        child(&uses, root, 0).context.domain,
-        invocation(&uses, root).context.domain
+        child(&uses, root, 0).context.region,
+        invocation(&uses, root).context.region
     );
     assert_guard(
         &uses,
@@ -416,8 +416,8 @@ fn occurrence_installed_coalesce_and_lower_have_exact_guarded_and_eager_edges() 
     let lower = child(&uses, root, 1);
     assert_eq!(lower.control, ControlShape::Eager);
     assert_eq!(
-        child(&uses, lower.context.use_id, 0).context.domain,
-        lower.context.domain
+        child(&uses, lower.context.use_id, 0).context.region,
+        lower.context.region
     );
     let trace = prefixes(&fragment, &catalog, true, false);
     assert!(
@@ -494,7 +494,7 @@ fn occurrence_intrinsic_boolean_and_both_case_shapes_preserve_order_and_hand_gua
         );
         let first = usize::from(simple);
         if simple {
-            assert_eq!(child(&uses, id, 0).context.domain, root.context.domain);
+            assert_eq!(child(&uses, id, 0).context.region, root.context.region);
         }
         for arm in 0..2 {
             assert_guard(
@@ -533,8 +533,8 @@ fn occurrence_intrinsic_boolean_and_both_case_shapes_preserve_order_and_hand_gua
             ControlShape::Eager
         );
         assert_eq!(
-            child(&uses, conjunction.context.use_id, 1).context.domain,
-            conjunction.context.domain
+            child(&uses, conjunction.context.use_id, 1).context.region,
+            conjunction.context.region
         );
     }
     prefixes(&fragment, &catalog, true, false);
@@ -808,7 +808,7 @@ fn occurrence_real_320_values_rows_expand_shared_definition_and_observe_actual_q
     let uses = run(&fragment, &catalog, &Control::default()).unwrap();
     assert_eq!(uses.bindings().len(), 320);
     assert_eq!(uses.flow().uses().len(), 320);
-    assert_eq!(uses.flow().domains().len(), 320);
+    assert_eq!(uses.flow().regions().len(), 320);
     for (site, id) in uses.bindings() {
         assert!(matches!(
             site.role,
@@ -817,7 +817,7 @@ fn occurrence_real_320_values_rows_expand_shared_definition_and_observe_actual_q
         let use_ = invocation(&uses, *id);
         assert_eq!(use_.definition, root);
         assert_eq!(use_.context.demand, EvaluationDemand::Value);
-        assert!(uses.flow().domains()[&use_.context.domain].parent.is_none());
+        assert!(uses.flow().regions()[&use_.context.region].parent.is_none());
     }
     prefixes(&fragment, &catalog, true, true);
 }
@@ -852,7 +852,7 @@ fn occurrence_shared_and_dag_reference_limit_counts_expanded_uses_before_publica
     let near_uses = run(&near, &catalog, &near_control).unwrap();
     assert_eq!(near_uses.bindings().len(), 1);
     assert_eq!(near_uses.flow().uses().len(), 32_767);
-    assert_eq!(near_uses.flow().domains().len(), 1);
+    assert_eq!(near_uses.flow().regions().len(), 1);
     let edges: usize = near_uses
         .flow()
         .uses()

@@ -62,7 +62,7 @@ pub(super) fn frozen_fixture(fragment: Fragment) -> Fixture {
             temporal_source: None,
             site: PhysicalCallSite::Expression(invocation.context.use_id),
             context: invocation.context,
-            effects: effects(FunctionKind::Scalar, invocation.context.domain),
+            effects: effects(FunctionKind::Scalar, invocation.context.region),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         })
         .collect();

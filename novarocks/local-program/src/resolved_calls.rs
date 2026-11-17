@@ -189,7 +189,7 @@ pub enum ProgramResolvedCallsError {
     MissingSite(ProgramCallSite),
     WrongSource,
     WrongContext,
-    InvalidDomain,
+    InvalidRegion,
     SharedUse,
     WrongControl,
     WrongArguments,
@@ -863,7 +863,7 @@ fn validate_expression(
             work.step()?;
             let common_use = &flow.uses()[use_id];
             if common_use.definition != *definition
-                || common_use.context.domain != edge.context.domain
+                || common_use.context.region != edge.context.region
                 || common_use.context.demand != EvaluationDemand::Value
             {
                 return Err(ProgramResolvedCallsError::WrongBody);
@@ -923,11 +923,11 @@ fn validate_relational_context<H>(
         return Err(ProgramResolvedCallsError::SharedUse.into());
     }
     let domain = flow
-        .domains()
-        .get(&context.domain)
-        .ok_or(ProgramResolvedCallsError::InvalidDomain)?;
+        .regions()
+        .get(&context.region)
+        .ok_or(ProgramResolvedCallsError::InvalidRegion)?;
     if domain.parent.is_some() || domain.guard.is_some() {
-        return Err(ProgramResolvedCallsError::InvalidDomain.into());
+        return Err(ProgramResolvedCallsError::InvalidRegion.into());
     }
     Ok(())
 }
@@ -1112,8 +1112,8 @@ fn check_argument_root(
     let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
     let invocation = &flow.uses()[use_id];
     let unguarded = flow
-        .domains()
-        .get(&invocation.context.domain)
+        .regions()
+        .get(&invocation.context.region)
         .is_some_and(|domain| domain.parent.is_none() && domain.guard.is_none());
     if !unguarded || invocation.context.demand != EvaluationDemand::Value {
         return Err(ProgramResolvedCallsError::WrongContext);

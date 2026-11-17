@@ -37,10 +37,10 @@ use novarocks_physical_plan::{
     RootUseBindingError, UnaryOperator, ValidationErrors, ValueOrigin,
 };
 use novarocks_type_contract::{
-    ArgumentControl, CallProofScope, ControlShape, DecimalOverflowPolicy, DomainGuard,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
-    SemanticParameters, ValueLogicalType, control_argument_semantics,
+    ArgumentControl, CallProofScope, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
+    ExpressionInvocation, ExpressionUseId, FunctionValueType, RegionGuard, SemanticParameters,
+    ValueLogicalType, control_argument_semantics,
 };
 use std::{num::NonZeroUsize, sync::Mutex};
 
@@ -418,16 +418,16 @@ enum Flow {
 fn uses(fixture: &Fixture, claim: Flow) -> Result<PhysicalRootUses, RootUseBindingError> {
     struct Author {
         next_use: u32,
-        next_domain: u32,
+        next_region: u32,
         uses: Vec<ExpressionInvocation<ExprId>>,
-        domains: Vec<ExpressionEvaluationDomain>,
+        domains: Vec<ExpressionEvaluationRegion>,
     }
     impl Author {
         fn visit(
             &mut self,
             fixture: &Fixture,
             expr: ExprId,
-            domain: EvaluationDomainId,
+            domain: EvaluationRegionId,
             demand: EvaluationDemand,
             claim: Flow,
         ) -> ExpressionUseId {
@@ -448,24 +448,24 @@ fn uses(fixture: &Fixture, claim: Flow) -> Result<PhysicalRootUses, RootUseBindi
             for (ordinal, child) in args.iter().enumerate() {
                 let (child_demand, guard) =
                     control_argument_semantics(shape, args.len(), ordinal, demand).unwrap();
-                let child_domain = if let Some(kind) = guard {
-                    let child_domain = EvaluationDomainId::new(self.next_domain);
-                    self.next_domain += 13;
-                    self.domains.push(ExpressionEvaluationDomain {
-                        id: child_domain,
+                let child_region = if let Some(kind) = guard {
+                    let child_region = EvaluationRegionId::new(self.next_region);
+                    self.next_region += 13;
+                    self.domains.push(ExpressionEvaluationRegion {
+                        id: child_region,
                         parent: Some(domain),
-                        guard: Some(DomainGuard { owner: id, kind }),
+                        guard: Some(RegionGuard { owner: id, kind }),
                     });
-                    child_domain
+                    child_region
                 } else {
                     domain
                 };
-                arguments.push(self.visit(fixture, *child, child_domain, child_demand, claim));
+                arguments.push(self.visit(fixture, *child, child_region, child_demand, claim));
             }
             self.uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: id,
-                    domain,
+                    region: domain,
                     demand,
                 },
                 definition: expr,
@@ -475,12 +475,12 @@ fn uses(fixture: &Fixture, claim: Flow) -> Result<PhysicalRootUses, RootUseBindi
             id
         }
     }
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let domain = EvaluationRegionId::new(u32::MAX);
     let mut author = Author {
         next_use: 7,
-        next_domain: 8,
+        next_region: 8,
         uses: vec![],
-        domains: vec![ExpressionEvaluationDomain {
+        domains: vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -559,7 +559,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Region(context.region),
                 },
                 author.selected.clone(),
                 PureCallPreparation::ControlIntrinsic {
@@ -692,7 +692,7 @@ fn unary_project_and_filter_keep_exact_slots_and_value_child_demand_without_call
             let invocation = &flow.uses()[&snapshot.bindings()[&root(mode)]];
             assert_eq!(invocation.control, ControlShape::Eager);
             assert_eq!(invocation.arguments.len(), 1);
-            assert_eq!(invocation.context.domain, EvaluationDomainId::new(u32::MAX));
+            assert_eq!(invocation.context.region, EvaluationRegionId::new(u32::MAX));
             assert_eq!(
                 invocation.context.demand,
                 match mode {
@@ -710,7 +710,7 @@ fn unary_project_and_filter_keep_exact_slots_and_value_child_demand_without_call
             assert_eq!(child.definition, child_id);
             // A NULL predicate and NOT need the operand value even under a filter demand.
             assert_eq!(child.context.demand, EvaluationDemand::Value);
-            assert_eq!(child.context.domain, invocation.context.domain);
+            assert_eq!(child.context.region, invocation.context.region);
             assert_eq!(
                 source.expression_uses().flow().uses()[&child.context.use_id].definition,
                 physical_input
@@ -803,13 +803,13 @@ fn actual_if_arguments_keep_distinct_unary_occurrences_and_guarded_value_childre
                 }
             );
             if ordinal == 0 {
-                assert_eq!(unary.context.domain, invocation.context.domain);
+                assert_eq!(unary.context.region, invocation.context.region);
             } else {
-                assert_ne!(unary.context.domain, invocation.context.domain);
+                assert_ne!(unary.context.region, invocation.context.region);
                 assert_ne!(*use_id, invocation.arguments[ordinal - 1]);
             }
             let operand = &flow.uses()[&unary.arguments[0]];
-            assert_eq!(operand.context.domain, unary.context.domain);
+            assert_eq!(operand.context.region, unary.context.region);
             assert_eq!(operand.context.demand, EvaluationDemand::Value);
             assert_eq!(
                 operand.definition,
@@ -821,8 +821,8 @@ fn actual_if_arguments_keep_distinct_unary_occurrences_and_guarded_value_childre
             ));
         }
         assert_ne!(
-            flow.uses()[&invocation.arguments[1]].context.domain,
-            flow.uses()[&invocation.arguments[2]].context.domain
+            flow.uses()[&invocation.arguments[1]].context.region,
+            flow.uses()[&invocation.arguments[2]].context.region
         );
         assert_eq!(source.calls().entries().len(), 1);
         assert_eq!(calls.calls().len(), 1);

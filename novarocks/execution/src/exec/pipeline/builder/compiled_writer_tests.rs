@@ -60,8 +60,8 @@ use novarocks_spi::connector::write_stack::{
 };
 use novarocks_spi::connector::{CatalogHandle, ConnectorErrorKind};
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     FunctionValueType, PureCompileControl,
 };
 use novarocks_types::UniqueId;
@@ -518,7 +518,7 @@ fn plan_with_cells(
 /// Literal cells are the only roots; each gets one eager use.
 fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
     let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut uses = Vec::new();
     let mut bindings = Vec::new();
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
@@ -526,7 +526,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: id,
-                domain,
+                region: domain,
                 demand: root.demand,
             },
             definition: root.expr,
@@ -536,7 +536,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         bindings.push((*site, id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -2177,7 +2177,7 @@ mod statistics {
             uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: id,
-                    domain: EvaluationDomainId::new(0),
+                    region: EvaluationRegionId::new(0),
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -2187,8 +2187,8 @@ mod statistics {
             bindings.push((*site, id));
         }
         let mut next_use = u32::try_from(uses.len()).unwrap();
-        let mut domains = vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        let mut domains = vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }];
@@ -2214,11 +2214,11 @@ mod statistics {
                 let mut context = || {
                     let context = ExpressionEffectContext {
                         use_id: ExpressionUseId::new(next_use),
-                        domain: EvaluationDomainId::new(domains.len() as u32),
+                        region: EvaluationRegionId::new(domains.len() as u32),
                         demand: EvaluationDemand::Value,
                     };
-                    domains.push(ExpressionEvaluationDomain {
-                        id: context.domain,
+                    domains.push(ExpressionEvaluationRegion {
+                        id: context.region,
                         parent: None,
                         guard: None,
                     });
@@ -2301,7 +2301,7 @@ mod statistics {
                             environment: &[],
                             parameters: &parameters,
                             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                            proof_scope: CallProofScope::Domain(context.domain),
+                            proof_scope: CallProofScope::Region(context.region),
                         },
                         Arc::clone(&selected),
                         PureCallPreparation::Aggregate {

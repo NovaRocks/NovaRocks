@@ -582,8 +582,8 @@ fn caller_control_cause_stays_primary_across_the_receiver() {
 /// root uses in one domain, no calls and an explicit empty pruning table.
 fn plan_packages(plan: &p::PhysicalPlan) -> BTreeMap<p::FragmentId, p::FragmentPackage> {
     use novarocks_type_contract::{
-        ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-        ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+        ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+        ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     };
     let setup = Control::default();
     let mut uses = BTreeMap::new();
@@ -605,7 +605,7 @@ fn plan_packages(plan: &p::PhysicalPlan) -> BTreeMap<p::FragmentId, p::FragmentP
             .map(|(ordinal, (_, root))| ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: ExpressionUseId::new(ordinal as u32),
-                    domain: EvaluationDomainId::new(0),
+                    region: EvaluationRegionId::new(0),
                     demand: root.demand,
                 },
                 definition: root.expr,
@@ -616,8 +616,8 @@ fn plan_packages(plan: &p::PhysicalPlan) -> BTreeMap<p::FragmentId, p::FragmentP
         let domains = if invocations.is_empty() {
             vec![]
         } else {
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
+            vec![ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(0),
                 parent: None,
                 guard: None,
             }]

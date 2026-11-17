@@ -25,7 +25,7 @@ use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use novarocks_connector_contract::*;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, EvaluationDomainId, FunctionArgumentType, FunctionValueType,
+    CompileCheckpoints, CompilePhase, EvaluationRegionId, FunctionArgumentType, FunctionValueType,
     NR_LOGICAL_TYPE_KEY, ValueLogicalType,
 };
 use novarocks_types::SlotId;
@@ -304,8 +304,8 @@ fn checked_scans(
         flows.insert(
             *scope,
             ProgramControlFlow::try_new(
-                vec![ProgramEvaluationDomain {
-                    id: EvaluationDomainId::new(0),
+                vec![ProgramEvaluationRegion {
+                    id: EvaluationRegionId::new(0),
                     parent: None,
                     guard: None,
                 }],

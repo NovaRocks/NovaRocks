@@ -20,7 +20,7 @@ use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::ArrayRef;
 use arrow_buffer::{NullBuffer, i256};
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -111,7 +111,7 @@ fn decimal_text_exact_p_s_null_promise_and_other_cast_domains_stay_separate() {
                     );
                     let c = ExpressionEffectContext {
                         use_id: ExpressionUseId::new(1),
-                        domain: EvaluationDomainId::new(2),
+                        region: EvaluationRegionId::new(2),
                         demand: EvaluationDemand::Value,
                     };
                     assert_eq!(

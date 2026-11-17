@@ -31,7 +31,7 @@ use novarocks_functions::{
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
     PureCompileControl, SemanticParameters,
 };
 use novarocks_types::SlotId;
@@ -144,7 +144,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
     assert_eq!(result_type.data_type(), &DataType::Float64);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(0),
-        domain: EvaluationDomainId::new(u32::MAX),
+        region: EvaluationRegionId::new(u32::MAX),
         demand: EvaluationDemand::Value,
     };
     let parameters = SemanticParameters::try_new([]).unwrap();
@@ -159,7 +159,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         environment: &[],
         parameters: &parameters,
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context.domain),
+        proof_scope: CallProofScope::Region(context.region),
     };
     let options = || PureCallPreparation::Scalar {
         arguments: ScopedExpressionEffects::pure_value(context),
@@ -280,8 +280,8 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
     };
     let flow = ProgramControlFlow::try_new(
-        vec![ProgramEvaluationDomain {
-            id: context.domain,
+        vec![ProgramEvaluationRegion {
+            id: context.region,
             parent: None,
             guard: None,
         }],

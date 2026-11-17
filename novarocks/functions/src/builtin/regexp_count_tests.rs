@@ -24,7 +24,7 @@ use crate::{
 use arrow_array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, RegexpCountPatternSource as Source,
     SemanticParameters,
 };
@@ -45,7 +45,7 @@ fn owner() -> RegexpCountOwner {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     }
 }

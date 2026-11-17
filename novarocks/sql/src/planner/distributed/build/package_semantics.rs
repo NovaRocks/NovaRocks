@@ -342,7 +342,7 @@ fn author_one(
                     source,
                     decimal_overflow_policy: captured.binding().decimal_overflow_policy(),
                     environment: &[],
-                    proof_scope: CallProofScope::Domain(invocation.context.domain),
+                    proof_scope: CallProofScope::Region(invocation.context.region),
                 },
             );
         }
@@ -414,7 +414,7 @@ fn author_one(
                     environment: aggregate_environments
                         .get(&site)
                         .map_or(&[][..], |refs| refs.as_slice()),
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Region(context.region),
                 },
             );
         }

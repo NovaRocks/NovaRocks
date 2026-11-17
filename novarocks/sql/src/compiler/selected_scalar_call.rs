@@ -402,9 +402,9 @@ pub(crate) fn freeze_fold_call(
 ) -> Result<Option<super::FrozenFoldCall>, super::SqlCompileError> {
     use super::{FrozenFoldArgumentSource as Source, FrozenFoldCall};
     use novarocks_type_contract::{
-        CallProofScope, CompilePhase, DomainGuard, EvaluationDemand, EvaluationDomainId,
-        ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-        ExpressionInvocation, ExpressionUseId, SemanticParameters, control_argument_semantics,
+        CallProofScope, CompilePhase, EvaluationDemand, EvaluationRegionId, ExpressionControlFlow,
+        ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
+        RegionGuard, SemanticParameters, control_argument_semantics,
     };
     let mut canonical_args = Vec::new();
     canonical_args
@@ -504,14 +504,14 @@ pub(crate) fn freeze_fold_call(
     })?;
     let type_only = matches!(shape, ControlShape::TypeOnly | ControlShape::NoArguments);
     let root_use = ExpressionUseId::new(0);
-    let root_domain = EvaluationDomainId::new(0);
+    let root_region = EvaluationRegionId::new(0);
     let context = ExpressionEffectContext {
         use_id: root_use,
-        domain: root_domain,
+        region: root_region,
         demand: EvaluationDemand::Value,
     };
-    let mut domains = vec![ExpressionEvaluationDomain {
-        id: root_domain,
+    let mut domains = vec![ExpressionEvaluationRegion {
+        id: root_region,
         parent: None,
         guard: None,
     }];
@@ -535,23 +535,23 @@ pub(crate) fn freeze_fold_call(
             control_argument_semantics(shape, args.len(), ordinal, EvaluationDemand::Value)
                 .map_err(compile_flow_error)?;
         let domain = if let Some(kind) = guard {
-            let domain = EvaluationDomainId::new(id);
-            domains.push(ExpressionEvaluationDomain {
+            let domain = EvaluationRegionId::new(id);
+            domains.push(ExpressionEvaluationRegion {
                 id: domain,
-                parent: Some(root_domain),
-                guard: Some(DomainGuard {
+                parent: Some(root_region),
+                guard: Some(RegionGuard {
                     owner: root_use,
                     kind,
                 }),
             });
             domain
         } else {
-            root_domain
+            root_region
         };
         uses.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id,
-                domain,
+                region: domain,
                 demand,
             },
             definition: id,
@@ -623,7 +623,7 @@ pub(crate) fn freeze_fold_call(
         environment: &[],
         parameters: &parameters,
         decimal_overflow_policy: binding.decimal_overflow_policy(),
-        proof_scope: CallProofScope::Domain(root_domain),
+        proof_scope: CallProofScope::Region(root_region),
     };
     let prepared = prepare_selected_scalar_call_observed(
         functions,

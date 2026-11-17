@@ -37,7 +37,7 @@ fn checked_package(
             &fragment,
             authors,
             root.expr,
-            EvaluationDomainId::new(u32::MAX),
+            EvaluationRegionId::new(u32::MAX),
             root.demand,
         );
         bindings.push((site, id));
@@ -65,7 +65,7 @@ fn checked_package(
                         .join_control_argument(summaries[child], &flow, ordinal)
                         .unwrap()
                 } else {
-                    children.join_same_domain(summaries[child]).unwrap()
+                    children.join_same_region(summaries[child]).unwrap()
                 };
             }
             let argument_uses = invocation
@@ -96,7 +96,7 @@ fn checked_package(
                         environment: &[],
                         parameters: &parameters,
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(context.domain),
+                        proof_scope: CallProofScope::Region(context.region),
                     },
                     owner.selected.clone(),
                     preparation,
@@ -410,7 +410,7 @@ fn all_fifteen_frozen_nullsafe_profiles_keep_nonnullable_boolean_sparse_rows_and
         assert_eq!(invocation.context.demand, EvaluationDemand::Value);
         assert_eq!(invocation.arguments.len(), 2);
         for child in &invocation.arguments {
-            assert_eq!(flow.uses()[child].context.domain, invocation.context.domain);
+            assert_eq!(flow.uses()[child].context.region, invocation.context.region);
             assert_eq!(flow.uses()[child].context.demand, EvaluationDemand::Value);
         }
         assert!(matches!(

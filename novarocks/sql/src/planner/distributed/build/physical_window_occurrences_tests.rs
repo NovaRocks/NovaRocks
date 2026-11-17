@@ -337,7 +337,7 @@ fn input<'a>(
         parameters: params,
         environment: &[],
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(flow.uses()[&id].context.domain),
+        proof_scope: CallProofScope::Region(flow.uses()[&id].context.region),
     }
 }
 fn run(
@@ -902,7 +902,7 @@ fn window_occurrences_frame_pool_offsets_are_ordered_children_not_function_chann
                 .arguments
                 .reverse();
             let wrong_flow = ExpressionControlFlow::try_new(
-                roots.flow().domains().values().copied().collect(),
+                roots.flow().regions().values().copied().collect(),
                 invocations,
                 fragment.expressions(),
                 PHASE,
@@ -1037,7 +1037,7 @@ fn window_occurrences_foreign_source_missing_ordered_effects_environment_and_pro
     ));
     let mut call = input(source, &req, roots.flow(), id, &children, &params);
     call.proof_scope =
-        CallProofScope::Domain(novarocks_type_contract::EvaluationDomainId::new(u32::MAX));
+        CallProofScope::Region(novarocks_type_contract::EvaluationRegionId::new(u32::MAX));
     assert!(matches!(
         run(call, &catalog, &Control::default()),
         Err(PhysicalWindowOccurrenceError::Function(_))

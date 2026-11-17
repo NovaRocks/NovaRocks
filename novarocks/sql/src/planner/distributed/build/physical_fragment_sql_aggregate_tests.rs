@@ -80,7 +80,7 @@ fn source_scopes<'a>(
                     source: node,
                     decimal_overflow_policy: captured.binding().decimal_overflow_policy(),
                     environment: &[],
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Region(context.region),
                 },
             )
         })

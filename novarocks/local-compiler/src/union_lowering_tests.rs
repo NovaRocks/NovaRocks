@@ -37,8 +37,8 @@ use novarocks_physical_plan::{
     RequiredInputs, ResultField, ResultPort, SetOperationKind, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     FunctionArgumentType, FunctionValueType, PureCompileControl, SemanticParameters,
 };
 use std::{
@@ -381,7 +381,7 @@ fn finish_package(
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let domain = EvaluationRegionId::new(u32::MAX);
     let mut invocations = Vec::new();
     let mut bindings = Vec::new();
     for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
@@ -393,7 +393,7 @@ fn finish_package(
         invocations.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id,
-                domain,
+                region: domain,
                 demand: root.demand,
             },
             definition: root.expr,
@@ -403,7 +403,7 @@ fn finish_package(
         bindings.push((*site, use_id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -750,7 +750,7 @@ fn union_all_split_provenance_and_fresh_root_lexical_coverage_are_complete() {
         unreachable!()
     };
     let mut new_uses = BTreeSet::new();
-    let mut new_domains = BTreeSet::new();
+    let mut new_regions = BTreeSet::new();
     for &normalizer in inputs {
         let ProgramNodeKind::Project { exprs, input, .. } =
             program.graph().nodes()[normalizer.index()].kind()
@@ -774,8 +774,8 @@ fn union_all_split_provenance_and_fresh_root_lexical_coverage_are_complete() {
             );
             assert!(invocation.arguments.is_empty());
             assert!(new_uses.insert(use_id));
-            assert!(new_domains.insert(invocation.context.domain));
-            let domain = &flow.domains()[&invocation.context.domain];
+            assert!(new_regions.insert(invocation.context.region));
+            let domain = &flow.regions()[&invocation.context.region];
             assert!(domain.parent.is_none() && domain.guard.is_none());
             assert_eq!(
                 program.checked().slots()[&ProgramUseRef {
@@ -791,7 +791,7 @@ fn union_all_split_provenance_and_fresh_root_lexical_coverage_are_complete() {
         }
     }
     assert_eq!(new_uses.len(), 6);
-    assert_eq!(new_domains.len(), 6);
+    assert_eq!(new_regions.len(), 6);
     // The original branch reads survive with their original sparse context.
     for (site, &original_use) in source.package.expression_uses().bindings() {
         if matches!(

@@ -406,7 +406,7 @@ impl WriterFixture {
     fn new(value_type: FunctionValueType) -> Self {
         use novarocks_functions::*;
         use novarocks_type_contract::{
-            CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+            CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
             ExpressionEffectContext, ExpressionUseId, SemanticParameters,
         };
         let catalog = catalog();
@@ -423,12 +423,12 @@ impl WriterFixture {
         let selected = Arc::new(bound.selected);
         let call = ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(17),
+            region: EvaluationRegionId::new(17),
             demand: EvaluationDemand::Value,
         };
         let input = ExpressionEffectContext {
             use_id: ExpressionUseId::new(42),
-            domain: EvaluationDomainId::new(18),
+            region: EvaluationRegionId::new(18),
             demand: EvaluationDemand::Value,
         };
         let parameters = SemanticParameters::try_new([]).unwrap();
@@ -445,7 +445,7 @@ impl WriterFixture {
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    proof_scope: CallProofScope::Domain(call.domain),
+                    proof_scope: CallProofScope::Region(call.region),
                 },
                 Arc::clone(&selected),
                 PureCallPreparation::Aggregate {

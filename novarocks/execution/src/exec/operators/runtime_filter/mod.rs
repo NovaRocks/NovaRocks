@@ -1003,7 +1003,7 @@ mod tests {
                 (
                     *arena,
                     (
-                        flow.domains().values().cloned().collect::<Vec<_>>(),
+                        flow.regions().values().cloned().collect::<Vec<_>>(),
                         flow.uses().values().cloned().collect::<Vec<_>>(),
                     ),
                 )
@@ -1045,7 +1045,7 @@ mod tests {
             uses.push(ProgramExpressionUse {
                 context: ExpressionEffectContext {
                     use_id,
-                    domain: like.context.domain,
+                    region: like.context.region,
                     demand: EvaluationDemand::Value,
                 },
                 definition: root.definition.unwrap_or(like.definition),

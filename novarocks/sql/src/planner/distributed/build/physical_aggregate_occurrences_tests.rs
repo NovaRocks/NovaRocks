@@ -507,7 +507,7 @@ fn input<'a>(
         parameters: p,
         environment: &[],
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context(o, r.site()).domain),
+        proof_scope: CallProofScope::Region(context(o, r.site()).region),
     }
 }
 fn run(
@@ -777,10 +777,10 @@ fn aggregate_occurrences_repeated_definition_has_independent_child_and_relationa
     let b = child(&o, &f, 1, 0);
     assert_ne!(a, b);
     assert_ne!(
-        o.root_uses.flow().uses()[&a].context.domain,
-        o.root_uses.flow().uses()[&b].context.domain
+        o.root_uses.flow().uses()[&a].context.region,
+        o.root_uses.flow().uses()[&b].context.region
     );
-    assert_ne!(context(&o, f.site(0)).domain, context(&o, f.site(1)).domain);
+    assert_ne!(context(&o, f.site(0)).region, context(&o, f.site(1)).region);
     let e = summaries(&o);
     let p = SemanticParameters::try_new([]).unwrap();
     for at in 0..2 {
@@ -1017,7 +1017,7 @@ fn aggregate_occurrences_missing_foreign_source_scope_environment_and_proof_keep
     prefixes(
         |c| {
             let mut i = input(&f, &r, &o, &e, &p);
-            i.proof_scope = CallProofScope::Domain(o.root_uses.flow().uses()[&id].context.domain);
+            i.proof_scope = CallProofScope::Region(o.root_uses.flow().uses()[&id].context.region);
             run(i, &f.catalog, c)
         },
         false,
@@ -1364,7 +1364,7 @@ fn fragment_scopes<'a>(
                     source: &f.fragment.nodes()[&node],
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                     environment: &[],
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Region(context.region),
                 },
             )
         })
@@ -1577,7 +1577,7 @@ fn aggregate_fragment_composer_missing_extra_and_same_shape_foreign_source_scope
             source: f.node(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             environment: &[],
-            proof_scope: CallProofScope::Domain(context(&o, f.site(0)).domain),
+            proof_scope: CallProofScope::Region(context(&o, f.site(0)).region),
         },
     );
     assert!(matches!(

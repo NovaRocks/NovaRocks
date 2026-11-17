@@ -22,7 +22,7 @@ use arrow_array::StringArray;
 
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     SemanticParameters,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
@@ -152,12 +152,12 @@ fn kernel_source(
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(641),
-        domain: EvaluationDomainId::new(69),
+        region: EvaluationRegionId::new(69),
         demand: EvaluationDemand::Value,
     };
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(644),
-        domain: EvaluationDomainId::new(70),
+        region: EvaluationRegionId::new(70),
         demand: EvaluationDemand::Value,
     };
     let state_type = selected
@@ -188,7 +188,7 @@ fn kernel_source(
             parameters: &parameters,
             environment: &[],
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         },
         selected.clone(),
         PureCallPreparation::Aggregate {
@@ -609,12 +609,12 @@ fn ordered_kernel_source(
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(641),
-        domain: EvaluationDomainId::new(69),
+        region: EvaluationRegionId::new(69),
         demand: EvaluationDemand::Value,
     };
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(644),
-        domain: EvaluationDomainId::new(70),
+        region: EvaluationRegionId::new(70),
         demand: EvaluationDemand::Value,
     };
     let state_type = selected
@@ -648,7 +648,7 @@ fn ordered_kernel_source(
             parameters: &parameters,
             environment: &[],
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         },
         selected.clone(),
         PureCallPreparation::Aggregate {

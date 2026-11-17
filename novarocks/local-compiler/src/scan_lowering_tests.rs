@@ -37,8 +37,8 @@ use novarocks_local_program::{
 };
 use novarocks_physical_plan::*;
 use novarocks_type_contract::{
-    ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, ExpressionUseId, control_argument_semantics,
 };
 use std::{
@@ -874,7 +874,7 @@ pub(super) fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             self.uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: id,
-                    domain: EvaluationDomainId::new(0),
+                    region: EvaluationRegionId::new(0),
                     demand,
                 },
                 definition: expr,
@@ -896,8 +896,8 @@ pub(super) fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
         .map(|(&site, root)| (site, author.visit(root.expr, root.demand)))
         .collect();
     let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],

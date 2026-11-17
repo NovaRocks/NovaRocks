@@ -18,7 +18,7 @@
 use super::*;
 use crate::{
     BindingRequirements, CompileProfile, ImmutableExpressions, KernelAbiVersion, LocalProgramGraph,
-    ProgramControlFlow, ProgramEvaluationDomain, ProgramExpressionArena, ProgramExpressionUse,
+    ProgramControlFlow, ProgramEvaluationRegion, ProgramExpressionArena, ProgramExpressionUse,
     ProgramNode, ProgramNodeId, ProgramRootControlBindings, ProgramRootUseBinding,
     ProgramTypedExpressions, StaticExprNode, StaticFunctionKind, StaticLayout, StaticLiteral,
     StaticValues,
@@ -27,20 +27,20 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_functions::*;
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CallProofScope, DecimalOverflowPolicy, DomainGuard,
-    EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
-    FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
-    FunctionIntrinsicRowError, FunctionKind, FunctionNullBehavior, FunctionVolatility, GuardKind,
-    ObservableEffects, SemanticParameters,
+    ArgumentControl, CallEffects, CallProofScope, DecimalOverflowPolicy, EvaluationDemand,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionEffectDeclaration,
+    FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError, FunctionKind,
+    FunctionNullBehavior, FunctionVolatility, GuardKind, ObservableEffects, RegionGuard,
+    SemanticParameters,
 };
 use std::{collections::HashMap, num::NonZeroUsize, sync::Mutex};
 
 const FUNCTION: &str = "fixture/lexical/higher-owner-v1";
 const OVERLOAD: &str = "fixture/lexical/int-body-v1";
 const IMPLEMENTATION: &str = "fixture/lexical/cpu-v1";
-const ROOT_DOMAIN: EvaluationDomainId = EvaluationDomainId::new(7);
-const OUTER_DOMAIN: EvaluationDomainId = EvaluationDomainId::new(8);
-const INNER_DOMAIN: EvaluationDomainId = EvaluationDomainId::new(9);
+const ROOT_DOMAIN: EvaluationRegionId = EvaluationRegionId::new(7);
+const OUTER_DOMAIN: EvaluationRegionId = EvaluationRegionId::new(8);
+const INNER_DOMAIN: EvaluationRegionId = EvaluationRegionId::new(9);
 #[derive(Default)]
 struct Control {
     fail: Option<(u32, CompileControlError)>,
@@ -83,7 +83,7 @@ fn base() -> FunctionEffectDeclaration {
         environment_dependencies: Box::default(),
     }
 }
-fn facts(domain: EvaluationDomainId) -> CallEffects {
+fn facts(domain: EvaluationRegionId) -> CallEffects {
     let base = base();
     CallEffects {
         value_stability: base.value_stability,
@@ -94,7 +94,7 @@ fn facts(domain: EvaluationDomainId) -> CallEffects {
         instance_state: base.instance_state,
         observable_effects: base.observable_effects,
         environment: Box::default(),
-        proof_scope: CallProofScope::Domain(domain),
+        proof_scope: CallProofScope::Region(domain),
     }
 }
 fn signature() -> Box<[FunctionArgumentType]> {
@@ -212,7 +212,7 @@ impl FunctionEffectOwner for Owner {
                 FunctionBindingError::InvalidBinding("fixture has no environment".into()).into(),
             );
         }
-        Ok(facts(input.context.domain))
+        Ok(facts(input.context.region))
     }
 }
 #[derive(Debug)]
@@ -321,14 +321,14 @@ fn lambda(edge: u32, captures: &[ProgramLexicalSource]) -> ProgramLambdaBinding 
 fn use_(
     id: u32,
     definition: usize,
-    domain: EvaluationDomainId,
+    domain: EvaluationRegionId,
     control: ControlShape,
     args: &[u32],
 ) -> ProgramExpressionUse {
     ProgramExpressionUse {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(id),
-            domain,
+            region: domain,
             demand: EvaluationDemand::Value,
         },
         definition: ProgramExprId::new(definition),
@@ -336,13 +336,13 @@ fn use_(
         arguments: args.iter().map(|id| ExpressionUseId::new(*id)).collect(),
     }
 }
-fn eager(id: u32, definition: usize, domain: EvaluationDomainId) -> ProgramExpressionUse {
+fn eager(id: u32, definition: usize, domain: EvaluationRegionId) -> ProgramExpressionUse {
     use_(id, definition, domain, ControlShape::Eager, &[])
 }
 fn higher(
     id: u32,
     definition: usize,
-    domain: EvaluationDomainId,
+    domain: EvaluationRegionId,
     args: &[u32],
 ) -> ProgramExpressionUse {
     use_(
@@ -388,7 +388,7 @@ fn build(
     definitions: Vec<StaticExprKind>,
     uses: Vec<ProgramExpressionUse>,
     roots: &[(usize, u32)],
-    domains: Vec<ProgramEvaluationDomain>,
+    domains: Vec<ProgramEvaluationRegion>,
     lambdas: Vec<ProgramLambdaBinding>,
     slots: Vec<ProgramSlotBinding>,
 ) -> Fixture {
@@ -408,7 +408,7 @@ fn build_project(
     definitions: Vec<StaticExprKind>,
     uses: Vec<ProgramExpressionUse>,
     roots: &[(usize, u32)],
-    domains: Vec<ProgramEvaluationDomain>,
+    domains: Vec<ProgramEvaluationRegion>,
     lambdas: Vec<ProgramLambdaBinding>,
     slots: Vec<ProgramSlotBinding>,
     projected_slots: Option<Vec<SlotId>>,
@@ -551,7 +551,7 @@ fn build_project(
             environment: &[],
             parameters: &parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            proof_scope: CallProofScope::Domain(invocation.context.domain),
+            proof_scope: CallProofScope::Region(invocation.context.region),
         };
         let count = lambdas
             .iter()
@@ -563,7 +563,7 @@ fn build_project(
             .prepare_frozen(
                 input,
                 selected.clone(),
-                &facts(invocation.context.domain),
+                &facts(invocation.context.region),
                 PureCallPreparation::HigherOrder(HigherOrderPreparationOptions {
                     arguments: ScopedExpressionEffects::pure_value(invocation.context),
                     body_context: body.context,
@@ -629,27 +629,27 @@ fn build_project(
         slots,
     }
 }
-fn domains(nested: bool, inner_owner: u32) -> Vec<ProgramEvaluationDomain> {
+fn domains(nested: bool, inner_owner: u32) -> Vec<ProgramEvaluationRegion> {
     let mut out = vec![
-        ProgramEvaluationDomain {
+        ProgramEvaluationRegion {
             id: ROOT_DOMAIN,
             parent: None,
             guard: None,
         },
-        ProgramEvaluationDomain {
+        ProgramEvaluationRegion {
             id: OUTER_DOMAIN,
             parent: Some(ROOT_DOMAIN),
-            guard: Some(DomainGuard {
+            guard: Some(RegionGuard {
                 owner: ExpressionUseId::new(0),
                 kind: GuardKind::LambdaInvocation,
             }),
         },
     ];
     if nested {
-        out.push(ProgramEvaluationDomain {
+        out.push(ProgramEvaluationRegion {
             id: INNER_DOMAIN,
             parent: Some(OUTER_DOMAIN),
-            guard: Some(DomainGuard {
+            guard: Some(RegionGuard {
                 owner: ExpressionUseId::new(inner_owner),
                 kind: GuardKind::LambdaInvocation,
             }),
@@ -829,7 +829,7 @@ fn ordinary_input_slot_is_not_an_unbound_capture() {
         vec![ref_(1)],
         vec![eager(0, 0, ROOT_DOMAIN)],
         &[(0, 0)],
-        vec![ProgramEvaluationDomain {
+        vec![ProgramEvaluationRegion {
             id: ROOT_DOMAIN,
             parent: None,
             guard: None,
@@ -928,7 +928,7 @@ fn new_closure_records_share_one_bound_and_observe_typed_outer_control() {
                 vec![ref_(1)],
                 uses,
                 &roots,
-                vec![ProgramEvaluationDomain {
+                vec![ProgramEvaluationRegion {
                     id: ROOT_DOMAIN,
                     parent: None,
                     guard: None,
@@ -967,10 +967,10 @@ fn new_closure_records_share_one_bound_and_observe_typed_outer_control() {
 
 #[test]
 fn same_lambda_definition_has_distinct_parameter_frames_for_each_real_use() {
-    let second_domain = ProgramEvaluationDomain {
+    let second_domain = ProgramEvaluationRegion {
         id: INNER_DOMAIN,
         parent: Some(ROOT_DOMAIN),
-        guard: Some(DomainGuard {
+        guard: Some(RegionGuard {
             owner: ExpressionUseId::new(4),
             kind: GuardKind::LambdaInvocation,
         }),
@@ -1069,7 +1069,7 @@ fn prior_unprojected_computation_and_same_slot_replacement_have_exact_sources() 
             vec![lit(), ref_(produced)],
             vec![eager(0, 0, ROOT_DOMAIN), eager(1, 1, ROOT_DOMAIN)],
             &[(0, 0), (1, 1)],
-            vec![ProgramEvaluationDomain {
+            vec![ProgramEvaluationRegion {
                 id: ROOT_DOMAIN,
                 parent: None,
                 guard: None,
@@ -1095,7 +1095,7 @@ fn prior_unprojected_computation_and_same_slot_replacement_have_exact_sources() 
         vec![lit(), ref_(1)],
         vec![eager(0, 0, ROOT_DOMAIN), eager(1, 1, ROOT_DOMAIN)],
         &[(0, 0), (1, 1)],
-        vec![ProgramEvaluationDomain {
+        vec![ProgramEvaluationRegion {
             id: ROOT_DOMAIN,
             parent: None,
             guard: None,
@@ -1113,7 +1113,7 @@ fn prior_unprojected_computation_and_same_slot_replacement_have_exact_sources() 
         vec![ref_(1), lit()],
         vec![eager(0, 0, ROOT_DOMAIN), eager(1, 1, ROOT_DOMAIN)],
         &[(0, 0), (1, 1)],
-        vec![ProgramEvaluationDomain {
+        vec![ProgramEvaluationRegion {
             id: ROOT_DOMAIN,
             parent: None,
             guard: None,

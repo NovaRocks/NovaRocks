@@ -24,7 +24,7 @@ use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, EffectContractError, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffects, ExpressionUseId, FunctionEffectDeclaration,
+    EvaluationRegionId, ExpressionEffects, ExpressionUseId, FunctionEffectDeclaration,
     FunctionFailureBehavior, FunctionInstanceState, FunctionNullBehavior, FunctionVolatility,
     ObservableEffects, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
     SemanticParameterValue,
@@ -162,7 +162,7 @@ impl Owner {
         CallEffectInput {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(9),
-                domain: EvaluationDomainId::new(11),
+                region: EvaluationRegionId::new(11),
                 demand: EvaluationDemand::Value,
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
@@ -388,7 +388,7 @@ fn argument_summary(input: CallEffectInput<'_>) -> ScopedExpressionEffects {
         },
     );
     ScopedExpressionEffects::pure_value(input.context)
-        .join_same_domain(child)
+        .join_same_region(child)
         .unwrap()
 }
 #[test]
@@ -483,7 +483,7 @@ fn every_frozen_effect_field_and_environment_reference_is_compared_before_prepar
             facts.observable_effects.controlled_wait = true
         }),
         ("scope", |facts| {
-            facts.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(11))
+            facts.proof_scope = CallProofScope::Region(EvaluationRegionId::new(11))
         }),
         ("environment missing", |facts| {
             facts.environment = Box::default()
@@ -535,7 +535,7 @@ fn child_summary_use_domain_and_demand_mismatches_fail_before_prepare() {
             ..input.context
         },
         ExpressionEffectContext {
-            domain: EvaluationDomainId::new(12),
+            region: EvaluationRegionId::new(12),
             ..input.context
         },
         ExpressionEffectContext {

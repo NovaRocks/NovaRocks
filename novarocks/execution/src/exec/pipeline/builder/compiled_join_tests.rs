@@ -44,7 +44,7 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     ArithmeticOperator, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, ExpressionUseId, FunctionValueType, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
     arithmetic_result_value_type_with_op, control_argument_semantics,
@@ -796,13 +796,13 @@ fn freeze(fragment: &Fragment) -> PhysicalRootUses {
         fragment: &'a Fragment,
         next: u32,
         uses: Vec<ExpressionInvocation<ExprId>>,
-        domains: Vec<ExpressionEvaluationDomain>,
+        domains: Vec<ExpressionEvaluationRegion>,
     }
     impl Author<'_> {
         fn visit(
             &mut self,
             expr: ExprId,
-            domain: EvaluationDomainId,
+            domain: EvaluationRegionId,
             demand: EvaluationDemand,
         ) -> ExpressionUseId {
             let id = ExpressionUseId::new(self.next);
@@ -826,24 +826,24 @@ fn freeze(fragment: &Fragment) -> PhysicalRootUses {
                 .map(|(ordinal, &child)| {
                     let (child_demand, guard) =
                         control_argument_semantics(shape, children.len(), ordinal, demand).unwrap();
-                    let child_domain = if let Some(kind) = guard {
-                        let child_domain = EvaluationDomainId::new(self.domains.len() as u32);
-                        self.domains.push(ExpressionEvaluationDomain {
-                            id: child_domain,
+                    let child_region = if let Some(kind) = guard {
+                        let child_region = EvaluationRegionId::new(self.domains.len() as u32);
+                        self.domains.push(ExpressionEvaluationRegion {
+                            id: child_region,
                             parent: Some(domain),
-                            guard: Some(novarocks_type_contract::DomainGuard { owner: id, kind }),
+                            guard: Some(novarocks_type_contract::RegionGuard { owner: id, kind }),
                         });
-                        child_domain
+                        child_region
                     } else {
                         domain
                     };
-                    self.visit(child, child_domain, child_demand)
+                    self.visit(child, child_region, child_demand)
                 })
                 .collect::<Vec<_>>();
             self.uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
                     use_id: id,
-                    domain,
+                    region: domain,
                     demand,
                 },
                 definition: expr,
@@ -853,12 +853,12 @@ fn freeze(fragment: &Fragment) -> PhysicalRootUses {
             id
         }
     }
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let mut author = Author {
         fragment,
         next: 0,
         uses: Vec::new(),
-        domains: vec![ExpressionEvaluationDomain {
+        domains: vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,

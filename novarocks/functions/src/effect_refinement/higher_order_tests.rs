@@ -22,7 +22,7 @@ use crate::{
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    ArgumentControl, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    ArgumentControl, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionUseId, FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError,
     FunctionNullBehavior, FunctionVolatility, MAX_UNOBSERVED_COMPILE_WORK, ObservableEffects,
 };
@@ -164,7 +164,7 @@ impl Fixture {
         CallEffectInput {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(7),
+                region: EvaluationRegionId::new(7),
                 demand: EvaluationDemand::Value,
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
@@ -179,7 +179,7 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(EvaluationDomainId::new(7)),
+            proof_scope: CallProofScope::Region(EvaluationRegionId::new(7)),
         }
     }
 }

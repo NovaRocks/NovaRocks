@@ -21,17 +21,17 @@
 use super::*;
 use crate::{
     BindingRequirements, CompileProfile, ImmutableExpressions, KernelAbiVersion, LocalProgramGraph,
-    ProgramControlFlow, ProgramEvaluationDomain, ProgramExpressionUse, ProgramNode,
+    ProgramControlFlow, ProgramEvaluationRegion, ProgramExpressionUse, ProgramNode,
     ProgramRootUseBinding, StaticExprNode, StaticFunctionKind, StaticLiteral, StaticValues,
 };
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_functions::*;
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CallProofScope, DecimalOverflowPolicy, DomainGuard,
-    EvaluationDomainId, ExpressionEffectContext, FunctionEffectDeclaration,
-    FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError, FunctionKind,
-    FunctionNullBehavior, FunctionVolatility, GuardKind, ObservableEffects, SemanticParameters,
+    ArgumentControl, CallEffects, CallProofScope, DecimalOverflowPolicy, EvaluationRegionId,
+    ExpressionEffectContext, FunctionEffectDeclaration, FunctionFailureBehavior,
+    FunctionInstanceState, FunctionIntrinsicRowError, FunctionKind, FunctionNullBehavior,
+    FunctionVolatility, GuardKind, ObservableEffects, RegionGuard, SemanticParameters,
 };
 use std::{
     collections::HashMap,
@@ -51,7 +51,7 @@ const SCALAR: &str = "fixture/local-resolved/compare-v1";
 const TYPE_ONLY: &str = "fixture/local-resolved/type-v1";
 const HIGHER: &str = "fixture/local-resolved/higher-v1";
 const IF: &str = "fixture/local-resolved/if-v1";
-const DOMAIN: EvaluationDomainId = EvaluationDomainId::new(7);
+const DOMAIN: EvaluationRegionId = EvaluationRegionId::new(7);
 
 #[derive(Default)]
 struct Control {
@@ -250,7 +250,7 @@ impl Owner {
             instance_state: base.instance_state,
             observable_effects: base.observable_effects,
             environment: Box::default(),
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         }
     }
 }
@@ -581,7 +581,7 @@ fn token(
         environment: &[],
         parameters: &parameters,
         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        proof_scope: CallProofScope::Domain(context.domain),
+        proof_scope: CallProofScope::Region(context.region),
     };
     let options = if overload == HIGHER {
         let body_context = body.unwrap();
@@ -620,12 +620,12 @@ fn token(
 }
 fn context(
     use_id: u32,
-    domain: EvaluationDomainId,
+    domain: EvaluationRegionId,
     demand: EvaluationDemand,
 ) -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(use_id),
-        domain,
+        region: domain,
         demand,
     }
 }
@@ -752,7 +752,7 @@ fn snapshot(
     program: LocalProgramGraph,
     uses: Vec<ProgramExpressionUse>,
     roots: Vec<(ProgramExpressionRootSite, u32)>,
-    domains: Vec<ProgramEvaluationDomain>,
+    domains: Vec<ProgramEvaluationRegion>,
 ) -> ProgramRootControlBindings {
     let flow = ProgramControlFlow::try_new(
         domains,
@@ -775,8 +775,8 @@ fn snapshot(
     )
     .unwrap()
 }
-fn root_domain() -> ProgramEvaluationDomain {
-    ProgramEvaluationDomain {
+fn root_region() -> ProgramEvaluationRegion {
+    ProgramEvaluationRegion {
         id: DOMAIN,
         parent: None,
         guard: None,
@@ -791,7 +791,7 @@ fn scalar_snapshot() -> ProgramRootControlBindings {
             invocation(2, 1, ControlShape::Eager, &[]),
         ],
         vec![(root(0), 0)],
-        vec![root_domain()],
+        vec![root_region()],
     )
 }
 fn scalar_token(catalog: &FixtureCatalog, owner: &Owner, use_id: u32) -> PureCallSpecialization {
@@ -914,7 +914,7 @@ fn changed_actual_order_and_occurrence_context_cannot_reuse_token_as_evidence() 
             invocation(2, 0, ControlShape::Eager, &[]),
         ],
         vec![(root(0), 0)],
-        vec![root_domain()],
+        vec![root_region()],
     );
     assert_eq!(
         ProgramResolvedCalls::try_new(
@@ -939,7 +939,7 @@ fn changed_actual_order_and_occurrence_context_cannot_reuse_token_as_evidence() 
         &catalog,
         &owner,
         SCALAR,
-        context(0, EvaluationDomainId::new(8), EvaluationDemand::Value),
+        context(0, EvaluationRegionId::new(8), EvaluationDemand::Value),
         &[Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))],
         None,
         false,
@@ -987,7 +987,7 @@ fn shared_definition_keeps_distinct_sparse_occurrences_and_host_root_scopes() {
             invocation(4, 1, ControlShape::Eager, &[]),
         ],
         vec![(root(0), 0), (root(1), u32::MAX)],
-        vec![root_domain()],
+        vec![root_region()],
     );
     let left = scalar_token(&catalog, &owner, 0);
     let right = token(
@@ -1058,7 +1058,7 @@ fn type_only_does_not_require_dead_child_call_attachments_and_cannot_be_eager() 
         project_program(arena, &[2]),
         vec![invocation(0, 2, ControlShape::TypeOnly, &[])],
         vec![(root(0), 0)],
-        vec![root_domain()],
+        vec![root_region()],
     );
     let call = token(
         &catalog,
@@ -1156,9 +1156,9 @@ fn higher_snapshot_locals(
         ControlShape::LambdaBody,
         edge_uses,
     );
-    edge.context.domain = EvaluationDomainId::new(8);
+    edge.context.region = EvaluationRegionId::new(8);
     let mut body = invocation(3, 1, ControlShape::Eager, &[]);
-    body.context.domain = EvaluationDomainId::new(8);
+    body.context.region = EvaluationRegionId::new(8);
     let mut uses = vec![
         invocation(
             0,
@@ -1179,7 +1179,7 @@ fn higher_snapshot_locals(
             invocation(5, 0, ControlShape::Eager, &[]),
             invocation(6, 0, ControlShape::Eager, &[]),
         ] {
-            child.context.domain = EvaluationDomainId::new(8);
+            child.context.region = EvaluationRegionId::new(8);
             uses.push(child);
         }
     }
@@ -1188,11 +1188,11 @@ fn higher_snapshot_locals(
         uses,
         vec![(root(0), 0)],
         vec![
-            root_domain(),
-            ProgramEvaluationDomain {
-                id: EvaluationDomainId::new(8),
+            root_region(),
+            ProgramEvaluationRegion {
+                id: EvaluationRegionId::new(8),
                 parent: Some(DOMAIN),
-                guard: Some(DomainGuard {
+                guard: Some(RegionGuard {
                     owner: ExpressionUseId::new(0),
                     kind: GuardKind::LambdaInvocation,
                 }),
@@ -1211,7 +1211,7 @@ fn lambda_local_calls_require_exact_frozen_tokens_and_order_before_body() {
         &[Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))],
         Some(context(
             3,
-            EvaluationDomainId::new(8),
+            EvaluationRegionId::new(8),
             EvaluationDemand::Value,
         )),
         false,
@@ -1220,7 +1220,7 @@ fn lambda_local_calls_require_exact_frozen_tokens_and_order_before_body() {
         &catalog,
         &owner,
         SCALAR,
-        context(4, EvaluationDomainId::new(8), EvaluationDemand::Value),
+        context(4, EvaluationRegionId::new(8), EvaluationDemand::Value),
         &[Some(ExpressionUseId::new(5)), Some(ExpressionUseId::new(6))],
         None,
         false,
@@ -1233,8 +1233,8 @@ fn lambda_local_calls_require_exact_frozen_tokens_and_order_before_body() {
     .unwrap();
     assert_eq!(resolved.calls().len(), 2);
     assert_eq!(
-        resolved.calls()[&scope(4)].call_contract().context().domain,
-        EvaluationDomainId::new(8)
+        resolved.calls()[&scope(4)].call_contract().context().region,
+        EvaluationRegionId::new(8)
     );
     assert_eq!(
         ProgramResolvedCalls::try_new(
@@ -1256,7 +1256,7 @@ fn lambda_local_calls_require_exact_frozen_tokens_and_order_before_body() {
         .arguments
         .reverse();
     let wrong = ProgramControlFlow::try_new(
-        flow.domains().values().copied().collect(),
+        flow.regions().values().copied().collect(),
         uses,
         snapshot.program().expressions().nodes().len(),
         &Control::default(),
@@ -1285,7 +1285,7 @@ fn lambda_local_calls_require_exact_frozen_tokens_and_order_before_body() {
 #[test]
 fn higher_order_keeps_actual_body_edge_and_inner_root_but_does_not_claim_capture_closure() {
     let (catalog, owner, _) = catalogue();
-    let body = context(3, EvaluationDomainId::new(8), EvaluationDemand::Value);
+    let body = context(3, EvaluationRegionId::new(8), EvaluationDemand::Value);
     let prepare = |body| {
         token(
             &catalog,
@@ -1314,7 +1314,7 @@ fn higher_order_keeps_actual_body_edge_and_inner_root_but_does_not_claim_capture
     assert_eq!(kernel.body_contract().context(), body);
     let wrong = context(
         u32::MAX,
-        EvaluationDomainId::new(8),
+        EvaluationRegionId::new(8),
         EvaluationDemand::Value,
     );
     assert_eq!(
@@ -1356,23 +1356,23 @@ fn intrinsic_controller_attachment_retains_guards_without_scalar_instance() {
     let mut condition = invocation(1, 0, ControlShape::Eager, &[]);
     condition.context.demand = EvaluationDemand::TruthOnly;
     let mut then = invocation(2, 0, ControlShape::Eager, &[]);
-    then.context.domain = EvaluationDomainId::new(8);
+    then.context.region = EvaluationRegionId::new(8);
     let mut otherwise = invocation(3, 1, ControlShape::Eager, &[]);
-    otherwise.context.domain = EvaluationDomainId::new(9);
+    otherwise.context.region = EvaluationRegionId::new(9);
     let domains = vec![
-        root_domain(),
-        ProgramEvaluationDomain {
-            id: EvaluationDomainId::new(8),
+        root_region(),
+        ProgramEvaluationRegion {
+            id: EvaluationRegionId::new(8),
             parent: Some(DOMAIN),
-            guard: Some(DomainGuard {
+            guard: Some(RegionGuard {
                 owner: ExpressionUseId::new(0),
                 kind: GuardKind::IfThen,
             }),
         },
-        ProgramEvaluationDomain {
-            id: EvaluationDomainId::new(9),
+        ProgramEvaluationRegion {
+            id: EvaluationRegionId::new(9),
             parent: Some(DOMAIN),
-            guard: Some(DomainGuard {
+            guard: Some(RegionGuard {
                 owner: ExpressionUseId::new(0),
                 kind: GuardKind::IfElse,
             }),
@@ -1411,7 +1411,7 @@ fn intrinsic_controller_attachment_retains_guards_without_scalar_instance() {
     ));
     assert_eq!(
         resolved.snapshot().flows()[&ProgramExpressionArena::Main]
-            .domains()
+            .regions()
             .len(),
         3
     );
@@ -1451,7 +1451,7 @@ fn entry_and_midwork_failures_are_typed_and_declaration_count_is_bounded() {
         project_program(scalar_arena(), &vec![2; 100]),
         uses,
         roots,
-        vec![root_domain()],
+        vec![root_region()],
     );
     for failure in [
         CompileControlError::Cancelled,
@@ -1525,7 +1525,7 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
                 &[Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))],
                 Some(context(
                     3,
-                    EvaluationDomainId::new(8),
+                    EvaluationRegionId::new(8),
                     EvaluationDemand::Value,
                 )),
                 false,
@@ -1654,7 +1654,7 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
             } else {
                 root(0)
             };
-            let snapshot = snapshot(program, vec![use_], vec![(site, 0)], vec![root_domain()]);
+            let snapshot = snapshot(program, vec![use_], vec![(site, 0)], vec![root_region()]);
             let call = token(
                 &catalog,
                 &owner,

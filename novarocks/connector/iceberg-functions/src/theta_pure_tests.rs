@@ -20,7 +20,7 @@ use arrow_array::*;
 use arrow_schema::{DataType, TimeUnit};
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
+    EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, ExpressionUseId,
     FunctionInstanceState, FunctionNullBehavior, ObservableEffects, PureCompileControl,
     SemanticParameters,
 };
@@ -118,7 +118,7 @@ fn runtime_causes() -> [KernelFailure; 7] {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(0),
-        domain: EvaluationDomainId::new(u32::MAX),
+        region: EvaluationRegionId::new(u32::MAX),
         demand: EvaluationDemand::Value,
     }
 }
@@ -205,7 +205,7 @@ impl Fixture {
                     phase,
                     state_context: ExpressionEffectContext {
                         use_id: ExpressionUseId::new(2),
-                        domain: EvaluationDomainId::new(u32::MAX - 1),
+                        region: EvaluationRegionId::new(u32::MAX - 1),
                         demand: EvaluationDemand::Value,
                     },
                     state_input_type: &self.state_type,
@@ -215,7 +215,7 @@ impl Fixture {
             parameters: &self.parameters,
             environment: &[],
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Domain(context().domain),
+            proof_scope: CallProofScope::Region(context().region),
         }
     }
     fn options(&self, phase: AggregateKernelPhase) -> PureCallPreparation {

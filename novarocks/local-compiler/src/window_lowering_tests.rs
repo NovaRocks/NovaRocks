@@ -51,8 +51,8 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEffects, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    EvaluationDemand, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEffects, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
     FunctionValueType, PureCompileControl, SemanticParameters, WindowBound, WindowFrame,
     WindowFrameExclusion, WindowFrameUnits,
 };
@@ -529,10 +529,10 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
         .with_call_requests_observed(requests, &Control)
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationDomainId::new(0);
+    let domain = EvaluationRegionId::new(0);
     let context = |id: u32| ExpressionEffectContext {
         use_id: ExpressionUseId::new(id),
-        domain,
+        region: domain,
         demand: EvaluationDemand::Value,
     };
     let mut uses = Vec::new();
@@ -570,7 +570,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
         bindings.push((*site, ExpressionUseId::new(id)));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -644,7 +644,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                 temporal_source: None,
                 site: PhysicalCallSite::Expression(use_id),
                 context: call_context,
-                effects: declared_aggregate_effects(CallProofScope::Domain(domain)),
+                effects: declared_aggregate_effects(CallProofScope::Region(domain)),
                 decimal_overflow_policy: POLICY,
             });
             continue;
@@ -692,7 +692,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: POLICY,
-                    proof_scope: CallProofScope::Domain(domain),
+                    proof_scope: CallProofScope::Region(domain),
                 },
                 Arc::clone(&selection),
                 options,

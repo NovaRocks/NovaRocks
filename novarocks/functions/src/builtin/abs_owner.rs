@@ -247,7 +247,7 @@ impl AbsOwner {
         }
         if !input.environment.is_empty()
             || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                && input.proof_scope != CallProofScope::Region(input.context.region)
         {
             return Err(FunctionBindingError::InvalidBinding(
                 "ABS has no environment dependencies and requires an exact proof scope".into(),
@@ -342,7 +342,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int8Array, Int16Array};
     use arrow_schema::DataType;
     use novarocks_type_contract::{
-        CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+        CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
         ExpressionEffectContext, ExpressionUseId, SemanticParameters, ValueLogicalType,
     };
     use std::time::Duration;
@@ -370,7 +370,7 @@ mod tests {
     fn context() -> ExpressionEffectContext {
         ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         }
     }
@@ -597,7 +597,7 @@ mod tests {
             ))
         ));
         let mut foreign_input = input;
-        foreign_input.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+        foreign_input.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
         assert!(matches!(
             owner.validate_and_refine(foreign_input, crate::binding_test_control()),
             Err(FunctionEffectOwnerError::Owner(

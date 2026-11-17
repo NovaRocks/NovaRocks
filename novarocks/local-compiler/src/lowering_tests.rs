@@ -38,7 +38,7 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
     ExpressionInvocation, ExpressionUseId, FunctionInstanceState, FunctionValueType,
     PureCompileControl, SemanticParameters,
 };
@@ -297,7 +297,7 @@ fn package_with_case(
         .with_call_requests_observed(original_requests, &FixtureControl)
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(u32::MAX);
+    let domain = EvaluationRegionId::new(u32::MAX);
     let mut uses = Vec::new();
     let mut bindings = Vec::new();
     let mut calls = Vec::new();
@@ -305,7 +305,7 @@ fn package_with_case(
         let use_id = ExpressionUseId::new(u32::MAX - ordinal as u32);
         let context = ExpressionEffectContext {
             use_id,
-            domain,
+            region: domain,
             demand: root.demand,
         };
         uses.push(ExpressionInvocation {
@@ -331,7 +331,7 @@ fn package_with_case(
                         environment: &[],
                         parameters: &parameters,
                         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                        proof_scope: novarocks_type_contract::CallProofScope::Domain(domain),
+                        proof_scope: novarocks_type_contract::CallProofScope::Region(domain),
                     },
                     selected.clone(),
                     PureCallPreparation::Scalar {
@@ -353,7 +353,7 @@ fn package_with_case(
         }
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -475,8 +475,8 @@ fn scalar_result_lowering_preserves_one_empty_row_sparse_sources_and_full_owner(
             PurePreparationSource::Frozen
         );
         assert_eq!(
-            call.call_contract().context().domain,
-            EvaluationDomainId::new(u32::MAX)
+            call.call_contract().context().region,
+            EvaluationRegionId::new(u32::MAX)
         );
         assert_eq!(
             call.call_contract().context().demand,

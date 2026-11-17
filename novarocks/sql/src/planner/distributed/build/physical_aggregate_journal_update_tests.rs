@@ -139,7 +139,7 @@ fn effects() -> ScopedExpressionEffects {
     ScopedExpressionEffects::primitive(
         novarocks_type_contract::ExpressionEffectContext {
             use_id: novarocks_type_contract::ExpressionUseId::new(91),
-            domain: novarocks_type_contract::EvaluationDomainId::new(92),
+            region: novarocks_type_contract::EvaluationRegionId::new(92),
             demand: novarocks_type_contract::EvaluationDemand::Value,
         },
         ExpressionEffects::PURE_VALUE,

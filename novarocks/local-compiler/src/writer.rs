@@ -44,7 +44,7 @@ use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use novarocks_connector_contract::ConnectorWriteRecipe;
 use novarocks_local_program::{
     BindingRequirement, ExpressionsCompileError, ImmutableExpressions, ProgramChannelLayoutRole,
-    ProgramChannelSite, ProgramControlFlow, ProgramEvaluationDomain, ProgramExprId,
+    ProgramChannelSite, ProgramControlFlow, ProgramEvaluationRegion, ProgramExprId,
     ProgramExpressionArena, ProgramExpressionRootSite, ProgramExpressionUse, ProgramLexicalSource,
     ProgramNodeId, ProgramNodeKind, ProgramRootUseBinding, ProgramSlotBinding, ProgramUseRef,
     StaticExprKind, StaticExprNode, StaticLayout, StaticWriterProjection,
@@ -55,7 +55,7 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionArgumentType,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionArgumentType,
     FunctionValueType, PureCompileControl,
 };
 use novarocks_types::SlotId;
@@ -723,9 +723,9 @@ fn projection_flow<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>
     for (expression, &ordinal) in ordinals.iter().enumerate() {
         let identity =
             u32::try_from(expression).map_err(|_| CompileControlError::ResourceExhausted)?;
-        let domain = EvaluationDomainId::new(identity);
+        let domain = EvaluationRegionId::new(identity);
         let use_id = ExpressionUseId::new(identity);
-        domains.push(ProgramEvaluationDomain {
+        domains.push(ProgramEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -733,7 +733,7 @@ fn projection_flow<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>
         uses.push(ProgramExpressionUse {
             context: ExpressionEffectContext {
                 use_id,
-                domain,
+                region: domain,
                 demand: EvaluationDemand::Value,
             },
             definition: ProgramExprId::new(expression),

@@ -457,7 +457,7 @@ impl FailureProjection for FrozenCallError {
                 PhysicalReason::FrozenCallWrongContext,
             ),
             Self::SharedUse => fact(FailureClass::Invariant, PhysicalReason::FrozenCallSharedUse),
-            Self::InvalidDomain => fact(
+            Self::InvalidRegion => fact(
                 FailureClass::Invariant,
                 PhysicalReason::FrozenCallInvalidDomain,
             ),

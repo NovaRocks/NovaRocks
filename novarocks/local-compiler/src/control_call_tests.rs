@@ -38,10 +38,10 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileControlError, CompilePhase, ControlShape,
-    DecimalOverflowPolicy, DomainGuard, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, FunctionInstanceState, FunctionNullBehavior,
-    FunctionValueType, FunctionVolatility, GuardKind, PureCompileControl, SemanticParameters,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
+    FunctionInstanceState, FunctionNullBehavior, FunctionValueType, FunctionVolatility, GuardKind,
+    PureCompileControl, RegionGuard, SemanticParameters,
 };
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
@@ -130,7 +130,7 @@ fn options() -> LocalCompileOptions {
 fn context(id: u32, domain: u32, demand: EvaluationDemand) -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(id),
-        domain: EvaluationDomainId::new(domain),
+        region: EvaluationRegionId::new(domain),
         demand,
     }
 }
@@ -278,18 +278,18 @@ fn package(
             contexts,
             uses,
             vec![
-                ExpressionEvaluationDomain {
-                    id: EvaluationDomainId::new(8),
-                    parent: Some(EvaluationDomainId::new(u32::MAX)),
-                    guard: Some(DomainGuard {
+                ExpressionEvaluationRegion {
+                    id: EvaluationRegionId::new(8),
+                    parent: Some(EvaluationRegionId::new(u32::MAX)),
+                    guard: Some(RegionGuard {
                         owner: ExpressionUseId::new(10),
                         kind: GuardKind::IfThen,
                     }),
                 },
-                ExpressionEvaluationDomain {
-                    id: EvaluationDomainId::new(9),
-                    parent: Some(EvaluationDomainId::new(u32::MAX)),
-                    guard: Some(DomainGuard {
+                ExpressionEvaluationRegion {
+                    id: EvaluationRegionId::new(9),
+                    parent: Some(EvaluationRegionId::new(u32::MAX)),
+                    guard: Some(RegionGuard {
                         owner: ExpressionUseId::new(10),
                         kind: GuardKind::IfElse,
                     }),
@@ -310,10 +310,10 @@ fn package(
             ControlShape::Coalesce,
             contexts,
             uses,
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(8),
-                parent: Some(EvaluationDomainId::new(u32::MAX)),
-                guard: Some(DomainGuard {
+            vec![ExpressionEvaluationRegion {
+                id: EvaluationRegionId::new(8),
+                parent: Some(EvaluationRegionId::new(u32::MAX)),
+                guard: Some(RegionGuard {
                     owner: ExpressionUseId::new(10),
                     kind: GuardKind::CoalesceAfterNull { ordinal: 1 },
                 }),
@@ -409,8 +409,8 @@ fn package(
         shape,
         &contexts.iter().map(|c| c.use_id.get()).collect::<Vec<_>>(),
     ));
-    let mut all_domains = vec![ExpressionEvaluationDomain {
-        id: EvaluationDomainId::new(u32::MAX),
+    let mut all_domains = vec![ExpressionEvaluationRegion {
+        id: EvaluationRegionId::new(u32::MAX),
         parent: None,
         guard: None,
     }];
@@ -446,7 +446,7 @@ fn package(
                 environment: &[],
                 parameters: &parameters,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                proof_scope: CallProofScope::Domain(rng_context.domain),
+                proof_scope: CallProofScope::Region(rng_context.region),
             },
             rng_selected.clone(),
             PureCallPreparation::Scalar {
@@ -479,7 +479,7 @@ fn package(
                 environment: &[],
                 parameters: &parameters,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                proof_scope: CallProofScope::Domain(parent_context.domain),
+                proof_scope: CallProofScope::Region(parent_context.region),
             },
             selected.clone(),
             PureCallPreparation::ControlIntrinsic {
@@ -649,8 +649,8 @@ fn assert_control_call(name: &str, expected: ControlShape, argument_control: Arg
     let guarded = &flow.uses()[&ExpressionUseId::new(20)];
     assert_eq!(guarded.context, context(20, 8, EvaluationDemand::Value));
     assert_eq!(
-        flow.domains()[&EvaluationDomainId::new(8)].guard.unwrap(),
-        DomainGuard {
+        flow.regions()[&EvaluationRegionId::new(8)].guard.unwrap(),
+        RegionGuard {
             owner: ExpressionUseId::new(10),
             kind: if name == "if" {
                 GuardKind::IfThen
@@ -665,11 +665,11 @@ fn assert_control_call(name: &str, expected: ControlShape, argument_control: Arg
             EvaluationDemand::TruthOnly
         );
         assert_eq!(
-            flow.uses()[&ExpressionUseId::new(30)].context.domain,
-            EvaluationDomainId::new(9)
+            flow.uses()[&ExpressionUseId::new(30)].context.region,
+            EvaluationRegionId::new(9)
         );
         assert_eq!(
-            flow.domains()[&EvaluationDomainId::new(9)]
+            flow.regions()[&EvaluationRegionId::new(9)]
                 .guard
                 .unwrap()
                 .kind,

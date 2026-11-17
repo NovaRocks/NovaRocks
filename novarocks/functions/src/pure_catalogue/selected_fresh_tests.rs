@@ -19,7 +19,7 @@ use super::*;
 use arrow_array::{Array, Int32Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, EvaluationDemand, EvaluationDomainId,
+    CallProofScope, CompileControlError, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, FunctionKind, FunctionValueType, SemanticParameters,
 };
 use std::sync::{
@@ -156,7 +156,7 @@ impl Fixture {
     fn context(&self) -> ExpressionEffectContext {
         ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         }
     }
@@ -175,7 +175,7 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(self.context().domain),
+            proof_scope: CallProofScope::Region(self.context().region),
         }
     }
     fn options(&self) -> PureCallPreparation {
@@ -350,7 +350,7 @@ fn ordinary_selected_fresh_checks_identity_options_complete_source_and_domain_be
                     constant: None,
                 }]
             }
-            4 => input.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(8)),
+            4 => input.proof_scope = CallProofScope::Region(EvaluationRegionId::new(8)),
             5 => {
                 selected.result_type =
                     FunctionResultType::Scalar(FunctionValueType::new(DataType::Boolean, false))

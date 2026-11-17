@@ -150,7 +150,7 @@ impl LambdaBodyContract {
         // The lambda edge and inner body root can have distinct use IDs.
         // Row expansion must not reuse the outer batch's evaluation domain.
         if context.demand != call.body_demand()
-            || context.domain == call.call().context().domain
+            || context.region == call.call().context().region
             || effects.context() != context
         {
             return Err(invalid(

@@ -22,7 +22,7 @@ use crate::{
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionUseId, SemanticParameters,
 };
 fn owner(name: &str) -> RegexpPositionOwner {
@@ -38,7 +38,7 @@ fn owner(name: &str) -> RegexpPositionOwner {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     }
 }

@@ -29,7 +29,7 @@ use crate::{
 use arrow_array::Int32Array;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
     FunctionNullBehavior, FunctionVolatility, PureCompileControl, SemanticParameters,
 };
 use std::{sync::Mutex, time::Duration};
@@ -212,7 +212,7 @@ fn calendar_day_number_three_actual_records_preserve_fresh_frozen_selected_ident
             );
             let context = ExpressionEffectContext {
                 use_id: ExpressionUseId::new(41),
-                domain: EvaluationDomainId::new(7),
+                region: EvaluationRegionId::new(7),
                 demand: EvaluationDemand::Value,
             };
             let parameters = SemanticParameters::try_new([]).unwrap();
@@ -227,7 +227,7 @@ fn calendar_day_number_three_actual_records_preserve_fresh_frozen_selected_ident
                 environment: &[],
                 parameters: &parameters,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             };
             let fresh = specialize_scalar(
                 &owner,
@@ -312,7 +312,7 @@ fn calendar_day_number_three_actual_records_preserve_fresh_frozen_selected_ident
                     .is_err()
             );
             stale = input;
-            stale.context.domain = EvaluationDomainId::new(999);
+            stale.context.region = EvaluationRegionId::new(999);
             assert!(
                 owner
                     .prepare_scalar(stale, canonical.clone(), crate::binding_test_control())
@@ -822,7 +822,7 @@ fn with_installed_day_number<T>(
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(841),
-        domain: EvaluationDomainId::new(847),
+        region: EvaluationRegionId::new(847),
         demand: EvaluationDemand::Value,
     };
     let uses = [Some(ExpressionUseId::new(842))];
@@ -837,7 +837,7 @@ fn with_installed_day_number<T>(
         environment: &[],
         parameters: &parameters,
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context.domain),
+        proof_scope: CallProofScope::Region(context.region),
     };
     let fresh = catalog
         .prepare_fresh_selected(
@@ -882,7 +882,7 @@ fn calendar_day_number_captured_owner_errors_return_without_a_later_compile_call
                 match mismatch {
                     0 => wrong.function_id = &foreign,
                     1 => wrong.kind = crate::FunctionKind::Aggregate,
-                    2 => wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(999)),
+                    2 => wrong.proof_scope = CallProofScope::Region(EvaluationRegionId::new(999)),
                     _ => unreachable!(),
                 }
                 let control = CompileControl::default();

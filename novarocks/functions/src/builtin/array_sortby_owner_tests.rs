@@ -23,7 +23,7 @@ use crate::{
 };
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionUseId, SemanticParameters,
 };
 
@@ -77,7 +77,7 @@ fn prepared_typed_with_result_storage(
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(771),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     };
     let uses = (0..types.len())
@@ -96,7 +96,7 @@ fn prepared_typed_with_result_storage(
                 parameters: &parameters,
                 environment: &[],
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             },
             selected.clone(),
             PureCallPreparation::Scalar {

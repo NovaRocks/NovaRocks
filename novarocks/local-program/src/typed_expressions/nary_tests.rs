@@ -18,14 +18,14 @@
 use super::*;
 use crate::{
     BindingRequirements, CompileProfile, ControlShape, ImmutableExpressions, KernelAbiVersion,
-    LocalProgramGraph, ProgramControlFlow, ProgramEvaluationDomain, ProgramExpressionRootSite,
+    LocalProgramGraph, ProgramControlFlow, ProgramEvaluationRegion, ProgramExpressionRootSite,
     ProgramExpressionUse, ProgramNode, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind,
     ProgramRootControlBindings, ProgramRootUseBinding, StaticExprNode, StaticLayout, StaticValues,
 };
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_functions::{ConstantPolicy, ConstantValue};
-use novarocks_type_contract::{EvaluationDomainId, ExpressionEffectContext, ExpressionUseId};
+use novarocks_type_contract::{EvaluationRegionId, ExpressionEffectContext, ExpressionUseId};
 use novarocks_types::SlotId;
 use std::{collections::HashMap, num::NonZeroUsize};
 
@@ -218,8 +218,8 @@ fn assembled(
     let mut uses = Vec::new();
     let root_use = add_use(root, demand, &arena, &mut uses);
     let flow = ProgramControlFlow::try_new(
-        vec![ProgramEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ProgramEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],
@@ -265,7 +265,7 @@ fn add_use(
     uses.push(ProgramExpressionUse {
         context: ExpressionEffectContext {
             use_id: id,
-            domain: EvaluationDomainId::new(0),
+            region: EvaluationRegionId::new(0),
             demand,
         },
         definition,

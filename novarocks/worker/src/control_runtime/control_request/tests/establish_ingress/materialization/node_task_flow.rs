@@ -79,8 +79,8 @@ use novarocks_physical_plan::{
     PropertyProofProjectionLimits, RequiredContracts, ResultPort, StagePlacementPolicy,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEvaluationDomain, PureCompileControl, SemanticParameters,
+    CompileControlError, CompilePhase, EvaluationRegionId, ExpressionControlFlow,
+    ExpressionEvaluationRegion, PureCompileControl, SemanticParameters,
 };
 use novarocks_types::{StageId, TaskId, UniqueId};
 use novarocks_worker_protocol::participation::{ParticipationCommand, ParticipationReplyBody};
@@ -145,8 +145,8 @@ fn compiled_count_root() -> Arc<LocalProgram> {
         )
         .unwrap();
     let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(1),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(1),
             parent: None,
             guard: None,
         }],

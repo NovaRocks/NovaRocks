@@ -205,7 +205,7 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         invocations.push(ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id,
-                domain: EvaluationDomainId::new(0),
+                region: EvaluationRegionId::new(0),
                 demand: root.demand,
             },
             definition: root.expr,
@@ -215,8 +215,8 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         bindings.push((*site, use_id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
+        vec![ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(0),
             parent: None,
             guard: None,
         }],
