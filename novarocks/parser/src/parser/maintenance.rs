@@ -23,7 +23,7 @@ use crate::{
     ParseError, Span, TokenKind,
     ast::{
         MaintenanceStatement, Statement,
-        maintenance::{
+        legacy::maintenance::{
             CallStatement, ExpireSnapshots, ExpireSnapshotsOption, MaintenanceValue, OptimizeTable,
             ProcedureArgument, ProcedureArgumentMode, ProcedureMap, ProcedureMapEntry,
             RemoveOrphanFiles, RewriteManifests,

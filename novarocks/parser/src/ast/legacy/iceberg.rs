@@ -19,7 +19,7 @@
 
 use crate::Span;
 
-use super::{Fold, Ident, Literal, ObjectName, Property, PropertyKeyValue, TypeName, Visit};
+use crate::ast::{Fold, Ident, Literal, ObjectName, Property, PropertyKeyValue, TypeName, Visit};
 
 /// Iceberg table commands owned by SQLP-3.
 #[derive(Clone, Debug, Eq, PartialEq)]

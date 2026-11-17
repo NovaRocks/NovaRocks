@@ -16,7 +16,7 @@
 // under the License.
 
 //! Syntax for statement-owned ANALYZE and SHOW STATS.
-use super::{Fold, Ident, ObjectName, Visit};
+use crate::ast::{Fold, Ident, ObjectName, Visit};
 use crate::{Span, printer::print_object_name};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

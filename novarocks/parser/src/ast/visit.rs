@@ -654,41 +654,41 @@ pub fn walk_statistics_statement<V: Visit + ?Sized>(
     visitor: &mut V,
     statement: &StatisticsStatement,
 ) {
-    super::statistics::walk(visitor, statement);
+    super::legacy::statistics::walk(visitor, statement);
 }
 
 pub fn walk_catalog_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &CatalogStatement) {
-    super::catalog::walk(visitor, statement);
+    super::legacy::catalog::walk(visitor, statement);
 }
 
 pub fn walk_iceberg_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &IcebergStatement) {
-    super::iceberg::walk(visitor, statement);
+    super::legacy::iceberg::walk(visitor, statement);
 }
 
 pub fn walk_maintenance_statement<V: Visit + ?Sized>(
     visitor: &mut V,
     statement: &MaintenanceStatement,
 ) {
-    super::maintenance::walk(visitor, statement);
+    super::legacy::maintenance::walk(visitor, statement);
 }
 
 pub fn walk_materialized_view_statement<V: Visit + ?Sized>(
     visitor: &mut V,
     statement: &MaterializedViewStatement,
 ) {
-    super::materialized_view::walk(visitor, statement);
+    super::legacy::materialized_view::walk(visitor, statement);
 }
 
 pub fn walk_view_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &ViewStatement) {
-    super::view::walk(visitor, statement);
+    super::legacy::view::walk(visitor, statement);
 }
 
 pub fn walk_table_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &TableStatement) {
-    super::table::walk(visitor, statement);
+    super::legacy::table::walk(visitor, statement);
 }
 
 pub fn walk_dml_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &DmlStatement) {
-    super::dml::walk(visitor, statement);
+    super::legacy::dml::walk(visitor, statement);
 }
 
 pub fn walk_ident<V: Visit + ?Sized>(_: &mut V, _: &Ident) {}
@@ -1664,56 +1664,56 @@ pub fn fold_statistics_statement<F: Fold + ?Sized>(
     folder: &mut F,
     statement: StatisticsStatement,
 ) -> StatisticsStatement {
-    super::statistics::fold(folder, statement)
+    super::legacy::statistics::fold(folder, statement)
 }
 
 pub fn fold_catalog_statement<F: Fold + ?Sized>(
     folder: &mut F,
     statement: CatalogStatement,
 ) -> CatalogStatement {
-    super::catalog::fold(folder, statement)
+    super::legacy::catalog::fold(folder, statement)
 }
 
 pub fn fold_iceberg_statement<F: Fold + ?Sized>(
     folder: &mut F,
     statement: IcebergStatement,
 ) -> IcebergStatement {
-    super::iceberg::fold(folder, statement)
+    super::legacy::iceberg::fold(folder, statement)
 }
 
 pub fn fold_maintenance_statement<F: Fold + ?Sized>(
     folder: &mut F,
     statement: MaintenanceStatement,
 ) -> MaintenanceStatement {
-    super::maintenance::fold(folder, statement)
+    super::legacy::maintenance::fold(folder, statement)
 }
 
 pub fn fold_materialized_view_statement<F: Fold + ?Sized>(
     folder: &mut F,
     statement: MaterializedViewStatement,
 ) -> MaterializedViewStatement {
-    super::materialized_view::fold(folder, statement)
+    super::legacy::materialized_view::fold(folder, statement)
 }
 
 pub fn fold_view_statement<F: Fold + ?Sized>(
     folder: &mut F,
     statement: ViewStatement,
 ) -> ViewStatement {
-    super::view::fold(folder, statement)
+    super::legacy::view::fold(folder, statement)
 }
 
 pub fn fold_table_statement<F: Fold + ?Sized>(
     folder: &mut F,
     statement: TableStatement,
 ) -> TableStatement {
-    super::table::fold(folder, statement)
+    super::legacy::table::fold(folder, statement)
 }
 
 pub fn fold_dml_statement<F: Fold + ?Sized>(
     folder: &mut F,
     statement: DmlStatement,
 ) -> DmlStatement {
-    super::dml::fold(folder, statement)
+    super::legacy::dml::fold(folder, statement)
 }
 
 pub fn walk_session_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &SessionStatement) {

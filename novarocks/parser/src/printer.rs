@@ -73,28 +73,32 @@ impl Printer {
     fn write_statement(&mut self, statement: &Statement) {
         match statement {
             Statement::ShowProcessList(statement) => {
-                crate::ast::session::write_show_process_list(statement, &mut self.output)
+                crate::ast::legacy::session::write_show_process_list(statement, &mut self.output)
             }
             Statement::Statistics(statement) => {
-                crate::ast::statistics::write_sql(statement, &mut self.output)
+                crate::ast::legacy::statistics::write_sql(statement, &mut self.output)
             }
             Statement::Catalog(statement) => {
-                crate::ast::catalog::write_sql(statement, &mut self.output)
+                crate::ast::legacy::catalog::write_sql(statement, &mut self.output)
             }
             Statement::Iceberg(statement) => {
-                crate::ast::iceberg::write_sql(statement, &mut self.output)
+                crate::ast::legacy::iceberg::write_sql(statement, &mut self.output)
             }
             Statement::Maintenance(statement) => {
-                crate::ast::maintenance::write_sql(statement, &mut self.output)
+                crate::ast::legacy::maintenance::write_sql(statement, &mut self.output)
             }
             Statement::MaterializedView(statement) => {
-                crate::ast::materialized_view::write_sql(statement, &mut self.output)
+                crate::ast::legacy::materialized_view::write_sql(statement, &mut self.output)
             }
-            Statement::View(statement) => crate::ast::view::write_sql(statement, &mut self.output),
+            Statement::View(statement) => {
+                crate::ast::legacy::view::write_sql(statement, &mut self.output)
+            }
             Statement::Table(statement) => {
-                crate::ast::table::write_sql(statement, &mut self.output)
+                crate::ast::legacy::table::write_sql(statement, &mut self.output)
             }
-            Statement::Dml(statement) => crate::ast::dml::write_sql(statement, &mut self.output),
+            Statement::Dml(statement) => {
+                crate::ast::legacy::dml::write_sql(statement, &mut self.output)
+            }
             Statement::Session(statement) => self.write_session_statement(statement),
             Statement::Query(query) => self.write_query(query),
             Statement::ExplainQuery(explain) => self.write_explain_query(explain),

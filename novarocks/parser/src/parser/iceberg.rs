@@ -21,7 +21,7 @@ use crate::ast::{AstBox, TypeParameter};
 
 use crate::{
     ParseError, Span, TokenKind,
-    ast::iceberg::{
+    ast::legacy::iceberg::{
         AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
         IcebergPartitionChange, IcebergPartitionField, IcebergPropertiesAction,
         IcebergReferenceAction, IcebergReferenceKind, IcebergSchemaChange, IcebergStatement,

@@ -22,7 +22,7 @@ use crate::{
     printer::{print_literal, print_object_name},
 };
 
-use super::{Fold, Ident, Literal, ObjectName, Query, Visit};
+use crate::ast::{Fold, Ident, Literal, ObjectName, Query, Visit};
 
 /// Materialized-view commands owned by SQLP-3.
 #[expect(

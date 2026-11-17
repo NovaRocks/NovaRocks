@@ -49,33 +49,6 @@ pub struct SessionProperty {
     pub span: Span,
 }
 
-/// A query EXPLAIN wrapper. It never grants a production execution route.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExplainQuery {
-    pub format: ExplainFormat,
-    /// Whether the EXPLAIN targets the logical planning view. This remains
-    /// separate from output detail so `EXPLAIN LOGICAL VERBOSE` is typed.
-    pub logical: bool,
-    pub query: Box<Query>,
-    pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExplainFormat {
-    Default,
-    Analyze,
-    Verbose,
-    Costs,
-    Logical,
-    /// The plan contract itself rather than the operators it describes.
-    ///
-    /// EXPLAIN answers what a statement will do, which is the operator tree.
-    /// What the plan states to the backend -- every value and expression it
-    /// defines, the partition spaces, the filter attachments, the cut
-    /// evidence -- is a different question, asked separately.
-    Contract,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct With {
     pub recursive: bool,

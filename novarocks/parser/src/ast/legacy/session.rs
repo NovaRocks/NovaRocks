@@ -19,7 +19,7 @@
 
 use crate::Span;
 
-use super::{Expr, Ident, Literal};
+use crate::ast::{Expr, Ident, Literal};
 
 /// `SHOW [FULL] PROCESSLIST`.
 ///

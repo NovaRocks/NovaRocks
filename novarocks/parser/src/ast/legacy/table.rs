@@ -3,8 +3,8 @@
 
 //! Table DDL syntax nodes owned by SQLP-5.
 
-use super::{Fold, Ident, Literal, ObjectName, TypeName, Visit};
 use crate::Span;
+use crate::ast::{Fold, Ident, Literal, ObjectName, TypeName, Visit};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TableStatement {

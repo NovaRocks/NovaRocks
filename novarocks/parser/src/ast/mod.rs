@@ -17,21 +17,38 @@
 
 //! Syntax-only SQL abstract syntax tree nodes.
 
-pub(crate) mod catalog;
-pub(crate) mod command;
 mod control_expr;
-pub(crate) mod dml;
 mod equivalence;
 mod expr;
-pub(crate) mod iceberg;
-pub(crate) mod maintenance;
-pub(crate) mod materialized_view;
 mod name_chain;
 mod predicate;
 pub use control_expr::*;
 mod query;
 pub use predicate::*;
 pub mod legacy;
+pub use legacy::{
+    AddEqualityDelete, AddFiles, AlterIcebergTable, AlterMaterializedView, AnalyzeTable,
+    Assignment, CallStatement, CatalogProperty, CatalogStatement, ColumnDefinition, ColumnPath,
+    ColumnPosition, CreateCatalog, CreateDatabase, CreateMaterializedView, CreateTable,
+    CreateTableAsSelect, CreateView, Delete, DmlStatement, DropCatalog, DropDatabase,
+    DropMaterializedView, DropTable, DropView, ExpireSnapshots, ExpireSnapshotsOption,
+    ExplainFormat, ExplainQuery, ExplainRefreshMaterializedView, IcebergColumnAction,
+    IcebergPartitionChange, IcebergPartitionField, IcebergPropertiesAction, IcebergReferenceAction,
+    IcebergReferenceKind, IcebergSchemaChange, IcebergStatement, IcebergTableAction, Insert,
+    InsertPartitionEntry, InsertPartitions, KillKind, KillStatement, LegacyRangePartition,
+    LegacyRangePartitionDefinition, MaintenanceStatement, MaintenanceValue,
+    MaterializedViewAlterAction, MaterializedViewDistribution, MaterializedViewExplainLevel,
+    MaterializedViewPartitionArgument, MaterializedViewPartitionField, MaterializedViewProperty,
+    MaterializedViewRefreshMode, MaterializedViewRefreshPolicy, MaterializedViewStatement, Merge,
+    MergeClause, MergeMatchedAction, MergeNotMatchedAction, MutationSource, OptimizeTable,
+    PartitionTransform, ProcedureArgument, ProcedureArgumentMode, ProcedureMap, ProcedureMapEntry,
+    Property, PropertyKeyValue, RawReferenceOptions, ReferenceAnchor, RefreshMaterializedView,
+    RemoveOrphanFiles, RewriteManifests, SessionStatement, SetAssignment, SetScope, SetStatement,
+    ShowCreateTable, ShowCreateView, ShowProcessList, ShowStats, Statement, StatisticsStatement,
+    TableDistribution, TableKey, TableKeyKind, TablePartition, TablePartitionTransform,
+    TableProperty, TableStatement, TransactionControlKind, TransactionControlStatement,
+    TruncateTable, Update, UseStatement, ViewStatement,
+};
 mod relation;
 mod routine;
 
@@ -42,29 +59,15 @@ pub use routine::{
     RoutineBody, RoutineCharacteristic, RoutineProperty, RoutineSecurity, VariableDeclaration,
     WhileStatement,
 };
-pub(crate) mod session;
-pub(crate) mod statistics;
 mod storage;
 mod type_literal;
 pub use type_literal::*;
 mod row_pattern;
-pub(crate) mod table;
 mod validate;
-pub(crate) mod view;
 mod visit;
 mod window;
 pub use storage::{AstBox, AstVec};
 
-pub use catalog::{
-    CatalogProperty, CatalogStatement, CreateCatalog, CreateDatabase, DropCatalog, DropDatabase,
-    DropTable, ShowCreateTable, TruncateTable,
-};
-pub use command::{Property, PropertyKeyValue};
-pub use dml::{
-    AddEqualityDelete, Assignment, CreateTableAsSelect, Delete, DmlStatement, Insert,
-    InsertPartitionEntry, InsertPartitions, Merge, MergeClause, MergeMatchedAction,
-    MergeNotMatchedAction, MutationSource, Update,
-};
 pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
     AllRows, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr, BinaryOperator, CallArgument,
@@ -72,48 +75,21 @@ pub use expr::{
     NestedExpr, NullTreatment, Parameter, ProcessingMode, ProcessingModeKind, RowExpr, RowField,
     SubqueryExpr, SubscriptExpr, UnaryExpr, UnaryOperator,
 };
-pub use iceberg::{
-    AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
-    IcebergPartitionChange, IcebergPartitionField, IcebergPropertiesAction, IcebergReferenceAction,
-    IcebergReferenceKind, IcebergSchemaChange, IcebergStatement, IcebergTableAction,
-    RawReferenceOptions, ReferenceAnchor,
-};
-pub use maintenance::{
-    CallStatement, ExpireSnapshots, ExpireSnapshotsOption, MaintenanceStatement, MaintenanceValue,
-    OptimizeTable, ProcedureArgument, ProcedureArgumentMode, ProcedureMap, ProcedureMapEntry,
-    RemoveOrphanFiles, RewriteManifests,
-};
-pub use materialized_view::{
-    AlterMaterializedView, CreateMaterializedView, DropMaterializedView,
-    ExplainRefreshMaterializedView, MaterializedViewAlterAction, MaterializedViewDistribution,
-    MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
-    MaterializedViewPartitionField, MaterializedViewProperty, MaterializedViewRefreshMode,
-    MaterializedViewRefreshPolicy, MaterializedViewStatement, RefreshMaterializedView,
-};
+
 pub use query::{
-    AllColumns, AutoGroupBy, Corresponding, Cte, ExplainFormat, ExplainQuery, FetchFirst, GroupBy,
-    GroupingElement, GroupingSets, GroupingSetsKind, Limit, NullOrdering, Offset, OrderBy, Query,
-    QueryLimit, QueryModifiers, Select, SelectItem, SessionProperty, SetExpr, SetOperation,
-    SetOperator, SimpleGroupBy, SingleColumn, SortItem, SortOrdering, Values, ValuesRowCells, With,
+    AllColumns, AutoGroupBy, Corresponding, Cte, FetchFirst, GroupBy, GroupingElement,
+    GroupingSets, GroupingSetsKind, Limit, NullOrdering, Offset, OrderBy, Query, QueryLimit,
+    QueryModifiers, Select, SelectItem, SessionProperty, SetExpr, SetOperation, SetOperator,
+    SimpleGroupBy, SingleColumn, SortItem, SortOrdering, Values, ValuesRowCells, With,
 };
 pub use relation::*;
 pub use row_pattern::{
     MeasureDefinition, PatternAnchorKind, PatternInteger, PatternQuantifier, PatternSearchMode,
     PatternSearchModeKind, RowPattern, SkipTo, SubsetDefinition, VariableDefinition,
 };
-pub use session::ShowProcessList;
-pub use session::{
-    KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement,
-    TransactionControlKind, TransactionControlStatement, UseStatement,
-};
-pub use statistics::{AnalyzeTable, ShowStats, StatisticsStatement};
-pub use table::{
-    ColumnDefinition, CreateTable, LegacyRangePartition, LegacyRangePartitionDefinition,
-    PartitionTransform, TableDistribution, TableKey, TableKeyKind, TablePartition,
-    TablePartitionTransform, TableProperty, TableStatement,
-};
+
 pub use validate::{validate_statement, validate_statements};
-pub use view::{CreateView, DropView, ShowCreateView, ViewStatement};
+
 pub use visit::{
     Fold, Visit, fold_all_columns, fold_auto_group_by, fold_binary_expr, fold_cte, fold_expr,
     fold_function_call, fold_group_by, fold_grouping_element, fold_grouping_sets, fold_ident,
@@ -132,42 +108,6 @@ pub use window::{
 };
 
 use crate::Span;
-
-/// A top-level SQL statement.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Statement {
-    ShowProcessList(ShowProcessList),
-    Statistics(StatisticsStatement),
-    Catalog(CatalogStatement),
-    Iceberg(IcebergStatement),
-    Maintenance(MaintenanceStatement),
-    MaterializedView(MaterializedViewStatement),
-    View(ViewStatement),
-    Table(TableStatement),
-    Dml(DmlStatement),
-    Session(SessionStatement),
-    Query(Query),
-    ExplainQuery(ExplainQuery),
-}
-
-impl Statement {
-    pub const fn span(&self) -> Span {
-        match self {
-            Self::ShowProcessList(statement) => statement.span,
-            Self::Statistics(statement) => statement.span(),
-            Self::Catalog(statement) => statement.span(),
-            Self::Iceberg(statement) => statement.span(),
-            Self::Maintenance(statement) => statement.span(),
-            Self::MaterializedView(statement) => statement.span(),
-            Self::View(statement) => statement.span(),
-            Self::Table(statement) => statement.span(),
-            Self::Dml(statement) => statement.span(),
-            Self::Session(statement) => statement.span(),
-            Self::Query(query) => query.span,
-            Self::ExplainQuery(query) => query.span,
-        }
-    }
-}
 
 /// Decoded identifier text and whether its source name was delimited.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -19,7 +19,7 @@
 
 use crate::Span;
 
-use super::{Fold, Ident, Literal, ObjectName, Visit};
+use crate::ast::{Fold, Ident, Literal, ObjectName, Visit};
 
 /// A procedure or table-maintenance statement.
 ///

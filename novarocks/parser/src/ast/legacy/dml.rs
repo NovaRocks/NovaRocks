@@ -20,7 +20,7 @@
 use crate::Span;
 use crate::ast::legacy::TableAlias;
 
-use super::{Expr, Fold, Ident, ObjectName, Query, Statement, TableStatement, Visit};
+use crate::ast::{Expr, Fold, Ident, ObjectName, Query, Statement, TableStatement, Visit};
 
 // Keep statement variants inline so parser/visitor consumers retain a uniform typed AST.
 #[allow(clippy::large_enum_variant)]

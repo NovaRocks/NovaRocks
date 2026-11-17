@@ -22,7 +22,7 @@ use crate::{
     printer::{print_literal, print_object_name},
 };
 
-use super::{Fold, Literal, ObjectName, Query, Visit};
+use crate::ast::{Fold, Literal, ObjectName, Query, Visit};
 
 /// View commands owned by SQLP-2.
 // Keep statement variants inline so parser/visitor consumers retain a uniform typed AST.

@@ -19,7 +19,7 @@
 
 use crate::{
     ParseError, Span, TokenKind,
-    ast::catalog::{
+    ast::legacy::catalog::{
         CatalogProperty, CreateCatalog, CreateDatabase, DropCatalog, DropDatabase, DropTable,
         ShowCreateTable, TruncateTable,
     },

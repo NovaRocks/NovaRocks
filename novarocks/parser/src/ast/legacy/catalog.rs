@@ -22,7 +22,7 @@ use crate::{
     printer::{print_literal, print_object_name},
 };
 
-use super::{Fold, Ident, Literal, ObjectName, Visit};
+use crate::ast::{Fold, Ident, Literal, ObjectName, Visit};
 
 /// Catalog and truncate commands owned by SQLP-3.
 #[derive(Clone, Debug, Eq, PartialEq)]

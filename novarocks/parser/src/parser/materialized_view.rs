@@ -19,7 +19,7 @@
 
 use crate::{
     ParseError, Span, TokenKind,
-    ast::materialized_view::{
+    ast::legacy::materialized_view::{
         AlterMaterializedView, CreateMaterializedView, DropMaterializedView,
         ExplainRefreshMaterializedView, MaterializedViewAlterAction, MaterializedViewDistribution,
         MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
