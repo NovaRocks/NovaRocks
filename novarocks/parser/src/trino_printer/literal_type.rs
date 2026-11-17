@@ -126,7 +126,7 @@ impl Writer {
     }
 
     #[recursive::recursive]
-    fn qualifier(&mut self, value: &IntervalQualifier) {
+    pub(super) fn qualifier(&mut self, value: &IntervalQualifier) {
         match value {
             IntervalQualifier::Simple(value) => {
                 self.qualifier_field(&value.field);

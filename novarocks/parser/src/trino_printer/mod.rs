@@ -9,6 +9,7 @@ mod expression;
 mod json;
 mod literal_type;
 mod query;
+mod special;
 
 pub fn print_query(query: &Query) -> String {
     let mut writer = Writer::default();

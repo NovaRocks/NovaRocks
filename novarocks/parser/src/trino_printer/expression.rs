@@ -218,7 +218,7 @@ impl Writer {
             | Expr::Overlay(_)
             | Expr::IntervalValueExpression(_)
             | Expr::MethodCall(_)
-            | Expr::StaticMethodCall(_) => unsupported("remaining dedicated special expressions"),
+            | Expr::StaticMethodCall(_) => self.special_expression(value),
         }
     }
 
@@ -359,9 +359,7 @@ impl Writer {
             && !value.name.parts[0].quoted
             && value.name.parts[0].value.eq_ignore_ascii_case("LISTAGG")
         {
-            // The pinned builder lowers WITHIN GROUP syntax into five real
-            // arguments. Generic call syntax is not a proven inverse here.
-            unsupported("LISTAGG's normalized arguments and WITHIN GROUP syntax");
+            return self.listagg(value);
         }
         if let Some(mode) = &value.processing_mode {
             self.text(match mode.mode {

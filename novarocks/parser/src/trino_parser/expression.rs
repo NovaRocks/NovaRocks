@@ -28,6 +28,7 @@ struct Parsed {
     logical: Option<LogicalOperator>,
     primary: bool,
     predicate: bool,
+    value_expression: bool,
 }
 
 impl Parsed {
@@ -38,6 +39,7 @@ impl Parsed {
             logical: None,
             primary: true,
             predicate: false,
+            value_expression: true,
         }
     }
 
@@ -48,6 +50,7 @@ impl Parsed {
             logical: None,
             primary: false,
             predicate: false,
+            value_expression: true,
         }
     }
 }
@@ -75,14 +78,16 @@ impl Parser<'_> {
         let mut left = if minimum <= 30 && self.eat_keyword(K::Not).is_some() {
             let child = self.expression_bp(30)?;
             let extent = self.span_since(start);
-            Parsed::value(
+            let mut parsed = Parsed::value(
                 Expr::Unary(UnaryExpr {
                     operator: UnaryOperator::Not,
                     expression: AstBox::new(child.expression),
                     span: extent,
                 }),
                 extent,
-            )
+            );
+            parsed.value_expression = false;
+            parsed
         } else if self.at_symbol(S::Plus)
             || (self.at_symbol(S::Minus)
                 && !matches!(self.peek(1).kind, T::Integer | T::Decimal | T::Double))
@@ -140,6 +145,7 @@ impl Parser<'_> {
                 left.logical = Some(operator);
                 left.primary = false;
                 left.predicate = false;
+                left.value_expression = false;
                 continue;
             }
             if minimum <= 40 && !left.predicate && self.predicate_start() {
@@ -154,6 +160,7 @@ impl Parser<'_> {
                     extent,
                 );
                 left.predicate = true;
+                left.value_expression = false;
                 continue;
             }
             let arithmetic = match self.peek(0).kind {
@@ -616,12 +623,12 @@ impl Parser<'_> {
                         span: self.span_since(start),
                     }))
                 } else {
-                    let first = self.parse_expression()?;
+                    let first = self.with_alias_follow(false, |parser| parser.expression_bp(0))?;
                     if self.eat_symbol(S::Comma).is_some() {
                         let mut fields = vec![RowField {
-                            span: first.span(),
+                            span: first.expression.span(),
                             name: None,
-                            expression: first,
+                            expression: first.expression,
                         }];
                         loop {
                             let expression = self.parse_expression()?;
@@ -641,7 +648,11 @@ impl Parser<'_> {
                         })
                     } else {
                         self.expect_symbol(S::RParen)?;
-                        first
+                        if first.value_expression && self.interval_value_tail_ahead() {
+                            self.parse_interval_value(first.expression, self.span_since(start))?
+                        } else {
+                            first.expression
+                        }
                     }
                 }
             }
@@ -688,7 +699,9 @@ impl Parser<'_> {
                     }))
                 } else {
                     let name = self.qualified_name()?;
-                    if self.at_symbol(S::LParen) {
+                    if self.at_symbol(S::DoubleColon) {
+                        self.parse_static_method_call(name, start)?
+                    } else if self.at_symbol(S::LParen) {
                         self.function_expression(name, None)?
                     } else if name.parts.len() == 1 && self.at_keyword(K::Over) {
                         let window = self.parse_window()?;
@@ -724,6 +737,14 @@ impl Parser<'_> {
                 };
                 parsed = Parsed::primary(expression, self.span_since(start));
             } else if self.at_symbol(S::Dot)
+                && self.peek(2).kind == T::Symbol(S::LParen)
+                && (self.is_identifier(1) || matches!(self.peek(1).kind, T::Keyword(_)))
+            {
+                self.bump();
+                let method = self.parse_method_name()?;
+                let expression = self.parse_method_call(parsed.expression, method, start)?;
+                parsed = Parsed::primary(expression, self.span_since(start));
+            } else if self.at_symbol(S::Dot)
                 && (self.is_identifier(1)
                     || matches!(self.peek(1).kind, T::String | T::UnicodeString))
             {
@@ -749,6 +770,40 @@ impl Parser<'_> {
             }
         }
         Ok(parsed)
+    }
+
+    fn interval_value_tail_ahead(&mut self) -> bool {
+        if !matches!(
+            self.peek(0).kind,
+            T::Keyword(K::Year | K::Month | K::Day | K::Hour | K::Minute | K::Second)
+        ) {
+            return false;
+        }
+        if !self.alias_follow {
+            return true;
+        }
+        // A bare field followed by the actual aliasedExpression boundary
+        // belongs to its parent. Precision, TO, and expression continuations
+        // instead require the intervalValueExpression alternative.
+        let checkpoint = self.checkpoint();
+        self.bump();
+        let alias_ends = matches!(
+            self.peek(0).kind,
+            T::End
+                | T::Symbol(S::Comma | S::RParen)
+                | T::Keyword(
+                    K::From
+                        | K::Where
+                        | K::Group
+                        | K::Having
+                        | K::Order
+                        | K::Union
+                        | K::Intersect
+                        | K::Except
+                )
+        ) || self.query_clause_follows_alias();
+        self.restore(checkpoint);
+        !alias_ends
     }
 
     fn json_constructor_or_call(&mut self) -> Result<Expr, ParserError> {
