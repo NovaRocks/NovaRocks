@@ -216,7 +216,7 @@ fn deeply_nested_parentheses_and_calls_use_the_default_test_thread_stack() {
     ));
     let calls = format!("{}1{}", "f(".repeat(5_000), ")".repeat(5_000));
     let parsed = parse_expression(&calls).unwrap();
-    let printed = novarocks_parser::trino_printer::print_expression(&parsed);
+    let printed = novarocks_parser::trino_printer::print_expression(&parsed).unwrap();
     let reparsed = parse_expression(&printed).unwrap();
     assert!(parsed.syntax_eq(&reparsed));
     drop(reparsed);
@@ -289,7 +289,7 @@ fn parenthesized_query_and_expression_alternatives_preserve_the_complete_context
                 "{source}"
             );
         }
-        let printed = novarocks_parser::trino_printer::print_expression(&expression);
+        let printed = novarocks_parser::trino_printer::print_expression(&expression).unwrap();
         assert!(
             expression.syntax_eq(&parse_expression(&printed).unwrap()),
             "{source} -> {printed}"
@@ -307,4 +307,119 @@ fn parenthesized_query_and_expression_alternatives_preserve_the_complete_context
         parameters.visit_expr(&expression);
         assert_eq!(parameters.0, vec![0, 1], "{source}");
     }
+}
+
+#[test]
+fn array_constructor_requires_its_array_keyword() {
+    for source in ["[]", "[1,2]", "f([?])"] {
+        assert!(parse_expression(source).is_err(), "{source}");
+    }
+    for source in ["ARRAY[]", "ARRAY[1,2]", "f(ARRAY[?])"] {
+        assert!(parse_expression(source).is_ok(), "{source}");
+    }
+}
+
+#[test]
+fn nonreserved_cast_and_unique_words_are_identifiers_outside_their_productions() {
+    for source in ["TRY_CAST", "UNIQUE"] {
+        assert!(
+            matches!(parse_expression(source).unwrap(), Expr::Identifier(value) if value.value == source)
+        );
+    }
+    assert!(
+        matches!(parse_expression("TRY_CAST(x AS INTEGER)").unwrap(), Expr::Cast(value) if value.safe)
+    );
+    assert!(matches!(
+        parse_expression("UNIQUE(SELECT 1)").unwrap(),
+        Expr::Unique(_)
+    ));
+}
+
+#[test]
+fn ordinary_function_all_and_order_prefix_preserve_real_arguments_and_header() {
+    let Expr::FunctionCall(call) = parse_expression("f(ALL)").unwrap() else {
+        panic!("not call")
+    };
+    assert!(!call.distinct);
+    assert!(matches!(&call.arguments[0].value, Expr::Identifier(value) if value.value == "ALL"));
+    let Expr::FunctionCall(call) = parse_expression("f(ALL a)").unwrap() else {
+        panic!("not call")
+    };
+    assert!(matches!(&call.arguments[0].value, Expr::Identifier(value) if value.value == "a"));
+    let Expr::FunctionCall(call) = parse_expression("f(ALL => ?)").unwrap() else {
+        panic!("not call")
+    };
+    assert_eq!(call.arguments[0].name.as_ref().unwrap().value, "ALL");
+    assert!(matches!(&call.arguments[0].value, Expr::Parameter(value) if value.position == 0));
+    let Expr::FunctionCall(call) = parse_expression("f(ALL ORDER BY ?)").unwrap() else {
+        panic!("not call")
+    };
+    assert!(matches!(&call.arguments[0].value, Expr::Identifier(value) if value.value == "ALL"));
+    assert!(
+        matches!(&call.order_by.as_ref().unwrap().items[0].sort_key, Expr::Parameter(value) if value.position == 0)
+    );
+    let Expr::FunctionCall(call) =
+        parse_expression("RUNNING \"cat\".f(ALL ? ORDER BY ?) OVER (PARTITION BY ?)").unwrap()
+    else {
+        panic!("not call")
+    };
+    assert_eq!(call.name.parts.len(), 2);
+    assert!(call.name.parts[0].quoted);
+    assert_eq!(call.name.parts[0].value, "cat");
+    assert_eq!(
+        call.processing_mode.as_ref().unwrap().mode,
+        ProcessingModeKind::Running
+    );
+    assert!(matches!(&call.arguments[0].value, Expr::Parameter(value) if value.position == 2));
+    assert!(
+        matches!(&call.order_by.as_ref().unwrap().items[0].sort_key, Expr::Parameter(value) if value.position == 1)
+    );
+    let Window::Specification(window) = call.window.as_ref().unwrap() else {
+        panic!("not spec")
+    };
+    assert!(matches!(&window.partition_by[0], Expr::Parameter(value) if value.position == 0));
+    let Expr::FunctionCall(call) = parse_expression("f(ALL.*)").unwrap() else {
+        panic!("not wildcard call")
+    };
+    assert!(
+        matches!(&call.arguments[0].value, Expr::Dereference(value) if value.field.is_none() && matches!(&value.base, Expr::Identifier(value) if value.value == "ALL"))
+    );
+    let Expr::FunctionCall(call) = parse_expression("f(\"ORDER\")").unwrap() else {
+        panic!("not call")
+    };
+    assert!(
+        matches!(&call.arguments[0].value, Expr::Identifier(value) if value.quoted && value.value == "ORDER")
+    );
+    let Expr::FunctionCall(call) = parse_expression("f(\"ORDER\" => ?)").unwrap() else {
+        panic!("not named call")
+    };
+    assert!(call.arguments[0].name.as_ref().unwrap().quoted);
+    assert_eq!(call.arguments[0].name.as_ref().unwrap().value, "ORDER");
+    assert!(matches!(&call.arguments[0].value, Expr::Parameter(value) if value.position == 0));
+    // ORDER is reserved in the exact pin, unlike ALL. No keyword rule changes.
+    assert!(parse_expression("f(ORDER)").is_err());
+}
+
+#[test]
+fn function_all_retry_rolls_back_consumed_parameters_without_swallowing_construction() {
+    let Expr::FunctionCall(outer) = parse_expression("f(ALL(?) FILTER (WHERE ?))").unwrap() else {
+        panic!("not outer")
+    };
+    assert_eq!(outer.arguments.len(), 1);
+    let Expr::FunctionCall(inner) = &outer.arguments[0].value else {
+        panic!("not actual ALL call")
+    };
+    assert_eq!(inner.name.parts[0].value, "ALL");
+    assert!(matches!(&inner.arguments[0].value, Expr::Parameter(value) if value.position == 1));
+    assert!(
+        matches!(inner.filter.as_ref().unwrap(), Expr::Parameter(value) if value.position == 0)
+    );
+    let source = "f(ALL IF())";
+    let error = parse_expression(source).unwrap_err();
+    let ParserError::Parse(ParseError::UnexpectedToken { span, found, .. }) = error else {
+        panic!("not construction diagnostic")
+    };
+    let start = source.find("IF()").unwrap();
+    assert_eq!(span, Span::new(start, start + 4));
+    assert_eq!(found, "IF");
 }

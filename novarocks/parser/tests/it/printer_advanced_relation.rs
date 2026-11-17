@@ -5,7 +5,7 @@ use novarocks_parser::{ParseError, ParserError, Span, trino_parser, trino_printe
 fn roundtrip(source: &str) -> Query {
     let original = trino_parser::parse_query(source)
         .unwrap_or_else(|error| panic!("source: {source}\nerror: {error:?}"));
-    let printed = trino_printer::print_query(&original);
+    let printed = trino_printer::print_query(&original).unwrap();
     let reparsed = trino_parser::parse_query(&printed)
         .unwrap_or_else(|error| panic!("source: {source}\nprinted: {printed}\nerror: {error:?}"));
     assert!(

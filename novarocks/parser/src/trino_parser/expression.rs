@@ -55,6 +55,17 @@ impl Parsed {
     }
 }
 
+// Real call-body products, without an owned name or fabricated FunctionCall.
+struct FunctionParts {
+    arguments: Vec<CallArgument>,
+    distinct: bool,
+    order_by: Option<OrderBy>,
+    filter: Option<Expr>,
+    null_treatment: Option<NullTreatment>,
+    window: Option<Window>,
+    span: Span,
+}
+
 impl Parser<'_> {
     pub(super) fn parse_expression(&mut self) -> Result<Expr, ParserError> {
         self.with_alias_follow(false, |parser| Ok(parser.expression_bp(0)?.expression))
@@ -548,7 +559,7 @@ impl Parser<'_> {
                 self.bump();
                 Expr::Parameter(self.new_parameter(start))
             }
-            T::Keyword(K::Cast | K::TryCast) => {
+            T::Keyword(K::Cast | K::TryCast) if self.peek(1).kind == T::Symbol(S::LParen) => {
                 let safe = self.bump().kind == T::Keyword(K::TryCast);
                 self.expect_symbol(S::LParen)?;
                 let expression = self.parse_expression()?;
@@ -562,7 +573,7 @@ impl Parser<'_> {
                     span: self.span_since(start),
                 }))
             }
-            T::Keyword(K::Exists | K::Unique) => {
+            T::Keyword(K::Exists | K::Unique) if self.peek(1).kind == T::Symbol(S::LParen) => {
                 self.bump();
                 let subquery = self.expression_subquery()?;
                 let span = self.span_since(start);
@@ -577,7 +588,6 @@ impl Parser<'_> {
                 self.bump();
                 self.array_expression(start)?
             }
-            T::Symbol(S::LBracket) => self.array_expression(start)?,
             T::Keyword(K::Row) if self.peek(1).kind == T::Symbol(S::LParen) => {
                 self.bump();
                 self.expect_symbol(S::LParen)?;
@@ -987,13 +997,39 @@ impl Parser<'_> {
         let start = processing_mode.as_ref().map_or(name.span, |mode| mode.span);
         self.expect_symbol(S::LParen)?;
         let parameter_start = self.next_parameter;
-        let distinct = self.eat_keyword(K::Distinct).is_some();
-        let all = !distinct && self.eat_keyword(K::All).is_some();
+        let parts = self.with_optional_set_quantifier(|parser, quantifier| {
+            parser.function_parts(start, parameter_start, quantifier)
+        })?;
+        // The actual owned header is moved once, after its complete body won.
+        self.function_node(FunctionCall {
+            name,
+            arguments: parts.arguments.into(),
+            distinct: parts.distinct,
+            order_by: parts.order_by,
+            filter: parts.filter,
+            null_treatment: parts.null_treatment,
+            window: parts.window,
+            processing_mode,
+            span: parts.span,
+        })
+    }
+
+    fn function_order_by_ahead(&self) -> bool {
+        self.at_keyword(K::Order) && self.peek(1).kind == T::Keyword(K::By)
+    }
+
+    fn function_parts(
+        &mut self,
+        start: Span,
+        parameter_start: usize,
+        quantifier: Option<bool>,
+    ) -> Result<FunctionParts, ParserError> {
+        let distinct = quantifier.unwrap_or(false);
         let mut wildcard = false;
         let mut arguments = Vec::new();
         if self.eat_symbol(S::Star).is_some() {
             wildcard = true;
-            if distinct || all {
+            if quantifier.is_some() {
                 return Err(self.error("an argument after DISTINCT"));
             }
         } else if self.is_identifier(0)
@@ -1001,7 +1037,7 @@ impl Parser<'_> {
             && self.peek(2).kind == T::Symbol(S::Star)
         {
             wildcard = true;
-            if distinct || all {
+            if quantifier.is_some() {
                 return Err(self.error("an argument after a set quantifier"));
             }
             let label = self.ident()?;
@@ -1017,7 +1053,7 @@ impl Parser<'_> {
                     span,
                 })),
             });
-        } else if !self.at_symbol(S::RParen) && !self.at_keyword(K::Order) {
+        } else if !self.at_symbol(S::RParen) && !self.function_order_by_ahead() {
             loop {
                 arguments.push(self.parse_call_argument()?);
                 if self.eat_symbol(S::Comma).is_none() {
@@ -1025,14 +1061,14 @@ impl Parser<'_> {
                 }
             }
         }
-        if (distinct || all) && arguments.is_empty() {
+        if quantifier.is_some() && arguments.is_empty() {
             return Err(self.error("an argument after a set quantifier"));
         }
-        if wildcard && self.at_keyword(K::Order) {
+        if wildcard && self.function_order_by_ahead() {
             return Err(self.error("closing parenthesis after wildcard"));
         }
         let arguments_end = self.next_parameter;
-        let order_by = if self.at_keyword(K::Order) {
+        let order_by = if self.function_order_by_ahead() {
             Some(self.parse_order_by()?)
         } else {
             None
@@ -1080,18 +1116,15 @@ impl Parser<'_> {
                 parameter_start..arguments_end,
             ],
         );
-        let call = FunctionCall {
-            name,
-            arguments: arguments.into(),
+        Ok(FunctionParts {
+            arguments,
             distinct,
             order_by,
             filter,
             null_treatment,
             window,
-            processing_mode,
             span,
-        };
-        self.function_node(call)
+        })
     }
 
     fn function_node(&self, call: FunctionCall) -> Result<Expr, ParserError> {

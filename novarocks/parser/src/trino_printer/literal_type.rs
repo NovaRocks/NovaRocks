@@ -3,7 +3,7 @@ use super::*;
 
 impl Writer {
     #[recursive::recursive]
-    pub(super) fn literal(&mut self, value: &Literal) {
+    pub(super) fn literal(&mut self, value: &Literal) -> PrintResult {
         match &value.kind {
             LiteralKind::Null => self.text("NULL"),
             LiteralKind::Boolean(value) => self.text(if *value { "TRUE" } else { "FALSE" }),
@@ -13,7 +13,7 @@ impl Writer {
                 if value.is_nan() {
                     // No numeric production in the pinned grammar constructs NaN.
                     // CAST or a type constructor would change the typed AST class.
-                    unsupported("a hand-authored NaN DoubleLiteral");
+                    return Err(unsupported("a hand-authored NaN DoubleLiteral"));
                 }
                 if value == f64::INFINITY {
                     self.text("1E9999");
@@ -55,13 +55,14 @@ impl Writer {
                 }
                 self.string(&value.value);
                 self.character(' ');
-                self.qualifier(&value.qualifier);
+                self.qualifier(&value.qualifier)?;
             }
         }
+        Ok(())
     }
 
     #[recursive::recursive]
-    pub(super) fn data_type(&mut self, value: &TypeName) {
+    pub(super) fn data_type(&mut self, value: &TypeName) -> PrintResult {
         match &value.kind {
             TypeKind::Generic(value) => {
                 self.identifier(&value.name);
@@ -71,7 +72,7 @@ impl Writer {
                         if index != 0 {
                             self.text(", ");
                         }
-                        self.type_parameter(argument);
+                        self.type_parameter(argument)?;
                     }
                     self.character(')');
                 }
@@ -86,7 +87,7 @@ impl Writer {
                         self.identifier(name);
                         self.character(' ');
                     }
-                    self.data_type(&field.data_type);
+                    self.data_type(&field.data_type)?;
                 }
                 self.character(')');
             }
@@ -97,7 +98,7 @@ impl Writer {
                 });
                 if let Some(precision) = &value.precision {
                     self.character('(');
-                    self.type_parameter(precision);
+                    self.type_parameter(precision)?;
                     self.character(')');
                 }
                 if value.with_time_zone {
@@ -106,30 +107,32 @@ impl Writer {
             }
             TypeKind::Interval(value) => {
                 self.text("INTERVAL ");
-                self.qualifier(&value.qualifier);
+                self.qualifier(&value.qualifier)?;
             }
             TypeKind::ExplicitArray(value) => {
-                self.data_type(&value.element);
+                self.data_type(&value.element)?;
                 self.text(" ARRAY[");
                 self.text(&value.length.spelling);
                 self.character(']');
             }
         }
+        Ok(())
     }
 
     #[recursive::recursive]
-    fn type_parameter(&mut self, value: &DataTypeParameter) {
+    fn type_parameter(&mut self, value: &DataTypeParameter) -> PrintResult {
         match value {
             DataTypeParameter::Numeric(value) => self.text(&value.spelling),
-            DataTypeParameter::Type(value) => self.data_type(&value.data_type),
+            DataTypeParameter::Type(value) => self.data_type(&value.data_type)?,
         }
+        Ok(())
     }
 
     #[recursive::recursive]
-    pub(super) fn qualifier(&mut self, value: &IntervalQualifier) {
+    pub(super) fn qualifier(&mut self, value: &IntervalQualifier) -> PrintResult {
         match value {
             IntervalQualifier::Simple(value) => {
-                self.qualifier_field(&value.field);
+                self.qualifier_field(&value.field)?;
                 let fraction = match &value.field {
                     IntervalQualifierField::Second {
                         fractional_precision,
@@ -140,43 +143,46 @@ impl Writer {
                     (None, None) => {}
                     (Some(leading), fractional) => {
                         self.character('(');
-                        self.type_parameter(leading);
+                        self.type_parameter(leading)?;
                         if let Some(fractional) = fractional {
                             self.text(", ");
-                            self.type_parameter(fractional);
+                            self.type_parameter(fractional)?;
                         }
                         self.character(')');
                     }
                     (None, Some(_)) => {
-                        unsupported("SECOND fractional precision without leading precision")
+                        return Err(unsupported(
+                            "SECOND fractional precision without leading precision",
+                        ));
                     }
                 }
             }
             IntervalQualifier::Composite(value) => {
                 // The start field cannot carry fractional precision in the grammar.
                 if matches!(&value.from, IntervalQualifierField::Second { .. }) {
-                    unsupported("SECOND as a composite interval start");
+                    return Err(unsupported("SECOND as a composite interval start"));
                 }
-                self.qualifier_field(&value.from);
+                self.qualifier_field(&value.from)?;
                 if let Some(precision) = &value.precision {
                     self.character('(');
-                    self.type_parameter(precision);
+                    self.type_parameter(precision)?;
                     self.character(')');
                 }
                 self.text(" TO ");
-                self.qualifier_field(&value.to);
+                self.qualifier_field(&value.to)?;
                 if let IntervalQualifierField::Second {
                     fractional_precision: Some(value),
                 } = &value.to
                 {
                     self.character('(');
-                    self.type_parameter(value);
+                    self.type_parameter(value)?;
                     self.character(')');
                 }
             }
         }
+        Ok(())
     }
-    fn qualifier_field(&mut self, value: &IntervalQualifierField) {
+    fn qualifier_field(&mut self, value: &IntervalQualifierField) -> PrintResult {
         self.text(match value {
             IntervalQualifierField::Year => "YEAR",
             IntervalQualifierField::Month => "MONTH",
@@ -185,5 +191,6 @@ impl Writer {
             IntervalQualifierField::Minute => "MINUTE",
             IntervalQualifierField::Second { .. } => "SECOND",
         });
+        Ok(())
     }
 }

@@ -3,38 +3,41 @@ use super::*;
 
 impl Writer {
     #[recursive::recursive]
-    pub(super) fn expression(&mut self, value: &Expr) {
+    pub(super) fn expression(&mut self, value: &Expr) -> PrintResult {
         match value {
             Expr::Identifier(value) => self.identifier(value),
-            Expr::Literal(value) => self.literal(value),
-            Expr::AllRows(_) => self.character('*'),
+            Expr::Literal(value) => self.literal(value)?,
+            Expr::AllRows(_) => return Err(unsupported("ALL rows outside a LIMIT row count")),
             // The grammar writes '?'. Its position is an AstBuilder visit fact,
             // not a printable numeric suffix. No position is changed here.
-            Expr::Parameter(_) => self.character('?'),
+            Expr::Parameter(value) => {
+                self.parameter_events.push((value.position, value.span));
+                self.character('?');
+            }
             Expr::Unary(value) => {
                 self.character('(');
                 self.text(match value.operator {
                     UnaryOperator::Not => "NOT ",
                     UnaryOperator::Plus => "+ ",
                     UnaryOperator::Minus => "- ",
-                    UnaryOperator::Legacy(_) => legacy("unary operator"),
+                    UnaryOperator::Legacy(_) => return Err(legacy("unary operator")),
                 });
                 // In particular, -(1) must not become a signed LongLiteral.
-                self.parenthesized_expression(&value.expression);
+                self.parenthesized_expression(&value.expression)?;
                 self.character(')');
             }
             Expr::Binary(value) => {
                 self.character('(');
-                self.expression(&value.left);
+                self.expression(&value.left)?;
                 self.text(match value.operator {
                     BinaryOperator::Add => " + ",
                     BinaryOperator::Subtract => " - ",
                     BinaryOperator::Multiply => " * ",
                     BinaryOperator::Divide => " / ",
                     BinaryOperator::Modulo => " % ",
-                    BinaryOperator::Legacy(_) => legacy("binary operator"),
+                    BinaryOperator::Legacy(_) => return Err(legacy("binary operator")),
                 });
-                self.expression(&value.right);
+                self.expression(&value.right)?;
                 self.character(')');
             }
             Expr::Logical(value) => {
@@ -47,94 +50,97 @@ impl Writer {
                         });
                     }
                     // A child Logical keeps its own frame; never flatten it.
-                    self.expression(term);
+                    self.expression(term)?;
                 }
                 self.character(')');
             }
             Expr::Predicated(value) => {
                 self.character('(');
-                self.expression(&value.value);
+                self.expression(&value.value)?;
                 self.character(' ');
-                self.predicate(&value.predicate);
+                self.predicate(&value.predicate)?;
                 self.character(')');
             }
             Expr::InList(value) => {
                 self.character('(');
-                self.expressions(&value.values);
+                self.expressions(&value.values)?;
                 self.character(')');
             }
             Expr::Cast(value) => {
                 self.text(if value.safe { "TRY_CAST(" } else { "CAST(" });
-                self.expression(&value.expression);
+                self.expression(&value.expression)?;
                 self.text(" AS ");
-                self.data_type(&value.data_type);
+                self.data_type(&value.data_type)?;
                 self.character(')');
             }
-            Expr::FunctionCall(value) => self.call(value),
+            Expr::FunctionCall(value) => self.call(value)?,
             Expr::If(value) => {
                 self.text("IF(");
-                self.expression(&value.condition);
+                self.expression(&value.condition)?;
                 self.text(", ");
-                self.expression(&value.true_value);
+                self.expression(&value.true_value)?;
                 if let Some(value) = &value.false_value {
                     self.text(", ");
-                    self.expression(value);
+                    self.expression(value)?;
                 }
                 self.character(')');
             }
             Expr::NullIf(value) => {
                 self.text("NULLIF(");
-                self.expression(&value.first);
+                self.expression(&value.first)?;
                 self.text(", ");
-                self.expression(&value.second);
+                self.expression(&value.second)?;
                 self.character(')');
             }
             Expr::Coalesce(value) => {
                 self.text("COALESCE(");
-                self.expressions(&value.operands);
+                self.expressions(&value.operands)?;
                 self.character(')');
             }
             Expr::Try(value) => {
                 self.text("TRY(");
-                self.expression(&value.as_ref().inner);
+                self.expression(&value.as_ref().inner)?;
                 self.character(')');
             }
             Expr::Format(value) => {
                 self.text("FORMAT(");
-                self.expressions(&value.arguments);
+                self.expressions(&value.arguments)?;
                 self.character(')');
             }
             Expr::SearchedCase(value) => {
                 self.text("CASE");
-                self.when_clauses(&value.when_clauses);
-                self.case_default(value.default_value.as_ref());
+                self.when_clauses(&value.when_clauses)?;
+                self.case_default(value.default_value.as_ref())?;
             }
             Expr::SimpleCase(value) => {
                 self.text("CASE ");
-                self.expression(&value.operand);
-                self.when_clauses(&value.when_clauses);
-                self.case_default(value.default_value.as_ref());
+                self.expression(&value.operand)?;
+                self.when_clauses(&value.when_clauses)?;
+                self.case_default(value.default_value.as_ref())?;
             }
             Expr::Subquery(value) => {
                 self.character('(');
-                self.query(&value.query);
+                self.query(&value.query)?;
                 self.character(')');
             }
             Expr::Exists(value) => {
                 self.text("EXISTS ");
-                self.subquery_argument(&value.subquery);
+                self.subquery_argument(&value.subquery)?;
             }
             Expr::Unique(value) => {
                 self.text("UNIQUE ");
-                self.subquery_argument(&value.subquery);
+                self.subquery_argument(&value.subquery)?;
             }
             Expr::Row(value) => {
+                if value.fields.is_empty() {
+                    return Err(unsupported("an empty ROW constructor"));
+                }
                 self.text("ROW(");
                 for (index, field) in value.fields.iter().enumerate() {
                     if index != 0 {
                         self.text(", ");
                     }
-                    self.expression(&field.expression);
+                    self.expression(&field.expression)?;
                     if let Some(name) = &field.name {
                         self.text(" AS ");
                         self.identifier(name);
@@ -144,7 +150,7 @@ impl Writer {
             }
             Expr::Array(value) => {
                 self.text("ARRAY[");
-                self.expressions(&value.values);
+                self.expressions(&value.values)?;
                 self.character(']');
             }
             Expr::Lambda(value) => {
@@ -157,17 +163,17 @@ impl Writer {
                     self.identifier(&argument.name);
                 }
                 self.text(") -> ");
-                self.expression(&value.body);
+                self.expression(&value.body)?;
                 self.character(')');
             }
             Expr::Subscript(value) => {
-                self.parenthesized_expression(&value.base);
+                self.parenthesized_expression(&value.base)?;
                 self.character('[');
-                self.expression(&value.index);
+                self.expression(&value.index)?;
                 self.character(']');
             }
             Expr::ArrayWildcardSubscript(value) => {
-                self.parenthesized_expression(&value.base);
+                self.parenthesized_expression(&value.base)?;
                 self.text("[*]");
             }
             Expr::Dereference(value) => {
@@ -176,11 +182,11 @@ impl Writer {
                     // base cannot be silently reclassified as a qualified name.
                     match &value.base {
                         Expr::Identifier(name) => self.identifier(name),
-                        _ => unsupported("a computed-base wildcard dereference"),
+                        _ => return Err(unsupported("a computed-base wildcard dereference")),
                     }
                     self.text(".*");
                 } else {
-                    self.parenthesized_expression(&value.base);
+                    self.parenthesized_expression(&value.base)?;
                     self.character('.');
                     self.identifier(value.field.as_ref().expect("checked field"));
                 }
@@ -190,26 +196,26 @@ impl Writer {
             Expr::CurrentPath(_) => self.text("CURRENT_PATH"),
             Expr::CurrentSchema(_) => self.text("CURRENT_SCHEMA"),
             Expr::CurrentUser(_) => self.text("CURRENT_USER"),
-            Expr::CurrentTime(value) => self.current_time("CURRENT_TIME", value.precision),
+            Expr::CurrentTime(value) => self.current_time("CURRENT_TIME", value.precision)?,
             Expr::CurrentTimestamp(value) => {
-                self.current_time("CURRENT_TIMESTAMP", value.precision)
+                self.current_time("CURRENT_TIMESTAMP", value.precision)?
             }
-            Expr::LocalTime(value) => self.current_time("LOCALTIME", value.precision),
-            Expr::LocalTimestamp(value) => self.current_time("LOCALTIMESTAMP", value.precision),
+            Expr::LocalTime(value) => self.current_time("LOCALTIME", value.precision)?,
+            Expr::LocalTimestamp(value) => self.current_time("LOCALTIMESTAMP", value.precision)?,
             Expr::WindowOperation(value) => {
                 self.identifier(&value.name);
                 self.text(" OVER ");
-                self.window(&value.window);
+                self.window(&value.window)?;
             }
-            Expr::LegacyParenthesized(_) => legacy("parenthesized expression"),
-            Expr::LegacyInterval(_) => legacy("interval expression"),
+            Expr::LegacyParenthesized(_) => return Err(legacy("parenthesized expression")),
+            Expr::LegacyInterval(_) => return Err(legacy("interval expression")),
             Expr::JsonConstructor(_)
             | Expr::JsonExists(_)
             | Expr::JsonValue(_)
             | Expr::JsonQuery(_)
             | Expr::JsonSerialize(_)
             | Expr::JsonObject(_)
-            | Expr::JsonArray(_) => self.json_expression(value),
+            | Expr::JsonArray(_) => self.json_expression(value)?,
             Expr::Extract(_)
             | Expr::AtLocal(_)
             | Expr::AtTimeZone(_)
@@ -218,17 +224,18 @@ impl Writer {
             | Expr::Overlay(_)
             | Expr::IntervalValueExpression(_)
             | Expr::MethodCall(_)
-            | Expr::StaticMethodCall(_) => self.special_expression(value),
+            | Expr::StaticMethodCall(_) => self.special_expression(value)?,
         }
+        Ok(())
     }
 
     #[recursive::recursive]
-    pub(super) fn predicate(&mut self, value: &Predicate) {
+    pub(super) fn predicate(&mut self, value: &Predicate) -> PrintResult {
         match value {
             Predicate::Comparison(value) => {
-                self.comparison(value.operator);
+                self.comparison(value.operator)?;
                 self.character(' ');
-                self.expression(&value.right);
+                self.expression(&value.right)?;
             }
             Predicate::DistinctFrom(value) => {
                 self.text(if value.negated {
@@ -236,7 +243,7 @@ impl Writer {
                 } else {
                     "IS DISTINCT FROM "
                 });
-                self.expression(&value.right);
+                self.expression(&value.right)?;
             }
             Predicate::Between(value) => {
                 self.text(if value.negated {
@@ -250,9 +257,9 @@ impl Writer {
                         BetweenSymmetry::Asymmetric => "ASYMMETRIC ",
                     });
                 }
-                self.expression(&value.min);
+                self.expression(&value.min)?;
                 self.text(" AND ");
-                self.expression(&value.max);
+                self.expression(&value.max)?;
             }
             Predicate::BooleanTest(value) => {
                 self.text(if value.negated { "IS NOT " } else { "IS " });
@@ -269,32 +276,36 @@ impl Writer {
             }),
             Predicate::Like(value) => {
                 self.text(if value.negated { "NOT LIKE " } else { "LIKE " });
-                self.expression(&value.pattern);
+                self.expression(&value.pattern)?;
                 if let Some(escape) = &value.escape {
                     self.text(" ESCAPE ");
-                    self.expression(escape);
+                    self.expression(escape)?;
                 }
             }
             Predicate::In(value) => {
                 self.text(if value.negated { "NOT IN " } else { "IN " });
                 match &value.value_list {
-                    Expr::InList(_) | Expr::Subquery(_) => self.expression(&value.value_list),
-                    _ => unsupported("an IN predicate without its list/subquery wrapper"),
+                    Expr::InList(_) | Expr::Subquery(_) => self.expression(&value.value_list)?,
+                    _ => {
+                        return Err(unsupported(
+                            "an IN predicate without its list/subquery wrapper",
+                        ));
+                    }
                 }
             }
             Predicate::Overlaps(value) => {
                 self.text("OVERLAPS ");
-                self.expression(&value.right);
+                self.expression(&value.right)?;
             }
             Predicate::QuantifiedComparison(value) => {
-                self.comparison(value.operator);
+                self.comparison(value.operator)?;
                 self.character(' ');
                 self.text(match value.quantifier {
                     ComparisonQuantifier::All => "ALL ",
                     ComparisonQuantifier::Any => "ANY ",
                     ComparisonQuantifier::Some => "SOME ",
                 });
-                self.subquery_argument(&value.subquery);
+                self.subquery_argument(&value.subquery)?;
             }
             Predicate::Match(value) => {
                 self.text("MATCH ");
@@ -306,11 +317,12 @@ impl Writer {
                     MatchType::Partial => "PARTIAL ",
                     MatchType::Full => "FULL ",
                 });
-                self.subquery_argument(&value.subquery);
+                self.subquery_argument(&value.subquery)?;
             }
         }
+        Ok(())
     }
-    fn comparison(&mut self, operator: ComparisonOperator) {
+    fn comparison(&mut self, operator: ComparisonOperator) -> PrintResult {
         self.text(match operator {
             ComparisonOperator::Equal => "=",
             ComparisonOperator::NotEqual => "<>",
@@ -319,48 +331,63 @@ impl Writer {
             ComparisonOperator::GreaterThan => ">",
             ComparisonOperator::GreaterThanOrEqual => ">=",
         });
+        Ok(())
     }
     #[recursive::recursive]
-    fn subquery_argument(&mut self, value: &Expr) {
+    fn subquery_argument(&mut self, value: &Expr) -> PrintResult {
         match value {
-            Expr::Subquery(_) => self.expression(value),
-            _ => unsupported("a missing typed subquery expression wrapper"),
+            Expr::Subquery(_) => self.expression(value)?,
+            _ => return Err(unsupported("a missing typed subquery expression wrapper")),
         }
+        Ok(())
     }
     #[recursive::recursive]
-    fn when_clauses(&mut self, values: &[WhenClause]) {
+    fn when_clauses(&mut self, values: &[WhenClause]) -> PrintResult {
         for value in values {
             self.text(" WHEN ");
             match &value.match_value {
-                WhenMatch::Operand(value) => self.expression(value),
-                WhenMatch::Partial(value) => self.predicate(value),
+                WhenMatch::Operand(value) => self.expression(value)?,
+                WhenMatch::Partial(value) => self.predicate(value)?,
             }
             self.text(" THEN ");
-            self.expression(&value.result);
+            self.expression(&value.result)?;
         }
+        Ok(())
     }
     #[recursive::recursive]
-    fn case_default(&mut self, value: Option<&Expr>) {
+    fn case_default(&mut self, value: Option<&Expr>) -> PrintResult {
         if let Some(value) = value {
             self.text(" ELSE ");
-            self.expression(value);
+            self.expression(value)?;
         }
         self.text(" END");
+        Ok(())
     }
-    fn current_time(&mut self, name: &str, precision: Option<i32>) {
+    fn current_time(&mut self, name: &str, precision: Option<i32>) -> PrintResult {
         self.text(name);
         if let Some(precision) = precision {
             write!(&mut self.output, "({precision})").expect("String formatting cannot fail");
         }
+        Ok(())
     }
     #[recursive::recursive]
-    fn call(&mut self, value: &FunctionCall) {
+    fn call(&mut self, value: &FunctionCall) -> PrintResult {
+        if self.inverse_position(value)? {
+            self.text("POSITION(");
+            self.expression(&value.arguments[1].value)?;
+            self.text(" IN ");
+            self.expression(&value.arguments[0].value)?;
+            self.character(')');
+            return Ok(());
+        }
+
         if value.name.parts.len() == 1
             && !value.name.parts[0].quoted
             && value.name.parts[0].value.eq_ignore_ascii_case("LISTAGG")
         {
             return self.listagg(value);
         }
+        let parameter_start = self.parameter_events.len();
         if let Some(mode) = &value.processing_mode {
             self.text(match mode.mode {
                 ProcessingModeKind::Running => "RUNNING ",
@@ -380,21 +407,24 @@ impl Writer {
                 self.identifier(name);
                 self.text(" => ");
             }
-            self.expression(&argument.value);
+            self.expression(&argument.value)?;
         }
+        let arguments_end = self.parameter_events.len();
         if let Some(order_by) = &value.order_by {
             self.character(' ');
-            self.order_by(order_by);
+            self.order_by(order_by)?;
         }
         self.character(')');
+        let order_end = self.parameter_events.len();
         if let Some(filter) = &value.filter {
             self.text(" FILTER (WHERE ");
-            self.expression(filter);
+            self.expression(filter)?;
             self.character(')');
         }
+        let filter_end = self.parameter_events.len();
         if let Some(treatment) = value.null_treatment {
             if value.window.is_none() {
-                unsupported("null treatment without its window");
+                return Err(unsupported("null treatment without its window"));
             }
             self.text(match treatment {
                 NullTreatment::IgnoreNulls => " IGNORE NULLS",
@@ -403,7 +433,19 @@ impl Writer {
         }
         if let Some(window) = &value.window {
             self.text(" OVER ");
-            self.window(window);
+            self.window(window)?;
         }
+        let end = self.parameter_events.len();
+        self.reorder_parameter_events(
+            parameter_start,
+            &[
+                order_end..filter_end,
+                filter_end..end,
+                arguments_end..order_end,
+                parameter_start..arguments_end,
+            ],
+            value.span,
+        )?;
+        Ok(())
     }
 }

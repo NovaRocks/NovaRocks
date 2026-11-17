@@ -22,7 +22,7 @@ use novarocks_parser::{SYNTHETIC, trino_parser, trino_printer};
 fn roundtrip_function(source: &str) -> FunctionSpecification {
     let original = trino_parser::parse_function_specification(source)
         .unwrap_or_else(|error| panic!("{source:?}: {error:?}"));
-    let printed = trino_printer::print_function_specification(&original);
+    let printed = trino_printer::print_function_specification(&original).unwrap();
     let reparsed = trino_parser::parse_function_specification(&printed)
         .unwrap_or_else(|error| panic!("{source:?} -> {printed:?}: {error:?}"));
     assert!(
@@ -151,7 +151,7 @@ fn query_prefixes_keep_body_first_parameter_numbers_and_function_list_order() {
             .collect::<Vec<_>>(),
         vec![6, 4, 2, 3, 5, 1, 0]
     );
-    let printed = trino_printer::print_query(&original);
+    let printed = trino_printer::print_query(&original).unwrap();
     assert!(printed.starts_with("WITH SESSION "));
     let reparsed = trino_parser::parse_query(&printed).unwrap();
     assert!(
@@ -178,7 +178,11 @@ fn routine_property_expression_default_is_distinct_from_the_default_marker() {
             ..
         }))
     ));
-    assert!(trino_printer::print_function_specification(&function).contains("p = (DEFAULT)"));
+    assert!(
+        trino_printer::print_function_specification(&function)
+            .unwrap()
+            .contains("p = (DEFAULT)")
+    );
 }
 
 #[test]
@@ -200,7 +204,7 @@ fn dollar_definitions_keep_raw_content_newlines_and_question_marks_outside_param
             panic!()
         };
         assert_eq!(parameter.position, 0);
-        let printed = trino_printer::print_function_specification(&function);
+        let printed = trino_printer::print_function_specification(&function).unwrap();
         assert!(printed.ends_with("AS $$\n? 'raw'\\n\n$$"));
     }
     let empty = roundtrip_function("FUNCTION f() RETURNS BIGINT AS $$\n$$");
@@ -209,7 +213,8 @@ fn dollar_definitions_keep_raw_content_newlines_and_question_marks_outside_param
     );
     let source = "WITH FUNCTION f() RETURNS BIGINT AS $$\n?\n$$ SELECT ?";
     let original = trino_parser::parse_query(source).unwrap();
-    let reparsed = trino_parser::parse_query(&trino_printer::print_query(&original)).unwrap();
+    let reparsed =
+        trino_parser::parse_query(&trino_printer::print_query(&original).unwrap()).unwrap();
     assert!(original.syntax_eq(&reparsed));
 }
 
@@ -224,10 +229,10 @@ fn unrepresentable_programmatic_routine_facts_are_refused_not_rewritten() {
             definition: definition.into(),
             span: SYNTHETIC,
         };
-        assert!(
-            std::panic::catch_unwind(|| trino_printer::print_function_specification(&function))
-                .is_err()
-        );
+        assert!(matches!(
+            trino_printer::print_function_specification(&function),
+            Err(novarocks_parser::trino_printer::PrintError::Unrepresentable { .. })
+        ));
     }
     let mut function =
         trino_parser::parse_function_specification("FUNCTION f() RETURNS BIGINT RETURN 1").unwrap();
@@ -236,10 +241,10 @@ fn unrepresentable_programmatic_routine_facts_are_refused_not_rewritten() {
         data_type: trino_parser::parse_type("INTERVAL DAY").unwrap(),
         span: SYNTHETIC,
     });
-    assert!(
-        std::panic::catch_unwind(|| trino_printer::print_function_specification(&function))
-            .is_err()
-    );
+    assert!(matches!(
+        trino_printer::print_function_specification(&function),
+        Err(novarocks_parser::trino_printer::PrintError::Unrepresentable { .. })
+    ));
 }
 
 #[test]
@@ -282,7 +287,7 @@ fn original_routine_coverage_rows_roundtrip_through_their_actual_component_entry
             let original = trino_parser::parse_query(source.as_ref())
                 .unwrap_or_else(|error| panic!("{}: {source:?}: {error:?}", fields[1]));
             assert!(!original.functions.is_empty());
-            let printed = trino_printer::print_query(&original);
+            let printed = trino_printer::print_query(&original).unwrap();
             let reparsed = trino_parser::parse_query(&printed)
                 .unwrap_or_else(|error| panic!("{} -> {printed:?}: {error:?}", fields[1]));
             assert!(
@@ -309,7 +314,7 @@ fn actual_deep_routine_control_prints_and_reparses_on_the_ordinary_test_thread()
     }
     source.push_str(" END");
     let original = trino_parser::parse_function_specification(&source).unwrap();
-    let printed = trino_printer::print_function_specification(&original);
+    let printed = trino_printer::print_function_specification(&original).unwrap();
     let reparsed = trino_parser::parse_function_specification(&printed).unwrap();
     assert!(original.syntax_eq(&reparsed));
     let RoutineBody::Sql(ControlStatement::Compound(body)) = &reparsed.body else {

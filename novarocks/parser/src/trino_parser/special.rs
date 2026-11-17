@@ -319,12 +319,18 @@ impl Parser<'_> {
         let start = self.expect_keyword(K::Listagg)?;
         let parameter_start = self.next_parameter;
         self.expect_symbol(S::LParen)?;
-        let distinct = if self.eat_keyword(K::Distinct).is_some() {
-            true
-        } else {
-            let _ = self.eat_keyword(K::All);
-            false
-        };
+        self.with_optional_set_quantifier(|parser, quantifier| {
+            parser.parse_listagg_body(start, parameter_start, quantifier.unwrap_or(false))
+        })
+    }
+
+    #[recursive::recursive]
+    fn parse_listagg_body(
+        &mut self,
+        start: Span,
+        parameter_start: usize,
+        distinct: bool,
+    ) -> Result<Expr, ParserError> {
         let argument_start = self.next_parameter;
         let value = self.parse_expression()?;
         let argument_end = self.next_parameter;

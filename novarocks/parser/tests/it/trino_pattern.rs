@@ -471,7 +471,7 @@ fn trino_pattern_new_printer_roundtrips_every_retained_fact() {
         "SELECT sum(?) OVER (MEASURES ? AS m ROWS BETWEEN ? PRECEDING AND CURRENT ROW EXCLUDE TIES AFTER MATCH SKIP PAST LAST ROW PATTERN(A??) DEFINE A AS ?)",
     ] {
         let parsed = query(source);
-        let rendered = trino_printer::print_query(&parsed);
+        let rendered = trino_printer::print_query(&parsed).unwrap();
         let reparsed = query(&rendered);
         assert!(syntax_eq_query(&parsed, &reparsed), "{source}\n{rendered}");
     }

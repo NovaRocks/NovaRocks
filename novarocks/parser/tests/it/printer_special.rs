@@ -4,7 +4,7 @@ use novarocks_parser::{trino_parser, trino_printer};
 
 fn roundtrip(source: &str) -> (Expr, String) {
     let original = trino_parser::parse_expression(source).unwrap();
-    let printed = trino_printer::print_expression(&original);
+    let printed = trino_printer::print_expression(&original).unwrap();
     let reparsed = trino_parser::parse_expression(&printed).unwrap();
     assert!(original.syntax_eq(&reparsed), "{source:?} -> {printed:?}");
     (original, printed)
@@ -150,7 +150,7 @@ fn method_and_interval_printer_keep_real_classes_and_prevent_day_alias_capture()
         &column.expression,
         Expr::IntervalValueExpression(_)
     ));
-    let printed = trino_printer::print_query(&original);
+    let printed = trino_printer::print_query(&original).unwrap();
     let reparsed = trino_parser::parse_query(&printed).unwrap();
     assert!(original.syntax_eq(&reparsed), "{printed}");
 }

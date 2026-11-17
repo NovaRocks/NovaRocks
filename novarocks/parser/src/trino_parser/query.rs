@@ -266,7 +266,17 @@ impl Parser<'_> {
 
     fn parse_select(&mut self) -> Result<Select, ParserError> {
         let start = self.expect_keyword(Keyword::Select)?;
-        let distinct = self.parse_optional_distinct();
+        self.with_optional_set_quantifier(|parser, quantifier| {
+            parser.parse_select_body(start, quantifier)
+        })
+    }
+
+    fn parse_select_body(
+        &mut self,
+        start: crate::Span,
+        quantifier: Option<bool>,
+    ) -> Result<Select, ParserError> {
+        let distinct = quantifier.unwrap_or(false);
         let mut projection = vec![self.parse_select_item()?];
         while self.eat_symbol(Symbol::Comma).is_some() {
             projection.push(self.parse_select_item()?);
@@ -322,6 +332,9 @@ impl Parser<'_> {
                     break;
                 }
             }
+        }
+        if quantifier.is_some() && !self.query_term_follows() {
+            return Err(self.error("a complete SELECT specification"));
         }
         Ok(Select {
             distinct,
@@ -411,21 +424,50 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_optional_distinct(&mut self) -> bool {
-        if self.eat_keyword(Keyword::Distinct).is_some() {
-            true
-        } else {
-            self.eat_keyword(Keyword::All);
-            false
-        }
+    // Query suffixes are parsed by their existing outer author. Check only
+    // their real grammar prefixes here, so an ALL-as-expression alternative
+    // can recover before a suffix without consuming or reconstructing it.
+    fn query_term_follows(&self) -> bool {
+        self.grammar_boundary_at_current()
+            || matches!(
+                self.peek(0).kind,
+                TokenKind::End
+                    | TokenKind::Symbol(Symbol::RParen)
+                    | TokenKind::Keyword(Keyword::Union | Keyword::Intersect | Keyword::Except)
+            )
+            || (self.at_keyword(Keyword::Order)
+                && self.peek(1).kind == TokenKind::Keyword(Keyword::By))
+            || (matches!(
+                self.peek(0).kind,
+                TokenKind::Keyword(Keyword::Offset | Keyword::Limit | Keyword::Fetch)
+            ) && self.query_clause_follows_alias())
     }
 
     pub(super) fn parse_group_by(&mut self) -> Result<GroupBy, ParserError> {
         let start = self.current().span;
-        let distinct = self.parse_optional_distinct();
+        self.with_optional_set_quantifier(|parser, quantifier| {
+            parser.parse_group_by_body(start, quantifier)
+        })
+    }
+
+    fn parse_group_by_body(
+        &mut self,
+        start: crate::Span,
+        quantifier: Option<bool>,
+    ) -> Result<GroupBy, ParserError> {
+        let distinct = quantifier.unwrap_or(false);
         let mut elements = vec![self.parse_grouping_element()?];
         while self.eat_symbol(Symbol::Comma).is_some() {
             elements.push(self.parse_grouping_element()?);
+        }
+        if quantifier.is_some()
+            && !self.query_term_follows()
+            && !self.at_keyword(Keyword::Having)
+            && !(self.at_keyword(Keyword::Window)
+                && self.is_identifier(1)
+                && self.peek(2).kind == TokenKind::Keyword(Keyword::As))
+        {
+            return Err(self.error("a complete GROUP BY clause"));
         }
         Ok(GroupBy {
             distinct,

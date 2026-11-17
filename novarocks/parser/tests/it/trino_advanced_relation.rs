@@ -350,7 +350,7 @@ fn trino_advanced_relation_roundtrips_include_all_table_argument_list_shapes() {
         "SELECT * FROM NEAREST(FROM t WHERE a=b MATCH ts<=?)",
     ] {
         let parsed = query(source);
-        let printed = trino_printer::print_query(&parsed);
+        let printed = trino_printer::print_query(&parsed).unwrap();
         let reparsed = query(&printed);
         assert!(syntax_eq_query(&parsed, &reparsed), "{source}\n{printed}");
     }
@@ -414,7 +414,7 @@ fn descriptor_argument_selection_requires_the_complete_grammar_alternative() {
             ),
             "{source}"
         );
-        let printed = novarocks_parser::trino_printer::print_query(&parsed);
+        let printed = novarocks_parser::trino_printer::print_query(&parsed).unwrap();
         let reparsed = parse_query(&printed).unwrap();
         assert!(syntax_eq_query(&parsed, &reparsed), "{source} -> {printed}");
     }
@@ -452,6 +452,6 @@ fn pivot_aliased_expression_keeps_a_bare_interval_field_as_the_real_alias() {
     assert!(matches!(pivot.aggregations[0].expression, Expr::Binary(_)));
     assert_eq!(pivot.value_groups[0].alias.as_ref().unwrap().value, "DAY");
     assert!(matches!(pivot.value_groups[0].values[0], Expr::Binary(_)));
-    let printed = novarocks_parser::trino_printer::print_query(&parsed);
+    let printed = novarocks_parser::trino_printer::print_query(&parsed).unwrap();
     assert!(syntax_eq_query(&parsed, &parse_query(&printed).unwrap()));
 }

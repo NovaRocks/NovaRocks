@@ -88,3 +88,61 @@ fn grammar_sample_tokens_reconstruct_the_complete_input() {
         }
     }
 }
+
+#[test]
+fn query_expression_type_and_pattern_grammar_samples_use_their_actual_entry() {
+    use novarocks_parser::trino_parser;
+    let mut failures = Vec::new();
+    for line in include_str!("grammar-coverage.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+    {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 10, "{line}");
+        if !matches!(fields[0], "alternative" | "optional") || fields[6] == "pending-p09" {
+            continue;
+        }
+        assert!(!fields[5].is_empty(), "missing grammar source: {line}");
+        let source = sample(fields[5]);
+        let result = match fields[1] {
+            "standaloneExpression" => trino_parser::parse_expression(&source).map(|_| ()),
+            "standaloneType" => trino_parser::parse_type(&source).map(|_| ()),
+            "standaloneRowPattern" => trino_parser::parse_row_pattern(&source).map(|_| ()),
+            "standaloneFunctionSpecification" => {
+                trino_parser::parse_function_specification(&source).map(|_| ())
+            }
+            _ => trino_parser::parse_query(&source).map(|_| ()),
+        };
+        match fields[7] {
+            "accept" if result.is_err() => {
+                failures.push(format!("{line}\nsource: {source}\n{result:?}"))
+            }
+            "reject" | "syntax-error" if result.is_ok() => {
+                failures.push(format!("{line}\nsource: {source}\nunexpected acceptance"))
+            }
+            "accept" | "reject" | "syntax-error" => {}
+            unexpected => panic!("unknown grammar expectation {unexpected}: {line}"),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn keyword_samples_obey_reserved_and_nonreserved_identifier_grammar() {
+    for line in include_str!("grammar-coverage.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+    {
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields[0] != "keyword" {
+            continue;
+        }
+        let source = sample(fields[5]);
+        let result = novarocks_parser::trino_parser::parse_query(&source);
+        match fields[7] {
+            "nonreserved" => assert!(result.is_ok(), "{line}\n{result:?}"),
+            "reserved" => assert!(result.is_err(), "{line}"),
+            unexpected => panic!("unknown keyword expectation {unexpected}: {line}"),
+        }
+    }
+}

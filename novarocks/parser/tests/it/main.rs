@@ -46,11 +46,13 @@ mod types;
 
 mod trino_json;
 
+mod nesting;
 mod printer_advanced_relation;
 mod printer_json;
 mod printer_pattern;
 mod printer_routine;
 mod printer_special;
+mod roundtrip;
 mod trino_access;
 mod trino_advanced_relation;
 mod trino_pattern;

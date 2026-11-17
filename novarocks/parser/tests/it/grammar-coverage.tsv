@@ -3,10 +3,10 @@
 # Empty samples marked pending-p09 belong to statement-family completion.
 # none in the last column means no reference disposition.
 alternative	singleStatement	1		0	SELECT 1	supported	accept	reviewed-grammar-path	none
-alternative	standaloneExpression	1		0	SELECT 1	supported	accept	reviewed-grammar-path	none
+alternative	standaloneExpression	1		0	1	supported	accept	reviewed-grammar-path	none
 alternative	standalonePathSpecification	1		0		pending-p09		pending-p09	none
-alternative	standaloneType	1		0	SELECT CAST(NULL AS integer)	supported	accept	reviewed-grammar-path	none
-alternative	standaloneRowPattern	1		0	SELECT * FROM t MATCH_RECOGNIZE (PATTERN (x) DEFINE x AS true)	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	standaloneType	1		0	integer	supported	accept	reviewed-grammar-path	none
+alternative	standaloneRowPattern	1		0	x	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	standaloneFunctionSpecification	1		0	@file:coverage-sql/routine-standalone.sql	supported	accept	reviewed-grammar-path	none
 alternative	statement	1	statementDefault	0		pending-p09		pending-p09	none
 alternative	statement	2	use	0		pending-p09		pending-p09	none
@@ -567,9 +567,9 @@ alternative	primaryExpression	21	cast	0	VALUES TRY_CAST ( ? AS x )	supported	acc
 optional	primaryExpression	22		1	VALUES ARRAY [ ? , ? ]	supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	22		2	VALUES ARRAY [ ? ]	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	22	arrayConstructor	0	VALUES ARRAY [ ]	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	23		1	VALUES [ ? , ? ]	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	23		2	VALUES [ ? ]	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	23	arrayConstructor	0	VALUES [ ]	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	23		1	VALUES ARRAY[ ? , ? ]	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	23		2	VALUES ARRAY[ ? ]	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	23	arrayConstructor	0	VALUES ARRAY[ ]	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	24	subscript	0	VALUES ? [ ? ]	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	25	arrayWildcardSubscript	0	VALUES ? [ * ]	parsed-not-supported	accept	reviewed-grammar-path	upstream-formatter-missing
 alternative	primaryExpression	26	columnReference	0	VALUES x	supported	accept	reviewed-grammar-path	none
@@ -881,8 +881,8 @@ alternative	ownedEntityKind	2		0		pending-p09		pending-p09	none
 alternative	ownedEntityKind	3		0		pending-p09		pending-p09	none
 alternative	ownedEntityKind	4		0		pending-p09		pending-p09	none
 alternative	ownedEntityKind	5		0		pending-p09		pending-p09	none
-optional	qualifiedName	1		1	DESC x . x	supported	accept	reviewed-grammar-path	none
-alternative	qualifiedName	1		0	DESC x	supported	accept	reviewed-grammar-path	none
+optional	qualifiedName	1		1	SELECT * FROM x . x	supported	accept	reviewed-grammar-path	none
+alternative	qualifiedName	1		0	SELECT * FROM x	supported	accept	reviewed-grammar-path	none
 alternative	queryPeriod	1		0	SELECT * FROM x FOR VERSION AS OF ?	supported	accept	reviewed-grammar-path	none
 alternative	rangeType	1		0	SELECT * FROM x FOR TIMESTAMP AS OF ?	supported	accept	reviewed-grammar-path	none
 alternative	rangeType	2		0	SELECT * FROM x FOR VERSION AS OF ?	supported	accept	reviewed-grammar-path	none
@@ -2180,8 +2180,8 @@ alternative	primaryExpression	18		g1.b1	VALUES CASE ? WHEN ? THEN ? ELSE ? END	s
 alternative	primaryExpression	19		g1.b1	VALUES CASE WHEN ? THEN ? ELSE ? END	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	22		g1.b1.g1.b1	VALUES ARRAY [ ? , ? ]	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	22		g1.b1	VALUES ARRAY [ ? ]	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	23		g1.b1.g1.b1	VALUES [ ? , ? ]	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	23		g1.b1	VALUES [ ? ]	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	23		g1.b1.g1.b1	VALUES ARRAY[ ? , ? ]	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	23		g1.b1	VALUES ARRAY[ ? ]	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	30		g1.b1	VALUES CURRENT_TIME ( 1 )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	31		g1.b1	VALUES CURRENT_TIMESTAMP ( 1 )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	32		g1.b1	VALUES LOCALTIME ( 1 )	supported	accept	reviewed-grammar-path	none
@@ -2317,4 +2317,4 @@ alternative	variableDeclaration	1		g1.b1	@file:coverage-sql/routine-declarations
 alternative	variableDeclaration	1		g2.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
 alternative	sqlStatementList	1		g1.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
 alternative	grantObject	1		g1.b1		pending-p09		pending-p09	none
-alternative	qualifiedName	1		g1.b1	DESC x . x	supported	accept	reviewed-grammar-path	none
+alternative	qualifiedName	1		g1.b1	SELECT * FROM x . x	supported	accept	reviewed-grammar-path	none

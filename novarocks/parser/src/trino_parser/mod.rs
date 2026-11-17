@@ -33,7 +33,7 @@ mod special;
 mod types;
 mod window;
 
-use crate::ast::{Expr, Fold, FunctionSpecification, Query, TypeName};
+use crate::ast::{Expr, Fold, FunctionSpecification, Query, RowPattern, TypeName};
 use crate::trino_token::{Token, TokenKind};
 use crate::{ParserError, Span, trino_lexer};
 use failure::GrammarError;
@@ -91,6 +91,30 @@ impl<'source> Parser<'source> {
             .is_some_and(|index| self.peek(0).span == self.tokens[index].span)
     }
 
+    /// Prefer the complete quantified grammar alternative. Only a syntax
+    /// mismatch may restore its real cursor and parameter-event checkpoint.
+    fn with_optional_set_quantifier<T>(
+        &mut self,
+        mut parse: impl FnMut(&mut Self, Option<bool>) -> Result<T, GrammarError>,
+    ) -> Result<T, GrammarError> {
+        use crate::trino_token::Keyword;
+        let quantifier = match self.peek(0).kind {
+            TokenKind::Keyword(Keyword::Distinct) => Some(true),
+            TokenKind::Keyword(Keyword::All) => Some(false),
+            _ => None,
+        };
+        if let Some(distinct) = quantifier {
+            let checkpoint = self.checkpoint();
+            self.bump();
+            match parse(self, Some(distinct)) {
+                Ok(value) => return Ok(value),
+                Err(GrammarError::Syntax(_)) => self.restore(checkpoint),
+                Err(error @ GrammarError::Construction(_)) => return Err(error),
+            }
+        }
+        parse(self, None)
+    }
+
     fn with_alias_follow<T>(
         &mut self,
         allowed: bool,
@@ -136,4 +160,12 @@ pub fn parse_function_specification(source: &str) -> Result<FunctionSpecificatio
     Ok(parser
         .parameter_numbers()
         .fold_function_specification(function))
+}
+
+/// Parses the standalone rowPattern grammar; quantifier question marks are not parameters.
+pub fn parse_row_pattern(source: &str) -> Result<RowPattern, ParserError> {
+    let mut parser = Parser::new(source)?;
+    let pattern = parser.parse_row_pattern()?;
+    parser.finish()?;
+    Ok(pattern)
 }

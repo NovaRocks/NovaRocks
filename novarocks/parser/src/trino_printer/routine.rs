@@ -19,7 +19,8 @@ use super::*;
 
 impl Writer {
     #[recursive::recursive]
-    pub(super) fn function_specification(&mut self, value: &FunctionSpecification) {
+    pub(super) fn function_specification(&mut self, value: &FunctionSpecification) -> PrintResult {
+        let parameter_start = self.parameter_events.len();
         self.text("FUNCTION ");
         self.name(&value.name);
         self.character('(');
@@ -37,18 +38,19 @@ impl Writer {
                     ..
                 })
             ) {
-                unsupported(
+                return Err(unsupported(
                     "an anonymous simple interval parameter ambiguous with its optional name",
-                );
+                ));
             }
-            self.data_type(&parameter.data_type);
+            self.data_type(&parameter.data_type)?;
         }
         self.text(") RETURNS ");
-        self.data_type(&value.returns);
+        self.data_type(&value.returns)?;
         for characteristic in &value.characteristics {
             self.character(' ');
-            self.routine_characteristic(characteristic);
+            self.routine_characteristic(characteristic)?;
         }
+        let characteristics_end = self.parameter_events.len();
         self.character(' ');
         match &value.body {
             RoutineBody::Sql(statement) => {
@@ -56,26 +58,38 @@ impl Writer {
                     statement,
                     ControlStatement::Return(_) | ControlStatement::Compound(_)
                 ) {
-                    unsupported("a function SQL body not beginning with RETURN or BEGIN");
+                    return Err(unsupported(
+                        "a function SQL body not beginning with RETURN or BEGIN",
+                    ));
                 }
-                self.routine_control_statement(statement);
+                self.routine_control_statement(statement)?;
             }
             RoutineBody::External { definition, .. } => {
                 // The grammar has one fixed, non-greedy delimiter. A trailing
                 // dollar would also overlap the closing delimiter's first byte.
                 if definition.contains("$$") || definition.ends_with('$') {
-                    unsupported(
+                    return Err(unsupported(
                         "an external definition not representable between dollar delimiters",
-                    );
+                    ));
                 }
                 self.text("AS $$\n");
                 self.text(definition);
                 self.text("$$");
             }
         }
+        let end = self.parameter_events.len();
+        self.reorder_parameter_events(
+            parameter_start,
+            &[
+                characteristics_end..end,
+                parameter_start..characteristics_end,
+            ],
+            value.span,
+        )?;
+        Ok(())
     }
 
-    fn routine_characteristic(&mut self, value: &RoutineCharacteristic) {
+    fn routine_characteristic(&mut self, value: &RoutineCharacteristic) -> PrintResult {
         match value {
             RoutineCharacteristic::Language { language, .. } => {
                 self.text("LANGUAGE ");
@@ -107,7 +121,7 @@ impl Writer {
             }
             RoutineCharacteristic::Properties { properties, .. } => {
                 if properties.is_empty() {
-                    unsupported("empty routine properties");
+                    return Err(unsupported("empty routine properties"));
                 }
                 self.text("WITH (");
                 for (index, property) in properties.iter().enumerate() {
@@ -119,61 +133,62 @@ impl Writer {
                     match &property.value {
                         // Parentheses distinguish Some(Identifier DEFAULT)
                         // from the dedicated property DEFAULT production.
-                        Some(value) => self.parenthesized_expression(value),
+                        Some(value) => self.parenthesized_expression(value)?,
                         None => self.text("DEFAULT"),
                     }
                 }
                 self.character(')');
             }
         }
+        Ok(())
     }
 
     #[recursive::recursive]
-    fn routine_control_statement(&mut self, value: &ControlStatement) {
+    fn routine_control_statement(&mut self, value: &ControlStatement) -> PrintResult {
         match value {
             ControlStatement::Return(value) => {
                 self.text("RETURN ");
-                self.expression(&value.value);
+                self.expression(&value.value)?;
             }
             ControlStatement::Assignment(value) => {
                 self.text("SET ");
                 self.identifier(&value.target);
                 self.text(" = ");
-                self.expression(&value.value);
+                self.expression(&value.value)?;
             }
             ControlStatement::Case(value) => {
                 if value.when_clauses.is_empty() {
-                    unsupported("CASE without routine WHEN clauses");
+                    return Err(unsupported("CASE without routine WHEN clauses"));
                 }
                 self.text("CASE ");
                 if let Some(expression) = &value.expression {
-                    self.expression(expression);
+                    self.expression(expression)?;
                     self.character(' ');
                 }
                 for clause in &value.when_clauses {
                     self.text("WHEN ");
-                    self.expression(&clause.expression);
+                    self.expression(&clause.expression)?;
                     self.text(" THEN ");
-                    self.routine_statement_list(&clause.statements);
+                    self.routine_statement_list(&clause.statements)?;
                 }
                 if let Some(clause) = &value.else_clause {
-                    self.routine_else(clause);
+                    self.routine_else(clause)?;
                 }
                 self.text("END CASE");
             }
             ControlStatement::If(value) => {
                 self.text("IF ");
-                self.expression(&value.expression);
+                self.expression(&value.expression)?;
                 self.text(" THEN ");
-                self.routine_statement_list(&value.statements);
+                self.routine_statement_list(&value.statements)?;
                 for clause in &value.else_if_clauses {
                     self.text("ELSEIF ");
-                    self.expression(&clause.expression);
+                    self.expression(&clause.expression)?;
                     self.text(" THEN ");
-                    self.routine_statement_list(&clause.statements);
+                    self.routine_statement_list(&clause.statements)?;
                 }
                 if let Some(clause) = &value.else_clause {
-                    self.routine_else(clause);
+                    self.routine_else(clause)?;
                 }
                 self.text("END IF");
             }
@@ -186,75 +201,82 @@ impl Writer {
                 self.identifier(&value.label);
             }
             ControlStatement::VariableDeclaration(_) => {
-                unsupported("a DECLARE outside a compound declaration prefix");
+                return Err(unsupported(
+                    "a DECLARE outside a compound declaration prefix",
+                ));
             }
             ControlStatement::Compound(value) => {
                 self.text("BEGIN ");
                 for declaration in &value.variable_declarations {
-                    self.routine_variable_declaration(declaration);
+                    self.routine_variable_declaration(declaration)?;
                     self.text("; ");
                 }
                 for statement in &value.statements {
-                    self.routine_control_statement(statement);
+                    self.routine_control_statement(statement)?;
                     self.text("; ");
                 }
                 self.text("END");
             }
             ControlStatement::Loop(value) => {
-                self.routine_label(value.label.as_ref());
+                self.routine_label(value.label.as_ref())?;
                 self.text("LOOP ");
-                self.routine_statement_list(&value.statements);
+                self.routine_statement_list(&value.statements)?;
                 self.text("END LOOP");
             }
             ControlStatement::While(value) => {
-                self.routine_label(value.label.as_ref());
+                self.routine_label(value.label.as_ref())?;
                 self.text("WHILE ");
-                self.expression(&value.expression);
+                self.expression(&value.expression)?;
                 self.text(" DO ");
-                self.routine_statement_list(&value.statements);
+                self.routine_statement_list(&value.statements)?;
                 self.text("END WHILE");
             }
             ControlStatement::Repeat(value) => {
-                self.routine_label(value.label.as_ref());
+                self.routine_label(value.label.as_ref())?;
                 self.text("REPEAT ");
-                self.routine_statement_list(&value.statements);
+                self.routine_statement_list(&value.statements)?;
                 self.text("UNTIL ");
-                self.expression(&value.condition);
+                self.expression(&value.condition)?;
                 self.text(" END REPEAT");
             }
         }
+        Ok(())
     }
 
-    fn routine_statement_list(&mut self, values: &[ControlStatement]) {
+    fn routine_statement_list(&mut self, values: &[ControlStatement]) -> PrintResult {
         if values.is_empty() {
-            unsupported("an empty required routine statement list");
+            return Err(unsupported("an empty required routine statement list"));
         }
         for value in values {
-            self.routine_control_statement(value);
+            self.routine_control_statement(value)?;
             self.text("; ");
         }
+        Ok(())
     }
-    fn routine_else(&mut self, value: &ElseClause) {
+    fn routine_else(&mut self, value: &ElseClause) -> PrintResult {
         self.text("ELSE ");
-        self.routine_statement_list(&value.statements);
+        self.routine_statement_list(&value.statements)?;
+        Ok(())
     }
-    fn routine_label(&mut self, label: Option<&Ident>) {
+    fn routine_label(&mut self, label: Option<&Ident>) -> PrintResult {
         if let Some(label) = label {
             self.identifier(label);
             self.text(": ");
         }
+        Ok(())
     }
-    fn routine_variable_declaration(&mut self, value: &VariableDeclaration) {
+    fn routine_variable_declaration(&mut self, value: &VariableDeclaration) -> PrintResult {
         if value.names.is_empty() {
-            unsupported("a DECLARE without names");
+            return Err(unsupported("a DECLARE without names"));
         }
         self.text("DECLARE ");
         self.identifiers(&value.names);
         self.character(' ');
-        self.data_type(&value.data_type);
+        self.data_type(&value.data_type)?;
         if let Some(default) = &value.default_value {
             self.text(" DEFAULT ");
-            self.expression(default);
+            self.expression(default)?;
         }
+        Ok(())
     }
 }

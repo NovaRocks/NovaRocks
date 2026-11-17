@@ -409,7 +409,7 @@ fn trino_query_first_slice_roundtrips_preserve_all_syntax_facts() {
         "SELECT \"MiXeD\" AS \"out\" FROM \"T\"",
     ] {
         let first = query(sql);
-        let rendered = trino_printer::print_query(&first);
+        let rendered = trino_printer::print_query(&first).unwrap();
         let second = query(&rendered);
         assert!(syntax_eq_query(&first, &second), "{sql}\n{rendered}");
     }
@@ -436,7 +436,119 @@ fn relation_parentheses_distinguish_query_wrappers_from_an_inner_alias() {
         matches!(&select.from, Some(Relation::TableSubquery(value)) if matches!(value.query.body.as_ref(), SetExpr::Query(_)))
     );
     for original in [aliased, nested] {
-        let printed = trino_printer::print_query(&original);
+        let printed = trino_printer::print_query(&original).unwrap();
         assert!(syntax_eq_query(&original, &query(&printed)), "{printed}");
+    }
+}
+
+#[test]
+fn all_quantifier_prefers_complete_select_and_grouping_alternatives() {
+    for (source, has_from, has_order, has_limit, alias) in [
+        ("SELECT ALL", false, false, false, None),
+        ("SELECT ALL FROM t", true, false, false, None),
+        ("SELECT ALL ORDER BY 1", false, true, false, None),
+        ("SELECT ALL LIMIT 1", false, false, true, None),
+        ("SELECT ALL AS x", false, false, false, Some("x")),
+    ] {
+        let parsed = query(source);
+        let select = select(&parsed);
+        assert!(!select.distinct);
+        assert_eq!(select.projection.len(), 1);
+        let SelectItem::SingleColumn(column) = &select.projection[0] else {
+            panic!("not column")
+        };
+        assert!(
+            matches!(&column.expression, Expr::Identifier(value) if value.value == "ALL" && !value.quoted),
+            "{source}"
+        );
+        assert_eq!(
+            column.alias.as_ref().map(|value| value.value.as_str()),
+            alias
+        );
+        assert_eq!(select.from.is_some(), has_from);
+        assert_eq!(select.modifiers.order_by.is_some(), has_order);
+        assert_eq!(select.modifiers.limit.is_some(), has_limit);
+    }
+    for (source, distinct) in [("SELECT ALL a", false), ("SELECT DISTINCT a", true)] {
+        let parsed = query(source);
+        assert_eq!(select(&parsed).distinct, distinct);
+        assert!(
+            matches!(expression(&select(&parsed).projection[0]), Expr::Identifier(value) if value.value == "a")
+        );
+    }
+    for source in [
+        "SELECT 1 FROM t GROUP BY ALL",
+        "SELECT 1 FROM t GROUP BY ALL HAVING TRUE",
+        "SELECT 1 FROM t GROUP BY ALL LIMIT 1",
+    ] {
+        let parsed = query(source);
+        let group = select(&parsed).group_by.as_ref().unwrap();
+        assert!(!group.distinct);
+        let GroupingElement::Simple(simple) = &group.elements[0] else {
+            panic!("not simple")
+        };
+        assert_eq!(simple.columns.len(), 1);
+        assert!(
+            matches!(&simple.columns[0], Expr::Identifier(value) if value.value == "ALL"),
+            "{source}"
+        );
+    }
+    for (source, distinct) in [
+        ("SELECT 1 FROM t GROUP BY ALL a", false),
+        ("SELECT 1 FROM t GROUP BY DISTINCT a", true),
+    ] {
+        let parsed = query(source);
+        let group = select(&parsed).group_by.as_ref().unwrap();
+        assert_eq!(group.distinct, distinct);
+        let GroupingElement::Simple(simple) = &group.elements[0] else {
+            panic!("not simple")
+        };
+        assert!(matches!(&simple.columns[0], Expr::Identifier(value) if value.value == "a"));
+    }
+    let parsed = query("SELECT 1 FROM t GROUP BY ALL()");
+    let GroupingElement::Simple(simple) = &select(&parsed).group_by.as_ref().unwrap().elements[0]
+    else {
+        panic!("not simple")
+    };
+    assert!(
+        simple.columns.is_empty(),
+        "the complete quantified empty grouping set wins"
+    );
+}
+
+#[test]
+fn select_and_group_all_retries_restore_real_parameter_events_and_keep_construction_errors() {
+    use novarocks_parser::{ParseError, ParserError, Span};
+    for (source, in_group) in [
+        ("SELECT ALL(?) FILTER (WHERE ?)", false),
+        ("SELECT 1 FROM t GROUP BY ALL(?) FILTER (WHERE ?)", true),
+    ] {
+        let parsed = query(source);
+        let value = if in_group {
+            let GroupingElement::Simple(simple) =
+                &select(&parsed).group_by.as_ref().unwrap().elements[0]
+            else {
+                panic!("not simple")
+            };
+            &simple.columns[0]
+        } else {
+            expression(&select(&parsed).projection[0])
+        };
+        let Expr::FunctionCall(call) = value else {
+            panic!("not the actual ALL function")
+        };
+        assert_eq!(call.name.parts[0].value, "ALL");
+        assert_eq!(call.arguments.len(), 1);
+        assert_eq!(parameter(&call.arguments[0].value), 1);
+        assert_eq!(parameter(call.filter.as_ref().unwrap()), 0);
+    }
+    for source in ["SELECT ALL IF()", "SELECT 1 FROM t GROUP BY ALL IF()"] {
+        let error = trino_parser::parse_query(source).unwrap_err();
+        let ParserError::Parse(ParseError::UnexpectedToken { span, found, .. }) = error else {
+            panic!("not construction diagnostic")
+        };
+        let start = source.find("IF()").unwrap();
+        assert_eq!(span, Span::new(start, start + 4));
+        assert_eq!(found, "IF");
     }
 }

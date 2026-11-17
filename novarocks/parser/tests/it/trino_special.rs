@@ -462,3 +462,46 @@ fn malformed_special_forms_reject_at_their_grammar_or_constructor_boundary() {
         );
     }
 }
+
+#[test]
+fn listagg_all_complete_alternatives_keep_value_identity_and_parameter_visits() {
+    let expression = parse_expression("LISTAGG(ALL) WITHIN GROUP (ORDER BY x)").unwrap();
+    let value = call(&expression);
+    assert!(!value.distinct);
+    assert!(matches!(&value.arguments[0].value, Expr::Identifier(value) if value.value == "ALL"));
+    let expression = parse_expression("LISTAGG(ALL a) WITHIN GROUP (ORDER BY x)").unwrap();
+    assert!(
+        matches!(&call(&expression).arguments[0].value, Expr::Identifier(value) if value.value == "a")
+    );
+    let expression = parse_expression("LISTAGG(DISTINCT ALL) WITHIN GROUP (ORDER BY x)").unwrap();
+    assert!(call(&expression).distinct);
+    assert!(
+        matches!(&call(&expression).arguments[0].value, Expr::Identifier(value) if value.value == "ALL")
+    );
+    let expression = parse_expression("LISTAGG(ALL(?)) WITHIN GROUP (ORDER BY ?)").unwrap();
+    let value = call(&expression);
+    assert_eq!(parameter(&value.arguments[0].value).position, 1);
+    assert_eq!(
+        parameter(&value.order_by.as_ref().unwrap().items[0].sort_key).position,
+        0
+    );
+    let expression =
+        parse_expression("LISTAGG(ALL(?) FILTER (WHERE ?)) WITHIN GROUP (ORDER BY ?)").unwrap();
+    let value = call(&expression);
+    let inner = call(&value.arguments[0].value);
+    assert_eq!(inner.name.parts[0].value, "ALL");
+    assert_eq!(parameter(&inner.arguments[0].value).position, 2);
+    assert_eq!(parameter(inner.filter.as_ref().unwrap()).position, 1);
+    assert_eq!(
+        parameter(&value.order_by.as_ref().unwrap().items[0].sort_key).position,
+        0
+    );
+    let source = "LISTAGG(ALL IF()) WITHIN GROUP (ORDER BY x)";
+    let error = parse_expression(source).unwrap_err();
+    let ParserError::Parse(ParseError::UnexpectedToken { span, found, .. }) = error else {
+        panic!("not construction diagnostic")
+    };
+    let start = source.find("IF()").unwrap();
+    assert_eq!(span, Span::new(start, start + 4));
+    assert_eq!(found, "IF");
+}

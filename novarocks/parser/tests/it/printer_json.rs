@@ -5,7 +5,7 @@ use novarocks_parser::trino_printer::{print_expression, print_query};
 
 fn expression_roundtrip(source: &str) -> Expr {
     let original = parse_expression(source).unwrap();
-    let printed = print_expression(&original);
+    let printed = print_expression(&original).unwrap();
     let reparsed = parse_expression(&printed)
         .unwrap_or_else(|error| panic!("source: {source}\nprinted: {printed}\nerror: {error:?}"));
     assert!(
@@ -17,7 +17,7 @@ fn expression_roundtrip(source: &str) -> Expr {
 
 fn query_roundtrip(source: &str) -> Query {
     let original = parse_query(source).unwrap();
-    let printed = print_query(&original);
+    let printed = print_query(&original).unwrap();
     let reparsed = parse_query(&printed)
         .unwrap_or_else(|error| panic!("source: {source}\nprinted: {printed}\nerror: {error:?}"));
     assert!(
@@ -281,17 +281,26 @@ fn empty_json_constructors_refuse_unrepresentable_member_list_policies() {
         panic!("not JSON_OBJECT")
     };
     value.unique_keys = true;
-    assert!(std::panic::catch_unwind(|| print_expression(&object)).is_err());
+    assert!(matches!(
+        print_expression(&object),
+        Err(novarocks_parser::trino_printer::PrintError::Unrepresentable { .. })
+    ));
     let Expr::JsonObject(value) = &mut object else {
         unreachable!()
     };
     value.unique_keys = false;
     value.null_on_null = false;
-    assert!(std::panic::catch_unwind(|| print_expression(&object)).is_err());
+    assert!(matches!(
+        print_expression(&object),
+        Err(novarocks_parser::trino_printer::PrintError::Unrepresentable { .. })
+    ));
     let mut array = parse_expression("JSON_ARRAY()").unwrap();
     let Expr::JsonArray(value) = &mut array else {
         panic!("not JSON_ARRAY")
     };
     value.null_on_null = true;
-    assert!(std::panic::catch_unwind(|| print_expression(&array)).is_err());
+    assert!(matches!(
+        print_expression(&array),
+        Err(novarocks_parser::trino_printer::PrintError::Unrepresentable { .. })
+    ));
 }

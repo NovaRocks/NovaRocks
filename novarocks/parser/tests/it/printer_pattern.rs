@@ -24,7 +24,7 @@ fn query(source: &str) -> Query {
 
 fn roundtrip(source: &str) -> (Query, String) {
     let original = query(source);
-    let printed = trino_printer::print_query(&original);
+    let printed = trino_printer::print_query(&original).unwrap();
     let reparsed = query(&printed);
     assert!(syntax_eq_query(&original, &reparsed), "{source}\n{printed}");
     (reparsed, printed)
@@ -341,7 +341,10 @@ fn printer_pattern_refuses_non_binary_typed_trees_without_flattening() {
     patterns.push(RowPattern::Empty {
         span: novarocks_parser::SYNTHETIC,
     });
-    assert!(std::panic::catch_unwind(|| trino_printer::print_query(&parsed)).is_err());
+    assert!(matches!(
+        trino_printer::print_query(&parsed),
+        Err(novarocks_parser::trino_printer::PrintError::Unrepresentable { .. })
+    ));
 }
 
 #[test]
@@ -381,7 +384,7 @@ fn printer_pattern_deep_lifecycle_uses_the_ordinary_thread() {
     let pattern = format!("{}A{}", "{- ".repeat(2000), " -}".repeat(2000));
     let source = format!("SELECT * FROM t MATCH_RECOGNIZE(PATTERN({pattern}) DEFINE A AS TRUE)");
     let original = query(&source);
-    let printed = trino_printer::print_query(&original);
+    let printed = trino_printer::print_query(&original).unwrap();
     let reparsed = query(&printed);
     let cloned = reparsed.clone();
     assert!(syntax_eq_query(&original, &reparsed));

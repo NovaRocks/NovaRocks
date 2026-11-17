@@ -4,18 +4,18 @@ use super::*;
 
 impl Writer {
     #[recursive::recursive]
-    pub(super) fn special_expression(&mut self, value: &Expr) {
+    pub(super) fn special_expression(&mut self, value: &Expr) -> PrintResult {
         match value {
             Expr::Extract(value) => {
                 self.text("EXTRACT(");
                 self.text(value.field.as_str());
                 self.text(" FROM ");
-                self.expression(&value.expression);
+                self.expression(&value.expression)?;
                 self.character(')');
             }
             Expr::AtLocal(value) => {
                 self.character('(');
-                self.parenthesized_expression(&value.value);
+                self.parenthesized_expression(&value.value)?;
                 self.text(" AT LOCAL)");
             }
             Expr::AtTimeZone(value) => {
@@ -26,12 +26,16 @@ impl Writer {
                         kind: LiteralKind::String(_) | LiteralKind::Interval(_),
                         ..
                     }) => {}
-                    _ => unsupported("a time zone outside the pinned string/interval grammar"),
+                    _ => {
+                        return Err(unsupported(
+                            "a time zone outside the pinned string/interval grammar",
+                        ));
+                    }
                 }
                 self.character('(');
-                self.parenthesized_expression(&value.value);
+                self.parenthesized_expression(&value.value)?;
                 self.text(" AT TIME ZONE ");
-                self.expression(&value.time_zone);
+                self.expression(&value.time_zone)?;
                 self.character(')');
             }
             Expr::GroupingOperation(value) => {
@@ -45,13 +49,16 @@ impl Writer {
                     let chain = identifier_chain_observed(column, |_| Ok::<_, ()>(()))
                         .expect("infallible borrowed observation");
                     if chain.is_none() {
-                        unsupported("a computed expression in GROUPING's qualified-name list");
+                        return Err(unsupported(
+                            "a computed expression in GROUPING's qualified-name list",
+                        ));
                     }
-                    self.grouping_name(column);
+                    self.grouping_name(column)?;
                 }
                 self.character(')');
             }
             Expr::Trim(value) => {
+                let parameter_start = self.parameter_events.len();
                 self.text("TRIM(");
                 self.text(match value.specification {
                     TrimSpecification::Both => "BOTH",
@@ -60,22 +67,29 @@ impl Writer {
                 });
                 if let Some(character) = &value.trim_character {
                     self.character(' ');
-                    self.expression(character);
+                    self.expression(character)?;
                 }
+                let character_end = self.parameter_events.len();
                 self.text(" FROM ");
-                self.expression(&value.trim_source);
+                self.expression(&value.trim_source)?;
+                let end = self.parameter_events.len();
+                self.reorder_parameter_events(
+                    parameter_start,
+                    &[character_end..end, parameter_start..character_end],
+                    value.span,
+                )?;
                 self.character(')');
             }
             Expr::Overlay(value) => {
                 self.text("OVERLAY(");
-                self.expression(&value.value);
+                self.expression(&value.value)?;
                 self.text(" PLACING ");
-                self.expression(&value.replacement);
+                self.expression(&value.replacement)?;
                 self.text(" FROM ");
-                self.expression(&value.start);
+                self.expression(&value.start)?;
                 if let Some(length) = &value.length {
                     self.text(" FOR ");
-                    self.expression(length);
+                    self.expression(length)?;
                 }
                 self.character(')');
             }
@@ -85,46 +99,48 @@ impl Writer {
                 // Its subtraction is syntax for the real left/right fields,
                 // not a fabricated BinaryExpr or a replacement type node.
                 self.text("((");
-                self.parenthesized_expression(&value.left);
+                self.parenthesized_expression(&value.left)?;
                 self.text(" - ");
-                self.parenthesized_expression(&value.right);
+                self.parenthesized_expression(&value.right)?;
                 self.text(") ");
-                self.qualifier(&value.data_type.qualifier);
+                self.qualifier(&value.data_type.qualifier)?;
                 self.character(')');
             }
             Expr::MethodCall(value) => {
                 // A parenthesized primary receiver distinguishes a method from
                 // a qualified ordinary function name without an origin flag.
-                self.parenthesized_expression(&value.receiver);
+                self.parenthesized_expression(&value.receiver)?;
                 self.character('.');
                 self.identifier(&value.method);
-                self.method_arguments(&value.arguments);
+                self.method_arguments(&value.arguments)?;
             }
             Expr::StaticMethodCall(value) => {
                 self.name(&value.type_name);
                 self.text("::");
                 self.identifier(&value.method);
-                self.method_arguments(&value.arguments);
+                self.method_arguments(&value.arguments)?;
             }
             _ => unreachable!("special-expression dispatch is an exhaustive typed subset"),
         }
+        Ok(())
     }
 
     #[recursive::recursive]
-    fn grouping_name(&mut self, value: &Expr) {
+    fn grouping_name(&mut self, value: &Expr) -> PrintResult {
         match value {
             Expr::Identifier(value) => self.identifier(value),
             Expr::Dereference(value) => {
-                self.grouping_name(&value.base);
+                self.grouping_name(&value.base)?;
                 self.character('.');
                 self.identifier(value.field.as_ref().expect("validated pure name chain"));
             }
             _ => unreachable!("qualified name was validated before writing"),
         }
+        Ok(())
     }
 
     #[recursive::recursive]
-    fn method_arguments(&mut self, values: &[CallArgument]) {
+    fn method_arguments(&mut self, values: &[CallArgument]) -> PrintResult {
         self.character('(');
         for (index, value) in values.iter().enumerate() {
             if index != 0 {
@@ -134,13 +150,14 @@ impl Writer {
                 self.identifier(name);
                 self.text(" => ");
             }
-            self.expression(&value.value);
+            self.expression(&value.value)?;
         }
         self.character(')');
+        Ok(())
     }
 
     #[recursive::recursive]
-    pub(super) fn listagg(&mut self, value: &FunctionCall) {
+    pub(super) fn listagg(&mut self, value: &FunctionCall) -> PrintResult {
         // These are exactly the pinned AstBuilder.visitListagg output facts.
         // A different spelling, quotation, argument kind or metadata cannot be
         // silently dropped to make the syntax appear reconstructible.
@@ -155,26 +172,36 @@ impl Writer {
             || value.null_treatment.is_some()
             || value.processing_mode.is_some()
         {
-            unsupported("LISTAGG facts outside the pinned normalized constructor");
+            return Err(unsupported(
+                "LISTAGG facts outside the pinned normalized constructor",
+            ));
         }
-        let separator = listagg_string(&value.arguments[1].value);
-        let overflow_error = listagg_boolean(&value.arguments[2].value);
-        let filler = listagg_string(&value.arguments[3].value);
-        let show_count = listagg_boolean(&value.arguments[4].value);
+        let separator = listagg_string(&value.arguments[1].value)?;
+        let overflow_error = listagg_boolean(&value.arguments[2].value)?;
+        let filler = listagg_string(&value.arguments[3].value)?;
+        let show_count = listagg_boolean(&value.arguments[4].value)?;
         let order_by = match &value.order_by {
             Some(order_by) if !order_by.items.is_empty() => order_by,
-            _ => unsupported("LISTAGG without its nonempty WITHIN GROUP ordering"),
+            _ => {
+                return Err(unsupported(
+                    "LISTAGG without its nonempty WITHIN GROUP ordering",
+                ));
+            }
         };
         if overflow_error && (filler != "..." || show_count) {
-            unsupported("LISTAGG ERROR carrying non-default filler/count facts");
+            return Err(unsupported(
+                "LISTAGG ERROR carrying non-default filler/count facts",
+            ));
         }
 
+        let parameter_start = self.parameter_events.len();
         self.identifier(&value.name.parts[0]);
         self.character('(');
         if value.distinct {
             self.text("DISTINCT ");
         }
-        self.expression(&value.arguments[0].value);
+        self.expression(&value.arguments[0].value)?;
+        let value_end = self.parameter_events.len();
         self.text(", ");
         self.string(separator);
         if overflow_error {
@@ -189,35 +216,53 @@ impl Writer {
             });
         }
         self.text(") WITHIN GROUP (");
-        self.order_by(order_by);
+        self.order_by(order_by)?;
         self.character(')');
+        let order_end = self.parameter_events.len();
         if let Some(filter) = &value.filter {
             self.text(" FILTER (WHERE ");
-            self.expression(filter);
+            self.expression(filter)?;
             self.character(')');
         }
+        let filter_end = self.parameter_events.len();
         if let Some(window) = &value.window {
             self.text(" OVER ");
-            self.window(window);
+            self.window(window)?;
         }
+        let end = self.parameter_events.len();
+        self.reorder_parameter_events(
+            parameter_start,
+            &[
+                filter_end..end,
+                value_end..order_end,
+                parameter_start..value_end,
+                order_end..filter_end,
+            ],
+            value.span,
+        )?;
+        Ok(())
     }
 }
 
-fn listagg_string(value: &Expr) -> &str {
+fn listagg_string(value: &Expr) -> Result<&str, PrintError> {
     match value {
         Expr::Literal(Literal {
             kind: LiteralKind::String(value),
             ..
-        }) => value,
-        _ => unsupported("a LISTAGG constructor string slot with another expression kind"),
+        }) => Ok(value),
+        _ => Err(unsupported(
+            "a LISTAGG constructor string slot with another expression kind",
+        )),
     }
 }
-fn listagg_boolean(value: &Expr) -> bool {
+fn listagg_boolean(value: &Expr) -> Result<bool, PrintError> {
     match value {
         Expr::Literal(Literal {
             kind: LiteralKind::Boolean(value),
             ..
-        }) => *value,
-        _ => unsupported("a LISTAGG constructor Boolean slot with another expression kind"),
+        }) => Ok(*value),
+        _ => Err(unsupported(
+            "a LISTAGG constructor Boolean slot with another expression kind",
+        )),
     }
 }
