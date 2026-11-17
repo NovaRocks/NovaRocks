@@ -19,7 +19,6 @@
 //! Failure drops every partially revised builder and journal. No intermediate
 //! graph, source owner, output contract or package is published.
 use super::*;
-use crate::binding::SqlResultConstraintOrigin;
 use novarocks_physical_plan::{NullabilityRebindError, PhysicalCallBinding, PhysicalCallSite};
 
 impl From<NullabilityRebindError> for ContractLoweringError {
@@ -87,138 +86,9 @@ impl ContractLoweringVisitor<'_> {
         binding: &SqlFunctionBinding,
         arguments: &[novarocks_functions::FunctionArgument],
     ) -> Result<Option<novarocks_functions::FunctionValueType>, ContractLoweringError> {
-        self.work.step()?;
-        match binding.result_constraint_origin() {
-            SqlResultConstraintOrigin::Unconstrained => {
-                if binding.result_constraint().is_some() {
-                    return Err(invalid("unconstrained source carries a result constraint"));
-                }
-                Ok(None)
-            }
-            SqlResultConstraintOrigin::EmptyArrayLiteral => {
-                if !arguments.is_empty() {
-                    return Err(invalid("empty-array result constraint acquired arguments"));
-                }
-                Ok(binding.result_constraint().cloned())
-            }
-            SqlResultConstraintOrigin::ValueDomainConversion { final_target } => {
-                let [novarocks_functions::FunctionArgument::Value { value_type, .. }] = arguments
-                else {
-                    return Err(invalid(
-                        "conversion result constraint lacks one actual value channel",
-                    ));
-                };
-                self.work.flush()?;
-                let mut target = final_target.clone();
-                self.work.step()?;
-                self.work.flush()?;
-                target = target
-                    .with_nullable(target.nullable() || (value_type.nullable()))
-                    .expect("validated root NULL contract");
-                novarocks_functions::builtin::value_conversion::conversion_intermediate_type(
-                    value_type, &target,
-                )
-                .map_err(|error| ContractLoweringError::InvalidFunctionBinding {
-                    detail: error.to_string(),
-                })?
-                .ok_or_else(|| invalid("conversion source lacks its admitted intermediate result"))
-                .map(Some)
-            }
-        }
+        super::scalar_nullability::current_constraint(binding, arguments, &mut self.work)
     }
-    fn rebind_call_entry(
-        &mut self,
-        fragment: FragmentId,
-        node: NodeId,
-        expression: ExprId,
-    ) -> Result<bool, ContractLoweringError> {
-        self.work.flush()?;
-        let mut entry = self
-            .call_sources
-            .expression_entries
-            .remove(&ScalarDefinitionAddress::new(
-                ScalarSourceSite::Node { fragment, node },
-                expression,
-            ))
-            .ok_or_else(|| invalid("call rebind lacks its original source entry"))?;
-        let old = self
-            .construction_expression(fragment, node, expression)?
-            .clone();
-        self.work.flush()?;
-        validate_expression_source_entry_observed(
-            &entry,
-            ScalarUnitOwner::Node(node),
-            &old,
-            &mut self.work,
-        )?;
-        self.work.flush()?;
-        let projected = project_emitted_call_arguments_observed(
-            EmittedOperationalCall {
-                expressions: super::super::unit_source::UnitDefinitions::from_draft(
-                    &self.fragments[&fragment],
-                    node,
-                ),
-                pools: self.constant_emission.pools(),
-                owner: entry.owner,
-                lambda_scope: entry.lambda_scope,
-                kind: Some(entry.kind),
-                captured: CapturedOperationalSource::call(entry.captured.captured()),
-                derived: match &entry.captured {
-                    LoweredExpressionLogicalSource::DerivedVariant(source) => Some(source.as_ref()),
-                    _ => None,
-                },
-                arguments: &entry.arguments,
-                channels: &entry.channels,
-            },
-            self.control,
-        )
-        .map_err(ContractLoweringError::from);
-        let arguments = self.completed_specialization_result(projected)?;
-        let binding = entry.captured.captured().binding();
-        let constraint = self.current_constraint(binding, &arguments)?;
-        let logical_count = entry.captured.captured().request().logical_argument_count;
-        let selected = self.select_canonical_request_with_constraint(
-            binding,
-            logical_count,
-            &arguments,
-            constraint.as_ref(),
-        )?;
-        let novarocks_functions::FunctionResultType::Scalar(result) = &selected.result_type else {
-            return Err(invalid("expression rebind acquired a relation result"));
-        };
-        let revised = bound_function_from_selection(binding.resolved(), &selected, result);
-        self.work.flush()?;
-        let changed = call_binding(&old.kind)
-            .ok_or_else(|| invalid("call rebind has no actual signature"))?
-            != &revised;
-        self.work.step()?;
-        self.work.flush()?;
-        match &old.kind {
-            ContractExprKind::FunctionCall { function, .. } => self
-                .fragments
-                .get_mut(&fragment)
-                .expect("checked above")
-                .unit(node)?
-                .types_mut()
-                .scalar_signature(expression, function, revised, &mut self.work)?,
-            _ => return Err(invalid("call rebind changed its actual lifecycle")),
-        }
-        self.work.flush()?;
-        entry.canonical_operational = Some(Arc::new(CanonicalCallOperationalRequest {
-            binding: binding.clone(),
-            arguments,
-            logical_count,
-            selected,
-            result_constraint: constraint,
-        }));
-        self.work.step()?;
-        self.call_sources.expression_entries.insert(
-            ScalarDefinitionAddress::new(ScalarSourceSite::Node { fragment, node }, expression),
-            entry,
-        );
-        self.work.step()?;
-        Ok(changed)
-    }
+
     fn rebind_window_entry(
         &mut self,
         fragment: FragmentId,
@@ -475,119 +345,12 @@ impl ContractLoweringVisitor<'_> {
                         continue;
                     }
                 };
-                self.work.flush()?;
-                let old = self.construction_expression(fragment, node, id)?.clone();
-                self.work.step()?;
-                self.work.flush()?;
-                let mut operands = Vec::new();
-                collect_operand_expressions(&old.kind, &mut operands);
-                self.work.flush()?;
-                let mut dependency_changed = false;
-                for &operand in operands.iter() {
-                    self.work.step()?;
-                    dependency_changed |= dirty_expressions.contains(&(fragment, node, operand));
-                }
-                dependency_changed |= match &old.kind {
-                    ContractExprKind::Value(value) => dirty_values.contains(&(fragment, *value)),
-                    ContractExprKind::Lambda { body, .. } => {
-                        dirty_expressions.contains(&(fragment, node, *body))
-                    }
-                    ContractExprKind::FunctionCall { args, .. } => {
-                        let mut dirty = false;
-                        for &arg in args.iter() {
-                            self.work.step()?;
-                            dirty |= dirty_expressions.contains(&(fragment, node, arg));
-                        }
-                        dirty
-                    }
-                    _ => false,
-                };
-                if matches!(&old.kind, ContractExprKind::FunctionCall { .. }) && dependency_changed
-                {
-                    let contract_changed = self.rebind_call_entry(fragment, node, id)?;
-                    if contract_changed {
-                        dirty_expressions.insert((fragment, node, id));
-                        self.work.step()?;
-                        changed = true;
-                    }
-                    continue;
-                }
-                let revised = match &old.kind {
-                    ContractExprKind::Unary {
-                        op: UnaryOperator::Minus,
-                        expr,
-                    } => novarocks_functions::native_negate_computed_result_type(
-                        &self.construction_expression(fragment, node, *expr)?.ty,
-                        self.control,
-                    )
-                    .map_err(|error| {
-                        if let Some(cause) = error.control_error() {
-                            ContractLoweringError::Control(cause)
-                        } else {
-                            ContractLoweringError::InvalidFunctionBinding {
-                                detail: format!("native negate preparation: {error:?}"),
-                            }
-                        }
-                    })?,
-                    ContractExprKind::Cast {
-                        expr,
-                        target,
-                        allow_throw_exception,
-                        decimal_overflow_policy,
-                    } => {
-                        // The same statement owner authored this occurrence's reference.
-                        // Read its frozen boolean, never an ambient setting or default.
-                        if *allow_throw_exception != self.root_allow_throw_reference() {
-                            return Err(invalid(
-                                "cast seed differs from its statement semantic source",
-                            ));
-                        }
-                        let input = &self.construction_expression(fragment, node, *expr)?.ty;
-                        let mut revised = old.ty.clone();
-                        revised = revised.with_nullable(revised.nullable() || (input.nullable()
-                            || novarocks_functions::carrier_cast_can_produce_null_with_policy(
-                                input.data_type(),
-                                target,
-                                *decimal_overflow_policy,
-                                self.root_allow_throw_exception,
-                            ))).expect("validated root NULL contract");
-                        revised
-                    }
-                    ContractExprKind::Value(value) if dependency_changed => published_value_type(
-                        &old.ty,
-                        &self.construction_value(fragment, *value)?.ty,
-                    ),
-                    ContractExprKind::Lambda { body, .. } if dependency_changed => {
-                        published_value_type(
-                            &old.ty,
-                            &self.construction_expression(fragment, node, *body)?.ty,
-                        )
-                    }
-                    _ if dependency_changed && kind_follows_operand_nullability(&old.kind) => {
-                        let mut revised = old.ty.clone();
-                        for operand in operands {
-                            self.work.step()?;
-                            revised = revised
-                                .with_nullable(
-                                    revised.nullable()
-                                        || (self
-                                            .construction_expression(fragment, node, operand)?
-                                            .ty
-                                            .nullable()),
-                                )
-                                .expect("validated root NULL contract");
-                        }
-                        revised
-                    }
-                    _ => old.ty.clone(),
-                };
-                if revised.nullable() != old.ty.nullable() {
-                    self.fragments
-                        .get_mut(&fragment)
-                        .expect("checked above")
-                        .unit(node)?
-                        .types_mut()
-                        .expression_type(id, &old.ty, revised, &mut self.work)?;
+                let contract_changed = self.scalar_emission_at(fragment, node).rebind_definition(
+                    id,
+                    |definition| dirty_expressions.contains(&(fragment, node, definition)),
+                    |value| dirty_values.contains(&(fragment, value)),
+                )?;
+                if contract_changed {
                     dirty_expressions.insert((fragment, node, id));
                     self.work.step()?;
                     changed = true;
@@ -741,12 +504,6 @@ impl ContractLoweringVisitor<'_> {
     }
 }
 
-fn call_binding(kind: &ContractExprKind) -> Option<&BoundFunction> {
-    match kind {
-        ContractExprKind::FunctionCall { function, .. } => Some(function),
-        _ => None,
-    }
-}
 impl ContractLoweringVisitor<'_> {
     fn rebind_relational_aggregates(
         &mut self,

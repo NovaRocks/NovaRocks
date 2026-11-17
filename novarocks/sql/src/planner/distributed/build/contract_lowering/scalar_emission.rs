@@ -19,6 +19,78 @@
 //! Relational topology and publication remain with ContractLoweringVisitor.
 use super::*;
 
+/// A short loan of the original fragment-local construction-order slot.
+/// Taking the Entry does not install a vacant value before the reserve gate.
+pub(super) struct NodeScalarOrder<'emission> {
+    slot: Option<
+        std::collections::btree_map::Entry<'emission, FragmentId, NullableConstructionOrder>,
+    >,
+    value: Option<&'emission mut NullableConstructionOrder>,
+}
+impl<'emission> NodeScalarOrder<'emission> {
+    pub(super) fn new(
+        slot: std::collections::btree_map::Entry<'emission, FragmentId, NullableConstructionOrder>,
+    ) -> Self {
+        Self {
+            slot: Some(slot),
+            value: None,
+        }
+    }
+    fn definition_count(&self) -> usize {
+        if let Some(value) = self.value.as_deref() {
+            return value.definitions;
+        }
+        match self
+            .slot
+            .as_ref()
+            .expect("the actual order slot remains borrowed")
+        {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.get().definitions,
+            std::collections::btree_map::Entry::Vacant(_) => 0,
+        }
+    }
+    fn get_mut(&mut self) -> &mut NullableConstructionOrder {
+        if self.value.is_none() {
+            let slot = self
+                .slot
+                .take()
+                .expect("the actual order slot remains borrowed");
+            self.value = Some(slot.or_default());
+        }
+        self.value
+            .as_deref_mut()
+            .expect("the original order was installed")
+    }
+}
+
+/// One actual node, its original fragment and its original shared order.
+pub(super) struct NodeScalarStorage<'emission> {
+    pub(super) fragment_id: FragmentId,
+    pub(super) node: NodeId,
+    pub(super) fragment: &'emission mut FragmentBuilder,
+    pub(super) order: NodeScalarOrder<'emission>,
+}
+
+impl NodeScalarStorage<'_> {
+    pub(super) fn definitions(&self) -> super::super::unit_source::UnitDefinitions<'_> {
+        super::super::unit_source::UnitDefinitions::from_draft(self.fragment, self.node)
+    }
+    pub(super) fn source_site(&self) -> ScalarSourceSite {
+        ScalarSourceSite::Node {
+            fragment: self.fragment_id,
+            node: self.node,
+        }
+    }
+    pub(super) fn current_value_type(&self, value: ValueId) -> Option<&ValueType> {
+        self.fragment.value(value).map(|value| &value.ty)
+    }
+    pub(super) fn type_editor(
+        &mut self,
+    ) -> Result<novarocks_expression_contract::UnitTypeEditor<'_>, ContractLoweringError> {
+        Ok(self.fragment.unit(self.node)?.types_mut())
+    }
+}
+
 pub(super) struct ScalarEmission<'emission, 'control> {
     pub(super) root_allow_throw_exception: bool,
     pub(super) constant_policy: novarocks_constant_contract::ConstantPolicy,
@@ -26,43 +98,22 @@ pub(super) struct ScalarEmission<'emission, 'control> {
     pub(super) functions: &'emission Arc<dyn crate::compiler::SqlFunctionCatalog>,
     pub(super) control: &'control dyn PureCompileControl,
     pub(super) work: &'emission mut CompileCheckpoints<'control>,
-    pub(super) current_fragment: FragmentId,
     pub(super) constant_emission: &'emission mut constant_emission::SqlConstantEmission,
     pub(super) lambda_scope: &'emission mut Vec<LoweringLambdaScope>,
-    pub(super) fragments: &'emission mut BTreeMap<FragmentId, FragmentBuilder>,
-    pub(super) definition_order: &'emission mut BTreeMap<FragmentId, NullableConstructionOrder>,
+    pub(super) storage: NodeScalarStorage<'emission>,
     pub(super) call_sources: &'emission mut SqlLogicalSourceJournal,
 }
 impl ScalarEmission<'_, '_> {
     fn fragment_mut(&mut self) -> &mut FragmentBuilder {
-        self.fragments
-            .get_mut(&self.current_fragment)
-            .expect("the current fragment is allocated before lowering")
+        self.storage.fragment
     }
 
     pub(super) fn root_allow_throw_reference(&mut self) -> SemanticParameterRef {
-        *self.root_allow_throw_exception_used = true;
-        SemanticParameterRef {
-            id: SemanticParameterId::new(0),
-            expected_key: SemanticParameterKey::AllowThrowException,
-        }
-    }
-
-    pub(super) fn value_declared_type_in(
-        &mut self,
-        fragment: FragmentId,
-        value: ValueId,
-    ) -> Result<ValueType, ContractLoweringError> {
-        self.fragments
-            .get_mut(&fragment)
-            .and_then(|fragment| fragment.value(value))
-            .map(|definition| definition.ty.clone())
-            .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))
+        root_allow_throw_reference(self.root_allow_throw_exception_used)
     }
 
     pub(super) fn lower_derived_variant_expression(
         &mut self,
-        owner: NodeId,
         source_value: ValueId,
         source: &Arc<crate::common::variant_source::DerivedVariantSource>,
         expected_result: &ValueType,
@@ -70,14 +121,12 @@ impl ScalarEmission<'_, '_> {
         let binding = source.captured().binding().resolved();
         let source_type = self.value_declared_type(source_value)?;
         let source_expression =
-            self.add_scoped_expression(owner, source_type, ContractExprKind::Value(source_value))?;
+            self.add_scoped_expression(source_type, ContractExprKind::Value(source_value))?;
         let path_expression = self.lower_constant_expression(
-            owner,
             source.canonical_path(),
             ValueType::new(DataType::Utf8, false),
         )?;
         let type_expression = self.lower_constant_expression(
-            owner,
             source.type_literal(),
             ValueType::new(DataType::Utf8, false),
         )?;
@@ -102,7 +151,6 @@ impl ScalarEmission<'_, '_> {
         self.work.step()?;
         let arguments = [source_expression, path_expression, type_expression];
         let canonical = self.author_canonical_call_selection(
-            owner,
             source.captured(),
             Some(SqlExpressionCallKind::DerivedVariant),
             Some(source.as_ref()),
@@ -128,7 +176,6 @@ impl ScalarEmission<'_, '_> {
         self.work.step()?;
         self.work.flush()?;
         let expression = self.add_scoped_expression(
-            owner,
             result_type.clone(),
             ContractExprKind::FunctionCall {
                 function,
@@ -140,7 +187,6 @@ impl ScalarEmission<'_, '_> {
         self.work.step()?;
         self.work.flush()?;
         self.record_expression_source_with_data(
-            owner,
             expression,
             LoweredExpressionLogicalSource::DerivedVariant(source),
             SqlExpressionCallKind::DerivedVariant,
@@ -152,7 +198,6 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn lower_boolean_connective(
         &mut self,
-        owner: NodeId,
         root: &TypedExpr,
         connective: BinOp,
         visible: &BTreeMap<ColumnId, ValueId>,
@@ -172,17 +217,18 @@ impl ScalarEmission<'_, '_> {
         }
         let mut args = Vec::with_capacity(operands.len());
         for operand in operands {
-            args.push(self.lower_expression(owner, operand, visible)?);
+            args.push(self.lower_expression(operand, visible)?);
         }
         Ok(args.into_boxed_slice())
     }
 
     pub(super) fn local_derived_value_expression(
         &mut self,
-        owner: NodeId,
         value: ValueId,
     ) -> Result<Option<ExprId>, ContractLoweringError> {
-        let fragment = &self.fragments[&self.current_fragment];
+        let owner = self.storage.node;
+
+        let fragment = &*self.storage.fragment;
         let definition = fragment
             .value(value)
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))?;
@@ -215,7 +261,7 @@ impl ScalarEmission<'_, '_> {
             .expression_entries
             .get(&ScalarDefinitionAddress::new(
                 ScalarSourceSite::Node {
-                    fragment: self.current_fragment,
+                    fragment: self.storage.fragment_id,
                     node: owner,
                 },
                 expression,
@@ -246,17 +292,16 @@ impl ScalarEmission<'_, '_> {
         let source = Arc::clone(source);
         let expected = definition.ty.clone();
         self.work.step()?;
-        self.lower_derived_variant_expression(owner, raw, &source, &expected)
+        self.lower_derived_variant_expression(raw, &source, &expected)
             .map(Some)
     }
 
     pub(super) fn lower_expression(
         &mut self,
-        owner: NodeId,
         expression: &TypedExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<ExprId, ContractLoweringError> {
-        let result = self.lower_expression_inner(owner, expression, visible);
+        let result = self.lower_expression_inner(expression, visible);
         if matches!(
             &result,
             Err(ContractLoweringError::Control(_)
@@ -276,13 +321,14 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn lower_expression_inner(
         &mut self,
-        owner: NodeId,
         expression: &TypedExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<ExprId, ContractLoweringError> {
+        let owner = self.storage.node;
+
         self.work.step()?;
         if let ExprKind::Literal(literal) = &expression.kind {
-            return self.lower_literal_expression(owner, literal, expression);
+            return self.lower_literal_expression(literal, expression);
         }
         let mut ty = expression_type(expression);
         let mut captured_call = None;
@@ -297,19 +343,19 @@ impl ScalarEmission<'_, '_> {
                     .get(column_id)
                     .copied()
                     .ok_or(ContractLoweringError::UnknownColumnReference(*column_id))?;
-                if let Some(definition) = self.local_derived_value_expression(owner, value)? {
+                if let Some(definition) = self.local_derived_value_expression(value)? {
                     return Ok(definition);
                 }
                 ty = self.value_declared_type(value)?;
                 ContractExprKind::Value(value)
             }
             ExprKind::Literal(_) => unreachable!("literal expressions return before dispatch"),
-            ExprKind::Constant(value) => return self.lower_constant_expression(owner, value, ty),
+            ExprKind::Constant(value) => return self.lower_constant_expression(value, ty),
             ExprKind::BinaryOp {
                 op: op @ (BinOp::And | BinOp::Or),
                 ..
             } => {
-                let args = self.lower_boolean_connective(owner, expression, *op, visible)?;
+                let args = self.lower_boolean_connective(expression, *op, visible)?;
                 if matches!(op, BinOp::And) {
                     ContractExprKind::Conjunction { args }
                 } else {
@@ -322,8 +368,8 @@ impl ScalarEmission<'_, '_> {
                 right,
                 decimal_overflow_policy,
             } => {
-                let lowered_left = self.lower_expression(owner, left, visible)?;
-                let lowered_right = self.lower_expression(owner, right, visible)?;
+                let lowered_left = self.lower_expression(left, visible)?;
+                let lowered_right = self.lower_expression(right, visible)?;
                 // A comparison answers about one type. Its operands were
                 // reconciled while the statement was analyzed -- an untyped
                 // NULL, a narrower integer -- and the plan states the
@@ -331,12 +377,12 @@ impl ScalarEmission<'_, '_> {
                 // reader has to reconcile again. Arithmetic keeps its own
                 // operands: its result type is derived from the pair.
                 let (lowered_left, lowered_right) = if is_comparison_operator(*op) {
-                    let left_type = self.expression_value_type(owner, lowered_left)?;
-                    let right_type = self.expression_value_type(owner, lowered_right)?;
+                    let left_type = self.expression_value_type(lowered_left)?;
+                    let right_type = self.expression_value_type(lowered_right)?;
                     let compared = self.common_comparison_value_type(&left_type, &right_type)?;
                     (
-                        self.cast_expression_to(owner, lowered_left, &compared)?,
-                        self.cast_expression_to(owner, lowered_right, &compared)?,
+                        self.cast_expression_to(lowered_left, &compared)?,
+                        self.cast_expression_to(lowered_right, &compared)?,
                     )
                 } else {
                     (lowered_left, lowered_right)
@@ -355,23 +401,17 @@ impl ScalarEmission<'_, '_> {
             }
             ExprKind::UnaryOp { op, expr } => ContractExprKind::Unary {
                 op: lower_unary_operator(*op),
-                expr: self.lower_expression(owner, expr, visible)?,
+                expr: self.lower_expression(expr, visible)?,
             },
             ExprKind::Cast {
                 expr,
                 decimal_overflow_policy,
                 ..
             } => {
-                return self.lower_expression_as(
-                    owner,
-                    expr,
-                    visible,
-                    &ty,
-                    *decimal_overflow_policy,
-                );
+                return self.lower_expression_as(expr, visible, &ty, *decimal_overflow_policy);
             }
             ExprKind::IsNull { expr, negated } => ContractExprKind::IsNull {
-                expr: self.lower_expression(owner, expr, visible)?,
+                expr: self.lower_expression(expr, visible)?,
                 negated: *negated,
             },
             ExprKind::InList {
@@ -384,22 +424,22 @@ impl ScalarEmission<'_, '_> {
                 // run time; the contract states the comparison it performs,
                 // so the widening is written down here -- the same way a
                 // range test and a comparison operator already do.
-                let input = self.lower_expression(owner, expr, visible)?;
+                let input = self.lower_expression(expr, visible)?;
                 let candidates = list
                     .iter()
-                    .map(|item| self.lower_expression(owner, item, visible))
+                    .map(|item| self.lower_expression(item, visible))
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut compared = self.expression_value_type(owner, input)?;
+                let mut compared = self.expression_value_type(input)?;
                 for candidate in &candidates {
-                    let other = self.expression_value_type(owner, *candidate)?;
+                    let other = self.expression_value_type(*candidate)?;
                     compared = self.common_comparison_value_type(&compared, &other)?;
                 }
                 let list = candidates
                     .into_iter()
-                    .map(|candidate| self.cast_expression_to(owner, candidate, &compared))
+                    .map(|candidate| self.cast_expression_to(candidate, &compared))
                     .collect::<Result<Vec<_>, _>>()?;
                 ContractExprKind::InList {
-                    expr: self.cast_expression_to(owner, input, &compared)?,
+                    expr: self.cast_expression_to(input, &compared)?,
                     list: list.into_boxed_slice(),
                     negated: *negated,
                 }
@@ -414,18 +454,18 @@ impl ScalarEmission<'_, '_> {
                 // three are compared as one type. The engine widens them at
                 // run time; the contract states the comparison it performs,
                 // so the widening is written down here.
-                let input = self.lower_expression(owner, expr, visible)?;
-                let low = self.lower_expression(owner, low, visible)?;
-                let high = self.lower_expression(owner, high, visible)?;
-                let mut compared = self.expression_value_type(owner, input)?;
+                let input = self.lower_expression(expr, visible)?;
+                let low = self.lower_expression(low, visible)?;
+                let high = self.lower_expression(high, visible)?;
+                let mut compared = self.expression_value_type(input)?;
                 for operand in [low, high] {
-                    let other = self.expression_value_type(owner, operand)?;
+                    let other = self.expression_value_type(operand)?;
                     compared = self.common_comparison_value_type(&compared, &other)?;
                 }
                 ContractExprKind::Between {
-                    expr: self.cast_expression_to(owner, input, &compared)?,
-                    low: self.cast_expression_to(owner, low, &compared)?,
-                    high: self.cast_expression_to(owner, high, &compared)?,
+                    expr: self.cast_expression_to(input, &compared)?,
+                    low: self.cast_expression_to(low, &compared)?,
+                    high: self.cast_expression_to(high, &compared)?,
                     negated: *negated,
                 }
             }
@@ -434,8 +474,8 @@ impl ScalarEmission<'_, '_> {
                 pattern,
                 negated,
             } => ContractExprKind::Like {
-                expr: self.lower_expression(owner, expr, visible)?,
-                pattern: self.lower_expression(owner, pattern, visible)?,
+                expr: self.lower_expression(expr, visible)?,
+                pattern: self.lower_expression(pattern, visible)?,
                 negated: *negated,
             },
             ExprKind::Case {
@@ -450,25 +490,25 @@ impl ScalarEmission<'_, '_> {
                 // than leaving each branch its own type.
                 let mut operand = operand
                     .as_deref()
-                    .map(|item| self.lower_expression(owner, item, visible))
+                    .map(|item| self.lower_expression(item, visible))
                     .transpose()?;
                 let mut whens = Vec::with_capacity(when_then.len());
                 for (when, _) in when_then {
-                    whens.push(self.lower_expression(owner, when, visible)?);
+                    whens.push(self.lower_expression(when, visible)?);
                 }
                 // A simple CASE compares its operand against every label, so
                 // the plan states the one type it compares them in the same
                 // way a comparison operator does -- an INT operand against a
                 // BIGINT label is one comparison, not two types.
                 if let Some(subject) = operand {
-                    let mut compared = self.expression_value_type(owner, subject)?;
+                    let mut compared = self.expression_value_type(subject)?;
                     for when in &whens {
-                        let when_type = self.expression_value_type(owner, *when)?;
+                        let when_type = self.expression_value_type(*when)?;
                         compared = self.common_comparison_value_type(&compared, &when_type)?;
                     }
-                    operand = Some(self.cast_expression_to(owner, subject, &compared)?);
+                    operand = Some(self.cast_expression_to(subject, &compared)?);
                     for when in &mut whens {
-                        *when = self.cast_expression_to(owner, *when, &compared)?;
+                        *when = self.cast_expression_to(*when, &compared)?;
                     }
                 }
                 let mut branches = Vec::with_capacity(when_then.len());
@@ -476,7 +516,6 @@ impl ScalarEmission<'_, '_> {
                     branches.push((
                         when,
                         self.lower_expression_as(
-                            owner,
                             then,
                             visible,
                             &ty,
@@ -486,7 +525,6 @@ impl ScalarEmission<'_, '_> {
                 }
                 let else_expr = match else_expr.as_deref() {
                     Some(item) => Some(self.lower_expression_as(
-                        owner,
                         item,
                         visible,
                         &ty,
@@ -505,7 +543,7 @@ impl ScalarEmission<'_, '_> {
                 value,
                 negated,
             } => ContractExprKind::IsTruthValue {
-                expr: self.lower_expression(owner, expr, visible)?,
+                expr: self.lower_expression(expr, visible)?,
                 value: *value,
                 negated: *negated,
             },
@@ -593,7 +631,7 @@ impl ScalarEmission<'_, '_> {
                     args.iter().zip(argument_types.iter()).enumerate()
                 {
                     let lowered = self.lower_captured_scalar_argument(
-                        owner, argument, ordinal, &captured, visible, expected,
+                        argument, ordinal, &captured, visible, expected,
                     )?;
                     lowered_args.push(lowered.expression);
                     self.work.step()?;
@@ -608,7 +646,6 @@ impl ScalarEmission<'_, '_> {
                 let channels = channels.into_boxed_slice();
                 self.work.step()?;
                 let canonical = self.author_canonical_call_selection(
-                    owner,
                     &captured,
                     Some(SqlExpressionCallKind::Scalar),
                     None,
@@ -655,7 +692,7 @@ impl ScalarEmission<'_, '_> {
             ExprKind::LambdaFunction { params, body } => {
                 // The lambda's identity exists before its body, because every
                 // parameter reference inside names it.
-                let lambda = self.reserve_definition(owner)?;
+                let lambda = self.reserve_definition()?;
                 // A parameter's type is the plan's, the same way every other
                 // type it states is: a provider's decoration on a nested
                 // field would make the declaration and the references to it
@@ -670,10 +707,10 @@ impl ScalarEmission<'_, '_> {
                     parameter_slots: params.iter().map(|param| param.slot_id).collect(),
                     parameter_types: parameter_types.clone(),
                 });
-                let body_result = self.lower_expression(owner, body, visible);
+                let body_result = self.lower_expression(body, visible);
                 self.lambda_scope.pop();
                 let body_id = body_result?;
-                let body_type = self.expression_value_type(owner, body_id)?;
+                let body_type = self.expression_value_type(body_id)?;
                 self.fragment_mut().unit(owner)?.insert(
                     lambda,
                     enclosing,
@@ -727,7 +764,7 @@ impl ScalarEmission<'_, '_> {
                     })?,
                 }
             }
-            ExprKind::Nested(inner) => return self.lower_expression(owner, inner, visible),
+            ExprKind::Nested(inner) => return self.lower_expression(inner, visible),
             other => {
                 return Err(ContractLoweringError::UnsupportedExpression {
                     kind: expression_kind_name(other),
@@ -743,7 +780,7 @@ impl ScalarEmission<'_, '_> {
             let mut operands = Vec::new();
             collect_operand_expressions(&kind, &mut operands);
             for operand in operands {
-                if self.expression_value_type(owner, operand)?.nullable() {
+                if self.expression_value_type(operand)?.nullable() {
                     ty = ty
                         .with_nullable(true)
                         .expect("validated root NULL contract");
@@ -751,10 +788,9 @@ impl ScalarEmission<'_, '_> {
                 }
             }
         }
-        let emitted = self.add_scoped_expression(owner, ty, kind)?;
+        let emitted = self.add_scoped_expression(ty, kind)?;
         if let Some((captured, channels, canonical)) = captured_call {
             self.record_expression_source(
-                owner,
                 emitted,
                 captured,
                 SqlExpressionCallKind::Scalar,
@@ -767,18 +803,19 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn author_canonical_call_selection(
         &mut self,
-        owner: NodeId,
         captured: &CapturedLogicalCallArguments,
         kind: Option<SqlExpressionCallKind>,
         derived: Option<&crate::common::variant_source::DerivedVariantSource>,
         arguments: &[ExprId],
         channels: &[LoweredOperationalChannel],
     ) -> Result<Arc<CanonicalCallOperationalRequest>, ContractLoweringError> {
+        let owner = self.storage.node;
+
         self.work.flush()?;
         let projection = project_emitted_call_arguments_observed(
             EmittedOperationalCall {
                 expressions: super::super::unit_source::UnitDefinitions::from_draft(
-                    &self.fragments[&self.current_fragment],
+                    &*self.storage.fragment,
                     owner,
                 ),
                 pools: self.constant_emission.pools(),
@@ -829,56 +866,25 @@ impl ScalarEmission<'_, '_> {
         logical_argument_count: usize,
         arguments: &[novarocks_functions::FunctionArgument],
     ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
-        self.select_canonical_request_with_constraint(
-            binding,
-            logical_argument_count,
-            arguments,
-            binding.result_constraint(),
-        )
-    }
-
-    pub(super) fn select_canonical_request_with_constraint(
-        &mut self,
-        binding: &SqlFunctionBinding,
-        logical_argument_count: usize,
-        arguments: &[novarocks_functions::FunctionArgument],
-        constraint: Option<&novarocks_functions::FunctionValueType>,
-    ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
-        self.work.flush()?;
-        let selection = crate::compiler::selected_scalar_call::canonical_scalar_request_observed(
-            self.functions.as_ref(),
-            binding,
-            logical_argument_count,
-            arguments,
-            constraint,
+        select_canonical_operational_request(
+            self.functions,
             self.control,
+            self.work,
+            binding,
+            logical_argument_count,
+            arguments,
         )
-        .map_err(|error| match error {
-            novarocks_functions::FunctionBindingError::Control(cause) => {
-                ContractLoweringError::Control(cause)
-            }
-            error => ContractLoweringError::InvalidFunctionBinding {
-                detail: format!("canonical call selection: {error}"),
-            },
-        });
-        self.completed_specialization_result(selection)
     }
 
     pub(super) fn completed_specialization_result<T>(
         &mut self,
         outcome: Result<T, ContractLoweringError>,
     ) -> Result<T, ContractLoweringError> {
-        if matches!(&outcome, Err(ContractLoweringError::Control(_))) {
-            return outcome;
-        }
-        self.work.step()?;
-        self.work.flush()?;
-        outcome
+        completed_specialization_result(self.work, outcome)
     }
 
     pub(super) fn record_expression_source(
         &mut self,
-        owner: NodeId,
         emitted: ExprId,
         captured: CapturedLogicalCallArguments,
         kind: SqlExpressionCallKind,
@@ -886,7 +892,6 @@ impl ScalarEmission<'_, '_> {
         canonical_operational: Option<Arc<CanonicalCallOperationalRequest>>,
     ) -> Result<(), ContractLoweringError> {
         self.record_expression_source_with_data(
-            owner,
             emitted,
             LoweredExpressionLogicalSource::Owned(captured),
             kind,
@@ -897,13 +902,14 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn record_expression_source_with_data(
         &mut self,
-        owner: NodeId,
         emitted: ExprId,
         captured: LoweredExpressionLogicalSource,
         kind: SqlExpressionCallKind,
         channels: Box<[LoweredOperationalChannel]>,
         canonical_operational: Option<Arc<CanonicalCallOperationalRequest>>,
     ) -> Result<(), ContractLoweringError> {
+        let owner = self.storage.node;
+
         self.work.flush()?;
         let mut arguments = Vec::new();
         arguments
@@ -912,7 +918,9 @@ impl ScalarEmission<'_, '_> {
         self.work.step()?;
         self.work.flush()?;
         let lambda_scope = self.lambda_scope.last().map(|scope| scope.lambda);
-        let source = self.fragments[&self.current_fragment]
+        let source = self
+            .storage
+            .fragment
             .construction_unit(owner)
             .and_then(|unit| unit.definition(emitted))
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))?;
@@ -953,7 +961,7 @@ impl ScalarEmission<'_, '_> {
         self.work.flush()?;
         let key = ScalarDefinitionAddress::new(
             ScalarSourceSite::Node {
-                fragment: self.current_fragment,
+                fragment: self.storage.fragment_id,
                 node: owner,
             },
             emitted,
@@ -985,7 +993,6 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn lower_captured_scalar_argument(
         &mut self,
-        owner: NodeId,
         argument: &TypedExpr,
         ordinal: usize,
         captured: &CapturedLogicalCallArguments,
@@ -999,7 +1006,7 @@ impl ScalarEmission<'_, '_> {
             expected,
         ) {
             let (expression, value) =
-                self.author_literal_expression_with_source(owner, &LiteralValue::Null, target)?;
+                self.author_literal_expression_with_source(&LiteralValue::Null, target)?;
             let channel = LoweredOperationalChannel {
                 expression,
                 role: SqlOperationalChannelRole::CanonicalNull { value },
@@ -1018,17 +1025,15 @@ impl ScalarEmission<'_, '_> {
                     detail: "literal scalar argument has no captured constant source".into(),
                 });
             };
-            let expression =
-                self.lower_constant_expression(owner, value, expression_type(argument))?;
+            let expression = self.lower_constant_expression(value, expression_type(argument))?;
             return self.original_emission_channel(expression, ordinal, captured);
         }
-        let expression = self.lower_bound_argument(owner, argument, visible, expected)?;
+        let expression = self.lower_bound_argument(argument, visible, expected)?;
         self.original_emission_channel(expression, ordinal, captured)
     }
 
     pub(super) fn lower_captured_unbound_argument(
         &mut self,
-        owner: NodeId,
         expression: &TypedExpr,
         ordinal: usize,
         captured: &CapturedLogicalCallArguments,
@@ -1049,11 +1054,10 @@ impl ScalarEmission<'_, '_> {
                     detail: "literal call channel has no captured constant source".into(),
                 });
             };
-            let emitted =
-                self.lower_constant_expression(owner, value, expression_type(expression))?;
+            let emitted = self.lower_constant_expression(value, expression_type(expression))?;
             return self.original_emission_channel(emitted, ordinal, captured);
         }
-        let emitted = self.lower_expression(owner, expression, visible)?;
+        let emitted = self.lower_expression(expression, visible)?;
         self.original_emission_channel(emitted, ordinal, captured)
     }
 
@@ -1063,57 +1067,20 @@ impl ScalarEmission<'_, '_> {
         ordinal: usize,
         captured: &CapturedLogicalCallArguments,
     ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
-        let argument = captured.request().arguments.get(ordinal);
-        self.work.step()?;
-        let role = match argument {
-            Some(novarocks_functions::FunctionArgument::Value { constant: None, .. }) => {
-                SqlOperationalChannelRole::ValueWithoutConstant
-            }
-            Some(novarocks_functions::FunctionArgument::Value {
-                constant: Some(_), ..
-            }) => SqlOperationalChannelRole::CapturedConstant,
-            Some(novarocks_functions::FunctionArgument::Lambda { .. }) => {
-                SqlOperationalChannelRole::Lambda
-            }
-            None => {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail: "emitted call channel has no original request occurrence".into(),
-                });
-            }
-        };
-        self.work.step()?;
-        Ok(LoweredOperationalChannel { expression, role })
+        original_emission_channel(self.work, expression, ordinal, captured)
     }
 
     pub(super) fn reserve_call_channels(
         &mut self,
         count: usize,
     ) -> Result<Vec<LoweredOperationalChannel>, ContractLoweringError> {
-        if count > novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS {
-            return Err(CompileControlError::ResourceExhausted.into());
-        }
-        std::alloc::Layout::array::<LoweredOperationalChannel>(count)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
-        self.work.step()?;
-        self.work.flush()?;
-        let mut channels = Vec::new();
-        channels
-            .try_reserve_exact(count)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
-        self.work.step()?;
-        self.work.flush()?;
-        Ok(channels)
+        reserve_call_channels(self.work, count)
     }
 
-    pub(super) fn reserve_definition(
-        &mut self,
-        owner: NodeId,
-    ) -> Result<ExprId, ContractLoweringError> {
-        let fragment = self.current_fragment;
-        let count = self
-            .definition_order
-            .get(&fragment)
-            .map_or(0, |order| order.definitions);
+    pub(super) fn reserve_definition(&mut self) -> Result<ExprId, ContractLoweringError> {
+        let owner = self.storage.node;
+
+        let count = self.storage.order.definition_count();
         if count == novarocks_physical_plan::PlanLimits::FROZEN.fragment_expressions {
             return Err(novarocks_expression_contract::UnitError::Resource(
                 "fragment expression definition limit exceeded",
@@ -1123,18 +1090,15 @@ impl ScalarEmission<'_, '_> {
         // This scratch only remembers the original construction sequence.
         // It does not assign a global expression ID or grant source access.
         self.work.flush()?;
-        self.definition_order
-            .entry(fragment)
-            .or_default()
+        self.storage
+            .order
+            .get_mut()
             .events
             .try_reserve(1)
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         self.work.flush()?;
         let id = self.fragment_mut().unit(owner)?.reserve()?;
-        let order = self
-            .definition_order
-            .get_mut(&fragment)
-            .expect("reserved original construction journal");
+        let order = self.storage.order.get_mut();
         order.definitions += 1;
         order.events.push(NullableEmission::Definition {
             node: owner,
@@ -1146,12 +1110,13 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn insert_definition(
         &mut self,
-        owner: NodeId,
         scope: Option<ExprId>,
         ty: ValueType,
         kind: ContractExprKind,
     ) -> Result<ExprId, ContractLoweringError> {
-        let id = self.reserve_definition(owner)?;
+        let owner = self.storage.node;
+
+        let id = self.reserve_definition()?;
         self.fragment_mut()
             .unit(owner)?
             .insert(id, scope, ty, kind)?;
@@ -1160,20 +1125,20 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn add_unscoped_expression(
         &mut self,
-        owner: NodeId,
         ty: ValueType,
         kind: ContractExprKind,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.insert_definition(owner, None, ty, kind)
+        self.insert_definition(None, ty, kind)
     }
 
     pub(super) fn root_definition(
         &mut self,
-        owner: NodeId,
         definition: ExprId,
         demand: novarocks_type_contract::EvaluationDemand,
         scope: novarocks_expression_contract::RootScope,
     ) -> Result<novarocks_expression_contract::RootOrdinal, ContractLoweringError> {
+        let owner = self.storage.node;
+
         Ok(self
             .fragment_mut()
             .unit(owner)?
@@ -1182,17 +1147,15 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn add_scoped_expression(
         &mut self,
-        owner: NodeId,
         ty: ValueType,
         kind: ContractExprKind,
     ) -> Result<ExprId, ContractLoweringError> {
         let scope = self.lambda_scope.last().map(|scope| scope.lambda);
-        self.insert_definition(owner, scope, ty, kind)
+        self.insert_definition(scope, ty, kind)
     }
 
     pub(super) fn lower_bound_argument(
         &mut self,
-        owner: NodeId,
         argument: &TypedExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
         expected: &FunctionArgumentType,
@@ -1202,14 +1165,13 @@ impl ScalarEmission<'_, '_> {
             && *expected.data_type() != DataType::Null
         {
             return self.author_literal_expression(
-                owner,
                 &LiteralValue::Null,
                 (expected.clone())
                     .with_nullable(true)
                     .expect("validated root NULL contract"),
             );
         }
-        self.lower_expression(owner, argument, visible)
+        self.lower_expression(argument, visible)
     }
 
     pub(super) fn value_declared_type(
@@ -1224,12 +1186,13 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn expression_value_type(
         &mut self,
-        owner: NodeId,
         expr: ExprId,
     ) -> Result<ValueType, ContractLoweringError> {
-        self.fragments
-            .get(&self.current_fragment)
-            .and_then(|fragment| fragment.construction_unit(owner))
+        let owner = self.storage.node;
+
+        self.storage
+            .fragment
+            .construction_unit(owner)
             .and_then(|unit| unit.definition(expr))
             .map(|expression| expression.ty.clone())
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))
@@ -1237,7 +1200,6 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn lower_expression_as(
         &mut self,
-        owner: NodeId,
         expression: &TypedExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
         target: &ValueType,
@@ -1250,13 +1212,13 @@ impl ScalarEmission<'_, '_> {
             target = target
                 .with_nullable(true)
                 .expect("validated root NULL contract");
-            return self.author_literal_expression(owner, &LiteralValue::Null, target);
+            return self.author_literal_expression(&LiteralValue::Null, target);
         }
-        let lowered = self.lower_expression(owner, expression, visible)?;
+        let lowered = self.lower_expression(expression, visible)?;
         // A carrier conversion preserves an actual source NULL, including a
         // value null-extended after analysis. Keep that fact before the CASE
         // or CAST owner publishes its final output type.
-        if self.expression_value_type(owner, lowered)?.nullable() && !target.nullable() {
+        if self.expression_value_type(lowered)?.nullable() && !target.nullable() {
             self.work.flush()?;
             let mut target = target.clone();
             self.work.step()?;
@@ -1264,9 +1226,9 @@ impl ScalarEmission<'_, '_> {
             target = target
                 .with_nullable(true)
                 .expect("validated root NULL contract");
-            self.convert_expression_to(owner, lowered, &target, policy)
+            self.convert_expression_to(lowered, &target, policy)
         } else {
-            self.convert_expression_to(owner, lowered, target, policy)
+            self.convert_expression_to(lowered, target, policy)
         }
     }
 
@@ -1274,32 +1236,16 @@ impl ScalarEmission<'_, '_> {
         &mut self,
         expression: &TypedExpr,
     ) -> Result<Option<ValueType>, ContractLoweringError> {
-        match &expression.kind {
-            ExprKind::Literal(LiteralValue::Null) => {
-                let mut ty = expression_type(expression);
-                ty = ty
-                    .with_nullable(true)
-                    .expect("validated root NULL contract");
-                Ok(Some(ty))
-            }
-            ExprKind::Constant(value) => {
-                self.work.flush()?;
-                let null = value.is_null_observed(CompilePhase::Validate, self.control)?;
-                self.work.flush()?;
-                Ok(null.then(|| expression_type(expression)))
-            }
-            _ => Ok(None),
-        }
+        null_constant_type(self.control, self.work, expression)
     }
 
     pub(super) fn convert_expression_to(
         &mut self,
-        owner: NodeId,
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<ExprId, ContractLoweringError> {
-        let result = self.convert_expression_to_inner(owner, expression, target, policy);
+        let result = self.convert_expression_to_inner(expression, target, policy);
         if matches!(&result, Err(ContractLoweringError::Control(_))) {
             return result;
         }
@@ -1309,12 +1255,13 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn convert_expression_to_inner(
         &mut self,
-        owner: NodeId,
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<ExprId, ContractLoweringError> {
-        let source = self.expression_value_type(owner, expression)?;
+        let owner = self.storage.node;
+
+        let source = self.expression_value_type(expression)?;
         let plan = crate::compiler::selected_scalar_call::plan_conversion(
             self.functions.as_ref(),
             &source,
@@ -1330,7 +1277,7 @@ impl ScalarEmission<'_, '_> {
             other => ContractLoweringError::InvalidFunctionBinding {
                 detail: format!(
                     "{other} (assignment fragment={:?}, owner={owner:?}, expression={expression:?}, source-domain={:?}, target-domain={:?}, source-carrier={:?}, target-carrier={:?}; source={source:?}, target={target:?})",
-                    self.current_fragment,
+                    self.storage.fragment_id,
                     source.logical_type(),
                     target.logical_type(),
                     source.data_type(),
@@ -1378,7 +1325,6 @@ impl ScalarEmission<'_, '_> {
             let channels = channels.into_boxed_slice();
             self.work.step()?;
             let canonical = self.author_canonical_call_selection(
-                owner,
                 &captured,
                 Some(SqlExpressionCallKind::ValueConversion),
                 None,
@@ -1409,7 +1355,6 @@ impl ScalarEmission<'_, '_> {
             self.work.step()?;
             self.work.flush()?;
             let emitted = self.add_scoped_expression(
-                owner,
                 result_type,
                 ContractExprKind::FunctionCall {
                     function,
@@ -1417,7 +1362,6 @@ impl ScalarEmission<'_, '_> {
                 },
             )?;
             self.record_expression_source(
-                owner,
                 emitted,
                 captured,
                 SqlExpressionCallKind::ValueConversion,
@@ -1433,7 +1377,6 @@ impl ScalarEmission<'_, '_> {
         };
         let allow_throw_exception = self.root_allow_throw_reference();
         self.add_scoped_expression(
-            owner,
             carrier.target().clone(),
             ContractExprKind::Cast {
                 allow_throw_exception,
@@ -1449,24 +1392,19 @@ impl ScalarEmission<'_, '_> {
         left: &ValueType,
         right: &ValueType,
     ) -> Result<ValueType, ContractLoweringError> {
-        self.work.step()?;
-        let result = crate::compiler::selected_scalar_call::comparison_type(left, right);
-        self.control.checkpoint(CompilePhase::Validate, 0)?;
-        result.map_err(ContractLoweringError::ComparisonCoercion)
+        common_comparison_value_type(self.control, self.work, left, right)
     }
 
     pub(super) fn cast_expression_to(
         &mut self,
-        owner: NodeId,
         expr: ExprId,
         target: &ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
-        let current = self.expression_value_type(owner, expr)?;
+        let current = self.expression_value_type(expr)?;
         let target = crate::compiler::selected_scalar_call::comparison_target(target, &current);
         // This port retains the existing late comparison OutputNull policy.
         // Request-owned policy freezing is a separate pending semantic gate.
         self.convert_expression_to(
-            owner,
             expr,
             &target,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1475,12 +1413,11 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn lower_constant_expression(
         &mut self,
-        owner: NodeId,
         value: &novarocks_constant_contract::ConstantValue,
         ty: ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
         let reference = self.register_constant_source(value, &ty)?;
-        self.add_scoped_expression(owner, ty, ContractExprKind::Constant(reference))
+        self.add_scoped_expression(ty, ContractExprKind::Constant(reference))
     }
 
     pub(super) fn register_constant_source(
@@ -1493,7 +1430,6 @@ impl ScalarEmission<'_, '_> {
 
     pub(super) fn author_utf8_expression(
         &mut self,
-        owner: NodeId,
         text: &str,
     ) -> Result<ExprId, ContractLoweringError> {
         let ty = ValueType::new(DataType::Utf8, false);
@@ -1508,22 +1444,20 @@ impl ScalarEmission<'_, '_> {
             self.control,
         )?;
         self.work.flush()?;
-        self.lower_constant_expression(owner, &value, ty)
+        self.lower_constant_expression(&value, ty)
     }
 
     pub(super) fn author_literal_expression(
         &mut self,
-        owner: NodeId,
         literal: &LiteralValue,
         ty: ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.author_literal_expression_with_source(owner, literal, ty)
+        self.author_literal_expression_with_source(literal, ty)
             .map(|(expression, _)| expression)
     }
 
     pub(super) fn author_literal_expression_with_source(
         &mut self,
-        owner: NodeId,
         literal: &LiteralValue,
         ty: ValueType,
     ) -> Result<(ExprId, novarocks_constant_contract::ConstantValue), ContractLoweringError> {
@@ -1535,13 +1469,12 @@ impl ScalarEmission<'_, '_> {
             self.control,
         )?;
         self.work.flush()?;
-        let expression = self.lower_constant_expression(owner, &value, ty)?;
+        let expression = self.lower_constant_expression(&value, ty)?;
         Ok((expression, value))
     }
 
     pub(super) fn lower_literal_expression(
         &mut self,
-        owner: NodeId,
         literal: &LiteralValue,
         expression: &TypedExpr,
     ) -> Result<ExprId, ContractLoweringError> {
@@ -1551,6 +1484,157 @@ impl ScalarEmission<'_, '_> {
                 .with_nullable(true)
                 .expect("validated root NULL contract");
         }
-        self.author_literal_expression(owner, literal, ty)
+        self.author_literal_expression(literal, ty)
     }
+}
+
+pub(super) fn root_allow_throw_reference(used: &mut bool) -> SemanticParameterRef {
+    *used = true;
+    SemanticParameterRef {
+        id: SemanticParameterId::new(0),
+        expected_key: SemanticParameterKey::AllowThrowException,
+    }
+}
+
+pub(super) fn select_canonical_operational_request(
+    functions: &Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+    binding: &SqlFunctionBinding,
+    logical_argument_count: usize,
+    arguments: &[novarocks_functions::FunctionArgument],
+) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
+    select_canonical_request_with_constraint(
+        functions,
+        control,
+        work,
+        binding,
+        logical_argument_count,
+        arguments,
+        binding.result_constraint(),
+    )
+}
+
+pub(super) fn select_canonical_request_with_constraint(
+    functions: &Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+    binding: &SqlFunctionBinding,
+    logical_argument_count: usize,
+    arguments: &[novarocks_functions::FunctionArgument],
+    constraint: Option<&novarocks_functions::FunctionValueType>,
+) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
+    work.flush()?;
+    let selection = crate::compiler::selected_scalar_call::canonical_scalar_request_observed(
+        functions.as_ref(),
+        binding,
+        logical_argument_count,
+        arguments,
+        constraint,
+        control,
+    )
+    .map_err(|error| match error {
+        novarocks_functions::FunctionBindingError::Control(cause) => {
+            ContractLoweringError::Control(cause)
+        }
+        error => ContractLoweringError::InvalidFunctionBinding {
+            detail: format!("canonical call selection: {error}"),
+        },
+    });
+    completed_specialization_result(work, selection)
+}
+
+pub(super) fn completed_specialization_result<T>(
+    work: &mut CompileCheckpoints<'_>,
+    outcome: Result<T, ContractLoweringError>,
+) -> Result<T, ContractLoweringError> {
+    if matches!(&outcome, Err(ContractLoweringError::Control(_))) {
+        return outcome;
+    }
+    work.step()?;
+    work.flush()?;
+    outcome
+}
+
+pub(super) fn original_emission_channel(
+    work: &mut CompileCheckpoints<'_>,
+    expression: ExprId,
+    ordinal: usize,
+    captured: &CapturedLogicalCallArguments,
+) -> Result<LoweredOperationalChannel, ContractLoweringError> {
+    let argument = captured.request().arguments.get(ordinal);
+    work.step()?;
+    let role = match argument {
+        Some(novarocks_functions::FunctionArgument::Value { constant: None, .. }) => {
+            SqlOperationalChannelRole::ValueWithoutConstant
+        }
+        Some(novarocks_functions::FunctionArgument::Value {
+            constant: Some(_), ..
+        }) => SqlOperationalChannelRole::CapturedConstant,
+        Some(novarocks_functions::FunctionArgument::Lambda { .. }) => {
+            SqlOperationalChannelRole::Lambda
+        }
+        None => {
+            return Err(ContractLoweringError::InvalidFunctionBinding {
+                detail: "emitted call channel has no original request occurrence".into(),
+            });
+        }
+    };
+    work.step()?;
+    Ok(LoweredOperationalChannel { expression, role })
+}
+
+pub(super) fn reserve_call_channels(
+    work: &mut CompileCheckpoints<'_>,
+    count: usize,
+) -> Result<Vec<LoweredOperationalChannel>, ContractLoweringError> {
+    if count > novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    std::alloc::Layout::array::<LoweredOperationalChannel>(count)
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    work.step()?;
+    work.flush()?;
+    let mut channels = Vec::new();
+    channels
+        .try_reserve_exact(count)
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    work.step()?;
+    work.flush()?;
+    Ok(channels)
+}
+
+pub(super) fn null_constant_type(
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+    expression: &TypedExpr,
+) -> Result<Option<ValueType>, ContractLoweringError> {
+    match &expression.kind {
+        ExprKind::Literal(LiteralValue::Null) => {
+            let mut ty = expression_type(expression);
+            ty = ty
+                .with_nullable(true)
+                .expect("validated root NULL contract");
+            Ok(Some(ty))
+        }
+        ExprKind::Constant(value) => {
+            work.flush()?;
+            let null = value.is_null_observed(CompilePhase::Validate, control)?;
+            work.flush()?;
+            Ok(null.then(|| expression_type(expression)))
+        }
+        _ => Ok(None),
+    }
+}
+
+pub(super) fn common_comparison_value_type(
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+    left: &ValueType,
+    right: &ValueType,
+) -> Result<ValueType, ContractLoweringError> {
+    work.step()?;
+    let result = crate::compiler::selected_scalar_call::comparison_type(left, right);
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    result.map_err(ContractLoweringError::ComparisonCoercion)
 }

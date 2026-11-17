@@ -29,6 +29,7 @@ mod grouped_topn;
 mod neutral_requests;
 mod nullable_transaction;
 mod scalar_emission;
+mod scalar_nullability;
 mod unit_authorship;
 
 #[cfg(test)]
@@ -1546,7 +1547,15 @@ fn resolve_runtime_filter_activations_observed(
 }
 
 impl<'a> ContractLoweringVisitor<'a> {
-    fn scalar_emission(&mut self) -> scalar_emission::ScalarEmission<'_, 'a> {
+    fn scalar_emission(&mut self, owner: NodeId) -> scalar_emission::ScalarEmission<'_, 'a> {
+        self.scalar_emission_at(self.current_fragment, owner)
+    }
+
+    fn scalar_emission_at(
+        &mut self,
+        fragment: FragmentId,
+        owner: NodeId,
+    ) -> scalar_emission::ScalarEmission<'_, 'a> {
         scalar_emission::ScalarEmission {
             root_allow_throw_exception: self.root_allow_throw_exception,
             constant_policy: self.constant_policy,
@@ -1554,11 +1563,17 @@ impl<'a> ContractLoweringVisitor<'a> {
             functions: &self.functions,
             control: self.control,
             work: &mut self.work,
-            current_fragment: self.current_fragment,
             constant_emission: &mut self.constant_emission,
             lambda_scope: &mut self.lambda_scope,
-            fragments: &mut self.fragments,
-            definition_order: &mut self.definition_order,
+            storage: scalar_emission::NodeScalarStorage {
+                fragment_id: fragment,
+                node: owner,
+                fragment: self
+                    .fragments
+                    .get_mut(&fragment)
+                    .expect("the current fragment is allocated before lowering"),
+                order: scalar_emission::NodeScalarOrder::new(self.definition_order.entry(fragment)),
+            },
             call_sources: &mut self.call_sources,
         }
     }
@@ -1624,7 +1639,7 @@ impl<'a> ContractLoweringVisitor<'a> {
     /// One admitted statement authors this source for every arithmetic/cast
     /// occurrence, independently of the occurrence's decimal overflow policy.
     fn root_allow_throw_reference(&mut self) -> SemanticParameterRef {
-        self.scalar_emission().root_allow_throw_reference()
+        scalar_emission::root_allow_throw_reference(&mut self.root_allow_throw_exception_used)
     }
 
     fn fragment_mut(&mut self) -> &mut FragmentBuilder {
@@ -1639,8 +1654,11 @@ impl<'a> ContractLoweringVisitor<'a> {
         fragment: FragmentId,
         value: ValueId,
     ) -> Result<ValueType, ContractLoweringError> {
-        self.scalar_emission()
-            .value_declared_type_in(fragment, value)
+        self.fragments
+            .get_mut(&fragment)
+            .and_then(|fragment| fragment.value(value))
+            .map(|definition| definition.ty.clone())
+            .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))
     }
 
     fn attach_runtime_filter_endpoints(&mut self) -> Result<(), ContractLoweringError> {
@@ -3076,12 +3094,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         source: &Arc<crate::common::variant_source::DerivedVariantSource>,
         expected_result: &ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission().lower_derived_variant_expression(
-            owner,
-            source_value,
-            source,
-            expected_result,
-        )
+        self.scalar_emission(owner)
+            .lower_derived_variant_expression(source_value, source, expected_result)
     }
 
     fn lower_scan(
@@ -10175,8 +10189,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         connective: BinOp,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<Box<[ExprId]>, ContractLoweringError> {
-        self.scalar_emission()
-            .lower_boolean_connective(owner, root, connective, visible)
+        self.scalar_emission(owner)
+            .lower_boolean_connective(root, connective, visible)
     }
 
     fn local_derived_value_expression(
@@ -10184,8 +10198,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         owner: NodeId,
         value: ValueId,
     ) -> Result<Option<ExprId>, ContractLoweringError> {
-        self.scalar_emission()
-            .local_derived_value_expression(owner, value)
+        self.scalar_emission(owner)
+            .local_derived_value_expression(value)
     }
 
     fn lower_expression(
@@ -10194,8 +10208,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         expression: &TypedExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .lower_expression(owner, expression, visible)
+        self.scalar_emission(owner)
+            .lower_expression(expression, visible)
     }
 
     fn lower_expression_inner(
@@ -10204,8 +10218,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         expression: &TypedExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .lower_expression_inner(owner, expression, visible)
+        self.scalar_emission(owner)
+            .lower_expression_inner(expression, visible)
     }
 
     /// Author the actual call signature before its parent enters
@@ -10220,8 +10234,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         arguments: &[ExprId],
         channels: &[LoweredOperationalChannel],
     ) -> Result<Arc<CanonicalCallOperationalRequest>, ContractLoweringError> {
-        self.scalar_emission()
-            .author_canonical_call_selection(owner, captured, kind, derived, arguments, channels)
+        self.scalar_emission(owner)
+            .author_canonical_call_selection(captured, kind, derived, arguments, channels)
     }
 
     fn select_canonical_operational_request(
@@ -10230,7 +10244,10 @@ impl<'a> ContractLoweringVisitor<'a> {
         logical_argument_count: usize,
         arguments: &[novarocks_functions::FunctionArgument],
     ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
-        self.scalar_emission().select_canonical_operational_request(
+        scalar_emission::select_canonical_operational_request(
+            &self.functions,
+            self.control,
+            &mut self.work,
             binding,
             logical_argument_count,
             arguments,
@@ -10244,13 +10261,15 @@ impl<'a> ContractLoweringVisitor<'a> {
         arguments: &[novarocks_functions::FunctionArgument],
         constraint: Option<&novarocks_functions::FunctionValueType>,
     ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
-        self.scalar_emission()
-            .select_canonical_request_with_constraint(
-                binding,
-                logical_argument_count,
-                arguments,
-                constraint,
-            )
+        scalar_emission::select_canonical_request_with_constraint(
+            &self.functions,
+            self.control,
+            &mut self.work,
+            binding,
+            logical_argument_count,
+            arguments,
+            constraint,
+        )
     }
 
     /// Single and Partial author their own actual update channels. A Merge
@@ -10392,8 +10411,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         &mut self,
         outcome: Result<T, ContractLoweringError>,
     ) -> Result<T, ContractLoweringError> {
-        self.scalar_emission()
-            .completed_specialization_result(outcome)
+        scalar_emission::completed_specialization_result(&mut self.work, outcome)
     }
 
     /// Retain the original ordered emission association alongside its request.
@@ -10407,8 +10425,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         channels: Box<[LoweredOperationalChannel]>,
         canonical_operational: Option<Arc<CanonicalCallOperationalRequest>>,
     ) -> Result<(), ContractLoweringError> {
-        self.scalar_emission().record_expression_source(
-            owner,
+        self.scalar_emission(owner).record_expression_source(
             emitted,
             captured,
             kind,
@@ -10426,14 +10443,14 @@ impl<'a> ContractLoweringVisitor<'a> {
         channels: Box<[LoweredOperationalChannel]>,
         canonical_operational: Option<Arc<CanonicalCallOperationalRequest>>,
     ) -> Result<(), ContractLoweringError> {
-        self.scalar_emission().record_expression_source_with_data(
-            owner,
-            emitted,
-            captured,
-            kind,
-            channels,
-            canonical_operational,
-        )
+        self.scalar_emission(owner)
+            .record_expression_source_with_data(
+                emitted,
+                captured,
+                kind,
+                channels,
+                canonical_operational,
+            )
     }
 
     fn lower_captured_scalar_argument(
@@ -10445,8 +10462,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         visible: &BTreeMap<ColumnId, ValueId>,
         expected: &FunctionArgumentType,
     ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
-        self.scalar_emission()
-            .lower_captured_scalar_argument(owner, argument, ordinal, captured, visible, expected)
+        self.scalar_emission(owner)
+            .lower_captured_scalar_argument(argument, ordinal, captured, visible, expected)
     }
 
     fn lower_captured_unbound_argument(
@@ -10457,8 +10474,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         captured: &CapturedLogicalCallArguments,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
-        self.scalar_emission()
-            .lower_captured_unbound_argument(owner, expression, ordinal, captured, visible)
+        self.scalar_emission(owner)
+            .lower_captured_unbound_argument(expression, ordinal, captured, visible)
     }
 
     /// The original captured request decides presence, even when a Cast or
@@ -10469,8 +10486,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         ordinal: usize,
         captured: &CapturedLogicalCallArguments,
     ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
-        self.scalar_emission()
-            .original_emission_channel(expression, ordinal, captured)
+        scalar_emission::original_emission_channel(&mut self.work, expression, ordinal, captured)
     }
 
     /// Admission includes the existing payload and retained request/role
@@ -10479,7 +10495,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         &mut self,
         count: usize,
     ) -> Result<Vec<LoweredOperationalChannel>, ContractLoweringError> {
-        self.scalar_emission().reserve_call_channels(count)
+        scalar_emission::reserve_call_channels(&mut self.work, count)
     }
 
     fn record_table_source(
@@ -10530,7 +10546,7 @@ impl<'a> ContractLoweringVisitor<'a> {
     }
 
     fn reserve_definition(&mut self, owner: NodeId) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission().reserve_definition(owner)
+        self.scalar_emission(owner).reserve_definition()
     }
     fn insert_definition(
         &mut self,
@@ -10539,8 +10555,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         ty: ValueType,
         kind: ContractExprKind,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .insert_definition(owner, scope, ty, kind)
+        self.scalar_emission(owner)
+            .insert_definition(scope, ty, kind)
     }
     fn add_unscoped_expression(
         &mut self,
@@ -10548,8 +10564,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         ty: ValueType,
         kind: ContractExprKind,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .add_unscoped_expression(owner, ty, kind)
+        self.scalar_emission(owner)
+            .add_unscoped_expression(ty, kind)
     }
     fn root_definition(
         &mut self,
@@ -10558,8 +10574,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         demand: novarocks_type_contract::EvaluationDemand,
         scope: novarocks_expression_contract::RootScope,
     ) -> Result<novarocks_expression_contract::RootOrdinal, ContractLoweringError> {
-        self.scalar_emission()
-            .root_definition(owner, definition, demand, scope)
+        self.scalar_emission(owner)
+            .root_definition(definition, demand, scope)
     }
 
     /// Builds an expression in the scope that is open.
@@ -10574,8 +10590,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         ty: ValueType,
         kind: ContractExprKind,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .add_scoped_expression(owner, ty, kind)
+        self.scalar_emission(owner).add_scoped_expression(ty, kind)
     }
 
     /// Lowers one argument in the type its binding takes.
@@ -10591,13 +10606,16 @@ impl<'a> ContractLoweringVisitor<'a> {
         visible: &BTreeMap<ColumnId, ValueId>,
         expected: &FunctionArgumentType,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .lower_bound_argument(owner, argument, visible, expected)
+        self.scalar_emission(owner)
+            .lower_bound_argument(argument, visible, expected)
     }
 
     /// The type one already-defined value declares.
     fn value_declared_type(&mut self, value: ValueId) -> Result<ValueType, ContractLoweringError> {
-        self.scalar_emission().value_declared_type(value)
+        self.fragment_mut()
+            .value(value)
+            .map(|definition| definition.ty.clone())
+            .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))
     }
 
     /// The type one already-lowered expression declares.
@@ -10606,7 +10624,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         owner: NodeId,
         expr: ExprId,
     ) -> Result<ValueType, ContractLoweringError> {
-        self.scalar_emission().expression_value_type(owner, expr)
+        self.scalar_emission(owner).expression_value_type(expr)
     }
 
     /// Lowers one expression as `target`.
@@ -10624,8 +10642,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .lower_expression_as(owner, expression, visible, target, policy)
+        self.scalar_emission(owner)
+            .lower_expression_as(expression, visible, target, policy)
     }
 
     /// The type a NULL constant is lowered in, or `None` for any other
@@ -10638,7 +10656,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         &mut self,
         expression: &TypedExpr,
     ) -> Result<Option<ValueType>, ContractLoweringError> {
-        self.scalar_emission().null_constant_type(expression)
+        scalar_emission::null_constant_type(self.control, &mut self.work, expression)
     }
 
     /// The same expression, compared as `target`.
@@ -10655,8 +10673,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .convert_expression_to(owner, expression, target, policy)
+        self.scalar_emission(owner)
+            .convert_expression_to(expression, target, policy)
     }
 
     fn convert_expression_to_inner(
@@ -10666,8 +10684,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .convert_expression_to_inner(owner, expression, target, policy)
+        self.scalar_emission(owner)
+            .convert_expression_to_inner(expression, target, policy)
     }
 
     fn common_comparison_value_type(
@@ -10675,8 +10693,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         left: &ValueType,
         right: &ValueType,
     ) -> Result<ValueType, ContractLoweringError> {
-        self.scalar_emission()
-            .common_comparison_value_type(left, right)
+        scalar_emission::common_comparison_value_type(self.control, &mut self.work, left, right)
     }
 
     fn cast_expression_to(
@@ -10685,8 +10702,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         expr: ExprId,
         target: &ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .cast_expression_to(owner, expr, target)
+        self.scalar_emission(owner).cast_expression_to(expr, target)
     }
 
     fn lower_constant_expression(
@@ -10695,8 +10711,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         value: &novarocks_constant_contract::ConstantValue,
         ty: ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .lower_constant_expression(owner, value, ty)
+        self.scalar_emission(owner)
+            .lower_constant_expression(value, ty)
     }
 
     // Scalar expressions and direct collection consumers share the original
@@ -10706,7 +10722,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         value: &novarocks_constant_contract::ConstantValue,
         ty: &ValueType,
     ) -> Result<novarocks_physical_plan::ConstantReference, ContractLoweringError> {
-        self.scalar_emission().register_constant_source(value, ty)
+        self.constant_emission.register(value, ty, &mut self.work)
     }
 
     fn author_unpivot_collection(
@@ -10767,7 +10783,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         owner: NodeId,
         text: &str,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission().author_utf8_expression(owner, text)
+        self.scalar_emission(owner).author_utf8_expression(text)
     }
 
     fn author_literal_expression(
@@ -10776,8 +10792,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         literal: &LiteralValue,
         ty: ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .author_literal_expression(owner, literal, ty)
+        self.scalar_emission(owner)
+            .author_literal_expression(literal, ty)
     }
 
     /// The same original factory result can be retained by a canonical call
@@ -10788,8 +10804,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         literal: &LiteralValue,
         ty: ValueType,
     ) -> Result<(ExprId, novarocks_constant_contract::ConstantValue), ContractLoweringError> {
-        self.scalar_emission()
-            .author_literal_expression_with_source(owner, literal, ty)
+        self.scalar_emission(owner)
+            .author_literal_expression_with_source(literal, ty)
     }
 
     fn lower_literal_expression(
@@ -10798,8 +10814,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         literal: &LiteralValue,
         expression: &TypedExpr,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission()
-            .lower_literal_expression(owner, literal, expression)
+        self.scalar_emission(owner)
+            .lower_literal_expression(literal, expression)
     }
 }
 
