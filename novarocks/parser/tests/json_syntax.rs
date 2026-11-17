@@ -94,7 +94,7 @@ fn every_json_expression_reaches_the_public_printer_and_validator() {
             "JSON_VALUE(doc FORMAT JSON, 'lax $' NULL ON EMPTY NULL ON ERROR)",
         ),
         (
-            Expr::JsonQuery(Box::new(JsonQuery::plain(invocation(), SYNTHETIC))),
+            Expr::JsonQuery(AstBox::new(JsonQuery::plain(invocation(), SYNTHETIC))),
             "JSON_QUERY(doc FORMAT JSON, 'lax $' WITHOUT ARRAY WRAPPER NULL ON EMPTY NULL ON ERROR)",
         ),
         (

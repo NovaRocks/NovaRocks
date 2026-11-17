@@ -2481,3 +2481,132 @@ fn actual_mixed_set_operation_inputs_keep_deep_owning_semantic_and_printing_edge
     assert_eq!(inputs.len(), 2);
     drop(inputs);
 }
+
+#[test]
+fn actual_plain_json_query_owning_chain_preserves_path_facts_and_original_input() {
+    use crate::ast::{
+        AstBox, Expr, Fold, JsonPathInvocation, JsonPathString, JsonQuery, JsonQueryBehavior,
+        JsonQueryWrapperBehavior, Literal, LiteralKind, Statement, SyntaxEq, Visit,
+    };
+    use crate::{Span, build};
+    const DEPTH: usize = 20_000;
+    let mut tree = build::integer(7);
+    for marker in 1..=DEPTH {
+        let span = Span::new(10, 50);
+        tree = Expr::JsonQuery(AstBox::new(JsonQuery::plain(
+            JsonPathInvocation::plain(
+                tree,
+                JsonPathString::new(format!("strict $.p{marker}"), Span::new(31, 49)),
+                span,
+            ),
+            span,
+        )));
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH);
+    let mut cursor = &mut copy;
+    for marker in (1..=DEPTH).rev() {
+        let Expr::JsonQuery(node) = cursor else {
+            panic!("actual JsonQuery AstBox edge");
+        };
+        assert_eq!(node.span, Span::new(10, 50));
+        assert_eq!(
+            node.path_invocation.json_path.value,
+            format!("strict $.p{marker}")
+        );
+        assert_eq!(node.path_invocation.json_path.span, Span::new(31, 49));
+        assert!(
+            node.returned_type.is_none()
+                && node.output_format.is_none()
+                && node.quotes_behavior.is_none()
+        );
+        assert_eq!(node.wrapper_behavior, JsonQueryWrapperBehavior::Without);
+        assert_eq!(node.empty_behavior, JsonQueryBehavior::Null);
+        assert_eq!(node.error_behavior, JsonQueryBehavior::Null);
+        cursor = &mut node.path_invocation.input_expression;
+    }
+    *cursor = build::integer(8);
+    assert_ne!(tree, copy);
+    assert!(!tree.syntax_eq(&copy));
+    drop(copy);
+    #[derive(Default)]
+    struct Facts {
+        paths: Vec<(String, Span)>,
+        leaves: Vec<i64>,
+    }
+    impl Visit for Facts {
+        fn visit_json_path_string(&mut self, node: &JsonPathString) {
+            self.paths.push((node.value.clone(), node.span));
+        }
+        fn visit_literal(&mut self, node: &Literal) {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                panic!("original integer input");
+            };
+            self.leaves.push(parsed_value);
+        }
+    }
+    let mut original = Facts::default();
+    original.visit_expr(&tree);
+    assert_eq!(original.leaves, [7]);
+    assert_eq!(
+        original.paths,
+        (1..=DEPTH)
+            .map(|marker| (format!("strict $.p{marker}"), Span::new(31, 49)))
+            .collect::<Vec<_>>()
+    );
+    struct Change;
+    impl Fold for Change {
+        fn fold_json_path_string(&mut self, mut node: JsonPathString) -> JsonPathString {
+            node.value.push_str(".next");
+            node.span = Span::new(131, 149);
+            node
+        }
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                panic!("integer input");
+            };
+            let Expr::Literal(value) = build::integer(parsed_value + 1) else {
+                unreachable!()
+            };
+            value
+        }
+    }
+    let changed = Change.fold_expr(tree.clone());
+    let mut facts = Facts::default();
+    facts.visit_expr(&changed);
+    assert_eq!(facts.leaves, [8]);
+    assert_eq!(
+        facts.paths,
+        (1..=DEPTH)
+            .map(|marker| (format!("strict $.p{marker}.next"), Span::new(131, 149)))
+            .collect::<Vec<_>>()
+    );
+    assert!(!tree.syntax_eq(&changed));
+    let statement = Statement::Query(build::query(crate::ast::SetExpr::Select(Box::new(
+        build::select(
+            vec![build::item(changed, None, false)],
+            Vec::new(),
+            None,
+            crate::ast::GroupBy::None,
+        )
+        .unwrap(),
+    ))));
+    crate::ast::validate_statement(&statement).unwrap();
+    drop(statement);
+    let printed = crate::printer::print_expr(&tree);
+    assert_eq!(printed.matches("JSON_QUERY(").count(), DEPTH);
+    assert_eq!(printed.matches("strict $.p1'").count(), 1);
+    let Expr::JsonQuery(top) = tree else {
+        unreachable!()
+    };
+    let node = top.into_inner();
+    assert_eq!(
+        node.path_invocation.json_path.value,
+        format!("strict $.p{DEPTH}")
+    );
+    drop(node.path_invocation.input_expression);
+}

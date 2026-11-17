@@ -26,14 +26,13 @@ use crate::ast::{
 use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
-        AccessExpr, AccessKind, ArrayExpr, AstVec, BinaryExpr, BinaryOperator, CastExpr,
-        DataTypeParameter, DereferenceExpr, ExistsExpr, Expr, FunctionCall, Ident, InListExpr,
-        IntervalExpr, IntervalField, JsonOperator, LambdaArgumentDeclaration, LambdaExpr, Literal,
-        LiteralKind, NestedExpr, NullOrdering, NullTreatment, ObjectName, OrderBy,
-        RowDataTypeField, RowExpr, RowField, SearchedCaseExpr, SimpleCaseExpr, SortItem,
-        SortOrdering, SubqueryExpr, TypeName, UnaryExpr, UnaryOperator, WhenClause, WhenMatch,
-        Window, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits,
-        WindowReference, WindowSpecification,
+        ArrayExpr, AstVec, BinaryExpr, BinaryOperator, CastExpr, DataTypeParameter,
+        DereferenceExpr, ExistsExpr, Expr, FunctionCall, Ident, InListExpr, IntervalExpr,
+        IntervalField, LambdaArgumentDeclaration, LambdaExpr, Literal, LiteralKind, NestedExpr,
+        NullOrdering, NullTreatment, ObjectName, OrderBy, RowDataTypeField, RowExpr, RowField,
+        SearchedCaseExpr, SimpleCaseExpr, SortItem, SortOrdering, SubqueryExpr, TypeName,
+        UnaryExpr, UnaryOperator, WhenClause, WhenMatch, Window, WindowFrame, WindowFrameBound,
+        WindowFrameExclusion, WindowFrameUnits, WindowReference, WindowSpecification,
     },
     error::ParseError,
     keyword_class,
@@ -412,23 +411,33 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 field: Some(field),
             })));
         }
-        let kind = if self.current_is_symbol(Symbol::Arrow) {
-            JsonOperator::Arrow
-        } else {
-            JsonOperator::ArrowText
-        };
         self.advance();
         self.skip_trivia();
         let path = self.parse_binding_power(UNARY_ARITHMETIC_PRECEDENCE + 1)?;
-        let end = path.span().end();
-        Ok(Expr::Access(AccessExpr {
-            expr: Box::new(base),
-            kind: AccessKind::Json {
-                operator: kind,
-                path: Box::new(path),
+        let span = Span::new(start, path.span().end());
+        // This is the old producer's uniform semantic bridge, not the
+        // AstBuilder result for the reserved Trino JSON_QUERY grammar.
+        Ok(Expr::FunctionCall(AstBox::new(FunctionCall {
+            name: ObjectName {
+                parts: vec![Ident {
+                    value: "json_query".to_owned(),
+                    quoted: false,
+                    span: crate::SYNTHETIC,
+                }],
+                span: crate::SYNTHETIC,
             },
-            span: Span::new(start, end),
-        }))
+            arguments: [base, path]
+                .into_iter()
+                .map(|value| crate::build::call_argument(value, None))
+                .collect(),
+            distinct: false,
+            order_by: None,
+            filter: None,
+            null_treatment: None,
+            window: None,
+            processing_mode: None,
+            span,
+        })))
     }
 
     fn arrow_starts_lambda(&self, left: &Expr, prefix_start: usize) -> bool {
@@ -2420,15 +2429,22 @@ mod tests {
 
     #[test]
     fn row_constructor_arrow_and_table_arguments_keep_their_original_grammar() {
-        use crate::ast::{AccessKind, Expr};
+        use crate::ast::Expr;
         for source in ["ROW(a, b) -> path", "(ROW(a, b)) -> path"] {
             let tokens = lex(source).unwrap();
             let expression = super::PrattParser::new(source, &tokens).parse().unwrap();
-            let Expr::Access(access) = expression else {
-                panic!("ROW constructor must remain a JSON access base: {source}");
+            let Expr::FunctionCall(call) = expression else {
+                panic!("ROW constructor must remain a JSON operation, not lambda: {source}");
             };
-            assert!(matches!(&access.kind, AccessKind::Json { path, .. }
-                if matches!(path.as_ref(), Expr::Identifier(name) if name.value == "path")));
+            assert_eq!(call.name.parts[0].value, "json_query");
+            assert_eq!(call.arguments.len(), 2);
+            assert!(matches!(
+                &call.arguments[0].value,
+                Expr::Row(_) | Expr::Nested(_)
+            ));
+            assert!(
+                matches!(&call.arguments[1].value,Expr::Identifier(name) if name.value=="path")
+            );
         }
         let source = "(a, b) -> a";
         let tokens = lex(source).unwrap();

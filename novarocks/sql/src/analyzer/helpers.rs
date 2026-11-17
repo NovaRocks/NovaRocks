@@ -885,7 +885,6 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
             expr_display_name(&node.index),
         ),
         ast::Expr::ArrayWildcardSubscript(_) => printer::print_expr(expr),
-        ast::Expr::Access(access) => format_access_display_name(access),
         ast::Expr::Array(array) => format!(
             "[{}]",
             array
@@ -1064,38 +1063,6 @@ fn mark_table_factor_aliases_explicit(factor: &mut ast::TableFactor) {
     }
 }
 
-fn format_access_display_name(access: &ast::AccessExpr) -> String {
-    let base = expr_display_name_preserve_path(&access.expr);
-    match &access.kind {
-        ast::AccessKind::Json { operator, path } => {
-            let operator = match operator {
-                ast::JsonOperator::Arrow => "->",
-                ast::JsonOperator::ArrowText => "->>",
-            };
-            format!(
-                "{base} {operator} {}",
-                expr_display_name_preserve_path(path)
-            )
-        }
-    }
-}
-
-fn format_access_display_name_preserve_path(access: &ast::AccessExpr) -> String {
-    let base = expr_display_name_preserve_path(&access.expr);
-    match &access.kind {
-        ast::AccessKind::Json { operator, path } => {
-            let operator = match operator {
-                ast::JsonOperator::Arrow => "->",
-                ast::JsonOperator::ArrowText => "->>",
-            };
-            format!(
-                "{base} {operator} {}",
-                expr_display_name_preserve_path(path)
-            )
-        }
-    }
-}
-
 fn pure_identifier_chain(expr: &ast::Expr) -> Option<ast::IdentifierChain<'_>> {
     ast::identifier_chain_observed(expr, |_| Ok::<(), std::convert::Infallible>(()))
         .unwrap_or_else(|never| match never {})
@@ -1140,7 +1107,6 @@ fn expr_display_name_preserve_path(expr: &ast::Expr) -> String {
             expr_display_name(&node.index)
         ),
         ast::Expr::ArrayWildcardSubscript(_) => printer::print_expr(expr),
-        ast::Expr::Access(access) => format_access_display_name_preserve_path(access),
         _ => expr_display_name(expr),
     }
 }

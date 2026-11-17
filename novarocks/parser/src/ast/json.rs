@@ -477,6 +477,7 @@ pub fn walk_json_value<V: Visit + ?Sized>(visitor: &mut V, node: &JsonValue) {
     }
 }
 
+#[recursive::recursive]
 pub fn walk_json_query<V: Visit + ?Sized>(visitor: &mut V, node: &JsonQuery) {
     visitor.visit_json_path_invocation(&node.path_invocation);
     if let Some(child) = &node.returned_type {
@@ -686,6 +687,7 @@ pub fn fold_json_value<F: Fold + ?Sized>(folder: &mut F, mut node: JsonValue) ->
     node
 }
 
+#[recursive::recursive]
 pub fn fold_json_query<F: Fold + ?Sized>(folder: &mut F, mut node: JsonQuery) -> JsonQuery {
     node.path_invocation = folder.fold_json_path_invocation(node.path_invocation);
     node.returned_type = node.returned_type.map(|child| folder.fold_type_name(child));
@@ -945,6 +947,7 @@ impl SyntaxEq for JsonValue {
 }
 
 impl SyntaxEq for JsonQuery {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         self.path_invocation.syntax_eq(&other.path_invocation)
             && eq_option(&self.returned_type, &other.returned_type)

@@ -551,7 +551,6 @@ impl SyntaxEq for Expr {
             (Self::Subquery(left), Self::Subquery(right)) => left.syntax_eq(right),
             (Self::Row(left), Self::Row(right)) => left.syntax_eq(right),
             (Self::Array(left), Self::Array(right)) => left.syntax_eq(right),
-            (Self::Access(left), Self::Access(right)) => left.syntax_eq(right),
             (Self::Subscript(left), Self::Subscript(right)) => left.syntax_eq(right),
             (Self::ArrayWildcardSubscript(left), Self::ArrayWildcardSubscript(right)) => {
                 left.syntax_eq(right)
@@ -643,29 +642,6 @@ impl SyntaxEq for ArrayExpr {
     }
 }
 
-impl SyntaxEq for AccessExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.expr.syntax_eq(&other.expr) && self.kind.syntax_eq(&other.kind)
-    }
-}
-
-impl SyntaxEq for AccessKind {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::Json {
-                    operator: left_operator,
-                    path: left_path,
-                },
-                Self::Json {
-                    operator: right_operator,
-                    path: right_path,
-                },
-            ) => left_operator == right_operator && left_path.syntax_eq(right_path),
-        }
-    }
-}
-
 impl SyntaxEq for SubscriptExpr {
     #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
@@ -749,21 +725,30 @@ mod tests {
                 span: span(start + 2),
             },
             arguments: vec![
-                Expr::Access(AccessExpr {
-                    expr: Box::new(Expr::Dereference(AstBox::new(DereferenceExpr {
-                        base: Expr::Identifier(ident("t", start + 3)),
-                        field: Some(ident("payload", start + 4)),
-                        span: span(start + 5),
-                    }))),
-                    kind: AccessKind::Json {
-                        operator: JsonOperator::ArrowText,
-                        path: Box::new(Expr::Literal(Literal {
-                            kind: LiteralKind::String("name".to_owned()),
-                            span: span(start + 6),
-                        })),
-                    },
-                    span: span(start + 7),
-                }),
+                {
+                    let mut bridge = crate::build::function(
+                        ObjectName {
+                            parts: vec![crate::build::ident("json_query", false)],
+                            span: crate::SYNTHETIC,
+                        },
+                        vec![
+                            Expr::Dereference(AstBox::new(DereferenceExpr {
+                                base: Expr::Identifier(ident("t", start + 3)),
+                                field: Some(ident("payload", start + 4)),
+                                span: span(start + 5),
+                            })),
+                            Expr::Literal(Literal {
+                                kind: LiteralKind::String("name".to_owned()),
+                                span: span(start + 6),
+                            }),
+                        ],
+                    );
+                    let Expr::FunctionCall(call) = &mut bridge else {
+                        unreachable!()
+                    };
+                    call.span = span(start + 7);
+                    bridge
+                },
                 Expr::Literal(Literal {
                     kind: LiteralKind::String(",".to_owned()),
                     span: span(start + 10),

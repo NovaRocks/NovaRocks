@@ -66,11 +66,10 @@ pub use dml::{
 };
 pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
-    AccessExpr, AccessKind, AllRows, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr,
-    BinaryOperator, CallArgument, DereferenceExpr, Expr, FunctionCall, IntervalExpr, IntervalField,
-    JsonOperator, LogicalExpr, LogicalOperator, NestedExpr, NullTreatment, Parameter,
-    ProcessingMode, ProcessingModeKind, RowExpr, RowField, SubqueryExpr, SubscriptExpr, UnaryExpr,
-    UnaryOperator,
+    AllRows, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr, BinaryOperator, CallArgument,
+    DereferenceExpr, Expr, FunctionCall, IntervalExpr, IntervalField, LogicalExpr, LogicalOperator,
+    NestedExpr, NullTreatment, Parameter, ProcessingMode, ProcessingModeKind, RowExpr, RowField,
+    SubqueryExpr, SubscriptExpr, UnaryExpr, UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,

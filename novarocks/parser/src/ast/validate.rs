@@ -584,12 +584,6 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             }
         }
         Expr::Lambda(lambda) => validate_expr(&lambda.body)?,
-        Expr::Access(access) => {
-            validate_expr(&access.expr)?;
-            match &access.kind {
-                super::AccessKind::Json { path, .. } => validate_expr(path)?,
-            }
-        }
         Expr::Subscript(node) => {
             validate_expr(&node.base)?;
             validate_expr(&node.index)?;
@@ -687,6 +681,7 @@ impl super::Visit for JsonValidation {
         }
     }
 }
+#[recursive::recursive]
 fn validate_json_root(walk: impl FnOnce(&mut JsonValidation)) -> Result<(), ValidateError> {
     let mut visitor = JsonValidation(Ok(()));
     walk(&mut visitor);

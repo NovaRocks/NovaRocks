@@ -424,9 +424,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 self.analyze_syntax_function("row", &arguments, row.span, scope)
             }
 
-            // The native parser retains JSON arrows as `AccessKind::Json` and
-            // gives them the grammar's intended precedence, so no SQL-text
-            // reparse or tree rotation is required here.
             ast::Expr::Binary(binary) => {
                 self.analyze_binary_op(&binary.left, &binary.operator, &binary.right, scope)
             }
@@ -652,11 +649,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 let base = self.analyze_expr(&node.base, scope)?;
                 self.analyze_subscript(base, &node.index, scope, node.span)
             }
-            ast::Expr::Access(access) => {
-                let base = self.analyze_expr(&access.expr, scope)?;
-                self.analyze_access(base, &access.kind, scope, access.span)
-            }
-
             // Nested (parenthesized)
             ast::Expr::Nested(nested) => {
                 let inner_typed = self.analyze_expr(&nested.expression, scope)?;
@@ -816,20 +808,6 @@ impl<'a> super::AnalyzerContext<'a> {
         )?;
         debug_assert_eq!(result.value_type.data_type(), &output_type);
         Ok(result)
-    }
-
-    fn analyze_access(
-        &self,
-        base: TypedExpr,
-        access: &ast::AccessKind,
-        scope: &AnalyzerScope,
-        _span: Span,
-    ) -> Result<TypedExpr, AnalyzeError> {
-        match access {
-            ast::AccessKind::Json { operator: _, path } => {
-                self.analyze_json_arrow_from_typed(base, path, scope)
-            }
-        }
     }
 
     fn infer_scalar_subquery_value_type(
@@ -1197,29 +1175,6 @@ impl<'a> super::AnalyzerContext<'a> {
             "__array_literal",
             args,
             array.span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )
-    }
-
-    /// Analyze `left -> right` as a JSON path operator. StarRocks treats
-    /// `json_col -> '$.a.b'` as `json_query(json_col, '$.a.b')` returning a
-    /// JSON value. Other operand types fall back to `get_json_string` so the
-    /// expression remains usable.
-    fn analyze_json_arrow_from_typed(
-        &self,
-        left_typed: TypedExpr,
-        right: &ast::Expr,
-        scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, AnalyzeError> {
-        let right_typed = self.analyze_expr(right, scope)?;
-        let args = vec![left_typed, right_typed];
-        resolved_scalar_call_at(
-            self.function_catalog,
-            "json_query",
-            args,
-            right.span(),
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
             self.constant_policy,
             self.control,
@@ -4394,6 +4349,9 @@ impl<'a> super::AnalyzerContext<'a> {
     /// Window functions (with OVER) are NOT counted as aggregates.
     pub(super) fn expr_contains_aggregate(&self, expr: &ast::Expr) -> bool {
         match expr {
+            ast::Expr::JsonQuery(node) => {
+                self.expr_contains_aggregate(&node.path_invocation.input_expression)
+            }
             ast::Expr::Extract(node) => self.expr_contains_aggregate(&node.expression),
             ast::Expr::If(node) => {
                 self.expr_contains_aggregate(&node.condition)
@@ -4479,12 +4437,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 .fields
                 .iter()
                 .any(|field| self.expr_contains_aggregate(&field.expression)),
-            ast::Expr::Access(access) => {
-                self.expr_contains_aggregate(&access.expr)
-                    || match &access.kind {
-                        ast::AccessKind::Json { path, .. } => self.expr_contains_aggregate(path),
-                    }
-            }
             ast::Expr::Subscript(node) => {
                 self.expr_contains_aggregate(&node.base)
                     || self.expr_contains_aggregate(&node.index)

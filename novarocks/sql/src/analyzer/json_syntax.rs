@@ -188,6 +188,9 @@ mod tests {
     }
     static NO_TABLES: NoTables = NoTables;
 
+    // These original component fixtures intentionally use unscoped metadata.
+    // They prove binding/type behavior, not full compiler or native admission.
+    // Presence-scoped refusals and the declaration shortcut are guarded below.
     fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
         AnalyzerContext {
             grouping_scope: Default::default(),
@@ -568,7 +571,7 @@ mod tests {
         ] {
             let node = plain(input, "$.a");
             let actual_query =
-                projection_query(ast::Expr::JsonQuery(Box::new(node.clone())), vec![]);
+                projection_query(ast::Expr::JsonQuery(ast::AstBox::new(node.clone())), vec![]);
             let expected_query = projection_query(ordinary_call(&node), vec![]);
             let (actual, _, _) = crate::analyzer::analyze(&actual_query, &NO_TABLES, "default")
                 .expect("plain typed JSON_QUERY must enter the original scalar binder");
@@ -589,7 +592,7 @@ mod tests {
                 ast::Expr::Identifier(build::ident_at("unknown_input", false, Span::new(11, 24)));
             let span = node.span;
             let query = projection_query(
-                ast::Expr::JsonQuery(Box::new(node)),
+                ast::Expr::JsonQuery(ast::AstBox::new(node)),
                 vec![missing_table("missing_from_table")],
             );
             // NoTables panics on any lookup. This exercises the public analyzer
@@ -1257,6 +1260,206 @@ mod tests {
                 )
                 .unwrap_err();
             assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+        }
+    }
+
+    fn opaque_dynamic_json_call(quoted: bool) -> ast::Expr {
+        let input = ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Generic(ast::GenericLiteral {
+                type_name: "JSON".to_string(),
+                value: "{\"a\":1}".to_string(),
+            }),
+            span: novarocks_parser::SYNTHETIC,
+        });
+        let path = ordinary_constructor(
+            "concat",
+            vec![build::string("$."), build::string("a")],
+            novarocks_parser::SYNTHETIC,
+        );
+        let mut call =
+            ordinary_constructor("json_query", vec![input, path], novarocks_parser::SYNTHETIC);
+        let ast::Expr::FunctionCall(function) = &mut call else {
+            panic!("ordinary call");
+        };
+        function.name.parts[0].quoted = quoted;
+        call
+    }
+
+    #[derive(Clone, Debug)]
+    struct ObservedPresenceCatalog {
+        original: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
+        scalar_resolutions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::compiler::SqlFunctionCatalog for ObservedPresenceCatalog {
+        fn snapshot(&self) -> std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog> {
+            std::sync::Arc::new(self.clone())
+        }
+        fn resolve_scalar_signature(
+            &self,
+            name: &str,
+            args: &[DataType],
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<
+            novarocks_functions::ResolvedFunctionSignature,
+            novarocks_functions::FunctionResolutionError,
+        > {
+            self.scalar_resolutions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.original.resolve_scalar_signature(name, args, control)
+        }
+        fn resolve_scalar_binding(
+            &self,
+            name: &str,
+            args: &[novarocks_functions::FunctionArgument],
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<
+            novarocks_functions::ResolvedFunctionBinding,
+            novarocks_functions::FunctionBindingError,
+        > {
+            self.scalar_resolutions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.original.resolve_scalar_binding(name, args, control)
+        }
+        fn contains_aggregate(&self, name: &str) -> bool {
+            self.original.contains_aggregate(name)
+        }
+        fn resolve_aggregate_signature(
+            &self,
+            name: &str,
+            args: &[DataType],
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<
+            novarocks_functions::ResolvedAggregateSignature,
+            novarocks_functions::FunctionResolutionError,
+        > {
+            self.original
+                .resolve_aggregate_signature(name, args, control)
+        }
+        fn resolve_aggregate_trusted(
+            &self,
+            name: &str,
+            args: &[DataType],
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<
+            novarocks_functions::ResolvedAggregateSignature,
+            novarocks_functions::FunctionResolutionError,
+        > {
+            self.original.resolve_aggregate_trusted(name, args, control)
+        }
+        fn volatility(&self, name: &str) -> novarocks_functions::FunctionVolatility {
+            self.original.volatility(name)
+        }
+    }
+
+    #[test]
+    fn typeof_cast_declaration_keeps_opaque_ordinary_and_quoted_children_unbound() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let control = SqlCompileControl::unbounded();
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let functions = ObservedPresenceCatalog {
+            original: crate::functions::builtin_sql_function_catalog()
+                .snapshot_for_scalar_presence(),
+            scalar_resolutions: resolutions.clone(),
+        };
+        let mut ctx = context(&control);
+        ctx.function_catalog = &functions;
+        let scope = ctx.new_scope();
+        for quoted in [false, true] {
+            let child = opaque_dynamic_json_call(quoted);
+            let statements =
+                novarocks_parser::parse("SELECT typeof(CAST(NULL AS INTEGER))").unwrap();
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query");
+            };
+            let ast::SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("select");
+            };
+            let ast::SelectItem::UnnamedExpr(mut expression) = select.projection[0].clone() else {
+                panic!("typeof");
+            };
+            let ast::Expr::FunctionCall(call) = &mut expression else {
+                panic!("typeof call");
+            };
+            let ast::Expr::Cast(cast) = &mut call.arguments[0].value else {
+                panic!("declared cast");
+            };
+            cast.expression = child.clone();
+            resolutions.store(0, Ordering::SeqCst);
+            let actual = ctx.analyze_expr(&expression, &scope).unwrap();
+            assert_eq!(
+                actual.value_type,
+                FunctionValueType::new(DataType::Utf8, false)
+            );
+            assert!(
+                matches!(&actual.kind, ExprKind::Literal(LiteralValue::String(value)) if value == "integer")
+            );
+            assert_eq!(
+                resolutions.load(Ordering::SeqCst),
+                0,
+                "the original declaration shortcut must not bind its opaque child"
+            );
+            let direct = ctx.analyze_expr(&child, &scope).unwrap_err();
+            assert!(
+                resolutions.load(Ordering::SeqCst) > 0,
+                "the observation must see actual child resolution"
+            );
+            if !quoted {
+                assert_eq!(direct.kind(), AnalyzeErrorKind::UnavailableImplementation);
+            }
+        }
+    }
+
+    #[test]
+    fn full_compiler_typeof_json_keeps_original_scalar_presence_refusal() {
+        use crate::compiler::{
+            SessionOptimizerSettings, SqlAnalyzeRequest, SqlCompileError, SqlCompileIntent,
+            SqlCompiler, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
+            SqlStatementInput,
+        };
+        let span = novarocks_parser::SYNTHETIC;
+        let literal_query =
+            ast::Expr::JsonQuery(ast::AstBox::new(plain(build::string("{\"a\":1}"), "$.a")));
+        let mut ordinary_literal_query = opaque_dynamic_json_call(false);
+        let ast::Expr::FunctionCall(call) = &mut ordinary_literal_query else {
+            panic!("ordinary call");
+        };
+        call.arguments[1].value = build::string("$.a");
+        for child in [
+            opaque_dynamic_json_call(false),
+            ordinary_literal_query,
+            literal_query,
+        ] {
+            let query = projection_query(ordinary_constructor("typeof", vec![child], span), vec![]);
+            let catalog = SqlPlannerTableSnapshot::new(&NO_TABLES);
+            let functions = crate::functions::builtin_sql_function_catalog();
+            let result = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                SqlStatementInput::parsed_query(Box::new(query)),
+                SqlCompileIntent::AnalyzeOnly,
+                SqlSessionContext {
+                    current_catalog: None,
+                    current_database: "default".to_string(),
+                    optimizer_settings: SessionOptimizerSettings::default(),
+                    sql_semantics: Default::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &catalog,
+                functions,
+                crate::compiler::noop_constant_evaluator(),
+                None,
+                crate::constant::test_constant_policy(),
+                SqlCompileControl::unbounded(),
+            ));
+            let error = match result {
+                Err(SqlCompileError::Analyze(error)) => error,
+                _ => panic!("full scalar presence must refuse the unavailable JSON query owner"),
+            };
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
+            assert_eq!(
+                error.code().as_str(),
+                "sql.analyze.unavailable_implementation"
+            );
+            assert!(error.message().contains("json_query"), "{error}");
         }
     }
 }

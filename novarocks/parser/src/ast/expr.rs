@@ -26,7 +26,7 @@ pub enum Expr {
     JsonConstructor(Box<super::JsonConstructor>),
     JsonExists(Box<super::JsonExists>),
     JsonValue(Box<super::JsonValue>),
-    JsonQuery(Box<super::JsonQuery>),
+    JsonQuery(AstBox<super::JsonQuery>),
     JsonSerialize(Box<super::JsonSerialize>),
     JsonObject(Box<super::JsonObject>),
     JsonArray(Box<super::JsonArray>),
@@ -60,7 +60,6 @@ pub enum Expr {
     Row(RowExpr),
     Array(ArrayExpr),
     Lambda(AstBox<super::LambdaExpr>),
-    Access(AccessExpr),
     Subscript(AstBox<SubscriptExpr>),
     ArrayWildcardSubscript(AstBox<ArrayWildcardSubscriptExpr>),
     Dereference(AstBox<DereferenceExpr>),
@@ -106,7 +105,6 @@ impl Expr {
             Self::Row(expression) => expression.span,
             Self::Array(expression) => expression.span,
             Self::Lambda(expression) => expression.span,
-            Self::Access(expression) => expression.span,
             Self::Subscript(expression) => expression.span,
             Self::ArrayWildcardSubscript(expression) => expression.span,
             Self::Dereference(expression) => expression.span,
@@ -225,27 +223,6 @@ pub struct DereferenceExpr {
     pub base: Expr,
     pub field: Option<Ident>,
     pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AccessExpr {
-    pub expr: Box<Expr>,
-    pub kind: AccessKind,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AccessKind {
-    Json {
-        operator: JsonOperator,
-        path: Box<Expr>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum JsonOperator {
-    Arrow,
-    ArrowText,
 }
 
 /// Ordered operands of one syntactic AND or OR expression.

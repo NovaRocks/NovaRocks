@@ -965,7 +965,6 @@ impl Printer {
             Expr::Row(expression) => self.write_row_expr(expression),
             Expr::Array(expression) => self.write_array_expr(expression),
             Expr::Lambda(expression) => self.write_lambda_expr(expression),
-            Expr::Access(expression) => self.write_access_expr(expression),
             Expr::Subscript(node) => self.write_subscript_expr(node),
             Expr::ArrayWildcardSubscript(node) => self.write_array_wildcard_subscript_expr(node),
             Expr::Dereference(node) => self.write_dereference_expr(node),
@@ -1643,18 +1642,6 @@ impl Printer {
         self.output.push_str(" -> ");
         self.write_expr(&expression.body);
     }
-    fn write_access_expr(&mut self, expression: &AccessExpr) {
-        self.write_expr(&expression.expr);
-        match &expression.kind {
-            AccessKind::Json { operator, path } => {
-                self.output.push_str(match operator {
-                    JsonOperator::Arrow => " -> ",
-                    JsonOperator::ArrowText => " ->> ",
-                });
-                self.write_expr(path);
-            }
-        }
-    }
     #[recursive::recursive]
     fn write_subscript_expr(&mut self, node: &SubscriptExpr) {
         self.write_expr(&node.base);
@@ -2112,6 +2099,7 @@ impl Printer {
         self.output.push_str(" ON ERROR)");
     }
 
+    #[recursive::recursive]
     fn write_json_query(&mut self, node: &JsonQuery) {
         self.output.push_str("JSON_QUERY(");
         self.write_json_path_invocation(&node.path_invocation);
@@ -2557,18 +2545,20 @@ mod tests {
         }));
         assert_eq!(print_expr(&between), "a + b NOT BETWEEN 1 AND 2");
         assert_eq!(
-            print_expr(&Expr::Access(AccessExpr {
-                expr: Box::new(identifier("payload")),
-                kind: AccessKind::Json {
-                    operator: JsonOperator::ArrowText,
-                    path: Box::new(Expr::Literal(Literal {
-                        kind: LiteralKind::String("name".to_owned()),
-                        span: span(),
-                    })),
+            print_expr(&crate::build::function(
+                ObjectName {
+                    parts: vec![crate::build::ident("json_query", false)],
+                    span: crate::SYNTHETIC
                 },
-                span: span(),
-            })),
-            "payload ->> 'name'"
+                vec![
+                    identifier("payload"),
+                    Expr::Literal(Literal {
+                        kind: LiteralKind::String("name".to_owned()),
+                        span: span()
+                    })
+                ],
+            )),
+            "json_query(payload, 'name')"
         );
         assert_eq!(
             print_expr(&Expr::Lambda(AstBox::new(LambdaExpr {

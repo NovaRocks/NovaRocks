@@ -3186,8 +3186,7 @@ impl Visit for CompletionRetainedBytes {
             | Expr::Binary(_)
             | Expr::Nested(_)
             | Expr::Interval(_)
-            | Expr::Subquery(_)
-            | Expr::Access(_) => {}
+            | Expr::Subquery(_) => {}
         }
         walk_expr(self, expression);
     }

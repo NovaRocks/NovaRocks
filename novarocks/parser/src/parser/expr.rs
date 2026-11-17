@@ -465,7 +465,9 @@ mod tests {
             parse("EXTRACT(YEAR FROM created_at)"),
             Expr::Extract(_)
         ));
-        assert!(matches!(parse("payload->>'$.name'"), Expr::Access(_)));
+        assert!(
+            matches!(parse("payload->>'$.name'"), Expr::FunctionCall(call) if call.name.parts[0].value=="json_query")
+        );
         let Expr::FunctionCall(call) = parse("array_map((x, y) -> x + y, input)") else {
             panic!("expected lambda function argument");
         };
@@ -634,29 +636,33 @@ mod tests {
     }
 
     #[test]
-    fn both_json_arrows_retain_their_original_operator_and_dynamic_path() {
-        for (operator, expected) in [
-            ("->", crate::ast::JsonOperator::Arrow),
-            ("->>", crate::ast::JsonOperator::ArrowText),
-        ] {
+    fn both_old_json_arrows_preserve_the_original_dynamic_path_in_uniform_calls() {
+        let mut nodes = Vec::new();
+        for operator in ["->", "->>"] {
             let source = format!("`payload`.value {operator} path_column");
             let expression = parse(&source);
-            let Expr::Access(node) = &expression else {
-                panic!("JSON access");
+            let Expr::FunctionCall(node) = &expression else {
+                panic!("old JSON operation bridge");
             };
-            let crate::ast::AccessKind::Json { operator, path } = &node.kind;
-            assert_eq!(*operator, expected);
+            assert_eq!(node.name.parts[0].value, "json_query");
+            assert_eq!(node.name.span, crate::SYNTHETIC);
+            assert_eq!(node.arguments.len(), 2);
+            assert!(node.arguments.iter().all(|arg| arg.name.is_none()));
+            let base = &node.arguments[0].value;
+            let path = &node.arguments[1].value;
             assert_eq!(
-                &source[node.expr.span().start()..node.expr.span().end()],
+                &source[base.span().start()..base.span().end()],
                 "`payload`.value"
             );
             assert_eq!(
                 &source[path.span().start()..path.span().end()],
                 "path_column"
             );
-            assert!(matches!(path.as_ref(), Expr::Identifier(_)));
-            assert!(matches!(node.expr.as_ref(), Expr::Dereference(_)));
+            assert!(matches!(path, Expr::Identifier(_)));
+            assert!(matches!(base, Expr::Dereference(_)));
             assert_eq!(node.span, Span::new(0, source.len()));
+            nodes.push(expression);
         }
+        assert!(crate::ast::SyntaxEq::syntax_eq(&nodes[0], &nodes[1]));
     }
 }

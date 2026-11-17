@@ -886,12 +886,6 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::Row(expression) => visitor.visit_row_expr(expression),
         Expr::Array(expression) => walk_array_expr(visitor, expression),
 
-        Expr::Access(expression) => {
-            visitor.visit_expr(&expression.expr);
-            match &expression.kind {
-                AccessKind::Json { path, .. } => visitor.visit_expr(path),
-            }
-        }
         Expr::Subscript(node) => visitor.visit_subscript_expr(node),
         Expr::ArrayWildcardSubscript(node) => visitor.visit_array_wildcard_subscript_expr(node),
         Expr::Dereference(node) => visitor.visit_dereference_expr(node),
@@ -2010,7 +2004,9 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         }
         Expr::JsonExists(node) => Expr::JsonExists(Box::new(folder.fold_json_exists(*node))),
         Expr::JsonValue(node) => Expr::JsonValue(Box::new(folder.fold_json_value(*node))),
-        Expr::JsonQuery(node) => Expr::JsonQuery(Box::new(folder.fold_json_query(*node))),
+        Expr::JsonQuery(node) => {
+            Expr::JsonQuery(AstBox::new(folder.fold_json_query(node.into_inner())))
+        }
         Expr::JsonSerialize(node) => {
             Expr::JsonSerialize(Box::new(folder.fold_json_serialize(*node)))
         }
@@ -2078,16 +2074,6 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::Row(expression) => Expr::Row(folder.fold_row_expr(expression)),
         Expr::Array(expression) => Expr::Array(fold_array_expr(folder, expression)),
 
-        Expr::Access(mut expression) => {
-            expression.expr = Box::new(folder.fold_expr(*expression.expr));
-            expression.kind = match expression.kind {
-                AccessKind::Json { operator, path } => AccessKind::Json {
-                    operator,
-                    path: Box::new(folder.fold_expr(*path)),
-                },
-            };
-            Expr::Access(expression)
-        }
         Expr::Subscript(node) => {
             Expr::Subscript(AstBox::new(folder.fold_subscript_expr(node.into_inner())))
         }

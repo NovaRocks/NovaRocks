@@ -3374,6 +3374,9 @@ fn case_contains_aggregate_function(clauses: &[ast::WhenClause], default: Option
 
 fn expr_contains_aggregate_function(expr: &Expr) -> bool {
     match expr {
+        Expr::JsonQuery(node) => {
+            expr_contains_aggregate_function(&node.path_invocation.input_expression)
+        }
         Expr::Extract(node) => expr_contains_aggregate_function(&node.expression),
         Expr::If(node) => {
             expr_contains_aggregate_function(&node.condition)
@@ -3565,7 +3568,6 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
         Expr::Format(node) => reject_unsupported_exprs(&node.arguments)?,
         Expr::Extract(node) => reject_unsupported_expr(&node.expression)?,
         Expr::FunctionCall(function) => reject_unsupported_function(function)?,
-        Expr::Access(access) => reject_unsupported_access_expr(access)?,
         Expr::Dereference(node) => {
             if node.field.is_none() {
                 return Err(projection_filter_error());
@@ -3633,14 +3635,6 @@ fn reject_unsupported_exprs(exprs: &[Expr]) -> Result<(), String> {
         reject_unsupported_expr(expr)?;
     }
     Ok(())
-}
-
-fn reject_unsupported_access_expr(access: &ast::AccessExpr) -> Result<(), String> {
-    let ast::AccessExpr { expr, kind, .. } = access;
-    reject_unsupported_expr(expr)?;
-    match kind {
-        ast::AccessKind::Json { path, .. } => reject_unsupported_expr(path),
-    }
 }
 
 fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), String> {
@@ -4080,7 +4074,7 @@ mod tests {
             panic!("SELECT")
         };
         select.projection[0] = novarocks_parser::build::item(
-            Expr::JsonQuery(Box::new(ast::JsonQuery::plain(
+            Expr::JsonQuery(ast::AstBox::new(ast::JsonQuery::plain(
                 ast::JsonPathInvocation::plain(
                     novarocks_parser::build::identifier(novarocks_parser::build::ident(
                         "k1", false,
