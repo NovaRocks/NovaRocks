@@ -220,9 +220,9 @@ impl<'a> super::AnalyzerContext<'a> {
                         ),
 
                         kind: ExprKind::BinaryOp {
-                            left: Box::new(left_ref),
+                            left: novarocks_parser::ast::AstBox::new(left_ref),
                             op: BinOp::Eq,
-                            right: Box::new(right_ref),
+                            right: novarocks_parser::ast::AstBox::new(right_ref),
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
@@ -241,9 +241,9 @@ impl<'a> super::AnalyzerContext<'a> {
                             ),
 
                             kind: ExprKind::BinaryOp {
-                                left: Box::new(prev),
+                                left: novarocks_parser::ast::AstBox::new(prev),
                                 op: BinOp::And,
-                                right: Box::new(result),
+                                right: novarocks_parser::ast::AstBox::new(result),
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
@@ -408,7 +408,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             }
         }
-        let current_rel = Relation::Join(Box::new(JoinRelation {
+        let current_rel = Relation::Join(novarocks_parser::ast::AstBox::new(JoinRelation {
             naa_author: None,
             left: current_rel,
             right: right_rel,
@@ -600,7 +600,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 return Ok((
                     Relation::Subquery {
-                        query: Box::new(query),
+                        query: novarocks_parser::ast::AstBox::new(query),
                         alias: alias_name,
                         output_columns,
                     },
@@ -885,7 +885,7 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         let relation = Relation::Subquery {
-            query: Box::new(resolved_query),
+            query: novarocks_parser::ast::AstBox::new(resolved_query),
             alias: alias_name,
             output_columns,
         };

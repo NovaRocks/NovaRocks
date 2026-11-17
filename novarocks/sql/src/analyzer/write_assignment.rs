@@ -656,7 +656,7 @@ impl super::AnalyzerContext<'_> {
         Ok(ResolvedQuery {
             body: QueryBody::Select(ResolvedSelect {
                 from: Some(Relation::Subquery {
-                    query: Box::new(query),
+                    query: novarocks_parser::ast::AstBox::new(query),
                     alias: alias.into(),
                     output_columns: original,
                 }),
@@ -667,8 +667,8 @@ impl super::AnalyzerContext<'_> {
                 has_aggregation: false,
                 distinct: false,
                 repeat: None,
-                apply_specs: Vec::new(),
-                predicate_apply_specs: Vec::new(),
+                apply_specs: (Vec::new()).into(),
+                predicate_apply_specs: (Vec::new()).into(),
             }),
             order_by: Vec::new(),
             limit: None,

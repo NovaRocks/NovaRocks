@@ -188,7 +188,7 @@ impl BridgeCtx<'_> {
                         TypedExpr {
                             kind: ExprKind::Cast {
                                 array_failure_mode: None,
-                                expr: Box::new(source),
+                                expr: novarocks_parser::ast::AstBox::new(source),
                                 target: DataType::Int8,
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

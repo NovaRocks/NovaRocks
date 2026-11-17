@@ -859,6 +859,7 @@ fn column_display_from_expr(expr: &TypedExpr) -> Option<ColumnDisplay> {
 }
 
 /// Recursively intern an analyzer `TypedExpr` into the arena, returning its id.
+#[recursive::recursive]
 pub(crate) fn intern_typed(
     arena: &mut ScalarArena,
     expr: &TypedExpr,
@@ -1077,6 +1078,7 @@ pub(crate) fn intern_typed(
 }
 
 /// Rebuild an analyzer `TypedExpr` from an interned id.
+#[recursive::recursive]
 pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
     let kind = match arena.node(id) {
         ScalarNode::ColumnRef(cid) => {
@@ -1101,14 +1103,14 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             right,
             decimal_overflow_policy,
         } => ExprKind::BinaryOp {
-            left: Box::new(materialize(arena, *left)),
+            left: novarocks_parser::ast::AstBox::new(materialize(arena, *left)),
             op: *op,
-            right: Box::new(materialize(arena, *right)),
+            right: novarocks_parser::ast::AstBox::new(materialize(arena, *right)),
             decimal_overflow_policy: *decimal_overflow_policy,
         },
         ScalarNode::UnaryOp { op, child } => ExprKind::UnaryOp {
             op: *op,
-            expr: Box::new(materialize(arena, *child)),
+            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
         },
         ScalarNode::FunctionCall {
             name,
@@ -1125,7 +1127,7 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
         },
         ScalarNode::LambdaFunction { params, body } => ExprKind::LambdaFunction {
             params: params.clone(),
-            body: Box::new(materialize(arena, *body)),
+            body: novarocks_parser::ast::AstBox::new(materialize(arena, *body)),
         },
         ScalarNode::AggregateCall {
             name,
@@ -1150,12 +1152,12 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             decimal_overflow_policy,
         } => ExprKind::Cast {
             array_failure_mode: *array_failure_mode,
-            expr: Box::new(materialize(arena, *child)),
+            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
             target: target.clone(),
             decimal_overflow_policy: *decimal_overflow_policy,
         },
         ScalarNode::IsNull { child, negated } => ExprKind::IsNull {
-            expr: Box::new(materialize(arena, *child)),
+            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
             negated: *negated,
         },
         ScalarNode::InList {
@@ -1163,7 +1165,7 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             list,
             negated,
         } => ExprKind::InList {
-            expr: Box::new(materialize(arena, *child)),
+            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
             list: list.iter().map(|item| materialize(arena, *item)).collect(),
             negated: *negated,
         },
@@ -1173,9 +1175,9 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             high,
             negated,
         } => ExprKind::Between {
-            expr: Box::new(materialize(arena, *child)),
-            low: Box::new(materialize(arena, *low)),
-            high: Box::new(materialize(arena, *high)),
+            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
+            low: novarocks_parser::ast::AstBox::new(materialize(arena, *low)),
+            high: novarocks_parser::ast::AstBox::new(materialize(arena, *high)),
             negated: *negated,
         },
         ScalarNode::Like {
@@ -1183,8 +1185,8 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             pattern,
             negated,
         } => ExprKind::Like {
-            expr: Box::new(materialize(arena, *child)),
-            pattern: Box::new(materialize(arena, *pattern)),
+            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
+            pattern: novarocks_parser::ast::AstBox::new(materialize(arena, *pattern)),
             negated: *negated,
         },
         ScalarNode::Case {
@@ -1192,23 +1194,27 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             when_then,
             else_expr,
         } => ExprKind::Case {
-            operand: operand.map(|item| Box::new(materialize(arena, item))),
+            operand: operand
+                .map(|item| novarocks_parser::ast::AstBox::new(materialize(arena, item))),
             when_then: when_then
                 .iter()
                 .map(|(when, then)| (materialize(arena, *when), materialize(arena, *then)))
                 .collect(),
-            else_expr: else_expr.map(|item| Box::new(materialize(arena, item))),
+            else_expr: else_expr
+                .map(|item| novarocks_parser::ast::AstBox::new(materialize(arena, item))),
         },
         ScalarNode::IsTruthValue {
             child,
             value,
             negated,
         } => ExprKind::IsTruthValue {
-            expr: Box::new(materialize(arena, *child)),
+            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
             value: *value,
             negated: *negated,
         },
-        ScalarNode::Nested(child) => ExprKind::Nested(Box::new(materialize(arena, *child))),
+        ScalarNode::Nested(child) => ExprKind::Nested(novarocks_parser::ast::AstBox::new(
+            materialize(arena, *child),
+        )),
         ScalarNode::WindowCall {
             name,
             args,
@@ -1243,7 +1249,7 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
         },
         ScalarNode::Lambda { params, body } => ExprKind::Lambda {
             params: params.clone(),
-            body: Box::new(materialize(arena, *body)),
+            body: novarocks_parser::ast::AstBox::new(materialize(arena, *body)),
         },
     };
     TypedExpr {

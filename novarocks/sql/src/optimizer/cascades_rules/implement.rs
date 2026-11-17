@@ -2011,9 +2011,9 @@ mod join_demotion_tests {
     fn bin(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),

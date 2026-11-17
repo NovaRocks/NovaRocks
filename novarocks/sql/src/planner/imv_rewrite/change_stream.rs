@@ -804,7 +804,7 @@ mod tests {
                         ),
                         volatility: crate::functions::builtin_function_volatility("state_all_zero"),
                         name: "state_all_zero".to_string(),
-                        args: Vec::new(),
+                        args: (Vec::new()).into(),
                         distinct: false,
                     },
                     value_type: novarocks_type_contract::FunctionValueType::new(

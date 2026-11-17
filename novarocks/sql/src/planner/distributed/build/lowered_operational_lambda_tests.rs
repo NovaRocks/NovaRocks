@@ -196,7 +196,7 @@ fn nested_identity_lambda_owner() -> (SqlAuthoredPhysicalPlan, ValueType) {
                 slot_id: 37,
                 value_type: parameter_type.clone(),
             }],
-            body: Box::new(TypedExpr {
+            body: novarocks_parser::ast::AstBox::new(TypedExpr {
                 kind: ExprKind::LambdaParamRef {
                     name: "item".into(),
                     slot_id: 37,
@@ -234,7 +234,7 @@ fn nested_identity_lambda_owner() -> (SqlAuthoredPhysicalPlan, ValueType) {
     let expression = TypedExpr {
         kind: ExprKind::FunctionCall {
             name: "array_map".into(),
-            args: expressions,
+            args: (expressions).into(),
             distinct: false,
             binding: SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError),
             volatility,

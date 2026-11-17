@@ -315,9 +315,9 @@ mod tests {
     fn correlation_predicate(nullable: bool) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref(INNER_K, "k", nullable)),
+                left: novarocks_parser::ast::AstBox::new(col_ref(INNER_K, "k", nullable)),
                 op: BinOp::Eq,
-                right: Box::new(col_ref(OUTER_K, "k", false)),
+                right: novarocks_parser::ast::AstBox::new(col_ref(OUTER_K, "k", false)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(

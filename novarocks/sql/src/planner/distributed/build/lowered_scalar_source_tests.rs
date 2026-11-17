@@ -94,7 +94,7 @@ pub(in crate::planner::distributed::build) fn lower_call(
     TypedExpr {
         kind: ExprKind::FunctionCall {
             name: "lower".into(),
-            args: vec![argument],
+            args: (vec![argument]).into(),
             distinct: false,
             binding: SqlFunctionBinding::new(resolved, decimal),
             volatility,
@@ -342,14 +342,14 @@ fn scalar_journal_original_cast_and_nested_none_survive_constant_emission() {
         TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(text("ABC")),
+                expr: novarocks_parser::ast::AstBox::new(text("ABC")),
                 target: DataType::Utf8,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },
             value_type: ValueType::new(DataType::Utf8, false),
         },
         TypedExpr {
-            kind: ExprKind::Nested(Box::new(text("ABC"))),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(text("ABC"))),
             value_type: ValueType::new(DataType::Utf8, false),
         },
     ] {
@@ -387,7 +387,10 @@ fn scalar_journal_lambda_body_call_keeps_its_actual_emission_scope() {
                 slot_id: 9,
                 value_type: parameter_type,
             }],
-            body: Box::new(lower_call(parameter, DecimalOverflowPolicy::ReportError)),
+            body: novarocks_parser::ast::AstBox::new(lower_call(
+                parameter,
+                DecimalOverflowPolicy::ReportError,
+            )),
         },
         value_type: ValueType::new(DataType::Null, true),
     };
@@ -528,7 +531,7 @@ fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources
     let cast = TypedExpr {
         kind: ExprKind::Cast {
             array_failure_mode: None,
-            expr: Box::new(null),
+            expr: novarocks_parser::ast::AstBox::new(null),
             target: DataType::Utf8,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
         },

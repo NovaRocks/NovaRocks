@@ -295,9 +295,9 @@ mod tests {
     fn eq(l: TypedExpr, r: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(l),
+                left: novarocks_parser::ast::AstBox::new(l),
                 op: BinOp::Eq,
-                right: Box::new(r),
+                right: novarocks_parser::ast::AstBox::new(r),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(

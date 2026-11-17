@@ -553,9 +553,9 @@ mod tests {
     fn eq_typed(a: &str, b: &str) -> crate::analysis::TypedExpr {
         crate::analysis::TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref_typed(a, DataType::Int64)),
+                left: novarocks_parser::ast::AstBox::new(col_ref_typed(a, DataType::Int64)),
                 op: BinOp::Eq,
-                right: Box::new(col_ref_typed(b, DataType::Int64)),
+                right: novarocks_parser::ast::AstBox::new(col_ref_typed(b, DataType::Int64)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -1156,9 +1156,19 @@ mod tests {
 
         let join_cond = crate::analysis::TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(qualified_col("t1", "c_bigint", c_bigint, DataType::Int64)),
+                left: novarocks_parser::ast::AstBox::new(qualified_col(
+                    "t1",
+                    "c_bigint",
+                    c_bigint,
+                    DataType::Int64,
+                )),
                 op: BinOp::Eq,
-                right: Box::new(qualified_col("t2", "c_int", c_int, DataType::Int32)),
+                right: novarocks_parser::ast::AstBox::new(qualified_col(
+                    "t2",
+                    "c_int",
+                    c_int,
+                    DataType::Int32,
+                )),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -1323,14 +1333,19 @@ mod tests {
         );
         let join_cond = crate::analysis::TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(qualified_col(
+                left: novarocks_parser::ast::AstBox::new(qualified_col(
                     "cs",
                     "cs_sold_date_sk",
                     sold_date,
                     DataType::Int64,
                 )),
                 op: BinOp::Eq,
-                right: Box::new(qualified_col("d", "d_date_sk", date_sk, DataType::Int64)),
+                right: novarocks_parser::ast::AstBox::new(qualified_col(
+                    "d",
+                    "d_date_sk",
+                    date_sk,
+                    DataType::Int64,
+                )),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -1482,9 +1497,19 @@ mod tests {
         let right = scan_opt_with_alias("t2", Some("t2"), &[("c_int", c_int, DataType::Int32)]);
         let join_cond = crate::analysis::TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(qualified_col("t1", "c_bigint", c_bigint, DataType::Int64)),
+                left: novarocks_parser::ast::AstBox::new(qualified_col(
+                    "t1",
+                    "c_bigint",
+                    c_bigint,
+                    DataType::Int64,
+                )),
                 op: BinOp::Eq,
-                right: Box::new(qualified_col("t2", "c_int", c_int, DataType::Int32)),
+                right: novarocks_parser::ast::AstBox::new(qualified_col(
+                    "t2",
+                    "c_int",
+                    c_int,
+                    DataType::Int32,
+                )),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),

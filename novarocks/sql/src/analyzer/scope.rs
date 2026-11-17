@@ -692,7 +692,7 @@ impl AnalyzerScope {
                     volatility: crate::functions::builtin_function_volatility("coalesce"),
                     name: "coalesce".to_string(),
                     binding: bound.binding,
-                    args: bound.args,
+                    args: (bound.args).into(),
                     distinct: false,
                 },
                 value_type,

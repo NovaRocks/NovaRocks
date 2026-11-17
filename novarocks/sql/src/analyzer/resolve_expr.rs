@@ -198,6 +198,7 @@ fn string_literal_expr(value: String, span: Span) -> ast::Expr {
     })
 }
 
+#[recursive::recursive]
 fn validate_nested_decimal_cast_policy(expr: &TypedExpr) -> Result<(), &'static str> {
     let visit = validate_nested_decimal_cast_policy;
     match &expr.kind {
@@ -435,7 +436,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 Ok(TypedExpr {
                     kind: ExprKind::UnaryOp {
                         op: UnOp::Not,
-                        expr: Box::new(inner_typed),
+                        expr: novarocks_parser::ast::AstBox::new(inner_typed),
                     },
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Boolean,
@@ -469,7 +470,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 Ok(TypedExpr {
                     kind: ExprKind::UnaryOp {
                         op: UnOp::Negate,
-                        expr: Box::new(inner_typed),
+                        expr: novarocks_parser::ast::AstBox::new(inner_typed),
                     },
                     value_type,
                 })
@@ -498,7 +499,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 Ok(TypedExpr {
                     kind: ExprKind::UnaryOp {
                         op: UnOp::BitwiseNot,
-                        expr: Box::new(inner_typed),
+                        expr: novarocks_parser::ast::AstBox::new(inner_typed),
                     },
                     value_type,
                 })
@@ -641,7 +642,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 let inner_typed = self.analyze_expr(&nested.expression, scope)?;
                 let value_type = inner_typed.value_type.clone();
                 Ok(TypedExpr {
-                    kind: ExprKind::Nested(Box::new(inner_typed)),
+                    kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(inner_typed)),
                     value_type,
                 })
             }
@@ -1023,7 +1024,7 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok(TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(TypedExpr {
+                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::String(value)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Utf8,
@@ -1204,7 +1205,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     Ok(TypedExpr {
                         kind: ExprKind::UnaryOp {
                             op: UnOp::Not,
-                            expr: Box::new(equal),
+                            expr: novarocks_parser::ast::AstBox::new(equal),
                         },
                         value_type,
                     })
@@ -1214,7 +1215,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 let inner = self.analyze_expr(value, scope)?;
                 Ok(TypedExpr {
                     kind: ExprKind::IsNull {
-                        expr: Box::new(inner),
+                        expr: novarocks_parser::ast::AstBox::new(inner),
                         negated: predicate.negated,
                     },
                     value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1227,7 +1228,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 let inner = self.analyze_expr(value, scope)?;
                 Ok(TypedExpr {
                     kind: ExprKind::IsTruthValue {
-                        expr: Box::new(inner),
+                        expr: novarocks_parser::ast::AstBox::new(inner),
                         value: predicate.truth_value == ast::TruthValue::True,
                         negated: predicate.negated,
                     },
@@ -1359,8 +1360,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 .any(|candidate| candidate.value_type.nullable());
         Ok(TypedExpr {
             kind: ExprKind::InList {
-                expr: Box::new(expr_typed),
-                list: list_typed,
+                expr: novarocks_parser::ast::AstBox::new(expr_typed),
+                list: (list_typed).into(),
                 negated,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1431,9 +1432,9 @@ impl<'a> super::AnalyzerContext<'a> {
             || high_typed.value_type.nullable();
         Ok(TypedExpr {
             kind: ExprKind::Between {
-                expr: Box::new(expr_typed),
-                low: Box::new(low_typed),
-                high: Box::new(high_typed),
+                expr: novarocks_parser::ast::AstBox::new(expr_typed),
+                low: novarocks_parser::ast::AstBox::new(low_typed),
+                high: novarocks_parser::ast::AstBox::new(high_typed),
                 negated: predicate.negated,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1455,8 +1456,8 @@ impl<'a> super::AnalyzerContext<'a> {
         let nullable = expr_typed.value_type.nullable() || pattern_typed.value_type.nullable();
         Ok(TypedExpr {
             kind: ExprKind::Like {
-                expr: Box::new(expr_typed),
-                pattern: Box::new(pattern_typed),
+                expr: novarocks_parser::ast::AstBox::new(expr_typed),
+                pattern: novarocks_parser::ast::AstBox::new(pattern_typed),
                 negated: predicate.negated,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1673,9 +1674,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 || compares_element_wise_with_nulls(right_typed.value_type.data_type()));
         Ok(TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left_typed),
+                left: novarocks_parser::ast::AstBox::new(left_typed),
                 op,
-                right: Box::new(right_typed),
+                right: novarocks_parser::ast::AstBox::new(right_typed),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1714,9 +1715,9 @@ impl<'a> super::AnalyzerContext<'a> {
                     let nullable = left.value_type.nullable() || right.value_type.nullable();
                     next_level.push(TypedExpr {
                         kind: ExprKind::BinaryOp {
-                            left: Box::new(left),
+                            left: novarocks_parser::ast::AstBox::new(left),
                             op: bin_op,
-                            right: Box::new(right),
+                            right: novarocks_parser::ast::AstBox::new(right),
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
@@ -1871,9 +1872,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 let nullable = left_cast.value_type.nullable() || right_cast.value_type.nullable();
                 return Ok(TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(left_cast),
+                        left: novarocks_parser::ast::AstBox::new(left_cast),
                         op: BinOp::Or,
-                        right: Box::new(right_cast),
+                        right: novarocks_parser::ast::AstBox::new(right_cast),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -1926,9 +1927,9 @@ impl<'a> super::AnalyzerContext<'a> {
         };
         Ok(TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left_typed),
+                left: novarocks_parser::ast::AstBox::new(left_typed),
                 op: bin_op,
-                right: Box::new(right_typed),
+                right: novarocks_parser::ast::AstBox::new(right_typed),
                 decimal_overflow_policy: if matches!(
                     bin_op,
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
@@ -2069,9 +2070,9 @@ impl<'a> super::AnalyzerContext<'a> {
 
         Ok(TypedExpr {
             kind: ExprKind::Case {
-                operand: operand_typed,
-                when_then,
-                else_expr: else_typed,
+                operand: operand_typed.map(novarocks_parser::ast::AstBox::from_box),
+                when_then: (when_then).into(),
+                else_expr: else_typed.map(novarocks_parser::ast::AstBox::from_box),
             },
             value_type: super::helpers::with_nullability(result_type, true),
         })
@@ -2140,7 +2141,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 volatility: self.function_catalog.volatility(function_name),
                 name: function_name.to_string(),
                 binding: bound.binding,
-                args: bound.args,
+                args: (bound.args).into(),
                 distinct: false,
             },
             value_type,
@@ -2578,7 +2579,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     *arg = TypedExpr {
                         kind: ExprKind::Cast {
                             array_failure_mode: None,
-                            expr: Box::new(inner),
+                            expr: novarocks_parser::ast::AstBox::new(inner),
                             target: DataType::Float64,
                             decimal_overflow_policy: self
                                 .sql_semantics
@@ -2667,7 +2668,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     *arg = TypedExpr {
                         kind: ExprKind::Cast {
                             array_failure_mode: None,
-                            expr: Box::new(inner),
+                            expr: novarocks_parser::ast::AstBox::new(inner),
                             target: DataType::Boolean,
                             decimal_overflow_policy: self
                                 .sql_semantics
@@ -2844,13 +2845,13 @@ impl<'a> super::AnalyzerContext<'a> {
             return Ok(TypedExpr {
                 kind: ExprKind::WindowCall {
                     name,
-                    args: args_typed,
+                    args: (args_typed).into(),
                     distinct: is_distinct,
                     binding,
-                    function_order_by: func_order_by,
+                    function_order_by: (func_order_by).into(),
                     aggregate_binding,
-                    partition_by,
-                    order_by,
+                    partition_by: (partition_by).into(),
+                    order_by: (order_by).into(),
                     window_frame,
                     ignore_nulls,
                 },
@@ -2885,7 +2886,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     *arg = TypedExpr {
                         kind: ExprKind::Cast {
                             array_failure_mode: None,
-                            expr: Box::new(inner),
+                            expr: novarocks_parser::ast::AstBox::new(inner),
                             target: DataType::Utf8,
                             decimal_overflow_policy: self
                                 .sql_semantics
@@ -2930,7 +2931,7 @@ impl<'a> super::AnalyzerContext<'a> {
             *value_arg = TypedExpr {
                 kind: ExprKind::Cast {
                     array_failure_mode: None,
-                    expr: Box::new(inner),
+                    expr: novarocks_parser::ast::AstBox::new(inner),
                     target: target.clone(),
                     decimal_overflow_policy: self
                         .sql_semantics
@@ -2963,7 +2964,7 @@ impl<'a> super::AnalyzerContext<'a> {
             args_typed[0] = TypedExpr {
                 kind: ExprKind::Cast {
                     array_failure_mode: None,
-                    expr: Box::new(inner),
+                    expr: novarocks_parser::ast::AstBox::new(inner),
                     target: DataType::Boolean,
                     decimal_overflow_policy: self
                         .sql_semantics
@@ -3084,8 +3085,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 .iter()
                 .map(|arg| arg.value_type.data_type().clone())
                 .collect();
-            args_typed = bound.args.clone();
-            bound_scalar = Some(bound);
+            args_typed = bound.args;
+            bound_scalar = Some(bound.binding);
         }
 
         match original_name.as_str() {
@@ -3109,7 +3110,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             .function_catalog
                             .volatility("ds_hll_count_distinct_state"),
                         name: "ds_hll_count_distinct_state".to_string(),
-                        args: bound_state.args,
+                        args: (bound_state.args).into(),
                         distinct: false,
                         binding: bound_state.binding,
                     },
@@ -3127,9 +3128,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 return Ok(TypedExpr {
                     kind: ExprKind::AggregateCall {
                         name: "ds_hll_count_distinct_union".to_string(),
-                        args: vec![state_expr],
+                        args: (vec![state_expr]).into(),
                         distinct: false,
-                        order_by: func_order_by,
+                        order_by: (func_order_by).into(),
                         resolved: aggregate_signature.clone(),
                     },
                     value_type: crate::functions::aggregate_result_type(&aggregate_signature)
@@ -3154,9 +3155,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 return Ok(TypedExpr {
                     kind: ExprKind::AggregateCall {
                         name: "ds_hll_count_distinct_union".to_string(),
-                        args: args_typed,
+                        args: (args_typed).into(),
                         distinct: false,
-                        order_by: func_order_by,
+                        order_by: (func_order_by).into(),
                         resolved: aggregate_signature.clone(),
                     },
                     value_type: crate::functions::aggregate_result_type(&aggregate_signature)
@@ -3181,9 +3182,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 return Ok(TypedExpr {
                     kind: ExprKind::AggregateCall {
                         name: "ds_hll_count_distinct_merge".to_string(),
-                        args: args_typed,
+                        args: (args_typed).into(),
                         distinct: false,
-                        order_by: func_order_by,
+                        order_by: (func_order_by).into(),
                         resolved: aggregate_signature.clone(),
                     },
                     value_type: crate::functions::aggregate_result_type(&aggregate_signature)
@@ -3238,9 +3239,9 @@ impl<'a> super::AnalyzerContext<'a> {
             Ok(TypedExpr {
                 kind: ExprKind::AggregateCall {
                     name,
-                    args: args_typed,
+                    args: (args_typed).into(),
                     distinct: is_distinct,
-                    order_by: func_order_by,
+                    order_by: (func_order_by).into(),
                     resolved: signature,
                 },
                 value_type,
@@ -3248,7 +3249,14 @@ impl<'a> super::AnalyzerContext<'a> {
         } else {
             // Scalar function
             let mut return_type = match bound_scalar.as_ref() {
-                Some(bound) => bound.return_type().clone(),
+                Some(binding) => match &binding.selected.result_type {
+                    novarocks_functions::FunctionResultType::Scalar(result) => {
+                        result.data_type().clone()
+                    }
+                    novarocks_functions::FunctionResultType::Relation(_) => {
+                        unreachable!("scalar function cannot have a relation result")
+                    }
+                },
                 None => infer_scalar_return_type_with_catalog(
                     self.function_catalog,
                     &name,
@@ -3330,9 +3338,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                 }
             }
-            let binding = bound_scalar
-                .expect("non-macro scalar function must be bound")
-                .binding;
+            let binding = bound_scalar.expect("non-macro scalar function must be bound");
             let bound_result = match &binding.selected.result_type {
                 novarocks_functions::FunctionResultType::Scalar(result) => result,
                 novarocks_functions::FunctionResultType::Relation(_) => {
@@ -3349,7 +3355,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 kind: ExprKind::FunctionCall {
                     volatility: self.function_catalog.volatility(&name),
                     name,
-                    args: args_typed,
+                    args: (args_typed).into(),
                     distinct: is_distinct,
                     binding,
                 },
@@ -3549,7 +3555,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
                 kind: ExprKind::LambdaFunction {
                     params: lambda_params,
-                    body: Box::new(body),
+                    body: novarocks_parser::ast::AstBox::new(body),
                 },
             };
             let args = vec![source, lambda];
@@ -3621,7 +3627,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
             kind: ExprKind::LambdaFunction {
                 params: lambda_params,
-                body: Box::new(body),
+                body: novarocks_parser::ast::AstBox::new(body),
             },
         };
 
@@ -3855,7 +3861,7 @@ impl<'a> super::AnalyzerContext<'a> {
         let lambda_typed = TypedExpr {
             kind: ExprKind::LambdaFunction {
                 params: lambda_params,
-                body: Box::new(body_typed),
+                body: novarocks_parser::ast::AstBox::new(body_typed),
             },
             value_type: body_type,
         };
@@ -3910,7 +3916,7 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok(Some(TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(array_expr),
+                expr: novarocks_parser::ast::AstBox::new(array_expr),
                 target: target.clone(),
                 decimal_overflow_policy: self.sql_semantics.sql_mode().decimal_overflow_policy(),
             },
@@ -4338,6 +4344,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
     /// Recursively check if an expression contains an aggregate function call.
     /// Window functions (with OVER) are NOT counted as aggregates.
+    #[recursive::recursive]
     pub(super) fn expr_contains_aggregate(&self, expr: &ast::Expr) -> bool {
         match expr {
             ast::Expr::JsonQuery(node) => {
@@ -4629,7 +4636,7 @@ fn normalize_slice_arguments(
         args[0] = TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(inner),
+                expr: novarocks_parser::ast::AstBox::new(inner),
                 target: domain.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -4816,7 +4823,7 @@ pub(crate) fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> Typed
             value_type: novarocks_type_contract::FunctionValueType::new(target.clone(), nullable),
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(expr),
+                expr: novarocks_parser::ast::AstBox::new(expr),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -5110,7 +5117,7 @@ pub(super) fn cast_null_preserving_target_type(
     TypedExpr {
         kind: ExprKind::Cast {
             array_failure_mode: None,
-            expr: Box::new(expr),
+            expr: novarocks_parser::ast::AstBox::new(expr),
             target: target.clone(),
             decimal_overflow_policy,
         },
@@ -5240,7 +5247,7 @@ fn cast_to_utf8_if_needed(expr: &mut TypedExpr) -> bool {
     *expr = TypedExpr {
         kind: ExprKind::Cast {
             array_failure_mode: None,
-            expr: Box::new(inner),
+            expr: novarocks_parser::ast::AstBox::new(inner),
             target: DataType::Utf8,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
@@ -5470,7 +5477,7 @@ pub(super) fn resolved_scalar_call_at(
             volatility: binding.semantics.volatility,
             name: name.to_string(),
             binding,
-            args,
+            args: (args).into(),
             distinct: false,
         },
         value_type: result,
@@ -5577,7 +5584,7 @@ fn coerce_function_argument(
         return Ok(TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(expr),
+                expr: novarocks_parser::ast::AstBox::new(expr),
                 target: target.clone(),
                 decimal_overflow_policy,
             },
@@ -5596,7 +5603,7 @@ fn coerce_function_argument(
     Ok(TypedExpr {
         kind: ExprKind::Cast {
             array_failure_mode: None,
-            expr: Box::new(expr),
+            expr: novarocks_parser::ast::AstBox::new(expr),
             target: target.clone(),
             decimal_overflow_policy,
         },
@@ -6219,7 +6226,7 @@ fn apply_implicit_aggregate_casts(name: &str, args: &mut [TypedExpr]) -> bool {
         *arg = TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(inner),
+                expr: novarocks_parser::ast::AstBox::new(inner),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -6441,7 +6448,7 @@ fn implicit_cast_to_boolean(expr: TypedExpr) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Cast {
             array_failure_mode: None,
-            expr: Box::new(expr),
+            expr: novarocks_parser::ast::AstBox::new(expr),
             target: DataType::Boolean,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
@@ -7034,6 +7041,7 @@ fn column_name_of_expr(expr: &TypedExpr) -> String {
     }
 }
 
+#[recursive::recursive]
 fn typed_expr_contains_column_ref(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::ColumnRef { .. } => true,
@@ -7083,6 +7091,7 @@ fn typed_expr_contains_column_ref(expr: &TypedExpr) -> bool {
     }
 }
 
+#[recursive::recursive]
 fn typed_expr_contains_nondeterministic_call(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     expr: &TypedExpr,
@@ -7154,6 +7163,7 @@ fn typed_expr_references_all_lambda_params(expr: &TypedExpr, params: &[LambdaPar
         .all(|param| referenced.contains(param.name.as_str()))
 }
 
+#[recursive::recursive]
 fn collect_lambda_param_refs<'a>(
     expr: &'a TypedExpr,
     referenced: &mut std::collections::HashSet<&'a str>,
@@ -8914,6 +8924,7 @@ mod tests {
             panic!("expected exact arithmetic");
         };
         assert!(matches!(right.kind, ExprKind::ColumnRef { .. }));
+        let left = left.into_inner();
         let ExprKind::FunctionCall { binding, args, .. } = left.kind else {
             panic!("nonliteral NULL must invoke its exact lift owner");
         };
@@ -9876,7 +9887,7 @@ mod tests {
                     ),
                     volatility: crate::functions::builtin_function_volatility(name),
                     name: name.to_string(),
-                    args: vec![],
+                    args: (vec![]).into(),
                     distinct: false,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -10350,7 +10361,7 @@ mod tests {
             panic!("admitted CV needs an actual runtime cast");
         };
         assert_eq!(source.value_type, source_type);
-        let ExprKind::Constant(actual) = source.kind else {
+        let ExprKind::Constant(actual) = source.into_inner().kind else {
             panic!("original admitted constant");
         };
         assert_eq!(actual.ordinal(), 1);
@@ -10428,7 +10439,7 @@ mod tests {
             let unary = TypedExpr {
                 kind: ExprKind::UnaryOp {
                     op: crate::analysis::UnOp::Negate,
-                    expr: Box::new(literal),
+                    expr: novarocks_parser::ast::AstBox::new(literal),
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(carrier, false),
             };
@@ -10707,7 +10718,7 @@ mod tests {
             panic!("expected outer Decimal CAST")
         };
         assert_eq!(expr.value_type.data_type().clone(), DataType::Int16);
-        let ExprKind::FunctionCall { args, .. } = expr.kind else {
+        let ExprKind::FunctionCall { args, .. } = expr.into_inner().kind else {
             panic!("expected inner ABS")
         };
         assert_eq!(args[0].value_type.data_type().clone(), DataType::Int8);
@@ -11246,10 +11257,10 @@ mod tests {
             let QueryBody::SetOperation(set) = query.body else {
                 panic!("set operation");
             };
-            let QueryBody::Select(left) = set.left.body else {
+            let QueryBody::Select(left) = set.left.into_inner().body else {
                 panic!("left select");
             };
-            let QueryBody::Select(right) = set.right.body else {
+            let QueryBody::Select(right) = set.right.into_inner().body else {
                 panic!("right select");
             };
             assert_eq!(

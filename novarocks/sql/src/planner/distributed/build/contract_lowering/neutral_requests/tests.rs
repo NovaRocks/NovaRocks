@@ -174,13 +174,13 @@ fn assert_expression_requests(owner: &SqlAuthoredPhysicalPlan) {
 fn neutral_sql_scalar_none_folded_constants_and_nonzero_cv_keep_original_identity() {
     for argument in [
         TypedExpr {
-            kind: TypedKind::Nested(Box::new(scalar::text("MiXeD"))),
+            kind: TypedKind::Nested(novarocks_parser::ast::AstBox::new(scalar::text("MiXeD"))),
             value_type: ValueType::new(DataType::Utf8, false),
         },
         TypedExpr {
             kind: TypedKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(scalar::text("MiXeD")),
+                expr: novarocks_parser::ast::AstBox::new(scalar::text("MiXeD")),
                 target: DataType::Utf8,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },

@@ -222,7 +222,7 @@ fn window_journal_computed_none_and_original_typed_null_remain_distinct() {
     let computed = TypedExpr {
         kind: SqlExprKind::Cast {
             array_failure_mode: None,
-            expr: Box::new(integer(7)),
+            expr: novarocks_parser::ast::AstBox::new(integer(7)),
             target: DataType::Int64,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         },

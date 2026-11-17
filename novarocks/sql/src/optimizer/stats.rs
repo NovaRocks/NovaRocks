@@ -4365,9 +4365,9 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: crate::analysis::BinOp::Eq,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
@@ -4378,9 +4378,9 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: crate::analysis::BinOp::And,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
@@ -4390,7 +4390,7 @@ mod tests {
         TypedExpr {
             value_type: expr.value_type.clone(),
 
-            kind: ExprKind::Nested(Box::new(expr)),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(expr)),
         }
     }
 
@@ -6312,9 +6312,9 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::Between {
-                expr: Box::new(expr),
-                low: Box::new(low),
-                high: Box::new(high),
+                expr: novarocks_parser::ast::AstBox::new(expr),
+                low: novarocks_parser::ast::AstBox::new(low),
+                high: novarocks_parser::ast::AstBox::new(high),
                 negated: false,
             },
         }
@@ -6346,9 +6346,9 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::Between {
-                expr: Box::new(col_ref("a")),
-                low: Box::new(int_lit(0)),
-                high: Box::new(int_lit(10)),
+                expr: novarocks_parser::ast::AstBox::new(col_ref("a")),
+                low: novarocks_parser::ast::AstBox::new(int_lit(0)),
+                high: novarocks_parser::ast::AstBox::new(int_lit(10)),
                 negated: true,
             },
         };
@@ -6636,8 +6636,8 @@ mod tests {
 
                 kind: ExprKind::BinaryOp {
                     op: BinOp::And,
-                    left: Box::new(lit(1)),
-                    right: Box::new(lit(2)),
+                    left: novarocks_parser::ast::AstBox::new(lit(1)),
+                    right: novarocks_parser::ast::AstBox::new(lit(2)),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },

@@ -1314,7 +1314,7 @@ mod scalar_domain_tests {
         let coerced = TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(original),
+                expr: novarocks_parser::ast::AstBox::new(original),
                 target: target.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -1402,7 +1402,7 @@ mod scalar_domain_tests {
         let value = TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(original.clone()),
+                expr: novarocks_parser::ast::AstBox::new(original.clone()),
                 target: original.value_type.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },

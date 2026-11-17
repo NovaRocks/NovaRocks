@@ -195,7 +195,7 @@ fn canonical_conversion_raw_lambda_uses_original_lexical_scope_and_none_request(
                 slot_id: 11,
                 value_type: json(false),
             }],
-            body: Box::new(cast(
+            body: novarocks_parser::ast::AstBox::new(cast(
                 input,
                 ValueType::new(DataType::Utf8, false),
                 DecimalOverflowPolicy::ReportError,

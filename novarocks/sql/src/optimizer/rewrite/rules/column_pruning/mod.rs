@@ -321,9 +321,9 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(col_ref(id_b, "b")),
+                        left: novarocks_parser::ast::AstBox::new(col_ref(id_b, "b")),
                         op: BinOp::Eq,
-                        right: Box::new(TypedExpr {
+                        right: novarocks_parser::ast::AstBox::new(TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
                             value_type: novarocks_type_contract::FunctionValueType::new(
                                 DataType::Utf8,

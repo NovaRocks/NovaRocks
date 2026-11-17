@@ -62,7 +62,7 @@ impl super::AnalyzerContext<'_> {
         }
         Ok(TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(source),
+                expr: novarocks_parser::ast::AstBox::new(source),
                 target: target.data_type().clone(),
                 decimal_overflow_policy: self.sql_semantics.sql_mode().decimal_overflow_policy(),
                 array_failure_mode: Some(mode),
@@ -141,7 +141,7 @@ pub(super) fn cast_to_value_type(
             kind: ExprKind::Cast {
                 array_failure_mode: None,
                 target: target.data_type().clone(),
-                expr: Box::new(source),
+                expr: novarocks_parser::ast::AstBox::new(source),
                 decimal_overflow_policy: sql_semantics.sql_mode().decimal_overflow_policy(),
             },
             value_type: target,
@@ -216,7 +216,7 @@ pub(super) fn coerce_array_common_argument(
                 decimal_overflow_policy,
                 target.clone(),
             ),
-            args: vec![source],
+            args: (vec![source]).into(),
             distinct: false,
         },
     })
@@ -292,7 +292,7 @@ pub(super) fn convert_value_domain_with_catalog(
                 intermediate,
                 target.clone(),
             ),
-            args: vec![source],
+            args: (vec![source]).into(),
             distinct: false,
         },
     };
@@ -309,7 +309,7 @@ pub(super) fn convert_value_domain_with_catalog(
         Ok(TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(converted),
+                expr: novarocks_parser::ast::AstBox::new(converted),
                 target: target.data_type().clone(),
                 decimal_overflow_policy,
             },

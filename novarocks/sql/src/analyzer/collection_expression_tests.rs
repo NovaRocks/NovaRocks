@@ -511,7 +511,7 @@ fn array_cast_modes_have_distinct_semantic_and_scalar_identity_and_survive_rebui
     ] {
         let actual = TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(source.clone()),
+                expr: novarocks_parser::ast::AstBox::new(source.clone()),
                 target: target.data_type().clone(),
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                 array_failure_mode: mode,
@@ -534,7 +534,7 @@ fn array_cast_modes_have_distinct_semantic_and_scalar_identity_and_survive_rebui
     }
     let nested_try = TypedExpr {
         kind: ExprKind::Cast {
-            expr: Box::new(typed[1].clone()),
+            expr: novarocks_parser::ast::AstBox::new(typed[1].clone()),
             target: target.data_type().clone(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             array_failure_mode: Some(ArrayCastFailureMode::OutputNull),

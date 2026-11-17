@@ -424,9 +424,13 @@ mod legacy {
                 decimal_overflow_policy,
             } if matches!(op, BinOp::And | BinOp::Or) => TypedExpr {
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(normalize_correlated_on_predicate_inner(*left, outer_ids)),
+                    left: novarocks_parser::ast::AstBox::new(
+                        normalize_correlated_on_predicate_inner(left.into_inner(), outer_ids),
+                    ),
                     op,
-                    right: Box::new(normalize_correlated_on_predicate_inner(*right, outer_ids)),
+                    right: novarocks_parser::ast::AstBox::new(
+                        normalize_correlated_on_predicate_inner(right.into_inner(), outer_ids),
+                    ),
                     decimal_overflow_policy,
                 },
                 value_type,
@@ -466,8 +470,8 @@ mod legacy {
                     },
                     (false, true) => {
                         let inner_type = left.value_type.data_type().clone();
-                        let inner_expr = *left;
-                        let mut outer_expr = *right;
+                        let inner_expr = left.into_inner();
+                        let mut outer_expr = right.into_inner();
                         if *outer_expr.value_type.data_type() != inner_type {
                             outer_expr = TypedExpr {
                                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -477,7 +481,7 @@ mod legacy {
 
                                 kind: ExprKind::Cast {
                                     array_failure_mode: None,
-                                    expr: Box::new(outer_expr),
+                                    expr: novarocks_parser::ast::AstBox::new(outer_expr),
                                     target: inner_type,
                                     decimal_overflow_policy:
                                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -486,9 +490,9 @@ mod legacy {
                         }
                         TypedExpr {
                             kind: ExprKind::BinaryOp {
-                                left: Box::new(outer_expr),
+                                left: novarocks_parser::ast::AstBox::new(outer_expr),
                                 op: reverse_comparison_op(op),
-                                right: Box::new(inner_expr),
+                                right: novarocks_parser::ast::AstBox::new(inner_expr),
                                 decimal_overflow_policy,
                             },
                             value_type,
@@ -616,9 +620,9 @@ mod legacy {
     pub(super) fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: BinOp::Eq,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -705,9 +709,9 @@ mod tests {
     fn predicate() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref(INNER_K, "k")),
+                left: novarocks_parser::ast::AstBox::new(col_ref(INNER_K, "k")),
                 op: BinOp::Eq,
-                right: Box::new(col_ref(OUTER_K, "k")),
+                right: novarocks_parser::ast::AstBox::new(col_ref(OUTER_K, "k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -717,9 +721,9 @@ mod tests {
     fn typed_inner_left_predicate(inner_type: DataType, outer_type: DataType) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(typed_col_ref(INNER_K, "k", inner_type)),
+                left: novarocks_parser::ast::AstBox::new(typed_col_ref(INNER_K, "k", inner_type)),
                 op: BinOp::Eq,
-                right: Box::new(typed_col_ref(OUTER_K, "k", outer_type)),
+                right: novarocks_parser::ast::AstBox::new(typed_col_ref(OUTER_K, "k", outer_type)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -729,9 +733,9 @@ mod tests {
     fn missing_inner_predicate() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref(MISSING_INNER, "missing_k")),
+                left: novarocks_parser::ast::AstBox::new(col_ref(MISSING_INNER, "missing_k")),
                 op: BinOp::Eq,
-                right: Box::new(col_ref(OUTER_K, "k")),
+                right: novarocks_parser::ast::AstBox::new(col_ref(OUTER_K, "k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),

@@ -153,9 +153,9 @@ fn explain_selected_constants_preserve_scalar_text_and_column_first_equality() {
     assert_eq!(format_expr(&expr, &Control::new(None)).unwrap(), "17");
     let equality = TypedExpr {
         kind: ExprKind::BinaryOp {
-            left: Box::new(expr),
+            left: novarocks_parser::ast::AstBox::new(expr),
             op: BinOp::Eq,
-            right: Box::new(TypedExpr {
+            right: novarocks_parser::ast::AstBox::new(TypedExpr {
                 kind: ExprKind::ColumnRef {
                     column_id: crate::column_id::ColumnId::new_for_test(4),
                     qualifier: Some("t".into()),
@@ -238,7 +238,7 @@ fn diagnostic_recursive_and_byte_work_preserve_entry_quantum_tail_refusals() {
                     )
                 })
                 .collect(),
-            else_expr: Some(Box::new(constant(selected(
+            else_expr: Some(novarocks_parser::ast::AstBox::new(constant(selected(
                 &Int64Array::from(vec![99, 17]),
                 1,
             )))),

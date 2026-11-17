@@ -270,7 +270,7 @@ impl AnalyzerContext<'_> {
             resolved = ResolvedQuery {
                 body: QueryBody::Select(ResolvedSelect {
                     from: Some(Relation::Subquery {
-                        query: Box::new(resolved),
+                        query: novarocks_parser::ast::AstBox::new(resolved),
                         alias: inner_alias,
                         output_columns: input_columns,
                     }),
@@ -281,8 +281,8 @@ impl AnalyzerContext<'_> {
                     has_aggregation: false,
                     distinct: false,
                     repeat: None,
-                    apply_specs: Vec::new(),
-                    predicate_apply_specs: Vec::new(),
+                    apply_specs: (Vec::new()).into(),
+                    predicate_apply_specs: (Vec::new()).into(),
                 }),
                 order_by: Vec::new(),
                 limit: None,
@@ -304,7 +304,7 @@ impl AnalyzerContext<'_> {
         }
         Ok((
             Relation::Subquery {
-                query: Box::new(resolved),
+                query: novarocks_parser::ast::AstBox::new(resolved),
                 alias: qualifier,
                 output_columns: fields,
             },

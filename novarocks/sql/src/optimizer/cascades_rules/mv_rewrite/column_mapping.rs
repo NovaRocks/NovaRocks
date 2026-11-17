@@ -326,9 +326,9 @@ mod tests {
         };
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(data_type, true),
@@ -454,9 +454,9 @@ mod tests {
         let agg = |distinct: bool| TypedExpr {
             kind: ExprKind::AggregateCall {
                 name: "count".to_string(),
-                args: vec![col_ref(&a)],
+                args: (vec![col_ref(&a)]).into(),
                 distinct,
-                order_by: vec![],
+                order_by: (vec![]).into(),
                 resolved: crate::functions::test_resolved_aggregate(
                     "count",
                     &[DataType::Int64],
@@ -557,8 +557,8 @@ mod tests {
         TypedExpr {
             kind: ExprKind::Case {
                 operand: None,
-                when_then: vec![(when, then)],
-                else_expr: else_expr.map(Box::new),
+                when_then: (vec![(when, then)]).into(),
+                else_expr: else_expr.map(novarocks_parser::ast::AstBox::new),
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
@@ -766,7 +766,7 @@ mod tests {
             value_type: value_type.clone(),
             kind: ExprKind::FunctionCall {
                 name: "abs".into(),
-                args,
+                args: (args).into(),
                 distinct: false,
                 volatility: binding.semantics.volatility,
                 binding,
@@ -799,9 +799,9 @@ mod tests {
             value_type: value_type.clone(),
             kind: ExprKind::AggregateCall {
                 name: "array_agg".into(),
-                args,
+                args: (args).into(),
                 distinct: false,
-                order_by,
+                order_by: (order_by).into(),
                 resolved: crate::binding::SqlFunctionBinding::new(resolved, policy),
             },
         }
@@ -911,7 +911,7 @@ mod tests {
                 ),
                 kind: ExprKind::Cast {
                     array_failure_mode: None,
-                    expr: Box::new(col_ref(a)),
+                    expr: novarocks_parser::ast::AstBox::new(col_ref(a)),
                     target: DataType::Decimal128(3, 0),
                     decimal_overflow_policy: policy,
                 },

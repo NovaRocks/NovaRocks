@@ -440,9 +440,9 @@ mod tests {
     fn binop_typed(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -468,9 +468,9 @@ mod tests {
     fn between_typed(expr: TypedExpr, low_v: i64, high_v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Between {
-                expr: Box::new(expr),
-                low: Box::new(int_typed(low_v)),
-                high: Box::new(int_typed(high_v)),
+                expr: novarocks_parser::ast::AstBox::new(expr),
+                low: novarocks_parser::ast::AstBox::new(int_typed(low_v)),
+                high: novarocks_parser::ast::AstBox::new(int_typed(high_v)),
                 negated: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -480,7 +480,7 @@ mod tests {
     fn in_list_typed(expr: TypedExpr, values: &[i64]) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::InList {
-                expr: Box::new(expr),
+                expr: novarocks_parser::ast::AstBox::new(expr),
                 list: values.iter().map(|&v| int_typed(v)).collect(),
                 negated: false,
             },
@@ -1291,7 +1291,7 @@ mod tests {
         TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(value),
+                expr: novarocks_parser::ast::AstBox::new(value),
                 target: target.clone(),
                 decimal_overflow_policy: policy,
             },
@@ -1321,7 +1321,10 @@ mod tests {
             // A finite rank bound must not hide a CAST overflow on a later row.
             let checked = TypedExpr {
                 kind: ExprKind::IsNull {
-                    expr: Box::new(decimal_cast_typed(col_typed(amount), policy)),
+                    expr: novarocks_parser::ast::AstBox::new(decimal_cast_typed(
+                        col_typed(amount),
+                        policy,
+                    )),
                     negated: true,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(

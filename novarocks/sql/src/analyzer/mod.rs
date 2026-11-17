@@ -990,6 +990,7 @@ impl<'a> AnalyzerContext<'a> {
     }
 
     /// Analyze a SetExpr and return (QueryBody, output_columns).
+    #[recursive::recursive]
     fn analyze_set_expr(
         &self,
         set_expr: &ast::SetExpr,
@@ -1026,8 +1027,8 @@ impl<'a> AnalyzerContext<'a> {
                         has_aggregation: false,
                         distinct: false,
                         repeat: None,
-                        apply_specs: Vec::new(),
-                        predicate_apply_specs: Vec::new(),
+                        apply_specs: (Vec::new()).into(),
+                        predicate_apply_specs: (Vec::new()).into(),
                     }),
                     columns,
                 ))
@@ -1070,7 +1071,7 @@ impl<'a> AnalyzerContext<'a> {
                 Ok((
                     QueryBody::Select(ResolvedSelect {
                         from: Some(Relation::Subquery {
-                            query: Box::new(resolved),
+                            query: novarocks_parser::ast::AstBox::new(resolved),
                             alias: String::new(),
                             output_columns: cols.clone(),
                         }),
@@ -1081,8 +1082,8 @@ impl<'a> AnalyzerContext<'a> {
                         has_aggregation: false,
                         distinct: false,
                         repeat: None,
-                        apply_specs: vec![],
-                        predicate_apply_specs: vec![],
+                        apply_specs: (vec![]).into(),
+                        predicate_apply_specs: (vec![]).into(),
                     }),
                     cols,
                 ))
@@ -1178,8 +1179,8 @@ impl<'a> AnalyzerContext<'a> {
                 body: QueryBody::SetOperation(ResolvedSetOp {
                     kind,
                     all,
-                    left: Box::new(left_query),
-                    right: Box::new(right_query),
+                    left: novarocks_parser::ast::AstBox::new(left_query),
+                    right: novarocks_parser::ast::AstBox::new(right_query),
                 }),
                 order_by: vec![],
                 limit: None,
@@ -1494,8 +1495,8 @@ impl<'a> AnalyzerContext<'a> {
             has_aggregation,
             distinct,
             repeat: None,
-            apply_specs: Vec::new(),
-            predicate_apply_specs: Vec::new(),
+            apply_specs: (Vec::new()).into(),
+            predicate_apply_specs: (Vec::new()).into(),
         };
 
         // --- Subquery rewriting ---
@@ -1531,6 +1532,7 @@ impl<'a> AnalyzerContext<'a> {
         self.substitute_select_aliases_for_select_inner(expr, projection, from_scope, false)
     }
 
+    #[recursive::recursive]
     fn substitute_select_aliases_for_select_inner(
         &self,
         expr: TypedExpr,
@@ -1570,13 +1572,23 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *left, projection, from_scope, inside_agg,
-                    )),
+                    left: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            left.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                     op,
-                    right: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *right, projection, from_scope, inside_agg,
-                    )),
+                    right: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            right.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                     decimal_overflow_policy,
                 },
             },
@@ -1585,9 +1597,14 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::UnaryOp {
                     op,
-                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *inner, projection, from_scope, inside_agg,
-                    )),
+                    expr: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            inner.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                 },
             },
             ExprKind::FunctionCall {
@@ -1626,9 +1643,14 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::LambdaFunction {
                     params,
-                    body: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *body, projection, from_scope, inside_agg,
-                    )),
+                    body: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            body.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                 },
             },
             ExprKind::AggregateCall {
@@ -1673,9 +1695,14 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::Cast {
                     array_failure_mode,
-                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *inner, projection, from_scope, inside_agg,
-                    )),
+                    expr: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            inner.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                     target,
                     decimal_overflow_policy,
                 },
@@ -1683,9 +1710,14 @@ impl<'a> AnalyzerContext<'a> {
             ExprKind::Nested(inner) => TypedExpr {
                 value_type: expr.value_type.clone(),
 
-                kind: ExprKind::Nested(Box::new(self.substitute_select_aliases_for_select_inner(
-                    *inner, projection, from_scope, inside_agg,
-                ))),
+                kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(
+                    self.substitute_select_aliases_for_select_inner(
+                        inner.into_inner(),
+                        projection,
+                        from_scope,
+                        inside_agg,
+                    ),
+                )),
             },
             ExprKind::IsNull {
                 expr: inner,
@@ -1694,9 +1726,14 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::IsNull {
-                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *inner, projection, from_scope, inside_agg,
-                    )),
+                    expr: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            inner.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                     negated,
                 },
             },
@@ -1708,9 +1745,14 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::IsTruthValue {
-                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *inner, projection, from_scope, inside_agg,
-                    )),
+                    expr: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            inner.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                     value,
                     negated,
                 },
@@ -1724,9 +1766,14 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::Case {
                     operand: operand.map(|expr| {
-                        Box::new(self.substitute_select_aliases_for_select_inner(
-                            *expr, projection, from_scope, inside_agg,
-                        ))
+                        novarocks_parser::ast::AstBox::new(
+                            self.substitute_select_aliases_for_select_inner(
+                                expr.into_inner(),
+                                projection,
+                                from_scope,
+                                inside_agg,
+                            ),
+                        )
                     }),
                     when_then: when_then
                         .into_iter()
@@ -1742,9 +1789,14 @@ impl<'a> AnalyzerContext<'a> {
                         })
                         .collect(),
                     else_expr: else_expr.map(|expr| {
-                        Box::new(self.substitute_select_aliases_for_select_inner(
-                            *expr, projection, from_scope, inside_agg,
-                        ))
+                        novarocks_parser::ast::AstBox::new(
+                            self.substitute_select_aliases_for_select_inner(
+                                expr.into_inner(),
+                                projection,
+                                from_scope,
+                                inside_agg,
+                            ),
+                        )
                     }),
                 },
             },
@@ -1752,6 +1804,7 @@ impl<'a> AnalyzerContext<'a> {
         }
     }
 
+    #[recursive::recursive]
     fn substitute_select_aliases_inner(
         &self,
         expr: TypedExpr,
@@ -1786,12 +1839,18 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(
-                        self.substitute_select_aliases_inner(*left, projection, inside_agg),
-                    ),
+                    left: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        left.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                     op,
-                    right: Box::new(
-                        self.substitute_select_aliases_inner(*right, projection, inside_agg),
+                    right: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_inner(
+                            right.into_inner(),
+                            projection,
+                            inside_agg,
+                        ),
                     ),
                     decimal_overflow_policy,
                 },
@@ -1801,9 +1860,11 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::UnaryOp {
                     op,
-                    expr: Box::new(
-                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
-                    ),
+                    expr: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        inner.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                 },
             },
             ExprKind::FunctionCall {
@@ -1833,9 +1894,11 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::LambdaFunction {
                     params,
-                    body: Box::new(
-                        self.substitute_select_aliases_inner(*body, projection, inside_agg),
-                    ),
+                    body: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        body.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                 },
             },
             ExprKind::AggregateCall {
@@ -1874,9 +1937,11 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::Cast {
                     array_failure_mode,
-                    expr: Box::new(
-                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
-                    ),
+                    expr: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        inner.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                     target,
                     decimal_overflow_policy,
                 },
@@ -1884,8 +1949,12 @@ impl<'a> AnalyzerContext<'a> {
             ExprKind::Nested(inner) => TypedExpr {
                 value_type: expr.value_type.clone(),
 
-                kind: ExprKind::Nested(Box::new(
-                    self.substitute_select_aliases_inner(*inner, projection, inside_agg),
+                kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(
+                    self.substitute_select_aliases_inner(
+                        inner.into_inner(),
+                        projection,
+                        inside_agg,
+                    ),
                 )),
             },
             ExprKind::IsNull {
@@ -1895,9 +1964,11 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::IsNull {
-                    expr: Box::new(
-                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
-                    ),
+                    expr: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        inner.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                     negated,
                 },
             },
@@ -1909,9 +1980,11 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::IsTruthValue {
-                    expr: Box::new(
-                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
-                    ),
+                    expr: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        inner.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                     value,
                     negated,
                 },
@@ -1925,9 +1998,11 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::Case {
                     operand: operand.map(|expr| {
-                        Box::new(
-                            self.substitute_select_aliases_inner(*expr, projection, inside_agg),
-                        )
+                        novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                            expr.into_inner(),
+                            projection,
+                            inside_agg,
+                        ))
                     }),
                     when_then: when_then
                         .into_iter()
@@ -1939,9 +2014,11 @@ impl<'a> AnalyzerContext<'a> {
                         })
                         .collect(),
                     else_expr: else_expr.map(|expr| {
-                        Box::new(
-                            self.substitute_select_aliases_inner(*expr, projection, inside_agg),
-                        )
+                        novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                            expr.into_inner(),
+                            projection,
+                            inside_agg,
+                        ))
                     }),
                 },
             },
@@ -2498,6 +2575,7 @@ impl<'a> AnalyzerContext<'a> {
         Ok(((), scope))
     }
 
+    #[recursive::recursive]
     fn collect_relation_scope(
         &self,
         relation: &Relation,
@@ -2983,6 +3061,7 @@ impl<'a> AnalyzerContext<'a> {
     /// Top-level references (`inside_agg == false`) are returned unchanged —
     /// they may legitimately point at projection outputs (for example a FULL
     /// OUTER USING coalesce column that is only valid above the Project).
+    #[recursive::recursive]
     fn rebind_order_by_agg_args(
         &self,
         expr: TypedExpr,
@@ -3045,14 +3124,26 @@ impl<'a> AnalyzerContext<'a> {
                 right,
                 decimal_overflow_policy,
             } => ExprKind::BinaryOp {
-                left: Box::new(self.rebind_order_by_agg_args(*left, from_scope, inside_agg)),
+                left: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    left.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 op,
-                right: Box::new(self.rebind_order_by_agg_args(*right, from_scope, inside_agg)),
+                right: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    right.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 decimal_overflow_policy,
             },
             ExprKind::UnaryOp { op, expr: inner } => ExprKind::UnaryOp {
                 op,
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
             },
             ExprKind::FunctionCall {
                 name,
@@ -3077,7 +3168,11 @@ impl<'a> AnalyzerContext<'a> {
                 decimal_overflow_policy,
             } => ExprKind::Cast {
                 array_failure_mode,
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 target,
                 decimal_overflow_policy,
             },
@@ -3085,7 +3180,11 @@ impl<'a> AnalyzerContext<'a> {
                 expr: inner,
                 negated,
             } => ExprKind::IsNull {
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 negated,
             },
             ExprKind::IsTruthValue {
@@ -3093,19 +3192,27 @@ impl<'a> AnalyzerContext<'a> {
                 value,
                 negated,
             } => ExprKind::IsTruthValue {
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 value,
                 negated,
             },
-            ExprKind::Nested(inner) => ExprKind::Nested(Box::new(
-                self.rebind_order_by_agg_args(*inner, from_scope, inside_agg),
+            ExprKind::Nested(inner) => ExprKind::Nested(novarocks_parser::ast::AstBox::new(
+                self.rebind_order_by_agg_args(inner.into_inner(), from_scope, inside_agg),
             )),
             ExprKind::InList {
                 expr: inner,
                 list,
                 negated,
             } => ExprKind::InList {
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 list: list
                     .into_iter()
                     .map(|item| self.rebind_order_by_agg_args(item, from_scope, inside_agg))
@@ -3118,9 +3225,21 @@ impl<'a> AnalyzerContext<'a> {
                 high,
                 negated,
             } => ExprKind::Between {
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
-                low: Box::new(self.rebind_order_by_agg_args(*low, from_scope, inside_agg)),
-                high: Box::new(self.rebind_order_by_agg_args(*high, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
+                low: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    low.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
+                high: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    high.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 negated,
             },
             ExprKind::Like {
@@ -3128,8 +3247,16 @@ impl<'a> AnalyzerContext<'a> {
                 pattern,
                 negated,
             } => ExprKind::Like {
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
-                pattern: Box::new(self.rebind_order_by_agg_args(*pattern, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
+                pattern: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    pattern.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 negated,
             },
             ExprKind::Case {
@@ -3137,8 +3264,13 @@ impl<'a> AnalyzerContext<'a> {
                 when_then,
                 else_expr,
             } => ExprKind::Case {
-                operand: operand
-                    .map(|e| Box::new(self.rebind_order_by_agg_args(*e, from_scope, inside_agg))),
+                operand: operand.map(|e| {
+                    novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                        e.into_inner(),
+                        from_scope,
+                        inside_agg,
+                    ))
+                }),
                 when_then: when_then
                     .into_iter()
                     .map(|(when, then)| {
@@ -3148,8 +3280,13 @@ impl<'a> AnalyzerContext<'a> {
                         )
                     })
                     .collect(),
-                else_expr: else_expr
-                    .map(|e| Box::new(self.rebind_order_by_agg_args(*e, from_scope, inside_agg))),
+                else_expr: else_expr.map(|e| {
+                    novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                        e.into_inner(),
+                        from_scope,
+                        inside_agg,
+                    ))
+                }),
             },
             // Leaves and node kinds that cannot carry an aggregate argument
             // needing a base-column rebind (Literal, LambdaParamRef,
@@ -3161,6 +3298,7 @@ impl<'a> AnalyzerContext<'a> {
     }
 }
 
+#[recursive::recursive]
 fn contains_subquery_placeholder(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::SubqueryPlaceholder { .. } => true,
@@ -4541,6 +4679,67 @@ mod tests {
             return Err("expected exactly one query".to_string());
         };
         Ok(query.clone())
+    }
+
+    /// Deep legal scalar input preserves the original declaration and column
+    /// identity through analysis, then releases the actual returned IR.
+    #[test]
+    fn deep_scalar_calls_keep_declared_types_and_exit_after_analysis() {
+        const DEPTH: usize = 50_000;
+        let baseline_query =
+            parse_native_query("SELECT abs(x) AS result FROM (VALUES (CAST(1 AS DOUBLE))) AS t(x)")
+                .expect("baseline source");
+        let (baseline, baseline_registry, baseline_factory) =
+            analyze(&baseline_query, &TestCatalog, "default").expect("baseline analysis");
+        let expected = &select_body(&baseline).projection[0].expr;
+        assert_eq!(
+            expected.value_type.data_type(),
+            &arrow::datatypes::DataType::Float64
+        );
+        let ExprKind::FunctionCall { args, .. } = &expected.kind else {
+            panic!("baseline scalar call");
+        };
+        assert_eq!(args.len(), 1);
+        let ExprKind::ColumnRef {
+            column_id: expected_column,
+            ..
+        } = args[0].kind
+        else {
+            panic!("baseline source column");
+        };
+        let sql = format!(
+            "SELECT {}x{} AS result FROM (VALUES (CAST(1 AS DOUBLE))) AS t(x)",
+            "abs(".repeat(DEPTH),
+            ")".repeat(DEPTH),
+        );
+        let query = parse_native_query(&sql).expect("deep scalar source");
+        let (resolved, registry, factory) =
+            analyze(&query, &TestCatalog, "default").expect("deep scalar analysis");
+        assert_eq!(resolved.output_columns[0].name, "result");
+        assert_eq!(
+            resolved.output_columns[0].value_type,
+            baseline.output_columns[0].value_type
+        );
+        let copy = resolved.clone();
+        let mut expression = &select_body(&copy).projection[0].expr;
+        for _ in 0..DEPTH {
+            assert_eq!(expression.value_type, expected.value_type);
+            let ExprKind::FunctionCall { name, args, .. } = &expression.kind else {
+                panic!("expected every original scalar call");
+            };
+            assert_eq!(name, "abs");
+            assert_eq!(args.len(), 1);
+            expression = &args[0];
+        }
+        assert_eq!(expression.value_type, args[0].value_type);
+        assert!(
+            matches!(expression.kind, ExprKind::ColumnRef { column_id, .. } if column_id == expected_column)
+        );
+        drop(copy);
+        drop((resolved, registry, factory));
+        drop(query);
+        drop((baseline, baseline_registry, baseline_factory));
+        drop(baseline_query);
     }
 
     fn parse_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {

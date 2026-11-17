@@ -136,7 +136,7 @@ fn scalar_owner() -> SqlAuthoredPhysicalPlan {
     let argument = crate::analysis::TypedExpr {
         kind: crate::analysis::ExprKind::Cast {
             array_failure_mode: None,
-            expr: Box::new(text("MiXeD")),
+            expr: novarocks_parser::ast::AstBox::new(text("MiXeD")),
             target: arrow::datatypes::DataType::Utf8,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         },

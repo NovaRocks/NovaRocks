@@ -428,9 +428,9 @@ mod tests {
     fn comparison(op: BinOp, left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -556,7 +556,7 @@ mod tests {
                 expression.value_type = expression.value_type.with_nullable(true).unwrap();
                 let predicate = TypedExpr {
                     kind: ExprKind::IsNull {
-                        expr: Box::new(expression),
+                        expr: novarocks_parser::ast::AstBox::new(expression),
                         negated,
                     },
                     value_type: novarocks_type_contract::FunctionValueType::new(
@@ -591,8 +591,8 @@ mod tests {
     fn negated_in_list_remains_an_engine_residual() {
         let predicate = TypedExpr {
             kind: ExprKind::InList {
-                expr: Box::new(column_ref()),
-                list: vec![integer(1), integer(2)],
+                expr: novarocks_parser::ast::AstBox::new(column_ref()),
+                list: (vec![integer(1), integer(2)]).into(),
                 negated: true,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),

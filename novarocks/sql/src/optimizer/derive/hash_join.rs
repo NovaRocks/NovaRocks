@@ -544,7 +544,7 @@ mod tests {
 
     fn nested_col(id: u32) -> TypedExpr {
         TypedExpr {
-            kind: ExprKind::Nested(Box::new(col(id))),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(col(id))),
             value_type: novarocks_type_contract::FunctionValueType::new(
                 arrow::datatypes::DataType::Int64,
                 false,
@@ -557,7 +557,7 @@ mod tests {
         TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(input),
+                expr: novarocks_parser::ast::AstBox::new(input),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },

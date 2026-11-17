@@ -186,7 +186,7 @@ mod tests {
                 ),
                 volatility: crate::functions::FunctionVolatility::Immutable,
                 name: name.to_string(),
-                args,
+                args: (args).into(),
                 distinct: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
@@ -206,7 +206,7 @@ mod tests {
                 binding,
                 volatility: crate::functions::FunctionVolatility::Immutable,
                 name: name.to_string(),
-                args,
+                args: (args).into(),
                 distinct: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
@@ -216,9 +216,9 @@ mod tests {
     fn equality_with_ten(expr: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(expr),
+                left: novarocks_parser::ast::AstBox::new(expr),
                 op: BinOp::Eq,
-                right: Box::new(int_literal(10)),
+                right: novarocks_parser::ast::AstBox::new(int_literal(10)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),

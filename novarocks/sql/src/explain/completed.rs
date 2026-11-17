@@ -3984,6 +3984,85 @@ mod tests {
         completed
     }
 
+    /// Deep legal source must exit through the original compiler result or its
+    /// existing physical expression-depth admission, including ordinary drop.
+    #[test]
+    fn deep_scalar_source_returns_a_plan_or_the_existing_physical_depth_error() {
+        use crate::compiler::{CompletionProtocolError, SqlCompileProgressError};
+
+        fn original_depth_rejection(message: &str, lowered: bool) -> bool {
+            let prefix = if lowered {
+                "final physical-plan validation failed: physical plan retains 1 validation error(s); [resource-limit] fragments["
+            } else {
+                "physical plan retains 1 validation error(s); [resource-limit] fragments["
+            };
+            let Some(rest) = message.strip_prefix(prefix) else {
+                return false;
+            };
+            let Some((fragment, detail)) = rest.split_once("].expressions: ") else {
+                return false;
+            };
+            !fragment.is_empty()
+                && fragment.bytes().all(|byte| byte.is_ascii_digit())
+                && detail
+                    == format!(
+                        "expression semantic depth exceeds {}",
+                        novarocks_physical_plan::PlanLimits::FROZEN.expression_semantic_depth
+                    )
+        }
+
+        const DEPTH: usize = 5_000;
+        let baseline = completed_sql(
+            "SELECT abs(x) AS result FROM (VALUES (1)) AS t(x)",
+            SqlCompileIntent::Query,
+            7,
+        );
+        let expected = baseline.plan().result_port().expect("baseline result port");
+        assert_eq!(expected.fields.len(), 1);
+        assert_eq!(expected.fields[0].alias.as_deref(), Some("result"));
+        let sql = format!(
+            "SELECT {}x{} AS result FROM (VALUES (1)) AS t(x)",
+            "abs(".repeat(DEPTH),
+            ")".repeat(DEPTH),
+        );
+        // A self-contained query can reach physical validation while preparing
+        // the first completion step, before start consumes that step.
+        let result = request(&sql, SqlCompileIntent::Query, 7)
+            .try_into_completion()
+            .map_err(SqlCompileProgressError::Compile)
+            .and_then(|input| {
+                SqlCompiler::start(input, &crate::compiler::SqlCompileControl::unbounded())
+            });
+        match result {
+            Ok(SqlCompileProgress::Complete(completed)) => {
+                let actual = completed.plan().result_port().expect("deep result port");
+                assert_eq!(actual.fields.len(), expected.fields.len());
+                assert_eq!(actual.fields[0].alias, expected.fields[0].alias);
+                assert_eq!(actual.fields[0].ty, expected.fields[0].ty);
+                eprintln!(
+                    "Deep source completed with {} fragment(s)",
+                    completed.plan().fragments().len()
+                );
+                drop(completed);
+            }
+            Err(SqlCompileProgressError::Compile(SqlCompileError::Compilation(message))) => {
+                assert!(original_depth_rejection(&message, true), "{message}");
+                eprintln!("Deep source rejected at original physical admission: {message}");
+            }
+            Err(SqlCompileProgressError::Protocol(CompletionProtocolError::PlanValidation(
+                message,
+            ))) => {
+                assert!(original_depth_rejection(&message, false), "{message}");
+                eprintln!("Deep source rejected at original physical admission: {message}");
+            }
+            Ok(SqlCompileProgress::Incomplete(_)) => {
+                panic!("self-contained source requires no external facts")
+            }
+            Err(error) => panic!("unexpected deep-source compiler error: {error}"),
+        }
+        drop(baseline);
+    }
+
     /// Shapes that generated SQL actually produces at scale.
     ///
     /// Every structural bound that can refuse a plan needs the symmetric

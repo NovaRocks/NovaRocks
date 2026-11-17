@@ -604,7 +604,7 @@ fn build_payload_coalesce_assert_filter(
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility("abs"),
             name: "abs".to_string(),
-            args: abs_args,
+            args: (abs_args).into(),
             distinct: false,
             binding: abs_binding,
         },
@@ -743,11 +743,15 @@ fn pending_count_expr(net_column: &OutputColumn, op: BinOp) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Case {
             operand: None,
-            when_then: vec![(
+            when_then: (vec![(
                 binary(column_ref(net_column), op, int_literal(0, DataType::Int64)),
                 int_literal(1, DataType::Int64),
-            )],
-            else_expr: Some(Box::new(int_literal(0, DataType::Int64))),
+            )])
+            .into(),
+            else_expr: Some(novarocks_parser::ast::AstBox::new(int_literal(
+                0,
+                DataType::Int64,
+            ))),
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     }
@@ -1093,15 +1097,16 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
     let case = TypedExpr {
         kind: ExprKind::Case {
             operand: None,
-            when_then: vec![(
+            when_then: (vec![(
                 binary(
                     column_ref(net_column),
                     BinOp::Gt,
                     int_literal(0, DataType::Int64),
                 ),
                 int_literal(i64::from(crate::common::CHANGE_OP_INSERT), DataType::Int8),
-            )],
-            else_expr: Some(Box::new(int_literal(
+            )])
+            .into(),
+            else_expr: Some(novarocks_parser::ast::AstBox::new(int_literal(
                 i64::from(crate::common::CHANGE_OP_DELETE),
                 DataType::Int8,
             ))),
@@ -1111,7 +1116,7 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Cast {
             array_failure_mode: None,
-            expr: Box::new(case),
+            expr: novarocks_parser::ast::AstBox::new(case),
             target: DataType::Int8,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
@@ -1230,9 +1235,9 @@ fn output_column_from_factory(
 fn binary(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::BinaryOp {
-            left: Box::new(left),
+            left: novarocks_parser::ast::AstBox::new(left),
             op,
-            right: Box::new(right),
+            right: novarocks_parser::ast::AstBox::new(right),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -1267,7 +1272,7 @@ fn assert_true_call(
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility("assert_true"),
             name: "assert_true".to_string(),
-            args,
+            args: (args).into(),
             distinct: false,
             binding,
         },
@@ -1278,7 +1283,7 @@ fn assert_true_call(
 fn is_not_null(expr: TypedExpr) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::IsNull {
-            expr: Box::new(expr),
+            expr: novarocks_parser::ast::AstBox::new(expr),
             negated: true,
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -1379,7 +1384,9 @@ fn project_item_for_mapping(
                     TypedExpr {
                         kind: ExprKind::Cast {
                             array_failure_mode: None,
-                            expr: Box::new(column_ref(&desc.action_column)),
+                            expr: novarocks_parser::ast::AstBox::new(column_ref(
+                                &desc.action_column,
+                            )),
                             target: DataType::Int8,
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1393,7 +1400,7 @@ fn project_item_for_mapping(
                 JoinApplyActionProjection::ConstantInsert => TypedExpr {
                     kind: ExprKind::Cast {
                         array_failure_mode: None,
-                        expr: Box::new(int_literal(
+                        expr: novarocks_parser::ast::AstBox::new(int_literal(
                             i64::from(crate::common::CHANGE_OP_INSERT),
                             DataType::Int8,
                         )),
@@ -1525,7 +1532,7 @@ pub(crate) fn join_row_key_expr(
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "join_row_key".to_string(),
-            args,
+            args: (args).into(),
             distinct: false,
             binding,
         },

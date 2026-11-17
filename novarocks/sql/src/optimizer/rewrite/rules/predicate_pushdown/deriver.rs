@@ -1059,9 +1059,9 @@ mod tests {
     fn bool_expr(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
@@ -1097,7 +1097,7 @@ mod tests {
                     ),
                     volatility: crate::functions::FunctionVolatility::Volatile,
                     name: "rand".to_string(),
-                    args: vec![],
+                    args: (vec![]).into(),
                     distinct: false,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1375,9 +1375,9 @@ mod tests {
         let or_pred = bool_expr(
             TypedExpr {
                 kind: ExprKind::Between {
-                    expr: Box::new(col("s", "price", 3)),
-                    low: Box::new(int_lit(100)),
-                    high: Box::new(int_lit(150)),
+                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
+                    low: novarocks_parser::ast::AstBox::new(int_lit(100)),
+                    high: novarocks_parser::ast::AstBox::new(int_lit(150)),
                     negated: false,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1388,9 +1388,9 @@ mod tests {
             BinOp::Or,
             TypedExpr {
                 kind: ExprKind::Between {
-                    expr: Box::new(col("s", "price", 3)),
-                    low: Box::new(int_lit(50)),
-                    high: Box::new(int_lit(200)),
+                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
+                    low: novarocks_parser::ast::AstBox::new(int_lit(50)),
+                    high: novarocks_parser::ast::AstBox::new(int_lit(200)),
                     negated: false,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1423,9 +1423,9 @@ mod tests {
         let or_pred = bool_expr(
             TypedExpr {
                 kind: ExprKind::Between {
-                    expr: Box::new(col("s", "price", 3)),
-                    low: Box::new(large_int_lit(9_007_199_254_740_993)),
-                    high: Box::new(large_int_lit(9_007_199_254_741_500)),
+                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
+                    low: novarocks_parser::ast::AstBox::new(large_int_lit(9_007_199_254_740_993)),
+                    high: novarocks_parser::ast::AstBox::new(large_int_lit(9_007_199_254_741_500)),
                     negated: false,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1436,9 +1436,9 @@ mod tests {
             BinOp::Or,
             TypedExpr {
                 kind: ExprKind::Between {
-                    expr: Box::new(col("s", "price", 3)),
-                    low: Box::new(large_int_lit(9_007_199_254_740_992)),
-                    high: Box::new(large_int_lit(9_007_199_254_741_600)),
+                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
+                    low: novarocks_parser::ast::AstBox::new(large_int_lit(9_007_199_254_740_992)),
+                    high: novarocks_parser::ast::AstBox::new(large_int_lit(9_007_199_254_741_600)),
                     negated: false,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1470,9 +1470,9 @@ mod tests {
         let or_pred = bool_expr(
             TypedExpr {
                 kind: ExprKind::Between {
-                    expr: Box::new(col("s", "price", 3)),
-                    low: Box::new(decimal_lit("10.25")),
-                    high: Box::new(decimal_lit("20.00")),
+                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
+                    low: novarocks_parser::ast::AstBox::new(decimal_lit("10.25")),
+                    high: novarocks_parser::ast::AstBox::new(decimal_lit("20.00")),
                     negated: false,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1483,9 +1483,9 @@ mod tests {
             BinOp::Or,
             TypedExpr {
                 kind: ExprKind::Between {
-                    expr: Box::new(col("s", "price", 3)),
-                    low: Box::new(decimal_lit("9.50")),
-                    high: Box::new(decimal_lit("30.00")),
+                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
+                    low: novarocks_parser::ast::AstBox::new(decimal_lit("9.50")),
+                    high: novarocks_parser::ast::AstBox::new(decimal_lit("30.00")),
                     negated: false,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1516,9 +1516,9 @@ mod tests {
         let or_pred = bool_expr(
             TypedExpr {
                 kind: ExprKind::Between {
-                    expr: Box::new(col("s", "price", 3)),
-                    low: Box::new(string_lit("a")),
-                    high: Box::new(string_lit("z")),
+                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
+                    low: novarocks_parser::ast::AstBox::new(string_lit("a")),
+                    high: novarocks_parser::ast::AstBox::new(string_lit("z")),
                     negated: false,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1529,9 +1529,9 @@ mod tests {
             BinOp::Or,
             TypedExpr {
                 kind: ExprKind::Between {
-                    expr: Box::new(col("s", "price", 3)),
-                    low: Box::new(string_lit("b")),
-                    high: Box::new(string_lit("y")),
+                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
+                    low: novarocks_parser::ast::AstBox::new(string_lit("b")),
+                    high: novarocks_parser::ast::AstBox::new(string_lit("y")),
                     negated: false,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(

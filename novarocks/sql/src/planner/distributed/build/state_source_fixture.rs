@@ -284,7 +284,7 @@ pub fn ordinary_extrema_constant_state_source_for_test(
     let narrow_input = TypedExpr {
         kind: ExprKind::Cast {
             array_failure_mode: None,
-            expr: Box::new(integer(i64::from(i8::MIN))),
+            expr: novarocks_parser::ast::AstBox::new(integer(i64::from(i8::MIN))),
             target: DataType::Int8,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         },
@@ -293,14 +293,14 @@ pub fn ordinary_extrema_constant_state_source_for_test(
     let narrow_minus = TypedExpr {
         kind: ExprKind::UnaryOp {
             op: crate::analysis::UnOp::Negate,
-            expr: Box::new(narrow_input),
+            expr: novarocks_parser::ast::AstBox::new(narrow_input),
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
     };
     let minus = TypedExpr {
         kind: ExprKind::Cast {
             array_failure_mode: None,
-            expr: Box::new(narrow_minus),
+            expr: novarocks_parser::ast::AstBox::new(narrow_minus),
             target: DataType::Int64,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         },
@@ -343,7 +343,7 @@ pub fn ordered_array_state_source_for_test(
     let narrow_input = TypedExpr {
         kind: ExprKind::Cast {
             array_failure_mode: None,
-            expr: Box::new(integer(i64::from(i8::MIN))),
+            expr: novarocks_parser::ast::AstBox::new(integer(i64::from(i8::MIN))),
             target: DataType::Int8,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         },
@@ -353,7 +353,7 @@ pub fn ordered_array_state_source_for_test(
         expr: TypedExpr {
             kind: ExprKind::UnaryOp {
                 op: crate::analysis::UnOp::Negate,
-                expr: Box::new(narrow_input),
+                expr: novarocks_parser::ast::AstBox::new(narrow_input),
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         },

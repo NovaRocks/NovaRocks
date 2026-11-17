@@ -9615,6 +9615,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         Ok(args.into_boxed_slice())
     }
 
+    #[recursive::recursive]
     fn lower_expression(
         &mut self,
         owner: NodeId,
@@ -14762,7 +14763,7 @@ mod tests {
         TypedExpr {
             kind: ExprKind::FunctionCall {
                 name: name.to_string(),
-                args,
+                args: (args).into(),
                 distinct: false,
                 binding,
                 volatility,
@@ -15982,9 +15983,9 @@ mod tests {
         let input = column(1, "number", DataType::Int64, false);
         let predicate = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(column_ref(&input)),
+                left: novarocks_parser::ast::AstBox::new(column_ref(&input)),
                 op: BinOp::Gt,
-                right: Box::new(literal_int(0)),
+                right: novarocks_parser::ast::AstBox::new(literal_int(0)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -16008,9 +16009,9 @@ mod tests {
                     ProjectItem {
                         expr: TypedExpr {
                             kind: ExprKind::BinaryOp {
-                                left: Box::new(column_ref(&input)),
+                                left: novarocks_parser::ast::AstBox::new(column_ref(&input)),
                                 op: BinOp::Add,
-                                right: Box::new(literal_int(1)),
+                                right: novarocks_parser::ast::AstBox::new(literal_int(1)),
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
@@ -16875,9 +16876,9 @@ mod tests {
             kind: PhysicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(column_ref(&input)),
+                        left: novarocks_parser::ast::AstBox::new(column_ref(&input)),
                         op: BinOp::Gt,
-                        right: Box::new(literal_int(0)),
+                        right: novarocks_parser::ast::AstBox::new(literal_int(0)),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -17991,7 +17992,7 @@ mod tests {
             join.condition.keys_mut()[0].right = TypedExpr {
                 kind: ExprKind::Cast {
                     array_failure_mode: None,
-                    expr: Box::new(column_ref(&right)),
+                    expr: novarocks_parser::ast::AstBox::new(column_ref(&right)),
                     target: DataType::Int64,
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -18424,12 +18425,12 @@ mod tests {
         for kind in [
             ExprKind::Case {
                 operand: None,
-                when_then: vec![(literal_bool(true), column_ref(&right))],
-                else_expr: Some(Box::new(literal_int(0))),
+                when_then: (vec![(literal_bool(true), column_ref(&right))]).into(),
+                else_expr: Some(novarocks_parser::ast::AstBox::new(literal_int(0))),
             },
             ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(column_ref(&right)),
+                expr: novarocks_parser::ast::AstBox::new(column_ref(&right)),
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -18778,9 +18779,9 @@ mod tests {
             let predicate = if volatile {
                 TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(scalar_call("rand", vec![])),
+                        left: novarocks_parser::ast::AstBox::new(scalar_call("rand", vec![])),
                         op: BinOp::Gt,
-                        right: Box::new(literal_float(0.0)),
+                        right: novarocks_parser::ast::AstBox::new(literal_float(0.0)),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -19989,32 +19990,33 @@ mod tests {
         let signed = literal_int(7);
         let kinds = [
             ExprKind::BinaryOp {
-                left: Box::new(large.clone()),
+                left: novarocks_parser::ast::AstBox::new(large.clone()),
                 op: BinOp::Eq,
-                right: Box::new(signed.clone()),
+                right: novarocks_parser::ast::AstBox::new(signed.clone()),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             ExprKind::InList {
-                expr: Box::new(large.clone()),
-                list: vec![signed.clone()],
+                expr: novarocks_parser::ast::AstBox::new(large.clone()),
+                list: (vec![signed.clone()]).into(),
                 negated: false,
             },
             ExprKind::Between {
-                expr: Box::new(large.clone()),
-                low: Box::new(signed.clone()),
-                high: Box::new(large.clone()),
+                expr: novarocks_parser::ast::AstBox::new(large.clone()),
+                low: novarocks_parser::ast::AstBox::new(signed.clone()),
+                high: novarocks_parser::ast::AstBox::new(large.clone()),
                 negated: false,
             },
             ExprKind::Case {
-                operand: Some(Box::new(large)),
-                when_then: vec![(
+                operand: Some(novarocks_parser::ast::AstBox::new(large)),
+                when_then: (vec![(
                     signed,
                     TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Bool(true)),
                         value_type: ValueType::new(DataType::Boolean, false),
                     },
-                )],
-                else_expr: Some(Box::new(TypedExpr {
+                )])
+                .into(),
+                else_expr: Some(novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(false)),
                     value_type: ValueType::new(DataType::Boolean, false),
                 })),
@@ -20279,7 +20281,7 @@ mod tests {
                     value_type: declared.clone(),
                 },
                 2 => TypedExpr {
-                    kind: ExprKind::Nested(Box::new(literal_int32(2))),
+                    kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(literal_int32(2))),
                     value_type: declared.clone(),
                 },
                 _ => literal_int32(row),

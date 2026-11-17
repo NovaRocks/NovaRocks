@@ -898,7 +898,7 @@ mod tests {
         local.group_by[0] = TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(input.clone()),
+                expr: novarocks_parser::ast::AstBox::new(input.clone()),
                 target: input.value_type.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -958,7 +958,12 @@ mod tests {
                     topn_mut(plan).items[0].expr = TypedExpr {
                         kind: ExprKind::Cast {
                             array_failure_mode: None,
-                            expr: Box::new(column(1, "key", DataType::Int64, false)),
+                            expr: novarocks_parser::ast::AstBox::new(column(
+                                1,
+                                "key",
+                                DataType::Int64,
+                                false,
+                            )),
                             target: DataType::Int64,
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1420,7 +1425,7 @@ mod tests {
         let expr = TypedExpr {
             kind: ExprKind::Cast {
                 array_failure_mode: None,
-                expr: Box::new(column(
+                expr: novarocks_parser::ast::AstBox::new(column(
                     1,
                     &key.name,
                     key.value_type.data_type().clone(),

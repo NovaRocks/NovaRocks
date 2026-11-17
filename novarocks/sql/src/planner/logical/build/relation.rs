@@ -133,7 +133,7 @@ pub(super) fn plan_relation_scoped(
             alias,
             output_columns,
         } => {
-            let inner_plan = plan_scoped_query(*query, cte_registry, factory, control)?;
+            let inner_plan = plan_scoped_query(query.into_inner(), cte_registry, factory, control)?;
             adapt_plan_output_with_qualifier(
                 inner_plan,
                 &crate::analysis::schema::planner_columns(&output_columns),
@@ -148,7 +148,7 @@ pub(super) fn plan_relation_scoped(
                 right,
                 join_type,
                 condition,
-            } = *join_rel;
+            } = join_rel.into_inner();
             match right {
                 Relation::Unnest(unnest) => {
                     let is_left_join = match join_type {
@@ -472,7 +472,7 @@ pub(super) fn plan_set_operation_scoped(
             offset,
             output_columns,
             local_cte_ids,
-        } = *left;
+        } = left.into_inner();
         let body = match body {
             QueryBody::SetOperation(inner)
                 if order_by.is_empty()
@@ -497,7 +497,7 @@ pub(super) fn plan_set_operation_scoped(
     };
     let mut left = plan_scoped_query(base_left, cte_registry, factory, control)?;
     while let Some((kind, all, right, output_columns)) = operations.pop() {
-        let right = plan_scoped_query(*right, cte_registry, factory, control)?;
+        let right = plan_scoped_query(right.into_inner(), cte_registry, factory, control)?;
         let payload = match kind {
             SetOpKind::Union => LogicalPlanKind::Union(LogicalUnionNode {
                 all,

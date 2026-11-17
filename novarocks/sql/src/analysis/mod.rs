@@ -27,7 +27,7 @@ pub(crate) mod schema;
 pub(crate) use schema::{AnalyzedOutputField, AnalyzedProjectItem};
 
 use arrow::datatypes::DataType;
-use novarocks_parser::ast::{Expr as SqlExpr, Query as SqlQuery};
+use novarocks_parser::ast::{AstBox, AstVec, Expr as SqlExpr, Query as SqlQuery};
 
 use crate::column_id::ColumnId;
 pub use crate::common::LiteralValue;
@@ -140,11 +140,11 @@ pub(crate) struct ResolvedSelect {
     pub repeat: Option<RepeatInfo>,
     /// Scalar subqueries routed to the Apply framework. Consumed by the
     /// planner to emit `LogicalPlanKind::Apply`.
-    pub apply_specs: Vec<ApplyScalarSpec>,
+    pub apply_specs: AstVec<ApplyScalarSpec>,
     /// EXISTS/IN subqueries routed to the Apply framework. Consumed by the
     /// planner alongside `apply_specs` to emit `LogicalPlanKind::Apply`.
     #[allow(dead_code)]
-    pub predicate_apply_specs: Vec<ApplyPredicateSpec>,
+    pub predicate_apply_specs: AstVec<ApplyPredicateSpec>,
 }
 
 /// Metadata for ROLLUP/CUBE/GROUPING SETS repeat execution.
@@ -206,12 +206,12 @@ pub(crate) enum Relation {
     IcebergDeltaScan(IcebergDeltaScanRelation),
     /// A subquery in FROM: `(SELECT ...) AS alias`.
     Subquery {
-        query: Box<ResolvedQuery>,
+        query: AstBox<ResolvedQuery>,
         alias: String,
         output_columns: Vec<AnalyzedOutputField>,
     },
     /// A join between two relations.
-    Join(Box<JoinRelation>),
+    Join(AstBox<JoinRelation>),
     /// `TABLE(generate_series(start, end[, step]))`.
     GenerateSeries(GenerateSeriesRelation),
     /// `LATERAL UNNEST(array_expr[, ...])`.
@@ -320,8 +320,8 @@ pub(crate) struct JoinRelation {
 pub(crate) struct ResolvedSetOp {
     pub kind: SetOpKind,
     pub all: bool,
-    pub left: Box<ResolvedQuery>,
-    pub right: Box<ResolvedQuery>,
+    pub left: AstBox<ResolvedQuery>,
+    pub right: AstBox<ResolvedQuery>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,10 +345,20 @@ pub(crate) struct ResolvedValues {
 // Typed expressions (all nodes carry resolved DataType)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TypedExpr {
     pub kind: ExprKind,
     pub value_type: novarocks_type_contract::FunctionValueType,
+}
+
+impl Clone for TypedExpr {
+    #[recursive::recursive]
+    fn clone(&self) -> Self {
+        Self {
+            kind: self.kind.clone(),
+            value_type: self.value_type.clone(),
+        }
+    }
 }
 
 pub(crate) fn function_argument(
@@ -594,17 +604,17 @@ pub enum ExprKind {
     Constant(novarocks_functions::ConstantValue),
     /// Binary operation (arithmetic, comparison, logical).
     BinaryOp {
-        left: Box<TypedExpr>,
+        left: AstBox<TypedExpr>,
         op: BinOp,
-        right: Box<TypedExpr>,
+        right: AstBox<TypedExpr>,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
     /// Unary operation.
-    UnaryOp { op: UnOp, expr: Box<TypedExpr> },
+    UnaryOp { op: UnOp, expr: AstBox<TypedExpr> },
     /// Scalar function call (non-aggregate).
     FunctionCall {
         name: String,
-        args: Vec<TypedExpr>,
+        args: AstVec<TypedExpr>,
         distinct: bool,
         /// Exact argument and result types selected during analysis.
         /// Downstream stages must preserve this binding and must not resolve
@@ -622,73 +632,76 @@ pub enum ExprKind {
             reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
         )]
         params: Vec<LambdaParam>,
-        body: Box<TypedExpr>,
+        body: AstBox<TypedExpr>,
     },
     /// Aggregate function call.
     AggregateCall {
         name: String,
-        args: Vec<TypedExpr>,
+        args: AstVec<TypedExpr>,
         distinct: bool,
-        order_by: Vec<SortItem>,
+        order_by: AstVec<SortItem>,
         resolved: crate::binding::SqlFunctionBinding,
     },
     /// CAST expression.
     Cast {
         array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
-        expr: Box<TypedExpr>,
+        expr: AstBox<TypedExpr>,
         target: DataType,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
     /// IS [NOT] NULL.
-    IsNull { expr: Box<TypedExpr>, negated: bool },
+    IsNull {
+        expr: AstBox<TypedExpr>,
+        negated: bool,
+    },
     /// [NOT] IN (list).
     InList {
-        expr: Box<TypedExpr>,
-        list: Vec<TypedExpr>,
+        expr: AstBox<TypedExpr>,
+        list: AstVec<TypedExpr>,
         negated: bool,
     },
     /// [NOT] BETWEEN low AND high.
     Between {
-        expr: Box<TypedExpr>,
-        low: Box<TypedExpr>,
-        high: Box<TypedExpr>,
+        expr: AstBox<TypedExpr>,
+        low: AstBox<TypedExpr>,
+        high: AstBox<TypedExpr>,
         negated: bool,
     },
     /// [NOT] LIKE pattern.
     Like {
-        expr: Box<TypedExpr>,
-        pattern: Box<TypedExpr>,
+        expr: AstBox<TypedExpr>,
+        pattern: AstBox<TypedExpr>,
         negated: bool,
     },
     /// CASE [operand] WHEN ... THEN ... [ELSE ...] END.
     Case {
-        operand: Option<Box<TypedExpr>>,
-        when_then: Vec<(TypedExpr, TypedExpr)>,
-        else_expr: Option<Box<TypedExpr>>,
+        operand: Option<AstBox<TypedExpr>>,
+        when_then: AstVec<(TypedExpr, TypedExpr)>,
+        else_expr: Option<AstBox<TypedExpr>>,
     },
     /// IS [NOT] TRUE / IS [NOT] FALSE.
     IsTruthValue {
-        expr: Box<TypedExpr>,
+        expr: AstBox<TypedExpr>,
         value: bool,
         negated: bool,
     },
     /// Parenthesized expression (preserved for display fidelity).
-    Nested(Box<TypedExpr>),
+    Nested(AstBox<TypedExpr>),
     /// Window function call: `func(...) OVER (PARTITION BY ... ORDER BY ... frame)`.
     WindowCall {
         name: String,
-        args: Vec<TypedExpr>,
+        args: AstVec<TypedExpr>,
         distinct: bool,
         binding: crate::binding::SqlFunctionBinding,
         /// ORDER BY owned by the aggregate call itself, for example
         /// `array_agg(value ORDER BY key)`. This is distinct from the ORDER BY
         /// in the OVER specification below.
-        function_order_by: Vec<SortItem>,
+        function_order_by: AstVec<SortItem>,
         /// Exact ordinary aggregate overload selected during analysis. Window-only
         /// functions carry `None`; aggregate functions used with OVER carry `Some`.
         aggregate_binding: Option<crate::binding::SqlFunctionBinding>,
-        partition_by: Vec<TypedExpr>,
-        order_by: Vec<SortItem>,
+        partition_by: AstVec<TypedExpr>,
+        order_by: AstVec<SortItem>,
         window_frame: Option<WindowFrame>,
         /// `IGNORE NULLS` modifier (for first_value/last_value/lead/lag).
         /// `false` means default (RESPECT NULLS).
@@ -715,7 +728,7 @@ pub enum ExprKind {
         params: Vec<String>,
         /// Lambda body, analyzed under a scope that binds each `params[i]` to
         /// the corresponding higher-order function's element type.
-        body: Box<TypedExpr>,
+        body: AstBox<TypedExpr>,
     },
 }
 
@@ -852,3 +865,6 @@ mod intrinsic_binding_helper_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod owning_tests;

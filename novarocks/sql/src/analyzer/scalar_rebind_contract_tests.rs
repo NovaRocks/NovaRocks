@@ -91,7 +91,7 @@ fn lambda() -> TypedExpr {
                 slot_id: 19,
                 value_type: ty.clone(),
             }],
-            body: Box::new(TypedExpr {
+            body: novarocks_parser::ast::AstBox::new(TypedExpr {
                 kind: ExprKind::LambdaParamRef {
                     name: "x".into(),
                     slot_id: 19,
@@ -281,7 +281,7 @@ fn bind(
             let ExprKind::FunctionCall { args, binding, .. } = expr.kind else {
                 panic!("bound call");
             };
-            Ok((args, binding, expr.value_type))
+            Ok((args.into_inner(), binding, expr.value_type))
         }
     }
 }

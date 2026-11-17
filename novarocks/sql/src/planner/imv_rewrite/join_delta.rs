@@ -501,7 +501,7 @@ fn join_row_key_expr(
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "join_row_key".to_string(),
-            args,
+            args: (args).into(),
             distinct: false,
             binding,
         },
@@ -2282,9 +2282,15 @@ mod tests {
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(col_expr(left_key.column_id.0, &left_key.name)),
+                        left: novarocks_parser::ast::AstBox::new(col_expr(
+                            left_key.column_id.0,
+                            &left_key.name,
+                        )),
                         op: BinOp::Eq,
-                        right: Box::new(col_expr(right_key.column_id.0, &right_key.name)),
+                        right: novarocks_parser::ast::AstBox::new(col_expr(
+                            right_key.column_id.0,
+                            &right_key.name,
+                        )),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -2554,9 +2560,9 @@ mod tests {
     fn condition() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_expr(1, "left_k")),
+                left: novarocks_parser::ast::AstBox::new(col_expr(1, "left_k")),
                 op: BinOp::Eq,
-                right: Box::new(col_expr(10, "right_k")),
+                right: novarocks_parser::ast::AstBox::new(col_expr(10, "right_k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),

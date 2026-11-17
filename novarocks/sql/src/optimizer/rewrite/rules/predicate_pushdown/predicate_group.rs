@@ -371,9 +371,9 @@ mod tests {
     fn bool_expr(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
@@ -392,7 +392,7 @@ mod tests {
                 binding,
                 volatility,
                 name: name.to_string(),
-                args,
+                args: (args).into(),
                 distinct: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn nested_top_level_and_is_split_into_groups() {
         let expr = TypedExpr {
-            kind: ExprKind::Nested(Box::new(bool_expr(
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(bool_expr(
                 bool_expr(col("a", 1), BinOp::Eq, int_lit(1)),
                 BinOp::And,
                 bool_expr(col("b", 2), BinOp::Eq, int_lit(2)),
@@ -576,7 +576,7 @@ mod tests {
                 ),
                 volatility: crate::functions::FunctionVolatility::Volatile,
                 name: "rand".to_string(),
-                args: vec![],
+                args: (vec![]).into(),
                 distinct: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, false),

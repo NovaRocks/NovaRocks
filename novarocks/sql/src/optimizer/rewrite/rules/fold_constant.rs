@@ -575,6 +575,7 @@ fn fold_scalar(
     Ok((folded != id).then_some(folded))
 }
 
+#[recursive::recursive]
 fn fold_scalar_id(
     arena: &mut ScalarArena,
     id: ScalarId,
@@ -746,6 +747,7 @@ fn has_sec_to_time_source(
 /// Keep the source-sensitive path intact, while still folding the producer's
 /// numeric arguments. Do not memoize this contextual result: the same producer
 /// may independently be folded when it is another projection's root.
+#[recursive::recursive]
 fn fold_sec_to_time_source(
     arena: &mut ScalarArena,
     id: ScalarId,

@@ -308,9 +308,9 @@ mod tests {
 
         let cond_typed = crate::analysis::TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_typed("k")),
+                left: novarocks_parser::ast::AstBox::new(col_typed("k")),
                 op: BinOp::Eq,
-                right: Box::new(col_typed("k")),
+                right: novarocks_parser::ast::AstBox::new(col_typed("k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),

@@ -41,6 +41,7 @@ pub(crate) fn typed_expr_semantically_eq(
     result
 }
 
+#[recursive::recursive]
 fn typed_expr_semantically_eq_with(
     left: &TypedExpr,
     right: &TypedExpr,
@@ -522,7 +523,7 @@ mod tests {
         let expression = |parameter: LambdaParam| TypedExpr {
             kind: ExprKind::LambdaFunction {
                 params: vec![parameter],
-                body: Box::new(TypedExpr {
+                body: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::Literal(super::super::LiteralValue::Int(1)),
                     value_type: FunctionValueType::new(DataType::Int64, false),
                 }),

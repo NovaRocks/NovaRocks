@@ -852,14 +852,14 @@ fn rewrite_expr_children_with<E>(
             right,
             decimal_overflow_policy,
         } => ExprKind::BinaryOp {
-            left: Box::new(rewrite_child(left)?),
+            left: novarocks_parser::ast::AstBox::new(rewrite_child(left)?),
             op: *op,
-            right: Box::new(rewrite_child(right)?),
+            right: novarocks_parser::ast::AstBox::new(rewrite_child(right)?),
             decimal_overflow_policy: *decimal_overflow_policy,
         },
         ExprKind::UnaryOp { op, expr: inner } => ExprKind::UnaryOp {
             op: *op,
-            expr: Box::new(rewrite_child(inner)?),
+            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
         },
         ExprKind::FunctionCall {
             name,
@@ -869,17 +869,18 @@ fn rewrite_expr_children_with<E>(
             volatility,
         } => ExprKind::FunctionCall {
             name: name.clone(),
-            args: args
+            args: (args
                 .iter()
                 .map(&mut rewrite_child)
-                .collect::<Result<_, _>>()?,
+                .collect::<Result<Vec<_>, _>>()?)
+            .into(),
             distinct: *distinct,
             binding: binding.clone(),
             volatility: *volatility,
         },
         ExprKind::LambdaFunction { params, body } => ExprKind::LambdaFunction {
             params: params.clone(),
-            body: Box::new(rewrite_child(body)?),
+            body: novarocks_parser::ast::AstBox::new(rewrite_child(body)?),
         },
         ExprKind::Cast {
             array_failure_mode,
@@ -888,7 +889,7 @@ fn rewrite_expr_children_with<E>(
             decimal_overflow_policy,
         } => ExprKind::Cast {
             array_failure_mode: *array_failure_mode,
-            expr: Box::new(rewrite_child(inner)?),
+            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
             target: target.clone(),
             decimal_overflow_policy: *decimal_overflow_policy,
         },
@@ -896,7 +897,7 @@ fn rewrite_expr_children_with<E>(
             expr: inner,
             negated,
         } => ExprKind::IsNull {
-            expr: Box::new(rewrite_child(inner)?),
+            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
             negated: *negated,
         },
         ExprKind::InList {
@@ -904,11 +905,12 @@ fn rewrite_expr_children_with<E>(
             list,
             negated,
         } => ExprKind::InList {
-            expr: Box::new(rewrite_child(inner)?),
-            list: list
+            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
+            list: (list
                 .iter()
                 .map(&mut rewrite_child)
-                .collect::<Result<_, _>>()?,
+                .collect::<Result<Vec<_>, _>>()?)
+            .into(),
             negated: *negated,
         },
         ExprKind::Between {
@@ -917,9 +919,9 @@ fn rewrite_expr_children_with<E>(
             high,
             negated,
         } => ExprKind::Between {
-            expr: Box::new(rewrite_child(inner)?),
-            low: Box::new(rewrite_child(low)?),
-            high: Box::new(rewrite_child(high)?),
+            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
+            low: novarocks_parser::ast::AstBox::new(rewrite_child(low)?),
+            high: novarocks_parser::ast::AstBox::new(rewrite_child(high)?),
             negated: *negated,
         },
         ExprKind::Like {
@@ -927,8 +929,8 @@ fn rewrite_expr_children_with<E>(
             pattern,
             negated,
         } => ExprKind::Like {
-            expr: Box::new(rewrite_child(inner)?),
-            pattern: Box::new(rewrite_child(pattern)?),
+            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
+            pattern: novarocks_parser::ast::AstBox::new(rewrite_child(pattern)?),
             negated: *negated,
         },
         ExprKind::Case {
@@ -938,15 +940,16 @@ fn rewrite_expr_children_with<E>(
         } => ExprKind::Case {
             operand: operand
                 .as_ref()
-                .map(|operand| rewrite_child(operand).map(Box::new))
+                .map(|operand| rewrite_child(operand).map(novarocks_parser::ast::AstBox::new))
                 .transpose()?,
-            when_then: when_then
+            when_then: (when_then
                 .iter()
                 .map(|(when, then)| Ok((rewrite_child(when)?, rewrite_child(then)?)))
-                .collect::<Result<_, E>>()?,
+                .collect::<Result<Vec<_>, E>>()?)
+            .into(),
             else_expr: else_expr
                 .as_ref()
-                .map(|else_expr| rewrite_child(else_expr).map(Box::new))
+                .map(|else_expr| rewrite_child(else_expr).map(novarocks_parser::ast::AstBox::new))
                 .transpose()?,
         },
         ExprKind::IsTruthValue {
@@ -954,11 +957,13 @@ fn rewrite_expr_children_with<E>(
             value,
             negated,
         } => ExprKind::IsTruthValue {
-            expr: Box::new(rewrite_child(inner)?),
+            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
             value: *value,
             negated: *negated,
         },
-        ExprKind::Nested(inner) => ExprKind::Nested(Box::new(rewrite_child(inner)?)),
+        ExprKind::Nested(inner) => {
+            ExprKind::Nested(novarocks_parser::ast::AstBox::new(rewrite_child(inner)?))
+        }
         ExprKind::WindowCall {
             name,
             args,
@@ -972,13 +977,14 @@ fn rewrite_expr_children_with<E>(
             ignore_nulls,
         } => ExprKind::WindowCall {
             name: name.clone(),
-            args: args
+            args: (args
                 .iter()
                 .map(&mut rewrite_child)
-                .collect::<Result<_, _>>()?,
+                .collect::<Result<Vec<_>, _>>()?)
+            .into(),
             distinct: *distinct,
             binding: binding.clone(),
-            function_order_by: function_order_by
+            function_order_by: (function_order_by
                 .iter()
                 .map(|item| {
                     Ok(SortItem {
@@ -987,13 +993,15 @@ fn rewrite_expr_children_with<E>(
                         nulls_first: item.nulls_first,
                     })
                 })
-                .collect::<Result<_, E>>()?,
+                .collect::<Result<Vec<_>, E>>()?)
+            .into(),
             aggregate_binding: aggregate_binding.clone(),
-            partition_by: partition_by
+            partition_by: (partition_by
                 .iter()
                 .map(&mut rewrite_child)
-                .collect::<Result<_, _>>()?,
-            order_by: order_by
+                .collect::<Result<Vec<_>, _>>()?)
+            .into(),
+            order_by: (order_by
                 .iter()
                 .map(|item| {
                     Ok(SortItem {
@@ -1002,13 +1010,14 @@ fn rewrite_expr_children_with<E>(
                         nulls_first: item.nulls_first,
                     })
                 })
-                .collect::<Result<_, E>>()?,
+                .collect::<Result<Vec<_>, E>>()?)
+            .into(),
             window_frame: window_frame.clone(),
             ignore_nulls: *ignore_nulls,
         },
         ExprKind::Lambda { params, body } => ExprKind::Lambda {
             params: params.clone(),
-            body: Box::new(rewrite_child(body)?),
+            body: novarocks_parser::ast::AstBox::new(rewrite_child(body)?),
         },
         ExprKind::AggregateCall { .. }
         | ExprKind::ColumnRef { .. }
@@ -1109,8 +1118,8 @@ pub(super) fn collect_aggregates(
                     result_type: expr.value_type.clone(),
                     output_column_id,
                     source: crate::binding::AggregateArgumentSource::logical_update(
-                        args.clone(),
-                        order_by.clone(),
+                        args.clone().into_inner(),
+                        order_by.clone().into_inner(),
                         resolved.clone(),
                     ),
                 });
@@ -1321,9 +1330,9 @@ mod call_policy_tests {
         let expression = |policy| TypedExpr {
             kind: ExprKind::AggregateCall {
                 name: "sum".into(),
-                args: args.clone(),
+                args: (args.clone()).into(),
                 distinct: false,
-                order_by: vec![],
+                order_by: (vec![]).into(),
                 resolved: crate::binding::SqlFunctionBinding::new(selected.clone(), policy),
             },
             value_type: result_type.clone(),
@@ -1417,9 +1426,9 @@ mod call_policy_tests {
         let aggregate = |argument| TypedExpr {
             kind: ExprKind::AggregateCall {
                 name: "sum".into(),
-                args: vec![argument],
+                args: (vec![argument]).into(),
                 distinct: false,
-                order_by: vec![],
+                order_by: (vec![]).into(),
                 resolved: binding.clone(),
             },
             value_type: crate::functions::aggregate_result_type(&selected).clone(),
@@ -1456,9 +1465,9 @@ mod call_policy_tests {
             value_type: crate::functions::aggregate_result_type(&selected).clone(),
             kind: ExprKind::AggregateCall {
                 name: name.into(),
-                args: vec![argument],
+                args: (vec![argument]).into(),
                 distinct: false,
-                order_by: vec![],
+                order_by: (vec![]).into(),
                 resolved: crate::binding::SqlFunctionBinding::new(
                     selected,
                     DecimalOverflowPolicy::ReportError,
@@ -1902,9 +1911,9 @@ mod call_policy_tests {
                 value_type: crate::functions::aggregate_result_type(&selected).clone(),
                 kind: ExprKind::AggregateCall {
                     name: "sum".into(),
-                    args: vec![argument],
+                    args: (vec![argument]).into(),
                     distinct: false,
-                    order_by: vec![],
+                    order_by: (vec![]).into(),
                     resolved: crate::binding::SqlFunctionBinding::new(
                         selected,
                         DecimalOverflowPolicy::OutputNull,
@@ -2100,8 +2109,8 @@ mod call_policy_tests {
         };
         let computed = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(selected.clone()),
-                right: Box::new(constant_expr(vec![1], 0)),
+                left: novarocks_parser::ast::AstBox::new(selected.clone()),
+                right: novarocks_parser::ast::AstBox::new(constant_expr(vec![1], 0)),
                 op: BinOp::Add,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },

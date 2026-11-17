@@ -495,9 +495,9 @@ mod tests {
         );
         let predicate = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(column_expr(1, Some("t"), "k")),
+                left: novarocks_parser::ast::AstBox::new(column_expr(1, Some("t"), "k")),
                 op: BinOp::Gt,
-                right: Box::new(int_literal(10)),
+                right: novarocks_parser::ast::AstBox::new(int_literal(10)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -579,7 +579,7 @@ mod tests {
     fn format_expr_prints_column_before_literal_for_equality() {
         let expr = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(TypedExpr {
+                left: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(10)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Int64,
@@ -587,7 +587,7 @@ mod tests {
                     ),
                 }),
                 op: BinOp::Eq,
-                right: Box::new(TypedExpr {
+                right: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id: ColumnId(42),
                         qualifier: Some("r".to_string()),
@@ -675,14 +675,17 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
         let expression = typed(ExprKind::Case {
-            operand: Some(Box::new(column_expr(1, None, "key"))),
-            when_then: vec![(
+            operand: Some(novarocks_parser::ast::AstBox::new(column_expr(
+                1, None, "key",
+            ))),
+            when_then: (vec![(
                 int_literal(1),
                 typed(ExprKind::Literal(LiteralValue::String("a'b".into()))),
-            )],
-            else_expr: Some(Box::new(typed(ExprKind::Literal(LiteralValue::Binary(
-                vec![0, 171, 255],
-            ))))),
+            )])
+            .into(),
+            else_expr: Some(novarocks_parser::ast::AstBox::new(typed(
+                ExprKind::Literal(LiteralValue::Binary(vec![0, 171, 255])),
+            ))),
         });
         assert_eq!(
             format_expr(&expression),
@@ -690,7 +693,7 @@ mod tests {
         );
         let lambda = typed(ExprKind::Lambda {
             params: vec!["x".into(), "y".into()],
-            body: Box::new(column_expr(1, None, "x")),
+            body: novarocks_parser::ast::AstBox::new(column_expr(1, None, "x")),
         });
         assert_eq!(format_expr(&lambda), "(x, y) -> x");
         assert_eq!(
@@ -763,7 +766,7 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::InList {
-                        expr: Box::new(column_expr(1, None, "k")),
+                        expr: novarocks_parser::ast::AstBox::new(column_expr(1, None, "k")),
                         list: (0..1024).map(int_literal).collect(),
                         negated: true,
                     },
@@ -847,7 +850,7 @@ mod tests {
         let mut expr = int_literal(1);
         for _ in 0..64 {
             expr = TypedExpr {
-                kind: ExprKind::Nested(Box::new(expr)),
+                kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(expr)),
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             };
         }
