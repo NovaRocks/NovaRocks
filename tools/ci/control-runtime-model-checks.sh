@@ -57,6 +57,7 @@ fi
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg loom"
 python3 - "$repo_root" "$output" "$target_dir" <<'MODELS'
 import datetime
+from collections import Counter
 import hashlib
 import json
 import os
@@ -133,12 +134,13 @@ if any(value['exit'] != 0 for value in toolchain.values()):
     sys.exit(2)
 initial = sources()
 save(output / 'sources-start.json', initial)
-# This target list belongs to the runtime's model boundary. Test counts are
-# discovered from each actual native libtest run, never assumed from source.
-targets = ('concurrency_loom', 'continuation_loom', 'exit_custody_loom', 'failure_publication_loom', 'read_resource_loom', 'coalescing_input_loom')
+# The runtime's model boundary requires a passing model from every declared
+# family. Counts come from the actual native libtest run, never from source.
+targets = {'loom': ('coalescing_input', 'concurrency', 'continuation', 'exit_custody',
+                    'failure_publication', 'read_resource')}
 results = []
 code = 0
-for target in targets:
+for target, families in targets.items():
     directory = output / target
     directory.mkdir()
     argv = [cargo, 'test', '-p', 'novarocks-control-runtime', '--test', target,
@@ -160,14 +162,20 @@ for target in targets:
     stdout = (directory / 'stdout.log').read_text()
     summaries = re.findall(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;', stdout, re.MULTILINE)
     running = re.findall(r'^running (\d+) tests?$', stdout, re.MULTILINE)
+    passed_names = re.findall(r'^test (\S+) \.\.\. ok$', stdout, re.MULTILINE)
+    counts = Counter(name.split('::', 1)[0] for name in passed_names)
+    missing = [family for family in families if counts[family] == 0]
     valid = (actual_exit == 0 and len(summaries) == 1 and len(running) == 1
              and summaries[0][0] == 'ok' and int(summaries[0][1]) > 0
              and int(running[0]) == int(summaries[0][1])
-             and all(int(value) == 0 for value in summaries[0][2:]))
+             and all(int(value) == 0 for value in summaries[0][2:]) and not missing)
     result = {'target': target, 'exit': actual_exit, 'complete': valid,
-              'passed': int(summaries[0][1]) if len(summaries) == 1 else None}
+              'passed': int(summaries[0][1]) if len(summaries) == 1 else None,
+              'families': dict(sorted(counts.items())), 'missing_families': missing}
     save(directory / 'result.json', result)
     results.append(result)
+    if missing:
+        print('ERROR: Loom model families produced no passing model: ' + ', '.join(missing), file=sys.stderr)
     if not valid:
         code = actual_exit if actual_exit is not None and actual_exit > 0 else 1
         print('ERROR: Loom target failed or lacked a complete nonempty native run: ' + target, file=sys.stderr)
