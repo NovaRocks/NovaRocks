@@ -3362,6 +3362,14 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
         Expr::JsonQuery(node) => {
             expr_contains_aggregate_function(&node.path_invocation.input_expression)
         }
+        Expr::GroupingOperation(_) => true,
+        Expr::Trim(node) => {
+            expr_contains_aggregate_function(&node.trim_source)
+                || node
+                    .trim_character
+                    .as_ref()
+                    .is_some_and(expr_contains_aggregate_function)
+        }
         Expr::Extract(node) => expr_contains_aggregate_function(&node.expression),
         Expr::If(node) => {
             expr_contains_aggregate_function(&node.condition)
@@ -3502,6 +3510,28 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
         return Err(projection_filter_error());
     }
     match expr {
+        Expr::GroupingOperation(_)
+        | Expr::AtLocal(_)
+        | Expr::AtTimeZone(_)
+        | Expr::Overlay(_)
+        | Expr::IntervalValueExpression(_)
+        | Expr::MethodCall(_)
+        | Expr::StaticMethodCall(_)
+        | Expr::CurrentCatalog(_)
+        | Expr::CurrentDate(_)
+        | Expr::CurrentPath(_)
+        | Expr::CurrentSchema(_)
+        | Expr::CurrentUser(_)
+        | Expr::CurrentTime(_)
+        | Expr::CurrentTimestamp(_)
+        | Expr::LocalTime(_)
+        | Expr::LocalTimestamp(_) => return Err(projection_filter_error()),
+        Expr::Trim(node) => {
+            if node.trim_character.is_some() {
+                return Err(projection_filter_error());
+            }
+            reject_unsupported_expr(&node.trim_source)?;
+        }
         Expr::JsonObject(node) => {
             if !crate::analyzer::is_supported_json_object_profile(node) {
                 return Err(projection_filter_error());

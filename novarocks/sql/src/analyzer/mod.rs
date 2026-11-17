@@ -494,11 +494,76 @@ struct GroupingAnalysis {
 
 #[derive(Clone)]
 struct GroupingCall {
-    syntax: ast::FunctionCall,
+    syntax: GroupingSyntax,
     name: String,
     columns: Vec<String>,
     typed_arguments: Vec<TypedExpr>,
     column_id: Option<ColumnId>,
+}
+
+#[derive(Clone)]
+enum GroupingSyntax {
+    Call(ast::FunctionCall),
+    Operation(ast::GroupingOperation),
+}
+#[derive(Clone, Copy)]
+pub(super) enum GroupingSyntaxRef<'a> {
+    Call(&'a ast::FunctionCall),
+    Operation(&'a ast::GroupingOperation),
+}
+impl<'a> GroupingSyntaxRef<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Call(call) => call.arguments.len(),
+            Self::Operation(node) => node.grouping_columns.len(),
+        }
+    }
+    fn span(self) -> novarocks_parser::Span {
+        match self {
+            Self::Call(call) => call.span,
+            Self::Operation(node) => node.span,
+        }
+    }
+    fn arguments(self) -> Vec<&'a ast::Expr> {
+        match self {
+            Self::Call(call) => call.arguments.iter().map(|arg| &arg.value).collect(),
+            Self::Operation(node) => node.grouping_columns.iter().collect(),
+        }
+    }
+    fn grouping(self) -> bool {
+        match self {
+            Self::Call(call) => call.name.parts[0].value.eq_ignore_ascii_case("grouping"),
+            Self::Operation(_) => true,
+        }
+    }
+    fn owned(self) -> GroupingSyntax {
+        match self {
+            Self::Call(call) => GroupingSyntax::Call(call.clone()),
+            Self::Operation(node) => GroupingSyntax::Operation(node.clone()),
+        }
+    }
+}
+impl GroupingSyntax {
+    fn as_ref(&self) -> GroupingSyntaxRef<'_> {
+        match self {
+            Self::Call(call) => GroupingSyntaxRef::Call(call),
+            Self::Operation(node) => GroupingSyntaxRef::Operation(node),
+        }
+    }
+    fn matches(&self, input: GroupingSyntaxRef<'_>) -> bool {
+        match (self, input) {
+            (Self::Call(a), GroupingSyntaxRef::Call(b)) => a == b,
+            (Self::Operation(a), GroupingSyntaxRef::Operation(b)) => a == b,
+            _ => false,
+        }
+    }
+    fn matches_expression(&self, expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::FunctionCall(call) => self.matches(GroupingSyntaxRef::Call(call)),
+            ast::Expr::GroupingOperation(node) => self.matches(GroupingSyntaxRef::Operation(node)),
+            _ => false,
+        }
+    }
 }
 
 pub(super) struct AnalyzerContext<'a> {
@@ -586,41 +651,47 @@ impl<'a> AnalyzerContext<'a> {
         function: &ast::FunctionCall,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        self.analyze_grouping_input(GroupingSyntaxRef::Call(function), scope)
+    }
+    fn analyze_grouping_input(
+        &self,
+        input: GroupingSyntaxRef<'_>,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
         use crate::analysis::LiteralValue;
         use novarocks_type_contract::FunctionValueType;
-        let grouping = function.name.parts[0]
-            .value
-            .eq_ignore_ascii_case("grouping");
-        let count = function.arguments.len();
+        let grouping = input.grouping();
+        let count = input.len();
         // Count occurrences, including duplicate arguments, before analyzing
         // an argument. This is Trino's GROUPING width/arity decision point.
         if grouping && count > 63 {
             return Err(AnalyzeError::too_many_arguments(
                 "GROUPING supports at most 63 arguments",
-                function.span,
+                input.span(),
             ));
         }
         if count == 0 {
             return Err(AnalyzeError::invalid_argument(
                 "GROUPING requires at least one argument",
-                function.span,
+                input.span(),
             ));
         }
         let state = self.grouping_scope.borrow().clone().ok_or_else(|| {
-            AnalyzeError::invalid_argument("GROUPING requires a GROUP BY clause", function.span)
+            AnalyzeError::invalid_argument("GROUPING requires a GROUP BY clause", input.span())
         })?;
         if !state.enabled.get() || state.keys.is_empty() {
             return Err(AnalyzeError::invalid_argument(
                 "GROUPING arguments must be grouping columns",
-                function.span,
+                input.span(),
             ));
         }
         let from_scope = state.from_scope.borrow().clone();
         let argument_scope = from_scope.as_ref().unwrap_or(scope);
+        let arguments = input.arguments();
         let mut typed_arguments = Vec::with_capacity(count);
-        for argument in &function.arguments {
+        for argument in &arguments {
             self.check_control()?;
-            typed_arguments.push(self.analyze_expr(&argument.value, argument_scope)?);
+            typed_arguments.push(self.analyze_expr(argument, argument_scope)?);
         }
         let public_type = if grouping && count <= 31 {
             DataType::Int32
@@ -633,7 +704,7 @@ impl<'a> AnalyzerContext<'a> {
             .calls
             .borrow()
             .iter()
-            .find(|call| call.syntax == *function)
+            .find(|call| call.syntax.matches(input))
             .cloned();
         let call = if let Some(call) = existing {
             call
@@ -649,7 +720,7 @@ impl<'a> AnalyzerContext<'a> {
                 )
             });
             let call = GroupingCall {
-                syntax: function.clone(),
+                syntax: input.owned(),
                 name,
                 columns: Vec::new(),
                 typed_arguments,
@@ -682,7 +753,7 @@ impl<'a> AnalyzerContext<'a> {
             FunctionValueType::new(public_type, true),
             self.control,
         )?;
-        self.cast_to_value_type(mask, target, function.span)
+        self.cast_to_value_type(mask, target, input.span())
     }
 
     /// Reuse the completed GROUP BY author's actual expressions, including
@@ -703,7 +774,11 @@ impl<'a> AnalyzerContext<'a> {
         let mut calls = state.calls.borrow().clone();
         for call in &mut calls {
             call.columns.clear();
-            for (argument, syntax) in call.typed_arguments.iter().zip(&call.syntax.arguments) {
+            for (argument, syntax) in call
+                .typed_arguments
+                .iter()
+                .zip(call.syntax.as_ref().arguments())
+            {
                 let mut matched = None;
                 for (index, key) in keys.iter().enumerate() {
                     self.check_control()?;
@@ -750,7 +825,7 @@ impl<'a> AnalyzerContext<'a> {
                 let Some(index) = matched else {
                     return Err(AnalyzeError::invalid_argument(
                         "GROUPING arguments must be grouping columns",
-                        syntax.value.span(),
+                        syntax.span(),
                     ));
                 };
                 let canonical = state.keys.get(index).map(expr_syntax_key).ok_or_else(|| {
@@ -3386,7 +3461,8 @@ fn select_item_output_column_id(
 }
 
 fn is_grouping_call(expression: &ast::Expr) -> bool {
-    matches!(expression, ast::Expr::FunctionCall(function)
+    matches!(expression, ast::Expr::GroupingOperation(_))
+        || matches!(expression, ast::Expr::FunctionCall(function)
         if function.name.parts.len() == 1
         && matches!(function.name.parts[0].value.to_ascii_lowercase().as_str(), "grouping" | "grouping_id"))
 }
@@ -3405,15 +3481,17 @@ impl ast::Fold for GroupingDisplayFolder<'_> {
         query
     }
     fn fold_expr(&mut self, expression: ast::Expr) -> ast::Expr {
-        if let ast::Expr::FunctionCall(function) = &expression
-            && let Some(index) = self.calls.iter().position(|call| call.syntax == **function)
+        if let Some(index) = self
+            .calls
+            .iter()
+            .position(|call| call.syntax.matches_expression(&expression))
         {
             return ast::Expr::Literal(ast::Literal {
                 kind: ast::LiteralKind::Long {
                     spelling: (-9000 - index as i64).to_string(),
                     parsed_value: -9000 - index as i64,
                 },
-                span: function.span,
+                span: expression.span(),
             });
         }
         ast::fold_expr(self, expression)
@@ -3602,6 +3680,75 @@ mod tests {
                 AnalyzeErrorKind::UnsupportedExpression
             );
         }
+    }
+
+    #[test]
+    fn dedicated_grouping_reuses_original_repeat_and_public_type_author() {
+        let mut query = parse_native_query(
+            "SELECT grouping(k), count(*) FROM (VALUES (1),(2)) t(k) GROUP BY ROLLUP(k)",
+        )
+        .unwrap();
+        let original = parse_and_analyze(
+            "SELECT grouping(k), count(*) FROM (VALUES (1),(2)) t(k) GROUP BY ROLLUP(k)",
+        )
+        .unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select")
+        };
+        let ast::SelectItem::SingleColumn(column) = &mut select.projection[0] else {
+            panic!("column")
+        };
+        let expression =
+            std::mem::replace(&mut column.expression, novarocks_parser::build::integer(0));
+        let ast::Expr::FunctionCall(call) = expression else {
+            panic!("original call")
+        };
+        let call = call.into_inner();
+        column.expression =
+            ast::Expr::GroupingOperation(ast::AstBox::new(ast::GroupingOperation {
+                grouping_columns: call
+                    .arguments
+                    .into_iter()
+                    .map(|argument| argument.value)
+                    .collect(),
+                span: call.span,
+            }));
+        let (actual, _, _) = super::analyze(&query, &TestCatalog, "default").unwrap();
+        let QueryBody::Select(expected) = original.body else {
+            panic!("select")
+        };
+        let QueryBody::Select(actual) = actual.body else {
+            panic!("select")
+        };
+        assert_eq!(
+            actual.projection[0].expr.value_type,
+            expected.projection[0].expr.value_type
+        );
+        assert_eq!(
+            actual.projection[0].field_name,
+            expected.projection[0].field_name
+        );
+        let actual = actual.repeat.unwrap();
+        let expected = expected.repeat.unwrap();
+        assert_eq!(actual.grouping_ids, vec![0, 1]);
+        assert_eq!(actual.grouping_ids, expected.grouping_ids);
+        assert_eq!(actual.grouping_fn_args, expected.grouping_fn_args);
+        assert_eq!(actual.grouping_fn_arg_ids, expected.grouping_fn_arg_ids);
+        assert_eq!(actual.all_rollup_columns, vec!["k"]);
+        assert_eq!(
+            actual.repeat_column_ref_list,
+            vec![vec!["k".to_owned()], Vec::<String>::new()]
+        );
+        assert_eq!(actual.grouping_fn_args.len(), 1);
+        assert_eq!(actual.grouping_fn_args[0].1, vec!["k"]);
+        assert_eq!(actual.grouping_fn_ids, expected.grouping_fn_ids);
+        assert_eq!(
+            actual.repeat_column_ref_list,
+            expected.repeat_column_ref_list
+        );
+        assert_eq!(actual.repeat_column_ref_ids, expected.repeat_column_ref_ids);
+        assert_eq!(actual.all_rollup_columns, expected.all_rollup_columns);
+        assert_eq!(actual.all_rollup_column_ids, expected.all_rollup_column_ids);
     }
 
     struct TestCatalog;

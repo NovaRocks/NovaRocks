@@ -552,6 +552,54 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
     // contain a Query or WindowSpecification. Other expression-local invariants are
     // enforced by their parser production and remain valid after construction.
     match expression {
+        Expr::AtLocal(node) => {
+            validate_special_root(|visitor| super::Visit::visit_at_local(visitor, node))?;
+        }
+        Expr::AtTimeZone(node) => {
+            node.validate_constructor_invariants().map_err(|error| {
+                ValidateError::invalid_structure(
+                    StructuralViolation::SpecialExpressionInvariant(error),
+                    node.span,
+                )
+            })?;
+            validate_special_root(|visitor| super::Visit::visit_at_time_zone(visitor, node))?;
+        }
+        Expr::GroupingOperation(node) => {
+            node.validate_constructor_invariants().map_err(|error| {
+                ValidateError::invalid_structure(
+                    StructuralViolation::SpecialExpressionInvariant(error),
+                    node.span,
+                )
+            })?;
+            validate_special_root(|visitor| super::Visit::visit_grouping_operation(visitor, node))?;
+        }
+        Expr::Trim(node) => {
+            validate_special_root(|visitor| super::Visit::visit_trim(visitor, node))?;
+        }
+        Expr::Overlay(node) => {
+            validate_special_root(|visitor| super::Visit::visit_overlay(visitor, node))?;
+        }
+        Expr::IntervalValueExpression(node) => {
+            validate_special_root(|visitor| {
+                super::Visit::visit_interval_value_expression(visitor, node)
+            })?;
+        }
+        Expr::MethodCall(node) => {
+            validate_special_root(|visitor| super::Visit::visit_method_call(visitor, node))?;
+        }
+        Expr::StaticMethodCall(node) => {
+            validate_special_root(|visitor| super::Visit::visit_static_method_call(visitor, node))?;
+        }
+        Expr::CurrentCatalog(_) => {}
+        Expr::CurrentDate(_) => {}
+        Expr::CurrentPath(_) => {}
+        Expr::CurrentSchema(_) => {}
+        Expr::CurrentUser(_) => {}
+        Expr::CurrentTime(_) => {}
+        Expr::CurrentTimestamp(_) => {}
+        Expr::LocalTime(_) => {}
+        Expr::LocalTimestamp(_) => {}
+
         Expr::JsonConstructor(node) => {
             validate_json_root(|visitor| super::Visit::visit_json_constructor(visitor, node))?
         }
@@ -931,4 +979,21 @@ fn validate_table(table: &super::Table) -> Result<(), ValidateError> {
         }
     }
     Ok(())
+}
+
+#[recursive::recursive]
+fn validate_special_root(
+    walk: impl FnOnce(&mut SpecialExpressionValidation),
+) -> Result<(), ValidateError> {
+    let mut visitor = SpecialExpressionValidation(Ok(()));
+    walk(&mut visitor);
+    visitor.0
+}
+struct SpecialExpressionValidation(Result<(), ValidateError>);
+impl super::Visit for SpecialExpressionValidation {
+    fn visit_expr(&mut self, node: &Expr) {
+        if self.0.is_ok() {
+            self.0 = validate_expr(node);
+        }
+    }
 }

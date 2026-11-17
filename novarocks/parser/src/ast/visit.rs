@@ -21,6 +21,58 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_at_local(&mut self, node: &AtLocal) {
+        super::walk_at_local(self, node);
+    }
+    fn visit_at_time_zone(&mut self, node: &AtTimeZone) {
+        super::walk_at_time_zone(self, node);
+    }
+    fn visit_grouping_operation(&mut self, node: &GroupingOperation) {
+        super::walk_grouping_operation(self, node);
+    }
+    fn visit_trim(&mut self, node: &Trim) {
+        super::walk_trim(self, node);
+    }
+    fn visit_overlay(&mut self, node: &Overlay) {
+        super::walk_overlay(self, node);
+    }
+    fn visit_interval_value_expression(&mut self, node: &IntervalValueExpression) {
+        super::walk_interval_value_expression(self, node);
+    }
+    fn visit_method_call(&mut self, node: &MethodCall) {
+        super::walk_method_call(self, node);
+    }
+    fn visit_static_method_call(&mut self, node: &StaticMethodCall) {
+        super::walk_static_method_call(self, node);
+    }
+    fn visit_current_catalog(&mut self, node: &CurrentCatalog) {
+        super::walk_current_catalog(self, node);
+    }
+    fn visit_current_date(&mut self, node: &CurrentDate) {
+        super::walk_current_date(self, node);
+    }
+    fn visit_current_path(&mut self, node: &CurrentPath) {
+        super::walk_current_path(self, node);
+    }
+    fn visit_current_schema(&mut self, node: &CurrentSchema) {
+        super::walk_current_schema(self, node);
+    }
+    fn visit_current_user(&mut self, node: &CurrentUser) {
+        super::walk_current_user(self, node);
+    }
+    fn visit_current_time(&mut self, node: &CurrentTime) {
+        super::walk_current_time(self, node);
+    }
+    fn visit_current_timestamp(&mut self, node: &CurrentTimestamp) {
+        super::walk_current_timestamp(self, node);
+    }
+    fn visit_local_time(&mut self, node: &LocalTime) {
+        super::walk_local_time(self, node);
+    }
+    fn visit_local_timestamp(&mut self, node: &LocalTimestamp) {
+        super::walk_local_timestamp(self, node);
+    }
+
     fn visit_values(&mut self, node: &Values) {
         walk_values(self, node);
     }
@@ -843,6 +895,24 @@ fn walk_array_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &ArrayExpr) {
 #[recursive::recursive]
 pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
     match expression {
+        Expr::AtLocal(node) => visitor.visit_at_local(node),
+        Expr::AtTimeZone(node) => visitor.visit_at_time_zone(node),
+        Expr::GroupingOperation(node) => visitor.visit_grouping_operation(node),
+        Expr::Trim(node) => visitor.visit_trim(node),
+        Expr::Overlay(node) => visitor.visit_overlay(node),
+        Expr::IntervalValueExpression(node) => visitor.visit_interval_value_expression(node),
+        Expr::MethodCall(node) => visitor.visit_method_call(node),
+        Expr::StaticMethodCall(node) => visitor.visit_static_method_call(node),
+        Expr::CurrentCatalog(node) => visitor.visit_current_catalog(node),
+        Expr::CurrentDate(node) => visitor.visit_current_date(node),
+        Expr::CurrentPath(node) => visitor.visit_current_path(node),
+        Expr::CurrentSchema(node) => visitor.visit_current_schema(node),
+        Expr::CurrentUser(node) => visitor.visit_current_user(node),
+        Expr::CurrentTime(node) => visitor.visit_current_time(node),
+        Expr::CurrentTimestamp(node) => visitor.visit_current_timestamp(node),
+        Expr::LocalTime(node) => visitor.visit_local_time(node),
+        Expr::LocalTimestamp(node) => visitor.visit_local_timestamp(node),
+
         Expr::JsonConstructor(node) => visitor.visit_json_constructor(node),
         Expr::JsonExists(node) => visitor.visit_json_exists(node),
         Expr::JsonValue(node) => visitor.visit_json_value(node),
@@ -931,6 +1001,61 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_at_local(&mut self, node: AtLocal) -> AtLocal {
+        super::fold_at_local(self, node)
+    }
+    fn fold_at_time_zone(&mut self, node: AtTimeZone) -> AtTimeZone {
+        super::fold_at_time_zone(self, node)
+    }
+    fn fold_grouping_operation(&mut self, node: GroupingOperation) -> GroupingOperation {
+        super::fold_grouping_operation(self, node)
+    }
+    fn fold_trim(&mut self, node: Trim) -> Trim {
+        super::fold_trim(self, node)
+    }
+    fn fold_overlay(&mut self, node: Overlay) -> Overlay {
+        super::fold_overlay(self, node)
+    }
+    fn fold_interval_value_expression(
+        &mut self,
+        node: IntervalValueExpression,
+    ) -> IntervalValueExpression {
+        super::fold_interval_value_expression(self, node)
+    }
+    fn fold_method_call(&mut self, node: MethodCall) -> MethodCall {
+        super::fold_method_call(self, node)
+    }
+    fn fold_static_method_call(&mut self, node: StaticMethodCall) -> StaticMethodCall {
+        super::fold_static_method_call(self, node)
+    }
+    fn fold_current_catalog(&mut self, node: CurrentCatalog) -> CurrentCatalog {
+        super::fold_current_catalog(self, node)
+    }
+    fn fold_current_date(&mut self, node: CurrentDate) -> CurrentDate {
+        super::fold_current_date(self, node)
+    }
+    fn fold_current_path(&mut self, node: CurrentPath) -> CurrentPath {
+        super::fold_current_path(self, node)
+    }
+    fn fold_current_schema(&mut self, node: CurrentSchema) -> CurrentSchema {
+        super::fold_current_schema(self, node)
+    }
+    fn fold_current_user(&mut self, node: CurrentUser) -> CurrentUser {
+        super::fold_current_user(self, node)
+    }
+    fn fold_current_time(&mut self, node: CurrentTime) -> CurrentTime {
+        super::fold_current_time(self, node)
+    }
+    fn fold_current_timestamp(&mut self, node: CurrentTimestamp) -> CurrentTimestamp {
+        super::fold_current_timestamp(self, node)
+    }
+    fn fold_local_time(&mut self, node: LocalTime) -> LocalTime {
+        super::fold_local_time(self, node)
+    }
+    fn fold_local_timestamp(&mut self, node: LocalTimestamp) -> LocalTimestamp {
+        super::fold_local_timestamp(self, node)
+    }
+
     fn fold_values(&mut self, node: Values) -> Values {
         fold_values(self, node)
     }
@@ -1961,6 +2086,34 @@ fn fold_array_expr<F: Fold + ?Sized>(folder: &mut F, mut expression: ArrayExpr) 
 #[recursive::recursive]
 pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
     match expression {
+        Expr::AtLocal(node) => Expr::AtLocal(AstBox::new(folder.fold_at_local(node.into_inner()))),
+        Expr::AtTimeZone(node) => {
+            Expr::AtTimeZone(AstBox::new(folder.fold_at_time_zone(node.into_inner())))
+        }
+        Expr::GroupingOperation(node) => Expr::GroupingOperation(AstBox::new(
+            folder.fold_grouping_operation(node.into_inner()),
+        )),
+        Expr::Trim(node) => Expr::Trim(AstBox::new(folder.fold_trim(node.into_inner()))),
+        Expr::Overlay(node) => Expr::Overlay(AstBox::new(folder.fold_overlay(node.into_inner()))),
+        Expr::IntervalValueExpression(node) => Expr::IntervalValueExpression(AstBox::new(
+            folder.fold_interval_value_expression(node.into_inner()),
+        )),
+        Expr::MethodCall(node) => {
+            Expr::MethodCall(AstBox::new(folder.fold_method_call(node.into_inner())))
+        }
+        Expr::StaticMethodCall(node) => Expr::StaticMethodCall(AstBox::new(
+            folder.fold_static_method_call(node.into_inner()),
+        )),
+        Expr::CurrentCatalog(node) => Expr::CurrentCatalog(folder.fold_current_catalog(node)),
+        Expr::CurrentDate(node) => Expr::CurrentDate(folder.fold_current_date(node)),
+        Expr::CurrentPath(node) => Expr::CurrentPath(folder.fold_current_path(node)),
+        Expr::CurrentSchema(node) => Expr::CurrentSchema(folder.fold_current_schema(node)),
+        Expr::CurrentUser(node) => Expr::CurrentUser(folder.fold_current_user(node)),
+        Expr::CurrentTime(node) => Expr::CurrentTime(folder.fold_current_time(node)),
+        Expr::CurrentTimestamp(node) => Expr::CurrentTimestamp(folder.fold_current_timestamp(node)),
+        Expr::LocalTime(node) => Expr::LocalTime(folder.fold_local_time(node)),
+        Expr::LocalTimestamp(node) => Expr::LocalTimestamp(folder.fold_local_timestamp(node)),
+
         Expr::JsonConstructor(node) => Expr::JsonConstructor(crate::ast::AstBox::new(
             folder.fold_json_constructor(node.into_inner()),
         )),

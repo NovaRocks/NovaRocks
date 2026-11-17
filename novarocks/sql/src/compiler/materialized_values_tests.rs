@@ -2013,3 +2013,153 @@ fn values_and_single_column_sites_keep_original_nonzero_full_field_sources() {
         .is_err()
     );
 }
+
+#[test]
+fn dedicated_trim_and_grouping_edges_keep_actual_nonzero_source_fields() {
+    use arrow::array::{Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_functions::ConstantPool;
+    use novarocks_parser::{SYNTHETIC, build};
+    let control = SqlCompileControl::unbounded();
+    let policy = crate::constant::test_constant_policy();
+    for trim in [false, true] {
+        let data = if trim {
+            StringArray::from(vec!["unused", " x "]).to_data()
+        } else {
+            Int32Array::from(vec![13, -23]).to_data()
+        };
+        let ty = FunctionValueType::new(data.data_type().clone(), false);
+        let field = Arc::new(
+            Field::new("original_special_child", data.data_type().clone(), false).with_metadata(
+                std::collections::HashMap::from([(
+                    "provider.unknown".to_string(),
+                    "special-root".to_string(),
+                )]),
+            ),
+        );
+        let pool = ConstantPool::try_new(
+            field.clone(),
+            ty.clone(),
+            data,
+            policy,
+            CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let retained = pool.value(1).unwrap();
+        let mut query = query("SELECT 1");
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select")
+        };
+        let ast::SelectItem::SingleColumn(column) = &mut select.projection[0] else {
+            panic!("column")
+        };
+        let child = build::identifier(build::ident("only_original_child", false));
+        column.expression = if trim {
+            ast::Expr::Trim(ast::AstBox::new(ast::Trim {
+                specification: ast::TrimSpecification::Both,
+                trim_source: child,
+                trim_character: None,
+                span: SYNTHETIC,
+            }))
+        } else {
+            ast::Expr::GroupingOperation(ast::AstBox::new(ast::GroupingOperation {
+                grouping_columns: vec![child].into(),
+                span: SYNTHETIC,
+            }))
+        };
+        let edge = if trim {
+            SqlConstantExpressionStep::TrimSource
+        } else {
+            SqlConstantExpressionStep::GroupingColumn(0)
+        };
+        let constant = |edge| {
+            vec![
+                SqlExpressionConstant::new(
+                    Vec::new(),
+                    SqlConstantExpressionSite::SelectProjection { column: 0 },
+                    retained.clone(),
+                )
+                .with_expression_path(vec![edge]),
+            ]
+            .into()
+        };
+        let source =
+            MaterializedValues::try_new_expressions(&query, constant(edge), &control).unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("select")
+        };
+        let ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
+            panic!("column")
+        };
+        let child = match &column.expression {
+            ast::Expr::Trim(node) => &node.trim_source,
+            ast::Expr::GroupingOperation(node) => &node.grouping_columns[0],
+            _ => panic!("actual root"),
+        };
+        let owned = source.loan(&query, &control).unwrap();
+        let loan = owned.view();
+        let actual = loan.constant_at(child).unwrap();
+        assert_eq!(actual.ordinal(), 1);
+        assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+        assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+        assert_eq!(actual.field(), field.as_ref());
+        assert_eq!(actual.value_type(), &ty);
+        assert_eq!(
+            actual
+                .field()
+                .metadata()
+                .get("provider.unknown")
+                .map(String::as_str),
+            Some("special-root")
+        );
+        assert!(loan.constant_at(&(*child).clone()).is_none());
+        for wrong in [
+            SqlConstantExpressionStep::GroupingColumn(1),
+            SqlConstantExpressionStep::FunctionArgumentValue(0),
+            if trim {
+                SqlConstantExpressionStep::GroupingColumn(0)
+            } else {
+                SqlConstantExpressionStep::TrimSource
+            },
+        ] {
+            assert!(
+                MaterializedValues::try_new_expressions(&query, constant(wrong), &control).is_err()
+            );
+        }
+        if trim {
+            let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            let functions = build_builtin_engine_function_catalog().unwrap();
+            let (resolved, _, _) =
+                crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
+                    &query,
+                    &catalog,
+                    "db",
+                    &functions,
+                    &crate::sql_mode::SqlSemanticSettings::default(),
+                    policy,
+                    &control,
+                    Some(&source),
+                )
+                .unwrap();
+            let crate::analysis::QueryBody::Select(select) = resolved.body else {
+                panic!("select")
+            };
+            let crate::analysis::ExprKind::FunctionCall { name, args, .. } =
+                &select.projection[0].expr.kind
+            else {
+                panic!("real trim binding")
+            };
+            assert_eq!(name, "trim");
+            let crate::analysis::ExprKind::Constant(actual) = &args[0].kind else {
+                panic!("original argument")
+            };
+            assert_eq!(actual.ordinal(), 1);
+            assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
+            assert_eq!(
+                select.projection[0].expr.value_type.data_type(),
+                &DataType::Utf8
+            );
+        }
+    }
+}

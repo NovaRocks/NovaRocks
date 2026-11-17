@@ -3100,6 +3100,40 @@ impl Visit for CompletionRetainedBytes {
                     expression.when_clauses.capacity(),
                 );
             }
+            Expr::AtLocal(_) => self.add(std::mem::size_of::<novarocks_parser::ast::AtLocal>()),
+            Expr::AtTimeZone(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::AtTimeZone>())
+            }
+            Expr::Trim(_) => self.add(std::mem::size_of::<novarocks_parser::ast::Trim>()),
+            Expr::Overlay(_) => self.add(std::mem::size_of::<novarocks_parser::ast::Overlay>()),
+            Expr::IntervalValueExpression(_) => self.add(std::mem::size_of::<
+                novarocks_parser::ast::IntervalValueExpression,
+            >()),
+            Expr::GroupingOperation(node) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::GroupingOperation>());
+                self.add_vec_capacity::<Expr>(node.grouping_columns.capacity());
+            }
+            Expr::MethodCall(node) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::MethodCall>());
+                self.add_vec_capacity::<novarocks_parser::ast::CallArgument>(
+                    node.arguments.capacity(),
+                );
+            }
+            Expr::StaticMethodCall(node) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::StaticMethodCall>());
+                self.add_vec_capacity::<novarocks_parser::ast::CallArgument>(
+                    node.arguments.capacity(),
+                );
+            }
+            Expr::CurrentCatalog(_)
+            | Expr::CurrentDate(_)
+            | Expr::CurrentPath(_)
+            | Expr::CurrentSchema(_)
+            | Expr::CurrentUser(_)
+            | Expr::CurrentTime(_)
+            | Expr::CurrentTimestamp(_)
+            | Expr::LocalTime(_)
+            | Expr::LocalTimestamp(_) => {}
             Expr::Extract(_) => self.add(std::mem::size_of::<novarocks_parser::ast::ExtractExpr>()),
             Expr::If(_) => self.add(std::mem::size_of::<novarocks_parser::ast::IfExpr>()),
             Expr::NullIf(_) => self.add(std::mem::size_of::<novarocks_parser::ast::NullIfExpr>()),

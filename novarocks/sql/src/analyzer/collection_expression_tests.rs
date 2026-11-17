@@ -728,7 +728,7 @@ fn unsupported_access_profiles_refuse_before_base_or_table_resolution() {
 #[test]
 fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly() {
     use crate::analysis::ExprKind;
-    use novarocks_parser::{Span, ast, build};
+    use novarocks_parser::{ast, build};
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();

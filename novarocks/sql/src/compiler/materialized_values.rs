@@ -63,6 +63,8 @@ pub enum SqlConstantExpressionStep {
     CoalesceOperand(usize),
     TryInner,
     FormatArgument(usize),
+    GroupingColumn(usize),
+    TrimSource,
     FunctionOrderByKey(usize),
     WindowOrderByKey(usize),
     CaseOperand,
@@ -223,6 +225,13 @@ pub(crate) fn resolve_expression_site<'a>(
     for step in expression_path {
         work.step()?;
         expression = match (step, expression) {
+            (
+                SqlConstantExpressionStep::GroupingColumn(index),
+                ast::Expr::GroupingOperation(node),
+            ) => node.grouping_columns.get(*index).ok_or_else(|| {
+                invalid("constant source grouping column differs from its owned syntax")
+            })?,
+            (SqlConstantExpressionStep::TrimSource, ast::Expr::Trim(node)) => &node.trim_source,
             (SqlConstantExpressionStep::Nested, ast::Expr::Nested(nested)) => &nested.expression,
             (SqlConstantExpressionStep::LogicalTerm(index), ast::Expr::Logical(logical)) => {
                 logical.terms.get(*index).ok_or_else(|| {

@@ -1165,6 +1165,24 @@ impl Printer {
     #[recursive::recursive]
     fn write_expr(&mut self, expression: &Expr) {
         match expression {
+            Expr::AtLocal(node) => self.write_at_local(node),
+            Expr::AtTimeZone(node) => self.write_at_time_zone(node),
+            Expr::GroupingOperation(node) => self.write_grouping_operation(node),
+            Expr::Trim(node) => self.write_trim(node),
+            Expr::Overlay(node) => self.write_overlay(node),
+            Expr::IntervalValueExpression(node) => self.write_interval_value_expression(node),
+            Expr::MethodCall(node) => self.write_method_call(node),
+            Expr::StaticMethodCall(node) => self.write_static_method_call(node),
+            Expr::CurrentCatalog(node) => self.write_current_catalog(node),
+            Expr::CurrentDate(node) => self.write_current_date(node),
+            Expr::CurrentPath(node) => self.write_current_path(node),
+            Expr::CurrentSchema(node) => self.write_current_schema(node),
+            Expr::CurrentUser(node) => self.write_current_user(node),
+            Expr::CurrentTime(node) => self.write_current_time(node),
+            Expr::CurrentTimestamp(node) => self.write_current_timestamp(node),
+            Expr::LocalTime(node) => self.write_local_time(node),
+            Expr::LocalTimestamp(node) => self.write_local_timestamp(node),
+
             Expr::JsonConstructor(node) => self.write_json_constructor(node),
             Expr::JsonExists(node) => self.write_json_exists(node),
             Expr::JsonValue(node) => self.write_json_value(node),
@@ -2985,6 +3003,159 @@ mod tests {
             };
             let printed = print_query(&query);
             assert!(printed.contains(&format!("AS $$\n{definition}$$ WITH c AS")));
+        }
+    }
+}
+
+impl Printer {
+    fn write_at_operand(&mut self, value: &Expr) {
+        let parentheses = matches!(
+            value,
+            Expr::Binary(_) | Expr::Logical(_) | Expr::Predicated(_) | Expr::Unary(_)
+        );
+        if parentheses {
+            self.output.push('(');
+        }
+        self.write_expr(value);
+        if parentheses {
+            self.output.push(')');
+        }
+    }
+    #[recursive::recursive]
+    fn write_at_local(&mut self, node: &AtLocal) {
+        self.write_at_operand(&node.value);
+        self.output.push_str(" AT LOCAL");
+    }
+    #[recursive::recursive]
+    fn write_at_time_zone(&mut self, node: &AtTimeZone) {
+        node.validate_constructor_invariants()
+            .expect("invalid AT TIME ZONE constructor facts");
+        self.write_at_operand(&node.value);
+        self.output.push_str(" AT TIME ZONE ");
+        self.write_expr(&node.time_zone);
+    }
+    #[recursive::recursive]
+    fn write_grouping_operation(&mut self, node: &GroupingOperation) {
+        node.validate_constructor_invariants()
+            .expect("invalid GROUPING constructor facts");
+        self.output.push_str("GROUPING (");
+        self.write_expr_list(&node.grouping_columns);
+        self.output.push(')');
+    }
+    #[recursive::recursive]
+    fn write_trim(&mut self, node: &Trim) {
+        self.output.push_str("trim(");
+        self.output.push_str(match node.specification {
+            TrimSpecification::Both => "BOTH",
+            TrimSpecification::Leading => "LEADING",
+            TrimSpecification::Trailing => "TRAILING",
+        });
+        if let Some(character) = &node.trim_character {
+            self.output.push(' ');
+            self.write_expr(character);
+        }
+        self.output.push_str(" FROM ");
+        self.write_expr(&node.trim_source);
+        self.output.push(')');
+    }
+    #[recursive::recursive]
+    fn write_overlay(&mut self, node: &Overlay) {
+        self.output.push_str("OVERLAY(");
+        self.write_expr(&node.value);
+        self.output.push_str(" PLACING ");
+        self.write_expr(&node.replacement);
+        self.output.push_str(" FROM ");
+        self.write_expr(&node.start);
+        if let Some(length) = &node.length {
+            self.output.push_str(" FOR ");
+            self.write_expr(length);
+        }
+        self.output.push(')');
+    }
+    #[recursive::recursive]
+    fn write_interval_value_expression(&mut self, node: &IntervalValueExpression) {
+        self.output.push_str("((");
+        self.write_binary_operand(&node.left, BinaryOperator::Subtract, BinarySide::Left);
+        self.output.push_str(" - ");
+        self.write_binary_operand(&node.right, BinaryOperator::Subtract, BinarySide::Right);
+        self.output.push_str(") ");
+        self.write_interval_qualifier(&node.data_type.qualifier);
+        self.output.push(')');
+    }
+    #[recursive::recursive]
+    fn write_method_call(&mut self, node: &MethodCall) {
+        self.output.push('(');
+        self.write_expr(&node.receiver);
+        self.output.push_str(").");
+        self.write_ident(&node.method);
+        self.output.push('(');
+        for (index, argument) in node.arguments.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_call_argument(argument);
+        }
+        self.output.push(')');
+    }
+    #[recursive::recursive]
+    fn write_static_method_call(&mut self, node: &StaticMethodCall) {
+        self.write_object_name(&node.type_name);
+        self.output.push_str("::");
+        self.write_ident(&node.method);
+        self.output.push('(');
+        for (index, argument) in node.arguments.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_call_argument(argument);
+        }
+        self.output.push(')');
+    }
+    fn write_current_catalog(&mut self, _node: &CurrentCatalog) {
+        self.output.push_str("CURRENT_CATALOG");
+    }
+    fn write_current_date(&mut self, _node: &CurrentDate) {
+        self.output.push_str("current_date");
+    }
+    fn write_current_path(&mut self, _node: &CurrentPath) {
+        self.output.push_str("CURRENT_PATH");
+    }
+    fn write_current_schema(&mut self, _node: &CurrentSchema) {
+        self.output.push_str("CURRENT_SCHEMA");
+    }
+    fn write_current_user(&mut self, _node: &CurrentUser) {
+        self.output.push_str("CURRENT_USER");
+    }
+    fn write_current_time(&mut self, node: &CurrentTime) {
+        self.output.push_str("current_time");
+        if let Some(precision) = node.precision {
+            self.output.push('(');
+            self.output.push_str(&precision.to_string());
+            self.output.push(')');
+        }
+    }
+    fn write_current_timestamp(&mut self, node: &CurrentTimestamp) {
+        self.output.push_str("current_timestamp");
+        if let Some(precision) = node.precision {
+            self.output.push('(');
+            self.output.push_str(&precision.to_string());
+            self.output.push(')');
+        }
+    }
+    fn write_local_time(&mut self, node: &LocalTime) {
+        self.output.push_str("localtime");
+        if let Some(precision) = node.precision {
+            self.output.push('(');
+            self.output.push_str(&precision.to_string());
+            self.output.push(')');
+        }
+    }
+    fn write_local_timestamp(&mut self, node: &LocalTimestamp) {
+        self.output.push_str("localtimestamp");
+        if let Some(precision) = node.precision {
+            self.output.push('(');
+            self.output.push_str(&precision.to_string());
+            self.output.push(')');
         }
     }
 }

@@ -324,6 +324,24 @@ impl SyntaxEq for WindowFrameBound {
 impl SyntaxEq for Expr {
     fn syntax_eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::AtLocal(a), Self::AtLocal(b)) => a.syntax_eq(b),
+            (Self::AtTimeZone(a), Self::AtTimeZone(b)) => a.syntax_eq(b),
+            (Self::GroupingOperation(a), Self::GroupingOperation(b)) => a.syntax_eq(b),
+            (Self::Trim(a), Self::Trim(b)) => a.syntax_eq(b),
+            (Self::Overlay(a), Self::Overlay(b)) => a.syntax_eq(b),
+            (Self::IntervalValueExpression(a), Self::IntervalValueExpression(b)) => a.syntax_eq(b),
+            (Self::MethodCall(a), Self::MethodCall(b)) => a.syntax_eq(b),
+            (Self::StaticMethodCall(a), Self::StaticMethodCall(b)) => a.syntax_eq(b),
+            (Self::CurrentCatalog(a), Self::CurrentCatalog(b)) => a.syntax_eq(b),
+            (Self::CurrentDate(a), Self::CurrentDate(b)) => a.syntax_eq(b),
+            (Self::CurrentPath(a), Self::CurrentPath(b)) => a.syntax_eq(b),
+            (Self::CurrentSchema(a), Self::CurrentSchema(b)) => a.syntax_eq(b),
+            (Self::CurrentUser(a), Self::CurrentUser(b)) => a.syntax_eq(b),
+            (Self::CurrentTime(a), Self::CurrentTime(b)) => a.syntax_eq(b),
+            (Self::CurrentTimestamp(a), Self::CurrentTimestamp(b)) => a.syntax_eq(b),
+            (Self::LocalTime(a), Self::LocalTime(b)) => a.syntax_eq(b),
+            (Self::LocalTimestamp(a), Self::LocalTimestamp(b)) => a.syntax_eq(b),
+
             (Self::JsonConstructor(left), Self::JsonConstructor(right)) => left.syntax_eq(right),
             (Self::JsonExists(left), Self::JsonExists(right)) => left.syntax_eq(right),
             (Self::JsonValue(left), Self::JsonValue(right)) => left.syntax_eq(right),

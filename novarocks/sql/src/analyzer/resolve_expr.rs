@@ -288,6 +288,61 @@ fn validate_nested_decimal_cast_policy(expr: &TypedExpr) -> Result<(), &'static 
     }
 }
 
+/// Neutral facts for the original function author. Dedicated syntax supplies
+/// an explicit builtin; ordinary calls retain their actual metadata owner.
+#[derive(Clone, Copy)]
+struct FunctionMetadata<'a> {
+    original: Option<&'a ast::FunctionCall>,
+    span: Span,
+    distinct: bool,
+    order_by: Option<&'a ast::OrderBy>,
+    window: Option<&'a ast::Window>,
+    null_treatment: Option<ast::NullTreatment>,
+}
+#[derive(Clone, Copy)]
+enum SyntaxBuiltin {
+    Row,
+    If,
+    NullIf,
+    Coalesce,
+    Trim,
+    Ltrim,
+    Rtrim,
+}
+impl SyntaxBuiltin {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Row => "row",
+            Self::If => "if",
+            Self::NullIf => "nullif",
+            Self::Coalesce => "coalesce",
+            Self::Trim => "trim",
+            Self::Ltrim => "ltrim",
+            Self::Rtrim => "rtrim",
+        }
+    }
+}
+fn unsupported_remaining_root(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::AtLocal(_)
+            | ast::Expr::AtTimeZone(_)
+            | ast::Expr::Overlay(_)
+            | ast::Expr::IntervalValueExpression(_)
+            | ast::Expr::MethodCall(_)
+            | ast::Expr::StaticMethodCall(_)
+            | ast::Expr::CurrentCatalog(_)
+            | ast::Expr::CurrentDate(_)
+            | ast::Expr::CurrentPath(_)
+            | ast::Expr::CurrentSchema(_)
+            | ast::Expr::CurrentUser(_)
+            | ast::Expr::CurrentTime(_)
+            | ast::Expr::CurrentTimestamp(_)
+            | ast::Expr::LocalTime(_)
+            | ast::Expr::LocalTimestamp(_)
+    ) || matches!(expr, ast::Expr::Trim(node) if node.trim_character.is_some())
+}
+
 impl<'a> super::AnalyzerContext<'a> {
     /// Analyze a single expression and produce a TypedExpr.
     #[recursive::recursive]
@@ -297,6 +352,14 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         self.check_control()?;
+        // Direct expression admission precedes its own CV lookup. This is not
+        // a whole-tree prepass over opaque declaration shortcuts.
+        if unsupported_remaining_root(expr) {
+            return Err(AnalyzeError::unsupported_expression(
+                "expression profile is not supported",
+                expr.span(),
+            ));
+        }
         if let Some(reason) = unsupported_control_expression_reason(expr) {
             return Err(AnalyzeError::unsupported_expression(reason, expr.span()));
         }
@@ -391,6 +454,41 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
 
+            ast::Expr::GroupingOperation(node) => {
+                self.analyze_grouping_input(super::GroupingSyntaxRef::Operation(node), scope)
+            }
+            ast::Expr::Trim(node) => {
+                if node.trim_character.is_some() {
+                    return Err(AnalyzeError::unsupported_expression(
+                        "explicit TRIM characters are not supported",
+                        node.span,
+                    ));
+                }
+                let builtin = match node.specification {
+                    ast::TrimSpecification::Both => SyntaxBuiltin::Trim,
+                    ast::TrimSpecification::Leading => SyntaxBuiltin::Ltrim,
+                    ast::TrimSpecification::Trailing => SyntaxBuiltin::Rtrim,
+                };
+                self.analyze_syntax_function(builtin, &[&node.trim_source], node.span, scope)
+            }
+            ast::Expr::AtLocal(_)
+            | ast::Expr::AtTimeZone(_)
+            | ast::Expr::Overlay(_)
+            | ast::Expr::IntervalValueExpression(_)
+            | ast::Expr::MethodCall(_)
+            | ast::Expr::StaticMethodCall(_)
+            | ast::Expr::CurrentCatalog(_)
+            | ast::Expr::CurrentDate(_)
+            | ast::Expr::CurrentPath(_)
+            | ast::Expr::CurrentSchema(_)
+            | ast::Expr::CurrentUser(_)
+            | ast::Expr::CurrentTime(_)
+            | ast::Expr::CurrentTimestamp(_)
+            | ast::Expr::LocalTime(_)
+            | ast::Expr::LocalTimestamp(_) => Err(AnalyzeError::unsupported_expression(
+                "expression profile is not supported",
+                expr.span(),
+            )),
             ast::Expr::Literal(value) => self.analyze_literal(value),
 
             ast::Expr::Array(array) => self.analyze_array_literal(array, scope),
@@ -409,7 +507,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     .iter()
                     .map(|field| &field.expression)
                     .collect::<Vec<_>>();
-                self.analyze_syntax_function("row", &arguments, row.span, scope)
+                self.analyze_syntax_function(SyntaxBuiltin::Row, &arguments, row.span, scope)
             }
 
             ast::Expr::Binary(binary) => {
@@ -562,21 +660,21 @@ impl<'a> super::AnalyzerContext<'a> {
                     ));
                 };
                 self.analyze_syntax_function(
-                    "if",
+                    SyntaxBuiltin::If,
                     &[&node.condition, &node.true_value, false_value],
                     node.span,
                     scope,
                 )
             }
             ast::Expr::NullIf(node) => self.analyze_syntax_function(
-                "nullif",
+                SyntaxBuiltin::NullIf,
                 &[&node.first, &node.second],
                 node.span,
                 scope,
             ),
             ast::Expr::Coalesce(node) => {
                 let arguments = node.operands.iter().collect::<Vec<_>>();
-                self.analyze_syntax_function("coalesce", &arguments, node.span, scope)
+                self.analyze_syntax_function(SyntaxBuiltin::Coalesce, &arguments, node.span, scope)
             }
             ast::Expr::Try(node) => Err(AnalyzeError::unsupported_expression(
                 "TRY expressions are not supported",
@@ -2148,27 +2246,27 @@ impl<'a> super::AnalyzerContext<'a> {
         })
     }
 
-    /// Use the existing function owner with the actual dedicated-node children.
-    /// The plain metadata carries no source occurrence or selected binding.
+    /// Borrow dedicated syntax children into the original function author.
     fn analyze_syntax_function(
         &self,
-        name: &'static str,
+        builtin: SyntaxBuiltin,
         arguments: &[&ast::Expr],
         span: Span,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        let mut metadata = novarocks_parser::build::function(
-            ast::ObjectName {
-                parts: vec![novarocks_parser::build::ident_at(name, false, span)],
+        self.analyze_function_from_metadata(
+            FunctionMetadata {
+                original: None,
                 span,
+                distinct: false,
+                order_by: None,
+                window: None,
+                null_treatment: None,
             },
-            Vec::new(),
-        );
-        let ast::Expr::FunctionCall(call) = &mut metadata else {
-            unreachable!("the function builder produces a FunctionCall");
-        };
-        call.span = span;
-        self.analyze_function_with_original_arguments(call, arguments, scope)
+            builtin.name().to_owned(),
+            arguments,
+            scope,
+        )
     }
 
     /// Share the original function admission/binding path while preserving
@@ -2203,6 +2301,29 @@ impl<'a> super::AnalyzerContext<'a> {
         if matches!(original_name.as_str(), "grouping" | "grouping_id") {
             return self.analyze_grouping_function(func, scope);
         }
+        self.analyze_function_from_metadata(
+            FunctionMetadata {
+                original: Some(func),
+                span: func.span,
+                distinct: func.distinct,
+                order_by: func.order_by.as_ref(),
+                window: func.window.as_ref(),
+                null_treatment: func.null_treatment,
+            },
+            original_name,
+            original_arguments,
+            scope,
+        )
+    }
+
+    #[recursive::recursive]
+    fn analyze_function_from_metadata(
+        &self,
+        func: FunctionMetadata<'_>,
+        original_name: String,
+        original_arguments: &[&ast::Expr],
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
         if original_name == "ds_theta_count_distinct" {
             return Err(AnalyzeError::unsupported_expression(
                 "unsupported agg function: ds_theta_count_distinct",
@@ -2701,7 +2822,10 @@ impl<'a> super::AnalyzerContext<'a> {
             .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
 
         // Extract ORDER BY within function args (for aggregates like array_agg)
-        let func_order_by = self.extract_function_order_by(func, scope, &args_typed)?;
+        let func_order_by = match func.original {
+            Some(original) => self.extract_function_order_by(original, scope, &args_typed)?,
+            None => Vec::new(),
+        };
 
         // Check for window function: func(...) OVER (...)
         if let Some(ref window_type) = func.window {
@@ -4350,6 +4474,17 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::JsonQuery(node) => {
                 self.expr_contains_aggregate(&node.path_invocation.input_expression)
             }
+            ast::Expr::GroupingOperation(node) => node
+                .grouping_columns
+                .iter()
+                .any(|value| self.expr_contains_aggregate(value)),
+            ast::Expr::Trim(node) => {
+                self.expr_contains_aggregate(&node.trim_source)
+                    || node
+                        .trim_character
+                        .as_ref()
+                        .is_some_and(|value| self.expr_contains_aggregate(value))
+            }
             ast::Expr::Extract(node) => self.expr_contains_aggregate(&node.expression),
             ast::Expr::If(node) => {
                 self.expr_contains_aggregate(&node.condition)
@@ -5319,15 +5454,6 @@ impl BoundScalarCall {
     pub(super) fn value_type(&self) -> &novarocks_type_contract::FunctionValueType {
         match &self.binding.selected.result_type {
             novarocks_functions::FunctionResultType::Scalar(result) => result,
-            novarocks_functions::FunctionResultType::Relation(_) => {
-                unreachable!("scalar function binding cannot have a relation result")
-            }
-        }
-    }
-
-    pub(super) fn return_type(&self) -> &DataType {
-        match &self.binding.selected.result_type {
-            novarocks_functions::FunctionResultType::Scalar(result) => result.data_type(),
             novarocks_functions::FunctionResultType::Relation(_) => {
                 unreachable!("scalar function binding cannot have a relation result")
             }
@@ -7324,7 +7450,7 @@ fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::super::analyze;
-    use super::{AnalyzeError, BinOp, TypedExpr};
+    use super::{AnalyzeError, BinOp, TypedExpr, string_literal_expr};
     use crate::analysis::{ExprKind, LiteralValue, QueryBody, UnOp};
     use crate::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::catalog::PlannerTableProvider;
@@ -7422,6 +7548,90 @@ mod tests {
             collected_subqueries: Default::default(),
             cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
         }
+    }
+
+    #[test]
+    fn dedicated_trim_profiles_keep_original_binding_and_refuse_explicit_characters() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let ctx = logical_context(&control);
+        let scope = ctx.new_scope();
+        for (specification, name) in [
+            (ast::TrimSpecification::Both, "trim"),
+            (ast::TrimSpecification::Leading, "ltrim"),
+            (ast::TrimSpecification::Trailing, "rtrim"),
+        ] {
+            let node = ast::Trim {
+                specification,
+                trim_source: string_literal_expr("  x  ".into(), novarocks_parser::SYNTHETIC),
+                trim_character: None,
+                span: novarocks_parser::SYNTHETIC,
+            };
+            let actual = ctx
+                .analyze_expr(&ast::Expr::Trim(ast::AstBox::new(node.clone())), &scope)
+                .unwrap();
+            let expected = analyze_projection_expr(&format!("SELECT {name}('  x  ')")).unwrap();
+            assert_eq!(actual.value_type, expected.value_type);
+            let (
+                ExprKind::FunctionCall {
+                    binding: actual, ..
+                },
+                ExprKind::FunctionCall {
+                    binding: expected, ..
+                },
+            ) = (&actual.kind, &expected.kind)
+            else {
+                panic!("real selected scalar binding")
+            };
+            assert_eq!(actual.selected.overload, expected.selected.overload);
+            let mut node = node;
+            node.trim_source =
+                ast::Expr::Identifier(novarocks_parser::build::ident("must_not_resolve", false));
+            node.trim_character = Some(string_literal_expr("x".into(), node.span));
+            assert_eq!(
+                ctx.analyze_expr(&ast::Expr::Trim(ast::AstBox::new(node)), &scope)
+                    .unwrap_err()
+                    .kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+            );
+        }
+        let leaf = ast::Expr::CurrentTimestamp(ast::CurrentTimestamp {
+            precision: Some(-17),
+            span: novarocks_parser::SYNTHETIC,
+        });
+        assert_eq!(
+            ctx.analyze_expr(&leaf, &scope).unwrap_err().kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        // The original ordinary CAST declaration shortcut remains opaque.
+        assert!(
+            analyze_projection_expr("SELECT typeof(CAST(current_timestamp() AS INTEGER))").is_ok()
+        );
+        let mut statements =
+            novarocks_parser::parse("SELECT typeof(CAST(NULL AS INTEGER))").unwrap();
+        let [ast::Statement::Query(query)] = statements.as_mut_slice() else {
+            panic!("query")
+        };
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select")
+        };
+        let ast::SelectItem::SingleColumn(column) = &mut select.projection[0] else {
+            panic!("projection")
+        };
+        let ast::Expr::FunctionCall(call) = &mut column.expression else {
+            panic!("typeof")
+        };
+        let ast::Expr::Cast(cast) = &mut call.arguments[0].value else {
+            panic!("declaration CAST")
+        };
+        cast.expression = leaf;
+        let declared = ctx.analyze_expr(&column.expression, &scope).unwrap();
+        assert_eq!(
+            declared.value_type,
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false)
+        );
+        assert!(
+            matches!(declared.kind, ExprKind::Literal(LiteralValue::String(name)) if name == "integer")
+        );
     }
 
     #[test]
@@ -10023,7 +10233,7 @@ mod tests {
         };
 
         assert_eq!(special_name, "substr");
-        assert_eq!(normal.return_type(), &DataType::Utf8);
+        assert_eq!(normal.value_type().data_type(), &DataType::Utf8);
         assert_eq!(normal.args.len(), special_args.len());
         for (normal, special) in normal.args.iter().zip(special_args.iter()) {
             assert_eq!(

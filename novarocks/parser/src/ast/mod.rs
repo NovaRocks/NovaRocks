@@ -18,6 +18,8 @@
 //! Syntax-only SQL abstract syntax tree nodes.
 
 mod control_expr;
+mod special_expr;
+pub use special_expr::*;
 mod equivalence;
 mod expr;
 mod name_chain;

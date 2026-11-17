@@ -585,6 +585,11 @@ impl Visit for CatalogEdits<'_> {
         }
     }
     fn visit_type_name(&mut self, _: &TypeName) {}
+    fn visit_static_method_call(&mut self, call: &novarocks_parser::ast::StaticMethodCall) {
+        for argument in &call.arguments {
+            self.visit_expr(&argument.value);
+        }
+    }
     fn visit_function_call(&mut self, call: &FunctionCall) {
         if call.name.parts.len() == 1
             && call.name.parts[0]

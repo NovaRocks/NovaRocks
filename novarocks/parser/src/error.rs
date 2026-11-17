@@ -144,6 +144,7 @@ pub enum StructuralViolation {
     EmptyPatternList,
     EmptySubsetIdentifierList,
     InvalidQueryModifierOwner,
+    SpecialExpressionInvariant(crate::ast::SpecialExpressionInvariantError),
     JsonConstructorInvariant(crate::ast::JsonAstInvariantError),
     EmptyUnnestExpressionList,
     EmptyCaseBranches,

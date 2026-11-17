@@ -911,6 +911,18 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
                 expr_display_name_preserve_path(&lambda.body)
             )
         }
+        ast::Expr::GroupingOperation(node) => format_control_call_display(
+            "grouping",
+            &node.grouping_columns.iter().collect::<Vec<_>>(),
+        ),
+        ast::Expr::Trim(node) if node.trim_character.is_none() => {
+            let name = match node.specification {
+                ast::TrimSpecification::Both => "trim",
+                ast::TrimSpecification::Leading => "ltrim",
+                ast::TrimSpecification::Trailing => "rtrim",
+            };
+            format_control_call_display(name, &[&node.trim_source])
+        }
         ast::Expr::Extract(_) => printer::print_expr(expr),
         ast::Expr::If(node) => {
             let mut arguments = vec![&node.condition, &node.true_value];

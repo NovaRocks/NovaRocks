@@ -3651,3 +3651,202 @@ fn pure_routine_statement_cycles_keep_each_body_slot_and_original_return_order()
     assert_eq!(functions[0].name.parts[0].value, "routine");
     drop(functions);
 }
+
+#[test]
+fn remaining_special_roots_keep_deep_owning_edges_and_ordered_actual_children() {
+    use crate::ast::*;
+    use crate::{SYNTHETIC, Span, build};
+    const DEPTH: i64 = 20_000;
+    let span = Span::new(10, 30);
+    let name = ObjectName {
+        parts: (0..DEPTH)
+            .map(|marker| build::ident_at(format!("P{marker}"), true, span))
+            .collect(),
+        span,
+    };
+    let mut tree = Expr::GroupingOperation(AstBox::new(
+        GroupingOperation::new(vec![name], span).unwrap(),
+    ));
+    for marker in 1..=DEPTH {
+        tree = match marker % 7 {
+            0 => Expr::AtLocal(AstBox::new(AtLocal { value: tree, span })),
+            1 => Expr::AtTimeZone(AstBox::new(
+                AtTimeZone::new(tree, build::string("UTC"), span).unwrap(),
+            )),
+            2 => Expr::Trim(AstBox::new(Trim {
+                specification: TrimSpecification::Both,
+                trim_source: tree,
+                trim_character: Some(build::integer(marker)),
+                span,
+            })),
+            3 => Expr::Overlay(AstBox::new(Overlay {
+                value: build::integer(marker),
+                replacement: tree,
+                start: build::integer(-marker),
+                length: Some(build::integer(marker + 100_000)),
+                span,
+            })),
+            4 => Expr::IntervalValueExpression(AstBox::new(IntervalValueExpression {
+                left: tree,
+                right: build::integer(marker),
+                data_type: IntervalDataType {
+                    span,
+                    qualifier: IntervalQualifier::Simple(SimpleIntervalQualifier {
+                        precision: None,
+                        field: IntervalQualifierField::Day,
+                        span,
+                    }),
+                },
+                span,
+            })),
+            5 => Expr::MethodCall(AstBox::new(MethodCall {
+                receiver: tree,
+                method: build::ident_at("method", true, span),
+                arguments: vec![
+                    CallArgument {
+                        name: None,
+                        value: build::integer(marker),
+                        span,
+                    },
+                    CallArgument {
+                        name: Some(build::ident_at("argument", true, span)),
+                        value: build::integer(-marker),
+                        span,
+                    },
+                ]
+                .into(),
+                span,
+            })),
+            _ => Expr::StaticMethodCall(AstBox::new(StaticMethodCall {
+                type_name: ObjectName {
+                    parts: vec![build::ident_at("TYPE", true, span)],
+                    span,
+                },
+                method: build::ident_at("static", false, span),
+                arguments: vec![
+                    CallArgument {
+                        name: None,
+                        value: tree,
+                        span,
+                    },
+                    CallArgument {
+                        name: None,
+                        value: build::integer(marker),
+                        span,
+                    },
+                ]
+                .into(),
+                span,
+            })),
+        };
+    }
+    let copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    drop(copy);
+    #[derive(Default)]
+    struct Facts {
+        numbers: Vec<i64>,
+        names: Vec<(String, bool)>,
+        zones: Vec<String>,
+    }
+    impl Visit for Facts {
+        fn visit_literal(&mut self, node: &Literal) {
+            match &node.kind {
+                LiteralKind::Long { parsed_value, .. } => self.numbers.push(*parsed_value),
+                LiteralKind::String(value) => self.zones.push(value.clone()),
+                _ => {}
+            }
+        }
+        fn visit_ident(&mut self, node: &Ident) {
+            self.names.push((node.value.clone(), node.quoted));
+        }
+    }
+    let mut expected_numbers = (1..=DEPTH)
+        .rev()
+        .filter(|marker| marker % 7 == 3)
+        .collect::<Vec<_>>();
+    for marker in 1..=DEPTH {
+        match marker % 7 {
+            2 | 4 | 6 => expected_numbers.push(marker),
+            3 => expected_numbers.extend([-marker, marker + 100_000]),
+            5 => expected_numbers.extend([marker, -marker]),
+            _ => {}
+        }
+    }
+    let mut expected_names = Vec::new();
+    for marker in (1..=DEPTH).rev() {
+        if marker % 7 == 6 {
+            expected_names.extend([("TYPE".into(), true), ("static".into(), false)]);
+        }
+    }
+    expected_names.extend((0..DEPTH).map(|marker| (format!("p{marker}"), false)));
+    for marker in 1..=DEPTH {
+        if marker % 7 == 5 {
+            expected_names.extend([("method".into(), true), ("argument".into(), true)]);
+        }
+    }
+    let mut facts = Facts::default();
+    facts.visit_expr(&tree);
+    assert_eq!(facts.numbers, expected_numbers);
+    assert_eq!(facts.names, expected_names);
+    assert!(!facts.zones.is_empty());
+    assert!(facts.zones.iter().all(|zone| zone == "UTC"));
+    struct Change;
+    impl Fold for Change {
+        fn fold_ident(&mut self, mut node: Ident) -> Ident {
+            node.value.push_str("_next");
+            node
+        }
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            if let LiteralKind::Long { parsed_value, .. } = node.kind {
+                let Expr::Literal(mut next) = build::integer(parsed_value + 1) else {
+                    unreachable!()
+                };
+                next.span = node.span;
+                next
+            } else {
+                node
+            }
+        }
+    }
+    let changed = Change.fold_expr(tree.clone());
+    let mut changed_facts = Facts::default();
+    changed_facts.visit_expr(&changed);
+    assert_eq!(
+        changed_facts.numbers,
+        expected_numbers
+            .iter()
+            .map(|number| number + 1)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        changed_facts.names,
+        expected_names
+            .iter()
+            .map(|(name, quoted)| (format!("{name}_next"), *quoted))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(changed_facts.zones, facts.zones);
+    assert!(!tree.syntax_eq(&changed));
+    let query = build::query(SetExpr::Select(AstBox::new(
+        build::select(vec![build::item(changed, None)], None, None, None).unwrap(),
+    )));
+    validate_statement(&Statement::Query(query)).unwrap();
+    let printed = crate::printer::print_expr(&tree);
+    assert!(printed.contains("GROUPING (p0.p1."));
+    assert!(printed.contains("p19999)"));
+    assert!(printed.contains(" AT TIME ZONE 'UTC'"));
+    assert!(printed.contains("`TYPE`::static("));
+    let Expr::AtTimeZone(root) = tree else {
+        panic!("actual outer input")
+    };
+    let payload = root.into_inner();
+    assert_eq!(payload.span, span);
+    assert_eq!(payload.time_zone.span(), SYNTHETIC);
+    drop(payload.value);
+    drop(payload.time_zone);
+}
