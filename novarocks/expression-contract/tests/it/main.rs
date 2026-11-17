@@ -37,3 +37,5 @@ mod root_use_contract;
 mod diagnostics;
 
 mod unit_creation;
+
+mod static_types;

@@ -2496,3 +2496,7 @@ mod checked_reference_tests;
 #[cfg(test)]
 #[path = "compiler/literal_metadata_tests.rs"]
 mod literal_metadata_tests;
+
+#[cfg(test)]
+#[path = "compiler/primary_cause_footer_tests.rs"]
+mod primary_cause_footer_tests;
