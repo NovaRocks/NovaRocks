@@ -691,6 +691,18 @@ pub(crate) use property_proof::OccurrencePropertyProof;
 pub use property_proof::{PropertyProofProjectionFacts, PropertyProofProjectionLimits};
 
 impl Fragment {
+    /// Install the original completed table without cloning its owned entries.
+    /// Recheck it against this exact fragment through the same frozen author;
+    /// the caller retains source/storage admission and final plan publication.
+    pub fn with_frozen_calls_observed(
+        mut self,
+        calls: FrozenFragmentCalls,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, FrozenCallError> {
+        calls.validate_fragment(&self, control)?;
+        self.calls = calls;
+        Ok(self)
+    }
     pub fn with_calls_observed(
         mut self,
         calls: Vec<FrozenPhysicalCall>,

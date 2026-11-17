@@ -1121,3 +1121,60 @@ fn definition_source_observes_each_unitless_node_on_the_original_caller_scope() 
         }
     }
 }
+
+#[test]
+fn completed_relation_table_moves_without_copy_and_rechecks_actual_source_and_control() {
+    let original = window_fragment(1);
+    let site = PhysicalCallSite::Window {
+        node: original.root(),
+        call: 0,
+    };
+    let table =
+        FrozenFragmentCalls::try_new(&original, vec![window_claim(site, 0)], &Control).unwrap();
+    let retained = table.clone();
+    let installed = original
+        .clone()
+        .with_frozen_calls_observed(table, &Control)
+        .unwrap();
+    assert!(std::ptr::eq(
+        installed.calls().entries(),
+        retained.entries()
+    ));
+    assert_eq!(installed.calls().entries().len(), 1);
+    let wider = window_fragment(2);
+    assert!(matches!(
+        wider.with_frozen_calls_observed(retained.clone(), &Control),
+        Err(FrozenCallError::MissingSite(PhysicalCallSite::Window {
+            call: 1,
+            ..
+        }))
+    ));
+    let mut other = FragmentBuilder::new(FragmentId::new(37));
+    let root = other.reserve_node_id().unwrap();
+    source(&mut other, root, &[]);
+    let other = finish(other, root).unwrap();
+    assert!(matches!(
+        other.with_frozen_calls_observed(retained.clone(), &Control),
+        Err(FrozenCallError::WrongFragment)
+    ));
+    struct Stop(CompileControlError, std::sync::atomic::AtomicUsize);
+    impl PureCompileControl for Stop {
+        fn checkpoint(&self, _phase: CompilePhase, _units: u32) -> Result<(), CompileControlError> {
+            let next = self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            assert_eq!(next, 1, "callback after the original refusal");
+            Err(self.0.clone())
+        }
+    }
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let control = Stop(cause.clone(), std::sync::atomic::AtomicUsize::new(0));
+        assert!(
+            matches!(original.clone().with_frozen_calls_observed(retained.clone(), &control), Err(FrozenCallError::Control(actual)) if actual == cause)
+        );
+        assert_eq!(control.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    assert_eq!(retained.entries().len(), 1);
+}
