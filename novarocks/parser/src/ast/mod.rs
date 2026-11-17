@@ -66,10 +66,11 @@ pub use dml::{
 };
 pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
-    AccessExpr, AccessKind, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr, BinaryOperator,
-    CallArgument, DereferenceExpr, Expr, FunctionCall, IntervalExpr, IntervalField, JsonOperator,
-    LogicalExpr, LogicalOperator, NestedExpr, NullTreatment, ProcessingMode, ProcessingModeKind,
-    RowExpr, RowField, SubqueryExpr, SubscriptExpr, UnaryExpr, UnaryOperator,
+    AccessExpr, AccessKind, AllRows, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr,
+    BinaryOperator, CallArgument, DereferenceExpr, Expr, FunctionCall, IntervalExpr, IntervalField,
+    JsonOperator, LogicalExpr, LogicalOperator, NestedExpr, NullTreatment, Parameter,
+    ProcessingMode, ProcessingModeKind, RowExpr, RowField, SubqueryExpr, SubscriptExpr, UnaryExpr,
+    UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -90,10 +91,10 @@ pub use materialized_view::{
     MaterializedViewRefreshPolicy, MaterializedViewStatement, RefreshMaterializedView,
 };
 pub use query::{
-    Corresponding, Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, NullOrdering, Offset,
-    OffsetRows, OrderBy, Query, QueryModifiers, ReplaceSelectItem, Select, SelectItem,
-    SelectQuantifier, SessionProperty, SetExpr, SetOperation, SetOperator, SetQuantifier, SortItem,
-    SortOrdering, Values, WildcardOptions, With,
+    Corresponding, Cte, ExplainFormat, ExplainQuery, FetchFirst, GroupBy, Limit, NullOrdering,
+    Offset, OrderBy, Query, QueryLimit, QueryModifiers, ReplaceSelectItem, Select, SelectItem,
+    SelectQuantifier, SessionProperty, SetExpr, SetOperation, SetOperator, SortItem, SortOrdering,
+    Values, WildcardOptions, With,
 };
 pub use relation::{
     Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableVersion,
@@ -398,3 +399,5 @@ pub use visit::{
 pub use visit::{
     fold_call_argument, fold_processing_mode, walk_call_argument, walk_processing_mode,
 };
+
+pub use visit::{fold_set_operation, walk_set_operation};

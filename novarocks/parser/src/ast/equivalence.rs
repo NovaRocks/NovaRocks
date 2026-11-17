@@ -78,8 +78,6 @@ impl SyntaxEq for QueryModifiers {
         syntax_eq_option(&self.order_by, &other.order_by)
             && syntax_eq_option(&self.limit, &other.limit)
             && syntax_eq_option(&self.offset, &other.offset)
-            && self.limit_comma_offset == other.limit_comma_offset
-            && syntax_eq_option(&self.fetch, &other.fetch)
     }
 }
 
@@ -116,10 +114,11 @@ impl SyntaxEq for SetExpr {
 }
 
 impl SyntaxEq for SetOperation {
+    #[recursive::recursive]
     fn syntax_eq(&self, other: &Self) -> bool {
         syntax_eq_slice(&self.inputs, &other.inputs)
             && self.operator == other.operator
-            && self.quantifier == other.quantifier
+            && self.distinct == other.distinct
             && syntax_eq_option(&self.corresponding, &other.corresponding)
     }
 }
@@ -271,17 +270,38 @@ impl SyntaxEq for SortItem {
     }
 }
 
-impl SyntaxEq for Offset {
+impl SyntaxEq for QueryLimit {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.value.syntax_eq(&other.value) && self.rows == other.rows
+        match (self, other) {
+            (Self::Limit(left), Self::Limit(right)) => left.syntax_eq(right),
+            (Self::FetchFirst(left), Self::FetchFirst(right)) => left.syntax_eq(right),
+            _ => false,
+        }
     }
 }
-
-impl SyntaxEq for Fetch {
+impl SyntaxEq for Limit {
     fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_option(&self.quantity, &other.quantity)
-            && self.percent == other.percent
-            && self.with_ties == other.with_ties
+        self.row_count.syntax_eq(&other.row_count)
+    }
+}
+impl SyntaxEq for Offset {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.row_count.syntax_eq(&other.row_count)
+    }
+}
+impl SyntaxEq for FetchFirst {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        syntax_eq_option(&self.row_count, &other.row_count) && self.with_ties == other.with_ties
+    }
+}
+impl SyntaxEq for AllRows {
+    fn syntax_eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl SyntaxEq for Parameter {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.position == other.position
     }
 }
 
@@ -503,6 +523,8 @@ impl SyntaxEq for Expr {
             (Self::JsonArray(left), Self::JsonArray(right)) => left.syntax_eq(right),
 
             (Self::Identifier(left), Self::Identifier(right)) => left.syntax_eq(right),
+            (Self::AllRows(left), Self::AllRows(right)) => left.syntax_eq(right),
+            (Self::Parameter(left), Self::Parameter(right)) => left.syntax_eq(right),
             (Self::Literal(left), Self::Literal(right)) => left.syntax_eq(right),
             (Self::FunctionCall(left), Self::FunctionCall(right)) => left.syntax_eq(right),
             (Self::Extract(left), Self::Extract(right)) => left.syntax_eq(right),
@@ -862,18 +884,14 @@ mod tests {
                         .into(),
                         span: span(start + 16),
                     }),
-                    limit: Some(number("10", start + 17)),
-                    offset: Some(Offset {
-                        value: number("3", start + 18),
-                        rows: OffsetRows::Rows,
-                        span: span(start + 19),
-                    }),
-                    limit_comma_offset: false,
-                    fetch: Some(Fetch {
-                        quantity: Some(number("4", start + 20)),
-                        percent: true,
+                    limit: Some(QueryLimit::FetchFirst(FetchFirst {
+                        row_count: Some(number("4", start + 20)),
                         with_ties: true,
                         span: span(start + 21),
+                    })),
+                    offset: Some(Offset {
+                        row_count: number("3", start + 18),
+                        span: span(start + 19),
                     }),
                 },
                 span: span(start + 14),
@@ -900,12 +918,10 @@ mod tests {
         let SetExpr::Select(select) = right.body.as_mut() else {
             panic!("SELECT")
         };
-        select
-            .modifiers
-            .fetch
-            .as_mut()
-            .expect("fixture has fetch")
-            .with_ties = false;
+        let Some(QueryLimit::FetchFirst(fetch)) = select.modifiers.limit.as_mut() else {
+            panic!("fixture has FETCH FIRST");
+        };
+        fetch.with_ties = false;
 
         assert!(!syntax_eq_query(&left, &right));
     }

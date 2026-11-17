@@ -166,10 +166,17 @@ fn validate_mv_query_modifiers(
     if modifiers.order_by.is_some() {
         return Err(unsupported_mv_query_clause("ORDER BY"));
     }
-    if modifiers.limit.is_some() || modifiers.offset.is_some() {
+    if matches!(
+        &modifiers.limit,
+        Some(novarocks_parser::ast::QueryLimit::Limit(_))
+    ) || modifiers.offset.is_some()
+    {
         return Err(unsupported_mv_query_clause("LIMIT or OFFSET"));
     }
-    if modifiers.fetch.is_some() {
+    if matches!(
+        &modifiers.limit,
+        Some(novarocks_parser::ast::QueryLimit::FetchFirst(_))
+    ) {
         return Err(unsupported_mv_query_clause("FETCH"));
     }
     Ok(())

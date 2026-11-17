@@ -26,7 +26,8 @@ use novarocks_parser::{
 #[test]
 fn query_forms_parse_and_print_as_typed_syntax() {
     for source in [
-        "SELECT a, count(*) AS n FROM db.t AS t WHERE a >= 1 GROUP BY a HAVING count(*) > 0 ORDER BY a DESC LIMIT 5 OFFSET 2 ROWS FETCH FIRST 1 ROW ONLY",
+        "SELECT a, count(*) AS n FROM db.t AS t WHERE a >= 1 GROUP BY a HAVING count(*) > 0 ORDER BY a DESC LIMIT 5 OFFSET 2 ROWS",
+        "SELECT a FROM db.t ORDER BY a DESC OFFSET 2 ROWS FETCH FIRST 1 ROW ONLY",
         "SELECT CASE WHEN a IS NULL THEN CAST(0 AS INT) ELSE CAST(a AS INT) END AS normalized FROM t WHERE a NOT BETWEEN 1 AND 3",
         "SELECT sum(v) OVER (PARTITION BY k ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
         "SELECT sum(v) OVER w FROM t WINDOW w AS (PARTITION BY k ORDER BY ts ROWS 1 PRECEDING)",
@@ -154,13 +155,51 @@ fn select_optimizer_assignment_hint_is_typed_and_roundtrips() {
 }
 
 #[test]
-fn comma_limit_syntax_is_retained_by_the_typed_ast() {
-    let statements = parse("SELECT * FROM t LIMIT 2, 10").expect("comma LIMIT should parse");
-
-    assert_eq!(
-        Printer::new().statements(&statements),
-        "SELECT * FROM t LIMIT 2, 10"
-    );
+fn comma_limit_normalizes_to_offset_and_limit() {
+    use novarocks_parser::ast::{Literal, LiteralKind, QueryLimit};
+    let source = "SELECT * FROM t LIMIT 2, 10";
+    let statements = parse(source).expect("comma LIMIT should parse");
+    let Statement::Query(query) = &statements[0] else {
+        panic!("query");
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("SELECT");
+    };
+    let offset = select.modifiers.offset.as_ref().expect("original offset");
+    let Some(QueryLimit::Limit(limit)) = &select.modifiers.limit else {
+        panic!("original row count");
+    };
+    assert!(matches!(
+        offset.row_count,
+        Expr::Literal(Literal {
+            kind: LiteralKind::Long {
+                parsed_value: 2,
+                ..
+            },
+            ..
+        })
+    ));
+    assert!(matches!(
+        limit.row_count,
+        Expr::Literal(Literal {
+            kind: LiteralKind::Long {
+                parsed_value: 10,
+                ..
+            },
+            ..
+        })
+    ));
+    let offset_span = offset.row_count.span();
+    let count_span = limit.row_count.span();
+    assert_eq!(&source[offset_span.start()..offset_span.end()], "2");
+    assert_eq!(&source[count_span.start()..count_span.end()], "10");
+    let canonical = Printer::new().statements(&statements);
+    assert_eq!(canonical, "SELECT * FROM t OFFSET 2 ROWS LIMIT 10");
+    let reparsed = parse(&canonical).expect("canonical count clauses parse");
+    let Statement::Query(reparsed) = &reparsed[0] else {
+        panic!("canonical query");
+    };
+    assert!(query.syntax_eq(reparsed));
 }
 
 #[test]

@@ -48,6 +48,16 @@ pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
         StructuralViolation::InvalidSetOperationOperandCount => {
             "invalid SQL structure: invalid set operation operand count".to_owned()
         }
+        StructuralViolation::InvalidLimitRowCount => {
+            "invalid SQL structure: LIMIT count must be ALL, a long literal, or a parameter"
+                .to_owned()
+        }
+        StructuralViolation::InvalidOffsetRowCount => {
+            "invalid SQL structure: OFFSET count must be a long literal or a parameter".to_owned()
+        }
+        StructuralViolation::InvalidFetchFirstRowCount => {
+            "invalid SQL structure: FETCH count must be a long literal or a parameter".to_owned()
+        }
         StructuralViolation::EmptyPatternList => {
             "invalid SQL structure: empty row-pattern list".to_owned()
         }

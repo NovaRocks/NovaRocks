@@ -309,7 +309,7 @@ fn validate_union_projection_set_expr(
     match set_expr {
         ast::SetExpr::SetOperation(ast::SetOperation {
             operator,
-            quantifier,
+            distinct,
             inputs,
             corresponding,
             ..
@@ -319,7 +319,7 @@ fn validate_union_projection_set_expr(
                     "iceberg UNION ALL MV full refresh does not support CORRESPONDING".to_string(),
                 );
             }
-            if *operator != ast::SetOperator::Union || *quantifier != ast::SetQuantifier::All {
+            if *operator != ast::SetOperator::Union || *distinct {
                 return Err("iceberg UNION ALL MV full refresh supports UNION ALL only".to_string());
             }
             if inputs.len() < 2 {
@@ -609,7 +609,7 @@ fn flatten_branch_union_all_set_expr(
     match body {
         ast::SetExpr::SetOperation(ast::SetOperation {
             operator,
-            quantifier,
+            distinct,
             inputs,
             corresponding,
             ..
@@ -617,9 +617,7 @@ fn flatten_branch_union_all_set_expr(
             if corresponding.is_some() {
                 return Err("iceberg branch UNION ALL aggregate first refresh does not support CORRESPONDING".to_string());
             }
-            if !matches!(operator, ast::SetOperator::Union)
-                || !matches!(quantifier, ast::SetQuantifier::All)
-            {
+            if !matches!(operator, ast::SetOperator::Union) || *distinct {
                 return Err(
                     "iceberg branch UNION ALL aggregate first refresh supports UNION ALL only"
                         .to_string(),

@@ -2360,3 +2360,124 @@ fn actual_extract_owning_and_semantic_cycle_keeps_deep_fields_and_original_leaf(
     assert_eq!(payload.field, fields[(DEPTH - 1) % fields.len()]);
     drop(payload.expression);
 }
+
+#[test]
+fn actual_mixed_set_operation_inputs_keep_deep_owning_semantic_and_printing_edges() {
+    use crate::ast::{
+        Expr, Fold, Literal, LiteralKind, SetExpr, SetOperation, SetOperator, Statement, SyntaxEq,
+        Values, Visit,
+    };
+    use crate::{Span, build};
+    const DEPTH: i64 = 20_000;
+    fn leaf(value: i64) -> SetExpr {
+        SetExpr::Values(Values {
+            rows: vec![vec![build::integer(value)]],
+            explicit_row: false,
+            span: Span::new(1, 2),
+        })
+    }
+    fn operator(marker: i64) -> SetOperator {
+        match marker % 3 {
+            0 => SetOperator::Union,
+            1 => SetOperator::Intersect,
+            _ => SetOperator::Except,
+        }
+    }
+    let mut tree = leaf(0);
+    for marker in 1..=DEPTH {
+        tree = SetExpr::SetOperation(SetOperation {
+            inputs: vec![tree, leaf(marker)].into(),
+            operator: operator(marker),
+            distinct: marker % 2 == 0,
+            corresponding: None,
+            span: Span::new(3, 13),
+        });
+    }
+    let mut copy = tree.clone();
+    assert_eq!(tree, copy);
+    assert!(tree.syntax_eq(&copy));
+    let mut sink = DebugSink::default();
+    write!(&mut sink, "{tree:?}").unwrap();
+    assert!(sink.bytes > DEPTH as usize);
+    let mut cursor = &mut copy;
+    for marker in (1..=DEPTH).rev() {
+        let SetExpr::SetOperation(operation) = cursor else {
+            panic!("actual SetOperation inputs edge");
+        };
+        assert_eq!(operation.operator, operator(marker));
+        assert_eq!(operation.distinct, marker % 2 == 0);
+        assert_eq!(operation.inputs.len(), 2);
+        assert_eq!(operation.span, Span::new(3, 13));
+        assert!(operation.corresponding.is_none());
+        cursor = &mut operation.inputs[0];
+    }
+    let SetExpr::Values(value) = cursor else {
+        panic!("original terminal");
+    };
+    value.rows[0][0] = build::integer(-1);
+    assert_ne!(tree, copy);
+    assert!(!tree.syntax_eq(&copy));
+    drop(copy);
+    #[derive(Default)]
+    struct Facts {
+        leaves: Vec<i64>,
+        operations: Vec<(SetOperator, bool)>,
+    }
+    impl Visit for Facts {
+        fn visit_set_operation(&mut self, node: &SetOperation) {
+            self.operations.push((node.operator, node.distinct));
+            crate::ast::walk_set_operation(self, node);
+        }
+        fn visit_literal(&mut self, node: &Literal) {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                panic!("integer value");
+            };
+            self.leaves.push(parsed_value);
+        }
+    }
+    let query = build::query(tree.clone());
+    let mut facts = Facts::default();
+    facts.visit_query(&query);
+    assert_eq!(facts.leaves, (0..=DEPTH).collect::<Vec<_>>());
+    assert_eq!(
+        facts.operations,
+        (1..=DEPTH)
+            .rev()
+            .map(|marker| (operator(marker), marker % 2 == 0))
+            .collect::<Vec<_>>()
+    );
+    struct Change;
+    impl Fold for Change {
+        fn fold_literal(&mut self, node: Literal) -> Literal {
+            let LiteralKind::Long { parsed_value, .. } = node.kind else {
+                panic!("integer value");
+            };
+            let Expr::Literal(value) = build::integer(parsed_value + 1) else {
+                unreachable!()
+            };
+            value
+        }
+    }
+    let changed = Change.fold_query(query);
+    let mut changed_facts = Facts::default();
+    changed_facts.visit_query(&changed);
+    assert_eq!(changed_facts.leaves, (1..=DEPTH + 1).collect::<Vec<_>>());
+    assert_eq!(changed_facts.operations, facts.operations);
+    assert!(!tree.syntax_eq(changed.body.as_ref()));
+    crate::ast::validate_statement(&Statement::Query(changed)).unwrap();
+    let query = build::query(tree);
+    let printed = crate::printer::print_query(&query);
+    assert_eq!(printed.matches("VALUES").count(), (DEPTH + 1) as usize);
+    assert_eq!(
+        printed.matches("UNION").count()
+            + printed.matches("INTERSECT").count()
+            + printed.matches("EXCEPT").count(),
+        DEPTH as usize
+    );
+    let SetExpr::SetOperation(top) = *query.body else {
+        unreachable!()
+    };
+    let inputs = top.inputs.into_inner();
+    assert_eq!(inputs.len(), 2);
+    drop(inputs);
+}

@@ -113,16 +113,25 @@ fn validate_query_modifiers(modifiers: &super::QueryModifiers) -> Result<(), Val
     if let Some(order_by) = &modifiers.order_by {
         validate_order_by(order_by)?;
     }
-    if let Some(limit) = &modifiers.limit {
-        validate_expr(limit)?;
-    }
     if let Some(offset) = &modifiers.offset {
-        validate_expr(&offset.value)?;
+        validate_row_count(
+            &offset.row_count,
+            false,
+            StructuralViolation::InvalidOffsetRowCount,
+        )?;
     }
-    if let Some(fetch) = &modifiers.fetch
-        && let Some(quantity) = &fetch.quantity
-    {
-        validate_expr(quantity)?;
+    match &modifiers.limit {
+        Some(super::QueryLimit::Limit(node)) => validate_row_count(
+            &node.row_count,
+            true,
+            StructuralViolation::InvalidLimitRowCount,
+        )?,
+        Some(super::QueryLimit::FetchFirst(node)) => {
+            if let Some(count) = &node.row_count {
+                validate_row_count(count, false, StructuralViolation::InvalidFetchFirstRowCount)?;
+            }
+        }
+        None => {}
     }
     Ok(())
 }
@@ -140,15 +149,17 @@ fn validate_unique_ctes(ctes: &[Cte]) -> Result<(), ValidateError> {
     Ok(())
 }
 
+#[recursive::recursive]
 fn validate_set_expr(set_expr: &SetExpr) -> Result<(), ValidateError> {
     match set_expr {
         SetExpr::Select(select) => validate_select(select),
         SetExpr::Values(values) => validate_values(values),
         SetExpr::Query(query) => validate_query(query),
         SetExpr::SetOperation(operation) => {
-            if operation.inputs.len() < 2
-                || (operation.operator == super::SetOperator::Except && operation.inputs.len() != 2)
-            {
+            let multi_union_all = operation.operator == super::SetOperator::Union
+                && !operation.distinct
+                && operation.corresponding.is_none();
+            if operation.inputs.len() < 2 || (!multi_union_all && operation.inputs.len() != 2) {
                 return Err(ValidateError::invalid_structure(
                     StructuralViolation::InvalidSetOperationOperandCount,
                     operation.span,
@@ -585,7 +596,7 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
         }
         Expr::ArrayWildcardSubscript(node) => validate_expr(&node.base)?,
         Expr::Dereference(node) => validate_expr(&node.base)?,
-        Expr::Identifier(_) | Expr::Literal(_) => {}
+        Expr::Identifier(_) | Expr::Literal(_) | Expr::AllRows(_) | Expr::Parameter(_) => {}
     }
     Ok(())
 }
@@ -765,4 +776,22 @@ fn validate_row_pattern(pattern: &super::RowPattern) -> Result<(), ValidateError
 #[recursive::recursive]
 fn validate_call_argument(argument: &super::CallArgument) -> Result<(), ValidateError> {
     validate_expr(&argument.value)
+}
+
+fn validate_row_count(
+    node: &Expr,
+    allow_all: bool,
+    violation: StructuralViolation,
+) -> Result<(), ValidateError> {
+    if matches!(
+        node,
+        Expr::Literal(super::Literal {
+            kind: super::LiteralKind::Long { .. },
+            ..
+        }) | Expr::Parameter(_)
+    ) || (allow_all && matches!(node, Expr::AllRows(_)))
+    {
+        return Ok(());
+    }
+    Err(ValidateError::invalid_structure(violation, node.span()))
 }

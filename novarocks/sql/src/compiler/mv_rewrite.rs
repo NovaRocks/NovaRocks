@@ -3177,7 +3177,9 @@ impl Visit for CompletionRetainedBytes {
                     expression.arguments.capacity(),
                 );
             }
-            Expr::Identifier(_)
+            Expr::AllRows(_)
+            | Expr::Parameter(_)
+            | Expr::Identifier(_)
             | Expr::Literal(_)
             | Expr::FunctionCall(_)
             | Expr::Unary(_)

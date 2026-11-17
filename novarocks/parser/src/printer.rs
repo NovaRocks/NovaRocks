@@ -202,36 +202,18 @@ impl Printer {
             self.output.push_str(" ORDER BY ");
             self.write_order_by_list(&order_by.items);
         }
-        if modifiers.limit_comma_offset {
-            let offset = modifiers
-                .offset
-                .as_ref()
-                .expect("comma LIMIT syntax requires an offset");
-            let limit = modifiers
-                .limit
-                .as_ref()
-                .expect("comma LIMIT syntax requires a limit");
-            self.output.push_str(" LIMIT ");
-            self.write_expr(&offset.value);
-            self.output.push_str(", ");
-            self.write_expr(limit);
-        } else if let Some(limit) = &modifiers.limit {
-            self.output.push_str(" LIMIT ");
-            self.write_expr(limit);
-        }
-        if !modifiers.limit_comma_offset
-            && let Some(offset) = &modifiers.offset
-        {
+        if let Some(offset) = &modifiers.offset {
             self.output.push_str(" OFFSET ");
-            self.write_expr(&offset.value);
-            match offset.rows {
-                OffsetRows::None => {}
-                OffsetRows::Row => self.output.push_str(" ROW"),
-                OffsetRows::Rows => self.output.push_str(" ROWS"),
-            }
+            self.write_expr(&offset.row_count);
+            self.output.push_str(" ROWS");
         }
-        if let Some(fetch) = &modifiers.fetch {
-            self.write_fetch(fetch);
+        match &modifiers.limit {
+            Some(QueryLimit::Limit(node)) => {
+                self.output.push_str(" LIMIT ");
+                self.write_expr(&node.row_count);
+            }
+            Some(QueryLimit::FetchFirst(node)) => self.write_fetch_first(node),
+            None => {}
         }
     }
 
@@ -273,6 +255,7 @@ impl Printer {
         }
     }
 
+    #[recursive::recursive]
     fn write_set_expr(&mut self, expression: &SetExpr) {
         match expression {
             SetExpr::Select(select) => self.write_select(select),
@@ -293,7 +276,7 @@ impl Printer {
                         SetOperator::Intersect => "INTERSECT",
                         SetOperator::Except => "EXCEPT",
                     });
-                    if operation.quantifier == SetQuantifier::All {
+                    if !operation.distinct {
                         self.output.push_str(" ALL");
                     }
                     if let Some(corresponding) = &operation.corresponding {
@@ -517,14 +500,11 @@ impl Printer {
         }
     }
 
-    fn write_fetch(&mut self, fetch: &Fetch) {
+    fn write_fetch_first(&mut self, fetch: &FetchFirst) {
         self.output.push_str(" FETCH FIRST");
-        if let Some(quantity) = &fetch.quantity {
+        if let Some(count) = &fetch.row_count {
             self.output.push(' ');
-            self.write_expr(quantity);
-        }
-        if fetch.percent {
-            self.output.push_str(" PERCENT");
+            self.write_expr(count);
         }
         self.output.push_str(" ROWS");
         self.output.push_str(if fetch.with_ties {
@@ -944,6 +924,8 @@ impl Printer {
             Expr::JsonArray(node) => self.write_json_array(node),
 
             Expr::Identifier(ident) => self.write_ident(ident),
+            Expr::AllRows(_) => self.output.push_str("ALL"),
+            Expr::Parameter(_) => self.output.push('?'),
             Expr::Literal(literal) => self.write_literal(literal),
             Expr::FunctionCall(call) => self.write_function_call(call),
             Expr::Extract(node) => self.write_extract_expr(node),
@@ -2671,17 +2653,12 @@ mod tests {
                         .into(),
                         span: span(),
                     }),
-                    limit: Some(number("10")),
-                    offset: Some(Offset {
-                        value: number("2"),
-                        rows: OffsetRows::Rows,
+                    limit: Some(QueryLimit::Limit(Limit {
+                        row_count: number("10"),
                         span: span(),
-                    }),
-                    limit_comma_offset: false,
-                    fetch: Some(Fetch {
-                        quantity: Some(number("3")),
-                        percent: false,
-                        with_ties: false,
+                    })),
+                    offset: Some(Offset {
+                        row_count: number("2"),
                         span: span(),
                     }),
                 },
@@ -2698,7 +2675,7 @@ mod tests {
                 query: Box::new(query),
                 span: span(),
             })),
-            "EXPLAIN VERBOSE WITH source AS (VALUES (1)) SELECT DISTINCT ON (s) s AS value FROM source s ORDER BY value DESC NULLS LAST LIMIT 10 OFFSET 2 ROWS FETCH FIRST 3 ROWS ONLY"
+            "EXPLAIN VERBOSE WITH source AS (VALUES (1)) SELECT DISTINCT ON (s) s AS value FROM source s ORDER BY value DESC NULLS LAST OFFSET 2 ROWS LIMIT 10"
         );
     }
 

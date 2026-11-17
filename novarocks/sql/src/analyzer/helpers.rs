@@ -1810,20 +1810,35 @@ pub(super) fn query_modifiers(query: &ast::Query) -> Result<&ast::QueryModifiers
 
 pub(super) fn extract_limit(modifiers: &ast::QueryModifiers) -> Result<Option<i64>, AnalyzeError> {
     match &modifiers.limit {
-        Some(limit) => eval_limit_or_offset(limit, "LIMIT").map(Some),
+        Some(ast::QueryLimit::Limit(limit)) => match &limit.row_count {
+            ast::Expr::AllRows(_) => Ok(None),
+            row_count => eval_limit_or_offset(row_count, "LIMIT").map(Some),
+        },
+        Some(ast::QueryLimit::FetchFirst(fetch)) => Err(AnalyzeError::unsupported_expression(
+            "FETCH FIRST is not supported",
+            fetch.span,
+        )),
         None => Ok(None),
     }
 }
 
 pub(super) fn extract_offset(modifiers: &ast::QueryModifiers) -> Result<Option<i64>, AnalyzeError> {
     match &modifiers.offset {
-        Some(offset) => eval_limit_or_offset(&offset.value, "OFFSET").map(Some),
+        Some(offset) => eval_limit_or_offset(&offset.row_count, "OFFSET").map(Some),
         None => Ok(None),
     }
 }
 
 fn eval_limit_or_offset(expr: &ast::Expr, keyword: &str) -> Result<i64, AnalyzeError> {
     match expr {
+        ast::Expr::Parameter(_) => Err(AnalyzeError::unsupported_expression(
+            format!("parameterized {keyword} is not supported"),
+            expr.span(),
+        )),
+        ast::Expr::AllRows(_) => Err(AnalyzeError::unsupported_expression(
+            format!("ALL is not supported for {keyword}"),
+            expr.span(),
+        )),
         ast::Expr::Literal(ast::Literal {
             kind:
                 ast::LiteralKind::Long {

@@ -4264,7 +4264,7 @@ mod tests {
             panic!("expected UNION ALL");
         };
         assert_eq!(root.operator, ast::SetOperator::Union);
-        assert_eq!(root.quantifier, ast::SetQuantifier::All);
+        assert!(!root.distinct);
         assert!(root.corresponding.is_none());
         assert_eq!(root.inputs.len(), 4);
         for (index, input) in root.inputs.iter().enumerate() {

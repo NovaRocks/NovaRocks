@@ -32,6 +32,8 @@ pub enum Expr {
     JsonArray(Box<super::JsonArray>),
 
     Identifier(Ident),
+    AllRows(AllRows),
+    Parameter(Parameter),
     Literal(Literal),
     FunctionCall(AstBox<FunctionCall>),
     Extract(AstBox<super::ExtractExpr>),
@@ -76,6 +78,8 @@ impl Expr {
             Self::JsonArray(node) => node.span,
 
             Self::Identifier(ident) => ident.span,
+            Self::AllRows(node) => node.span,
+            Self::Parameter(node) => node.span,
             Self::Literal(literal) => literal.span,
             Self::FunctionCall(call) => call.span,
             Self::Extract(node) => node.span,
@@ -303,4 +307,26 @@ pub struct ProcessingMode {
 pub enum ProcessingModeKind {
     Running,
     Final,
+}
+
+/// The explicit unbounded row count, distinct from an absent LIMIT clause.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllRows {
+    pub span: Span,
+}
+/// A positional parameter fact; numbering belongs to the source parser.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Parameter {
+    pub position: usize,
+    pub span: Span,
+}
+impl AllRows {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+impl Parameter {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
 }

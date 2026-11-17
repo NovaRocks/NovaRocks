@@ -138,8 +138,7 @@ pub(crate) fn resolve_expression_site<'a>(
             (SqlConstantQueryStep::SetOperand { index }, ast::SetExpr::SetOperation(op))
                 if op.corresponding.is_none()
                     && (allow_set_operations
-                        || (op.operator == ast::SetOperator::Union
-                            && op.quantifier == ast::SetQuantifier::All)) =>
+                        || (op.operator == ast::SetOperator::Union && !op.distinct)) =>
             {
                 query_owner = None;
                 op.inputs.get(*index).ok_or_else(|| {

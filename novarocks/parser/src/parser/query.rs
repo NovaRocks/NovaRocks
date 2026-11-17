@@ -20,11 +20,11 @@
 use crate::{
     Span, Token, TokenKind,
     ast::{
-        Cte, ExplainFormat, ExplainQuery, Expr, Fetch, GroupBy, Ident, Join, JoinConstraint,
-        JoinOperator, NullOrdering, Offset, OffsetRows, OrderBy, Query, Select, SelectItem,
-        SelectQuantifier, SetExpr, SetOperator, SetQuantifier, SortItem, SortOrdering, Statement,
-        TableFactor, TableVersion, TableVersionKind, TableWithJoins, Values, WildcardOptions,
-        WindowDefinition, With,
+        AllRows, Cte, ExplainFormat, ExplainQuery, Expr, FetchFirst, GroupBy, Ident, Join,
+        JoinConstraint, JoinOperator, Limit, Literal, LiteralKind, NullOrdering, Offset, OrderBy,
+        Query, QueryLimit, Select, SelectItem, SelectQuantifier, SetExpr, SetOperator, SortItem,
+        SortOrdering, Statement, TableFactor, TableVersion, TableVersionKind, TableWithJoins,
+        Values, WildcardOptions, WindowDefinition, With,
     },
     lex,
     token::{Keyword, Symbol},
@@ -113,16 +113,15 @@ pub(super) fn parse_query(
     };
     let (mut body, mut session_properties) = parse_set_expr(parser)?;
     while let Some(operator) = parse_set_operator(parser) {
-        let quantifier = if parser.consume_if_word("ALL") {
-            SetQuantifier::All
-        } else if parser.consume_if_word("DISTINCT") {
-            SetQuantifier::Distinct
+        let distinct = if parser.consume_if_word("ALL") {
+            false
         } else {
-            SetQuantifier::Distinct
+            parser.consume_if_word("DISTINCT");
+            true
         };
         let (right, _) = parse_set_expr(parser)?;
         session_properties.clear();
-        body = crate::build::set_operation(body, operator, quantifier, right, None);
+        body = crate::build::set_operation(body, operator, distinct, right, None);
     }
 
     let order_by = if parser.current_is_word("ORDER") {
@@ -133,87 +132,86 @@ pub(super) fn parse_query(
     } else {
         None
     };
-    let (limit, limit_offset, limit_comma_offset) = if parser.consume_if_word("LIMIT") {
-        let first = parse_expression_until(
-            parser,
-            &["OFFSET", "FETCH"],
-            &[Symbol::Comma, Symbol::Semicolon, Symbol::RParen],
-        )?;
-        if parser.consume_if_symbol(Symbol::Comma) {
-            let limit = parse_expression_until(
+    let mut limit = None;
+    let mut offset = None;
+    let mut end = order_by
+        .as_ref()
+        .map_or(body.span().end(), |node| node.span.end());
+    loop {
+        if parser.current_is_word("LIMIT") {
+            if limit.is_some() {
+                return Err(parser.unexpected("a single LIMIT or FETCH clause"));
+            }
+            let limit_start = parser.consume_word("LIMIT")?.start();
+            let first = parse_row_count(
                 parser,
-                &["OFFSET", "FETCH"],
+                true,
+                &["OFFSET", "FETCH", "LIMIT"],
+                &[Symbol::Comma, Symbol::Semicolon, Symbol::RParen],
+            )?;
+            let count = if parser.consume_if_symbol(Symbol::Comma) {
+                if offset.is_some() {
+                    return Err(parser.unexpected("one OFFSET clause"));
+                }
+                if matches!(&first, Expr::AllRows(_)) {
+                    return Err(parser.unexpected("integer comma-LIMIT offset"));
+                }
+                let offset_span = first.span();
+                offset = Some(Offset {
+                    row_count: first,
+                    span: offset_span,
+                });
+                parse_row_count(
+                    parser,
+                    false,
+                    &["OFFSET", "FETCH", "LIMIT"],
+                    &[Symbol::Semicolon, Symbol::RParen],
+                )?
+            } else {
+                first
+            };
+            end = count.span().end();
+            limit = Some(QueryLimit::Limit(Limit {
+                row_count: count,
+                span: Span::new(limit_start, end),
+            }));
+        } else if parser.current_is_word("OFFSET") {
+            if offset.is_some() {
+                return Err(parser.unexpected("one OFFSET clause"));
+            }
+            let offset_start = parser.consume_word("OFFSET")?.start();
+            let row_count = parse_row_count(
+                parser,
+                false,
+                &["ROW", "ROWS", "FETCH", "LIMIT", "OFFSET"],
                 &[Symbol::Semicolon, Symbol::RParen],
             )?;
-            let offset_span = Span::new(first.span().start(), first.span().end());
-            (
-                Some(limit),
-                Some(Offset {
-                    value: first,
-                    rows: OffsetRows::None,
-                    span: offset_span,
-                }),
-                true,
-            )
+            end = row_count.span().end();
+            if parser.current_is_word("ROW") {
+                end = parser.consume_word("ROW")?.end();
+            } else if parser.current_is_word("ROWS") {
+                end = parser.consume_word("ROWS")?.end();
+            }
+            offset = Some(Offset {
+                row_count,
+                span: Span::new(offset_start, end),
+            });
+        } else if parser.current_is_word("FETCH") {
+            if limit.is_some() {
+                return Err(parser.unexpected("FETCH without LIMIT"));
+            }
+            let fetch_start = parser.consume_word("FETCH")?.start();
+            let fetch = parse_fetch(parser, fetch_start)?;
+            end = fetch.span.end();
+            limit = Some(QueryLimit::FetchFirst(fetch));
         } else {
-            (Some(first), None, false)
+            break;
         }
-    } else {
-        (None, None, false)
-    };
-    let offset = if parser.consume_if_word("OFFSET") {
-        if limit_offset.is_some() {
-            return Err(parser.unexpected("end of LIMIT offset syntax"));
-        }
-        let value = parse_expression_until(
-            parser,
-            &["ROW", "ROWS", "FETCH"],
-            &[Symbol::Semicolon, Symbol::RParen],
-        )?;
-        let end = value.span().end();
-        let rows = if parser.consume_if_word("ROW") {
-            OffsetRows::Row
-        } else if parser.consume_if_word("ROWS") {
-            OffsetRows::Rows
-        } else {
-            OffsetRows::None
-        };
-        Some(Offset {
-            value,
-            rows,
-            span: Span::new(start, end),
-        })
-    } else {
-        limit_offset
-    };
-    let fetch = if parser.consume_if_word("FETCH") {
-        Some(parse_fetch(parser, start)?)
-    } else {
-        None
-    };
-    let end = fetch
-        .as_ref()
-        .map_or_else(
-            || {
-                offset.as_ref().map_or_else(
-                    || {
-                        limit.as_ref().map_or_else(
-                            || order_by.as_ref().map_or(body.span(), |order| order.span),
-                            |limit| limit.span(),
-                        )
-                    },
-                    |offset| offset.span,
-                )
-            },
-            |fetch| fetch.span,
-        )
-        .end();
+    }
     let modifiers = crate::ast::QueryModifiers {
         order_by,
-        limit,
         offset,
-        limit_comma_offset,
-        fetch,
+        limit,
     };
     let modifiers = if let SetExpr::Select(select) = &mut body {
         select.modifiers = modifiers;
@@ -1340,30 +1338,69 @@ fn parse_order_by(
 fn parse_fetch(
     parser: &mut StatementParser<'_, '_>,
     start: usize,
-) -> Result<Fetch, crate::ParseError> {
-    parser.consume_if_word("FIRST");
-    parser.consume_if_word("NEXT");
-    let quantity = if parser.current_is_word("ROW")
+) -> Result<FetchFirst, crate::ParseError> {
+    let mut end = start + "FETCH".len();
+    for word in ["FIRST", "NEXT"] {
+        if parser.current_is_word(word) {
+            end = parser.consume_word(word)?.end();
+        }
+    }
+    let row_count = if parser.current_is_word("ROW")
         || parser.current_is_word("ROWS")
         || parser.current_is_word("ONLY")
     {
         None
     } else {
-        Some(parse_expression_until(
+        let count = parse_row_count(
             parser,
-            &["ROW", "ROWS", "ONLY"],
+            false,
+            &[
+                "ROW", "ROWS", "ONLY", "PERCENT", "WITH", "LIMIT", "OFFSET", "FETCH",
+            ],
             &[Symbol::Semicolon, Symbol::RParen],
-        )?)
+        )?;
+        end = count.span().end();
+        Some(count)
     };
-    parser.consume_if_word("ROW");
-    parser.consume_if_word("ROWS");
-    parser.consume_if_word("ONLY");
-    let end = quantity.as_ref().map_or(start, |expr| expr.span().end());
-    Ok(Fetch {
-        quantity,
-        percent: false,
+    if parser.current_is_word("PERCENT") {
+        return Err(parser.unexpected("FETCH without PERCENT"));
+    }
+    for word in ["ROW", "ROWS", "ONLY"] {
+        if parser.current_is_word(word) {
+            end = parser.consume_word(word)?.end();
+        }
+    }
+    Ok(FetchFirst {
+        row_count,
         with_ties: false,
         span: Span::new(start, end),
+    })
+}
+
+fn parse_row_count(
+    parser: &mut StatementParser<'_, '_>,
+    allow_all: bool,
+    words: &[&str],
+    symbols: &[Symbol],
+) -> Result<Expr, crate::ParseError> {
+    if allow_all && parser.current_is_word("ALL") {
+        let span = parser.consume_word("ALL")?;
+        return Ok(Expr::AllRows(AllRows { span }));
+    }
+    let node = parse_expression_until(parser, words, symbols)?;
+    if matches!(
+        &node,
+        Expr::Literal(Literal {
+            kind: LiteralKind::Long { .. },
+            ..
+        }) | Expr::Parameter(_)
+    ) {
+        return Ok(node);
+    }
+    Err(crate::ParseError::UnexpectedToken {
+        expected: "an integer row count",
+        found: "a non-long row-count expression".to_owned(),
+        span: node.span(),
     })
 }
 

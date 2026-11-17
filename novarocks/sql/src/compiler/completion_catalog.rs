@@ -534,18 +534,16 @@ impl<'a> CatalogNeedCollector<'a> {
         for order in modifiers.order_by.iter().flat_map(|order| &order.items) {
             self.collect_expr(&order.sort_key, scope)?;
         }
-        if let Some(limit) = &modifiers.limit {
-            self.collect_expr(limit, scope)?;
+        if let Some(ast::QueryLimit::Limit(limit)) = &modifiers.limit {
+            self.collect_expr(&limit.row_count, scope)?;
         }
         if let Some(offset) = &modifiers.offset {
-            self.collect_expr(&offset.value, scope)?;
+            self.collect_expr(&offset.row_count, scope)?;
         }
-        if let Some(quantity) = modifiers
-            .fetch
-            .as_ref()
-            .and_then(|fetch| fetch.quantity.as_ref())
-        {
-            self.collect_expr(quantity, scope)?;
+        if let Some(ast::QueryLimit::FetchFirst(fetch)) = &modifiers.limit {
+            if let Some(row_count) = &fetch.row_count {
+                self.collect_expr(row_count, scope)?;
+            }
         }
         Ok(())
     }

@@ -1058,7 +1058,10 @@ impl<'a> AnalyzerContext<'a> {
                 ));
             };
             if operation.inputs.len() < 2
-                || (operation.operator == ast::SetOperator::Except && operation.inputs.len() != 2)
+                || (!(operation.operator == ast::SetOperator::Union
+                    && !operation.distinct
+                    && operation.corresponding.is_none())
+                    && operation.inputs.len() != 2)
             {
                 return Err(AnalyzeError::invalid_query_shape(
                     "invalid set operation input count",
@@ -1069,7 +1072,7 @@ impl<'a> AnalyzerContext<'a> {
                 self.check_control()?;
                 operations.push((
                     operation.operator,
-                    operation.quantifier,
+                    operation.distinct,
                     right,
                     operation.span,
                 ));
@@ -1078,7 +1081,7 @@ impl<'a> AnalyzerContext<'a> {
         }
         operations.reverse();
         let mut left_query = self.analyze_set_operand(leftmost)?;
-        for (operator, quantifier, right, span) in operations {
+        for (operator, distinct, right, span) in operations {
             self.check_control()?;
             let right_query = self.analyze_set_operand(right)?;
             let left_cols = &left_query.output_columns;
@@ -1115,7 +1118,7 @@ impl<'a> AnalyzerContext<'a> {
                 ast::SetOperator::Intersect => SetOpKind::Intersect,
                 ast::SetOperator::Except => SetOpKind::Except,
             };
-            let all = matches!(quantifier, ast::SetQuantifier::All);
+            let all = !distinct;
             left_query = ResolvedQuery {
                 body: QueryBody::SetOperation(ResolvedSetOp {
                     kind,
@@ -3276,6 +3279,103 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     struct TestCatalog;
+
+    #[test]
+    fn count_nodes_keep_static_values_and_direct_capability_refusals() {
+        use novarocks_parser::{Span, ast, build};
+        let mut statements = novarocks_parser::parse("SELECT 1").unwrap();
+        let [ast::Statement::Query(query)] = statements.as_mut_slice() else {
+            panic!("query");
+        };
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select");
+        };
+        select.modifiers.limit = Some(ast::QueryLimit::Limit(ast::Limit {
+            row_count: build::integer(7),
+            span: novarocks_parser::SYNTHETIC,
+        }));
+        select.modifiers.offset = Some(ast::Offset {
+            row_count: build::integer(2),
+            span: novarocks_parser::SYNTHETIC,
+        });
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let (resolved, _, _) = super::analyze(query, &catalog, "default").unwrap();
+        assert_eq!(resolved.limit, Some(7));
+        assert_eq!(resolved.offset, Some(2));
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select");
+        };
+        select.modifiers.limit = Some(ast::QueryLimit::Limit(ast::Limit {
+            row_count: ast::Expr::AllRows(ast::AllRows {
+                span: Span::new(2, 5),
+            }),
+            span: Span::new(0, 5),
+        }));
+        let (resolved, _, _) = super::analyze(query, &catalog, "default").unwrap();
+        assert_eq!(resolved.limit, None);
+        assert_eq!(resolved.offset, Some(2));
+        for with_ties in [false, true] {
+            for row_count in [None, Some(build::integer(3))] {
+                let ast::SetExpr::Select(select) = query.body.as_mut() else {
+                    panic!("select");
+                };
+                select.modifiers.limit = Some(ast::QueryLimit::FetchFirst(ast::FetchFirst {
+                    row_count,
+                    with_ties,
+                    span: Span::new(10, 20),
+                }));
+                let error = super::analyze(query, &catalog, "default").unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+                );
+                assert_eq!(error.span(), Some(Span::new(10, 20)));
+            }
+        }
+        let limit_span = Span::new(21, 22);
+        let offset_span = Span::new(31, 32);
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select");
+        };
+        select.modifiers.limit = Some(ast::QueryLimit::Limit(ast::Limit {
+            row_count: ast::Expr::Parameter(ast::Parameter {
+                position: 7,
+                span: limit_span,
+            }),
+            span: limit_span,
+        }));
+        select.modifiers.offset = Some(ast::Offset {
+            row_count: ast::Expr::Parameter(ast::Parameter {
+                position: 9,
+                span: offset_span,
+            }),
+            span: offset_span,
+        });
+        let error = super::analyze(query, &catalog, "default").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert_eq!(
+            error.span(),
+            Some(limit_span),
+            "LIMIT refusal precedes OFFSET"
+        );
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select");
+        };
+        select.modifiers.limit = None;
+        select.modifiers.offset = Some(ast::Offset {
+            row_count: ast::Expr::AllRows(ast::AllRows { span: offset_span }),
+            span: offset_span,
+        });
+        let error = super::analyze(query, &catalog, "default").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert_eq!(error.span(), Some(offset_span));
+    }
 
     #[test]
     fn parenthesized_query_retains_each_suffix_and_original_output_identity() {

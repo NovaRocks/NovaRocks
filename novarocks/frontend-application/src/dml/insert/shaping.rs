@@ -133,8 +133,7 @@ fn shape_insert_source_in(
         && source.with.is_none()
         && source.modifiers.order_by.is_none()
         && source.modifiers.limit.is_none()
-        && source.modifiers.offset.is_none()
-        && source.modifiers.fetch.is_none();
+        && source.modifiers.offset.is_none();
     if (typed_write && !uncontrolled_values) || (!uncontrolled_values && !literal_query(source)) {
         return Ok(None);
     }
@@ -169,7 +168,7 @@ fn body_has_distinct_set(body: &ast::SetExpr) -> bool {
     match body {
         ast::SetExpr::SetOperation(operation) => {
             !matches!(operation.operator, ast::SetOperator::Union)
-                || !matches!(operation.quantifier, ast::SetQuantifier::All)
+                || operation.distinct
                 || operation.corresponding.is_some()
                 || operation.inputs.iter().any(body_has_distinct_set)
         }
@@ -326,7 +325,7 @@ fn shape_body(
         }
         ast::SetExpr::SetOperation(operation) => {
             if !matches!(operation.operator, ast::SetOperator::Union)
-                || !matches!(operation.quantifier, ast::SetQuantifier::All)
+                || operation.distinct
                 || operation.corresponding.is_some()
             {
                 return Err(
@@ -1033,7 +1032,6 @@ fn source_assignment_before_common_type(query: &ast::Query) -> bool {
         || query.modifiers.order_by.is_some()
         || query.modifiers.limit.is_some()
         || query.modifiers.offset.is_some()
-        || query.modifiers.fetch.is_some()
     {
         return false;
     }
@@ -1060,7 +1058,7 @@ fn source_assignment_before_common_type(query: &ast::Query) -> bool {
             ast::SetExpr::Query(query) => source_assignment_before_common_type(query),
             ast::SetExpr::SetOperation(operation) => {
                 matches!(operation.operator, ast::SetOperator::Union)
-                    && operation.quantifier == ast::SetQuantifier::All
+                    && !operation.distinct
                     && operation.corresponding.is_none()
                     && operation.inputs.iter().all(eligible)
             }
@@ -1282,7 +1280,7 @@ fn capture_typed_write_body(
         }
         ast::SetExpr::SetOperation(operation)
             if matches!(operation.operator, ast::SetOperator::Union)
-                && matches!(operation.quantifier, ast::SetQuantifier::All)
+                && !operation.distinct
                 && operation.corresponding.is_none() =>
         {
             for (index, input) in operation.inputs.iter_mut().enumerate() {

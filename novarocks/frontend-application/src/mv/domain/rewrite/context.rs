@@ -870,7 +870,7 @@ pub fn first_union_branch_query(
         match body {
             novarocks_parser::ast::SetExpr::SetOperation(operation) => {
                 if operation.operator != novarocks_parser::ast::SetOperator::Union
-                    || operation.quantifier != novarocks_parser::ast::SetQuantifier::All
+                    || operation.distinct
                     || operation.corresponding.is_some()
                 {
                     return Err(

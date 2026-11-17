@@ -27,20 +27,13 @@ pub struct Query {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryModifiers {
     pub order_by: Option<OrderBy>,
-    pub limit: Option<Expr>,
     pub offset: Option<Offset>,
-    /// Whether this query used MySQL `LIMIT offset, count` spelling.
-    pub limit_comma_offset: bool,
-    pub fetch: Option<Fetch>,
+    pub limit: Option<QueryLimit>,
 }
 
 impl QueryModifiers {
     pub fn is_empty(&self) -> bool {
-        self.order_by.is_none()
-            && self.limit.is_none()
-            && self.offset.is_none()
-            && self.fetch.is_none()
-            && !self.limit_comma_offset
+        self.order_by.is_none() && self.offset.is_none() && self.limit.is_none()
     }
 }
 
@@ -115,9 +108,9 @@ impl SetExpr {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetOperation {
-    pub inputs: Vec<SetExpr>,
+    pub inputs: AstVec<SetExpr>,
     pub operator: SetOperator,
-    pub quantifier: SetQuantifier,
+    pub distinct: bool,
     pub corresponding: Option<Corresponding>,
     pub span: Span,
 }
@@ -133,12 +126,6 @@ pub enum SetOperator {
     Union,
     Intersect,
     Except,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SetQuantifier {
-    Distinct,
-    All,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,24 +236,48 @@ pub enum NullOrdering {
     Undefined,
 }
 
+/// The mutually exclusive Trino row-count clauses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryLimit {
+    Limit(Limit),
+    FetchFirst(FetchFirst),
+}
+impl QueryLimit {
+    pub const fn span(&self) -> Span {
+        match self {
+            Self::Limit(node) => node.span,
+            Self::FetchFirst(node) => node.span,
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Limit {
+    pub row_count: Expr,
+    pub span: Span,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Offset {
-    pub value: Expr,
-    pub rows: OffsetRows,
+    pub row_count: Expr,
     pub span: Span,
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OffsetRows {
-    None,
-    Row,
-    Rows,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Fetch {
-    pub quantity: Option<Expr>,
-    pub percent: bool,
+pub struct FetchFirst {
+    pub row_count: Option<Expr>,
     pub with_ties: bool,
     pub span: Span,
+}
+impl Limit {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+impl Offset {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+impl FetchFirst {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
 }

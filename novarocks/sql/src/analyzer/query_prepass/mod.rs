@@ -25,8 +25,7 @@ use novarocks_parser::{
     Span,
     ast::{
         Expr, Fold, GroupBy, Ident, JoinConstraint, JoinOperator, LiteralKind, Query, Select,
-        SelectItem, SetExpr, SetOperator, SetQuantifier, TableAlias, TableFactor, TableWithJoins,
-        Visit,
+        SelectItem, SetExpr, SetOperator, TableAlias, TableFactor, TableWithJoins, Visit,
     },
 };
 
@@ -299,7 +298,7 @@ fn try_unroll_cte(
             cte.span,
         ));
     }
-    let Some(Ok((quantifier, operands))) = union_chain else {
+    let Some(Ok((distinct, operands))) = union_chain else {
         return Ok(None);
     };
     let anchor = &operands[0];
@@ -334,7 +333,7 @@ fn try_unroll_cte(
         }
         iterations.push(query_with_body(
             cte.query.as_ref(),
-            build_set_operation_chain(quantifier, &parts),
+            build_set_operation_chain(distinct, &parts),
         ));
     }
 
@@ -346,15 +345,15 @@ fn try_unroll_cte(
     let mut rewritten = cte.clone();
     rewritten.query = Box::new(query_with_body(
         cte.query.as_ref(),
-        build_set_operation_chain(SetQuantifier::All, &branches),
+        build_set_operation_chain(false, &branches),
     ));
     Ok(Some(rewritten))
 }
 
-fn extract_union_chain(expr: &SetExpr) -> Option<Result<(SetQuantifier, Vec<SetExpr>), ()>> {
+fn extract_union_chain(expr: &SetExpr) -> Option<Result<(bool, Vec<SetExpr>), ()>> {
     fn visit(
         expr: &SetExpr,
-        quantifier: &mut Option<SetQuantifier>,
+        distinct: &mut Option<bool>,
         parts: &mut Vec<SetExpr>,
         mixed: &mut bool,
     ) {
@@ -363,29 +362,29 @@ fn extract_union_chain(expr: &SetExpr) -> Option<Result<(SetQuantifier, Vec<SetE
                 parts.push(expr.clone());
                 return;
             }
-            match quantifier {
-                Some(existing) if *existing != operation.quantifier => *mixed = true,
+            match distinct {
+                Some(existing) if *existing != operation.distinct => *mixed = true,
                 Some(_) => {}
-                None => *quantifier = Some(operation.quantifier),
+                None => *distinct = Some(operation.distinct),
             }
             for input in &operation.inputs {
-                visit(input, quantifier, parts, mixed);
+                visit(input, distinct, parts, mixed);
             }
         } else {
             parts.push(expr.clone());
         }
     }
 
-    let mut quantifier = None;
+    let mut distinct = None;
     let mut parts = Vec::new();
     let mut mixed = false;
-    visit(expr, &mut quantifier, &mut parts, &mut mixed);
+    visit(expr, &mut distinct, &mut parts, &mut mixed);
     if parts.len() < 2 {
         None
     } else if mixed {
         Some(Err(()))
     } else {
-        quantifier.map(|quantifier| Ok((quantifier, parts)))
+        distinct.map(|distinct| Ok((distinct, parts)))
     }
 }
 
@@ -475,14 +474,14 @@ fn query_with_body(template: &Query, body: SetExpr) -> Query {
     }
 }
 
-fn build_set_operation_chain(quantifier: SetQuantifier, parts: &[SetExpr]) -> SetExpr {
+fn build_set_operation_chain(distinct: bool, parts: &[SetExpr]) -> SetExpr {
     let mut parts = parts.iter();
     let first = parts.next().expect("recursive CTE has an anchor").clone();
     parts.fold(first, |left, right| {
         novarocks_parser::build::set_operation(
             left,
             SetOperator::Union,
-            quantifier,
+            distinct,
             right.clone(),
             None,
         )
@@ -847,7 +846,6 @@ fn remove_bare_top_level_dual(query: &mut Query) {
         || query.modifiers.order_by.is_some()
         || query.modifiers.limit.is_some()
         || query.modifiers.offset.is_some()
-        || query.modifiers.fetch.is_some()
     {
         return;
     }

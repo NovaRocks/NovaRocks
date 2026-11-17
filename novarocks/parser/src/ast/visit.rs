@@ -21,6 +21,23 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_all_rows(&mut self, _node: &AllRows) {}
+    fn visit_parameter(&mut self, _node: &Parameter) {}
+    fn visit_limit(&mut self, node: &Limit) {
+        self.visit_expr(&node.row_count);
+    }
+    fn visit_offset(&mut self, node: &Offset) {
+        self.visit_expr(&node.row_count);
+    }
+    fn visit_fetch_first(&mut self, node: &FetchFirst) {
+        if let Some(count) = &node.row_count {
+            self.visit_expr(count);
+        }
+    }
+    fn visit_set_operation(&mut self, node: &SetOperation) {
+        walk_set_operation(self, node);
+    }
+
     fn visit_extract_expr(&mut self, node: &ExtractExpr) {
         super::control_expr::walk_extract_expr(self, node);
     }
@@ -598,19 +615,19 @@ pub fn walk_query_modifiers<V: Visit + ?Sized>(visitor: &mut V, modifiers: &Quer
     if let Some(order) = &modifiers.order_by {
         visitor.visit_order_by(order);
     }
-    if let Some(limit) = &modifiers.limit {
-        visitor.visit_expr(limit);
+    // Preserve the original LIMIT/offset/FETCH traversal contract.
+    if let Some(QueryLimit::Limit(node)) = &modifiers.limit {
+        visitor.visit_limit(node);
     }
-    if let Some(offset) = &modifiers.offset {
-        visitor.visit_expr(&offset.value);
+    if let Some(node) = &modifiers.offset {
+        visitor.visit_offset(node);
     }
-    if let Some(fetch) = &modifiers.fetch
-        && let Some(quantity) = &fetch.quantity
-    {
-        visitor.visit_expr(quantity);
+    if let Some(QueryLimit::FetchFirst(node)) = &modifiers.limit {
+        visitor.visit_fetch_first(node);
     }
 }
 
+#[recursive::recursive]
 pub fn walk_set_expr<V: Visit + ?Sized>(visitor: &mut V, set_expr: &SetExpr) {
     match set_expr {
         SetExpr::Select(select) => visitor.visit_select(select),
@@ -622,16 +639,7 @@ pub fn walk_set_expr<V: Visit + ?Sized>(visitor: &mut V, set_expr: &SetExpr) {
             }
         }
         SetExpr::Query(query) => visitor.visit_query(query),
-        SetExpr::SetOperation(operation) => {
-            if let Some(corresponding) = &operation.corresponding {
-                for column in &corresponding.columns {
-                    visitor.visit_ident(column);
-                }
-            }
-            for input in &operation.inputs {
-                walk_set_expr(visitor, input);
-            }
-        }
+        SetExpr::SetOperation(operation) => visitor.visit_set_operation(operation),
     }
 }
 
@@ -840,6 +848,8 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::JsonArray(node) => visitor.visit_json_array(node),
 
         Expr::Identifier(ident) => visitor.visit_ident(ident),
+        Expr::AllRows(node) => visitor.visit_all_rows(node),
+        Expr::Parameter(node) => visitor.visit_parameter(node),
         Expr::Literal(literal) => visitor.visit_literal(literal),
         Expr::FunctionCall(call) => visitor.visit_function_call(call),
         Expr::Extract(node) => visitor.visit_extract_expr(node),
@@ -923,6 +933,28 @@ pub fn walk_nested_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &NestedE
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_all_rows(&mut self, node: AllRows) -> AllRows {
+        node
+    }
+    fn fold_parameter(&mut self, node: Parameter) -> Parameter {
+        node
+    }
+    fn fold_limit(&mut self, mut node: Limit) -> Limit {
+        node.row_count = self.fold_expr(node.row_count);
+        node
+    }
+    fn fold_offset(&mut self, mut node: Offset) -> Offset {
+        node.row_count = self.fold_expr(node.row_count);
+        node
+    }
+    fn fold_fetch_first(&mut self, mut node: FetchFirst) -> FetchFirst {
+        node.row_count = node.row_count.map(|count| self.fold_expr(count));
+        node
+    }
+    fn fold_set_operation(&mut self, node: SetOperation) -> SetOperation {
+        fold_set_operation(self, node)
+    }
+
     fn fold_extract_expr(&mut self, node: ExtractExpr) -> ExtractExpr {
         super::control_expr::fold_extract_expr(self, node)
     }
@@ -1650,18 +1682,23 @@ pub fn fold_query_modifiers<F: Fold + ?Sized>(
     mut modifiers: QueryModifiers,
 ) -> QueryModifiers {
     modifiers.order_by = modifiers.order_by.map(|order| folder.fold_order_by(order));
-    modifiers.limit = modifiers.limit.map(|limit| folder.fold_expr(limit));
-    modifiers.offset = modifiers.offset.map(|mut offset| {
-        offset.value = folder.fold_expr(offset.value);
-        offset
-    });
-    modifiers.fetch = modifiers.fetch.map(|mut fetch| {
-        fetch.quantity = fetch.quantity.map(|quantity| folder.fold_expr(quantity));
-        fetch
-    });
+    let limit = modifiers.limit.take();
+    let fetch = match limit {
+        Some(QueryLimit::Limit(node)) => {
+            modifiers.limit = Some(QueryLimit::Limit(folder.fold_limit(node)));
+            None
+        }
+        Some(QueryLimit::FetchFirst(node)) => Some(node),
+        None => None,
+    };
+    modifiers.offset = modifiers.offset.map(|node| folder.fold_offset(node));
+    if let Some(node) = fetch {
+        modifiers.limit = Some(QueryLimit::FetchFirst(folder.fold_fetch_first(node)));
+    }
     modifiers
 }
 
+#[recursive::recursive]
 pub fn fold_set_expr<F: Fold + ?Sized>(folder: &mut F, set_expr: SetExpr) -> SetExpr {
     match set_expr {
         SetExpr::Select(select) => SetExpr::Select(Box::new(folder.fold_select(*select))),
@@ -1674,19 +1711,8 @@ pub fn fold_set_expr<F: Fold + ?Sized>(folder: &mut F, set_expr: SetExpr) -> Set
             SetExpr::Values(values)
         }
         SetExpr::Query(query) => SetExpr::Query(Box::new(folder.fold_query(*query))),
-        SetExpr::SetOperation(mut operation) => {
-            operation.inputs = operation
-                .inputs
-                .into_iter()
-                .map(|input| fold_set_expr(folder, input))
-                .collect();
-            if let Some(corresponding) = &mut operation.corresponding {
-                corresponding.columns = std::mem::take(&mut corresponding.columns)
-                    .into_iter()
-                    .map(|column| folder.fold_ident(column))
-                    .collect();
-            }
-            SetExpr::SetOperation(operation)
+        SetExpr::SetOperation(operation) => {
+            SetExpr::SetOperation(folder.fold_set_operation(operation))
         }
     }
 }
@@ -1992,6 +2018,8 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::JsonArray(node) => Expr::JsonArray(Box::new(folder.fold_json_array(*node))),
 
         Expr::Identifier(ident) => Expr::Identifier(folder.fold_ident(ident)),
+        Expr::AllRows(node) => Expr::AllRows(folder.fold_all_rows(node)),
+        Expr::Parameter(node) => Expr::Parameter(folder.fold_parameter(node)),
 
         Expr::Literal(literal) => Expr::Literal(folder.fold_literal(literal)),
         Expr::FunctionCall(call) => {
@@ -2364,5 +2392,35 @@ pub fn fold_processing_mode<F: Fold + ?Sized>(
     node: ProcessingMode,
 ) -> ProcessingMode {
     let _ = folder;
+    node
+}
+
+#[recursive::recursive]
+pub fn walk_set_operation<V: Visit + ?Sized>(visitor: &mut V, node: &SetOperation) {
+    if let Some(corresponding) = &node.corresponding {
+        for column in &corresponding.columns {
+            visitor.visit_ident(column);
+        }
+    }
+    for input in &node.inputs {
+        walk_set_expr(visitor, input);
+    }
+}
+#[recursive::recursive]
+pub fn fold_set_operation<F: Fold + ?Sized>(
+    folder: &mut F,
+    mut node: SetOperation,
+) -> SetOperation {
+    node.inputs = node
+        .inputs
+        .into_iter()
+        .map(|input| fold_set_expr(folder, input))
+        .collect();
+    if let Some(corresponding) = &mut node.corresponding {
+        corresponding.columns = std::mem::take(&mut corresponding.columns)
+            .into_iter()
+            .map(|column| folder.fold_ident(column))
+            .collect();
+    }
     node
 }

@@ -584,30 +584,28 @@ pub fn query(body: SetExpr) -> Query {
 pub fn set_operation(
     left: SetExpr,
     operator: SetOperator,
-    quantifier: SetQuantifier,
+    distinct: bool,
     right: SetExpr,
     corresponding: Option<Corresponding>,
 ) -> SetExpr {
     let span = left.span().cover(right.span());
-    let flatten = operator == SetOperator::Union
-        && quantifier == SetQuantifier::All
-        && corresponding.is_none();
+    let flatten = operator == SetOperator::Union && !distinct && corresponding.is_none();
     let mut inputs = match left {
         SetExpr::SetOperation(operation)
             if flatten
                 && operation.operator == SetOperator::Union
-                && operation.quantifier == SetQuantifier::All
+                && !operation.distinct
                 && operation.corresponding.is_none() =>
         {
             operation.inputs
         }
-        other => vec![other],
+        other => vec![other].into(),
     };
     match right {
         SetExpr::SetOperation(operation)
             if flatten
                 && operation.operator == SetOperator::Union
-                && operation.quantifier == SetQuantifier::All
+                && !operation.distinct
                 && operation.corresponding.is_none() =>
         {
             inputs.extend(operation.inputs)
@@ -617,7 +615,7 @@ pub fn set_operation(
     SetExpr::SetOperation(SetOperation {
         inputs,
         operator,
-        quantifier,
+        distinct,
         corresponding,
         span,
     })
@@ -627,7 +625,7 @@ pub fn union_all(parts: Vec<SetExpr>) -> Result<SetExpr, BuildError> {
     let mut parts = parts.into_iter();
     let first = parts.next().ok_or(BuildError::EmptyUnion)?;
     Ok(parts.fold(first, |left, right| {
-        set_operation(left, SetOperator::Union, SetQuantifier::All, right, None)
+        set_operation(left, SetOperator::Union, false, right, None)
     }))
 }
 

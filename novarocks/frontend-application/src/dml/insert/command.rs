@@ -136,7 +136,6 @@ pub(crate) fn literal_query(query: &ast::Query) -> bool {
         && query.modifiers.order_by.is_none()
         && query.modifiers.limit.is_none()
         && query.modifiers.offset.is_none()
-        && query.modifiers.fetch.is_none()
         && literal_body(&query.body)
 }
 
@@ -252,7 +251,6 @@ fn legacy_literal_query(query: &ast::Query) -> bool {
         || query.modifiers.order_by.is_some()
         || query.modifiers.limit.is_some()
         || query.modifiers.offset.is_some()
-        || query.modifiers.fetch.is_some()
     {
         return false;
     }
@@ -287,7 +285,7 @@ fn validate_literal_set_operations(body: &ast::SetExpr) -> Result<(), String> {
             if !matches!(operation.operator, ast::SetOperator::Union) {
                 return Err("INSERT SELECT set operation is only UNION ALL here".to_string());
             }
-            if !matches!(operation.quantifier, ast::SetQuantifier::All) {
+            if operation.distinct {
                 return Err(
                     "INSERT SELECT UNION requires UNION ALL (UNION/UNION DISTINCT unsupported)"
                         .to_string(),

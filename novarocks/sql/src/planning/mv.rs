@@ -2634,7 +2634,7 @@ fn flatten_union_all<'a>(body: &'a SetExpr, out: &mut Vec<&'a SetExpr>) -> Resul
     match body {
         SetExpr::SetOperation(ast::SetOperation {
             operator,
-            quantifier,
+            distinct,
             inputs,
             corresponding,
             ..
@@ -2642,9 +2642,7 @@ fn flatten_union_all<'a>(body: &'a SetExpr, out: &mut Vec<&'a SetExpr>) -> Resul
             if corresponding.is_some() {
                 return Err("incremental UNION ALL MV does not support CORRESPONDING".to_string());
             }
-            if !matches!(operator, ast::SetOperator::Union)
-                || !matches!(quantifier, ast::SetQuantifier::All)
-            {
+            if !matches!(operator, ast::SetOperator::Union) || *distinct {
                 return Err(union_all_non_all_error());
             }
             if inputs.len() < 2 {
@@ -3049,7 +3047,6 @@ fn reject_unsupported_query_clauses(query: &Query) -> Result<(), String> {
         || query.modifiers.order_by.is_some()
         || query.modifiers.limit.is_some()
         || query.modifiers.offset.is_some()
-        || query.modifiers.fetch.is_some()
         || matches!(query.body.as_ref(), SetExpr::Select(select) if !select.modifiers.is_empty())
     {
         return Err(projection_filter_error());
@@ -3625,6 +3622,7 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
                 );
             }
         }
+        Expr::AllRows(_) | Expr::Parameter(_) => return Err(projection_filter_error()),
         Expr::Literal(_) => {}
     }
     Ok(())
