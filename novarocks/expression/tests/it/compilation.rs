@@ -2333,3 +2333,143 @@ fn source_dictionary_ids_do_not_change_complete_static_binding_and_invalid_nomin
         ValueType::try_with_logical_type(DataType::Boolean, true, ValueLogicalType::Json).is_err()
     );
 }
+
+#[test]
+fn scope_layout_creator_funds_only_actual_temporary_duplicate_checks() {
+    let columns: Arc<[ScopeColumn]> = (0..32)
+        .rev()
+        .map(|value| ScopeColumn {
+            value: ValueId::new(value),
+            ty: int(false),
+        })
+        .collect();
+    let schema = Arc::new(Schema::new(
+        (0..32)
+            .map(|ordinal| Field::new(format!("input{ordinal}"), DataType::Int64, false))
+            .collect::<Vec<_>>(),
+    ));
+    let source_hold = Arc::new(Hold);
+    let source_weak = Arc::downgrade(&source_hold);
+    let run = |refuse| {
+        let control = Arc::new(Control::good());
+        let factory = Factory {
+            events: Arc::new(Mutex::default()),
+            holds: Mutex::default(),
+            refuse,
+            control: control.clone(),
+            stopped: Arc::new(Mutex::default()),
+        };
+        let mut temporary = factory.scope();
+        let mut work = CompileCheckpoints::try_new(control.as_ref(), CompilePhase::Decode).unwrap();
+        let result = ScopeLayout::try_new_with_creator_in(
+            schema.clone(),
+            columns.clone(),
+            ValueTypeStorageLifetime::held(source_hold.clone()),
+            &mut temporary,
+            &mut work,
+        );
+        let count = factory.events.lock().unwrap().len();
+        match refuse {
+            Some(_) => {
+                assert!(matches!(
+                    result,
+                    Err(ExprCompileFailure::Creator(HostRefusal))
+                ));
+                assert_eq!(
+                    factory.stopped.lock().unwrap().unwrap(),
+                    control.trace().len()
+                );
+            }
+            None => {
+                let layout = result.unwrap();
+                work.finish().unwrap();
+                assert_eq!(layout.columns().as_ptr(), columns.as_ptr());
+                drop(temporary);
+                assert!(
+                    factory
+                        .holds
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|hold| hold.upgrade().is_none()),
+                    "temporary index responsibility must end before the returned layout"
+                );
+                assert!(source_weak.upgrade().is_some());
+                assert_eq!(layout.columns()[0].value, ValueId::new(31));
+                drop(layout);
+                return count;
+            }
+        }
+        drop(temporary);
+        assert!(
+            factory
+                .holds
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|hold| hold.upgrade().is_none())
+        );
+        count
+    };
+    let requests = run(None);
+    assert!(requests > 0);
+    for at in 0..requests {
+        run(Some(at));
+    }
+}
+#[test]
+fn scope_layout_creator_keeps_original_phase_and_every_first_control_cause() {
+    let columns: Arc<[ScopeColumn]> = (0..32)
+        .map(|value| ScopeColumn {
+            value: ValueId::new(value),
+            ty: int(false),
+        })
+        .collect();
+    let schema = Arc::new(Schema::new(
+        (0..32)
+            .map(|ordinal| Field::new(format!("input{ordinal}"), DataType::Int64, false))
+            .collect::<Vec<_>>(),
+    ));
+    let run = |control: Arc<Control>| -> Result<ScopeLayout, ExprCompileFailure<HostRefusal>> {
+        let factory = Factory {
+            events: Arc::new(Mutex::default()),
+            holds: Mutex::default(),
+            refuse: None,
+            control: control.clone(),
+            stopped: Arc::new(Mutex::default()),
+        };
+        let mut temporary = factory.scope();
+        let mut work = CompileCheckpoints::try_new(control.as_ref(), CompilePhase::Decode)?;
+        let result = ScopeLayout::try_new_with_creator_in(
+            schema.clone(),
+            columns.clone(),
+            ValueTypeStorageLifetime::pure(),
+            &mut temporary,
+            &mut work,
+        )?;
+        work.finish()?;
+        Ok(result)
+    };
+    let control = Arc::new(Control::good());
+    run(control.clone()).unwrap();
+    let original = control.trace();
+    assert!(original.len() > 2);
+    assert!(
+        original
+            .iter()
+            .all(|(phase, _)| *phase == CompilePhase::Decode)
+    );
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at in 0..original.len() {
+            let control = Arc::new(Control::at(at, cause.clone()));
+            assert!(
+                matches!(run(control.clone()),Err(ExprCompileFailure::Control(actual)) if actual==cause)
+            );
+            assert_eq!(control.trace(), original[..=at]);
+        }
+    }
+}

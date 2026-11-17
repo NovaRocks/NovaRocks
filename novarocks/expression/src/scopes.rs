@@ -16,10 +16,13 @@
 // under the License.
 
 //! Complete scope layouts supplied by the enclosing compiler, without slot identities.
-use crate::ExprCompileError;
+use crate::creation::{ProgramCreation, ProgramCreationFailure};
+use crate::{ExprCompileError, ExprCompileFailure};
 use arrow::datatypes::SchemaRef;
 use novarocks_expression_contract::{RootScope, ValueId};
-use novarocks_type_contract::{CompileCheckpoints, FunctionValueType, ValueTypeStorageLifetime};
+use novarocks_type_contract::{
+    CompileCheckpoints, FunctionValueType, ValueSchemaCreationScope, ValueTypeStorageLifetime,
+};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -41,14 +44,56 @@ impl ScopeLayout {
         storage: ValueTypeStorageLifetime,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, ExprCompileError> {
+        Self::try_new_core(
+            schema,
+            columns,
+            storage,
+            ProgramCreation::<std::convert::Infallible> { creator: None },
+            work,
+        )
+        .map_err(ExprCompileFailure::into_pure)
+    }
+
+    /// Validate the original source on its caller's work scope. The temporary
+    /// owner funds only this check's duplicate-value index; supplied schema,
+    /// columns and their source lifetime remain with their original author.
+    /// This entry creates no factory, retention grant, phase or footer.
+    pub fn try_new_with_creator_in<H>(
+        schema: SchemaRef,
+        columns: Arc<[ScopeColumn]>,
+        storage: ValueTypeStorageLifetime,
+        temporary: &mut dyn ValueSchemaCreationScope<H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ExprCompileFailure<H>> {
+        Self::try_new_core(
+            schema,
+            columns,
+            storage,
+            ProgramCreation {
+                creator: Some(temporary),
+            },
+            work,
+        )
+    }
+
+    fn try_new_core<H>(
+        schema: SchemaRef,
+        columns: Arc<[ScopeColumn]>,
+        storage: ValueTypeStorageLifetime,
+        mut creation: ProgramCreation<'_, H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ExprCompileFailure<H>> {
         if schema.fields().len() != columns.len() {
-            return Err(ExprCompileError::Invalid(
-                "scope schema and complete columns differ",
-            ));
+            return Err(
+                ExprCompileError::Invalid("scope schema and complete columns differ").into(),
+            );
         }
         let mut values = std::collections::BTreeSet::new();
         for (field, column) in schema.fields().iter().zip(columns.iter()) {
             work.step()?;
+            creation
+                .before_tree_insert::<ExprCompileError, ValueId, ()>(values.len(), work)
+                .map_err(scope_creation_failure)?;
             if !values.insert(column.value)
                 || field.is_nullable() != column.ty.nullable()
                 || !novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<
@@ -62,7 +107,8 @@ impl ScopeLayout {
             {
                 return Err(ExprCompileError::Invalid(
                     "scope field differs from its complete input declaration",
-                ));
+                )
+                .into());
             }
         }
         Ok(Self {
@@ -90,4 +136,18 @@ pub struct ScopeLayouts<'a> {
 pub struct InputBinding {
     pub scope: RootScope,
     pub ordinal: u32,
+}
+
+fn scope_creation_failure<H>(
+    error: ProgramCreationFailure<ExprCompileError, H>,
+) -> ExprCompileFailure<H> {
+    match error {
+        ProgramCreationFailure::Control(cause) => ExprCompileFailure::Control(cause),
+        ProgramCreationFailure::Creator(cause) => ExprCompileFailure::Creator(cause),
+        ProgramCreationFailure::Resource(cause) => ExprCompileFailure::Resource(cause),
+        ProgramCreationFailure::Owner(cause) => cause.into(),
+        ProgramCreationFailure::Capacity(cause) => ExprCompileFailure::Owner(
+            ExprCompileError::Publication(ProgramCreationFailure::Capacity(cause)),
+        ),
+    }
 }
