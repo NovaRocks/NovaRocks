@@ -20,6 +20,9 @@
 //! Declarations do not grant a setter or publication capability. Dedicated
 //! format-version, partition-spec and location changes retain their owners.
 
+mod projection;
+pub use projection::project_partial_raw_table_property;
+
 mod data_size;
 pub use data_size::{
     DataSizeFailureReason, DataSizeParseFailure, DataSizeProperty, DataSizePropertyFailure,

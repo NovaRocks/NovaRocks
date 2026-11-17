@@ -10504,4 +10504,322 @@ mod tests {
             control.original.source().unwrap().source().unwrap(),
         ));
     }
+    #[test]
+    fn ddl_partial_raw_projection_preserves_values_keys_and_reset_intentions() {
+        use crate::table_properties::{ExtraPropertyWrite, project_partial_raw_table_property};
+        use novarocks_spi::connector::{DdlPropertyChange as C, DdlPropertyValue as V};
+        let control = context();
+        let cases = [
+            (
+                "format",
+                V::Varchar("pArQuEt".into()),
+                "write.format.default",
+                "parquet",
+            ),
+            (
+                "max_commit_retry",
+                V::Integer(0),
+                "commit.retry.num-retries",
+                "0",
+            ),
+            (
+                "max_commit_retry",
+                V::Integer(i32::MAX),
+                "commit.retry.num-retries",
+                "2147483647",
+            ),
+            ("gc_enabled", V::Boolean(false), "gc.enabled", "false"),
+            (
+                "data_location",
+                V::Varchar("s3://warehouse/data-α".into()),
+                "write.data.path",
+                "s3://warehouse/data-α",
+            ),
+            (
+                "statistics_collect_on_write",
+                V::Boolean(false),
+                "novarocks.statistics.collect-on-write",
+                "false",
+            ),
+            (
+                "maintenance_enabled",
+                V::Boolean(true),
+                "novarocks.maintenance.enabled",
+                "true",
+            ),
+            (
+                "parquet_writer_row_group_size",
+                V::Varchar("2GB".into()),
+                "write.parquet.row-group-size-bytes",
+                "2147483648",
+            ),
+            (
+                "target_max_file_size",
+                V::Varchar("0B".into()),
+                "write.target-file-size-bytes",
+                "0",
+            ),
+        ];
+        for (name, value, key, expected) in cases {
+            let expected = vec![ConnectorPropertyChange::Set {
+                key: key.into(),
+                value: expected.into(),
+            }];
+            let actual = project_partial_raw_table_property(
+                name,
+                &C::Set(value.clone()),
+                ExtraPropertyWrite::Create,
+                &control,
+            )
+            .unwrap();
+            assert_eq!(actual, expected, "{name}");
+            assert_eq!(
+                project_partial_raw_table_property(
+                    name,
+                    &C::Reset(value),
+                    ExtraPropertyWrite::Alter,
+                    &control
+                )
+                .unwrap(),
+                expected,
+                "{name}"
+            );
+            assert_eq!(
+                project_partial_raw_table_property(
+                    name,
+                    &C::Reset(V::Null),
+                    ExtraPropertyWrite::Alter,
+                    &control
+                )
+                .unwrap(),
+                vec![ConnectorPropertyChange::Unset {
+                    key: key.into(),
+                    if_exists: true
+                }]
+            );
+            assert_eq!(
+                project_partial_raw_table_property(
+                    name,
+                    &C::Set(V::Null),
+                    ExtraPropertyWrite::Alter,
+                    &control
+                )
+                .unwrap_err()
+                .kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+        }
+        for change in [
+            C::Set(V::Integer(-1)),
+            C::Set(V::Bigint(3)),
+            C::Reset(V::Varchar("3".into())),
+        ] {
+            assert_eq!(
+                project_partial_raw_table_property(
+                    "max_commit_retry",
+                    &change,
+                    ExtraPropertyWrite::Alter,
+                    &control
+                )
+                .unwrap_err()
+                .kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+        }
+        assert_eq!(
+            project_partial_raw_table_property(
+                "format",
+                &C::Set(V::Varchar("ORC".into())),
+                ExtraPropertyWrite::Create,
+                &control
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        assert_eq!(
+            project_partial_raw_table_property(
+                "write.data.path",
+                &C::Set(V::Varchar("s3://x".into())),
+                ExtraPropertyWrite::Create,
+                &control
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            project_partial_raw_table_property(
+                "sorted_by",
+                &C::Set(V::ArrayVarchar(vec![])),
+                ExtraPropertyWrite::Create,
+                &control
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn ddl_partial_raw_projection_keeps_dedicated_and_extra_default_refusals() {
+        use crate::table_properties::{
+            ExtraPropertyWrite as W, project_partial_raw_table_property as project,
+        };
+        use novarocks_spi::connector::{DdlPropertyChange as C, DdlPropertyValue as V};
+        let control = context();
+        for (name, change) in [
+            ("format_version", C::Reset(V::Integer(2))),
+            ("partitioning", C::Reset(V::ArrayVarchar(vec![]))),
+            ("location", C::Reset(V::Null)),
+        ] {
+            assert_eq!(
+                project(name, &change, W::Create, &control)
+                    .unwrap_err()
+                    .kind(),
+                ConnectorErrorKind::Unsupported,
+                "{name}"
+            );
+        }
+        let extra = C::Set(V::MapVarcharVarchar(vec![
+            ("B".into(), Some("one".into())),
+            ("a".into(), Some("two".into())),
+        ]));
+        let expected = vec![
+            ConnectorPropertyChange::Set {
+                key: "b".into(),
+                value: "one".into(),
+            },
+            ConnectorPropertyChange::Set {
+                key: "a".into(),
+                value: "two".into(),
+            },
+        ];
+        for operation in [W::Create, W::Alter] {
+            assert_eq!(
+                project("extra_properties", &extra, operation, &control).unwrap(),
+                expected
+            );
+            assert_eq!(
+                project(
+                    "extra_properties",
+                    &C::Set(V::MapVarcharVarchar(vec![])),
+                    operation,
+                    &control
+                )
+                .unwrap(),
+                vec![]
+            );
+            for value in [
+                V::MapVarcharVarchar(vec![("gc.enabled".into(), Some("false".into()))]),
+                V::MapVarcharVarchar(vec![
+                    ("DUP".into(), Some("one".into())),
+                    ("dup".into(), Some("two".into())),
+                ]),
+                V::MapVarcharVarchar(vec![("ordinary".into(), None)]),
+                V::Null,
+            ] {
+                assert_eq!(
+                    project("extra_properties", &C::Set(value), operation, &control)
+                        .unwrap_err()
+                        .kind(),
+                    ConnectorErrorKind::InvalidRequest
+                );
+            }
+        }
+        // The reference's DEFAULT(NULL) is an Internal refusal. No Set/Unset
+        // instruction is returned, and existing raw keys are never cleared.
+        let error =
+            project("extra_properties", &C::Reset(V::Null), W::Alter, &control).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::Internal);
+        assert_eq!(
+            error.message(),
+            "The extra_properties property cannot be empty"
+        );
+    }
+
+    #[test]
+    fn ddl_partial_raw_projection_preserves_original_control_and_datasize_causes() {
+        use crate::table_properties::{
+            DataSizeFailureReason, DataSizeParseFailure, DataSizePropertyFailure,
+            ExtraPropertyWrite, project_partial_raw_table_property as project,
+        };
+        use novarocks_failure_contract::{FailureFact, FailureProjection, SharedFailureCause};
+        use novarocks_spi::connector::{DdlPropertyChange as C, DdlPropertyValue as V};
+        use std::{
+            error::Error,
+            fmt,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Debug)]
+        struct OriginalControl;
+        impl fmt::Display for OriginalControl {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("original projection control stop")
+            }
+        }
+        impl Error for OriginalControl {}
+        impl FailureProjection for OriginalControl {
+            fn failure_fact(&self) -> FailureFact {
+                ConnectorErrorKind::Cancelled.failure_fact()
+            }
+        }
+        struct StopAfter {
+            calls: AtomicUsize,
+            allowed: usize,
+            original: ConnectorError,
+        }
+        impl ConnectorOperationControl for StopAfter {
+            fn check_active(&self) -> Result<(), ConnectorError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) >= self.allowed {
+                    Err(self.original.clone())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for allowed in [0, 7] {
+            let control = StopAfter {
+                calls: AtomicUsize::new(0),
+                allowed,
+                original: ConnectorError::from_domain(
+                    ConnectorErrorKind::Cancelled,
+                    OriginalControl,
+                ),
+            };
+            let error = project(
+                "target_max_file_size",
+                &C::Set(V::Varchar("123456789.125kB".into())),
+                ExtraPropertyWrite::Alter,
+                &control,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+            assert_eq!(error.failure_fact(), control.original.failure_fact());
+            assert_eq!(error.message(), control.original.message());
+            assert!(std::ptr::eq(
+                error.source().unwrap().source().unwrap(),
+                control.original.source().unwrap().source().unwrap()
+            ));
+        }
+        let error = project(
+            "target_max_file_size",
+            &C::Set(V::Varchar("2KB".into())),
+            ExtraPropertyWrite::Alter,
+            &context(),
+        )
+        .unwrap_err();
+        let actual = error
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .downcast_ref::<DataSizePropertyFailure>()
+            .unwrap();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            actual.reason(),
+            DataSizeFailureReason::Parse(DataSizeParseFailure::Unit)
+        );
+    }
 }
