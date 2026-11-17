@@ -497,6 +497,31 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             .is_some_and(|token| matches!(token.kind, TokenKind::Symbol(found) if found == symbol))
     }
 
+    fn position_special_form_follows(&self) -> bool {
+        let mut depth = 0_usize;
+        let mut separator = false;
+        for token in self
+            .tokens
+            .iter()
+            .skip(self.position)
+            .filter(|token| !matches!(token.kind, TokenKind::Trivia(_)))
+        {
+            match token.kind {
+                TokenKind::Symbol(Symbol::LParen | Symbol::LBracket | Symbol::LBrace) => depth += 1,
+                TokenKind::Symbol(Symbol::RParen) if depth == 1 => return separator,
+                TokenKind::Symbol(Symbol::RParen | Symbol::RBracket | Symbol::RBrace) => {
+                    depth = depth.saturating_sub(1)
+                }
+                // Any top-level comma selects the ordinary function grammar,
+                // including POSITION(predicate IN (...), another_argument).
+                TokenKind::Symbol(Symbol::Comma) if depth == 1 => return false,
+                TokenKind::Keyword(Keyword::In) if depth == 1 => separator = true,
+                _ => {}
+            }
+        }
+        separator
+    }
+
     fn substring_special_form_follows(&self) -> bool {
         let mut depth = 0;
         for token in self
@@ -798,6 +823,15 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
         if self.current_is_word("ROW") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
             return self.parse_row_expression();
+        }
+        if self.current_is_word("POSITION")
+            && self.peek_nontrivia_is_symbol(1, Symbol::LParen)
+            && self.position_special_form_follows()
+        {
+            return self.parse_position_expression();
+        }
+        if self.current_is_word("NORMALIZE") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
+            return self.parse_normalize_expression();
         }
         if self.current_is_word("SUBSTRING") && self.substring_special_form_follows() {
             return self.parse_substring_expression();
@@ -1237,6 +1271,97 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             field,
             span: Span::new(start, end),
         })))
+    }
+
+    fn parse_position_expression(&mut self) -> Result<Expr, ParseError> {
+        let start = self.current_span().start();
+        self.advance();
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::LParen) {
+            return Err(self.unexpected("'(' after POSITION"));
+        }
+        self.advance();
+        self.skip_trivia();
+        // Preserve the original TABLE named-argument nesting boundary.
+        self.function_call_depth += 1;
+        let needle = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+        self.skip_trivia();
+        if !self.current_is_keyword(Keyword::In) {
+            return Err(self.unexpected("IN in POSITION"));
+        }
+        self.advance();
+        self.skip_trivia();
+        let haystack = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::RParen) {
+            return Err(self.unexpected("')' after POSITION"));
+        }
+        let end = self.current_span().end();
+        self.advance();
+        self.function_call_depth -= 1;
+        self.skip_trivia();
+        Ok(ordinary_special_call(
+            "strpos",
+            false,
+            vec![haystack, needle],
+            Span::new(start, end),
+        ))
+    }
+
+    fn parse_normalize_expression(&mut self) -> Result<Expr, ParseError> {
+        let start = self.current_span().start();
+        self.advance();
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::LParen) {
+            return Err(self.unexpected("'(' after NORMALIZE"));
+        }
+        self.advance();
+        self.skip_trivia();
+        // Preserve the original TABLE named-argument nesting boundary.
+        self.function_call_depth += 1;
+        let value = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+        self.skip_trivia();
+        let form = if self.current_is_symbol(Symbol::Comma) {
+            self.advance();
+            self.skip_trivia();
+            let raw = self.token_text(self.current_span());
+            if !matches!(
+                self.current().map(|token| &token.kind),
+                Some(TokenKind::Ident | TokenKind::Keyword(_))
+            ) || !["NFC", "NFD", "NFKC", "NFKD"]
+                .iter()
+                .any(|label| raw.eq_ignore_ascii_case(label))
+            {
+                return Err(self.unexpected("NFC, NFD, NFKC, or NFKD in NORMALIZE"));
+            }
+            // Pinned AstBuilder uses normalForm().getText(), not uppercase.
+            let form = raw.to_owned();
+            self.advance();
+            self.skip_trivia();
+            form
+        } else {
+            "NFC".to_owned()
+        };
+        if !self.current_is_symbol(Symbol::RParen) {
+            return Err(self.unexpected("')' after NORMALIZE"));
+        }
+        let end = self.current_span().end();
+        self.advance();
+        self.function_call_depth -= 1;
+        self.skip_trivia();
+        let span = Span::new(start, end);
+        // The generated literal's pinned location is the whole context's
+        // start, for explicit and absent forms; there is no source string.
+        let form = Expr::Literal(Literal {
+            kind: LiteralKind::String(form),
+            span,
+        });
+        Ok(ordinary_special_call(
+            "normalize",
+            true,
+            vec![value, form],
+            span,
+        ))
     }
 
     fn parse_substring_expression(&mut self) -> Result<Expr, ParseError> {
@@ -2481,6 +2606,36 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_special_children_do_not_inherit_table_named_argument_privilege() {
+        for source in [
+            "POSITION(generate_series(end => 1) IN text_value)",
+            "POSITION(needle IN generate_series(end => 1))",
+            "NORMALIZE(generate_series(end => 1))",
+            "POSITION(generate_series(end => 1), text_value)",
+            "`POSITION`(generate_series(end => 1), text_value)",
+            "ns.POSITION(generate_series(end => 1), text_value)",
+            "`NORMALIZE`(generate_series(end => 1))",
+            "ns.NORMALIZE(generate_series(end => 1))",
+        ] {
+            let tokens = lex(source).unwrap();
+            assert!(
+                super::PrattParser::new(source, &tokens)
+                    .with_table_function_named_arguments()
+                    .parse()
+                    .is_err(),
+                "{source}"
+            );
+        }
+        let source = "generate_series(end => 1)";
+        let tokens = lex(source).unwrap();
+        let expression = super::PrattParser::new(source, &tokens)
+            .with_table_function_named_arguments()
+            .parse()
+            .unwrap();
+        assert!(matches!(expression, crate::ast::Expr::FunctionCall(_)));
+    }
+
+    #[test]
     fn user_and_system_variables_are_lexically_rejected() {
         for source in [
             "@user",
@@ -2624,6 +2779,36 @@ fn predicate_node(value: Expr, predicate: Predicate) -> Expr {
     Expr::Predicated(AstBox::new(PredicatedExpr {
         value,
         predicate,
+        span,
+    }))
+}
+
+/// The final ordinary FunctionCall directly owns the original producer children.
+fn ordinary_special_call(
+    name: &'static str,
+    quoted: bool,
+    arguments: Vec<Expr>,
+    span: Span,
+) -> Expr {
+    Expr::FunctionCall(AstBox::new(FunctionCall {
+        name: ObjectName {
+            parts: vec![Ident {
+                value: name.to_owned(),
+                quoted,
+                span: crate::SYNTHETIC,
+            }],
+            span: crate::SYNTHETIC,
+        },
+        arguments: arguments
+            .into_iter()
+            .map(|value| crate::build::call_argument(value, None))
+            .collect(),
+        distinct: false,
+        order_by: None,
+        filter: None,
+        null_treatment: None,
+        window: None,
+        processing_mode: None,
         span,
     }))
 }

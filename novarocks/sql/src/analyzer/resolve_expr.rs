@@ -2206,6 +2206,21 @@ impl<'a> super::AnalyzerContext<'a> {
         if let Some(reason) = unsupported_call_facts(func) {
             return Err(AnalyzeError::unsupported_expression(reason, func.span));
         }
+        // These exact canonical Trino calls have no selected implementation.
+        // Keep this direct capability refusal after the original metadata guard;
+        // qualified and differently quoted ordinary names retain their lookup.
+        if let [name] = func.name.parts.as_slice()
+            && ((!name.quoted && name.value.eq_ignore_ascii_case("strpos"))
+                || (name.quoted && name.value == "normalize"))
+        {
+            return Err(AnalyzeError::unsupported_expression(
+                format!(
+                    "builtin function `{}` has no admitted selected scalar implementation",
+                    name.value.to_ascii_lowercase()
+                ),
+                func.span,
+            ));
+        }
         let original_name = print_object_name(&func.name).to_ascii_lowercase();
         if matches!(original_name.as_str(), "grouping" | "grouping_id") {
             return self.analyze_grouping_function(func, scope);
@@ -7836,6 +7851,98 @@ mod tests {
             assert!(
                 !expression.value_type.nullable(),
                 "total non-null inputs stay non-null: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_missing_specials_refuse_before_children_but_keep_metadata_and_opaque_casts() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_parser::build;
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let ctx = logical_context(&control);
+        let scope = ctx.new_scope();
+        let missing = build::identifier(build::ident("only_missing_child", false));
+        let missing_kind = ctx.analyze_expr(&missing, &scope).unwrap_err().kind();
+        for (name, quoted) in [("strpos", false), ("normalize", true)] {
+            let mut expression = build::function(
+                build::object_name(vec![build::ident(name, quoted)]).unwrap(),
+                vec![missing.clone(), build::string("NFC")],
+            );
+            let error = ctx.analyze_expr(&expression, &scope).unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+            assert!(error.message().contains(name), "{error}");
+            assert_eq!(error.span(), Some(expression.span()));
+
+            let ast::Expr::FunctionCall(call) = &mut expression else {
+                panic!("call");
+            };
+            call.arguments[0].name = Some(build::ident("named", false));
+            let error = ctx.analyze_expr(&expression, &scope).unwrap_err();
+            assert_eq!(
+                error.message(),
+                "named function arguments are not supported"
+            );
+            let ast::Expr::FunctionCall(call) = &mut expression else {
+                panic!("call");
+            };
+            call.arguments[0].name = None;
+
+            let statements =
+                novarocks_parser::parse("SELECT typeof(CAST(NULL AS INTEGER))").unwrap();
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query");
+            };
+            let ast::SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("select");
+            };
+            let ast::SelectItem::UnnamedExpr(mut opaque) = select.projection[0].clone() else {
+                panic!("projection");
+            };
+            let ast::Expr::FunctionCall(call) = &mut opaque else {
+                panic!("typeof");
+            };
+            let ast::Expr::Cast(cast) = &mut call.arguments[0].value else {
+                panic!("cast");
+            };
+            cast.expression = expression;
+            let actual = ctx.analyze_expr(&opaque, &scope).unwrap();
+            assert_eq!(
+                actual.value_type,
+                novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false)
+            );
+            assert!(
+                matches!(actual.kind, ExprKind::Literal(LiteralValue::String(value)) if value == "integer")
+            );
+        }
+        let unknown = build::function(
+            build::object_name(vec![build::ident("only_unknown_function", false)]).unwrap(),
+            vec![build::string("original")],
+        );
+        assert_eq!(
+            ctx.analyze_expr(&unknown, &scope).unwrap_err().kind(),
+            AnalyzeErrorKind::UnknownFunction
+        );
+        for parts in [
+            vec![build::ident("strpos", true)],
+            vec![build::ident("normalize", false)],
+            vec![build::ident("NORMALIZE", true)],
+            vec![
+                build::ident("catalog", false),
+                build::ident("strpos", false),
+            ],
+            vec![
+                build::ident("catalog", false),
+                build::ident("normalize", true),
+            ],
+            vec![build::ident("only_unknown_function", false)],
+        ] {
+            let expression =
+                build::function(build::object_name(parts).unwrap(), vec![missing.clone()]);
+            assert_eq!(
+                ctx.analyze_expr(&expression, &scope).unwrap_err().kind(),
+                missing_kind,
+                "noncanonical names must still analyze their original child before catalog lookup"
             );
         }
     }
