@@ -25,7 +25,7 @@ under the License.
 [ADR-0229](../../adr/ADR-0229-rust-test-placement-dependency-direction-and-fixture-ownership.md)，这里只写操作。
 
 本指南是这些规则的唯一完整表述。`AGENTS.md` 和 [test-governance](test-governance.md) 里只有入口与摘要；
-摘要与本指南不一致时以本指南为准。
+摘要与本指南不一致时以本指南为准。ADR-0229 记录裁决；本指南与它不一致时以 ADR 为准，并在同一个改动里修订本指南。
 
 仓库里现有的测试布局大多早于本指南，相邻文件的写法不是范例。新测试按下面的判定程序放置；旧测试不成批迁移，
 由改动到它的任务按[存量测试的迁移](#存量测试的迁移)处理。
@@ -42,12 +42,13 @@ under the License.
 | 你要写的测试 | 放在哪里 |
 |---|---|
 | 断言与输入都能经 crate 的公共 API 表达（公开契约） | `<crate>/tests/it/` 下按行为轴命名的子模块 |
-| 必须观察内部性质：私有状态、内部共享与释放、公开入口到达不了的内部错误路径（白盒） | 被测模块的 `tests.rs`，主题多时接 `tests/<subject>.rs`，并写明观察的内部性质 |
+| 必须观察内部性质（私有状态、内部共享与释放、公开入口到达不了的内部错误路径），或输入只能经私有项构造（白盒） | 被测模块的 `tests.rs`，主题多时接 `tests/<subject>.rs`，并写明观察的内部性质 |
 | 需要本 crate 的领域 testkit | 只能是 `<crate>/tests/it/` |
 | 检查下游怎样消费上游的真实产物，且下游生产依赖上游 | 下游 crate |
-| 期望值相对 SQL 文本陈述，一路到 Execution 求值，且属于[选层](#选层)表中接缝那一行的性质 | 接缝测试 package `tests/compile-to-execute`；一条语句端到端的结果归 SQL 套件 |
+| 穿过“编译到执行”接缝、按[选层](#选层)属于接缝那一行的性质，例如期望值相对 SQL 文本陈述，或要靠非法 package 触发 | 接缝测试 package `tests/compile-to-execute`；一条语句端到端的结果归 SQL 套件 |
 | 从物理计划片段经局部编译器取输入，检查 Execution 的行为 | Execution，见[输入契约生产者](#输入契约生产者) |
-| 需要 Loom、Miri、全局 allocator、自定义 harness、`required-features` 或按 binary 选择的资源组 | 该 crate 中同一理由的那一个独立 target，target 根的顶部写明理由；同时需要私有项的留在 `src/` 内按该模式门控的模块 |
+| 需要 Loom、全局 allocator、自定义 harness 或 `required-features` | 该 crate 中同一理由的那一个独立 target，target 根的顶部写明理由；同时需要私有项的留在 `src/`，见[第 4 问](#第-4-问是否需要-target-级属性) |
+| 需要 nextest 资源组、更长的超时或 Miri | 沿用第 3 问的位置，按测试名选择，不为此拆 target |
 | 启动真实进程、走真实协议或多个角色协作 | 拥有该场景的 Server、cluster harness 或 System owner，沿现有入口 |
 | 多个 crate 要用同一份领域输入 | 按[测试支持的暴露方式](#测试支持的暴露方式)选择门控模块或 testkit crate |
 | 改动到一个旧布局的测试 | [存量测试的迁移](#存量测试的迁移) |
@@ -55,7 +56,8 @@ under the License.
 ## 选层
 
 先决定一个性质该由哪一层的测试验证，再决定 Rust 测试放在哪里。开发期的快速验证靠 owner crate 的 Rust 测试，
-具体位置按下面的判定程序；SQL 级测试只有一份语料，由 SQL runner 在真实部署上运行，留给 CI 与收尾阶段。
+具体位置按下面的判定程序；SQL 级测试只有一份语料，由 SQL runner 在真实部署上运行，开发期按影响声明选择运行，
+收尾验证时运行，目前还不在自动准入中。
 不为验证 SQL 的计算语义在 Rust 测试里起服务，也不为“快速路径”另立一种用例形式；进程与协议级行为仍由拥有该场景的
 owner 启动真实进程。
 
@@ -64,8 +66,8 @@ owner 启动真实进程。
 | 单个函数、转换或运算的值、类型与失败 | Functions 的 Rust 测试；Functions 的 testkit 建成后使用它 |
 | 算子与 pipeline 的局部行为 | Execution 的 Rust 测试 |
 | 只有在编译产物与求值器之间才看得见的性质；需要特殊输入形状、注入控制或非法 package 才能触发的行为 | 接缝测试 package `tests/compile-to-execute` |
-| 一条语句端到端的结果，以及依赖拓扑的行为 | SQL 套件，CI 在 1FE+3BE 上运行 |
-| 进程与协议级行为 | 原生多节点测试与 System 场景 |
+| 一条语句端到端的结果，以及依赖拓扑的行为 | SQL 套件，在 1FE+3BE 上运行 |
+| 启动真实进程、走真实协议的行为 | 原生多节点测试与 System 场景；协议核心的纯逻辑仍是 owner crate 的 Rust 测试 |
 
 预期由测试手写，独立于被测代码，不引入 golden 录制。这个分工接受一个代价：跨层问题，例如分析期推导的类型与
 运行期结果类型不一致，发现得较晚；接缝测试 package 覆盖其中最常见的一段。
@@ -119,14 +121,20 @@ cargo tree -p <crate> -e normal --locked --prefix none | grep '^novarocks' | sor
 - 期望值相对 owner 自己的输入陈述，例如“这个程序对这几列求值得到这些值”。越界的 crate 只是用来把输入构造出来，
   换一种构造方式期望值不变。测试留在 owner，输入改在允许范围内构造，进入第 3 问。
 - 期望值相对上游的原始输入陈述，例如“这条 SQL 文本求值得到这些值”。换掉上游的真实产物，期望值就失去了依据。
-  它属于对应的[接缝测试 package](#接缝测试-package)，位置判定到此结束，第 5、6 问在那个 package 内照常适用。
+  这个性质按[选层](#选层)属于接缝那一行时，它属于对应的[接缝测试 package](#接缝测试-package)，位置判定到此结束，
+  第 5、6 问在那个 package 内照常适用；一条语句端到端的结果归 SQL 套件，单个函数的值归 Functions。
 
 拿不准时，看结论是否依赖上游对原始输入的解释，例如类型推导、隐式转换或计划选择：依赖的，期望值就是相对上游原始输入陈述的。
 接缝两侧之间如果有生产依赖，上游本来就在下游的闭包内，不会走到这一步。
 
+替换检验指向留在 owner、而这份输入在允许范围内造不出来时，看 owner 真正消费的是什么，改用它的替身。例如 Worker 的
+任务流测试用局部编译器编出 `LocalProgram` 来实现执行宿主，而 Worker 消费的是 `TaskExecutionHost`，不是 `LocalProgram`：
+测试改用允许范围内构造的宿主，期望值不变。替身保不住要断言的性质时，这条规则在真实代码上不可执行：
+被改到的存量测试暂时保留现有依赖并在迁移记录里写明，按 ADR-0229 的再评估条件提出，不另起新的越界依赖。
+
 **得到什么。** 确认测试留在 owner，或者进入接缝测试 package。任何情况下都不为测试新增允许范围之外的 dev 依赖。
 
-**反例。** 在 Execution 的测试里写“SQL 文本经编译后求值”。Execution 是 BE 的执行引擎，生产闭包里没有 SQL，
+**反例。** 在 Execution 的测试里写“SQL 文本经编译后求值”。Execution 的生产闭包里没有 SQL，
 SQL 也不在它的输入契约生产者表里。把 SQL 加进 Execution 的 `[dev-dependencies]` 能让它编译，但从此任何 SQL 改动
 都会选中 Execution 的全部测试。原因见[测试依赖方向](#测试依赖方向)。
 
@@ -160,23 +168,32 @@ SQL 也不在它的输入契约生产者表里。把 SQL 加进 Execution 的 `[
 - 自定义 harness（`harness = false`）；
 - 全局 allocator；
 - `required-features`；
-- Loom 或 Miri 这类按 target 运行的模式；
-- `.config/nextest.toml` 中按 binary 选择的资源组或超时。
+- Loom 这类改变整个构建的运行模式。`--cfg loom` 会改变生产代码本身，例如换成 Loom 的同步原语、去掉部分项，
+  普通测试在这种构建里不成立，所以按模式分 target。
+
+nextest 的资源组、超时和 Miri 不在清单内：它们都能按测试名选择，例如在 `.config/nextest.toml` 的 filter 里加
+`test(...)`，或给 `cargo miri test` 传测试名过滤。需要它们的测试沿用第 3 问的位置，公开契约测试与白盒测试都一样。
 
 **得到什么。** 需要其中一项、且第 3 问的答案是公开契约时，放进该 crate 中理由相同的那一个独立 target；
 还没有就新建 `<crate>/tests/<name>/main.rs`，并在 target 根的顶部用一行英文注释写明是哪一项。不用 `tests/<name>.rs`
-作为有子模块的 target 根：它的子模块会解析到 `tests/` 顶层，被 Cargo 当成另外的 target。理由相同指同一项属性且取值相同，
-例如同一个 allocator、同一组 `required-features` 或同一个资源组；这样的独立 target 在一个 crate 中只有一个，各主题作为它的子模块。
+作为有子模块的 target 根：它的子模块解析到 `tests/` 顶层，写成 `tests/<sub>.rs` 时会被 Cargo 当成另外的 target。理由相同指同一项属性且取值相同，
+例如同一个 allocator、同一组 `required-features` 或同一种运行模式；这样的独立 target 在一个 crate 中只有一个，各主题作为它的子模块。
 不需要时沿用第 3 问的位置。集成 target 的组织细节见[公开契约测试与集成 target](#公开契约测试与集成-target)。
 
-第 3 问优先。Loom、Miri 这类模式下的测试如果同时需要私有项，留在 `src/`，放进按该模式的 cfg 门控的独立模块，
-不为了成为独立 target 而放宽可见性。两种放法的现有例子是 `novarocks/memory/src/lane_loom.rs`（在 `src/` 内）
-和 `novarocks/control-runtime/tests/loom/main.rs`（独立 target，6 个模型族是它的子模块）。白盒测试需要某个资源组或超时时，
-在 `.config/nextest.toml` 里按测试名选择它，不为此拆出 target；白盒测试需要全局 allocator 或自定义 harness 的情形还没有先例，
-按[首次使用时验证](#存量测试的迁移)处理。
+第 3 问优先。Loom 模型如果同时需要私有项，留在 `src/`，放进被测模块测试树里按模式门控的模块，例如在
+`foo/tests.rs` 里声明 `#[cfg(loom)] mod loom;`，不为了成为独立 target 而放宽可见性。独立 target 的现有例子是
+`novarocks/control-runtime/tests/loom/main.rs`（6 个模型族是它的子模块）；`src/` 内现有的
+`novarocks/memory/src/lane_loom.rs` 等由 `lib.rs` 逐个声明的平铺文件属于旧布局，不作范例。
+
+全局 allocator 作用于整个测试二进制，一个二进制只能有一个。白盒测试声明的 allocator 对这个 crate 的全部 lib 单元测试生效，
+所以它必须转发给 `System`，只在当前测试经线程局部开关启用时计数或注入失败，其余测试不受影响。
+`novarocks/functions/src/source_custody_resources_tests.rs` 与 `novarocks/proto-codec/src/scalar_result.rs` 的测试模块
+是这种写法（它们的文件布局属于旧布局）。需要 allocator 的白盒测试复用 crate 里已有的那一个，没有时按这种写法在测试树里新建。
+自定义 harness 只能作用于整个 target：需要它的性质改写成公开契约测试，进 harness 相同的独立 target。
 
 **反例。** “这些测试会互相干扰全局状态，所以各自一个 binary。”仓库的规范执行器 nextest 每个测试一个进程，
-同一个 binary 里的测试并不共享进程状态，这不构成理由。
+同一个 binary 里的测试并不共享进程状态，这不构成理由。直接用 `cargo test` 时同一个 binary 的测试共享一个进程：
+合并依赖进程级全局状态的测试之前，确认它们在 `cargo test` 下也成立，或者让它们自行隔离，例如重新启动自身。
 
 ### 第 5 问：是否已有承载它的主题
 
@@ -210,9 +227,9 @@ SQL 也不在它的输入契约生产者表里。把 SQL 加进 Execution 的 `[
 白盒测试默认放在独立文件。生产文件里只留一行入口：
 
 ```text
-exec/chunk/mod.rs           # production code; declares `#[cfg(test)] mod tests;`
-exec/chunk/tests.rs         # white-box assertions, or the root of the test tree
-exec/chunk/tests/
+foo/mod.rs                  # production code; declares `#[cfg(test)] mod tests;`
+foo/tests.rs                # white-box assertions, or the root of the test tree
+foo/tests/
     slicing.rs              # one behaviour axis per file
     nullability.rs
     fixtures.rs             # inputs and the check entry for this tree only
@@ -220,7 +237,7 @@ exec/chunk/tests/
 
 `foo.rs` 或 `foo/mod.rs` 里的 `#[cfg(test)] mod tests;` 都解析到 `foo/tests.rs`，它的子模块解析到 `foo/tests/`。
 两种模块入口都可以：一个具名实现文件加一个测试模块时，沿用 `foo.rs` 与 `foo/tests.rs`；已有目录式的子系统沿用 `mod.rs`。
-现有的例子是 `novarocks/execution/src/exec/chunk/mod.rs` 与同目录的 `tests.rs`，以及
+现有的例子是 `novarocks/value-arrays/src/storage/mod.rs` 与同目录的 `tests.rs`，以及
 `novarocks/functions/src/arithmetic/decimal.rs` 与 `arithmetic/decimal/tests.rs`。
 
 独立文件的理由是构建行为。非测试构建不读取 `tests.rs`，修改它不会让这个 crate 的库和所有下游失效；
@@ -237,9 +254,11 @@ exec/chunk/tests/
   子文件用显式的 `super::super::` 访问被测模块，不经根的通配导入转取，以免根里的 helper 遮蔽被测模块的同名私有项。
   `novarocks/functions/src/cast/tests.rs` 与 `cast/tests/` 是这种写法。
 - 不用 `#[path]` 把兄弟文件接成测试模块，不新建 `foo_tests.rs` 这样的平铺兄弟文件。生产模块经 `#[path]` 从非标准位置
-  加载、又要接测试树时，先把生产文件移到标准位置，再用标准写法接入；`#[path]` 有真实理由（例如按平台或 cfg 选择
-  实现文件）时保留它，测试入口写成 `#[cfg(test)] #[path = "<实现文件名>/tests.rs"] mod tests;`。经 `#[path]` 加载的文件
-  按 `mod.rs` 的方式解析子模块，不写路径时会解析到同目录的 `tests.rs`，几个实现文件会互相冲突。
+  加载、又要接测试树时，先把生产文件移到标准位置（只改路径，内容不变），再用标准写法接入。`#[path]` 有真实理由时保留，
+  例如按平台或 cfg 选择实现文件，或者这个文件被多个 package 经 `#[path]` 引入；这时测试入口写成
+  `#[cfg(test)] #[path = "<实现文件名>/tests/mod.rs"] mod tests;`。经 `#[path]` 加载的文件按 `mod.rs` 的方式解析子模块：
+  不写路径时 `mod tests;` 会解析到同目录的 `tests.rs`，几个实现文件会互相冲突；测试树的根本身也经 `#[path]` 加载，
+  所以放在 `<实现文件名>/tests/mod.rs`，主题文件与它同在 `<实现文件名>/tests/` 下。
 - 白盒测试写明它观察的内部性质：在测试函数或测试树根的文档注释里用一句英文说明，例如“two internal conversions
   share the target storage until the last reference is dropped”。
 - 已有的合理内联测试不需要为了统一外观而迁移。
@@ -289,7 +308,8 @@ cfg、`required-features` 或运行模式时，才拆成少数几个按领域命
 ### testkit 的“两份类型”规则
 
 设 U 是事实 owner，`U-testkit` 依赖 U。U 的 lib 单元测试如果使用 `U-testkit`，测试二进制里就有两份 U：
-被测的那份，和 testkit 链接的那份。两份里的同名类型互不相同，编译会失败。
+被测的那份，和 testkit 链接的那份。两份里的同名类型互不相同：U 的类型跨越 testkit 与被测代码的边界时编译失败；
+只传 std 或 Arrow 类型时仍能编译，但两份各有自己的静态状态，测试观察到的可能是另一份。编译器并不总能拦住，评审要核对。
 
 | 使用方 | 能否使用 `U-testkit` | 原因 |
 |---|---|---|
@@ -332,31 +352,33 @@ cfg、`required-features` 或运行模式时，才拆成少数几个按领域命
 
 | owner | 输入契约 | 允许依赖的生产者 | 生产组合点 | 依据 |
 |---|---|---|---|---|
-| `novarocks-execution` | `LocalProgram`（`novarocks-local-program`） | `novarocks-local-compiler`，及其生产闭包内的 `novarocks-physical-plan` | `novarocks-native-adapter` | 没有测试从零构造 `LocalProgram`；至少 72 个测试文件经物理计划片段与局部编译器取得输入，其中很多是白盒测试 |
+| `novarocks-execution` | `LocalProgram`（`novarocks-local-program`） | `novarocks-local-compiler`，及其生产闭包内的 `novarocks-physical-plan` | BE 一侧 `novarocks-native-adapter`；FE 一侧 `novarocks-frontend-application` 的常量求值 | 没有测试从零构造 `LocalProgram`；至少 72 个测试文件经物理计划片段与局部编译器取得输入，其中很多是白盒测试 |
 
 新增一行需要同时满足四个条件，并在改动中给出证据：
 
 1. 契约类型定义在 owner 的生产闭包内；
 2. 它没有可行的闭包内构造方式；
-3. 生产者的公开生产 API 直接产出该类型，并且生产上由同一角色的组合点把生产者的输出直接交给 owner；
+3. 生产者的公开生产 API 直接产出该类型，并且生产上由同一角色的组合点把生产者的输出交给 owner；
 4. 生产者自己的生产闭包不含另一角色一侧的 crate。
 
-新增一行是一次普通的指南修订；改变这四个条件要修订 ADR-0229。SQL、parser 与应用层 crate 不在表内，
-以 SQL 文本为输入的测试仍按替换检验归 owner 或进接缝测试 package。Plan Codec 也不在表内：Execution 不消费 package，
-经过 package 编解码的测试属于接缝测试。
+新增一行是一次普通的指南修订；改变这四个条件要写新的 ADR，部分替代 ADR-0229。SQL、parser 与应用层 crate 不在表内，
+以 SQL 文本为输入的测试仍按替换检验归 owner 或进接缝测试 package。Plan Codec 也不在表内：Execution 不消费 package。
+检查 package 编解码本身、或要靠非法 package 触发的测试属于接缝测试；package 只是用来构造输入的，按替换检验去掉 package
+往返，改为从物理计划片段经局部编译器取输入，留在 Execution。
 
-这样做保留了规则要防的事：FE 一侧的改动不会选中 BE 的测试。改局部编译器或物理计划的输出本来就影响 Execution 的行为，
-此时选中 Execution 的测试是合理的。
+这样做保留了规则要防的事：表里只有本来就影响 owner 输入的 crate，改局部编译器或物理计划时选中 Execution 的测试是合理的，
+SQL、parser 与应用层 crate 的改动不会因为这张表而选中 Execution 的测试。这一点要等 Execution 的过渡期越界依赖迁走后
+才完全成立，见[接缝测试 package](#接缝测试-package) 末尾。
 
-**Execution 自己的输入。** Execution 的语义测试经物理计划片段与局部编译器取得 `LocalProgram`，例如
+**Execution 自己的输入。** Execution 的算子与求值器测试经物理计划片段与局部编译器取得 `LocalProgram`，例如
 `novarocks/execution/src/exec/expr/f3_concat_trim_sql_boundary_tests.rs` 里的 `compiled_slot_program`。
 这类测试的 owner 是 Execution，依赖合规，在 Execution 内按第 3 问放置，不进接缝测试 package。
 
 ### 接缝测试 package
 
 它是只含测试的 workspace 成员，按一条真实的产品接缝命名，依赖接缝两侧和它们的 testkit，不被任何成员依赖
-（过渡期的例外见本节末尾）。它不是通用的测试 crate：数量由产品接缝的数量决定，每个 package 只放期望值相对上游原始输入陈述、
-穿过那条接缝的断言。
+（过渡期的例外见本节末尾）。它不是通用的测试 crate：数量由产品接缝的数量决定，每个 package 只放穿过那条接缝、
+并且按[选层](#选层)属于接缝的断言：期望值相对上游原始输入陈述，或者要靠特殊输入形状、注入控制或非法 package 才能触发。
 
 接缝测试 package 的允许范围是接缝两侧、连接两侧所需的中间 crate，以及它们的 testkit 与机械支持。新建一个接缝测试 package
 是新的长期结构决策，先在对应任务中明确设计，不在写测试时顺手新建。
@@ -376,8 +398,11 @@ Plan Codec、局部编译器、物理计划与 Execution 及其 testkit。
 
 **过渡期的依赖。** 接缝 package 与 SQL 的编译输入建立之前，Execution 里已有不少测试依赖这些输入与链路 helper。
 它们尚未迁走，Execution 因此暂时 dev 依赖 `novarocks-sql-testkit` 与接缝 package 的 lib，并在原位置保留转调，
-例如 `novarocks/execution/src/exec/expr/sql_test_source.rs`。新测试不经由转调，也不使用 Execution 现有的越界 dev 依赖；
-转调与这些依赖在最后的使用方随改动迁走时删除。
+例如 `novarocks/execution/src/exec/expr/sql_test_source.rs`。这还不是全部：Execution 的 dev 依赖里，除生产者表中的
+`novarocks-local-compiler` 与 `novarocks-physical-plan` 外，其余 workspace 成员都越出允许范围，包括 `novarocks-sql`、
+`novarocks-parser`、`novarocks-query-application`、`novarocks-plan-codec` 等。新测试不经由转调，也不使用这些依赖；
+转调与依赖在最后的使用方随改动迁走时删除，已经没有使用方的依赖直接删除。它们迁走之前，改这些 crate 仍会选中
+Execution 及其下游的测试。
 
 ## fixture 归属阶梯
 
@@ -394,30 +419,43 @@ Plan Codec、局部编译器、物理计划与 Execution 及其 testkit。
 
 同名的 fixture 不一定该合并。先比较语义和输入责任：同一事实的重复构造收口到一处，语义不同的本地 stub 即使长得相似也各自保留。
 
-testkit 只构造输入。它不实现被测的消费规则，也不给出由被测代码算出来的预期。
+testkit 构造领域输入，也可以按 ADR-0140 承载跨实现共用的行为 suite，例如 `novarocks/state-store/testkit` 里供各 provider
+调用的一致性检查，其中的预期按契约手写。它不实现被测的消费规则，也不给出由被测代码算出来的预期。
 
 “同 crate”一级只服务 `src/` 内的测试树；`tests/it/` 是另一个 crate，看不见 `cfg(test)` 模块，用自己的 `fixtures` 模块。
 同一份 helper 既被留在 `src/` 的白盒测试使用、又被本 crate `tests/it/` 的测试使用时，放进本 crate 的门控 testkit 模块，不复制。
+门控模块只能使用 owner 的生产依赖；这份 helper 需要生产闭包之外的依赖时，它构造的是别的 crate 的事实，放进那个事实 owner
+持有、不依赖本 crate 的 testkit crate，见[测试支持的暴露方式](#测试支持的暴露方式)第 4 步。
 
 ### 测试支持的暴露方式
 
 一份要给 owner 之外的测试使用的支持代码，按顺序判断它放在哪里。owner 自己的 `tests/it/` 也算 owner 之外，它是另一个 crate。
 
-1. 它是运行期的控制或观察接缝吗，例如 `with_test_controls`、观察器、故障钩子？是，则不属于本指南，按 ADR-0175 与 ADR-0181。
+1. 它是运行期的控制或观察接缝吗，例如 `with_test_controls`、观察器、故障钩子？是，则不属于本指南，按
+   [测试控制 ADR-0175](../../adr/ADR-0175-test-capabilities-and-finite-role-authorization.md) 与
+   [ADR-0181](../../adr/ADR-0181-unified-development-capabilities-and-executable-provenance.md)。
 2. 它必须触及 owner 的私有项吗？是，则在 owner 内放开发 cfg 门控、以 `_for_test` 结尾的 `pub` 函数，只转调私有项，
    不写输入构造逻辑。例如 `novarocks/execution/src/exec/operators/compiled_expression.rs` 的
    `prepare_project_factory_for_test`，供 Native Adapter 的测试使用。如果这份支持本身是一份被 owner 白盒测试共用的输入构造，
    直接按第 3 步放进门控 testkit 模块：门控模块在 owner 内，可以使用私有项。本 crate 的 `tests/it/` 不使用薄入口。
 3. 同一份输入也被 owner 的 `src/` 白盒测试使用吗？是，则放在 owner 内开发 cfg 门控的 testkit 模块，保持单份。例如
    `novarocks/plan-codec/src/physical_package_v2.rs` 的 `test_support` 模块，被 Plan Codec 自己的白盒测试和其他 crate 的测试共用。
+   门控模块只能使用 owner 的生产依赖；需要闭包之外的依赖时转到第 4 步。
 4. 其余情况放 testkit crate；需要 owner 生产闭包之外的依赖时，也只能用 testkit crate。例如 `novarocks/sql/testkit`
    （`novarocks-sql-testkit`）只用 SQL 的公共 API 构造编译输入，SQL 自己的白盒测试不使用它。testkit crate 带入的依赖
-   同样要落在每个消费者的允许范围内。
+   同样要落在每个消费者的允许范围内。要给某个 crate 自己的白盒测试用的 testkit crate 不能依赖那个 crate（见“两份类型”规则），
+   它由所构造事实的 owner 持有。例如 Execution 白盒测试与 `tests/it` 共用、经局部编译器构造 `LocalProgram` 的 helper，
+   放进 `novarocks-local-program` 的领域 testkit crate：Local Program 在 Execution 的生产闭包内，这个 testkit 带入的
+   局部编译器与物理计划都在 Execution 的允许范围内，它也不依赖 Execution。目前还没有这个 crate，由第一个需要它的改动新建。
 
 门控代码的写法与约束：
 
 - owner 的白盒测试也要用时写 `#[cfg(any(test, novarocks_dev_controls))]`，只给其他 crate 用时写 `#[cfg(novarocks_dev_controls)]`。
-  `novarocks_dev_controls` 由实际的 debug assertions 决定，不是 Cargo feature，标准 release 不包含它。
+  `novarocks_dev_controls` 由实际的 debug assertions 决定，不是 Cargo feature，标准 release 不包含它，机制见 ADR-0181。
+- 这个 cfg 只在 `build.rs` 调用共享 build helper 的 crate 里存在：`build.rs` 经 `#[path]` 引入
+  `build-support/development.rs` 并调用 `development::emit()`，写法见 `novarocks/execution/build.rs`。不是每个 crate 都有它；
+  在没有的 crate 里放门控代码之前，先在同一个改动里加上这个 `build.rs`。否则 lib 单元测试会因 `unexpected_cfgs` 在
+  Clippy 中失败，本 crate 的 `tests/it` 也看不到门控项。
 - 门控代码编在库的非测试构建里，只能使用 owner 的生产依赖；修改它会让 owner 及其下游在 dev 构建中重编。
   所以既不被 owner 白盒测试使用、也不需要私有项的输入构造不放进门控模块。
 - 生产代码不得引用它。按仓库约定，Rust 测试只在 dev 配置下构建运行，消费门控支持的测试随之只在 dev 下成立，不另加门控。
@@ -510,7 +548,7 @@ fn concat_is_strict_on_null() {
 如果测试需要新的 dev 依赖，同时写明它属于允许范围的哪一类。
 
 如果这项工作会改到存量测试，plan 同时列出：迁移哪些测试、迁到哪里；删除哪些测试，以及它们保护的每条性质由哪个测试接手，
-见[存量测试的迁移](#存量测试的迁移)。
+或者随哪项退役不再成立，见[存量测试的迁移](#存量测试的迁移)。
 
 评审 plan 的人按本指南的判定程序核对落点。这是规则生效的位置；仓库不用源码扫描检查文件名或位置。
 
@@ -521,7 +559,7 @@ fn concat_is_strict_on_null() {
 | 责任 | 用词 | 位置 |
 |---|---|---|
 | 领域输入与本树的 check 入口 | fixtures | 测试树内，或 crate 内的 `cfg(test)` 模块 |
-| 跨 crate 的领域输入 | testkit | `novarocks/<domain>/testkit`，或 owner 内开发 cfg 门控的 `testkit` 模块 |
+| 跨 crate 的领域输入，以及跨实现共用的行为 suite | testkit | `novarocks/<domain>/testkit`，或 owner 内开发 cfg 门控的 `testkit` 模块 |
 | owner 之外的测试需要的私有入口 | `*_for_test` | owner 内开发 cfg 门控的 `pub` 函数 |
 | 进程、端口、I/O 等机械资源 | support | `tests/test-support` |
 
@@ -536,6 +574,8 @@ fn concat_is_strict_on_null() {
 没被改到的保持现状，包括仍在使用越界 dev 依赖的那些。专门的整理，例如为一个反复拖累开发的热点合并集成 target，
 只在单独立项之后进行，并按本节同样的规则核对。
 
+本指南 2026-11-17 定稿之前已获批的 plan 不追溯：其中写明的测试落点照常执行；plan 修订时，按本指南重新核对修订到的落点。
+
 **何时迁。** 一个任务在下列情况下迁移相应的存量测试：
 
 - 它要改变某个存量测试断言的行为，或这个测试保护的契约；
@@ -547,17 +587,20 @@ fn concat_is_strict_on_null() {
 **怎样迁。** 对每个被改到的测试函数，重新走一遍判定程序：
 
 1. 先按[选层](#选层)确认这个性质该在哪一层。与现在的层不同时，例如接缝 package 里只保护单个 owner 计算语义的值断言，
-   改写到那一层的 owner；断言一条语句端到端结果的，交给 SQL 套件。被替代的旧测试按下面删除旧测试的规则处理。
+   改写到那一层的 owner；断言一条语句端到端结果的，交给 SQL 套件，并实际运行对应的 suite。SQL 套件目前不在自动准入中，
+   记录里写明这条保护改由它承担。被替代的旧测试按下面删除旧测试的规则处理。
 2. 第 1 问给出的 owner 可能与现在的位置不同，例如 Execution 目录里只断言 SQL 产物的测试，迁到真实 owner。
 3. 第 3 问先找公开边界：能经公开入口表达的，改写到公开入口，进 owner 的 `tests/it/`；否则留在 owner 的测试树，
    并写明观察的内部性质。
-4. 改写只动入口、输入与注入失败的构造方式、helper 的位置和导入；入口只能换成同一个 owner 的公开入口，不借改写改变 owner。
+4. 留在原层的测试，改写只动入口、输入与注入失败的构造方式、helper 的位置和导入；入口只能换成同一个 owner 的公开入口，
+   不借改写改变 owner。改层的测试按第 1 步替代旧测试，不适用本步。
    输入值、期望值及其独立来源、测试函数名、`cfg` 与 `#[ignore]` 保持不变；因本次行为改变而改动的期望值单独标出，并说明依据。
    不借迁移合并测试或删减断言。
 5. 迁移之后的测试按新测试对待：此后加入的用例遵循[形态与增长规则](#形态与增长规则)；迁移当次不为套用形态而合并或拆分测试函数。
 
 **删除旧测试。** 被替代或已废弃的旧测试在同一个改动里删除。删除时逐项写明它保护的每条性质现在由哪个测试断言，
-或者随哪项退役不再成立、为什么；写在 plan 的测试落点和 PR 说明里，评审按这份记录核对。处置清单里有记录的测试
+或者随哪项退役不再成立、为什么；写在 plan 的测试落点和 PR 说明里，评审按这份记录核对。随同一项退役而删除的测试
+可以合并成一条记录，写明退役项与被删测试的范围。处置清单里有记录的测试
 被删除或改名时，同步处理对应的处置，不能借删除或改名清掉历史失败。
 
 **只挪位置。** 只移动、不改写时，例如第 5 问允许的顺手挪动，按纯位置迁移处理：输入、断言、测试函数名、`cfg`、
@@ -570,8 +613,8 @@ fn concat_is_strict_on_null() {
 **首次使用时验证的步骤。** 下面几项的规则已定，但具体步骤还没有在真实代码上走过。第一个用到它的任务按本指南执行并核对结果；
 需要补充步骤时直接修订本指南：
 
-- 迁移带自定义 harness、全局 allocator、`required-features` 或 Miri 的 target；
-- nextest 按 binary 的资源组或超时随 target 改名同步；
+- 迁移带自定义 harness、全局 allocator 或 `required-features` 的 target；
+- 合并只为 Miri、资源组或超时而存在的 target，把 `.config/nextest.toml` 与 Miri 包装器里按 binary 的选择改写成按测试名选择；
 - 处置清单的 Rust 单元键随测试身份改名；
 - 接缝测试三步次序中的第 2、3 步；
 - 新建门控 testkit 模块。
@@ -579,41 +622,44 @@ fn concat_is_strict_on_null() {
 ## 移动或删除测试时的同步
 
 nextest 用 binary ID 标识测试：lib 单元测试是 `<package>`，集成 target 是 `<package>::<target>`；测试名带着模块路径。
-一个测试从 `src/` 移到 `tests/it/`，binary ID 会从 `<package>` 变成 `<package>::it`；移到接缝测试 package 则换成那个 package
-的 ID；换模块时测试名也随之改变。
+一个测试从 `src/` 移到 `tests/it/`，binary ID 会从 `<package>` 变成 `<package>::it`；移到接缝测试 package 则变成
+`novarocks-test-compile-to-execute::it`；换模块时测试名也随之改变。
 
 移动、改名或删除测试时，在同一个改动里核对并同步：
 
 - `.config/nextest.toml` 中按 `binary(...)` 选择的资源组与超时；
 - `tools/ci/baselines/dispositions.json` 中以 `rust-test:` 开头的处置键；
 - 按 target 名选择、检查或运行的 CI 包装器，例如 Loom 包装器的模型族清单；新建或合并按模式运行的 target 时，包装器要同步覆盖它；
-- 重新启动自身的测试的子进程路径，它们应当已由 `module_path!()` 推导；
+- 重新启动自身的测试的子进程路径，它们应当已由 `module_path!()` 推导；还没有的，先在原位置单独加固并验证，再移动；
 - `tests/it/main.rs` 与测试树根的模块清单，以及没有被声明的孤儿文件；
 - 经 `include!` 或 `#[path]` 接入的测试文件。
 
-新建测试通常不涉及前两处。只有当新测试需要某个资源组时，才按第 4 问把它放进对应的独立 target。
+新建测试通常不涉及前两处。新测试需要资源组或更长的超时时，在 `.config/nextest.toml` 里按测试名选择，不为此拆出 target。
 
 ## 走查用例
 
-下面的用例演示判定程序。A～D、O、P 取自现有代码，其余是假设的新测试。
+下面的用例演示判定程序。A～D、J～L、O、P 取自现有代码，其余是假设的新测试。
 
 **A：SQL 编译 `SELECT concat(a,b,c) FROM t` 后检查计划的参数个数与类型顺序。**
 现位于 `novarocks/execution/src/exec/expr/f3_concat_trim_sql_boundary_tests.rs`。第 1 问：它只调用 SQL 编译器这一个入口，
 之后只是读取产物，owner 是 SQL。第 2 问：只需要 SQL 闭包内的 crate。第 3 问：断言与输入都能经 SQL 的公共 API 表达。
 第 4 问：不需要。结果：SQL 的 `tests/it/`，输入取自 `novarocks-sql-testkit`。它目前是存量，由改动到它的任务迁走。
 
-**B：搭一个只含 `concat` 的物理计划片段，经局部编译器得到 `LocalProgram`，检查它对 NULL 与空串的求值。**
-与 A 在同一个文件里，经 `compiled_slot_program` 取得输入。第 1 问：链条上最后被调用的是 Execution 的求值入口，
-owner 是 Execution。第 2 问：物理计划与局部编译器不在 Execution 的生产闭包内，但在它的输入契约生产者表里，依赖合规。
-第 3 问：求值入口与观察的结果都是公共 API。结果：Execution 的 `tests/it/`，还没有就新建，不进接缝测试 package。
-A 与 B 同在一个文件却归属不同，所以要按测试函数判定，不按文件判定。
+**B：搭一个只含 `concat` 的物理计划片段，经局部编译器得到 `LocalProgram`，检查求值器在稀疏选择下按编译出的槽位读写，
+输出行与选择向量一一对应。**
+与 A 在同一个文件里，经 `compiled_slot_program` 取得输入。选层：槽位与选择向量是 Execution 求值器的局部行为。
+第 1 问：链条上最后被调用的是 Execution 的求值入口，owner 是 Execution。第 2 问：物理计划与局部编译器不在 Execution 的
+生产闭包内，但在它的输入契约生产者表里，依赖合规。第 3 问：求值入口与观察的结果都是公共 API。结果：Execution 的
+`tests/it/`，还没有就新建，不进接缝测试 package。如果只检查 `concat` 自己对 NULL 与空串的值，按选层归 Functions 的
+Rust 测试，那里已有同样的用例。A 与 B 同在一个文件却归属不同，所以要按测试函数判定，不按文件判定。
 
 **C：SQL 文本经 SQL 编译、package 编码、局部编译后求值，检查带符号转换的最终结果。**
 第 1 问：沿链依次调用 SQL 编译、package 编码、局部编译和 Execution 求值，最下游是 Execution。第 2 问：SQL 与 Plan Codec
 不在 Execution 的允许范围内；替换检验：期望值相对 SQL 文本陈述。结果：接缝测试 package，即现在的
-`tests/compile-to-execute/tests/it/signed_cast_nullability.rs`。它原先用 Execution 的私有分配宿主观察内存记账，迁入时
-按三步次序的第 1 步改为经公开的 `try_new_with_allocator` 传入测试自己的分配器，生产适配器的记账由 Execution 内
-具名的白盒测试承接。
+`tests/compile-to-execute/tests/it/signed_cast_nullability.rs`。它原先经公开的 `try_new_with_allocator` 传入 Execution
+私有的分配宿主，观察 `MemTracker` 的记账；迁入时按三步次序的第 1 步改为传入测试自己的计数分配器，观察的仍是同一个量，
+即求值结束后没有未释放的分配。生产分配宿主的记账继续由 Execution 的白盒测试断言，例如
+`novarocks/execution/src/exec/expr/compiled_program/` 下的 `scalar_invocation_frame_tests.rs` 与 `input_source_tests.rs`。
 
 **D：Query Application 冻结 SQL 产出的结果声明，并拒绝与声明不符的输出。**
 第 1 问：它先调用 SQL 编译，再调用 Query Application 的冻结入口，最下游是 Query Application；对 SQL 声明的检查是前置条件，
@@ -633,7 +679,7 @@ A 与 B 同在一个文件却归属不同，所以要按测试函数判定，不
 **G：新增，某个并发结构的 Loom 模型检查。**
 第 3 问：经公共 API 就能驱动这个结构。第 4 问：Loom 是 target 级模式。结果：该 crate 的 Loom target 中的一个子模块，
 模式门控在 target 根上；还没有 Loom target 就新建，并写明理由。如果模型检查必须触及私有项，第 3 问优先，
-它留在 `src/` 内按 Loom 门控的模块里。
+它留在 `src/`，放在被测模块测试树里按 Loom 门控的模块。
 
 **H：新增，两个 crate 的测试都要用同一份领域输入。**
 第 6 问：到达阶梯上跨 crate 的一级，按[测试支持的暴露方式](#测试支持的暴露方式)判定：事实 owner 的白盒测试也用这份输入，
@@ -647,10 +693,12 @@ A 与 B 同在一个文件却归属不同，所以要按测试函数判定，不
 测试支持的暴露方式第 3 步：放在 Plan Codec 内的门控 testkit 模块，保持单份。现有的例子是
 `physical_package_v2::test_support`；新建的同类模块叫 `testkit`。
 
-**K：经 SQL 公共 API 构造的编译输入，供 Execution 与接缝测试使用；SQL 自己的白盒测试走另一条私有流程，不使用它。**
-测试支持的暴露方式第 3 步不满足，落到第 4 步：独立的 testkit crate，即 `novarocks-sql-testkit`。
+**K：经 SQL 公共 API 构造的编译输入，供 SQL 与 Query Application 的 `tests/it` 及接缝测试使用；SQL 自己的白盒测试
+走另一条私有流程，不使用它。**
+测试支持的暴露方式第 3 步不满足，落到第 4 步：独立的 testkit crate，即 `novarocks-sql-testkit`。Execution 目前经过渡期的
+转调也在使用它，见[接缝测试 package](#接缝测试-package) 末尾；新的 Execution 测试不这样做。
 
-**L：某个 crate 有十几个没有 target 级理由的顶层集成 target，另有几个都是 Loom 模型的 target。**
+**L：某个 crate 有几十个没有 target 级理由的顶层集成 target，另有几个都是 Loom 模型的 target。**
 第 4 问：普通 target 没有清单内的理由，合成一个 `it`，各文件成为子模块；Loom target 理由相同，合成一个 `loom`，
 包装器按模型族检查。按[移动或删除测试时的同步](#移动或删除测试时的同步)核对身份与耦合点。现有的例子是 Control Runtime。
 
@@ -659,8 +707,8 @@ A 与 B 同在一个文件却归属不同，所以要按测试函数判定，不
 先单独加固，再移动。
 
 **N：一个生产模块经 `#[path]` 从非标准位置加载，现在要给它接测试树。**
-先把生产文件移到标准位置（只改名，内容不变），再用 `#[cfg(test)] mod tests;` 接入。`#[path]` 有真实理由时保留，
-测试入口也保留一个 `#[path]`。
+先把生产文件移到标准位置（只改路径，内容不变），再用 `#[cfg(test)] mod tests;` 接入。`#[path]` 有真实理由时保留，
+测试入口写成 `#[cfg(test)] #[path = "<实现文件名>/tests/mod.rs"] mod tests;`，见[白盒测试的形态](#白盒测试的形态)。
 
 **O：修复有符号整数运算的控制错误传播缺陷时，改到了 `novarocks/functions/src/arithmetic/tests.rs` 里的相关测试。**
 这些测试调用公开的 `PreparedArithmeticRecipe::evaluate_row`，留在白盒只因用了 crate 私有的简写 `invalid()`、`internal()`
