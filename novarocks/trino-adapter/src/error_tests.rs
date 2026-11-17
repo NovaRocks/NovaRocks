@@ -49,6 +49,11 @@ const TRINO_STANDARD_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("QUERY_TEXT_TOO_LARGE", 35, "USER_ERROR"),
     ("ADMINISTRATIVELY_KILLED", 38, "USER_ERROR"),
     ("INVALID_ANALYZE_PROPERTY", 42, "USER_ERROR"),
+    ("INVALID_CATALOG_PROPERTY", 124, "USER_ERROR"),
+    ("INVALID_SCHEMA_PROPERTY", 33, "USER_ERROR"),
+    ("INVALID_TABLE_PROPERTY", 18, "USER_ERROR"),
+    ("INVALID_MATERIALIZED_VIEW_PROPERTY", 95, "USER_ERROR"),
+    ("INVALID_BRANCH_PROPERTY", 136, "USER_ERROR"),
     ("CATALOG_NOT_FOUND", 44, "USER_ERROR"),
     ("SCHEMA_NOT_FOUND", 45, "USER_ERROR"),
     ("TABLE_NOT_FOUND", 46, "USER_ERROR"),
@@ -169,6 +174,12 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.invalid_literal" => "INVALID_LITERAL",
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
         "sql.analyze.invalid_analyze_property" => "INVALID_ANALYZE_PROPERTY",
+        "sql.admit.invalid_catalog_property" => "INVALID_CATALOG_PROPERTY",
+        "sql.admit.invalid_schema_property" => "INVALID_SCHEMA_PROPERTY",
+        "sql.admit.invalid_table_property" => "INVALID_TABLE_PROPERTY",
+        "sql.admit.invalid_materialized_view_property" => "INVALID_MATERIALIZED_VIEW_PROPERTY",
+        "sql.admit.invalid_analyze_property" => "INVALID_ANALYZE_PROPERTY",
+        "sql.admit.invalid_branch_property" => "INVALID_BRANCH_PROPERTY",
         "sql.analyze.too_many_arguments" => "TOO_MANY_ARGUMENTS",
         "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => "GENERIC_USER_ERROR",
         "query.execution.merge_target_row_multiple_matches"
@@ -275,6 +286,7 @@ fn every_registered_user_descriptor_has_an_explicit_trino_mapping() {
         novarocks_parser::ERROR_CODE_DESCRIPTORS,
         novarocks_sql::analyze_error::ERROR_CODE_DESCRIPTORS,
         novarocks_query_application::sql::session_admit::SESSION_ERROR_CODE_DESCRIPTORS,
+        novarocks_query_application::sql::property_admit::DDL_PROPERTY_ERROR_CODE_DESCRIPTORS,
         novarocks_query_application::sql::dml_admission::DML_ADMISSION_ERROR_CODE_DESCRIPTORS,
         EXECUTION_ERROR_CODE_DESCRIPTORS,
     ];
@@ -1235,5 +1247,141 @@ fn declared_row_match_identity_controls_standard_error_without_reclassifying_oth
             }),
             name,
         );
+    }
+}
+
+#[test]
+fn ddl_property_scopes_publish_real_user_errors_with_exact_trino_identity_and_location() {
+    use novarocks_query_application::sql::property_admit::DdlPropertyScope;
+    // The original error location uses byte columns; the wire uses UTF-16.
+    let source = "-- 中文😀\nWITH (\"😀\" = 1, broken = 2)";
+    let start = source.find("broken").unwrap();
+    let span = novarocks_parser::Span::new(start, start + "broken".len());
+    for (scope, descriptor, name, number) in [
+        (
+            DdlPropertyScope::Catalog,
+            "sql.admit.invalid_catalog_property",
+            "INVALID_CATALOG_PROPERTY",
+            124,
+        ),
+        (
+            DdlPropertyScope::Schema,
+            "sql.admit.invalid_schema_property",
+            "INVALID_SCHEMA_PROPERTY",
+            33,
+        ),
+        (
+            DdlPropertyScope::Table,
+            "sql.admit.invalid_table_property",
+            "INVALID_TABLE_PROPERTY",
+            18,
+        ),
+        (
+            DdlPropertyScope::MaterializedView,
+            "sql.admit.invalid_materialized_view_property",
+            "INVALID_MATERIALIZED_VIEW_PROPERTY",
+            95,
+        ),
+        (
+            DdlPropertyScope::Analyze,
+            "sql.admit.invalid_analyze_property",
+            "INVALID_ANALYZE_PROPERTY",
+            42,
+        ),
+        (
+            DdlPropertyScope::Branch,
+            "sql.admit.invalid_branch_property",
+            "INVALID_BRANCH_PROPERTY",
+            136,
+        ),
+    ] {
+        let detail = "same original property detail";
+        let user = scope.to_user_error(source, span, detail);
+        assert_eq!(user.code().as_str(), descriptor);
+        assert_eq!(user.phase(), ErrorPhase::Admit);
+        assert_eq!(user.retry(), RetryClass::Never);
+        assert_eq!(user.location().unwrap().line(), 2);
+        assert_eq!(user.location().unwrap().column(), 19);
+        let service = QueryServiceError::from_user_error(user);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: source,
+        });
+        assert_wire(&wire, name);
+        assert_eq!(
+            (wire.error_code, wire.error_name, wire.error_type),
+            (number, name, "USER_ERROR")
+        );
+        assert_eq!(
+            wire.error_location,
+            Some(TrinoErrorLocation {
+                line_number: 2,
+                column_number: 17
+            })
+        );
+        assert!(wire.message.contains(detail));
+        assert!(wire.message.starts_with(&format!("[{descriptor}]")));
+        assert!(wire.sql_state.is_none());
+        assert!(wire.failure_info.is_none());
+        let encoded = serde_json::to_value(&wire).unwrap();
+        assert_eq!(encoded["errorName"], name);
+        assert_eq!(encoded["errorCode"], number);
+        assert_eq!(encoded["errorType"], "USER_ERROR");
+        assert_eq!(
+            encoded["errorLocation"],
+            serde_json::json!({"lineNumber": 2, "columnNumber": 17})
+        );
+        assert_eq!(service.user_error().unwrap().code().as_str(), descriptor);
+
+        let user = scope.without_location(detail);
+        assert_eq!(user.code().as_str(), descriptor);
+        assert_eq!(user.phase(), ErrorPhase::Admit);
+        assert_eq!(user.retry(), RetryClass::Never);
+        assert!(user.location().is_none());
+        let service = QueryServiceError::from_user_error(user);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: source,
+        });
+        assert_wire(&wire, name);
+        assert!(wire.error_location.is_none());
+        assert!(
+            serde_json::to_value(&wire)
+                .unwrap()
+                .get("errorLocation")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn ddl_property_mapping_keeps_the_old_analyzer_owner_and_never_classifies_error_wording() {
+    let analysis = novarocks_sql::analyze_error::AnalyzeError::invalid_analyze_property(
+        "old analyzer property detail",
+    );
+    let user = analysis.to_user_error(None);
+    assert_eq!(user.code().as_str(), "sql.analyze.invalid_analyze_property");
+    assert_eq!(user.phase(), ErrorPhase::Analyze);
+    let service = QueryServiceError::from_user_error(user);
+    assert_wire(
+        &query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "ANALYZE t",
+        }),
+        "INVALID_ANALYZE_PROPERTY",
+    );
+    for (kind, name) in [
+        (QueryServiceErrorKind::InvalidValue, "GENERIC_USER_ERROR"),
+        (QueryServiceErrorKind::Unsupported, "NOT_SUPPORTED"),
+        (QueryServiceErrorKind::Interrupted, "USER_CANCELED"),
+        (QueryServiceErrorKind::Internal, "GENERIC_INTERNAL_ERROR"),
+    ] {
+        let service =
+            QueryServiceError::new(kind, "INVALID_TABLE_PROPERTY invalid catalog property");
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "SELECT 1",
+        });
+        assert_wire(&wire, name);
     }
 }

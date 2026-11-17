@@ -33,6 +33,7 @@ pub use array_cast::{
 pub use array_common::{
     ArrayCommonRuleFailure, ArrayCommonTypeFailure, array_common_coercion_types_valid_observed,
     array_common_numeric_coercion, array_constructor_result_with_construction,
+    list_value_type_with_construction,
 };
 mod array_generate;
 mod carrier_parameters;

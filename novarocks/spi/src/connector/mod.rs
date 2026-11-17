@@ -43,6 +43,7 @@ mod original_result_scope;
 mod payload_retention;
 mod predicate;
 mod process_local;
+mod property;
 pub mod provider;
 mod provider_binding;
 mod publication;
@@ -266,6 +267,9 @@ pub use predicate::{
     MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES, MAX_CONNECTOR_STATIC_PREDICATES,
     MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES, normalize_predicate_dispositions,
     validate_static_predicates,
+};
+pub use property::{
+    DdlPropertyDeclaration, DdlPropertyDeclarationError, DdlPropertyType, DdlPropertyValue,
 };
 pub use provider::{
     CatalogActivityEvents, CatalogActivityPhase, CatalogActivityReader, CatalogActivitySnapshot,

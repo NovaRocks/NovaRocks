@@ -51,6 +51,12 @@ pub mod session;
 /// Typed session-admission errors and their stable user-error descriptors.
 pub mod session_admit;
 
+/// Typed user-data errors for DDL property scopes and stable descriptors.
+pub mod property_admit;
+
+/// Declared DDL-property evaluation through the original required-constant port.
+pub mod property_evaluation;
+
 /// Typed DML statement-shape admission errors and their stable user-error descriptors.
 pub mod dml_admission;
 

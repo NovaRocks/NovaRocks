@@ -36,7 +36,15 @@ pub(super) fn test_product() -> (RequiredConstantInterpreter, Arc<EngineFunction
     // A small real catalogue fixture, not a second production seal.
     let mut builder = EngineFunctionCatalogBuilder::new();
     let mut installed = Vec::new();
-    for name in ["lower", "concat", "if", "coalesce", "rand"] {
+    for name in [
+        "lower",
+        "concat",
+        "if",
+        "coalesce",
+        "rand",
+        "__array_literal",
+        novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME,
+    ] {
         let definition = metadata.definition(name, FunctionKind::Scalar).unwrap();
         builder.register(definition.clone()).unwrap();
         let declaration = definition.binding_declaration().unwrap();

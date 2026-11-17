@@ -34,6 +34,14 @@ pub struct SelectedInt32List<'a> {
     start: usize,
     len: usize,
 }
+/// One selected List<Utf8>, retaining the original constant and child backing.
+/// This carrier view does not authorize a physical String or nominal domain.
+pub struct SelectedUtf8List<'a> {
+    source: &'a ConstantValue,
+    child: &'a ArrayData,
+    start: usize,
+    len: usize,
+}
 /// One selected Map<Utf8, Utf8>, in its original entry order. Empty, duplicate
 /// and NULL keys/values are preserved; no Unpivot-specific policy is imposed.
 pub struct SelectedUtf8Map<'a> {
@@ -89,6 +97,45 @@ impl ConstantValue {
         work.step()?;
         let (start, end) = range?;
         Ok(Some(SelectedInt32List {
+            source: self,
+            child: &row.data.child_data()[0],
+            start,
+            len: end - start,
+        }))
+    }
+
+    pub fn utf8_list_observed(
+        &self,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<SelectedUtf8List<'_>>, ConstantError> {
+        let mut work = CompileCheckpoints::try_new(control, phase)?;
+        let result = self.utf8_list_in(&mut work);
+        finish(work, result)
+    }
+
+    /// Borrow only List<Utf8> after resolving the selected root encoding.
+    /// The caller separately validates the complete semantic FVT. No source,
+    /// entry or tail is recreated, and a NULL root remains None.
+    pub fn utf8_list_in(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<SelectedUtf8List<'_>>, ConstantError> {
+        let Some(row) = selected_row(self, work)? else {
+            return Ok(None);
+        };
+        let valid = matches!(row.data.data_type(), DataType::List(field)
+            if field.data_type() == &DataType::Utf8);
+        work.step()?;
+        if !valid {
+            return Err(ConstantError::Invalid(
+                "selected constant is not a List<Utf8>",
+            ));
+        }
+        let range = list_range(row);
+        work.step()?;
+        let (start, end) = range?;
+        Ok(Some(SelectedUtf8List {
             source: self,
             child: &row.data.child_data()[0],
             start,
@@ -227,10 +274,42 @@ fn text<'a>(
     // cooperation/temporary-cost admission is not claimed by this accessor.
     work.flush()?;
     let value = std::str::from_utf8(bytes)
-        .map_err(|_| ConstantError::Invalid("selected map item text is not UTF8"));
+        .map_err(|_| ConstantError::Invalid("selected collection item text is not UTF8"));
     work.flush()?;
     work.step()?;
     value.map(Some)
+}
+
+impl<'a> SelectedUtf8List<'a> {
+    pub fn source(&self) -> &'a ConstantValue {
+        self.source
+    }
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn item(
+        &self,
+        index: usize,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<&'a str>, ConstantError> {
+        let mut work = CompileCheckpoints::try_new(control, phase)?;
+        let result = self.item_observed(index, &mut work);
+        finish(work, result)
+    }
+    /// NULL payloads are never read. The caller owns entry/finish and may
+    /// reuse one original meter across the selected range.
+    pub fn item_observed(
+        &self,
+        index: usize,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'a str>, ConstantError> {
+        let index = ordinal(self.start, self.len, index, work)?;
+        text(self.child, index, work)
+    }
 }
 
 impl<'a> SelectedUtf8Map<'a> {

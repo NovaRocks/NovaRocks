@@ -98,6 +98,19 @@ pub fn array_constructor_result_with_construction<E>(
     list_result(&item, false, storage, &mut creation)
 }
 
+/// Declare one List from an explicit complete child type. This shares the
+/// constructor's original Field/layout creators without implying an ARRAY
+/// expression, a common-type rule, or any conversion/runtime capability.
+pub fn list_value_type_with_construction<E>(
+    child: &FunctionValueType,
+    nullable: bool,
+    storage: ValueTypeStorageLifetime,
+    observer: Option<&mut dyn FnMut(ValueConstructionRequest) -> Result<(), E>>,
+) -> Result<FunctionValueType, ArrayCommonTypeFailure<E>> {
+    let mut creation = ValueConstruction::new(observer);
+    list_result(child, nullable, storage, &mut creation)
+}
+
 fn pair<E>(
     left: &FunctionValueType,
     right: &FunctionValueType,

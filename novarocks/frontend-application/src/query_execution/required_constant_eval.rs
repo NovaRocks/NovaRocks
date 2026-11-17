@@ -294,10 +294,14 @@ impl RequiredConstantInterpreter {
                 "required result differs from its complete frozen carrier",
             ));
         }
-        // Materialize a new flat result under the original copy host invoice.
-        // The copy author proves no nonempty input alias before dropping the
-        // old operation/source lease; output Buffer custody carries ONLY its
-        // actual new backing grant. No stock-based second payload charge is made.
+        // ARRAY<VARCHAR> uses the original nested take and keeps its source
+        // lease through every reachable child buffer. Scalar results retain
+        // their original independent-copy path and its no-alias proof.
+        let array_result = matches!(
+            prepared.value_type().value_type().kind(),
+            novarocks_type_contract::ValueKind::List(child)
+                if matches!(child.kind(), novarocks_type_contract::ValueKind::String)
+        );
         let mut indices_scope = resources.factory.begin_scope()?;
         indices_scope.request_layout(
             std::alloc::Layout::array::<u64>(1)
@@ -329,18 +333,28 @@ impl RequiredConstantInterpreter {
         let indices = novarocks_functions::selected_copy::CopyIndices::UInt64(Arc::new(
             UInt64Array::new(index_values.into(), None),
         ));
-        let array = novarocks_functions::selected_copy::take_flat_owned_copy_in(
-            array,
-            indices,
-            (
-                resources.operation_storage(),
-                indices_scope.storage_lifetime(),
-            ),
-            resources.allocator.clone(),
-            &kernel_control,
-        )
-        .map_err(copy_operation_error)?
-        .into_values();
+        let source_storage = (
+            resources.operation_storage(),
+            indices_scope.storage_lifetime(),
+        );
+        let copied = if array_result {
+            novarocks_functions::selected_copy::take_copy_in(
+                array,
+                indices,
+                source_storage,
+                resources.allocator.clone(),
+                &kernel_control,
+            )
+        } else {
+            novarocks_functions::selected_copy::take_flat_owned_copy_in(
+                array,
+                indices,
+                source_storage,
+                resources.allocator.clone(),
+                &kernel_control,
+            )
+        };
+        let array = copied.map_err(copy_operation_error)?.into_values();
         drop(indices_scope);
         let mut storage = resources.factory.begin_scope()?;
         let lifetime = storage
@@ -354,16 +368,32 @@ impl RequiredConstantInterpreter {
                 },
             )
             .map_err(constant_creation_error)?;
-        storage
-            .with_creation(|creation| {
-                novarocks_functions::selected_copy::preflight_flat_arrow_structure_construction(
-                    array.data_type(),
-                    array.nulls().is_some(),
-                    creation,
-                    &mut |_| control.checkpoint(CompilePhase::FunctionSpecialization, 0),
-                )
-            })
-            .map_err(copy_construction_error)?;
+        if array_result {
+            // Bound the actual complete Arrow subtree before to_data creates
+            // its metadata. Payload is already held by the original take.
+            let metadata = novarocks_functions::source_metadata_bytes_observed::<
+                SqlConstantEvaluationError,
+            >(array.as_ref(), &mut |boundary| {
+                if boundary {
+                    work.flush()?;
+                } else {
+                    work.step()?;
+                }
+                Ok(())
+            })?;
+            storage.observe_opaque_upper_bound(metadata)?;
+        } else {
+            storage
+                .with_creation(|creation| {
+                    novarocks_functions::selected_copy::preflight_flat_arrow_structure_construction(
+                        array.data_type(),
+                        array.nulls().is_some(),
+                        creation,
+                        &mut |_| control.checkpoint(CompilePhase::FunctionSpecialization, 0),
+                    )
+                })
+                .map_err(copy_construction_error)?;
+        }
         work.flush()?;
         let data = array.to_data();
         work.flush()?;

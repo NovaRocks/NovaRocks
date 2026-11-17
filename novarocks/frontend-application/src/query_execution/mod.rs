@@ -29,6 +29,7 @@ pub(crate) mod connector_domain;
 pub mod constant_eval;
 pub mod contract;
 mod core_bindings;
+pub(crate) mod ddl_properties;
 #[cfg(test)]
 mod dependency_artifact_records;
 #[cfg(test)]
