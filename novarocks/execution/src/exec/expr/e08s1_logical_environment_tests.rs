@@ -24,7 +24,7 @@ fn e08s1_logical_environment_exact_absent_source_is_named_with_original_span() {
     for (sql, name) in [
         (
             "SELECT GROUP_CONCAT(REVERSE('abc'))",
-            "builtin.aggregate/group_concat/",
+            "builtin.aggregate/string_agg/",
         ),
         (
             "SELECT FROM_UNIXTIME(CAST(ABS(CAST(1 AS BIGINT)) AS BIGINT))",
