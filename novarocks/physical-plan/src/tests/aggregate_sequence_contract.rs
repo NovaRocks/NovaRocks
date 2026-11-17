@@ -1483,6 +1483,13 @@ fn grouped_topn_rejects_missing_contributions_row_budgets_and_binding_drift() {
                 | GroupedReductionFixture::UnionCompleteRowBudget
         ) {
             assert!(error.contains("TopN partial paths"), "{fixture:?}: {error}");
+        } else if matches!(fixture, GroupedReductionFixture::DistinctState) {
+            assert!(
+                error.contains(
+                    "aggregate state paths do not reduce exactly into their matching final"
+                ),
+                "{fixture:?}: {error}"
+            );
         }
     }
 }
