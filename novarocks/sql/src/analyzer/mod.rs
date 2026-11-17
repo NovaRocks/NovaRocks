@@ -5754,6 +5754,69 @@ mod tests {
     }
 
     #[test]
+    fn empty_rollup_and_cube_keep_one_empty_repeat_group_and_original_count_binding() {
+        let count_type = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
+        let mut canonical_binding = None;
+        for group_by in ["GROUPING SETS (())", "ROLLUP()", "CUBE()"] {
+            let sql =
+                format!("SELECT count(*) AS cnt FROM (VALUES (1), (2)) t(v) GROUP BY {group_by}");
+            let query = parse_and_analyze(&sql).unwrap_or_else(|error| {
+                panic!("{group_by} must retain its original analysis: {error}")
+            });
+            let QueryBody::Select(select) = &query.body else {
+                panic!("{group_by} must produce the original Select with RepeatInfo");
+            };
+            let repeat = select.repeat.as_ref().expect("an actual Repeat expansion");
+            assert_eq!(repeat.repeat_column_ref_list, vec![Vec::<String>::new()]);
+            // This analyzer stage leaves the per-group ColumnId mapping unpopulated.
+            assert!(repeat.repeat_column_ref_ids.is_empty());
+            assert_eq!(repeat.grouping_ids, vec![0]);
+            assert!(repeat.all_rollup_columns.is_empty());
+            assert!(repeat.all_rollup_column_ids.is_empty());
+            assert!(repeat.grouping_fn_args.is_empty());
+            assert!(repeat.grouping_fn_arg_ids.is_empty());
+            assert!(repeat.grouping_fn_ids.is_empty());
+            assert!(select.group_by.is_empty());
+            assert!(select.has_aggregation);
+            assert_eq!(select.projection.len(), 1);
+            assert_eq!(query.output_columns.len(), 1);
+            let projection = &select.projection[0];
+            let output = &query.output_columns[0];
+            assert_eq!(projection.output_name, "cnt");
+            assert_eq!(projection.field_name.as_deref(), Some("cnt"));
+            assert_eq!(output.field_name.as_deref(), Some("cnt"));
+            assert_eq!(projection.output_column_id, output.column_id);
+            assert_eq!(projection.expr.value_type, count_type);
+            assert_eq!(output.value_type, count_type);
+            assert!(!output.is_internal);
+            let ExprKind::AggregateCall {
+                name,
+                args,
+                distinct,
+                order_by,
+                resolved,
+            } = &projection.expr.kind
+            else {
+                panic!("{group_by} must keep the actual COUNT aggregate binding");
+            };
+            assert_eq!(name, "count");
+            assert!(args.is_empty());
+            assert!(!distinct);
+            assert!(order_by.is_empty());
+            assert!(resolved.selected.argument_types.is_empty());
+            assert_eq!(
+                resolved.selected.result_type,
+                novarocks_functions::FunctionResultType::Scalar(count_type.clone())
+            );
+            if let Some(expected) = &canonical_binding {
+                assert_eq!(resolved, expected, "{group_by}");
+            } else {
+                canonical_binding = Some(resolved.clone());
+            }
+        }
+    }
+
+    #[test]
     fn test_group_by_rollup() {
         // q5 pattern: GROUP BY ROLLUP(a, b)
         let sql = "SELECT o_orderstatus, o_orderpriority, count(*) as cnt \
