@@ -40,12 +40,27 @@ impl ContractLoweringVisitor<'_> {
     fn construction_expression(
         &self,
         fragment: FragmentId,
+        node: NodeId,
         expression: ExprId,
-    ) -> Result<&novarocks_physical_plan::ExprNode, ContractLoweringError> {
+    ) -> Result<&novarocks_expression_contract::ExprNode, ContractLoweringError> {
         self.fragments
             .get(&fragment)
-            .and_then(|builder| builder.expressions().get(expression))
+            .and_then(|builder| builder.construction_unit(node))
+            .and_then(|unit| unit.definition(expression))
             .ok_or_else(|| invalid("nullable transaction expression is absent"))
+    }
+    fn construction_root_definition(
+        &self,
+        fragment: FragmentId,
+        node: NodeId,
+        root: RootOrdinal,
+    ) -> Result<ExprId, ContractLoweringError> {
+        self.fragments
+            .get(&fragment)
+            .and_then(|builder| builder.construction_unit(node))
+            .and_then(|unit| unit.roots().get(root.get() as usize))
+            .map(|root| root.definition)
+            .ok_or_else(|| invalid("nullable transaction root is absent from its node unit"))
     }
     fn construction_value(
         &self,
@@ -114,22 +129,36 @@ impl ContractLoweringVisitor<'_> {
     fn rebind_call_entry(
         &mut self,
         fragment: FragmentId,
+        node: NodeId,
         expression: ExprId,
     ) -> Result<bool, ContractLoweringError> {
         self.work.flush()?;
         let mut entry = self
             .call_sources
             .expression_entries
-            .remove(&(fragment, expression))
+            .remove(&ScalarDefinitionAddress::new(
+                ScalarSourceSite::Node { fragment, node },
+                expression,
+            ))
             .ok_or_else(|| invalid("call rebind lacks its original source entry"))?;
-        let old = self.construction_expression(fragment, expression)?.clone();
+        let old = self
+            .construction_expression(fragment, node, expression)?
+            .clone();
         self.work.flush()?;
-        validate_expression_source_entry_observed(&entry, &old, &mut self.work)?;
+        validate_expression_source_entry_observed(
+            &entry,
+            ScalarUnitOwner::Node(node),
+            &old,
+            &mut self.work,
+        )?;
         self.work.flush()?;
         let projected = project_emitted_call_arguments_observed(
             EmittedOperationalCall {
-                expressions: self.fragments[&fragment].expressions(),
-                pools: self.plan_builder.constants(),
+                expressions: super::super::unit_source::UnitDefinitions::from_draft(
+                    &self.fragments[&fragment],
+                    node,
+                ),
+                pools: self.constant_emission.pools(),
                 owner: entry.owner,
                 lambda_scope: entry.lambda_scope,
                 kind: Some(entry.kind),
@@ -169,39 +198,9 @@ impl ContractLoweringVisitor<'_> {
                 .fragments
                 .get_mut(&fragment)
                 .expect("checked above")
-                .nullability_editor()
+                .unit(node)?
+                .types_mut()
                 .scalar_signature(expression, function, revised, &mut self.work)?,
-            ContractExprKind::WindowCall {
-                function,
-                aggregate_binding,
-                function_order_by: order_by,
-                ..
-            } => {
-                let aggregate = if let Some(original) = aggregate_binding {
-                    Some(Box::new(lower_captured_aggregate_binding(
-                        binding,
-                        logical_count,
-                        order_by.len(),
-                        &selected,
-                        original.phase,
-                        &mut self.work,
-                    )?))
-                } else {
-                    None
-                };
-                self.fragments
-                    .get_mut(&fragment)
-                    .expect("checked above")
-                    .nullability_editor()
-                    .window_signature(
-                        expression,
-                        function,
-                        aggregate_binding.as_deref(),
-                        revised,
-                        aggregate,
-                        &mut self.work,
-                    )?;
-            }
             _ => return Err(invalid("call rebind changed its actual lifecycle")),
         }
         self.work.flush()?;
@@ -213,9 +212,118 @@ impl ContractLoweringVisitor<'_> {
             result_constraint: constraint,
         }));
         self.work.step()?;
+        self.call_sources.expression_entries.insert(
+            ScalarDefinitionAddress::new(ScalarSourceSite::Node { fragment, node }, expression),
+            entry,
+        );
+        self.work.step()?;
+        Ok(changed)
+    }
+    fn rebind_window_entry(
+        &mut self,
+        fragment: FragmentId,
+        site: PhysicalCallSite,
+    ) -> Result<bool, ContractLoweringError> {
+        let PhysicalCallSite::Window { node, call } = site else {
+            return Err(invalid("Window rebind names another lifecycle"));
+        };
+        self.work.flush()?;
+        let mut entry = self
+            .call_sources
+            .window_entries
+            .remove(&(fragment, site))
+            .ok_or_else(|| invalid("Window rebind lacks its original source entry"))?;
+        let NodeKind::Window(spec) = &self.construction_node(fragment, node)?.kind else {
+            return Err(invalid("Window rebind node has another kind"));
+        };
+        let old = spec
+            .calls
+            .get(call as usize)
+            .ok_or_else(|| invalid("Window rebind call ordinal is absent"))?
+            .clone();
+        self.work.flush()?;
+        super::super::lowered_draft::validate_window_source_entry_observed(
+            &entry,
+            super::super::unit_source::UnitDefinitions::from_draft(
+                &self.fragments[&fragment],
+                node,
+            ),
+            &old,
+            &mut self.work,
+        )?;
+        self.work.flush()?;
+        let projected = project_emitted_call_arguments_observed(
+            EmittedOperationalCall {
+                expressions: super::super::unit_source::UnitDefinitions::from_draft(
+                    &self.fragments[&fragment],
+                    node,
+                ),
+                pools: self.constant_emission.pools(),
+                owner: ScalarUnitOwner::Node(node),
+                lambda_scope: None,
+                kind: Some(SqlExpressionCallKind::Window),
+                captured: CapturedOperationalSource::call(&entry.captured),
+                derived: None,
+                arguments: &entry.arguments,
+                channels: &entry.channels,
+            },
+            self.control,
+        )
+        .map_err(ContractLoweringError::from);
+        let arguments = self.completed_specialization_result(projected)?;
+        let binding = entry.captured.binding();
+        let constraint = self.current_constraint(binding, &arguments)?;
+        let logical_count = entry.captured.request().logical_argument_count;
+        let selected = self.select_canonical_request_with_constraint(
+            binding,
+            logical_count,
+            &arguments,
+            constraint.as_ref(),
+        )?;
+        let novarocks_functions::FunctionResultType::Scalar(result) = &selected.result_type else {
+            return Err(invalid("Window rebind acquired a relation result"));
+        };
+        let revised = bound_function_from_selection(binding.resolved(), &selected, result);
+        let aggregate = if let Some(original) = old.aggregate_binding.as_deref() {
+            Some(Box::new(lower_captured_aggregate_binding(
+                binding,
+                logical_count,
+                old.order_by.len(),
+                &selected,
+                original.phase,
+                &mut self.work,
+            )?))
+        } else {
+            None
+        };
+        self.work.flush()?;
+        let changed = old.binding != revised || old.aggregate_binding != aggregate;
+        self.work.step()?;
+        self.work.flush()?;
+        self.fragments
+            .get_mut(&fragment)
+            .expect("checked actual Window construction")
+            .nullability_editor()
+            .window_signature(
+                site,
+                &old.binding,
+                old.aggregate_binding.as_deref(),
+                revised,
+                aggregate,
+                &mut self.work,
+            )?;
+        self.work.flush()?;
+        entry.canonical_operational = Arc::new(CanonicalCallOperationalRequest {
+            binding: binding.clone(),
+            arguments,
+            logical_count,
+            selected,
+            result_constraint: constraint,
+        });
+        self.work.step()?;
         self.call_sources
-            .expression_entries
-            .insert((fragment, expression), entry);
+            .window_entries
+            .insert((fragment, site), entry);
         self.work.step()?;
         Ok(changed)
     }
@@ -230,13 +338,24 @@ impl ContractLoweringVisitor<'_> {
             .remove(&(fragment, node))
             .ok_or_else(|| invalid("table rebind lacks its original source entry"))?;
         let old = self.construction_node(fragment, node)?.clone();
-        validate_table_source_entry_observed(&entry, &old, &mut self.work)?;
+        validate_table_source_entry_observed(
+            &entry,
+            super::super::unit_source::UnitDefinitions::from_draft(
+                &self.fragments[&fragment],
+                node,
+            ),
+            &old,
+            &mut self.work,
+        )?;
         self.work.flush()?;
         let projected = project_emitted_call_arguments_observed(
             EmittedOperationalCall {
-                expressions: self.fragments[&fragment].expressions(),
-                pools: self.plan_builder.constants(),
-                owner: node,
+                expressions: super::super::unit_source::UnitDefinitions::from_draft(
+                    &self.fragments[&fragment],
+                    node,
+                ),
+                pools: self.constant_emission.pools(),
+                owner: ScalarUnitOwner::Node(node),
                 lambda_scope: None,
                 kind: None,
                 captured: CapturedOperationalSource::call(&entry.captured),
@@ -301,20 +420,63 @@ impl ContractLoweringVisitor<'_> {
         let mut dirty_values = BTreeSet::new();
         loop {
             let mut changed = false;
-            let mut expression_ids = Vec::new();
-            for (&fragment, builder) in &self.fragments {
-                for (&id, _) in builder.expressions().iter() {
+            let mut emissions = Vec::new();
+            for (&fragment, order) in &self.definition_order {
+                for &event in &order.events {
                     self.work.flush()?;
-                    expression_ids
+                    emissions
                         .try_reserve(1)
                         .map_err(|_| CompileControlError::ResourceExhausted)?;
-                    expression_ids.push((fragment, id));
+                    emissions.push((fragment, event));
                     self.work.step()?;
                 }
             }
-            for (fragment, id) in expression_ids {
+            for (fragment, event) in emissions {
+                let (node, id) = match event {
+                    NullableEmission::Definition { node, definition } => (node, definition),
+                    NullableEmission::Window { site } => {
+                        let node = site.node();
+                        let PhysicalCallSite::Window { call, .. } = site else {
+                            return Err(invalid("nullable Window emission has another lifecycle"));
+                        };
+                        let actual_node = self
+                            .fragments
+                            .get(&fragment)
+                            .and_then(|builder| builder.construction_node(node))
+                            .ok_or_else(|| invalid("nullable Window emission node is absent"))?;
+                        let NodeKind::Window(spec) = &actual_node.kind else {
+                            return Err(invalid("nullable Window emission node has another kind"));
+                        };
+                        let source = spec
+                            .calls
+                            .get(call as usize)
+                            .ok_or_else(|| invalid("nullable Window emission call is absent"))?;
+                        let definitions = super::super::unit_source::UnitDefinitions::from_draft(
+                            &self.fragments[&fragment],
+                            node,
+                        );
+                        let mut dependent = false;
+                        for root in source
+                            .arguments
+                            .iter()
+                            .copied()
+                            .chain(source.order_by.iter().map(|key| key.expr))
+                        {
+                            let definition = definitions
+                                .root(root)
+                                .ok_or_else(|| invalid("nullable Window parameter root is absent"))?
+                                .definition;
+                            dependent |= dirty_expressions.contains(&(fragment, node, definition));
+                            self.work.step()?;
+                        }
+                        if dependent {
+                            changed |= self.rebind_window_entry(fragment, site)?;
+                        }
+                        continue;
+                    }
+                };
                 self.work.flush()?;
-                let old = self.construction_expression(fragment, id)?.clone();
+                let old = self.construction_expression(fragment, node, id)?.clone();
                 self.work.step()?;
                 self.work.flush()?;
                 let mut operands = Vec::new();
@@ -323,43 +485,28 @@ impl ContractLoweringVisitor<'_> {
                 let mut dependency_changed = false;
                 for &operand in operands.iter() {
                     self.work.step()?;
-                    dependency_changed |= dirty_expressions.contains(&(fragment, operand));
+                    dependency_changed |= dirty_expressions.contains(&(fragment, node, operand));
                 }
                 dependency_changed |= match &old.kind {
                     ContractExprKind::Value(value) => dirty_values.contains(&(fragment, *value)),
                     ContractExprKind::Lambda { body, .. } => {
-                        dirty_expressions.contains(&(fragment, *body))
+                        dirty_expressions.contains(&(fragment, node, *body))
                     }
                     ContractExprKind::FunctionCall { args, .. } => {
                         let mut dirty = false;
                         for &arg in args.iter() {
                             self.work.step()?;
-                            dirty |= dirty_expressions.contains(&(fragment, arg));
-                        }
-                        dirty
-                    }
-                    ContractExprKind::WindowCall {
-                        args,
-                        function_order_by: order_by,
-                        ..
-                    } => {
-                        let mut dirty = false;
-                        for &arg in args.iter().chain(order_by.iter().map(|key| &key.expr)) {
-                            self.work.step()?;
-                            dirty |= dirty_expressions.contains(&(fragment, arg));
+                            dirty |= dirty_expressions.contains(&(fragment, node, arg));
                         }
                         dirty
                     }
                     _ => false,
                 };
-                if matches!(
-                    &old.kind,
-                    ContractExprKind::FunctionCall { .. } | ContractExprKind::WindowCall { .. }
-                ) && dependency_changed
+                if matches!(&old.kind, ContractExprKind::FunctionCall { .. }) && dependency_changed
                 {
-                    let contract_changed = self.rebind_call_entry(fragment, id)?;
+                    let contract_changed = self.rebind_call_entry(fragment, node, id)?;
                     if contract_changed {
-                        dirty_expressions.insert((fragment, id));
+                        dirty_expressions.insert((fragment, node, id));
                         self.work.step()?;
                         changed = true;
                     }
@@ -370,7 +517,7 @@ impl ContractLoweringVisitor<'_> {
                         op: UnaryOperator::Minus,
                         expr,
                     } => novarocks_functions::native_negate_computed_result_type(
-                        &self.construction_expression(fragment, *expr)?.ty,
+                        &self.construction_expression(fragment, node, *expr)?.ty,
                         self.control,
                     )
                     .map_err(|error| {
@@ -395,7 +542,7 @@ impl ContractLoweringVisitor<'_> {
                                 "cast seed differs from its statement semantic source",
                             ));
                         }
-                        let input = &self.construction_expression(fragment, *expr)?.ty;
+                        let input = &self.construction_expression(fragment, node, *expr)?.ty;
                         let mut revised = old.ty.clone();
                         revised = revised.with_nullable(revised.nullable() || (input.nullable()
                             || novarocks_functions::carrier_cast_can_produce_null_with_policy(
@@ -413,7 +560,7 @@ impl ContractLoweringVisitor<'_> {
                     ContractExprKind::Lambda { body, .. } if dependency_changed => {
                         published_value_type(
                             &old.ty,
-                            &self.construction_expression(fragment, *body)?.ty,
+                            &self.construction_expression(fragment, node, *body)?.ty,
                         )
                     }
                     _ if dependency_changed && kind_follows_operand_nullability(&old.kind) => {
@@ -424,7 +571,7 @@ impl ContractLoweringVisitor<'_> {
                                 .with_nullable(
                                     revised.nullable()
                                         || (self
-                                            .construction_expression(fragment, operand)?
+                                            .construction_expression(fragment, node, operand)?
                                             .ty
                                             .nullable()),
                                 )
@@ -438,9 +585,10 @@ impl ContractLoweringVisitor<'_> {
                     self.fragments
                         .get_mut(&fragment)
                         .expect("checked above")
-                        .nullability_editor()
+                        .unit(node)?
+                        .types_mut()
                         .expression_type(id, &old.ty, revised, &mut self.work)?;
-                    dirty_expressions.insert((fragment, id));
+                    dirty_expressions.insert((fragment, node, id));
                     self.work.step()?;
                     changed = true;
                 }
@@ -466,7 +614,8 @@ impl ContractLoweringVisitor<'_> {
                 let mut dependent = false;
                 for &id in arguments.iter() {
                     self.work.step()?;
-                    dependent |= dirty_expressions.contains(&(fragment, id));
+                    let definition = self.construction_root_definition(fragment, node, id)?;
+                    dependent |= dirty_expressions.contains(&(fragment, node, definition));
                 }
                 if dependent {
                     changed |= self.rebind_table_entry(fragment, node)?;
@@ -594,15 +743,14 @@ impl ContractLoweringVisitor<'_> {
 
 fn call_binding(kind: &ContractExprKind) -> Option<&BoundFunction> {
     match kind {
-        ContractExprKind::FunctionCall { function, .. }
-        | ContractExprKind::WindowCall { function, .. } => Some(function),
+        ContractExprKind::FunctionCall { function, .. } => Some(function),
         _ => None,
     }
 }
 impl ContractLoweringVisitor<'_> {
     fn rebind_relational_aggregates(
         &mut self,
-        dirty_expressions: &BTreeSet<(FragmentId, ExprId)>,
+        dirty_expressions: &BTreeSet<(FragmentId, NodeId, ExprId)>,
         dirty_values: &BTreeSet<(FragmentId, ValueId)>,
     ) -> Result<bool, ContractLoweringError> {
         enum Call {
@@ -614,16 +762,7 @@ impl ContractLoweringVisitor<'_> {
             builder.visit_construction_relational_calls_observed(
                 &mut self.work,
                 |site, binding, work| {
-                    let node_id = match site {
-                        PhysicalCallSite::Aggregate { node, .. }
-                        | PhysicalCallSite::TopNState { node, .. }
-                        | PhysicalCallSite::WriterPartial { node, .. }
-                        | PhysicalCallSite::WriterFinal { node, .. }
-                        | PhysicalCallSite::Table { node } => node,
-                        PhysicalCallSite::Expression(_) => {
-                            return Err(invalid("relational visitor returned an expression site"));
-                        }
-                    };
+                    let node_id = site.node();
                     let node = builder
                         .construction_node(node_id)
                         .ok_or_else(|| invalid("relational call construction node is absent"))?;
@@ -666,7 +805,9 @@ impl ContractLoweringVisitor<'_> {
                                 .ok_or_else(|| invalid("Writer final ordinal is absent"))?
                                 .clone(),
                         ),
-                        (PhysicalCallSite::Table { .. }, _) => return Ok(()),
+                        (PhysicalCallSite::Table { .. } | PhysicalCallSite::Window { .. }, _) => {
+                            return Ok(());
+                        }
                         _ => {
                             return Err(invalid(
                                 "actual relational call site differs from its node",
@@ -806,7 +947,8 @@ impl ContractLoweringVisitor<'_> {
                         .chain(c.order_by.iter().map(|key| &key.expr))
                     {
                         self.work.step()?;
-                        dirty |= dirty_expressions.contains(&(fragment, id));
+                        let definition = self.construction_root_definition(fragment, node, id)?;
+                        dirty |= dirty_expressions.contains(&(fragment, node, definition));
                     }
                     dirty
                 }
@@ -969,8 +1111,11 @@ impl ContractLoweringVisitor<'_> {
                             .chain(c.order_by.iter().map(|key| &key.expr))
                             .enumerate()
                         {
-                            channels
-                                .push(self.aggregate_operational_channel(*id, ordinal, captured)?);
+                            channels.push(self.aggregate_operational_channel(
+                                self.construction_root_definition(fragment, node, *id)?,
+                                ordinal,
+                                captured,
+                            )?);
                             self.work.step()?;
                         }
                         self.author_canonical_update_aggregate(node, captured, &channels)
@@ -1131,7 +1276,7 @@ impl ContractLoweringVisitor<'_> {
         &mut self,
         fragment: FragmentId,
         value: &novarocks_physical_plan::ValueDef,
-        dirty_expressions: &BTreeSet<(FragmentId, ExprId)>,
+        dirty_expressions: &BTreeSet<(FragmentId, NodeId, ExprId)>,
         dirty_values: &BTreeSet<(FragmentId, ValueId)>,
     ) -> Result<ValueType, ContractLoweringError> {
         self.work.flush()?;
@@ -1143,11 +1288,12 @@ impl ContractLoweringVisitor<'_> {
             ValueOrigin::JoinMark { .. }
             | ValueOrigin::Summary { .. }
             | ValueOrigin::ProviderField { .. } => {}
-            ValueOrigin::Expr { expr, .. } => {
-                if dirty_expressions.contains(&(fragment, expr)) {
+            ValueOrigin::Expr { node, root } => {
+                let expr = self.construction_root_definition(fragment, node, root)?;
+                if dirty_expressions.contains(&(fragment, node, expr)) {
                     revised = published_value_type(
                         &value.ty,
-                        &self.construction_expression(fragment, expr)?.ty,
+                        &self.construction_expression(fragment, node, expr)?.ty,
                     );
                 }
             }
@@ -1248,18 +1394,42 @@ impl ContractLoweringVisitor<'_> {
                             let expr = *row.get(ordinal).ok_or_else(|| {
                                 invalid("VALUES row differs from its original output width")
                             })?;
-                            if dirty_expressions.contains(&(fragment, expr)) {
+                            let expr = self.construction_root_definition(fragment, node, expr)?;
+                            if dirty_expressions.contains(&(fragment, node, expr)) {
                                 revised = revised
                                     .with_nullable(
                                         revised.nullable()
                                             || (self
-                                                .construction_expression(fragment, expr)?
+                                                .construction_expression(fragment, node, expr)?
                                                 .ty
                                                 .nullable()),
                                     )
                                     .expect("validated root NULL contract");
                             }
                         }
+                    }
+                    NodeKind::Window(spec) => {
+                        let input = actual
+                            .inputs
+                            .first()
+                            .copied()
+                            .ok_or_else(|| invalid("Window output has no actual input"))?;
+                        let prefix = self
+                            .construction_node(fragment, input)?
+                            .output
+                            .columns
+                            .len();
+                        let call = ordinal
+                            .checked_sub(prefix)
+                            .and_then(|ordinal| spec.calls.get(ordinal))
+                            .ok_or_else(|| invalid("Window output has no actual call producer"))?;
+                        self.work.step()?;
+                        if call.output != value.id {
+                            return Err(invalid(
+                                "Window output differs from its actual call ordinal",
+                            ));
+                        }
+                        revised = published_value_type(&value.ty, &call.binding.result_type);
                     }
                     NodeKind::SetOp { input_mappings, .. } => {
                         for input in input_mappings.iter() {
@@ -1355,12 +1525,16 @@ impl ContractLoweringVisitor<'_> {
                                     constant
                                 {
                                     self.work.step()?;
-                                    if dirty_expressions.contains(&(fragment, *expr)) {
+                                    let expr =
+                                        self.construction_root_definition(fragment, node, *expr)?;
+                                    if dirty_expressions.contains(&(fragment, node, expr)) {
                                         revised = revised
                                             .with_nullable(
                                                 revised.nullable()
                                                     || (self
-                                                        .construction_expression(fragment, *expr)?
+                                                        .construction_expression(
+                                                            fragment, node, expr,
+                                                        )?
                                                         .ty
                                                         .nullable()),
                                             )
@@ -1383,18 +1557,24 @@ impl ContractLoweringVisitor<'_> {
                                         (&assignment.output, &assignment.expression);
                                     self.work.step()?;
                                     if *output == value.id
-                                        && let Some(expr) = expr
-                                        && dirty_expressions.contains(&(fragment, *expr))
+                                        && let Some(root) = expr
                                     {
-                                        revised = revised
-                                            .with_nullable(
-                                                revised.nullable()
-                                                    || (self
-                                                        .construction_expression(fragment, *expr)?
-                                                        .ty
-                                                        .nullable()),
-                                            )
-                                            .expect("validated root NULL contract");
+                                        let expression = self
+                                            .construction_root_definition(fragment, node, *root)?;
+                                        if dirty_expressions.contains(&(fragment, node, expression))
+                                        {
+                                            revised = revised
+                                                .with_nullable(
+                                                    revised.nullable()
+                                                        || self
+                                                            .construction_expression(
+                                                                fragment, node, expression,
+                                                            )?
+                                                            .ty
+                                                            .nullable(),
+                                                )
+                                                .expect("validated root NULL contract");
+                                        }
                                     }
                                 }
                             }
@@ -1429,7 +1609,6 @@ impl ContractLoweringVisitor<'_> {
                     | NodeKind::Sort { .. }
                     | NodeKind::TopN { .. }
                     | NodeKind::Limit { .. }
-                    | NodeKind::Window(_)
                     | NodeKind::AssertOneRow(_)
                     | NodeKind::ExchangeSource { .. }
                     | NodeKind::TableWriter { .. }
@@ -1492,13 +1671,24 @@ impl ContractLoweringVisitor<'_> {
                                         constant
                                     {
                                         self.work.step()?;
-                                        if dirty_expressions.contains(&(fragment, *expr)) {
+                                        let expr = self.construction_root_definition(
+                                            fragment,
+                                            writer_node,
+                                            *expr,
+                                        )?;
+                                        if dirty_expressions.contains(&(
+                                            fragment,
+                                            writer_node,
+                                            expr,
+                                        )) {
                                             revised = revised
                                                 .with_nullable(
                                                     revised.nullable()
                                                         || (self
                                                             .construction_expression(
-                                                                fragment, *expr,
+                                                                fragment,
+                                                                writer_node,
+                                                                expr,
                                                             )?
                                                             .ty
                                                             .nullable()),

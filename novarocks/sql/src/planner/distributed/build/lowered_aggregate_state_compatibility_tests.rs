@@ -131,8 +131,7 @@ fn assert_actual_root_widening(owner: &SqlAuthoredPhysicalPlan, original: &Value
     assert_eq!(final_entry.source().binding.logical_argument_count, 1);
     let expression = partial
         .fragment()
-        .expressions()
-        .get(partial.source().arguments[0])
+        .root_expression(partial.node().id, partial.source().arguments[0])
         .unwrap();
     assert_eq!(expression.ty, actual);
     let control = Control::default();
@@ -231,6 +230,184 @@ fn nested_type(child_nullable: bool, origin: &str) -> ValueType {
     )
 }
 
+fn assert_original_root_widening(
+    view: &OriginalEmissionView<'_>,
+    original: &ValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ContractLoweringError> {
+    let partial = original_aggregate(
+        view,
+        |phase| matches!(phase, AggregatePhase::Partial { .. }),
+        work,
+    )?;
+    let final_entry = original_aggregate(
+        view,
+        |phase| matches!(phase, AggregatePhase::Final { .. }),
+        work,
+    )?;
+    let canonical = partial.canonical();
+    let contract =
+        novarocks_type_contract::AggregateStateArgumentContract::ValueRootNullabilityIndependent;
+    assert_eq!(partial.source.binding.state_argument_contract, contract);
+    assert_eq!(final_entry.source.binding.state_argument_contract, contract);
+    assert_eq!(
+        canonical
+            .selected()
+            .aggregate
+            .as_ref()
+            .unwrap()
+            .state_argument_contract,
+        contract
+    );
+    assert_eq!(
+        final_entry
+            .captured()
+            .binding()
+            .selected
+            .aggregate
+            .as_ref()
+            .unwrap()
+            .state_argument_contract,
+        contract
+    );
+    let (captured, cv) = value(&partial.captured().request().arguments[0]);
+    assert_eq!(captured, original);
+    assert!(cv.is_none());
+    let mut actual = original.clone();
+    actual = actual.with_nullable(true).unwrap();
+    assert_eq!(value(&canonical.request().arguments[0]).0, &actual);
+    assert!(value(&canonical.request().arguments[0]).1.is_none());
+    assert_eq!(
+        value(&final_entry.captured().request().arguments[0]).0,
+        original
+    );
+    let final_canonical = final_entry.canonical();
+    assert!(final_canonical.belongs_to(final_entry.captured()));
+    assert!(!Arc::ptr_eq(final_canonical, canonical));
+    assert_eq!(
+        final_canonical.selected().argument_types.as_ref(),
+        final_entry.source.binding.function.argument_types.as_ref()
+    );
+    assert_eq!(value(&final_canonical.request().arguments[0]).0, &actual);
+    assert!(value(&final_canonical.request().arguments[0]).1.is_none());
+    assert_eq!(
+        canonical.selected().argument_types.as_ref(),
+        partial.source.binding.function.argument_types.as_ref()
+    );
+    assert_eq!(
+        final_entry
+            .captured()
+            .binding()
+            .selected
+            .argument_types
+            .as_ref(),
+        &[novarocks_functions::FunctionArgumentType::Value(
+            original.clone()
+        )]
+    );
+    assert!(canonical.belongs_to(partial.captured()));
+    assert!(
+        partial
+            .captured()
+            .logical_identity()
+            .same_revision(final_entry.captured().logical_identity())
+    );
+    let AggregatePhase::Partial { sequence } = partial.entry.phase else {
+        unreachable!()
+    };
+    assert_eq!(final_entry.entry.phase, AggregatePhase::Final { sequence });
+    assert_eq!(
+        partial.source.binding.intermediate_type,
+        final_entry.source.binding.intermediate_type
+    );
+    assert_eq!(
+        partial.source.binding.function.result_type,
+        final_entry.source.binding.function.result_type
+    );
+    assert_eq!(
+        partial.source.binding.state_format,
+        final_entry.source.binding.state_format
+    );
+    assert_eq!(partial.source.binding.logical_argument_count, 1);
+    assert_eq!(final_entry.source.binding.logical_argument_count, 1);
+    let expression = partial
+        .definitions
+        .root_definition(partial.source.arguments[0])
+        .unwrap();
+    assert_eq!(expression.ty, actual);
+
+    // Traverse the original construction graph with its existing validator and
+    // sole visitor; these raw facts are not final merge-call receipts.
+    let mut producers = 0;
+    let mut streams = 0;
+    view.state_graph().visit_merge_path_for_test(
+        final_entry.fragment,
+        final_entry.site,
+        work,
+        |producer, endpoint, work| {
+            producers += 1;
+            assert_eq!(producer.site, partial.site);
+            assert_eq!(endpoint.fragment, partial.fragment);
+            assert_eq!(endpoint.node, partial.node.id);
+            assert_eq!(endpoint.value, partial.source.output);
+            assert!(std::ptr::eq(
+                producer.entry.logical.captured().unwrap(),
+                partial.captured()
+            ));
+            assert!(Arc::ptr_eq(
+                producer.entry.canonical.as_ref().unwrap().selected(),
+                canonical.selected()
+            ));
+            assert_eq!(
+                value(
+                    &producer
+                        .entry
+                        .canonical
+                        .as_ref()
+                        .unwrap()
+                        .request()
+                        .arguments[0]
+                )
+                .0,
+                &actual
+            );
+            assert_eq!(
+                value(
+                    &producer
+                        .entry
+                        .logical
+                        .captured()
+                        .unwrap()
+                        .request()
+                        .arguments[0]
+                )
+                .0,
+                original
+            );
+            work.step()?;
+            Ok(())
+        },
+        |_, kind, links, work| {
+            assert!(matches!(
+                kind,
+                crate::planner::distributed::build::lowered_draft::AggregateStateTransport::Stream(
+                    _
+                )
+            ));
+            assert_eq!(links.len(), 1);
+            streams += 1;
+            work.step()?;
+            Ok(())
+        },
+    )?;
+    assert_eq!((producers, streams), (1, 1));
+    let mut state = original.clone();
+    state = state.with_nullable(true).unwrap();
+    assert_eq!(final_entry.source.binding.intermediate_type, state);
+    assert_eq!(final_entry.source.binding.function.result_type, state);
+    Ok(())
+}
+
 #[test]
 fn state_compat_min_preserves_nested_metadata_and_nominal_json_beyond_root_nullable() {
     let json = ValueType::try_with_logical_type(
@@ -241,13 +418,24 @@ fn state_compat_min_preserves_nested_metadata_and_nominal_json_beyond_root_nulla
     .unwrap();
     for original in [nested_type(true, "original"), json] {
         let source = repeated_chain("min", original.clone());
-        let owner = authored(&source, &Control::default()).unwrap();
-        assert_actual_root_widening(&owner, &original);
-        let final_entry = entry(&owner, false);
-        let mut state = original.clone();
-        state = state.with_nullable(true).unwrap();
-        assert_eq!(final_entry.source().binding.intermediate_type, state);
-        assert_eq!(final_entry.source().binding.function.result_type, state);
+        if matches!(original.data_type(), DataType::Struct(_)) {
+            let (result, calls) =
+                observe_original_min(&source, &Control::default(), |view, work| {
+                    assert_original_root_widening(&view, &original, work)
+                });
+            assert_eq!(calls, 1);
+            assert_min_carrier_refusal(result);
+        } else {
+            // Keep the genuine supported Json UTF8 Partial/Final owner,
+            // merge request and original checked state-graph assertions.
+            let owner = authored(&source, &Control::default()).unwrap();
+            assert_actual_root_widening(&owner, &original);
+            let final_entry = entry(&owner, false);
+            let mut state = original.clone();
+            state = state.with_nullable(true).unwrap();
+            assert_eq!(final_entry.source().binding.intermediate_type, state);
+            assert_eq!(final_entry.source().binding.function.result_type, state);
+        }
     }
 }
 
@@ -318,7 +506,15 @@ fn mutate_final_binding(
     let original = &spec.aggregates[0].source;
     let mut resolved = original.binding().resolved().clone();
     change(&mut resolved);
-    let binding = SqlFunctionBinding::new(resolved, original.binding().decimal_overflow_policy());
+    let mut binding =
+        SqlFunctionBinding::new(resolved, original.binding().decimal_overflow_policy());
+    if let Some(source) = original.binding().aggregate_state_source() {
+        let control = Control::default();
+        let mut work =
+            CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
+        binding = binding.with_aggregate_state_source(source.clone_observed(&mut work).unwrap());
+        work.finish().unwrap();
+    }
     // Deliberate malformed metadata from a clone of the actual installed
     // binding. This does not create a new implementation or bypass its gate.
     spec.aggregates[0].source = AggregateArgumentSource::logical_update(

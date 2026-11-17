@@ -23,17 +23,20 @@ use std::{alloc::Layout, sync::Arc};
 use novarocks_functions::{
     ConstantError, ConstantValue, FunctionArgument, MAX_CALL_EFFECT_ARGUMENTS,
 };
-use novarocks_physical_plan::{
-    ConstantPools, ConstantReferenceError, ExprArena, ExprId, ExprKind, ExprNode, NodeId,
-};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionArgumentType, FunctionValueType,
     PureCompileControl, ValueTypeError,
 };
+use {
+    novarocks_expression_contract::{ExprKind, ExprNode},
+    novarocks_physical_plan::{ConstantPools, ConstantReferenceError, ExprId},
+};
 
+use super::super::unit_source::{ScalarUnitOwner, UnitDefinitions};
 use super::{
     CheckedExpressionLogicalSourceEntry, CheckedTableLogicalSourceEntry,
-    LoweredExpressionLogicalSource, SqlExpressionCallKind, SqlSourceJournalError,
+    CheckedWindowLogicalSourceEntry, LoweredExpressionLogicalSource, SqlExpressionCallKind,
+    SqlSourceJournalError,
 };
 use crate::{
     binding::{CapturedAggregateLogicalRequest, CapturedLogicalCallArguments, SqlFunctionBinding},
@@ -167,7 +170,7 @@ impl<'a> CheckedExpressionLogicalSourceEntry<'a> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
         let context = Projection {
-            expressions: self.fragment.expressions(),
+            expressions: self.definitions,
             owner: self.entry.owner,
             lambda_scope: self.entry.lambda_scope,
             kind: Some(self.entry.kind),
@@ -180,7 +183,34 @@ impl<'a> CheckedExpressionLogicalSourceEntry<'a> {
             channels: &self.entry.channels,
         };
         context.check_extent(work)?;
-        super::validate_expression_source_entry_observed(self.entry, self.source, work)?;
+        super::validate_expression_source_entry_observed(
+            self.entry,
+            self.definitions.owner(),
+            self.source,
+            work,
+        )?;
+        context.project(pools, work)
+    }
+}
+impl<'a> CheckedWindowLogicalSourceEntry<'a> {
+    pub(crate) fn operational_arguments_observed(
+        &self,
+        pools: &ConstantPools,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
+        let definitions = UnitDefinitions::from_node(self.node);
+        let context = Projection {
+            expressions: definitions,
+            owner: ScalarUnitOwner::Node(self.node.id),
+            lambda_scope: None,
+            kind: Some(SqlExpressionCallKind::Window),
+            captured: CapturedOperationalSource::call(&self.entry.captured),
+            derived: None,
+            arguments: &self.entry.arguments,
+            channels: &self.entry.channels,
+        };
+        context.check_extent(work)?;
+        super::validate_window_source_entry_observed(self.entry, definitions, self.source, work)?;
         context.project(pools, work)
     }
 }
@@ -199,8 +229,8 @@ impl<'a> CheckedTableLogicalSourceEntry<'a> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
         let context = Projection {
-            expressions: self.fragment.expressions(),
-            owner: self.source.id,
+            expressions: UnitDefinitions::from_node(self.source),
+            owner: ScalarUnitOwner::Node(self.source.id),
             lambda_scope: None,
             kind: None,
             captured: CapturedOperationalSource::call(&self.entry.captured),
@@ -209,7 +239,12 @@ impl<'a> CheckedTableLogicalSourceEntry<'a> {
             channels: &self.entry.channels,
         };
         context.check_extent(work)?;
-        super::validate_table_source_entry_observed(self.entry, self.source, work)?;
+        super::validate_table_source_entry_observed(
+            self.entry,
+            UnitDefinitions::from_node(self.source),
+            self.source,
+            work,
+        )?;
         context.project(pools, work)
     }
 }
@@ -217,9 +252,9 @@ impl<'a> CheckedTableLogicalSourceEntry<'a> {
 /// Borrowed channels from the original emitter before its parent call exists.
 /// This is a projection input, not a checked source loan or call certificate.
 pub(in crate::planner::distributed::build) struct EmittedOperationalCall<'a> {
-    pub(in crate::planner::distributed::build) expressions: &'a ExprArena,
+    pub(in crate::planner::distributed::build) expressions: UnitDefinitions<'a>,
     pub(in crate::planner::distributed::build) pools: &'a ConstantPools,
-    pub(in crate::planner::distributed::build) owner: NodeId,
+    pub(in crate::planner::distributed::build) owner: ScalarUnitOwner,
     pub(in crate::planner::distributed::build) lambda_scope: Option<ExprId>,
     pub(in crate::planner::distributed::build) kind: Option<SqlExpressionCallKind>,
     pub(in crate::planner::distributed::build) captured: CapturedOperationalSource<'a>,
@@ -283,8 +318,8 @@ fn finish_projection_work<T>(
 }
 
 struct Projection<'a> {
-    expressions: &'a ExprArena,
-    owner: NodeId,
+    expressions: UnitDefinitions<'a>,
+    owner: ScalarUnitOwner,
     lambda_scope: Option<ExprId>,
     kind: Option<SqlExpressionCallKind>,
     captured: CapturedOperationalSource<'a>,
@@ -320,7 +355,7 @@ impl Projection<'_> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<&'a ExprNode, SqlOperationalProjectionError> {
         work.flush()?;
-        let expression = self.expressions.get(id);
+        let expression = self.expressions.definition(id);
         work.step()?;
         work.flush()?;
         expression.ok_or(SqlOperationalProjectionError::InvalidSource(
@@ -354,8 +389,8 @@ impl Projection<'_> {
                 "operational channel differs from its recorded expression identity",
             )?;
             let expression = self.expression(*id, work)?;
-            let same_scope =
-                expression.owner == self.owner && expression.lambda_scope == self.lambda_scope;
+            let same_scope = self.expressions.owner() == self.owner
+                && expression.lambda_scope == self.lambda_scope;
             work.step()?;
             require(
                 same_scope,
@@ -524,7 +559,8 @@ impl Projection<'_> {
             exact_type(actual, original, work)?;
         }
         let body = self.expression(*body, work)?;
-        let same_scope = body.owner == expression.owner && body.lambda_scope == Some(expression.id);
+        let same_scope =
+            self.expressions.owner() == self.owner && body.lambda_scope == Some(expression.id);
         work.step()?;
         require(
             same_scope,

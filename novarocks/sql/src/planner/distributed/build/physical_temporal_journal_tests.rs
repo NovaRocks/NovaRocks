@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original FE emitter/journal authors precise temporal source occurrences.
-use super::contract_lowering::lowered_scalar_source_tests::{authored, policy, text};
-use super::expression_occurrences::{
-    ExpressionOccurrenceError, author_physical_occurrences_from_journal_observed,
-    author_physical_occurrences_observed,
+use super::contract_lowering::ContractLoweringError;
+use super::contract_lowering::lowered_scalar_source_tests::{
+    authored, lower_draft_with_control, policy, text,
 };
 use crate::{
     analysis::{ExprKind, LiteralValue, TypedExpr},
@@ -83,34 +82,44 @@ fn cast(input: TypedExpr, target: DataType) -> TypedExpr {
         value_type: FunctionValueType::new(target, true),
     }
 }
+fn temporal_sources(
+    owner: &SqlAuthoredPhysicalPlan,
+) -> impl Iterator<
+    Item = (
+        &novarocks_expression_contract::BoundExprSet,
+        &novarocks_type_contract::TemporalSourcePlan<novarocks_expression_contract::ExprId>,
+    ),
+> {
+    owner
+        .plan()
+        .fragments()
+        .values()
+        .flat_map(|fragment| fragment.nodes().values())
+        .filter_map(|node| node.expressions.as_deref())
+        .flat_map(|unit| {
+            unit.claims().values().filter_map(move |claim| {
+                claim.temporal_source.as_ref().map(|source| (unit, source))
+            })
+        })
+}
 fn author_shapes(owner: &SqlAuthoredPhysicalPlan) -> Vec<S> {
     let mut shapes = vec![];
-    for fragment in owner.plan().fragments().values() {
-        let authored =
-            author_physical_occurrences_from_journal_observed(owner, fragment, &Control::default())
-                .unwrap();
-        for source in authored.temporal_sources.values() {
-            source.validate_structure().unwrap();
-            shapes.push(source.facts.shape());
-            let definition = source.sources[0].definition;
-            for occurrence in &source.sources {
-                let invocation = authored
-                    .root_uses
-                    .flow()
-                    .uses()
-                    .get(&occurrence.use_id)
-                    .unwrap();
-                assert_eq!(invocation.definition, occurrence.definition);
-            }
-            if source.facts.shape() == S::SecondsCastOther {
-                assert_eq!(source.sources[1].role, R::ImmediateCastSource);
-                assert_eq!(source.sources[2].role, R::DeepestCastSource);
-                if source.sources[1].definition == source.sources[2].definition {
-                    assert_ne!(source.sources[1].use_id, source.sources[2].use_id);
-                }
-            }
-            assert!(fragment.expressions().get(definition).is_some());
+    for (unit, source) in temporal_sources(owner) {
+        source.validate_structure().unwrap();
+        shapes.push(source.facts.shape());
+        let definition = source.sources[0].definition;
+        for occurrence in &source.sources {
+            let invocation = unit.control_flow().uses().get(&occurrence.use_id).unwrap();
+            assert_eq!(invocation.definition, occurrence.definition);
         }
+        if source.facts.shape() == S::SecondsCastOther {
+            assert_eq!(source.sources[1].role, R::ImmediateCastSource);
+            assert_eq!(source.sources[2].role, R::DeepestCastSource);
+            if source.sources[1].definition == source.sources[2].definition {
+                assert_ne!(source.sources[1].use_id, source.sources[2].use_id);
+            }
+        }
+        assert!(unit.definition(definition).is_some());
     }
     shapes
 }
@@ -127,20 +136,12 @@ fn emitted_utf8_cast_override_retains_raw_before_normal_and_format() {
         ],
     ));
     assert_eq!(author_shapes(&owner), vec![S::FormatUtf8Override]);
-    for fragment in owner.plan().fragments().values() {
-        let authored = author_physical_occurrences_from_journal_observed(
-            &owner,
-            fragment,
-            &Control::default(),
-        )
-        .unwrap();
-        for source in authored.temporal_sources.values() {
-            assert_eq!(
-                source.sources.iter().map(|s| s.role).collect::<Vec<_>>(),
-                vec![R::RawOverride, R::Normal, R::Format]
-            );
-            assert_ne!(source.sources[0].use_id, source.sources[1].use_id);
-        }
+    for (_, source) in temporal_sources(&owner) {
+        assert_eq!(
+            source.sources.iter().map(|s| s.role).collect::<Vec<_>>(),
+            vec![R::RawOverride, R::Normal, R::Format]
+        );
+        assert_ne!(source.sources[0].use_id, source.sources[1].use_id);
     }
 }
 #[test]
@@ -175,27 +176,17 @@ fn original_seconds_roundtrip_authors_only_original_integer_use() {
         )],
     ));
     assert_eq!(author_shapes(&owner), vec![S::SecondsRoundtrip]);
-    for fragment in owner.plan().fragments().values() {
-        let occurrences = author_physical_occurrences_from_journal_observed(
-            &owner,
-            fragment,
-            &Control::default(),
-        )
-        .unwrap();
-        for source in occurrences.temporal_sources.values() {
-            assert_eq!(source.sources.len(), 1);
-            assert_eq!(source.sources[0].role, R::OriginalSeconds);
-            assert_eq!(
-                fragment
-                    .expressions()
-                    .get(source.sources[0].definition)
-                    .unwrap()
-                    .ty
-                    .data_type()
-                    .clone(),
-                DataType::Int64
-            );
-        }
+    for (unit, source) in temporal_sources(&owner) {
+        assert_eq!(source.sources.len(), 1);
+        assert_eq!(source.sources[0].role, R::OriginalSeconds);
+        assert_eq!(
+            unit.definition(source.sources[0].definition)
+                .unwrap()
+                .ty
+                .data_type()
+                .clone(),
+            DataType::Int64
+        );
     }
 }
 #[test]
@@ -203,15 +194,66 @@ fn ordinary_occurrence_entry_without_original_journal_cannot_guess_temporal_fact
     let owner = authored(call("time_to_sec", vec![text("12:34:56")]));
     let mut count = 0;
     for fragment in owner.plan().fragments().values() {
-        if fragment.expressions().iter().any(|(_,node)|matches!(&node.kind,novarocks_physical_plan::ExprKind::FunctionCall{function,..} if function.function_id.as_str().contains("time_to_sec"))){
-   assert!(author_physical_occurrences_observed(fragment,owner.function_catalog().as_ref(),&Control::default()).is_err());count+=1;
-  }
+        for node in fragment.nodes().values() {
+            let Some(unit) = &node.expressions else {
+                continue;
+            };
+            for (&use_id, invocation) in unit.control_flow().uses() {
+                let source = unit.definition(invocation.definition).unwrap();
+                if !matches!(&source.kind, novarocks_expression_contract::ExprKind::FunctionCall { function, .. } if function.function_id.as_str().contains("time_to_sec"))
+                {
+                    continue;
+                }
+                // The direct component can borrow real definitions, but has no
+                // same-emission temporal receipt. It cannot guess one from CVs.
+                let control = Control::default();
+                let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+                    &control,
+                    CompilePhase::FunctionSpecialization,
+                )
+                .unwrap();
+                let definitions = super::unit_source::UnitDefinitions::from_node(node);
+                let request =
+                    super::physical_scalar_requests::author_physical_scalar_request_observed(
+                        source,
+                        definitions,
+                        owner.plan().constants(),
+                        policy(),
+                        &mut work,
+                    )
+                    .unwrap();
+                let children = std::collections::BTreeMap::new();
+                let result =
+                    super::physical_scalar_occurrences::prepare_physical_scalar_occurrence_observed(
+                        super::physical_scalar_occurrences::PhysicalScalarOccurrenceInput {
+                            source,
+                            definitions: Some(definitions),
+                            temporal_source: None,
+                            request: &request,
+                            flow: unit.control_flow(),
+                            use_id,
+                            child_effects: &children,
+                            parameters: owner.plan().parameters(),
+                            environment: &[],
+                            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                            proof_scope: novarocks_type_contract::CallProofScope::Region(
+                                invocation.context.region,
+                            ),
+                        },
+                        owner.function_catalog().as_ref(),
+                        &mut work,
+                    );
+                assert!(matches!(result, Err(super::physical_scalar_occurrences::PhysicalScalarOccurrenceError::InvalidSource("missing same-emission temporal source facts"))));
+                work.finish().unwrap();
+                count += 1;
+            }
+        }
     }
     assert_eq!(count, 1);
 }
 #[test]
 fn actual_emitted_journal_author_preserves_each_compile_cause_at_every_checkpoint() {
-    let owner = authored(call(
+    let expression = call(
         "time_format",
         vec![
             cast(
@@ -220,26 +262,26 @@ fn actual_emitted_journal_author_preserves_each_compile_cause_at_every_checkpoin
             ),
             text("%f"),
         ],
-    ));
-    for fragment in owner.plan().fragments().values() {
-        let recorder = Control::default();
-        author_physical_occurrences_from_journal_observed(&owner, fragment, &recorder).unwrap();
-        let trace = recorder.trace.lock().unwrap().clone();
-        for at in 1..=trace.len() {
-            for cause in [
-                CompileControlError::Cancelled,
-                CompileControlError::DeadlineExceeded,
-                CompileControlError::ResourceExhausted,
-            ] {
-                let control = Control {
-                    trace: Mutex::new(vec![]),
-                    refuse: Some((at, cause.clone())),
-                };
-                assert!(
-                    matches!(author_physical_occurrences_from_journal_observed(&owner,fragment,&control),Err(ExpressionOccurrenceError::Control(actual)) if actual==cause)
-                );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
-            }
+    );
+    let recorder = Control::default();
+    lower_draft_with_control(expression.clone(), &recorder).unwrap();
+    let trace = recorder.trace.lock().unwrap().clone();
+    // Claims now belong to the original lowering/sealing author. Re-enter that
+    // actual producer, not a removed late package author, for each first cause.
+    for at in 1..=trace.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control {
+                trace: Mutex::new(vec![]),
+                refuse: Some((at, cause.clone())),
+            };
+            assert!(
+                matches!(lower_draft_with_control(expression.clone(), &control), Err(ContractLoweringError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
         }
     }
 }

@@ -25,12 +25,14 @@ use super::physical_fragment_effects::{
 };
 
 use novarocks_functions::{FunctionBindingError, PureCallLifecycle};
-use novarocks_physical_plan::{
-    ExprKind, FragmentDefinitionSource, PhysicalCallDefinition, PhysicalCallSite,
-    visit_fragment_definitions_observed,
-};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+};
+use {
+    novarocks_expression_contract::ExprKind,
+    novarocks_physical_plan::{
+        FragmentDefinitionSource, PhysicalCallSite, visit_fragment_definitions_observed,
+    },
 };
 
 #[derive(Debug)]
@@ -71,30 +73,36 @@ fn admit_loan(
         .canonical()
         .map(|canonical| canonical.binding())
         .unwrap_or_else(|| loan.original_binding());
-    functions
-        .admit_bound_lifecycle_observed(binding.resolved(), lifecycle, control)
-        .map_err(SqlSourceSupportError::Binding)?;
-    // Original lexical facts are retained even when the actual emitted
-    // request carries canonical types. IDs/values are the original sparse
-    // parameter author, never guessed from the function name or data.
-    let environment = loan
-        .original_binding()
+    admit_original_binding_observed(
+        functions,
+        binding,
+        loan.original_binding(),
+        parameters,
+        lifecycle,
+        control,
+    )
+    .map_err(SqlSourceSupportError::Binding)
+}
+
+/// Shared lifecycle/environment admission for an already authenticated original
+/// source. It neither captures arguments nor selects a new binding.
+pub(super) fn admit_original_binding_observed(
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    binding: &crate::binding::SqlFunctionBinding,
+    original: &crate::binding::SqlFunctionBinding,
+    parameters: &novarocks_type_contract::SemanticParameters,
+    lifecycle: PureCallLifecycle,
+    control: &dyn PureCompileControl,
+) -> Result<(), FunctionBindingError> {
+    functions.admit_bound_lifecycle_observed(binding.resolved(), lifecycle, control)?;
+    let environment = original
         .group_concat_source()
         .map(|facts| facts.environment());
     let references = environment
         .as_ref()
         .map(|refs| refs.as_slice())
         .unwrap_or(&[]);
-    functions
-        .admit_bound_environment_observed(binding.resolved(), references, parameters, control)
-        .map_err(SqlSourceSupportError::Binding)
-}
-
-pub(crate) fn admit_all_call_definitions_observed(
-    owner: &SqlAuthoredPhysicalPlan,
-    control: &dyn PureCompileControl,
-) -> Result<(), SqlSourceSupportError> {
-    check_source_definitions(owner, control)
+    functions.admit_bound_environment_observed(binding.resolved(), references, parameters, control)
 }
 
 /// Explicit read-only inspection of a completed original SQL source using its
@@ -115,22 +123,25 @@ fn check_source_definitions(
         visit_fragment_definitions_observed(fragment, &mut work, |source, work| {
             match source {
                 FragmentDefinitionSource::Value { .. } => Ok(()),
-                FragmentDefinitionSource::Expression { expression, .. } => {
-                    let lifecycle = match &expression.kind {
-                        ExprKind::FunctionCall { .. } => PureCallLifecycle::Scalar,
-                        ExprKind::WindowCall { function, .. } => {
-                            if function.kind == novarocks_functions::FunctionKind::Aggregate {
-                                PureCallLifecycle::AggregateWindow
-                            } else {
-                                PureCallLifecycle::Window
-                            }
-                        }
-                        _ => return Ok(()),
-                    };
+                FragmentDefinitionSource::Expression {
+                    node, expression, ..
+                } => {
+                    if !matches!(expression.kind, ExprKind::FunctionCall { .. }) {
+                        return Ok(());
+                    }
+                    let node =
+                        fragment
+                            .nodes()
+                            .get(&node)
+                            .ok_or(SqlSourceSupportError::InvalidSource(
+                                "call definition node is absent",
+                            ))?;
+                    let lifecycle = PureCallLifecycle::Scalar;
                     let loan = owner
                         .borrow_call_dependency_observed(
                             SqlCallDependencySite::Expression {
                                 fragment,
+                                node,
                                 source: expression,
                             },
                             work,
@@ -144,36 +155,39 @@ fn check_source_definitions(
                         control,
                     )
                 }
-                FragmentDefinitionSource::Request {
-                    definition: PhysicalCallDefinition::Expression(_),
-                    ..
-                } => {
-                    // The expression callback admitted this definition once;
-                    // builder validation preserves its exact request association.
+                FragmentDefinitionSource::ExpressionRequest { .. } => {
+                    // Its stored expression was admitted by the callback above;
+                    // the unit validator checks its exact request association.
                     Ok(())
                 }
                 FragmentDefinitionSource::Request {
-                    definition: PhysicalCallDefinition::Relational(site),
-                    ..
+                    definition: site, ..
                 } => {
-                    let node_id = match site {
-                        PhysicalCallSite::Table { node }
-                        | PhysicalCallSite::Aggregate { node, .. }
-                        | PhysicalCallSite::TopNState { node, .. }
-                        | PhysicalCallSite::WriterPartial { node, .. }
-                        | PhysicalCallSite::WriterFinal { node, .. } => node,
-                        PhysicalCallSite::Expression(_) => {
-                            return Err(SqlSourceSupportError::InvalidSource(
-                                "relational request names an expression use",
-                            ));
-                        }
-                    };
+                    let node_id = site.node();
                     let node = fragment.nodes().get(&node_id).ok_or(
                         SqlSourceSupportError::InvalidSource(
                             "call definition names an absent original node",
                         ),
                     )?;
                     let source = match site {
+                        PhysicalCallSite::Window { call, .. } => {
+                            let novarocks_physical_plan::NodeKind::Window(spec) = &node.kind else {
+                                return Err(SqlSourceSupportError::InvalidSource(
+                                    "window call node has a different kind",
+                                ));
+                            };
+                            let source = spec.calls.get(call as usize).ok_or(
+                                SqlSourceSupportError::InvalidSource(
+                                    "window call ordinal is absent",
+                                ),
+                            )?;
+                            SqlCallDependencySite::Window {
+                                fragment,
+                                node,
+                                site,
+                                source,
+                            }
+                        }
                         PhysicalCallSite::Table { .. } => SqlCallDependencySite::Table {
                             fragment,
                             source: node,
@@ -199,12 +213,17 @@ fn check_source_definitions(
                                 source,
                             }
                         }
-                        PhysicalCallSite::Expression(_) => unreachable!(),
                     };
-                    let lifecycle = if matches!(site, PhysicalCallSite::Table { .. }) {
-                        PureCallLifecycle::Table
-                    } else {
-                        PureCallLifecycle::Aggregate
+                    let lifecycle = match &source {
+                        SqlCallDependencySite::Window { source, .. } => {
+                            if source.binding.kind == novarocks_functions::FunctionKind::Aggregate {
+                                PureCallLifecycle::AggregateWindow
+                            } else {
+                                PureCallLifecycle::Window
+                            }
+                        }
+                        SqlCallDependencySite::Table { .. } => PureCallLifecycle::Table,
+                        _ => PureCallLifecycle::Aggregate,
                     };
                     let loan = owner
                         .borrow_call_dependency_observed(source, work)

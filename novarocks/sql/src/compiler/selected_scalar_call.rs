@@ -91,7 +91,7 @@ pub(crate) fn prepare_selected_scalar_call_observed(
         }
     };
     let call = CallEffectInput {
-        context: input.context,
+        context: input.context.into(),
         argument_uses: input.argument_uses,
         function_id: input.function_id,
         kind: input.kind,

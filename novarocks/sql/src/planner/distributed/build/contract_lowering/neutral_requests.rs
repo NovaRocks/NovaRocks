@@ -22,19 +22,31 @@ use std::{alloc::Layout, collections::BTreeMap};
 
 use novarocks_constant_contract::{ConstantPolicy, ConstantValue};
 use novarocks_functions::{FunctionArgument, FunctionBindingRequest, MAX_CALL_EFFECT_ARGUMENTS};
-use novarocks_physical_plan::{
-    ConstantReference, FragmentId, MAX_FRAGMENT_DYNAMIC_BYTES, MAX_FRAGMENT_DYNAMIC_ITEMS,
-    MAX_PLAN_DYNAMIC_BYTES, MAX_PLAN_DYNAMIC_ITEMS, PhysicalCallDefinition, PhysicalCallRequest,
-    StaticFunctionArgument, ValueType,
-};
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
+use {
+    novarocks_expression_contract::PhysicalCallRequest,
+    novarocks_physical_plan::{
+        ConstantReference, FragmentId, MAX_FRAGMENT_DYNAMIC_BYTES, MAX_FRAGMENT_DYNAMIC_ITEMS,
+        MAX_PLAN_DYNAMIC_BYTES, MAX_PLAN_DYNAMIC_ITEMS, StaticFunctionArgument, ValueType,
+    },
+};
 
 use super::{
-    AggregateRuntimeDemand, ContractLoweringError, LoweredAggregateSourceEntry,
+    AggregateRuntimeDemand, ContractLoweringError, LoweredAggregateSourceEntry, ScalarSourceSite,
     SqlLogicalSourceJournal,
 };
 
-type Entries = Vec<(PhysicalCallDefinition, PhysicalCallRequest)>;
+/// Construction-only routing. Scalar requests move straight into their actual
+/// node unit; only relation entries enter the fragment's request table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RequestTarget {
+    Unit {
+        node: novarocks_physical_plan::NodeId,
+        definition: novarocks_expression_contract::ExprId,
+    },
+    Relation(novarocks_physical_plan::PhysicalCallSite),
+}
+type Entries = Vec<(RequestTarget, PhysicalCallRequest)>;
 pub(super) type Transferred = BTreeMap<FragmentId, Entries>;
 
 /// The caller owns the original entry/footer and backing registry. Completed
@@ -51,10 +63,11 @@ pub(super) fn transfer_neutral_requests_observed(
     let total = journal
         .expression_entries
         .len()
-        .checked_add(journal.table_entries.len())
+        .checked_add(journal.window_entries.len())
+        .and_then(|count| count.checked_add(journal.table_entries.len()))
         .and_then(|count| count.checked_add(journal.entries.len()))
         .ok_or(CompileControlError::ResourceExhausted)?;
-    let layout = Layout::array::<(PhysicalCallDefinition, PhysicalCallRequest)>(total)
+    let layout = Layout::array::<(RequestTarget, PhysicalCallRequest)>(total)
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     if total > MAX_PLAN_DYNAMIC_ITEMS || layout.size() > MAX_PLAN_DYNAMIC_BYTES {
         return Err(CompileControlError::ResourceExhausted.into());
@@ -68,7 +81,11 @@ pub(super) fn transfer_neutral_requests_observed(
     for fragment in journal
         .expression_entries
         .keys()
-        .map(|(fragment, _)| *fragment)
+        .map(|address| {
+            let ScalarSourceSite::Node { fragment, .. } = address.site;
+            fragment
+        })
+        .chain(journal.window_entries.keys().map(|(fragment, _)| *fragment))
         .chain(journal.table_entries.keys().map(|(fragment, _)| *fragment))
     {
         count_fragment(&mut counts, fragment, work)?;
@@ -79,7 +96,7 @@ pub(super) fn transfer_neutral_requests_observed(
     let mut output = BTreeMap::new();
     for (fragment, count) in counts {
         let mut entries = Vec::new();
-        Layout::array::<(PhysicalCallDefinition, PhysicalCallRequest)>(count)
+        Layout::array::<(RequestTarget, PhysicalCallRequest)>(count)
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         work.step()?;
         work.flush()?;
@@ -91,8 +108,10 @@ pub(super) fn transfer_neutral_requests_observed(
         output.insert(fragment, entries);
         work.step()?;
     }
-    for (&(fragment, expression), entry) in &journal.expression_entries {
+    for (&address, entry) in &journal.expression_entries {
         work.step()?;
+        let ScalarSourceSite::Node { fragment, node } = address.site;
+        let expression = address.definition;
         let captured = entry.captured.captured();
         let canonical = entry.canonical_operational.as_ref();
         work.step()?;
@@ -115,7 +134,34 @@ pub(super) fn transfer_neutral_requests_observed(
         push(
             &mut output,
             fragment,
-            PhysicalCallDefinition::Expression(expression),
+            RequestTarget::Unit {
+                node,
+                definition: expression,
+            },
+            record,
+            work,
+        )?;
+    }
+    for (&(fragment, site), entry) in &journal.window_entries {
+        work.step()?;
+        let canonical = &entry.canonical_operational;
+        let belongs = canonical.belongs_to(&entry.captured);
+        work.step()?;
+        if !belongs {
+            return Err(invalid(
+                "neutral Window request has another original source",
+            ));
+        }
+        let record = transfer_request(
+            canonical.request(),
+            entry.captured.constant_policy(),
+            work,
+            &mut register,
+        )?;
+        push(
+            &mut output,
+            fragment,
+            RequestTarget::Relation(site),
             record,
             work,
         )?;
@@ -137,9 +183,7 @@ pub(super) fn transfer_neutral_requests_observed(
         push(
             &mut output,
             fragment,
-            PhysicalCallDefinition::Relational(novarocks_physical_plan::PhysicalCallSite::Table {
-                node,
-            }),
+            RequestTarget::Relation(novarocks_physical_plan::PhysicalCallSite::Table { node }),
             record,
             work,
         )?;
@@ -151,7 +195,7 @@ pub(super) fn transfer_neutral_requests_observed(
         push(
             &mut output,
             fragment,
-            PhysicalCallDefinition::Relational(site),
+            RequestTarget::Relation(site),
             record,
             work,
         )?;
@@ -357,7 +401,7 @@ fn clone_type(
 fn push(
     output: &mut Transferred,
     fragment: FragmentId,
-    definition: PhysicalCallDefinition,
+    definition: RequestTarget,
     request: PhysicalCallRequest,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ContractLoweringError> {
@@ -374,6 +418,21 @@ fn push(
     entries.push((definition, request));
     work.step()?;
     Ok(())
+}
+
+/// Feed a direct-component fixture through the original request transfer leaf.
+/// This does not construct a SQL journal, source loan, entry or completion scope.
+#[cfg(test)]
+pub(in crate::planner::distributed::build) fn transfer_component_request_for_test(
+    request: FunctionBindingRequest<'_>,
+    policy: ConstantPolicy,
+    work: &mut CompileCheckpoints<'_>,
+    register: &mut impl FnMut(
+        &ConstantValue,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantReference, ContractLoweringError>,
+) -> Result<PhysicalCallRequest, ContractLoweringError> {
+    transfer_request(request, policy, work, register)
 }
 
 #[cfg(test)]

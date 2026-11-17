@@ -18,10 +18,11 @@ mod left_right {
     //! The actual SQL case with no-op folding retains the original emitted call and request authors.
     //! Prior native PASS alone does not establish that a call survived real constant folding.
     use arrow::datatypes::DataType;
-    use novarocks_physical_plan::{
-        ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
-    };
     use novarocks_sql_testkit::sql_source;
+    use {
+        novarocks_expression_contract::ExprKind,
+        novarocks_physical_plan::{FunctionArgumentType, StaticFunctionArgument},
+    };
 
     use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
     const SQL: &str = include_str!(concat!(
@@ -32,7 +33,13 @@ mod left_right {
         let owner = sql_source(SQL, DataType::Int64);
         let mut count = 0;
         for fragment in owner.plan().fragments().values() {
-            for (id, node) in fragment.expressions().iter() {
+            for (unit, node) in fragment
+                .nodes()
+                .values()
+                .filter_map(|node| node.expressions.as_deref())
+                .flat_map(|unit| unit.definitions().iter().map(move |node| (unit, node)))
+            {
+                let id = node.id;
                 let ExprKind::FunctionCall { function, args } = &node.kind else {
                     continue;
                 };
@@ -41,10 +48,7 @@ mod left_right {
                 {
                     continue;
                 }
-                let request = fragment
-                    .call_requests()
-                    .get(PhysicalCallDefinition::Expression(*id))
-                    .unwrap();
+                let request = unit.requests().get(&id).unwrap();
                 assert_eq!(args.len(), 2);
                 assert_eq!(request.logical_argument_count, 2);
                 assert_eq!(request.arguments.len(), 2);
@@ -72,7 +76,7 @@ mod left_right {
                             DataType::Int64
                         }
                     );
-                    assert_eq!(&fragment.expressions().get(*child).unwrap().ty, bound);
+                    assert_eq!(&unit.definition(*child).unwrap().ty, bound);
                 }
                 assert_eq!(node.ty, function.result_type);
                 assert_eq!(node.ty, FunctionValueType::new(DataType::Utf8, true));
@@ -99,8 +103,7 @@ mod exact_percentile {
     //! Actual original SQL request/binding source, prior to owner correction.
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::{
-        FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
-        StaticFunctionArgument,
+        FunctionArgumentType, NodeKind, PhysicalCallSite, StaticFunctionArgument,
     };
     use novarocks_sql_testkit::sql_source;
 
@@ -121,10 +124,7 @@ mod exact_percentile {
                                 node: node.id,
                                 call: ordinal as u32,
                             };
-                            let request = fragment
-                                .call_requests()
-                                .get(PhysicalCallDefinition::Relational(site))
-                                .unwrap();
+                            let request = fragment.call_requests().get(site).unwrap();
                             assert_eq!(request.logical_argument_count, 2);
                             assert_eq!(call.binding.function.argument_types.len(), 2);
                             let StaticFunctionArgument::Value {
@@ -181,7 +181,10 @@ mod exact_percentile {
 }
 mod canonical_calls {
     use arrow::datatypes::DataType;
-    use novarocks_sql::compiler::{SqlCompileControl, check_pure_call_definitions_observed};
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_sql::compiler::{
+        PackageSemanticsError, SqlCompileControl, check_pure_call_definitions_observed,
+    };
     use novarocks_sql_testkit::sql_source;
     #[test]
     fn e08s1_late_actual_source_same_journal_supported_canonical_calls_and_over_are_accepted() {
@@ -191,6 +194,19 @@ mod canonical_calls {
                 DataType::Int32,
             );
             check_pure_call_definitions_observed(&source, &SqlCompileControl::unbounded()).unwrap();
+            let policy = novarocks_sql_testkit::sql_fixture_constant_policy();
+            assert_eq!(source.plan().statement_constant_policy(), policy);
+            source.require_statement_constant_policy(policy).unwrap();
+            let mut foreign = policy;
+            foreign.max_rows -= 1;
+            let error = source
+                .require_statement_constant_policy(foreign)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                PackageSemanticsError::StatementPolicyMismatch
+            ));
+            assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
         }
     }
 }

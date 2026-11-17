@@ -135,15 +135,13 @@ fn prefixes(
     }
 }
 
-fn effects() -> ScopedExpressionEffects {
-    ScopedExpressionEffects::primitive(
-        novarocks_type_contract::ExpressionEffectContext {
-            use_id: novarocks_type_contract::ExpressionUseId::new(91),
-            region: novarocks_type_contract::EvaluationRegionId::new(92),
-            demand: novarocks_type_contract::EvaluationDemand::Value,
-        },
-        ExpressionEffects::PURE_VALUE,
-    )
+fn effects(
+    entry: &CheckedAggregateLogicalSourceEntry<'_>,
+) -> novarocks_functions::ScopedRelationalEffects {
+    // This test observes option assembly. Borrow the actual authored relation
+    // context rather than assigning an unrelated expression use or region.
+    let context = entry.fragment().calls().entries()[&entry.site()].context;
+    novarocks_functions::ScopedRelationalEffects::primitive(context, ExpressionEffects::PURE_VALUE)
 }
 
 #[test]
@@ -198,7 +196,8 @@ fn journal_update_partial_count_min_max_borrow_canonical_request_and_selected_ar
             request.selected().as_ref(),
             &entry.captured().binding().resolved().selected
         );
-        let PureCallPreparation::Aggregate { options, .. } = request.preparation(effects()) else {
+        let PureCallPreparation::Aggregate { options, .. } = request.preparation(effects(&entry))
+        else {
             panic!("actual Aggregate update preparation")
         };
         assert_eq!(options.phase, AggregateKernelPhase::Partial);
@@ -272,10 +271,9 @@ fn journal_update_literal_keeps_original_captured_constant_and_physical_pool_bac
     );
     let expression = entry
         .fragment()
-        .expressions()
-        .get(entry.source().arguments[0])
+        .root_expression(entry.node().id, entry.source().arguments[0])
         .unwrap();
-    let novarocks_physical_plan::ExprKind::Constant(reference) = &expression.kind else {
+    let novarocks_expression_contract::ExprKind::Constant(reference) = &expression.kind else {
         panic!("original literal lowering publishes the captured pool reference")
     };
     let mut work =
@@ -335,8 +333,7 @@ fn journal_update_computed_and_cast_arguments_remain_original_nonconstant_none()
         assert!(request.request().expected_result_type.is_none());
         let expression = entry
             .fragment()
-            .expressions()
-            .get(entry.source().arguments[0])
+            .root_expression(entry.node().id, entry.source().arguments[0])
             .unwrap();
         assert_eq!(&expression.ty, actual_type);
     }

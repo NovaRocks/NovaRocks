@@ -20,11 +20,14 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use novarocks_functions::{PureCallSpecialization, PureKernelAbi, ScopedExpressionEffects};
-use novarocks_physical_plan::{ExprId, ExprKind, ExprNode, FrozenPhysicalCall, PhysicalCallSite};
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, ControlShape, DecimalOverflowPolicy,
     EffectContractError, ExpressionControlFlow, ExpressionUseId, SemanticParameterRef,
     SemanticParameters,
+};
+use {
+    novarocks_expression_contract::{ExprKind, ExprNode, ExpressionCallClaim},
+    novarocks_physical_plan::ExprId,
 };
 
 use super::{
@@ -71,7 +74,7 @@ impl From<EffectContractError> for PhysicalScalarOccurrenceError {
 /// environment-key list or frozen-call claim supplies these inputs.
 pub(crate) struct PhysicalScalarOccurrenceInput<'a> {
     pub source: &'a ExprNode,
-    pub definitions: Option<&'a novarocks_physical_plan::ExprArena>,
+    pub definitions: Option<super::unit_source::UnitDefinitions<'a>>,
     pub temporal_source: Option<&'a novarocks_type_contract::TemporalSourcePlan<ExprId>>,
     pub request: &'a AuthoredPhysicalScalarRequest<'a>,
     pub flow: &'a ExpressionControlFlow<ExprId>,
@@ -85,7 +88,7 @@ pub(crate) struct PhysicalScalarOccurrenceInput<'a> {
 
 #[derive(Debug)]
 pub(crate) struct FreshPhysicalScalarOccurrence {
-    pub frozen: FrozenPhysicalCall,
+    pub claim: ExpressionCallClaim,
     pub preparation: PureCallSpecialization,
 }
 
@@ -150,24 +153,27 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
                     .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
                         "missing same-emission temporal source facts",
                     ))?;
-            let definitions = novarocks_physical_plan::temporal_source_definitions_observed(
-                kind,
+            let definitions_source =
                 input
                     .definitions
                     .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
-                        "missing original temporal source arena",
-                    ))?,
-                args,
-                work,
-            )
-            .map_err(|error| match error {
-                novarocks_physical_plan::TemporalSourceProjectionError::Control(cause) => {
-                    PhysicalScalarOccurrenceError::Control(cause)
-                }
-                _ => PhysicalScalarOccurrenceError::InvalidSource(
-                    "invalid original temporal source projection",
-                ),
-            })?;
+                        "missing original temporal source unit",
+                    ))?;
+            let definitions =
+                novarocks_expression_contract::temporal_source_definitions_from_lookup_observed(
+                    kind,
+                    |id| definitions_source.definition(id),
+                    args,
+                    work,
+                )
+                .map_err(|error| match error {
+                    novarocks_expression_contract::TemporalSourceProjectionError::Control(
+                        cause,
+                    ) => PhysicalScalarOccurrenceError::Control(cause),
+                    _ => PhysicalScalarOccurrenceError::InvalidSource(
+                        "invalid original temporal source projection",
+                    ),
+                })?;
             source.validate(&definitions).map_err(|_| {
                 PhysicalScalarOccurrenceError::InvalidSource(
                     "stale temporal source roles, definitions or facts",
@@ -258,7 +264,7 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
                     .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
                         "missing temporal source arena",
                     ))?
-                    .get(definition)
+                    .definition(definition)
                     .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
                         "missing temporal source definition",
                     ))?;
@@ -283,18 +289,19 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
             .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
                 "source-sensitive scalar requires the original emitted definition arena",
             ))?;
-        let definition =
-            definitions
-                .get(args[ordinal])
-                .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
-                    "source-sensitive scalar argument definition is absent",
-                ))?;
+        let definition = definitions.definition(args[ordinal]).ok_or(
+            PhysicalScalarOccurrenceError::InvalidSource(
+                "source-sensitive scalar argument definition is absent",
+            ),
+        )?;
         work.step()?;
         Some(EmittedScalarArgumentSource {
             value_type: &definition.ty,
             checked_constant_reference:
-                novarocks_physical_plan::native_v1_emitted_constant_reference(&definition.kind)
-                    .is_some(),
+                novarocks_expression_contract::native_v1_emitted_constant_reference(
+                    &definition.kind,
+                )
+                .is_some(),
             immediate_function: match &definition.kind {
                 ExprKind::FunctionCall { function, .. } => Some(&function.function_id),
                 _ => None,
@@ -353,9 +360,7 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
     )
     .map_err(ExpressionOccurrenceError::function)?;
     work.flush()?;
-    let frozen = FrozenPhysicalCall {
-        materialized_writer_input: None,
-        site: PhysicalCallSite::Expression(input.use_id),
+    let claim = ExpressionCallClaim {
         context: invocation.context,
         effects: preparation.call_contract().effects().clone(),
         decimal_overflow_policy: input.decimal_overflow_policy,
@@ -364,8 +369,5 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         temporal_source: input.temporal_source.cloned(),
     };
     work.flush()?;
-    Ok(FreshPhysicalScalarOccurrence {
-        frozen,
-        preparation,
-    })
+    Ok(FreshPhysicalScalarOccurrence { claim, preparation })
 }

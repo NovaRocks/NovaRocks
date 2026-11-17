@@ -22,14 +22,17 @@ use std::sync::Arc;
 use novarocks_functions::{
     AggregateKernelPhase, AggregatePreparationOptions, ConstantPolicy, FunctionBindingError,
     FunctionBindingRequest, FunctionBindingSelection, MAX_CALL_EFFECT_ARGUMENTS,
-    PureCallPreparation, ScopedExpressionEffects,
-};
-use novarocks_physical_plan::{
-    AggregateBinding, AggregatePhase, BoundFunction, Fragment, PhysicalCallSite, PhysicalNode,
-    ValueDef, ValueId, WriterAggregateCall,
+    PureCallPreparation, ScopedRelationalEffects,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, DecimalOverflowPolicy, FunctionKind,
+};
+use {
+    novarocks_expression_contract::BoundFunction,
+    novarocks_physical_plan::{
+        AggregateBinding, AggregatePhase, Fragment, PhysicalCallSite, PhysicalNode, ValueDef,
+        ValueId, WriterAggregateCall,
+    },
 };
 
 use super::{
@@ -154,7 +157,7 @@ impl<'entry, 'source> AuthoredPhysicalWriterRequest<'entry, 'source> {
     }
     /// The caller admits the opaque full-type clone and owns its original
     /// scope footer. This options loan is not an allocation or runtime grant.
-    pub fn preparation(&self, arguments: ScopedExpressionEffects) -> PureCallPreparation {
+    pub fn preparation(&self, arguments: ScopedRelationalEffects) -> PureCallPreparation {
         PureCallPreparation::Aggregate {
             arguments,
             options: AggregatePreparationOptions {

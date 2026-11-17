@@ -15,21 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Production package semantics authored from real SQL statements.
+//! Completed SQL sources already own the calls consumed by package extraction.
 
 use std::collections::BTreeMap;
 
 use novarocks_physical_plan::{
-    FragmentPackageAdmission, NodeKind, PhysicalCallSite, PlanLimits,
+    FragmentPackageAdmission, FrozenFragmentPruning, NodeKind, PhysicalCallSite, PlanLimits,
     PropertyProofProjectionLimits, extract_fragment_packages,
 };
 
 use super::SqlCompileIntent;
 use super::tests::complete_with_exact_statistics;
-use crate::compiler::{
-    PackageSemanticsError, SqlAuthoredPhysicalPlan, SqlCompileControl,
-    author_fragment_package_semantics,
-};
+use crate::compiler::{PackageSemanticsError, SqlAuthoredPhysicalPlan, SqlCompileControl};
 
 // A table-free statement completes on its first step: it has no catalog,
 // statistics or provider observation need.
@@ -56,20 +53,16 @@ fn owner(sql: &str) -> SqlAuthoredPhysicalPlan {
 #[test]
 fn aggregate_scan_statement_authors_every_fragment_and_covers_each_aggregate_call() {
     let owner = owner("SELECT MIN(order_key) AS lo FROM orders");
-    let semantics = author_fragment_package_semantics(
-        &owner,
-        crate::constant::test_constant_policy(),
-        &SqlCompileControl::unbounded(),
-    )
-    .expect("package semantics");
-    assert_eq!(
-        semantics.keys().collect::<Vec<_>>(),
-        owner.plan().fragments().keys().collect::<Vec<_>>()
-    );
+    owner
+        .require_statement_constant_policy(crate::constant::test_constant_policy())
+        .unwrap();
+    let control = SqlCompileControl::unbounded();
     let mut aggregate_calls = 0;
     for (id, fragment) in owner.plan().fragments() {
-        let authored = &semantics[id];
-        assert_eq!(authored.pruning.fragment(), *id);
+        let authored = fragment.calls();
+        authored.validate_fragment(fragment, &control).unwrap();
+        let pruning = FrozenFragmentPruning::try_new(*id, Vec::new(), &control).unwrap();
+        assert_eq!(pruning.fragment(), *id);
         for node in fragment.nodes().values() {
             if let NodeKind::Aggregate { calls, .. } = &node.kind {
                 for ordinal in 0..calls.len() {
@@ -78,7 +71,7 @@ fn aggregate_scan_statement_authors_every_fragment_and_covers_each_aggregate_cal
                         call: ordinal as u32,
                     };
                     assert!(
-                        authored.calls.entries().contains_key(&site),
+                        authored.entries().contains_key(&site),
                         "aggregate call {site:?} is frozen"
                     );
                     aggregate_calls += 1;
@@ -94,10 +87,11 @@ fn statement_policy_must_equal_every_captured_call_policy() {
     let owner = owner("SELECT MIN(order_key) AS lo FROM orders");
     let mut other = crate::constant::test_constant_policy();
     other.max_rows -= 1;
-    let error = author_fragment_package_semantics(&owner, other, &SqlCompileControl::unbounded())
+    let error = owner
+        .require_statement_constant_policy(other)
         .expect_err("a different statement policy is refused");
     assert!(
-        matches!(error, PackageSemanticsError::PolicyMismatch(_)),
+        matches!(error, PackageSemanticsError::StatementPolicyMismatch),
         "{error}"
     );
 }
@@ -108,20 +102,16 @@ fn statement_policy_must_equal_every_captured_call_policy() {
 fn provider_free_statement_publishes_checked_packages_through_extraction() {
     let owner = table_free_owner("SELECT 1 + 2 AS x, abs(-5) AS y");
     let control = SqlCompileControl::unbounded();
-    let semantics = author_fragment_package_semantics(
-        &owner,
-        crate::constant::test_constant_policy(),
-        &control,
-    )
-    .expect("package semantics");
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
+    owner
+        .require_statement_constant_policy(crate::constant::test_constant_policy())
+        .unwrap();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (id, authored) in semantics {
-        uses.insert(id, authored.expression_uses);
-        calls.insert(id, authored.calls);
-        pruning.insert(id, authored.pruning);
+    for &id in owner.plan().fragments().keys() {
+        pruning.insert(
+            id,
+            FrozenFragmentPruning::try_new(id, Vec::new(), &control).unwrap(),
+        );
         admissions.insert(
             id,
             FragmentPackageAdmission {
@@ -139,8 +129,6 @@ fn provider_free_statement_publishes_checked_packages_through_extraction() {
         owner.plan(),
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &control,
@@ -188,7 +176,7 @@ fn json_in_subquery_authors_a_null_aware_hash_mark_with_canonical_keys() {
                 assert!(scope_keys.is_empty() && eligibility.is_none());
                 assert!(!value_equal_keys[0].null_safe);
                 for key in [value_equal_keys[0].left, value_equal_keys[0].right] {
-                    let ty = &fragment.expressions().get(key).unwrap().ty;
+                    let ty = &fragment.root_expression(node.id, key).unwrap().ty;
                     assert_eq!(ty.data_type(), &arrow::datatypes::DataType::Utf8);
                     assert_eq!(
                         ty.logical_type(),
@@ -222,10 +210,13 @@ fn json_in_subquery_authors_a_null_aware_hash_mark_with_canonical_keys() {
                 .any(|line| line.contains("NULL AWARE LEFT MARK"))
         );
     }
-    author_fragment_package_semantics(
-        &owner,
-        crate::constant::test_constant_policy(),
-        &SqlCompileControl::unbounded(),
-    )
-    .expect("JSON normalization calls and hash key roots are frozen");
+    owner
+        .require_statement_constant_policy(crate::constant::test_constant_policy())
+        .unwrap();
+    for fragment in owner.plan().fragments().values() {
+        fragment
+            .calls()
+            .validate_fragment(fragment, &control)
+            .expect("JSON normalization calls and hash key roots were frozen in lowering");
+    }
 }

@@ -661,9 +661,11 @@ fn assert_licensed_nested_writer_projection(mode: LicensedWriterProjectionFixtur
     }
     assert!(
         !fragment
-            .expressions()
-            .iter()
-            .any(|(_, expression)| matches!(
+            .nodes()
+            .values()
+            .filter_map(|node| node.expressions.as_ref())
+            .flat_map(|unit| unit.definitions())
+            .any(|expression| matches!(
                 &expression.kind,
                 ContractExprKind::Cast {
                     target: DataType::Struct(_),

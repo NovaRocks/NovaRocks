@@ -18,6 +18,7 @@
 
 mod contract_lowering;
 mod lowered_draft;
+mod unit_source;
 mod wait_graph;
 #[cfg(test)]
 pub(crate) use lowered_draft::CheckedAggregateLogicalSourceEntry;
@@ -47,9 +48,7 @@ mod physical_window_occurrences;
 mod physical_window_requests;
 mod physical_writer_occurrences;
 mod physical_writer_requests;
-pub use package_semantics::{
-    FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
-};
+pub use package_semantics::PackageSemanticsError;
 
 #[cfg(test)]
 pub(crate) use contract_lowering::lower_final_physical_plan;
@@ -69,3 +68,6 @@ pub mod state_source_fixture;
 pub mod state_author_fixture;
 #[cfg(novarocks_dev_controls)]
 pub mod writer_state_fixture;
+
+#[cfg(test)]
+mod expression_component_test_fixture;

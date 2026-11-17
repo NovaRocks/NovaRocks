@@ -23,22 +23,23 @@ use novarocks_functions::{
     AggregateKernelPhase, AggregateOrderKey, AggregatePreparationOptions,
     AggregateWindowPreparationOptions, ConstantPolicy, FunctionArgument, FunctionBindingRequest,
     FunctionBindingSelection, FunctionResultType, FunctionSpecializationFailure, KernelFailure,
-    MAX_CALL_EFFECT_ARGUMENTS, PureCallPreparation, ScopedExpressionEffects, WindowCallOptions,
-};
-use novarocks_physical_plan::{
-    AggregatePhase, BoundFunction, ConstantPools, ExprId, ExprKind, ExprNode, Fragment,
-    NullOrdering, SortDirection, WindowBound, window_offset_observed,
+    MAX_CALL_EFFECT_ARGUMENTS, PureCallPreparation, ScopedRelationalEffects, WindowCallOptions,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionKind,
     FunctionValueType, ValueTypeError,
 };
+use {
+    novarocks_expression_contract::{BoundFunction, RootOrdinal},
+    novarocks_physical_plan::{
+        AggregatePhase, ConstantPools, ConstantReference, NullOrdering, PhysicalNode,
+        SortDirection, WindowBound, WindowCallSpec, window_offset_observed,
+    },
+};
 
 use super::{
     expression_occurrences::ExpressionOccurrenceError,
-    lowered_draft::{
-        CanonicalCallOperationalRequest, CheckedExpressionLogicalSourceEntry, SqlExpressionCallKind,
-    },
+    lowered_draft::{CanonicalCallOperationalRequest, CheckedWindowLogicalSourceEntry},
     physical_call_arguments::{
         PhysicalArgumentError, argument_types_exact_observed, author_physical_argument_observed,
     },
@@ -51,8 +52,8 @@ pub(crate) enum PhysicalWindowRequestError {
     Argument(PhysicalArgumentError),
     Function(ExpressionOccurrenceError),
     InvalidSource(&'static str),
-    MissingArgument(ExprId),
-    NonconstantFrameOffset(ExprId),
+    MissingArgument(RootOrdinal),
+    NonconstantFrameOffset(ConstantReference),
     TooManyArguments,
 }
 impl From<CompileControlError> for PhysicalWindowRequestError {
@@ -99,7 +100,7 @@ enum WindowRequestArguments<'a> {
 
 #[derive(Debug)]
 pub(crate) struct AuthoredPhysicalWindowRequest<'a> {
-    source: &'a ExprNode,
+    source: &'a WindowCallSpec,
     function: &'a BoundFunction,
     selected: Arc<FunctionBindingSelection>,
     arguments: WindowRequestArguments<'a>,
@@ -107,7 +108,7 @@ pub(crate) struct AuthoredPhysicalWindowRequest<'a> {
     aggregate: Option<AggregatePreparationOptions>,
 }
 impl AuthoredPhysicalWindowRequest<'_> {
-    pub const fn source(&self) -> &ExprNode {
+    pub const fn source(&self) -> &WindowCallSpec {
         self.source
     }
     pub const fn function(&self) -> &BoundFunction {
@@ -146,7 +147,7 @@ impl AuthoredPhysicalWindowRequest<'_> {
             } => Some(*constant_policy),
         }
     }
-    pub fn preparation(&self, arguments: ScopedExpressionEffects) -> PureCallPreparation {
+    pub fn preparation(&self, arguments: ScopedRelationalEffects) -> PureCallPreparation {
         match &self.aggregate {
             Some(aggregate) => PureCallPreparation::AggregateWindow {
                 arguments,
@@ -164,32 +165,28 @@ impl AuthoredPhysicalWindowRequest<'_> {
 }
 
 /// Static channels are args then function ORDER BY. Frame offsets remain
-/// independent runtime-use children, never logical function arguments.
+/// independent checked constants, never runtime uses or logical arguments.
 /// Exact offset facts reuse the sole physical constant consumer; None frame
 /// stays None. The caller owns original source/result/lexical admission, entry,
 /// footer and opaque request/selection/options coexistence, not a host grant.
 pub(crate) fn author_physical_window_request_observed<'a>(
-    source: &'a ExprNode,
-    fragment: &Fragment,
+    source: &'a WindowCallSpec,
+    node: &PhysicalNode,
     pools: &ConstantPools,
     literal_policy: ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<AuthoredPhysicalWindowRequest<'a>, PhysicalWindowRequestError> {
     work.step()?;
-    let ExprKind::WindowCall {
-        function,
+    let WindowCallSpec {
+        binding: function,
         distinct,
-        args,
-        function_order_by,
+        arguments: args,
+        order_by: function_order_by,
         frame,
         ignore_nulls,
         aggregate_binding,
-    } = &source.kind
-    else {
-        return Err(PhysicalWindowRequestError::InvalidSource(
-            "window request is not an actual WindowCall",
-        ));
-    };
+        ..
+    } = source;
     let count = args.len().checked_add(function_order_by.len());
     work.step()?;
     let count = count
@@ -220,7 +217,7 @@ pub(crate) fn author_physical_window_request_observed<'a>(
         .copied()
         .chain(function_order_by.iter().map(|key| key.expr))
     {
-        let argument = fragment.expressions().get(id);
+        let argument = super::unit_source::UnitDefinitions::from_node(node).root_definition(id);
         work.step()?;
         let argument = argument.ok_or(PhysicalWindowRequestError::MissingArgument(id))?;
         arguments.push(author_physical_argument_observed(
@@ -234,7 +231,7 @@ pub(crate) fn author_physical_window_request_observed<'a>(
     }
     let selected =
         author_scalar_result_selection_observed(function, aggregate_binding.as_deref(), work)?;
-    let window = window_options_observed(frame.as_ref(), *ignore_nulls, fragment, pools, work)?;
+    let window = window_options_observed(frame.as_ref(), *ignore_nulls, pools, work)?;
     Ok(AuthoredPhysicalWindowRequest {
         source,
         function,
@@ -242,7 +239,7 @@ pub(crate) fn author_physical_window_request_observed<'a>(
         arguments: WindowRequestArguments::OwnedPhysical {
             arguments,
             logical_count: args.len(),
-            result_constraint: &source.ty,
+            result_constraint: &function.result_type,
         },
         window,
         aggregate,
@@ -254,44 +251,46 @@ pub(crate) fn author_physical_window_request_observed<'a>(
 /// logical arguments are neither projected again nor admitted as literals.
 /// The caller owns immutable source/catalog/pool admission and the footer.
 pub(crate) fn author_physical_window_request_from_journal_observed<'source>(
-    entry: &CheckedExpressionLogicalSourceEntry<'source>,
+    entry: &CheckedWindowLogicalSourceEntry<'source>,
     pools: &ConstantPools,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<AuthoredPhysicalWindowRequest<'source>, PhysicalWindowRequestError> {
-    let is_window = entry.kind() == SqlExpressionCallKind::Window;
+    author_window_request_from_canonical_observed(
+        entry.source(),
+        entry.captured(),
+        entry.canonical_operational(),
+        || entry.fragment().values().get(&entry.source().output),
+        pools,
+        work,
+    )
+}
+
+fn author_window_request_from_canonical_observed<'source>(
+    source: &'source WindowCallSpec,
+    captured: &'source crate::binding::CapturedLogicalCallArguments,
+    canonical: &'source Arc<CanonicalCallOperationalRequest>,
+    output: impl FnOnce() -> Option<&'source novarocks_physical_plan::ValueDef>,
+    pools: &ConstantPools,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<AuthoredPhysicalWindowRequest<'source>, PhysicalWindowRequestError> {
     work.step()?;
-    if !is_window {
-        return Err(PhysicalWindowRequestError::InvalidSource(
-            "window journal has another source kind",
-        ));
-    }
-    let canonical = entry.canonical_operational();
-    work.step()?;
-    let canonical = canonical.ok_or(PhysicalWindowRequestError::InvalidSource(
-        "window journal has no canonical operational request",
-    ))?;
-    let belongs = canonical.belongs_to(entry.captured());
+    let belongs = canonical.belongs_to(captured);
     work.step()?;
     if !belongs {
         return Err(PhysicalWindowRequestError::InvalidSource(
             "window canonical request has another original capture",
         ));
     }
-    let source = entry.source();
-    let ExprKind::WindowCall {
-        function,
+    let WindowCallSpec {
+        binding: function,
         distinct,
-        args,
-        function_order_by,
+        arguments: args,
+        order_by: function_order_by,
         frame,
         ignore_nulls,
         aggregate_binding,
-    } = &source.kind
-    else {
-        return Err(PhysicalWindowRequestError::InvalidSource(
-            "window request is not an actual WindowCall",
-        ));
-    };
+        ..
+    } = source;
     let count = args.len().checked_add(function_order_by.len());
     work.step()?;
     let count = count
@@ -309,7 +308,7 @@ pub(crate) fn author_physical_window_request_from_journal_observed<'source>(
         ));
     }
     work.flush()?;
-    let original = entry.captured().binding().resolved();
+    let original = captured.binding().resolved();
     let identity = original.function_id == function.function_id
         && original.kind == function.kind
         && original.selected.overload == function.overload
@@ -327,7 +326,11 @@ pub(crate) fn author_physical_window_request_from_journal_observed<'source>(
             "window canonical result is not scalar",
         ));
     };
-    if !source.ty.exactly_equals_observed(result, || {
+    let output = output().ok_or(PhysicalWindowRequestError::InvalidSource(
+        "window output value is absent",
+    ))?;
+    work.step()?;
+    if !output.ty.exactly_equals_observed(result, || {
         work.step().map_err(PhysicalWindowRequestError::from)
     })? {
         return Err(PhysicalWindowRequestError::InvalidSource(
@@ -371,8 +374,7 @@ pub(crate) fn author_physical_window_request_from_journal_observed<'source>(
         aggregate_binding.as_deref(),
         work,
     )?;
-    let window =
-        window_options_observed(frame.as_ref(), *ignore_nulls, entry.fragment(), pools, work)?;
+    let window = window_options_observed(frame.as_ref(), *ignore_nulls, pools, work)?;
     work.flush()?;
     let selected = Arc::clone(selected);
     work.step()?;
@@ -383,12 +385,32 @@ pub(crate) fn author_physical_window_request_from_journal_observed<'source>(
         selected,
         arguments: WindowRequestArguments::BorrowedCanonical {
             request: canonical,
-            decimal_policy: entry.captured().binding().decimal_overflow_policy(),
-            constant_policy: entry.captured().constant_policy(),
+            decimal_policy: captured.binding().decimal_overflow_policy(),
+            constant_policy: captured.constant_policy(),
         },
         window,
         aggregate,
     })
+}
+
+/// Test-only access to the same request core from an actual raw emission.
+/// The view's original draft validator ran before this component invocation;
+/// neither this adapter nor its output is a Frozen-call receipt.
+#[cfg(test)]
+fn author_window_request_from_emission_for_test<'source>(
+    emission: &super::contract_lowering::original_emission_test_observer::OriginalWindowEmission<
+        'source,
+    >,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<AuthoredPhysicalWindowRequest<'source>, PhysicalWindowRequestError> {
+    author_window_request_from_canonical_observed(
+        emission.source(),
+        emission.captured(),
+        emission.canonical(),
+        || emission.builder().value(emission.source().output),
+        emission.constants(),
+        work,
+    )
 }
 
 fn signature_observed(
@@ -487,7 +509,6 @@ fn aggregate_options_observed(
 fn window_options_observed(
     frame: Option<&novarocks_physical_plan::WindowFrame>,
     ignore_nulls: bool,
-    fragment: &Fragment,
     pools: &ConstantPools,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<WindowCallOptions, PhysicalWindowRequestError> {
@@ -495,8 +516,8 @@ fn window_options_observed(
         .map(|frame| {
             Ok::<_, PhysicalWindowRequestError>(novarocks_type_contract::WindowFrame {
                 units: frame.units,
-                start: bound(frame.start, fragment, pools, work)?,
-                end: bound(frame.end, fragment, pools, work)?,
+                start: bound(frame.start, pools, work)?,
+                end: bound(frame.end, pools, work)?,
                 exclusion: frame.exclusion,
             })
         })
@@ -509,7 +530,6 @@ fn window_options_observed(
 
 fn bound(
     bound: WindowBound,
-    fragment: &Fragment,
     pools: &ConstantPools,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<novarocks_type_contract::WindowBound<u64>, PhysicalWindowRequestError> {
@@ -520,8 +540,8 @@ fn bound(
         Bound::CurrentRow => Bound::CurrentRow,
         Bound::UnboundedFollowing => Bound::UnboundedFollowing,
         Bound::Preceding(id) | Bound::Following(id) => {
-            let offset = window_offset_observed(fragment, pools, id, work)
-                .map_err(PhysicalArgumentError::from)?;
+            let offset =
+                window_offset_observed(pools, id, work).map_err(PhysicalArgumentError::from)?;
             work.step()?;
             let offset = offset.ok_or(PhysicalWindowRequestError::NonconstantFrameOffset(id))?;
             if matches!(bound, Bound::Preceding(_)) {

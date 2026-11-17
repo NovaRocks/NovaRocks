@@ -183,7 +183,7 @@ impl AggregateStateSources {
 /// request; this graph exposes every original emission without choosing one.
 #[derive(Clone, Copy)]
 pub(crate) struct CheckedAggregateStateInputs<'a> {
-    owner: &'a SqlAuthoredPhysicalPlan,
+    owner: super::SqlRelationalSourceFacts<'a>,
     root: AggregateStateEndpoint,
 }
 impl<'a> CheckedAggregateStateInputs<'a> {
@@ -228,7 +228,7 @@ impl<'a> CheckedAggregateStateInputs<'a> {
 /// A Writer merge borrows its own logical request and every actual input route.
 #[derive(Clone, Copy)]
 pub(crate) struct CheckedWriterAggregateStateInputs<'a> {
-    owner: &'a SqlAuthoredPhysicalPlan,
+    owner: super::SqlRelationalSourceFacts<'a>,
     root: AggregateStateEndpoint,
 }
 impl<'a> CheckedWriterAggregateStateInputs<'a> {
@@ -278,7 +278,7 @@ enum CheckedStateEmission<'a> {
 /// The sole walk visits each endpoint once while retaining ordered, repeated
 /// links. Writer terminals add no calls or cross-phase compatibility proof.
 fn visit_state_sources_observed<'a>(
-    owner: &'a SqlAuthoredPhysicalPlan,
+    owner: super::SqlRelationalSourceFacts<'a>,
     root: AggregateStateEndpoint,
     work: &mut CompileCheckpoints<'_>,
     emission: impl FnMut(
@@ -298,7 +298,7 @@ fn visit_state_sources_observed<'a>(
     ) -> Result<(), SqlSourceJournalError>,
 ) -> Result<(), SqlSourceJournalError> {
     visit_state_graph_observed(
-        &PublishedStateGraph(owner),
+        &ImmutableStateGraph(owner),
         root,
         work,
         emission,
@@ -519,12 +519,15 @@ fn check_transport_observed<'a, G: StateGraph<'a>>(
                 let pair = expressions.get(ordinal).copied();
                 work.step()?;
                 work.flush()?;
-                let expression = pair
-                    .and_then(|(expression, _)| graph.expression(endpoint.fragment, expression));
-                // ExprArena is an opaque owner lookup on the original meter.
+                let expression = pair.and_then(|(expression, _)| {
+                    graph
+                        .unit(endpoint.fragment, endpoint.node)
+                        .and_then(|unit| unit.root_definition(expression))
+                });
+                // The actual node unit is borrowed on the original meter.
                 work.step()?;
                 local_input && output && pair.is_some_and(|(_, value)| value == endpoint.value)
-                    && expression.is_some_and(|expr| matches!(expr.kind, novarocks_physical_plan::ExprKind::Value(value) if value == link.source.value))
+                    && expression.is_some_and(|expr| matches!(expr.kind, novarocks_expression_contract::ExprKind::Value(value) if value == link.source.value))
             }
             (
                 NodeKind::SetOp {
@@ -628,9 +631,13 @@ pub(super) fn check_state_inputs_observed<'a>(
         "aggregate merge has no original state input association",
     ))?;
     work.flush()?;
-    let actual = entry.fragment.expressions().get(expression);
+    let actual = entry
+        .node
+        .expressions
+        .as_ref()
+        .and_then(|unit| unit.definition(expression));
     work.step()?;
-    if endpoint.fragment != entry.fragment.id() || entry.node.inputs.as_ref() != [endpoint.node] || !actual.is_some_and(|expr| matches!(expr.kind, novarocks_physical_plan::ExprKind::Value(value) if value == endpoint.value)) {
+    if endpoint.fragment != entry.fragment.id() || entry.node.inputs.as_ref() != [endpoint.node] || !actual.is_some_and(|expr| matches!(expr.kind, novarocks_expression_contract::ExprKind::Value(value) if value == endpoint.value)) {
         return Err(SqlSourceJournalError::InvalidSource("aggregate state association differs from its actual merge channel"));
     }
     work.flush()?;
@@ -754,11 +761,11 @@ trait StateGraph<'a> {
         fragment: FragmentId,
         node: NodeId,
     ) -> Option<&'a novarocks_physical_plan::PhysicalNode>;
-    fn expression(
+    fn unit(
         &self,
         fragment: FragmentId,
-        expr: novarocks_physical_plan::ExprId,
-    ) -> Option<&'a novarocks_physical_plan::ExprNode>;
+        node: NodeId,
+    ) -> Option<super::super::unit_source::UnitDefinitions<'a>>;
     fn value(
         &self,
         fragment: FragmentId,
@@ -776,33 +783,34 @@ trait StateGraph<'a> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(Self::Emission, Option<AggregateStateEndpoint>), SqlSourceJournalError>;
 }
-struct PublishedStateGraph<'a>(&'a SqlAuthoredPhysicalPlan);
-impl<'a> StateGraph<'a> for PublishedStateGraph<'a> {
+struct ImmutableStateGraph<'a>(super::SqlRelationalSourceFacts<'a>);
+impl<'a> StateGraph<'a> for ImmutableStateGraph<'a> {
     type Emission = CheckedStateEmission<'a>;
     fn journal(&self) -> &'a super::SqlLogicalSourceJournal {
-        &self.0.call_sources
+        self.0.call_sources
     }
     fn node(&self, f: FragmentId, n: NodeId) -> Option<&'a novarocks_physical_plan::PhysicalNode> {
-        self.0.plan.fragments().get(&f)?.nodes().get(&n)
+        self.0.fragments.get(&f)?.nodes().get(&n)
     }
-    fn expression(
+    fn unit(
         &self,
         f: FragmentId,
-        e: novarocks_physical_plan::ExprId,
-    ) -> Option<&'a novarocks_physical_plan::ExprNode> {
-        self.0.plan.fragments().get(&f)?.expressions().get(e)
+        n: NodeId,
+    ) -> Option<super::super::unit_source::UnitDefinitions<'a>> {
+        let node = self.0.fragments.get(&f)?.nodes().get(&n)?;
+        Some(super::super::unit_source::UnitDefinitions::from_node(node))
     }
     fn value(&self, f: FragmentId, v: ValueId) -> Option<&'a novarocks_physical_plan::ValueDef> {
-        self.0.plan.fragments().get(&f)?.values().get(&v)
+        self.0.fragments.get(&f)?.values().get(&v)
     }
     fn edge(
         &self,
         e: novarocks_physical_plan::EdgeId,
     ) -> Option<&'a novarocks_physical_plan::Edge> {
-        self.0.plan.edges().get(&e)
+        self.0.edges.get(&e)
     }
     fn root(&self, f: FragmentId) -> Option<NodeId> {
-        Some(self.0.plan.fragments().get(&f)?.root())
+        Some(self.0.fragments.get(&f)?.root())
     }
     fn emission(
         &self,
@@ -812,7 +820,7 @@ impl<'a> StateGraph<'a> for PublishedStateGraph<'a> {
     ) -> Result<(Self::Emission, Option<AggregateStateEndpoint>), SqlSourceJournalError> {
         work.flush()?;
         let owner = self.0;
-        let fragment = owner.plan.fragments().get(&endpoint.fragment);
+        let fragment = owner.fragments.get(&endpoint.fragment);
         work.step()?;
         let fragment = fragment.ok_or(SqlSourceJournalError::MissingEntry)?;
         work.flush()?;
@@ -938,6 +946,22 @@ impl<'a> ConstructionStateGraph<'a> {
             &mut CompileCheckpoints<'_>,
         ) -> Result<(), SqlSourceJournalError>,
     ) -> Result<(), SqlSourceJournalError> {
+        let root = self.merge_root_observed(fragment, site, work)?;
+        visit_state_graph_observed(
+            self,
+            root,
+            work,
+            emission,
+            |_, _, _, _| Ok(()),
+            no_contribution,
+        )
+    }
+    fn merge_root_observed(
+        &self,
+        fragment: FragmentId,
+        site: PhysicalCallSite,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<AggregateStateEndpoint, SqlSourceJournalError> {
         let entry = self
             .journal
             .entries
@@ -958,15 +982,32 @@ impl<'a> ConstructionStateGraph<'a> {
         let node = self
             .node(fragment, node_id)
             .ok_or(SqlSourceJournalError::MissingEntry)?;
-        let root = construction_input_root(self, fragment, node, site, entry.runtime, work)?;
-        visit_state_graph_observed(
-            self,
-            root,
-            work,
-            emission,
-            |_, _, _, _| Ok(()),
-            no_contribution,
-        )
+        construction_input_root(self, fragment, node, site, entry.runtime, work)
+    }
+    #[cfg(test)]
+    pub(in crate::planner::distributed::build) fn visit_merge_path_for_test(
+        &self,
+        fragment: FragmentId,
+        site: PhysicalCallSite,
+        work: &mut CompileCheckpoints<'_>,
+        emission: impl FnMut(
+            ConstructionStateEmission<'a>,
+            AggregateStateEndpoint,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), SqlSourceJournalError>,
+        transport: impl FnMut(
+            AggregateStateEndpoint,
+            AggregateStateTransport,
+            &[AggregateStateLink],
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), SqlSourceJournalError>,
+    ) -> Result<(), SqlSourceJournalError> {
+        let root = self.merge_root_observed(fragment, site, work)?;
+        visit_state_graph_observed(self, root, work, emission, transport, |_, _| {
+            Err(SqlSourceJournalError::InvalidSource(
+                "ordinary original state route has a Writer non-contribution",
+            ))
+        })
     }
 }
 impl<'a> StateGraph<'a> for ConstructionStateGraph<'a> {
@@ -977,12 +1018,16 @@ impl<'a> StateGraph<'a> for ConstructionStateGraph<'a> {
     fn node(&self, f: FragmentId, n: NodeId) -> Option<&'a novarocks_physical_plan::PhysicalNode> {
         self.fragments.get(&f)?.construction_node(n)
     }
-    fn expression(
+    fn unit(
         &self,
         f: FragmentId,
-        e: novarocks_physical_plan::ExprId,
-    ) -> Option<&'a novarocks_physical_plan::ExprNode> {
-        self.fragments.get(&f)?.expressions().get(e)
+        n: NodeId,
+    ) -> Option<super::super::unit_source::UnitDefinitions<'a>> {
+        let builder = self.fragments.get(&f)?;
+        builder.construction_node(n)?;
+        Some(super::super::unit_source::UnitDefinitions::from_draft(
+            builder, n,
+        ))
     }
     fn value(&self, f: FragmentId, v: ValueId) -> Option<&'a novarocks_physical_plan::ValueDef> {
         self.fragments.get(&f)?.value(v)
@@ -1131,7 +1176,7 @@ fn construction_input_root<'a, G: StateGraph<'a>>(
         ));
     }
     let actual=match demand {
-        AggregateRuntimeDemand::ExpressionState(expr)=>graph.expression(fragment,expr).is_some_and(|expr|matches!(expr.kind,novarocks_physical_plan::ExprKind::Value(value) if value==root.value)),
+        AggregateRuntimeDemand::ExpressionState(expr)=>graph.unit(fragment,node.id).and_then(|unit| unit.definition(expr)).is_some_and(|expr|matches!(expr.kind,novarocks_expression_contract::ExprKind::Value(value) if value==root.value)),
         AggregateRuntimeDemand::WriterState(value)=>value==root.value,
         AggregateRuntimeDemand::Update=>false,
     };

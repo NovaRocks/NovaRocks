@@ -23,19 +23,23 @@ use novarocks_functions::{
     FunctionResolutionError, FunctionResultType, FunctionValueType, ResolvedAggregateSignature,
     ResolvedFunctionBinding, builtin::catalogue::build_builtin_engine_function_catalog,
 };
-use novarocks_physical_plan::{
-    AggregateBinding, AggregateCall, AggregateCallId, AggregateGrouping, AggregatePhase,
-    BoundFunction, BoundTableFunction, Distribution, ExprKind, FragmentId, FragmentSink,
-    FrozenCallError, FrozenFragmentCalls, FrozenPhysicalCall, NodeId, NodeKind, OutputPort,
-    PhysicalNode, PhysicalProperties, PipelineDopDomain, PlanLimits, RowMultiplicity,
-    TableFunctionOutput, ValueOrigin,
-};
 use novarocks_type_contract::{
-    AggregateStateFormatId, CallEffects, CallProofScope, DecimalOverflowPolicy,
+    AggregateStateFormatId, CallEffects, CallProofScope, DecimalOverflowPolicy, EvaluationDemand,
     FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError,
     FunctionNullBehavior, FunctionOverloadId, FunctionVolatility, ObservableEffects,
+    RelationEffectContext, RelationEffectRole,
 };
 use std::sync::{Arc, Mutex};
+use {
+    novarocks_expression_contract::{BoundFunction, ExprKind, RootOrdinal, RootScope},
+    novarocks_physical_plan::{
+        AggregateBinding, AggregateCall, AggregateCallId, AggregateGrouping, AggregatePhase,
+        BoundTableFunction, Distribution, FragmentId, FragmentSink, FrozenCallError,
+        FrozenFragmentCalls, FrozenPhysicalCall, NodeId, NodeKind, OutputPort, PhysicalNode,
+        PhysicalProperties, PipelineDopDomain, PlanLimits, RowMultiplicity, TableFunctionOutput,
+        ValueOrigin,
+    },
+};
 
 const CAUSES: [CompileControlError; 3] = [
     CompileControlError::Cancelled,
@@ -80,7 +84,11 @@ fn prefixes(
     wide: bool,
 ) -> Vec<(CompilePhase, u32)> {
     let baseline = Control::default();
-    assert_eq!(run(fragment, catalog, &baseline).is_ok(), success);
+    let result = run(fragment, catalog, &baseline);
+    let source_count = result
+        .as_ref()
+        .map_or(0, |authored| authored.relational_contexts.len());
+    assert_eq!(result.is_ok(), success);
     let trace = baseline.trace.lock().unwrap().clone();
     assert_eq!(trace.first(), Some(&(CompilePhase::Validate, 0)));
     assert!(
@@ -88,13 +96,31 @@ fn prefixes(
         "ordinary exits must observe their actual tail"
     );
     if wide {
-        assert!(trace.contains(&(CompilePhase::Validate, 256)));
+        let observed: u64 = trace
+            .iter()
+            .filter(|(phase, _)| *phase == CompilePhase::Validate)
+            .map(|(_, units)| u64::from(*units))
+            .sum();
+        assert!(source_count > novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK as usize);
+        assert!(
+            observed >= u64::try_from(source_count).unwrap(),
+            "every actual relation source contributes observed work"
+        );
     }
     let positions: Vec<_> = if wide {
+        // The enclosing author flushes before each real function owner and
+        // allocation. Sample the actual callback crossing one cumulative work
+        // quantum, rather than inventing a 256-unit callback at that boundary.
+        let mut observed = 0u64;
         let quantum = trace
             .iter()
-            .position(|item| *item == (CompilePhase::Validate, 256))
-            .unwrap();
+            .position(|(phase, units)| {
+                if *phase == CompilePhase::Validate {
+                    observed += u64::from(*units);
+                }
+                observed >= u64::from(novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK)
+            })
+            .expect("actual source work crosses one quantum");
         vec![0, quantum, trace.len() - 1]
     } else {
         (0..trace.len()).collect()
@@ -146,7 +172,7 @@ fn empty() -> (FragmentBuilder, NodeId) {
     builder
         .add_values(
             leaf,
-            Box::from([Box::<[ExprId]>::default()]),
+            Box::from([Box::<[RootOrdinal]>::default()]),
             Box::default(),
         )
         .unwrap();
@@ -162,7 +188,7 @@ fn scalar(resolved: ResolvedFunctionBinding) -> BoundFunction {
         kind: resolved.kind,
         argument_types: resolved.selected.argument_types,
         result_type,
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: resolved.semantics.volatility,
             argument_evaluation: resolved.semantics.argument_evaluation,
             failure_behavior: resolved.semantics.failure_behavior,
@@ -201,7 +227,7 @@ fn aggregate(
     builder: &mut FragmentBuilder,
     input: NodeId,
     owner: NodeId,
-    bindings: Vec<(AggregateBinding, Box<[ExprId]>)>,
+    bindings: Vec<(AggregateBinding, Box<[RootOrdinal]>)>,
 ) {
     let mut calls = Vec::new();
     let mut output = Vec::new();
@@ -225,6 +251,7 @@ fn aggregate(
     }
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: owner,
             inputs: Box::from([input]),
             required_inputs: Box::from([properties()]),
@@ -258,33 +285,21 @@ fn count_fragment(
     );
     finish(builder, owner)
 }
-fn assert_contexts(authored: &AuthoredPhysicalOccurrences) {
-    let expression_count = authored.root_uses.flow().uses().len();
+fn assert_contexts(authored: &AuthoredPhysicalOccurrences<'_>) {
     for (ordinal, (_, context)) in authored.relational_contexts.iter().enumerate() {
-        assert_eq!(context.use_id.get() as usize, expression_count + ordinal);
-        assert!(
-            !authored
-                .root_uses
-                .flow()
-                .uses()
-                .contains_key(&context.use_id)
-        );
-        assert_eq!(
-            context.demand,
-            novarocks_type_contract::EvaluationDemand::Value
-        );
-        let domain = authored.root_uses.flow().regions()[&context.region];
-        assert!(domain.parent.is_none());
-        assert!(domain.guard.is_none());
+        assert_eq!(context.identity.call.get() as usize, ordinal);
+        assert_eq!(context.identity.role, RelationEffectRole::Call);
+        assert!(context.is_call());
+        assert_eq!(context.demand, EvaluationDemand::Value);
     }
     for pair in authored.relational_contexts.windows(2) {
-        assert_ne!(pair[0].1.use_id, pair[1].1.use_id);
-        assert_ne!(pair[0].1.region, pair[1].1.region);
+        assert_ne!(pair[0].1.identity.call, pair[1].1.identity.call);
     }
+    assert_eq!(authored.writer_value_uses().count(), 0);
 }
-fn effects(control: ArgumentControl, domain: EvaluationRegionId) -> CallEffects {
-    // Explicit public structural claims for the ID-collision test. These do
-    // not prove installed preparation or authorize an execution lifecycle.
+fn effects(control: ArgumentControl, context: RelationEffectContext) -> CallEffects {
+    // Explicit public structural claims test FrozenFragmentCalls identities.
+    // These are not installed preparation receipts or a SQL source journal.
     CallEffects {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: if control == ArgumentControl::Aggregate {
@@ -306,8 +321,62 @@ fn effects(control: ArgumentControl, domain: EvaluationRegionId) -> CallEffects 
         },
         observable_effects: ObservableEffects::NONE,
         environment: Box::default(),
-        proof_scope: CallProofScope::Region(domain),
+        proof_scope: CallProofScope::Relation(context.identity),
     }
+}
+fn seal_function_node(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    pools: &novarocks_physical_plan::ConstantPools,
+    catalog: &EngineFunctionCatalog,
+) {
+    use super::super::{
+        expression_component_test_fixture::seal_node_observed,
+        physical_expression_effects::{
+            PhysicalCallSourceScope, PhysicalExpressionEffectsInput,
+            author_physical_expression_effects_observed,
+        },
+    };
+    let control = Control::default();
+    let mut work =
+        CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
+    let sealed =
+        seal_node_observed(builder, node, pools, catalog, checked::policy(), &mut work).unwrap();
+    let scopes = sealed
+        .uses()
+        .iter()
+        .filter_map(|(&id, item)| {
+            let source = sealed.definition(item.definition).unwrap();
+            matches!(source.kind, ExprKind::FunctionCall { .. }).then_some((
+                id,
+                PhysicalCallSourceScope {
+                    source,
+                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                    environment: &[],
+                    proof_scope: CallProofScope::Region(item.context.region),
+                },
+            ))
+        })
+        .collect();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
+    work.flush().unwrap();
+    let authored = author_physical_expression_effects_observed(
+        PhysicalExpressionEffectsInput {
+            owner: crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(node),
+            unit: &sealed,
+            constants: pools,
+            parameters: &parameters,
+            literal_policy: checked::policy(),
+            call_scopes: &scopes,
+        },
+        catalog,
+        work.control(),
+    )
+    .unwrap();
+    drop(scopes);
+    let unit = sealed.finish(authored.calls, &mut work).unwrap();
+    work.finish().unwrap();
+    builder.install_unit(node, Arc::new(unit)).unwrap();
 }
 #[derive(Clone, Debug)]
 struct MetadataOnly;
@@ -351,7 +420,12 @@ impl SqlFunctionCatalog for MetadataOnly {
 fn relational_rootless_count_star_has_its_own_value_use_and_unguarded_domain() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let fragment = count_fragment(&catalog, 1, |_| {});
-    assert!(fragment.expressions().is_empty());
+    assert!(
+        fragment
+            .nodes()
+            .values()
+            .all(|node| node.expressions.is_none())
+    );
     let NodeKind::Aggregate { calls, .. } = &fragment.nodes()[&NodeId::new(901)].kind else {
         unreachable!()
     };
@@ -370,8 +444,6 @@ fn relational_rootless_count_star_has_its_own_value_use_and_unguarded_domain() {
     assert_eq!(calls[0].binding.logical_argument_count, 0);
     assert_eq!(calls[0].binding.phase, AggregatePhase::Single);
     let authored = run(&fragment, &catalog, &Control::default()).unwrap();
-    assert!(authored.root_uses.bindings().is_empty());
-    assert!(authored.root_uses.flow().uses().is_empty());
     assert_eq!(authored.relational_contexts.len(), 1);
     assert_eq!(
         authored.relational_contexts[0].0,
@@ -381,10 +453,9 @@ fn relational_rootless_count_star_has_its_own_value_use_and_unguarded_domain() {
         }
     );
     assert_eq!(
-        authored.relational_contexts[0].1.use_id,
-        ExpressionUseId::new(0)
+        authored.relational_contexts[0].1.identity.call,
+        novarocks_type_contract::RelationCallId::new(0)
     );
-    assert_eq!(authored.root_uses.flow().regions().len(), 1);
     assert_contexts(&authored);
     prefixes(&fragment, &catalog, true, false);
 }
@@ -395,7 +466,9 @@ fn relational_count_value_and_scalar_argument_uses_stay_disjoint_and_frozen_coll
     let (mut builder, input) = empty();
     let owner = NodeId::new(901);
     let text = ty(DataType::Utf8, false);
-    let literal = builder.constant(owner, text.clone(), checked::utf8("MiXeD".into()));
+    let mut pools = novarocks_physical_plan::ConstantPools::empty();
+    let kind = checked::insert(&mut pools, checked::utf8("MiXeD".into())(&text));
+    let literal = builder.add_expression(owner, text.clone(), kind).unwrap();
     let args = [FunctionArgument::Value {
         value_type: text,
         constant: None,
@@ -415,61 +488,74 @@ fn relational_count_value_and_scalar_argument_uses_stay_disjoint_and_frozen_coll
             },
         )
         .unwrap();
+    let argument = builder
+        .unit(owner)
+        .unwrap()
+        .root(lowered, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let binding = count(&catalog, &[lower.result_type]);
     aggregate(
         &mut builder,
         input,
         owner,
-        vec![(binding, Box::from([lowered]))],
+        vec![(binding, Box::from([argument]))],
     );
+    seal_function_node(&mut builder, owner, &pools, &catalog);
     let fragment = finish(builder, owner);
+    let unit = fragment.nodes()[&owner].expressions.as_deref().unwrap();
+    assert_eq!(unit.roots().len(), 1);
+    assert_eq!(unit.control_flow().uses().len(), 2);
+    assert_eq!(unit.claims().len(), 1);
+    assert_eq!(unit.ports().len(), 1);
+    assert!(unit.ports()[0].values.is_empty());
+    assert_eq!(unit.root(argument).unwrap().scope, RootScope::Port(0));
+    assert_eq!(unit.root(argument).unwrap().demand, EvaluationDemand::Value);
+    let scalar_use = unit.root_use_ids()[argument.get() as usize];
+    let scalar_context = unit.control_flow().uses()[&scalar_use].context;
     let authored = run(&fragment, &catalog, &Control::default()).unwrap();
-    assert_eq!(authored.root_uses.bindings().len(), 1);
-    assert_eq!(authored.root_uses.flow().uses().len(), 2);
     assert_eq!(authored.relational_contexts.len(), 1);
     assert_contexts(&authored);
-    let scalar_use = *authored.root_uses.bindings().values().next().unwrap();
-    let scalar_context = authored.root_uses.flow().uses()[&scalar_use].context;
     let (site, context) = authored.relational_contexts[0];
-    assert_eq!(context.use_id, ExpressionUseId::new(2));
-    assert_ne!(context.region, scalar_context.region);
-    let scalar_call = FrozenPhysicalCall {
-        materialized_writer_input: None,
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
-        temporal_source: None,
-        site: PhysicalCallSite::Expression(scalar_use),
-        context: scalar_context,
-        effects: effects(ArgumentControl::Eager, scalar_context.region),
-        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-    };
+    // Equal underlying numbers are legal across independent typed spaces.
+    // A scalar context cannot be assigned to FrozenPhysicalCall.context.
+    assert_eq!(context.identity.call.get(), scalar_use.get());
+    assert_eq!(scalar_context.use_id, scalar_use);
+    assert_eq!(scalar_context.demand, EvaluationDemand::Value);
     let aggregate_call = FrozenPhysicalCall {
-        materialized_writer_input: None,
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
-        temporal_source: None,
         site,
         context,
-        effects: effects(ArgumentControl::Aggregate, context.region),
+        materialized_writer_input: None,
+        effects: effects(ArgumentControl::Aggregate, context),
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
     };
-    FrozenFragmentCalls::try_new(
-        &fragment,
-        &authored.root_uses,
-        vec![scalar_call.clone(), aggregate_call.clone()],
-        &Control::default(),
-    )
-    .unwrap();
-    let mut bad = aggregate_call;
-    bad.context.use_id = scalar_use;
+    FrozenFragmentCalls::try_new(&fragment, vec![aggregate_call.clone()], &Control::default())
+        .unwrap();
+    let mut wrong_role = aggregate_call;
+    wrong_role.context = RelationEffectContext::materialized_input(context.identity.call);
     assert!(matches!(
-        FrozenFragmentCalls::try_new(
-            &fragment,
-            &authored.root_uses,
-            vec![scalar_call, bad],
-            &Control::default()
-        ),
-        Err(FrozenCallError::SharedUse)
+        FrozenFragmentCalls::try_new(&fragment, vec![wrong_role], &Control::default()),
+        Err(FrozenCallError::WrongContext)
+    ));
+    // A collision remains rejectable in the actual relation namespace.
+    let pair = count_fragment(&catalog, 2, |_| {});
+    let pair_uses = run(&pair, &catalog, &Control::default()).unwrap();
+    let calls: Vec<_> = pair_uses
+        .relational_contexts
+        .iter()
+        .map(|&(site, context)| FrozenPhysicalCall {
+            site,
+            context,
+            materialized_writer_input: None,
+            effects: effects(ArgumentControl::Aggregate, context),
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+        })
+        .collect();
+    FrozenFragmentCalls::try_new(&pair, calls.clone(), &Control::default()).unwrap();
+    let mut bad = calls;
+    bad[1].context.identity.call = bad[0].context.identity.call;
+    assert!(matches!(
+        FrozenFragmentCalls::try_new(&pair, bad, &Control::default()),
+        Err(FrozenCallError::DuplicateIdentity)
     ));
     prefixes(&fragment, &catalog, true, false);
 }
@@ -490,6 +576,11 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
     };
     let original_layout = original_layout.clone();
     let literal = builder.constant(leaf, list.clone(), checked::null());
+    let cell = builder
+        .unit(leaf)
+        .unwrap()
+        .root(literal, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
     let value = builder
         .add_value(
             list.clone(),
@@ -500,10 +591,15 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
         )
         .unwrap();
     builder
-        .add_values(leaf, Box::from([Box::from([literal])]), Box::from([value]))
+        .add_values(leaf, Box::from([Box::from([cell])]), Box::from([value]))
         .unwrap();
     let argument = builder
         .add_expression(owner, list.clone(), ExprKind::Value(value))
+        .unwrap();
+    let parameter = builder
+        .unit(owner)
+        .unwrap()
+        .root(argument, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let request = [FunctionArgument::Value {
         value_type: list,
@@ -520,7 +616,7 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
         overload: resolved.selected.overload,
         argument_types: resolved.selected.argument_types,
         result_types: result_types.clone(),
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: resolved.semantics.volatility,
             argument_evaluation: resolved.semantics.argument_evaluation,
             failure_behavior: resolved.semantics.failure_behavior,
@@ -540,6 +636,7 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: owner,
             inputs: Box::from([leaf]),
             required_inputs: Box::from([properties()]),
@@ -550,7 +647,7 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
             },
             kind: NodeKind::TableFunction {
                 function,
-                arguments: Box::from([argument]),
+                arguments: Box::from([parameter]),
                 outputs: Box::from([TableFunctionOutput::FunctionResult {
                     result_ordinal: 0,
                     value: output,
@@ -561,32 +658,45 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
         .unwrap();
     let fragment = finish(builder, owner);
     let authored = run(&fragment, &catalog, &Control::default()).unwrap();
-    assert_eq!(authored.root_uses.bindings().len(), 2);
-    assert_eq!(authored.root_uses.flow().uses().len(), 2);
+    let units: Vec<_> = fragment
+        .nodes()
+        .values()
+        .filter_map(|node| node.expressions.as_deref())
+        .collect();
+    assert_eq!(
+        units.iter().map(|unit| unit.roots().len()).sum::<usize>(),
+        2
+    );
+    assert_eq!(
+        units
+            .iter()
+            .map(|unit| unit.control_flow().uses().len())
+            .sum::<usize>(),
+        2
+    );
     assert_eq!(authored.relational_contexts.len(), 1);
     assert_contexts(&authored);
     assert_eq!(
         authored.relational_contexts[0].0,
         PhysicalCallSite::Table { node: owner }
     );
-    let DataType::List(original) = &fragment.expressions().get(argument).unwrap().ty.data_type()
-    else {
+    let unit = fragment.nodes()[&owner].expressions.as_deref().unwrap();
+    let DataType::List(original) = unit.definition(argument).unwrap().ty.data_type() else {
         unreachable!()
     };
     assert!(Arc::ptr_eq(original, &original_layout));
     assert_eq!(original.name(), "item");
     assert!(original.metadata().is_empty());
     assert_eq!(field.metadata()["unknown-source"], "preserved");
-    let source = authored
-        .root_uses
-        .roots()
-        .sites()
-        .values()
-        .find(|root| root.expr == argument)
-        .unwrap();
+    let source = unit.root(parameter).unwrap();
+    assert_eq!(source.definition, argument);
+    assert_eq!(source.demand, EvaluationDemand::Value);
+    assert_eq!(source.scope, RootScope::Port(0));
+    let scalar = unit.control_flow().uses()[&unit.root_use_ids()[parameter.get() as usize]].context;
+    assert_eq!(scalar.demand, EvaluationDemand::Value);
     assert_eq!(
-        source.demand,
-        novarocks_type_contract::EvaluationDemand::Value
+        authored.relational_contexts[0].1.identity.role,
+        RelationEffectRole::Call
     );
     prefixes(&fragment, &catalog, true, false);
 }
@@ -643,10 +753,14 @@ fn relational_320_real_count_calls_observe_source_quantum_and_distinct_actual_co
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let fragment = count_fragment(&catalog, 320, |_| {});
     let authored = run(&fragment, &catalog, &Control::default()).unwrap();
-    assert!(authored.root_uses.flow().uses().is_empty());
-    assert!(authored.root_uses.bindings().is_empty());
+    assert!(
+        fragment
+            .nodes()
+            .values()
+            .all(|node| node.expressions.is_none())
+    );
     assert_eq!(authored.relational_contexts.len(), 320);
-    assert_eq!(authored.root_uses.flow().regions().len(), 320);
+    assert_eq!(authored.writer_value_uses().count(), 0);
     assert_contexts(&authored);
     for (ordinal, (site, context)) in authored.relational_contexts.iter().enumerate() {
         assert_eq!(
@@ -656,9 +770,56 @@ fn relational_320_real_count_calls_observe_source_quantum_and_distinct_actual_co
                 call: ordinal as u32
             }
         );
-        assert_eq!(context.use_id.get() as usize, ordinal);
+        assert_eq!(context.identity.call.get() as usize, ordinal);
     }
-    // Wide source sampling covers actual entry, collector quantum and final
-    // tail; the small cases above test every actual callback for all causes.
+    // The sole physical relational walker owns the uninterrupted source
+    // traversal. Its real 320-call loop still reaches an exact 256 callback;
+    // the installed-owner composer intentionally flushes more often.
+    let invoke = |control: &Control| -> Result<Vec<PhysicalCallSite>, FrozenCallError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let mut sites = Vec::new();
+        let result = novarocks_physical_plan::visit_relational_calls_observed(
+            &fragment,
+            &mut work,
+            |site, _, _| {
+                sites.push(site);
+                Ok::<_, FrozenCallError>(())
+            },
+        )
+        .map(|()| sites);
+        work.finish_result(result, FrozenCallError::Control)
+    };
+    let baseline = Control::default();
+    let sites = invoke(&baseline).unwrap();
+    assert_eq!(
+        sites,
+        authored
+            .relational_contexts
+            .iter()
+            .map(|(site, _)| *site)
+            .collect::<Vec<_>>()
+    );
+    let trace = baseline.trace.lock().unwrap().clone();
+    assert_eq!(trace.first(), Some(&(CompilePhase::Validate, 0)));
+    assert!(
+        trace
+            .iter()
+            .all(|(phase, units)| *phase == CompilePhase::Validate && *units <= 256)
+    );
+    assert!(trace.contains(&(CompilePhase::Validate, 256)));
+    for at in 0..trace.len() {
+        for cause in CAUSES {
+            let control = Control {
+                trace: Mutex::default(),
+                refusal: Some((at, cause.clone())),
+            };
+            assert!(
+                matches!(invoke(&control), Err(FrozenCallError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+        }
+    }
+    // The actual installed-owner composition retains its own entry, original
+    // cumulative work boundary and final-tail sampling for all three causes.
     prefixes(&fragment, &catalog, true, true);
 }

@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use novarocks_functions::{ConstantPolicy, ScopedExpressionEffects};
+use novarocks_functions::ConstantPolicy;
 use novarocks_physical_plan::{
     AggregateCall, AggregatePhase, ConstantPools, Fragment, FrozenCallError, FrozenFragmentCalls,
     NodeKind, PhysicalCallBinding, PhysicalCallSite, PhysicalNode, WriterAggregateCall,
@@ -27,13 +27,12 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
-    ExpressionUseId, MAX_CONTROL_USE_REFERENCES, PureCompileControl, SemanticParameterRef,
-    SemanticParameters,
+    MAX_CONTROL_USE_REFERENCES, PureCompileControl, SemanticParameterRef, SemanticParameters,
 };
 
 use super::{
     expression_occurrences::{AuthoredPhysicalOccurrences, ExpressionOccurrenceError},
-    lowered_draft::{SqlAuthoredPhysicalPlan, SqlSourceJournalError},
+    lowered_draft::{SqlRelationalSourceFacts, SqlSourceJournalError},
     physical_aggregate_occurrences::{
         PhysicalAggregateMergeOccurrenceInput, PhysicalAggregateOccurrenceError,
         PhysicalAggregateOccurrenceInput, prepare_physical_aggregate_merge_occurrence_observed,
@@ -44,10 +43,7 @@ use super::{
         author_physical_aggregate_update_request_from_journal_observed,
         author_physical_aggregate_update_request_observed,
     },
-    physical_expression_effects::{
-        PhysicalCallSourceScope, PhysicalExpressionEffectsError, PhysicalExpressionEffectsInput,
-        author_physical_expression_effects_observed, author_sql_expression_effects_observed,
-    },
+    physical_expression_effects::PhysicalExpressionEffectsError,
     physical_table_occurrences::{
         PhysicalTableOccurrenceError, PhysicalTableOccurrenceInput,
         prepare_physical_table_occurrence_observed,
@@ -55,6 +51,14 @@ use super::{
     physical_table_requests::{
         PhysicalTableRequestError, author_physical_table_request_from_journal_observed,
         author_physical_table_request_observed,
+    },
+    physical_window_occurrences::{
+        PhysicalWindowOccurrenceError, PhysicalWindowOccurrenceInput,
+        prepare_physical_window_occurrence_observed,
+    },
+    physical_window_requests::{
+        PhysicalWindowRequestError, author_physical_window_request_from_journal_observed,
+        author_physical_window_request_observed,
     },
     physical_writer_occurrences::{
         PhysicalWriterOccurrenceError, PhysicalWriterOccurrenceInput,
@@ -79,7 +83,10 @@ pub(crate) struct PhysicalFragmentEffectsInput<'a> {
     pub constants: &'a ConstantPools,
     pub parameters: &'a SemanticParameters,
     pub literal_policy: ConstantPolicy,
-    pub expression_scopes: &'a BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'a>>,
+    pub node_effects: &'a BTreeMap<
+        novarocks_physical_plan::NodeId,
+        super::contract_lowering::NodeExpressionEffects,
+    >,
     pub relational_scopes: &'a BTreeMap<PhysicalCallSite, PhysicalRelationalCallSourceScope<'a>>,
 }
 
@@ -87,7 +94,6 @@ pub(crate) struct PhysicalFragmentEffectsInput<'a> {
 /// It is not complete source admission or a PhysicalPlan/Package publication.
 #[derive(Debug)]
 pub(crate) struct AuthoredPhysicalFragmentEffects {
-    pub summaries: BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     pub calls: FrozenFragmentCalls,
 }
 
@@ -99,6 +105,8 @@ pub(crate) enum PhysicalFragmentEffectsError {
     AggregateRequest(PhysicalAggregateRequestError),
     Journal(SqlSourceJournalError),
     Aggregate(PhysicalAggregateOccurrenceError),
+    WindowRequest(PhysicalWindowRequestError),
+    Window(PhysicalWindowOccurrenceError),
     TableRequest(PhysicalTableRequestError),
     Table(PhysicalTableOccurrenceError),
     WriterRequest(PhysicalWriterRequestError),
@@ -130,6 +138,8 @@ nested_error!(PhysicalExpressionEffectsError, Expressions);
 nested_error!(PhysicalAggregateRequestError, AggregateRequest);
 nested_error!(SqlSourceJournalError, Journal);
 nested_error!(PhysicalAggregateOccurrenceError, Aggregate);
+nested_error!(PhysicalWindowRequestError, WindowRequest);
+nested_error!(PhysicalWindowOccurrenceError, Window);
 nested_error!(PhysicalTableRequestError, TableRequest);
 nested_error!(PhysicalTableOccurrenceError, Table);
 nested_error!(PhysicalWriterRequestError, WriterRequest);
@@ -167,7 +177,7 @@ pub(crate) fn author_physical_fragment_effects_observed(
 /// Per-use source scopes remain mandatory caller obligations. This composes
 /// fresh calls; it does not replace full static or Package publication gates.
 pub(crate) fn author_sql_fragment_effects_observed(
-    owner: &SqlAuthoredPhysicalPlan,
+    owner: SqlRelationalSourceFacts<'_>,
     input: PhysicalFragmentEffectsInput<'_>,
     control: &dyn PureCompileControl,
 ) -> Result<AuthoredPhysicalFragmentEffects, PhysicalFragmentEffectsError> {
@@ -181,7 +191,7 @@ pub(crate) fn author_sql_fragment_effects_observed(
 
 enum PhysicalCallSources<'a> {
     DirectPhysical,
-    SqlJournal(&'a SqlAuthoredPhysicalPlan),
+    SqlJournal(SqlRelationalSourceFacts<'a>),
 }
 
 fn compose_fragment_effects_observed(
@@ -193,11 +203,11 @@ fn compose_fragment_effects_observed(
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let result = (|| {
         if let PhysicalCallSources::SqlJournal(owner) = &sources {
-            let original = owner.plan().fragments().get(&input.fragment.id());
+            let original = owner.fragments().get(&input.fragment.id());
             work.step()?;
             let same = original.is_some_and(|value| std::ptr::eq(value, input.fragment))
-                && std::ptr::eq(owner.plan().constants(), input.constants)
-                && std::ptr::eq(owner.plan().parameters(), input.parameters);
+                && std::ptr::eq(owner.constants(), input.constants)
+                && std::ptr::eq(owner.parameters(), input.parameters);
             work.step()?;
             if !same {
                 return Err(PhysicalFragmentEffectsError::InvalidSource(
@@ -212,14 +222,7 @@ fn compose_fragment_effects_observed(
         // grammar before preparing any expression or relational owner.
         let mut relational_count = 0usize;
         visit_relational_calls_observed(input.fragment, &mut work, |site, binding, work| {
-            let node = match site {
-                PhysicalCallSite::Table { node }
-                | PhysicalCallSite::Aggregate { node, .. }
-                | PhysicalCallSite::TopNState { node, .. }
-                | PhysicalCallSite::WriterPartial { node, .. }
-                | PhysicalCallSite::WriterFinal { node, .. } => node,
-                _ => return Err(PhysicalFragmentEffectsError::UnsupportedLifecycle(site)),
-            };
+            let node = site.node();
             let actual = input.fragment.nodes().get(&node);
             work.step()?;
             let scope = input.relational_scopes.get(&site);
@@ -229,6 +232,17 @@ fn compose_fragment_effects_observed(
                 PhysicalCallBinding::Table(function) => {
                     matches!(&scope.source.kind, NodeKind::TableFunction { function: original, .. } if std::ptr::eq(original, function))
                 }
+                PhysicalCallBinding::Window {
+                    function,
+                    aggregate,
+                } => window_source(scope.source, site).is_ok_and(|call| {
+                    std::ptr::eq(&call.binding, function)
+                        && match (call.aggregate_binding.as_deref(), aggregate) {
+                            (None, None) => true,
+                            (Some(left), Some(right)) => std::ptr::eq(left, right),
+                            _ => false,
+                        }
+                }),
                 PhysicalCallBinding::Aggregate(binding) => {
                     if matches!(
                         site,
@@ -242,7 +256,6 @@ fn compose_fragment_effects_observed(
                             .is_ok_and(|source| std::ptr::eq(&source.binding, binding))
                     }
                 }
-                _ => false,
             };
             let same =
                 actual.is_some_and(|actual| std::ptr::eq(actual, scope.source)) && original_binding;
@@ -266,33 +279,30 @@ fn compose_fragment_effects_observed(
                 "relational source scopes contain an extra call site",
             ));
         }
-        work.flush()?;
-        let expression_input = PhysicalExpressionEffectsInput {
-            fragment: input.fragment,
-            roots: &input.occurrences.root_uses,
-            constants: input.constants,
-            parameters: input.parameters,
-            literal_policy: input.literal_policy,
-            call_scopes: input.expression_scopes,
-            temporal_sources: Some(&input.occurrences.temporal_sources),
-        };
-        let expressions = match &sources {
-            PhysicalCallSources::DirectPhysical => {
-                author_physical_expression_effects_observed(expression_input, functions, control)?
+        // Each temporary summary owner must loan this exact installed unit.
+        let mut unit_count = 0usize;
+        for node in input.fragment.nodes().values() {
+            work.step()?;
+            if let Some(unit) = node.expressions.as_deref() {
+                let effects = input.node_effects.get(&node.id);
+                work.step()?;
+                if !effects.is_some_and(|effects| std::ptr::eq(unit, effects.unit())) {
+                    return Err(PhysicalFragmentEffectsError::InvalidSource(
+                        "relation composition has missing or foreign node-unit summaries",
+                    ));
+                }
+                unit_count = unit_count
+                    .checked_add(1)
+                    .ok_or(CompileControlError::ResourceExhausted)?;
             }
-            PhysicalCallSources::SqlJournal(owner) => {
-                author_sql_expression_effects_observed(owner, expression_input, control)?
-            }
-        };
+        }
+        if unit_count != input.node_effects.len() {
+            return Err(PhysicalFragmentEffectsError::InvalidSource(
+                "relation composition has extra node-unit summaries",
+            ));
+        }
         work.flush()?;
-        let mut calls = expressions.calls;
-        let total = calls
-            .len()
-            .checked_add(relational_count)
-            .filter(|&count| count <= MAX_CONTROL_USE_REFERENCES);
-        work.step()?;
-        total.ok_or(CompileControlError::ResourceExhausted)?;
-        work.flush()?;
+        let mut calls = Vec::new();
         calls
             .try_reserve_exact(relational_count)
             .map_err(|_| CompileControlError::ResourceExhausted)?;
@@ -302,6 +312,62 @@ fn compose_fragment_effects_observed(
             work.step()?;
             let scope = scope.ok_or(PhysicalFragmentEffectsError::MissingScope(site))?;
             let frozen = match binding {
+                PhysicalCallBinding::Window { .. } => {
+                    let source = window_source(scope.source, site)?;
+                    let request = match &sources {
+                        PhysicalCallSources::DirectPhysical => {
+                            author_physical_window_request_observed(
+                                source,
+                                scope.source,
+                                input.constants,
+                                input.literal_policy,
+                                work,
+                            )?
+                        }
+                        PhysicalCallSources::SqlJournal(owner) => {
+                            let entry = owner.checked_window_source_observed(
+                                input.fragment,
+                                scope.source,
+                                site,
+                                source,
+                                work,
+                            )?;
+                            let request = author_physical_window_request_from_journal_observed(
+                                &entry,
+                                input.constants,
+                                work,
+                            )?;
+                            let same = request.captured_constant_policy()
+                                == Some(input.literal_policy)
+                                && request.captured_decimal_overflow_policy()
+                                    == Some(scope.decimal_overflow_policy);
+                            work.step()?;
+                            if !same {
+                                return Err(PhysicalFragmentEffectsError::InvalidSource(
+                                    "SQL Window occurrence changes its original captured policy",
+                                ));
+                            }
+                            request
+                        }
+                    };
+                    prepare_physical_window_occurrence_observed(
+                        PhysicalWindowOccurrenceInput {
+                            node: scope.source,
+                            site,
+                            source,
+                            request: &request,
+                            occurrences: input.occurrences,
+                            child_effects: input.node_effects.get(&scope.source.id),
+                            parameters: input.parameters,
+                            environment: scope.environment,
+                            decimal_overflow_policy: scope.decimal_overflow_policy,
+                            proof_scope: scope.proof_scope,
+                        },
+                        functions,
+                        work,
+                    )?
+                    .frozen
+                }
                 PhysicalCallBinding::Table(_) => {
                     let request = match &sources {
                         PhysicalCallSources::DirectPhysical => {
@@ -340,7 +406,7 @@ fn compose_fragment_effects_observed(
                             source: scope.source,
                             request: &request,
                             occurrences: input.occurrences,
-                            child_effects: &expressions.summaries,
+                            child_effects: input.node_effects.get(&scope.source.id),
                             parameters: input.parameters,
                             environment: scope.environment,
                             decimal_overflow_policy: scope.decimal_overflow_policy,
@@ -414,7 +480,7 @@ fn compose_fragment_effects_observed(
                                     source,
                                     request: &request,
                                     occurrences: input.occurrences,
-                                    child_effects: &expressions.summaries,
+                                    child_effects: input.node_effects.get(&scope.source.id),
                                     parameters: input.parameters,
                                     environment: scope.environment,
                                     decimal_overflow_policy: scope.decimal_overflow_policy,
@@ -453,7 +519,7 @@ fn compose_fragment_effects_observed(
                                             source,
                                             request: &request,
                                             occurrences: input.occurrences,
-                                            child_effects: &expressions.summaries,
+                                            child_effects: input.node_effects.get(&scope.source.id),
                                             parameters: input.parameters,
                                             environment: scope.environment,
                                             decimal_overflow_policy: scope.decimal_overflow_policy,
@@ -476,7 +542,7 @@ fn compose_fragment_effects_observed(
                                             source,
                                             request: &request,
                                             occurrences: input.occurrences,
-                                            child_effects: &expressions.summaries,
+                                            child_effects: input.node_effects.get(&scope.source.id),
                                             parameters: input.parameters,
                                             environment: scope.environment,
                                             decimal_overflow_policy: scope.decimal_overflow_policy,
@@ -491,30 +557,41 @@ fn compose_fragment_effects_observed(
                         }
                     }
                 }
-                _ => return Err(PhysicalFragmentEffectsError::UnsupportedLifecycle(site)),
             };
             calls.push(frozen);
             work.step()?;
             Ok(())
         })?;
         work.flush()?;
-        let calls = FrozenFragmentCalls::try_new(
-            input.fragment,
-            &input.occurrences.root_uses,
-            calls,
-            control,
-        )?;
+        let calls = FrozenFragmentCalls::try_new(input.fragment, calls, control)?;
         work.flush()?;
-        Ok(AuthoredPhysicalFragmentEffects {
-            summaries: expressions.summaries,
-            calls,
-        })
+        Ok(AuthoredPhysicalFragmentEffects { calls })
     })();
     work.finish_result(result, PhysicalFragmentEffectsError::from)
 }
 
 /// Borrow the original call selected by the sole visitor's node/ordinal site.
 /// The sealed request still verifies this exact call/node/source association.
+pub(super) fn window_source(
+    node: &PhysicalNode,
+    site: PhysicalCallSite,
+) -> Result<&novarocks_physical_plan::WindowCallSpec, PhysicalFragmentEffectsError> {
+    match (site, &node.kind) {
+        (PhysicalCallSite::Window { node: owner, call }, NodeKind::Window(spec))
+            if owner == node.id =>
+        {
+            spec.calls
+                .get(call as usize)
+                .ok_or(PhysicalFragmentEffectsError::InvalidSource(
+                    "Window site has no actual ordered call",
+                ))
+        }
+        _ => Err(PhysicalFragmentEffectsError::InvalidSource(
+            "Window site differs from its original node kind",
+        )),
+    }
+}
+
 pub(super) fn aggregate_source(
     node: &PhysicalNode,
     site: PhysicalCallSite,

@@ -258,6 +258,8 @@ impl novarocks_failure_contract::FailureProjection for RequiredLoweringFailure {
         use crate::planner::distributed::build::ContractLoweringError as E;
         match &self.0 {
             E::Control(cause) => cause.failure_fact(),
+            E::FunctionBinding(cause) => cause.failure_fact(),
+            E::Semantics(cause) => cause.failure_fact(),
             E::ComparisonCoercion(cause) => cause.failure_fact(),
             E::ConstantSource(cause) => cause.failure_fact(),
             E::CallRequests(cause) => cause.failure_fact(),
@@ -281,6 +283,7 @@ impl std::error::Error for RequiredConstructionFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(match &self.0 {
             novarocks_physical_plan::PlanConstructionError::Requests(cause) => cause,
+            novarocks_physical_plan::PlanConstructionError::Calls(cause) => cause,
             novarocks_physical_plan::PlanConstructionError::Constants(cause) => cause,
             novarocks_physical_plan::PlanConstructionError::Structure(cause) => cause,
         })
@@ -290,6 +293,7 @@ impl novarocks_failure_contract::FailureProjection for RequiredConstructionFailu
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         match &self.0 {
             novarocks_physical_plan::PlanConstructionError::Requests(cause) => cause.failure_fact(),
+            novarocks_physical_plan::PlanConstructionError::Calls(cause) => cause.failure_fact(),
             novarocks_physical_plan::PlanConstructionError::Constants(cause) => {
                 cause.failure_fact()
             }

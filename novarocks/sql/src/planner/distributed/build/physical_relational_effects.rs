@@ -15,19 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Checked original relational contexts and independent argument-root effects.
-
+//! Checked actual relation identities and independent node-unit root effects.
+use super::contract_lowering::NodeExpressionEffects;
 use super::expression_occurrences::{AuthoredPhysicalOccurrences, WriterOccurrenceContexts};
-use novarocks_functions::ScopedExpressionEffects;
-use novarocks_physical_plan::{
-    ExprId, ExpressionRootSite, Fragment, PhysicalCallSite, PhysicalRootUses, ValueDef,
-};
+use novarocks_expression_contract::{BoundExprSet, RootOrdinal};
+use novarocks_functions::ScopedRelationalEffects;
+use novarocks_physical_plan::{Fragment, PhysicalCallSite, ValueDef};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, EffectContractError, EvaluationDemand,
-    ExpressionEffectContext, ExpressionEffects, ExpressionUseId,
+    ExpressionEffects, ExpressionUseId, RelationEffectContext,
 };
-use std::collections::BTreeMap;
-
 #[derive(Debug)]
 pub(crate) enum PhysicalRelationalEffectsError {
     Control(CompileControlError),
@@ -36,94 +33,87 @@ pub(crate) enum PhysicalRelationalEffectsError {
     InvalidSource(&'static str),
 }
 impl From<CompileControlError> for PhysicalRelationalEffectsError {
-    fn from(error: CompileControlError) -> Self {
-        Self::Control(error)
+    fn from(cause: CompileControlError) -> Self {
+        Self::Control(cause)
     }
 }
 impl From<EffectContractError> for PhysicalRelationalEffectsError {
-    fn from(error: EffectContractError) -> Self {
-        Self::Effects(error)
+    fn from(cause: EffectContractError) -> Self {
+        Self::Effects(cause)
     }
 }
-
-/// Borrow the actual root and preserve its own context. This returns only a
-/// neutral conservative summary for the operator; it never transfers the
-/// child's region or grants movement/caching permission. The caller supplies
-/// the role/ordinal and definition from its exact immutable source call, after
-/// same-source static/topology admission. Original scope/resource obligations
-/// and the caller's entry/ordinary footer remain outside this narrow loan.
+/// The actual field names one root of its own node unit. Only the neutral
+/// summary crosses into a relation; scalar region/caching rights do not.
+/// The caller validates actual node/unit/source pairing and owns admission.
 pub(crate) fn relational_root_effects_observed(
-    roots: &PhysicalRootUses,
-    root_site: ExpressionRootSite,
-    definition: ExprId,
-    child_effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    unit: &BoundExprSet,
+    root: RootOrdinal,
+    child_effects: &NodeExpressionEffects,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ExpressionUseId, ExpressionEffects), PhysicalRelationalEffectsError> {
-    let root = roots.roots().sites().get(&root_site);
+    let same_unit = std::ptr::eq(unit, child_effects.unit());
     work.step()?;
-    let matching =
-        root.is_some_and(|root| root.expr == definition && root.demand == EvaluationDemand::Value);
-    work.step()?;
-    if !matching {
+    if !same_unit {
         return Err(PhysicalRelationalEffectsError::InvalidSource(
-            "ordered relational argument root differs from actual source",
+            "relational parameter summaries belong to another unit",
         ));
     }
-    let use_id = roots.bindings().get(&root_site).copied();
+    let declaration = unit.root(root);
+    work.step()?;
+    let declaration = declaration
+        .filter(|root| root.demand == EvaluationDemand::Value)
+        .ok_or(PhysicalRelationalEffectsError::InvalidSource(
+            "ordered relational parameter is not an actual Value root",
+        ))?;
+    let use_id = unit.root_use_ids().get(root.get() as usize).copied();
     work.step()?;
     let use_id = use_id.ok_or(PhysicalRelationalEffectsError::InvalidSource(
-        "ordered relational argument root has no actual use",
+        "ordered relational parameter has no actual use",
     ))?;
-    let invocation = roots.flow().uses().get(&use_id);
+    let invocation = unit.control_flow().uses().get(&use_id);
     work.step()?;
     let matching = invocation.is_some_and(|invocation| {
-        invocation.definition == definition
+        invocation.definition == declaration.definition
             && invocation.context.use_id == use_id
             && invocation.context.demand == EvaluationDemand::Value
     });
     work.step()?;
     if !matching {
         return Err(PhysicalRelationalEffectsError::InvalidSource(
-            "relational argument invocation differs from its original root",
+            "relational parameter invocation differs from its original unit root",
         ));
     }
-    let invocation = invocation.expect("checked original invocation");
-    let region = roots.flow().regions().get(&invocation.context.region);
+    let invocation = invocation.expect("checked original root invocation");
+    let region = unit
+        .control_flow()
+        .regions()
+        .get(&invocation.context.region);
     work.step()?;
-    let unguarded = region.is_some_and(|region| region.parent.is_none() && region.guard.is_none());
-    work.step()?;
-    if !unguarded {
+    if !region.is_some_and(|region| region.parent.is_none() && region.guard.is_none()) {
         return Err(PhysicalRelationalEffectsError::InvalidSource(
-            "relational argument root has a guarded or absent region",
+            "relational parameter root has a guarded or absent region",
         ));
     }
-    let summary = child_effects.get(&use_id).copied();
+    let summary = child_effects.summaries().get(&use_id).copied();
     work.step()?;
     let summary = summary.ok_or(PhysicalRelationalEffectsError::MissingChildEffects(use_id))?;
-    // for_use retains the child's exact context. Only the neutral result
-    // of this check is joined; no scoped cross-region join is permitted.
-    let actual_effects = summary.for_use(invocation.context);
+    let effects = summary.for_use(invocation.context);
     work.step()?;
-    let actual_effects = actual_effects?;
-    Ok((use_id, actual_effects))
+    Ok((use_id, effects?))
 }
 
-/// Relational contexts are not flow invocations. Keep their original authored
-/// disjoint use namespace and unguarded Value region, with exactly one context
-/// for this actual relational call site. The complete topology remains caller-validated.
 pub(crate) fn relational_context_observed(
-    occurrences: &AuthoredPhysicalOccurrences,
+    occurrences: &AuthoredPhysicalOccurrences<'_>,
     site: PhysicalCallSite,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<ExpressionEffectContext, PhysicalRelationalEffectsError> {
+) -> Result<RelationEffectContext, PhysicalRelationalEffectsError> {
     relational_writer_context_observed(&occurrences.writer_contexts(), site, work)
 }
-
 pub(crate) fn relational_writer_context_observed(
     occurrences: &WriterOccurrenceContexts<'_, '_>,
     site: PhysicalCallSite,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<ExpressionEffectContext, PhysicalRelationalEffectsError> {
+) -> Result<RelationEffectContext, PhysicalRelationalEffectsError> {
     let mut found = None;
     for &(actual_site, context) in occurrences.relational_contexts {
         let matching = actual_site == site;
@@ -133,68 +123,53 @@ pub(crate) fn relational_writer_context_observed(
             work.step()?;
             if repeated {
                 return Err(PhysicalRelationalEffectsError::InvalidSource(
-                    "relational site has repeated relational contexts",
+                    "relational site has repeated relation contexts",
                 ));
             }
         }
     }
     let context = found.ok_or(PhysicalRelationalEffectsError::InvalidSource(
-        "relational site has no original relational context",
+        "relational site has no original relation context",
     ))?;
-    for &(other_site, other) in occurrences.relational_contexts {
-        let colliding = other_site != site
-            && (other.use_id == context.use_id || other.region == context.region);
-        work.step()?;
-        if colliding {
-            return Err(PhysicalRelationalEffectsError::InvalidSource(
-                "relational context shares another relational use identity or region",
-            ));
-        }
-    }
-    for (_, _, other) in occurrences.writer_value_uses() {
-        let colliding = other.use_id == context.use_id || other.region == context.region;
-        work.step()?;
-        if colliding {
-            return Err(PhysicalRelationalEffectsError::InvalidSource(
-                "relational context borrows a materialized Writer channel use or region",
-            ));
-        }
-    }
-    for invocation in occurrences.expression_invocations() {
-        let shares_region = invocation.context.region == context.region;
-        work.step()?;
-        if shares_region {
-            return Err(PhysicalRelationalEffectsError::InvalidSource(
-                "relational context borrows an expression invocation region",
-            ));
-        }
-    }
-    let expression_collision = occurrences.contains_expression_use(context.use_id);
-    work.step()?;
-    let region = occurrences.region(context.region);
-    work.step()?;
-    let matching = !expression_collision
-        && context.demand == EvaluationDemand::Value
-        && region.is_some_and(|region| region.parent.is_none() && region.guard.is_none());
-    work.step()?;
-    if !matching {
+    if !context.is_call() {
         return Err(PhysicalRelationalEffectsError::InvalidSource(
-            "relational context differs from original disjoint Value region",
+            "relation call has a materialized-input role or non-Value demand",
         ));
+    }
+    for &(other_site, other) in occurrences.relational_contexts {
+        let colliding = other_site != site && other.identity.call == context.identity.call;
+        work.step()?;
+        if colliding {
+            return Err(PhysicalRelationalEffectsError::InvalidSource(
+                "relation call shares another call's identity",
+            ));
+        }
+    }
+    for (input_site, _, input) in occurrences.writer_value_uses() {
+        let matching = if input_site == site {
+            input.is_materialized_input_of(context)
+        } else {
+            input.identity.call != context.identity.call
+        };
+        work.step()?;
+        if !matching {
+            return Err(PhysicalRelationalEffectsError::InvalidSource(
+                "materialized Writer input has a different actual relation identity or role",
+            ));
+        }
     }
     Ok(context)
 }
 
-/// Authenticate an actual materialized Writer channel from the same source
-/// loan. Both host roles reuse this Value-only law; neither re-evaluates an
-/// origin expression or transfers an upstream expression's effects.
+/// A materialized Writer channel is an actual Value, never a re-evaluated
+/// origin expression. Its conservative effects are pure in its own input role.
 pub(crate) fn writer_value_context_effects_observed(
     occurrences: &WriterOccurrenceContexts<'_, '_>,
     fragment: &Fragment,
     site: PhysicalCallSite,
     actual_value: &ValueDef,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(ExpressionEffectContext, ExpressionEffects), PhysicalRelationalEffectsError> {
+) -> Result<(RelationEffectContext, ExpressionEffects), PhysicalRelationalEffectsError> {
     let same_fragment = std::ptr::eq(occurrences.fragment(), fragment);
     work.step()?;
     let same_value = fragment
@@ -212,9 +187,9 @@ pub(crate) fn writer_value_context_effects_observed(
         let same_site = actual_site == site;
         work.step()?;
         if same_site {
-            let same = std::ptr::eq(value, actual_value) && found.is_none();
+            let matching = std::ptr::eq(value, actual_value) && found.is_none();
             work.step()?;
-            if !same {
+            if !matching {
                 return Err(PhysicalRelationalEffectsError::InvalidSource(
                     "Writer channel differs from its original unique Value occurrence",
                 ));
@@ -225,37 +200,15 @@ pub(crate) fn writer_value_context_effects_observed(
     let context = found.ok_or(PhysicalRelationalEffectsError::InvalidSource(
         "Writer channel has no original materialized Value occurrence",
     ))?;
-    let region = occurrences.region(context.region);
+    let call = relational_writer_context_observed(occurrences, site, work)?;
+    let matching = context.is_materialized_input_of(call);
     work.step()?;
-    let actual = !occurrences.contains_expression_use(context.use_id)
-        && context.demand == EvaluationDemand::Value
-        && region.is_some_and(|region| region.parent.is_none() && region.guard.is_none());
-    work.step()?;
-    if !actual {
+    if !matching {
         return Err(PhysicalRelationalEffectsError::InvalidSource(
-            "Writer channel differs from its original unguarded materialized Value region",
+            "Writer channel differs from its original materialized-input role",
         ));
     }
-    for (_, other) in occurrences.relational_contexts {
-        let colliding = other.use_id == context.use_id || other.region == context.region;
-        work.step()?;
-        if colliding {
-            return Err(PhysicalRelationalEffectsError::InvalidSource(
-                "Writer channel borrows a relational operator use or region",
-            ));
-        }
-    }
-    for invocation in occurrences.expression_invocations() {
-        let shares = invocation.context.region == context.region;
-        work.step()?;
-        if shares {
-            return Err(PhysicalRelationalEffectsError::InvalidSource(
-                "Writer channel borrows an expression invocation region",
-            ));
-        }
-    }
-    let scoped = super::physical_expression_effects::materialized_value_effects(context);
-    let effects = scoped.for_use(context);
+    let effects = ScopedRelationalEffects::pure_value(context).for_use(context);
     work.step()?;
     Ok((context, effects?))
 }

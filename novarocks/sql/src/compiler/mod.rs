@@ -53,8 +53,7 @@ pub use crate::planner::distributed::build::{
     SqlSourceJournalError,
 };
 pub use crate::planner::distributed::build::{
-    FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
-    check_pure_call_definitions_observed,
+    PackageSemanticsError, check_pure_call_definitions_observed,
 };
 pub use captured_catalog::{SqlCapturedCatalog, SqlCapturedCatalogPreparation};
 #[cfg(test)]

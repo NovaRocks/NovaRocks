@@ -28,9 +28,12 @@ use crate::{
     analysis::{ExprKind, TypedExpr},
     compiler::SqlAuthoredPhysicalPlan,
 };
-use novarocks_physical_plan::{ExprKind as PhysicalExprKind, TableFunctionOutput};
 use novarocks_type_contract::PureCompileControl;
 use std::sync::Mutex;
+use {
+    novarocks_expression_contract::ExprKind as PhysicalExprKind,
+    novarocks_physical_plan::TableFunctionOutput,
+};
 
 #[derive(Default)]
 struct Control {
@@ -107,10 +110,17 @@ fn constant(argument: &FunctionArgument) -> &novarocks_functions::ConstantValue 
 }
 fn emitted(
     owner: &SqlAuthoredPhysicalPlan,
-    fragment: &Fragment,
+    node: &novarocks_physical_plan::PhysicalNode,
     id: ExprId,
 ) -> novarocks_functions::ConstantValue {
-    let PhysicalExprKind::Constant(reference) = fragment.expressions().get(id).unwrap().kind else {
+    let PhysicalExprKind::Constant(reference) = node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .definition(id)
+        .unwrap()
+        .kind
+    else {
         panic!("actual selected physical constant")
     };
     let control = Control::default();
@@ -273,7 +283,7 @@ fn table_journal_selected_nonzero_cv_ordinals_keep_field_backing_metadata_and_le
     for (index, ordinal) in [1, 2].into_iter().enumerate() {
         let original = constant(&entry.captured().request().arguments[index]);
         let operational = constant(&request.request().arguments[index]);
-        let actual = emitted(&owner, fragment, entry.arguments()[index]);
+        let actual = emitted(&owner, node, entry.arguments()[index]);
         assert_eq!(original.ordinal(), ordinal);
         assert_eq!(operational.ordinal(), ordinal);
         assert_eq!(actual.ordinal(), ordinal);
@@ -335,7 +345,10 @@ fn table_journal_computed_none_stays_none_when_emitted_as_constant() {
         unreachable!()
     };
     assert!(matches!(
-        fragment.expressions().get(arguments[0]).unwrap().kind,
+        fragment
+            .root_expression(node.id, arguments[0])
+            .unwrap()
+            .kind,
         PhysicalExprKind::Constant(_)
     ));
     let control = Control::default();

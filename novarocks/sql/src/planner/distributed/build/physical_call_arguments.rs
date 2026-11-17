@@ -19,9 +19,12 @@
 //! This leaf does not resolve names, evaluate expressions or author effects.
 
 use novarocks_functions::{ConstantError, ConstantPolicy, FunctionArgument};
-use novarocks_physical_plan::{ConstantPools, ConstantReferenceError, ExprKind, ExprNode};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ValueTypeError,
+};
+use {
+    novarocks_expression_contract::{ExprKind, ExprNode},
+    novarocks_physical_plan::{ConstantPools, ConstantReferenceError},
 };
 
 #[derive(Debug)]

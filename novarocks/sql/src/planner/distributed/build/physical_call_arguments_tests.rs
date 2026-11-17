@@ -21,7 +21,7 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use novarocks_constant_contract::{ConstantPool, ConstantValue};
-use novarocks_physical_plan::{ConstantPoolId, ConstantReference, ExprId, NodeId, ValueId};
+use novarocks_physical_plan::{ConstantPoolId, ConstantReference, ExprId, ValueId};
 use novarocks_type_contract::{
     DecimalOverflowPolicy, FunctionValueType, PureCompileControl, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, ValueLogicalType,
@@ -101,7 +101,6 @@ fn refusal_policy() -> ConstantPolicy {
 fn source(ty: FunctionValueType, kind: ExprKind) -> ExprNode {
     ExprNode {
         id: ExprId::new(0),
-        owner: NodeId::new(u32::MAX),
         lambda_scope: None,
         ty,
         kind,

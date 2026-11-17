@@ -25,23 +25,30 @@ const ARRAY_LITERAL: &str = "builtin.scalar/__array_literal/v1";
 fn calls<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     id: &str,
-) -> Vec<(&'a Fragment, &'a novarocks_physical_plan::ExprNode)> {
+) -> Vec<(
+    &'a Fragment,
+    &'a novarocks_physical_plan::PhysicalNode,
+    &'a novarocks_expression_contract::ExprNode,
+)> {
     owner
         .plan()
         .fragments()
         .values()
         .flat_map(|fragment| {
-            fragment
-                .expressions()
-                .iter()
-                .filter_map(move |(_, source)| match &source.kind {
-                    ContractExprKind::FunctionCall { function, .. }
-                        if function.function_id.as_str() == id =>
-                    {
-                        Some((fragment, source))
-                    }
-                    _ => None,
+            fragment.nodes().values().flat_map(move |node| {
+                node.expressions.iter().flat_map(move |unit| {
+                    unit.definitions()
+                        .iter()
+                        .filter_map(move |source| match &source.kind {
+                            ContractExprKind::FunctionCall { function, .. }
+                                if function.function_id.as_str() == id =>
+                            {
+                                Some((fragment, node, source))
+                            }
+                            _ => None,
+                        })
                 })
+            })
         })
         .collect()
 }
@@ -49,9 +56,10 @@ fn calls<'a>(
 fn assert_constraint<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     fragment: &'a Fragment,
-    source: &'a novarocks_physical_plan::ExprNode,
+    unit_node: &'a novarocks_physical_plan::PhysicalNode,
+    source: &'a novarocks_expression_contract::ExprNode,
 ) -> CheckedExpressionLogicalSourceEntry<'a> {
-    let receipt = loan(owner, fragment, source, &Control::default()).unwrap();
+    let receipt = loan(owner, fragment, unit_node, source, &Control::default()).unwrap();
     let target = receipt
         .captured()
         .binding()
@@ -85,7 +93,7 @@ fn assert_constraint<'a>(
             .as_slice()
     );
     let cloned = owner.clone();
-    let again = loan(&cloned, fragment, source, &Control::default()).unwrap();
+    let again = loan(&cloned, fragment, unit_node, source, &Control::default()).unwrap();
     assert!(std::ptr::eq(
         target,
         again.captured().binding().result_constraint().unwrap()
@@ -116,10 +124,11 @@ fn assert_public_result_fields(owner: &SqlAuthoredPhysicalPlan) {
 fn assert_loan_prefixes(
     owner: &SqlAuthoredPhysicalPlan,
     fragment: &Fragment,
-    source: &novarocks_physical_plan::ExprNode,
+    unit_node: &novarocks_physical_plan::PhysicalNode,
+    source: &novarocks_expression_contract::ExprNode,
 ) {
     let control = Control::default();
-    loan(owner, fragment, source, &control).unwrap();
+    loan(owner, fragment, unit_node, source, &control).unwrap();
     let baseline = control.trace();
     assert_eq!(baseline[0], (CompilePhase::Validate, 0));
     for stop in 0..baseline.len() {
@@ -132,7 +141,7 @@ fn assert_loan_prefixes(
                 refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
-            assert!(matches!(loan(owner, fragment, source, &control),
+            assert!(matches!(loan(owner, fragment, unit_node, source, &control),
                 Err(SqlSourceJournalError::Control(actual)) if actual == cause));
             assert_eq!(control.trace(), baseline[..=stop]);
         }
@@ -159,8 +168,8 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
             !conversions.is_empty(),
             "actual logical-domain conversion must survive"
         );
-        for (fragment, source) in conversions {
-            let receipt = assert_constraint(&owner, fragment, source);
+        for (fragment, unit_node, source) in conversions {
+            let receipt = assert_constraint(&owner, fragment, unit_node, source);
             let original = receipt.captured().request();
             assert_eq!(original.arguments.len(), 1);
             let FunctionArgument::Value {
@@ -199,7 +208,7 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
             }
             let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
             assert!(constant(&operational[0]).is_none());
-            assert_loan_prefixes(&owner, fragment, source);
+            assert_loan_prefixes(&owner, fragment, unit_node, source);
         }
         assert_public_result_fields(&owner);
         let result = owner.plan().result_port().unwrap();
@@ -225,8 +234,8 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
     );
     let ordinary = calls(&owner, "builtin.scalar/lower/v1");
     assert_eq!(ordinary.len(), 1);
-    let (fragment, source) = ordinary[0];
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = ordinary[0];
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     assert!(receipt.captured().request().expected_result_type.is_some());
     assert!(
         receipt.captured().binding().result_constraint().is_none(),
@@ -244,8 +253,8 @@ fn canonical_constraint_actual_typed_empty_array_retains_full_json_item_target()
     );
     let arrays = calls(&owner, ARRAY_LITERAL);
     assert_eq!(arrays.len(), 1);
-    let (fragment, source) = arrays[0];
-    let receipt = assert_constraint(&owner, fragment, source);
+    let (fragment, unit_node, source) = arrays[0];
+    let receipt = assert_constraint(&owner, fragment, unit_node, source);
     assert!(receipt.arguments().is_empty());
     assert!(receipt.captured().request().arguments.is_empty());
     assert_eq!(receipt.captured().request().logical_argument_count, 0);
@@ -274,5 +283,5 @@ fn canonical_constraint_actual_typed_empty_array_retains_full_json_item_target()
     let result = owner.plan().result_port().unwrap();
     assert_eq!(result.fields.len(), 1);
     assert_eq!(&result.fields[0].ty, target);
-    assert_loan_prefixes(&owner, fragment, source);
+    assert_loan_prefixes(&owner, fragment, unit_node, source);
 }

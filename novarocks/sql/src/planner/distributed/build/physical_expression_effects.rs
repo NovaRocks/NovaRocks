@@ -19,15 +19,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::unit_source::ScalarUnitOwner;
+use novarocks_expression_contract::{
+    BinaryOperator, ExprId, ExprKind, ExprNode, ExpressionCallClaim, SealedUnit, UnaryOperator,
+};
 use novarocks_functions::{
     ArithmeticPrepareError, CastOperation, CastPrepareError, ComparisonPrepareError,
     ConstantPolicy, PreparedArithmeticRecipe, PreparedCastRecipe, PreparedComparisonRecipe,
     PreparedNullSafeComparisonRecipe, ScopedExpressionEffects,
 };
-use novarocks_physical_plan::{
-    BinaryOperator, ConstantPools, ExprId, ExprKind, ExprNode, Fragment, FrozenPhysicalCall,
-    PhysicalRootUses, RootUseBindingError, UnaryOperator,
-};
+use novarocks_physical_plan::ConstantPools;
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
     EffectContractError, ExpressionUseId, PureCompileControl, SemanticParameterError,
@@ -36,25 +37,16 @@ use novarocks_type_contract::{
 };
 
 use super::{
-    lowered_draft::{SqlAuthoredPhysicalPlan, SqlSourceJournalError},
+    contract_lowering::SqlUnitSourceLoan,
+    lowered_draft::SqlSourceJournalError,
     physical_call_arguments::{PhysicalArgumentError, author_physical_argument_observed},
     physical_scalar_occurrences::{
         PhysicalScalarOccurrenceError, PhysicalScalarOccurrenceInput,
         prepare_physical_scalar_occurrence_observed,
     },
     physical_scalar_requests::{
-        AuthoredPhysicalScalarRequest, PhysicalScalarRequestError,
-        author_physical_scalar_request_from_journal_observed,
+        PhysicalScalarRequestError, author_physical_scalar_request_from_journal_observed,
         author_physical_scalar_request_observed,
-    },
-    physical_window_occurrences::{
-        PhysicalWindowOccurrenceError, PhysicalWindowOccurrenceInput,
-        prepare_physical_window_occurrence_observed,
-    },
-    physical_window_requests::{
-        AuthoredPhysicalWindowRequest, PhysicalWindowRequestError,
-        author_physical_window_request_from_journal_observed,
-        author_physical_window_request_observed,
     },
 };
 use crate::compiler::SqlFunctionCatalog;
@@ -74,13 +66,11 @@ pub(crate) struct PhysicalCallSourceScope<'a> {
 }
 
 pub(crate) struct PhysicalExpressionEffectsInput<'a> {
-    pub fragment: &'a Fragment,
-    pub roots: &'a PhysicalRootUses,
+    pub owner: ScalarUnitOwner,
+    pub unit: &'a SealedUnit,
     pub constants: &'a ConstantPools,
     pub parameters: &'a SemanticParameters,
     pub literal_policy: ConstantPolicy,
-    pub temporal_sources:
-        Option<&'a BTreeMap<ExpressionUseId, novarocks_type_contract::TemporalSourcePlan<ExprId>>>,
     pub call_scopes: &'a BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'a>>,
 }
 
@@ -90,19 +80,16 @@ pub(crate) struct PhysicalExpressionEffectsInput<'a> {
 #[derive(Debug)]
 pub(crate) struct AuthoredPhysicalExpressionEffects {
     pub summaries: BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
-    pub calls: Vec<FrozenPhysicalCall>,
+    pub calls: BTreeMap<ExpressionUseId, ExpressionCallClaim>,
 }
 
 #[derive(Debug)]
 pub(crate) enum PhysicalExpressionEffectsError {
     Control(CompileControlError),
-    Roots(RootUseBindingError),
     Argument(PhysicalArgumentError),
     Journal(SqlSourceJournalError),
     Request(PhysicalScalarRequestError),
     Scalar(PhysicalScalarOccurrenceError),
-    WindowRequest(PhysicalWindowRequestError),
-    Window(PhysicalWindowOccurrenceError),
     Cast(CastPrepareError),
     /// A cast between these carriers has no prepared recipe.
     UnsupportedCast {
@@ -153,17 +140,10 @@ macro_rules! source_error {
     };
 }
 source_error!(SqlSourceJournalError, Journal);
-source_error!(RootUseBindingError, Roots);
 source_error!(PhysicalArgumentError, Argument);
 source_error!(PhysicalScalarRequestError, Request);
 source_error!(PhysicalScalarOccurrenceError, Scalar);
-source_error!(PhysicalWindowRequestError, WindowRequest);
-source_error!(PhysicalWindowOccurrenceError, Window);
 
-enum AuthoredPhysicalExpressionRequest<'a> {
-    Scalar(AuthoredPhysicalScalarRequest<'a>),
-    Window(AuthoredPhysicalWindowRequest<'a>),
-}
 macro_rules! recipe_error {
     ($error:ident, $variant:ident) => {
         impl From<$error> for PhysicalExpressionEffectsError {
@@ -204,59 +184,47 @@ pub(crate) fn author_physical_expression_effects_observed(
 /// Production SQL borrows the original journal and immutable catalogue. Missing
 /// or foreign source facts never fall back to direct physical reconstruction.
 pub(crate) fn author_sql_expression_effects_observed(
-    owner: &SqlAuthoredPhysicalPlan,
+    owner: &SqlUnitSourceLoan<'_>,
     input: PhysicalExpressionEffectsInput<'_>,
     control: &dyn PureCompileControl,
 ) -> Result<AuthoredPhysicalExpressionEffects, PhysicalExpressionEffectsError> {
-    compose_expression_effects_observed(
-        input,
-        Some(owner),
-        owner.function_catalog().as_ref(),
-        control,
-    )
+    compose_expression_effects_observed(input, Some(owner), owner.functions().as_ref(), control)
 }
 
 fn compose_expression_effects_observed<'source>(
     input: PhysicalExpressionEffectsInput<'source>,
-    owner: Option<&'source SqlAuthoredPhysicalPlan>,
+    owner: Option<&SqlUnitSourceLoan<'source>>,
     functions: &dyn SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<AuthoredPhysicalExpressionEffects, PhysicalExpressionEffectsError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let result = (|| {
         if let Some(owner) = owner {
-            let original = owner.plan().fragments().get(&input.fragment.id());
-            work.step()?;
-            let same = original.is_some_and(|fragment| std::ptr::eq(fragment, input.fragment))
-                && std::ptr::eq(owner.plan().constants(), input.constants)
-                && std::ptr::eq(owner.plan().parameters(), input.parameters)
-                && std::ptr::eq(owner.function_catalog().as_ref(), functions);
+            let same = owner.owner() == input.owner
+                && owner.definitions().is_sealed_source(input.unit)
+                && std::ptr::eq(owner.constants(), input.constants)
+                && std::ptr::eq(owner.parameters(), input.parameters)
+                && std::ptr::eq(owner.functions().as_ref(), functions);
             work.step()?;
             if !same {
                 return Err(PhysicalExpressionEffectsError::InvalidSource(
-                    "SQL expression composition loans a foreign plan, pool, parameter or catalogue source",
+                    "SQL scalar composition loans a foreign sealed unit, pool, parameters or catalogue",
                 ));
             }
         }
-        work.flush()?;
-        input.roots.validate_fragment(input.fragment, control)?;
-        work.flush()?;
-        let flow = input.roots.flow();
-        let definitions = input.fragment.expressions();
+        let flow = input.unit.control_flow();
+        let definitions = super::unit_source::UnitDefinitions::from_sealed(input.owner, input.unit);
         // Exact scope coverage is checked before any owner preparation. A
         // matching topology is not proof of matching immutable source contents.
         for (&id, scope) in input.call_scopes {
             let source = flow
                 .uses()
                 .get(&id)
-                .and_then(|use_| definitions.get(use_.definition));
+                .and_then(|use_| definitions.definition(use_.definition));
             work.step()?;
             let matching_source = source.is_some_and(|source| {
                 std::ptr::eq(source, scope.source)
-                    && matches!(
-                        source.kind,
-                        ExprKind::FunctionCall { .. } | ExprKind::WindowCall { .. }
-                    )
+                    && matches!(source.kind, ExprKind::FunctionCall { .. })
             });
             work.step()?;
             if !matching_source {
@@ -265,16 +233,125 @@ fn compose_expression_effects_observed<'source>(
                 ));
             }
         }
+        // This checks every static definition, including TypeOnly children
+        // without an invocation. A deciding constant is read from the same
+        // actual statement pool and full source type, never from display text.
+        for source in input.unit.definitions() {
+            work.step()?;
+            match &source.kind {
+                ExprKind::Like {
+                    expr,
+                    pattern,
+                    negated,
+                } => {
+                    work.flush()?;
+                    novarocks_functions::PreparedNativeLikeRecipe::try_new(
+                        *negated,
+                        &input
+                            .unit
+                            .definition(*expr)
+                            .expect("checked static LIKE source")
+                            .ty,
+                        &input
+                            .unit
+                            .definition(*pattern)
+                            .expect("checked static LIKE pattern")
+                            .ty,
+                        &source.ty,
+                        control,
+                    )?;
+                    work.flush()?;
+                }
+                ExprKind::InList { expr, list, .. } => {
+                    work.flush()?;
+                    novarocks_functions::PreparedNativeInListRecipe::validate_borrowed_profile(
+                        &input
+                            .unit
+                            .definition(*expr)
+                            .expect("checked static IN source")
+                            .ty,
+                        list.iter().map(|id| {
+                            &input
+                                .unit
+                                .definition(*id)
+                                .expect("checked static IN candidate")
+                                .ty
+                        }),
+                        &source.ty,
+                        control,
+                    )?;
+                    work.flush()?;
+                }
+                ExprKind::Between {
+                    expr,
+                    low,
+                    high,
+                    negated,
+                } => {
+                    work.flush()?;
+                    novarocks_functions::PreparedNativeBetweenRecipe::try_new(
+                        novarocks_type_contract::NativeBetweenPlan::new(*negated),
+                        &input
+                            .unit
+                            .definition(*expr)
+                            .expect("checked static BETWEEN source")
+                            .ty,
+                        &input
+                            .unit
+                            .definition(*low)
+                            .expect("checked static BETWEEN lower")
+                            .ty,
+                        &input
+                            .unit
+                            .definition(*high)
+                            .expect("checked static BETWEEN upper")
+                            .ty,
+                        &source.ty,
+                        control,
+                    )?;
+                    work.flush()?;
+                }
+                _ => {}
+            }
+            if !matches!(
+                source.kind,
+                ExprKind::Conjunction { .. } | ExprKind::Disjunction { .. }
+            ) {
+                continue;
+            }
+            let valid = novarocks_expression_contract::boolean_connective_nullability_observed(
+                source,
+                |id| definitions.definition(id),
+                |operand, work| {
+                    let ExprKind::Constant(reference) = operand.kind else {
+                        return Err(PhysicalExpressionEffectsError::InvalidSource(
+                            "Boolean source is not an immediate constant",
+                        ));
+                    };
+                    let constant = input
+                        .constants
+                        .resolve_observed(reference, &operand.ty, work)
+                        .map_err(PhysicalArgumentError::from)?;
+                    constant
+                        .try_boolean()
+                        .map_err(PhysicalArgumentError::from)
+                        .map_err(PhysicalExpressionEffectsError::from)
+                },
+                &mut work,
+            )?;
+            if !valid {
+                return Err(PhysicalExpressionEffectsError::InvalidSource(
+                    "Boolean connective result discards nullable operands without a deciding constant",
+                ));
+            }
+        }
         let mut requests = BTreeMap::new();
         for (&id, invocation) in flow.uses() {
-            let source = definitions.get(invocation.definition).ok_or(
+            let source = definitions.definition(invocation.definition).ok_or(
                 PhysicalExpressionEffectsError::InvalidSource("missing source definition"),
             )?;
             work.step()?;
-            if matches!(
-                source.kind,
-                ExprKind::FunctionCall { .. } | ExprKind::WindowCall { .. }
-            ) {
+            if matches!(source.kind, ExprKind::FunctionCall { .. }) {
                 let has_scope = input.call_scopes.contains_key(&id);
                 work.step()?;
                 if !has_scope {
@@ -282,48 +359,21 @@ fn compose_expression_effects_observed<'source>(
                 }
                 if let std::collections::btree_map::Entry::Vacant(entry) = requests.entry(source.id)
                 {
-                    let request = if matches!(source.kind, ExprKind::FunctionCall { .. }) {
-                        AuthoredPhysicalExpressionRequest::Scalar(match owner {
-                            Some(owner) => {
-                                let entry = owner.checked_expression_call_source_observed(
-                                    input.fragment,
-                                    source,
-                                    &mut work,
-                                )?;
-                                author_physical_scalar_request_from_journal_observed(
-                                    &entry, &mut work,
-                                )?
-                            }
-                            None => author_physical_scalar_request_observed(
-                                source,
-                                definitions,
-                                input.constants,
-                                input.literal_policy,
-                                &mut work,
-                            )?,
-                        })
-                    } else {
-                        AuthoredPhysicalExpressionRequest::Window(match owner {
-                            Some(owner) => {
-                                let entry = owner.checked_expression_call_source_observed(
-                                    input.fragment,
-                                    source,
-                                    &mut work,
-                                )?;
-                                author_physical_window_request_from_journal_observed(
-                                    &entry,
-                                    input.constants,
-                                    &mut work,
-                                )?
-                            }
-                            None => author_physical_window_request_observed(
-                                source,
-                                input.fragment,
-                                input.constants,
-                                input.literal_policy,
-                                &mut work,
-                            )?,
-                        })
+                    let request = match owner {
+                        Some(owner) => {
+                            let original =
+                                owner.checked_expression_source_observed(source, &mut work)?;
+                            author_physical_scalar_request_from_journal_observed(
+                                &original, &mut work,
+                            )?
+                        }
+                        None => author_physical_scalar_request_observed(
+                            source,
+                            definitions,
+                            input.constants,
+                            input.literal_policy,
+                            &mut work,
+                        )?,
                     };
                     entry.insert(request);
                     work.step()?;
@@ -331,16 +381,8 @@ fn compose_expression_effects_observed<'source>(
                 if owner.is_some() {
                     let scope = &input.call_scopes[&id];
                     let request = &requests[&source.id];
-                    let (decimal, constant) = match request {
-                        AuthoredPhysicalExpressionRequest::Scalar(request) => (
-                            request.captured_decimal_overflow_policy(),
-                            request.captured_constant_policy(),
-                        ),
-                        AuthoredPhysicalExpressionRequest::Window(request) => (
-                            request.captured_decimal_overflow_policy(),
-                            request.captured_constant_policy(),
-                        ),
-                    };
+                    let decimal = request.captured_decimal_overflow_policy();
+                    let constant = request.captured_constant_policy();
                     let same = decimal == Some(scope.decimal_overflow_policy)
                         && constant == Some(input.literal_policy);
                     work.step()?;
@@ -354,15 +396,12 @@ fn compose_expression_effects_observed<'source>(
             work.step()?;
         }
         let mut summaries = BTreeMap::new();
-        let mut calls = Vec::new();
+        let mut calls = BTreeMap::new();
         let mut active = BTreeSet::new();
         let mut stack = Vec::new();
         work.flush()?;
         stack
             .try_reserve_exact(novarocks_type_contract::MAX_CONTROL_DEPTH)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
-        calls
-            .try_reserve_exact(input.call_scopes.len())
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         for &root in flow.root_use_ids() {
             active.insert(root);
@@ -398,56 +437,38 @@ fn compose_expression_effects_observed<'source>(
                     work.step()?;
                     continue;
                 }
-                let source = definitions.get(invocation.definition).ok_or(
+                let source = definitions.definition(invocation.definition).ok_or(
                     PhysicalExpressionEffectsError::InvalidSource("missing actual definition"),
                 )?;
                 work.step()?;
                 let summary = if let Some(request) = requests.get(&source.id) {
                     let scope = &input.call_scopes[&id];
-                    let (frozen, summary) = match request {
-                        AuthoredPhysicalExpressionRequest::Scalar(request) => {
-                            let fresh = prepare_physical_scalar_occurrence_observed(
-                                PhysicalScalarOccurrenceInput {
-                                    source,
-                                    definitions: Some(definitions),
-                                    temporal_source: input
-                                        .temporal_sources
-                                        .and_then(|sources| sources.get(&id)),
-                                    request,
-                                    flow,
-                                    use_id: id,
-                                    child_effects: &summaries,
-                                    parameters: input.parameters,
-                                    environment: scope.environment,
-                                    decimal_overflow_policy: scope.decimal_overflow_policy,
-                                    proof_scope: scope.proof_scope,
-                                },
-                                functions,
-                                &mut work,
-                            )?;
-                            (fresh.frozen, fresh.preparation.effects())
-                        }
-                        AuthoredPhysicalExpressionRequest::Window(request) => {
-                            let fresh = prepare_physical_window_occurrence_observed(
-                                PhysicalWindowOccurrenceInput {
-                                    source,
-                                    request,
-                                    flow,
-                                    use_id: id,
-                                    child_effects: &summaries,
-                                    parameters: input.parameters,
-                                    environment: scope.environment,
-                                    decimal_overflow_policy: scope.decimal_overflow_policy,
-                                    proof_scope: scope.proof_scope,
-                                },
-                                functions,
-                                &mut work,
-                            )?;
-                            (fresh.frozen, fresh.preparation.effects())
-                        }
-                    };
-                    calls.push(frozen);
+                    let fresh = prepare_physical_scalar_occurrence_observed(
+                        PhysicalScalarOccurrenceInput {
+                            source,
+                            definitions: Some(definitions),
+                            temporal_source: input.unit.temporal_source(id),
+                            request,
+                            flow,
+                            use_id: id,
+                            child_effects: &summaries,
+                            parameters: input.parameters,
+                            environment: scope.environment,
+                            decimal_overflow_policy: scope.decimal_overflow_policy,
+                            proof_scope: scope.proof_scope,
+                        },
+                        functions,
+                        &mut work,
+                    )?;
+                    let effects = fresh.preparation.effects().for_use(invocation.context)?;
+                    let summary = ScopedExpressionEffects::primitive(invocation.context, effects);
+                    let repeated = calls.insert(id, fresh.claim).is_some();
                     work.step()?;
+                    if repeated {
+                        return Err(PhysicalExpressionEffectsError::InvalidSource(
+                            "scalar invocation has repeated call claims",
+                        ));
+                    }
                     summary
                 } else {
                     let mut summary = primitive_own_effects(
@@ -520,12 +541,14 @@ fn primitive_own_effects(
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScopedExpressionEffects, PhysicalExpressionEffectsError> {
-    let operand =
-        |id| {
-            input.fragment.expressions().get(id).ok_or(
-                PhysicalExpressionEffectsError::InvalidSource("missing primitive operand"),
-            )
-        };
+    let operand = |id| {
+        input
+            .unit
+            .definition(id)
+            .ok_or(PhysicalExpressionEffectsError::InvalidSource(
+                "missing primitive operand",
+            ))
+    };
     let allow = |reference| match input.parameters.require(reference)? {
         SemanticParameterValue::AllowThrowException(value) => Ok(*value),
         _ => Err(PhysicalExpressionEffectsError::InvalidSource(

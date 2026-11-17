@@ -144,11 +144,12 @@ impl ContractLoweringVisitor<'_> {
         let mut ordering = Vec::new();
         for key in &order_by {
             self.work.flush()?;
-            let expression = self
-                .fragment_mut()
-                .expressions()
-                .get(key.expr)
-                .ok_or_else(|| grouped_shape("GroupedStates TopN ordering expression is absent"))?;
+            let expression = super::super::unit_source::UnitDefinitions::from_draft(
+                &self.fragments[&self.current_fragment],
+                node,
+            )
+            .root_definition(key.expr)
+            .ok_or_else(|| grouped_shape("GroupedStates TopN ordering expression is absent"))?;
             let ContractExprKind::Value(value) = expression.kind else {
                 return Err(grouped_shape(
                     "GroupedStates TopN rank is not a direct complete grouping key",
@@ -184,9 +185,14 @@ impl ContractLoweringVisitor<'_> {
                 ));
             }
             let expression =
-                self.fragment_mut()
-                    .add_expression(node, ty, ContractExprKind::Value(*value))?;
-            group_by.push((expression, *value));
+                self.add_unscoped_expression(node, ty, ContractExprKind::Value(*value))?;
+            let root = self.root_definition(
+                node,
+                expression,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            )?;
+            group_by.push((root, *value));
             self.work.step()?;
         }
         let mut output = keys;
@@ -258,11 +264,10 @@ impl ContractLoweringVisitor<'_> {
                     "GroupedStates TopN state differs from the exact intermediate type",
                 ));
             }
-            let argument = self.fragment_mut().add_expression(
-                node,
-                ty,
-                ContractExprKind::Value(original.output),
-            )?;
+            let argument =
+                self.add_unscoped_expression(node, ty, ContractExprKind::Value(original.output))?;
+            let argument_root =
+                self.root_definition(node, argument, EvaluationDemand::Value, RootScope::Port(0))?;
             let id = self.allocate_aggregate_call()?;
             let phase = AggregatePhase::Intermediate { sequence };
             self.work.flush()?;
@@ -305,7 +310,7 @@ impl ContractLoweringVisitor<'_> {
             calls.push(ContractAggregateCall {
                 id,
                 binding,
-                arguments: Box::from([argument]),
+                arguments: Box::from([argument_root]),
                 distinct: false,
                 order_by: Box::default(),
                 output: value,
@@ -329,6 +334,7 @@ impl ContractLoweringVisitor<'_> {
                 node,
                 columns: output.clone().into_boxed_slice(),
             },
+            expressions: None,
             kind: NodeKind::TopN {
                 order_by,
                 limit,

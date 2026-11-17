@@ -95,7 +95,10 @@ pub(crate) fn utf8(value: String) -> Source {
     })
 }
 
-pub(crate) fn insert(pools: &mut p::ConstantPools, source: ConstantValue) -> p::ExprKind {
+pub(crate) fn insert(
+    pools: &mut p::ConstantPools,
+    source: ConstantValue,
+) -> novarocks_expression_contract::ExprKind {
     let mut ordinal = 0x8000_0000u32
         .checked_add(u32::try_from(pools.entries().len()).unwrap())
         .unwrap();
@@ -111,7 +114,7 @@ pub(crate) fn insert(pools: &mut p::ConstantPools, source: ConstantValue) -> p::
         ordinal: source.ordinal(),
     };
     pools.insert(pool, source.pool().clone()).unwrap();
-    p::ExprKind::Constant(reference)
+    novarocks_expression_contract::ExprKind::Constant(reference)
 }
 pub(crate) fn merge(target: &mut p::ConstantPools, sources: &p::ConstantPools) {
     for (&id, pool) in sources.entries() {
@@ -154,12 +157,13 @@ pub(crate) struct FragmentBuilder {
 }
 impl FragmentBuilder {
     pub(crate) fn finish_definition(
-        self,
+        mut self,
         root: p::NodeId,
         sink: p::FragmentSink,
         dop: p::PipelineDopDomain,
         placement: p::StagePlacementPolicy,
     ) -> Result<Fragment, p::ValidationErrors> {
+        self.seal_pure_units();
         Ok(Fragment {
             fragment: self.builder.finish_definition(root, sink, dop, placement)?,
             constants: self.constants,
@@ -176,9 +180,37 @@ impl FragmentBuilder {
         &mut self,
         node: p::NodeId,
         ty: p::ValueType,
-        kind: p::ExprKind,
-    ) -> Result<p::ExprId, p::BuildError> {
-        self.builder.add_expression(node, ty, kind)
+        kind: novarocks_expression_contract::ExprKind,
+    ) -> Result<p::ExprId, novarocks_expression_contract::UnitError> {
+        self.builder
+            .unit(node)
+            .expect("fixture definition belongs to an unfinished node unit")
+            .add(None, ty, kind)
+    }
+    // Pure fixture construction consumes exactly its explicit roots/ports.
+    // Function fixtures must install their own real requests/control/claims.
+    fn seal_pure_units(&mut self) {
+        use novarocks_type_contract::CompileCheckpoints;
+        let nodes = self
+            .builder
+            .construction_nodes()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for node in nodes {
+            if self.builder.construction_unit(node).is_none() {
+                continue;
+            }
+            let ports = self.builder.node_ports(node).unwrap();
+            let draft = self.builder.take_unit_builder(node).unwrap();
+            let mut work = CompileCheckpoints::try_new(&Setup, CompilePhase::Validate).unwrap();
+            let unit = draft
+                .seal(ports, &mut work)
+                .unwrap()
+                .finish(std::collections::BTreeMap::new(), &mut work)
+                .unwrap();
+            work.finish().unwrap();
+            self.builder.install_unit(node, Arc::new(unit)).unwrap();
+        }
     }
     pub(crate) fn new(id: p::FragmentId) -> Self {
         Self {
@@ -186,7 +218,11 @@ impl FragmentBuilder {
             constants: p::ConstantPools::empty(),
         }
     }
-    pub(crate) fn constant_kind(&mut self, ty: &p::ValueType, source: Source) -> p::ExprKind {
+    pub(crate) fn constant_kind(
+        &mut self,
+        ty: &p::ValueType,
+        source: Source,
+    ) -> novarocks_expression_contract::ExprKind {
         insert(&mut self.constants, source(ty))
     }
     pub(crate) fn constant(
@@ -196,10 +232,10 @@ impl FragmentBuilder {
         source: Source,
     ) -> p::ExprId {
         let kind = self.constant_kind(&ty, source);
-        self.builder.add_expression(owner, ty, kind).unwrap()
+        self.add_expression(owner, ty, kind).unwrap()
     }
     pub(crate) fn finish_structure(
-        self,
+        mut self,
         root: p::NodeId,
         sink: p::FragmentSink,
         dop: p::PipelineDopDomain,
@@ -207,6 +243,7 @@ impl FragmentBuilder {
         control: &dyn PureCompileControl,
         placement: p::StagePlacementPolicy,
     ) -> Result<Fragment, p::FragmentStructureError> {
+        self.seal_pure_units();
         Ok(Fragment {
             fragment: self
                 .builder

@@ -17,16 +17,23 @@
 
 use super::*;
 use crate::test_constants::{self as checked, FragmentBuilder};
+use novarocks_expression_contract::{RootScope, UnaryOperator};
 use novarocks_physical_plan::{
     OutputPort, PipelineDopDomain, PlanBuilder, PlanVersionId, ResultField, ResultPort,
-    ResultValueDomain, UnaryOperator, ValueOrigin, ValueType,
+    ResultValueDomain, ValueOrigin, ValueType,
 };
+use novarocks_type_contract::EvaluationDemand;
 
 fn base() -> (FragmentBuilder, NodeId, ValueId, ValueType) {
     let mut builder = FragmentBuilder::new(FragmentId::new(0));
     let node = builder.reserve_node_id().unwrap();
     let ty = ValueType::new(DataType::Int64, false);
-    let expression = builder.constant(node, ty.clone(), checked::i64(1));
+    let definition = builder.constant(node, ty.clone(), checked::i64(1));
+    let expression = builder
+        .unit(node)
+        .unwrap()
+        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
     let value = builder
         .add_value(
             ty.clone(),
@@ -67,8 +74,8 @@ fn finish(
         .unwrap();
     let (fragment, constants) = fragment.into_parts();
     let fragment_id = fragment.id();
-    let mut plan =
-        PlanBuilder::new(PlanVersionId::try_new([1; 16]).unwrap()).with_constant_pools(constants);
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([1; 16]).unwrap(), checked::policy())
+        .with_constant_pools(constants);
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
@@ -100,13 +107,18 @@ fn project(
 ) -> PhysicalPlan {
     let (mut builder, input, _, _) = base();
     let node = builder.reserve_node_id().unwrap();
-    let expression = kind(&mut builder, node, &ty);
+    let definition = kind(&mut builder, node, &ty);
+    let expression = builder
+        .unit(node)
+        .unwrap()
+        .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let value = builder
         .add_value(
             ty.clone(),
             ValueOrigin::Expr {
                 node,
-                expr: expression,
+                root: expression,
             },
         )
         .unwrap();
@@ -252,8 +264,10 @@ fn wide_boolean_arguments_remain_shallow_and_streamed() {
         |builder, node, ty| {
             let leaf = builder.constant(node, ty.clone(), checked::boolean(true));
             builder
-                .add_expression(
-                    node,
+                .unit(node)
+                .unwrap()
+                .add(
+                    None,
                     ty.clone(),
                     ExprKind::Conjunction {
                         args: vec![leaf; 4096].into_boxed_slice(),
@@ -316,8 +330,10 @@ fn valid_but_deep_node_and_expression_inputs_are_refused_without_elision() {
             let mut expression = builder.constant(node, ty.clone(), checked::boolean(true));
             for _ in 0..ExprText::MAX_DEPTH + 1 {
                 expression = builder
-                    .add_expression(
-                        node,
+                    .unit(node)
+                    .unwrap()
+                    .add(
+                        None,
                         ty.clone(),
                         ExprKind::Unary {
                             op: UnaryOperator::Not,

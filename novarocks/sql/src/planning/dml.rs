@@ -4475,8 +4475,7 @@ mod tests {
                         assert_eq!(calls[0].arguments.len(), 1);
                         assert_eq!(
                             fragment
-                                .expressions()
-                                .get(calls[0].arguments[0])
+                                .root_expression(node.id, calls[0].arguments[0])
                                 .unwrap()
                                 .ty,
                             requirement.input().value_type().clone(),
@@ -4492,8 +4491,7 @@ mod tests {
                         assert_eq!(calls[0].arguments.len(), 1);
                         assert_eq!(
                             fragment
-                                .expressions()
-                                .get(calls[0].arguments[0])
+                                .root_expression(node.id, calls[0].arguments[0])
                                 .unwrap()
                                 .ty,
                             calls[0].binding.intermediate_type,

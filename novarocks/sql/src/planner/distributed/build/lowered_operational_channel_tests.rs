@@ -72,11 +72,10 @@ fn foreign_namespace(
     receipt: &CheckedExpressionLogicalSourceEntry<'_>,
     changed_field: bool,
 ) -> ConstantPools {
-    let emitted = physical_constant(owner, receipt.fragment(), receipt.arguments()[0]);
+    let emitted = physical_constant(owner, receipt, receipt.arguments()[0]);
     let expression = receipt
-        .fragment()
-        .expressions()
-        .get(receipt.arguments()[0])
+        .definitions()
+        .definition(receipt.arguments()[0])
         .unwrap();
     let ContractExprKind::Constant(reference) = expression.kind else {
         panic!("actual reference")
@@ -132,11 +131,11 @@ fn operational_channels_none_does_not_demand_a_pool_for_cast_or_nested_constants
         },
     ] {
         let owner = authored(lower_call(argument, DecimalOverflowPolicy::OutputNull));
-        let (fragment, source) = scalar_source(&owner);
-        let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+        let (fragment, unit_node, source) = scalar_source(&owner);
+        let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
         assert!(constant(&receipt.captured().request().arguments[0]).is_none());
         assert_eq!(
-            physical_constant(&owner, fragment, receipt.arguments()[0])
+            physical_constant(&owner, &receipt, receipt.arguments()[0])
                 .try_utf8()
                 .unwrap(),
             Some("MiXeD")
@@ -160,8 +159,8 @@ fn operational_channels_none_does_not_demand_a_pool_for_cast_or_nested_constants
 #[test]
 fn operational_channels_nonzero_some_preserves_full_source_field_and_backing() {
     let (owner, pool, field) = selected_source_owner();
-    let (fragment, source) = scalar_source(&owner);
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = scalar_source(&owner);
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     let arguments = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
     let original = constant(&receipt.captured().request().arguments[0]).unwrap();
     let projected = constant(&arguments[0]).unwrap();
@@ -198,12 +197,12 @@ fn operational_channels_canonical_null_keeps_distinct_emission_and_exact_origina
         value_type: ValueType::new(DataType::Null, true),
     };
     let owner = authored(lower_call(argument, DecimalOverflowPolicy::OutputNull));
-    let (fragment, source) = scalar_source(&owner);
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = scalar_source(&owner);
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     let original = constant(&receipt.captured().request().arguments[0]).unwrap();
     let arguments = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
     let projected = constant(&arguments[0]).unwrap();
-    let emitted = physical_constant(&owner, fragment, receipt.arguments()[0]);
+    let emitted = physical_constant(&owner, &receipt, receipt.arguments()[0]);
     assert_eq!(original.value_type(), &ValueType::new(DataType::Null, true));
     assert_eq!(
         projected.value_type(),
@@ -269,8 +268,8 @@ fn operational_channels_canonical_null_keeps_distinct_emission_and_exact_origina
 #[test]
 fn operational_channels_equal_content_foreign_pool_and_field_cannot_replace_original_source() {
     let (owner, _, _) = selected_source_owner();
-    let (fragment, source) = scalar_source(&owner);
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = scalar_source(&owner);
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     operational_arguments(&owner, &receipt, &Control::default()).unwrap();
     for changed_field in [false, true] {
         let foreign = foreign_namespace(&owner, &receipt, changed_field);
@@ -294,8 +293,8 @@ fn operational_channels_equal_content_foreign_pool_and_field_cannot_replace_orig
 #[test]
 fn operational_channels_success_and_ordinary_refusal_stop_at_every_original_control_prefix() {
     let (owner, _, _) = selected_source_owner();
-    let (fragment, source) = scalar_source(&owner);
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = scalar_source(&owner);
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     let foreign = foreign_namespace(&owner, &receipt, false);
     for (pools, success) in [(owner.plan().constants(), true), (&foreign, false)] {
         let baseline = Control::default();
@@ -325,8 +324,8 @@ fn operational_channels_success_and_ordinary_refusal_stop_at_every_original_cont
 #[test]
 fn original_emission_retains_operational_request_and_selected_constant_backing_together() {
     let (owner, pool, field) = selected_source_owner();
-    let (fragment, source) = scalar_source(&owner);
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = scalar_source(&owner);
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     let canonical = receipt.canonical_operational().unwrap();
     let request = canonical.request();
     assert_eq!(request.logical_argument_count, 1);
@@ -344,7 +343,7 @@ fn original_emission_retains_operational_request_and_selected_constant_backing_t
     assert!(Arc::ptr_eq(value.pool().array(), pool.array()));
     assert!(Arc::ptr_eq(value.pool().field_ref(), &field));
     let cloned = owner.clone();
-    let again = loan(&cloned, fragment, source, &Control::default()).unwrap();
+    let again = loan(&cloned, fragment, unit_node, source, &Control::default()).unwrap();
     assert!(Arc::ptr_eq(
         canonical,
         again.canonical_operational().unwrap()
@@ -366,10 +365,10 @@ fn original_emission_retained_none_is_not_reconstructed_from_physical_constant()
         value_type: ValueType::new(DataType::Utf8, false),
     };
     let owner = authored(lower_call(argument, DecimalOverflowPolicy::OutputNull));
-    let (fragment, source) = scalar_source(&owner);
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = scalar_source(&owner);
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     assert_eq!(
-        physical_constant(&owner, fragment, receipt.arguments()[0])
+        physical_constant(&owner, &receipt, receipt.arguments()[0])
             .try_utf8()
             .unwrap(),
         Some("MiXeD")
