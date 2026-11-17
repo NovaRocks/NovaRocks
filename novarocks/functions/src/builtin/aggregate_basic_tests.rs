@@ -22,9 +22,8 @@ use super::*;
 use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
-    SemanticParameters, WindowFrame,
+    CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, ExpressionUseId,
+    PureCompileControl, SemanticParameters, WindowFrame,
 };
 use std::{sync::Mutex, time::Duration};
 
@@ -84,12 +83,10 @@ fn causes() -> [KernelFailure; 7] {
     ]
 }
 
-fn context() -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(41),
-        region: EvaluationRegionId::new(7),
-        demand: EvaluationDemand::Value,
-    }
+fn context() -> novarocks_type_contract::RelationEffectContext {
+    novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(41),
+    )
 }
 
 struct Fixture {
@@ -141,7 +138,7 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: context(),
+            context: (context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Aggregate,
@@ -154,7 +151,7 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Region(context().region),
+            proof_scope: CallProofScope::Relation(context().identity),
         }
     }
     fn aggregate_options(distinct: bool) -> AggregatePreparationOptions {
@@ -177,7 +174,7 @@ impl Fixture {
             self.input(),
             self.selected.clone(),
             PureCallPreparation::AggregateWindow {
-                arguments: ScopedExpressionEffects::pure_value(context()),
+                arguments: ScopedRelationalEffects::pure_value(context()),
                 options: AggregateWindowPreparationOptions {
                     aggregate: Self::aggregate_options(distinct),
                     window: WindowCallOptions::try_new(

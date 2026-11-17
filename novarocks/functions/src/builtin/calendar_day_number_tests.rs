@@ -218,7 +218,7 @@ fn calendar_day_number_three_actual_records_preserve_fresh_frozen_selected_ident
             let parameters = SemanticParameters::try_new([]).unwrap();
             let uses = [Some(ExpressionUseId::new(42))];
             let input = crate::CallEffectInput {
-                context,
+                context: context.into(),
                 argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
                 function_id: owner.binding_declaration().function_id(),
                 kind: crate::FunctionKind::Scalar,
@@ -312,7 +312,11 @@ fn calendar_day_number_three_actual_records_preserve_fresh_frozen_selected_ident
                     .is_err()
             );
             stale = input;
-            stale.context.region = EvaluationRegionId::new(999);
+            stale.context = novarocks_type_contract::ExpressionEffectContext {
+                region: EvaluationRegionId::new(999),
+                ..stale.context.expression().unwrap()
+            }
+            .into();
             assert!(
                 owner
                     .prepare_scalar(stale, canonical.clone(), crate::binding_test_control())
@@ -828,7 +832,7 @@ fn with_installed_day_number<T>(
     let uses = [Some(ExpressionUseId::new(842))];
     let parameters = SemanticParameters::default();
     let input = crate::CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: &bound.function_id,
         kind: crate::FunctionKind::Scalar,

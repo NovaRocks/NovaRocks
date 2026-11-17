@@ -260,12 +260,13 @@ impl FunctionEffectDeclaration {
     }
 }
 
-/// Assumptions used by a refiner are local to one proven evaluation region.
-/// This identity is not an authorization to hoist a call outside its guard.
+/// Assumptions belong to one proven scalar region or exact relation identity.
+/// This identity grants no permission to hoist, cache or change a lifecycle.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CallProofScope {
     Unconditional,
     Region(EvaluationRegionId),
+    Relation(crate::RelationEffectId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

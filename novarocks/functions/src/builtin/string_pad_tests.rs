@@ -194,7 +194,7 @@ fn string_pad_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_s
             .collect();
         let params = SemanticParameters::try_new([]).unwrap();
         let input = crate::CallEffectInput {
-            context,
+            context: context.into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
             function_id: owner.binding_declaration().function_id(),
             kind: crate::FunctionKind::Scalar,
@@ -332,7 +332,11 @@ fn string_pad_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_s
                 .is_err()
         );
         stale = input;
-        stale.context.region = EvaluationRegionId::new(999);
+        stale.context = novarocks_type_contract::ExpressionEffectContext {
+            region: EvaluationRegionId::new(999),
+            ..stale.context.expression().unwrap()
+        }
+        .into();
         assert!(
             owner
                 .prepare_scalar(stale, canonical.clone(), crate::binding_test_control())
@@ -352,7 +356,11 @@ fn string_pad_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_s
             .is_err()
         );
         stale = input;
-        stale.context.use_id = ExpressionUseId::new(999);
+        stale.context = novarocks_type_contract::ExpressionEffectContext {
+            use_id: ExpressionUseId::new(999),
+            ..stale.context.expression().unwrap()
+        }
+        .into();
         assert!(
             owner
                 .prepare_scalar(stale, canonical, crate::binding_test_control())

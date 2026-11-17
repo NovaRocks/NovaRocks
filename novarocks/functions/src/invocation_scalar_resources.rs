@@ -657,7 +657,7 @@ mod tests {
         let prepared = catalog
             .prepare_fresh_selected(
                 CallEffectInput {
-                    context,
+                    context: context.into(),
                     argument_uses: CallArgumentUses::SelectedChannels(&uses),
                     function_id: definition.binding_declaration().unwrap().function_id(),
                     kind: FunctionKind::Scalar,

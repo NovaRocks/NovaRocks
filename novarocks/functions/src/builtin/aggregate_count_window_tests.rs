@@ -24,10 +24,9 @@ use arrow_array::{
 use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
-    FunctionIntrinsicRowError, FunctionNullBehavior, SemanticParameters, WindowBound, WindowFrame,
-    WindowFrameExclusion, WindowFrameUnits,
+    CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, ExpressionUseId,
+    FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior, SemanticParameters,
+    WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -87,12 +86,10 @@ fn causes() -> [KernelFailure; 7] {
         KernelFailure::InstanceFailed,
     ]
 }
-fn context() -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(41),
-        region: EvaluationRegionId::new(7),
-        demand: EvaluationDemand::Value,
-    }
+fn context() -> novarocks_type_contract::RelationEffectContext {
+    novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(41),
+    )
 }
 
 struct Fixture {
@@ -141,7 +138,7 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: context(),
+            context: (context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Aggregate,
@@ -154,12 +151,12 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Region(context().region),
+            proof_scope: CallProofScope::Relation(context().identity),
         }
     }
     fn preparation(&self, ignore: bool) -> PureCallPreparation {
         PureCallPreparation::AggregateWindow {
-            arguments: ScopedExpressionEffects::pure_value(context()),
+            arguments: ScopedRelationalEffects::pure_value(context()),
             options: AggregateWindowPreparationOptions {
                 aggregate: AggregatePreparationOptions {
                     state_interpretation: None,

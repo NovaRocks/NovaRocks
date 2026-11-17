@@ -342,7 +342,7 @@ impl WindowNtileOwner {
             }
             let exact_scope = input.environment.is_empty()
                 && (matches!(input.proof_scope, CallProofScope::Unconditional)
-                    || input.proof_scope == CallProofScope::Region(input.context.region));
+                    || input.proof_scope == input.context.proof_scope());
             work.step().map_err(FunctionEffectOwnerError::Control)?;
             if !exact_scope {
                 return Err(FunctionBindingError::InvalidBinding(

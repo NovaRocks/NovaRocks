@@ -87,7 +87,7 @@ fn prepared(
     specialize_invocation_scalar(
         &owner,
         CallEffectInput {
-            context,
+            context: context.into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
             function_id: owner.declaration.function_id(),
             kind: FunctionKind::Scalar,
@@ -885,7 +885,7 @@ fn json_object_checked_creator_keeps_original_owner_and_primary_refusals() {
         selected: &selected,
         request,
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
-        context,
+        context: context.into(),
         parameters: &parameters,
         environment: &[],
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

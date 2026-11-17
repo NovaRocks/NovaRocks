@@ -173,11 +173,9 @@ fn kernel(name: &str, values: &[FunctionValueType], phase: AggregateKernelPhase)
         .resolve_bound_user(name, FunctionKind::Aggregate, request, &Compile)
         .unwrap();
     let selected = Arc::new(bound.selected);
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(431),
-        region: EvaluationRegionId::new(29),
-        demand: EvaluationDemand::Value,
-    };
+    let context = novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(431),
+    );
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(434),
         region: EvaluationRegionId::new(30),
@@ -193,7 +191,7 @@ fn kernel(name: &str, values: &[FunctionValueType], phase: AggregateKernelPhase)
     } else {
         CallArgumentUses::AggregateMerge {
             phase,
-            state_context,
+            state_context: state_context.into(),
             state_input_type: &state_type,
         }
     };
@@ -206,15 +204,15 @@ fn kernel(name: &str, values: &[FunctionValueType], phase: AggregateKernelPhase)
                 selected: &selected,
                 request,
                 argument_uses,
-                context,
+                context: context.into(),
                 parameters: &parameters,
                 environment: &[],
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Region(context.region),
+                proof_scope: CallProofScope::Relation(context.identity),
             },
             selected.clone(),
             PureCallPreparation::Aggregate {
-                arguments: ScopedExpressionEffects::pure_value(context),
+                arguments: ScopedRelationalEffects::pure_value(context),
                 options: AggregatePreparationOptions {
                     state_interpretation: None,
                     phase,

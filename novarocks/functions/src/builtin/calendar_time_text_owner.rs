@@ -239,7 +239,7 @@ impl TemporalOwner {
             }
             if !input.environment.is_empty()
                 || (input.proof_scope != CallProofScope::Unconditional
-                    && input.proof_scope != CallProofScope::Region(input.context.region))
+                    && input.proof_scope != input.context.proof_scope())
             {
                 return Err(FunctionBindingError::InvalidBinding(
                     "TIME source requires no environment and its exact proof scope".into(),

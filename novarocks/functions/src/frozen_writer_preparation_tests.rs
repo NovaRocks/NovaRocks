@@ -18,9 +18,7 @@
 use super::*;
 use crate::{FunctionArgument, FunctionBindingRequest, PreparedPureKernel};
 use arrow_schema::DataType;
-use novarocks_type_contract::{
-    CallProofScope, CompileControlError, EvaluationRegionId, ExpressionUseId,
-};
+use novarocks_type_contract::{CallProofScope, CompileControlError, EvaluationRegionId};
 use std::sync::Mutex;
 #[derive(Default)]
 struct Control {
@@ -47,8 +45,8 @@ struct Source {
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
     ty: FunctionValueType,
-    call: ExpressionEffectContext,
-    input: ExpressionEffectContext,
+    call: RelationEffectContext,
+    input: RelationEffectContext,
     parameters: SemanticParameters,
     frozen: CallEffects,
 }
@@ -62,16 +60,10 @@ impl Source {
             value_type: ty.clone(),
             constant: None,
         }];
-        let call = ExpressionEffectContext {
-            use_id: ExpressionUseId::new(41),
-            region: EvaluationRegionId::new(17),
-            demand: EvaluationDemand::Value,
-        };
-        let input = ExpressionEffectContext {
-            use_id: ExpressionUseId::new(42),
-            region: EvaluationRegionId::new(18),
-            demand: EvaluationDemand::Value,
-        };
+        let call = RelationEffectContext::call(novarocks_type_contract::RelationCallId::new(41));
+        let input = RelationEffectContext::materialized_input(
+            novarocks_type_contract::RelationCallId::new(41),
+        );
         let parameters = SemanticParameters::try_new([]).unwrap();
         let request = FunctionBindingRequest {
             arguments: &arguments,
@@ -90,12 +82,15 @@ impl Source {
         let function = resolved.function_id;
         // This is the original FE-like installed author. The BE tests below
         // borrow its actual frozen effects, not a declared/default effect set.
-        let uses = [Some(input.use_id)];
+
         let authored = catalog
             .prepare_fresh_selected(
                 CallEffectInput {
-                    context: call,
-                    argument_uses: CallArgumentUses::SelectedChannels(&uses),
+                    context: (call).into(),
+                    argument_uses: CallArgumentUses::MaterializedInput {
+                        context: input,
+                        input_type: &ty,
+                    },
                     function_id: &function,
                     kind: FunctionKind::Aggregate,
                     selected: &selected,
@@ -103,13 +98,13 @@ impl Source {
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    proof_scope: CallProofScope::Region(call.region),
+                    proof_scope: CallProofScope::Relation(call.identity),
                 },
                 selected.clone(),
                 PureCallPreparation::Aggregate {
-                    arguments: ScopedExpressionEffects::primitive(
+                    arguments: ScopedRelationalEffects::primitive(
                         call,
-                        ScopedExpressionEffects::pure_value(input)
+                        ScopedRelationalEffects::pure_value(input)
                             .for_use(input)
                             .unwrap(),
                     ),
@@ -165,7 +160,7 @@ fn frozen_writer_uses_actual_installed_call_and_rejects_context_or_effect_drift(
     let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
         panic!("actual aggregate handle");
     };
-    assert_eq!(handle.contract().call().context(), source.call);
+    assert_eq!(handle.contract().call().context(), source.call.into());
     assert_eq!(handle.contract().call().effects(), &source.frozen);
     assert_eq!(handle.contract().phase(), AggregateKernelPhase::Partial);
     assert_eq!(
@@ -321,7 +316,7 @@ fn frozen_writer_checked_count_borrows_its_original_owner_without_type_requests(
     let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
         panic!("actual checked Count handle");
     };
-    assert_eq!(handle.contract().call().context(), source.call);
+    assert_eq!(handle.contract().call().context(), source.call.into());
     assert_eq!(handle.contract().call().effects(), &source.frozen);
     assert_eq!(handle.contract().phase(), AggregateKernelPhase::Partial);
     assert_eq!(

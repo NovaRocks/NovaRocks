@@ -26,9 +26,8 @@ use arrow_array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase,
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
-    ExpressionUseId, FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior,
-    ObservableEffects, PureCompileControl, SemanticParameters,
+    DecimalOverflowPolicy, ExpressionUseId, FunctionEffectDeclaration, FunctionInstanceState,
+    FunctionNullBehavior, ObservableEffects, PureCompileControl, SemanticParameters,
 };
 use std::{
     alloc::Layout,
@@ -126,11 +125,9 @@ fn contract(phase: AggregateKernelPhase) -> Arc<AggregateCallContract> {
         Some(ExpressionUseId::new(3)),
         Some(ExpressionUseId::new(4)),
     ];
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(1),
-        region: EvaluationRegionId::new(11),
-        demand: EvaluationDemand::Value,
-    };
+    let context = novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(1),
+    );
     let params = SemanticParameters::default();
     let input = CallEffectInput {
         function_id: &owner.id,
@@ -138,7 +135,7 @@ fn contract(phase: AggregateKernelPhase) -> Arc<AggregateCallContract> {
         selected: &selected,
         request,
         argument_uses: CallArgumentUses::SelectedChannels(&uses),
-        context,
+        context: context.into(),
         parameters: &params,
         environment: &[],
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

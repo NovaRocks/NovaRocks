@@ -24,7 +24,7 @@ use crate::{
     AggregateCallContract, AggregateKernelPhase, AggregateOrderKey, AggregateStateMemoryPolicy,
     CallEffectInput, EvaluatedArgument, FunctionBindingError, FunctionBindingResolver,
     FunctionBindingSelection, FunctionCallContract, FunctionEffectOwner,
-    FunctionSpecializationFailure, KernelEvaluationControl, KernelFailure, ScopedExpressionEffects,
+    FunctionSpecializationFailure, KernelEvaluationControl, KernelFailure, ScopedRelationalEffects,
     SelectedAggregateMergeInput, SelectedAggregateUpdateInput, Selection,
 };
 use arrow_array::ArrayRef;
@@ -339,13 +339,13 @@ pub struct AggregatePreparationOptions {
 #[derive(Debug)]
 pub struct AggregateSpecialization<K: PreparedAggregateKernel> {
     prepared: Arc<K>,
-    effects: ScopedExpressionEffects,
+    effects: ScopedRelationalEffects,
 }
 impl<K: PreparedAggregateKernel> AggregateSpecialization<K> {
     pub fn prepared(&self) -> &Arc<K> {
         &self.prepared
     }
-    pub const fn effects(&self) -> ScopedExpressionEffects {
+    pub const fn effects(&self) -> ScopedRelationalEffects {
         self.effects
     }
     pub fn into_prepared(self) -> Arc<K> {
@@ -360,7 +360,7 @@ pub fn specialize_aggregate<O: PureAggregateImplementation + ?Sized>(
     owner: &O,
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<AggregateSpecialization<O::Kernel>, FunctionSpecializationFailure> {
@@ -379,7 +379,7 @@ pub fn specialize_frozen_aggregate<O: PureAggregateImplementation + ?Sized>(
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: &CallEffects,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<AggregateSpecialization<O::Kernel>, FunctionSpecializationFailure> {
@@ -407,7 +407,7 @@ pub(crate) fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<AggregateSpecialization<O::Kernel>, FunctionSpecializationFailure> {
@@ -437,7 +437,7 @@ pub(crate) fn specialize_aggregate_once_checked<O: PureAggregateImplementation +
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<
@@ -465,7 +465,7 @@ pub(crate) fn specialize_aggregate_once_checked_with_preparation<
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
     prepare: impl FnOnce(
@@ -510,12 +510,12 @@ fn specialize_aggregate_once_core<
     input: CallEffectInput<'a>,
     selected: Arc<FunctionBindingSelection>,
     _frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
     refine: impl FnOnce(
-        ScopedExpressionEffects,
-    ) -> Result<(crate::RefinedCallEffects<'a>, ScopedExpressionEffects), E>,
+        ScopedRelationalEffects,
+    ) -> Result<(crate::RefinedCallEffects<'a>, ScopedRelationalEffects), E>,
     prepare: impl FnOnce(Arc<AggregateCallContract>) -> Result<Arc<O::Kernel>, E>,
 ) -> Result<AggregateSpecialization<O::Kernel>, E> {
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
@@ -529,7 +529,8 @@ fn specialize_aggregate_once_core<
             crate::CallArgumentUses::TemporalSources { .. }
             | crate::CallArgumentUses::RegexpCountPattern { .. }
             | crate::CallArgumentUses::ToBase64Bytes { .. } => false,
-            crate::CallArgumentUses::SelectedChannels(_) => {
+            crate::CallArgumentUses::SelectedChannels(_)
+            | crate::CallArgumentUses::MaterializedInput { .. } => {
                 phase.consumes_logical_arguments() && options.state_input_type.is_none()
             }
             crate::CallArgumentUses::AggregateMerge { phase: actual, .. } => {
@@ -551,7 +552,8 @@ fn specialize_aggregate_once_core<
             | crate::CallArgumentUses::ToBase64Bytes { .. } => Err(invalid(
                 "aggregate preparation rejects scalar temporal source channels",
             )),
-            crate::CallArgumentUses::SelectedChannels(_) => Ok(None),
+            crate::CallArgumentUses::SelectedChannels(_)
+            | crate::CallArgumentUses::MaterializedInput { .. } => Ok(None),
             crate::CallArgumentUses::AggregateMerge {
                 state_input_type, ..
             } => {

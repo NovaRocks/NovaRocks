@@ -22,7 +22,7 @@ use crate::{
     FunctionArgument, FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind,
     FunctionOverloadId, FunctionResultType, FunctionSpecializationFailure, InstalledPureKernel,
     KernelDiagnostic, PreparedPureKernel, PureCallPreparation, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi, PurePreparationSource, ScopedExpressionEffects,
+    PureImplementationId, PureKernelAbi, PurePreparationSource, ScopedRelationalEffects,
     WindowCallOptions, WindowEvaluationPartition, WindowRowRange,
 };
 use arrow_array::{Float64Array, Int64Array};
@@ -96,12 +96,10 @@ fn causes() -> [KernelFailure; 7] {
         KernelFailure::InstanceFailed,
     ]
 }
-fn context() -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(41),
-        region: EvaluationRegionId::new(7),
-        demand: EvaluationDemand::Value,
-    }
+fn context() -> novarocks_type_contract::RelationEffectContext {
+    novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(41),
+    )
 }
 struct Fixture {
     catalog: EngineFunctionCatalog,
@@ -138,7 +136,7 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: context(),
+            context: (context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&[]),
             function_id: &self.id,
             kind: FunctionKind::Window,
@@ -147,7 +145,7 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Region(context().region),
+            proof_scope: CallProofScope::Relation(context().identity),
         }
     }
     fn prepare(
@@ -159,7 +157,7 @@ impl Fixture {
             self.input(),
             self.selected.clone(),
             PureCallPreparation::Window {
-                arguments: ScopedExpressionEffects::pure_value(context()),
+                arguments: ScopedRelationalEffects::pure_value(context()),
                 options,
             },
             control,
@@ -261,7 +259,7 @@ fn installed_five_rankings_preserve_independent_peer_values_and_exact_effects_un
             );
             assert_eq!(
                 call.effects().proof_scope,
-                CallProofScope::Region(context().region)
+                CallProofScope::Relation(context().identity)
             );
             assert!(prepared.contract().result_type().nullable());
             let input = geometry(&prepared, 6, &peers, &frames);
@@ -544,7 +542,7 @@ fn frozen_owner_uses_exact_same_selected_signature_policy_and_rejects_stale_argu
                 fixture.selected.clone(),
                 fresh.contract().call().effects(),
                 PureCallPreparation::Window {
-                    arguments: ScopedExpressionEffects::pure_value(context()),
+                    arguments: ScopedRelationalEffects::pure_value(context()),
                     options,
                 },
                 &CompileControl::default(),
@@ -578,7 +576,7 @@ fn frozen_owner_uses_exact_same_selected_signature_policy_and_rejects_stale_argu
                     input,
                     fixture.selected.clone(),
                     PureCallPreparation::Window {
-                        arguments: ScopedExpressionEffects::pure_value(context()),
+                        arguments: ScopedRelationalEffects::pure_value(context()),
                         options
                     },
                     &CompileControl::default()
@@ -598,7 +596,7 @@ fn frozen_owner_uses_exact_same_selected_signature_policy_and_rejects_stale_argu
                     input,
                     selected.clone(),
                     PureCallPreparation::Window {
-                        arguments: ScopedExpressionEffects::pure_value(context()),
+                        arguments: ScopedRelationalEffects::pure_value(context()),
                         options
                     },
                     &CompileControl::default()
@@ -614,7 +612,7 @@ fn frozen_owner_uses_exact_same_selected_signature_policy_and_rejects_stale_argu
                     input,
                     fixture.selected.clone(),
                     PureCallPreparation::Window {
-                        arguments: ScopedExpressionEffects::pure_value(context()),
+                        arguments: ScopedRelationalEffects::pure_value(context()),
                         options
                     },
                     &CompileControl::default()
@@ -851,7 +849,11 @@ fn original_contract_geometry_and_host_capacity_are_required_without_replacement
             fixture.input(),
             fixture.selected.clone(),
             PureCallPreparation::Scalar {
-                arguments: ScopedExpressionEffects::pure_value(context())
+                arguments: crate::ScopedExpressionEffects::pure_value(ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(900),
+                    region: EvaluationRegionId::new(901),
+                    demand: EvaluationDemand::Value
+                })
             },
             &CompileControl::default()
         ),

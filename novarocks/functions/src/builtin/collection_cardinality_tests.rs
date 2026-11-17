@@ -378,7 +378,7 @@ fn cardinality_two_actual_records_keep_selected_fresh_frozen_complete_sources_an
             let uses = [Some(ExpressionUseId::new(42))];
             let parameters = SemanticParameters::try_new([]).unwrap();
             let input = crate::CallEffectInput {
-                context,
+                context: context.into(),
                 argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
                 function_id: owner.binding_declaration().function_id(),
                 kind: crate::FunctionKind::Scalar,
@@ -469,7 +469,11 @@ fn cardinality_two_actual_records_keep_selected_fresh_frozen_complete_sources_an
                     .is_err()
             );
             let mut wrong_context = input;
-            wrong_context.context.region = EvaluationRegionId::new(99);
+            wrong_context.context = ExpressionEffectContext {
+                region: EvaluationRegionId::new(99),
+                ..wrong_context.context.expression().unwrap()
+            }
+            .into();
             assert!(
                 owner
                     .prepare_scalar(

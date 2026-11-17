@@ -286,7 +286,7 @@ fn calendar_period_diff_all_six_actual_records_preserve_fresh_frozen_selected_id
                 Some(ExpressionUseId::new(43)),
             ];
             let input = crate::CallEffectInput {
-                context,
+                context: context.into(),
                 argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
                 function_id: owner.binding_declaration().function_id(),
                 kind: crate::FunctionKind::Scalar,
@@ -380,7 +380,11 @@ fn calendar_period_diff_all_six_actual_records_preserve_fresh_frozen_selected_id
                     .is_err()
             );
             stale = input;
-            stale.context.region = EvaluationRegionId::new(999);
+            stale.context = novarocks_type_contract::ExpressionEffectContext {
+                region: EvaluationRegionId::new(999),
+                ..stale.context.expression().unwrap()
+            }
+            .into();
             assert!(
                 owner
                     .prepare_scalar(stale, canonical.clone(), crate::binding_test_control())

@@ -81,6 +81,8 @@ pub mod decimal256_digits;
 pub mod decimal_text;
 mod effect_metadata;
 mod effect_refinement;
+mod scoped_relation_effects;
+pub use scoped_relation_effects::*;
 mod evaluation;
 mod evaluation_failure;
 #[cfg(test)]

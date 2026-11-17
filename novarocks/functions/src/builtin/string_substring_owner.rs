@@ -339,7 +339,7 @@ pub(super) fn prepared_for_test_with_control(
         .map(|i| Some(ExpressionUseId::new(42 + i as u32)))
         .collect();
     let input = CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Scalar,
@@ -378,7 +378,7 @@ impl StringSubstringOwner {
             }
             if !input.environment.is_empty()
                 || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                    && input.proof_scope != CallProofScope::Region(input.context.region)
+                    && input.proof_scope != input.context.proof_scope()
             {
                 return Err(FunctionBindingError::InvalidBinding(
                     "substring has no environment dependencies and requires an exact proof scope"
@@ -414,7 +414,8 @@ impl StringSubstringOwner {
                 || input.kind != FunctionKind::Scalar
                 || contract.function_id() != input.function_id
                 || !std::ptr::eq(contract.selected(), input.selected)
-                || contract.context() != input.context
+                || novarocks_type_contract::CallEffectContext::from(contract.context())
+                    != input.context
                 || contract.decimal_overflow_policy() != input.decimal_overflow_policy
                 || contract.effects() != &self.call_effects(input.proof_scope)
                 || !input.environment.is_empty()

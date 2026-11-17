@@ -119,6 +119,16 @@ effect 后的验证伪装成同一次观察。
 
 ## 本地程序与 Task 准备
 
+表达式的独立契约在 `novarocks/expression-contract/src/**`：`BoundExprSet` 保存端口、定义、
+根、局部控制流、按 use 的声明和按定义的原始请求；`BoundExprSetBuilder` 负责封存与校验。
+常量池保留在 constant-contract，语义参数在 type-contract，调用者显式交付环境与控制。
+纯编译 crate `novarocks/expression` 已建立依赖闭包，单元编译入口与 `CompiledExprSet` 尚待实现；
+终态由 LocalProgram 持有编译单元表，节点/sink按（单元、根）消费。两个表达式 crate 都不反向
+依赖计划、SQL 或运行时 owner。关系调用及 writer 物化输入使用真实关系上下文，不借用单元
+use/region；函数绑定在 wire 上仍只有 package 级表。节点单元、wire27、逐单元编译与必需常量
+接入仍在迁移，不能从契约源码推定这些路径或最终原生验证已完成。见
+[ADR-0236](../../adr/ADR-0236-self-contained-expression-units-and-explicit-environments.md)。
+
 `novarocks/local-program/src/**` 定义纯 `LocalProgram`：节点、表达式、布局、sink
 和 binding requirements 都是静态事实，不持有 scan、writer、Connector 或异步运行能力。
 Native 在 `novarocks/native-adapter/src/backend_task_execution/{compiled_package,execution_host}.rs`

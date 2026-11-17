@@ -237,7 +237,7 @@ fn calendar_parts_all_48_actual_records_preserve_fresh_frozen_selected_identity_
             let parameters = SemanticParameters::try_new([]).unwrap();
             let uses = [Some(ExpressionUseId::new(42))];
             let input = crate::CallEffectInput {
-                context,
+                context: context.into(),
                 argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
                 function_id: owner.binding_declaration().function_id(),
                 kind: crate::FunctionKind::Scalar,
@@ -331,7 +331,11 @@ fn calendar_parts_all_48_actual_records_preserve_fresh_frozen_selected_identity_
                     .is_err()
             );
             stale = input;
-            stale.context.region = EvaluationRegionId::new(999);
+            stale.context = novarocks_type_contract::ExpressionEffectContext {
+                region: EvaluationRegionId::new(999),
+                ..stale.context.expression().unwrap()
+            }
+            .into();
             assert!(
                 owner
                     .prepare_scalar(stale, canonical.clone(), crate::binding_test_control())

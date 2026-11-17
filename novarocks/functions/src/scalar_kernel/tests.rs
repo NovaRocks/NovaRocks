@@ -137,11 +137,12 @@ fn contract_with_argument_nullability(
     }];
     let parameters = SemanticParameters::default();
     let input = CallEffectInput {
-        context: ExpressionEffectContext {
+        context: (ExpressionEffectContext {
             use_id: ExpressionUseId::new(7),
             region: EvaluationRegionId::new(9),
             demand: EvaluationDemand::Value,
-        },
+        })
+        .into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: &function_id,
         kind: FunctionKind::Scalar,
@@ -676,7 +677,7 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
     }];
     let argument_uses = [Some(ExpressionUseId::new(10))];
     let input = CallEffectInput {
-        context: frozen.context(),
+        context: (frozen.context()).into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&argument_uses),
         function_id: frozen.function_id(),
         kind: FunctionKind::Scalar,
@@ -710,7 +711,7 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
             &owner,
             input,
             frozen.call().selected_owner().clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedExpressionEffects::pure_value(input.context.expression().unwrap()),
             &CompileControl,
         );
         assert_eq!(owner.validations.load(Ordering::Relaxed), 1);

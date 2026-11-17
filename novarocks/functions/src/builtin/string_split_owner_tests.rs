@@ -59,7 +59,7 @@ fn input<'a>(
     uses: &'a [Option<ExpressionUseId>],
 ) -> CallEffectInput<'a> {
     CallEffectInput {
-        context: context(),
+        context: (context()).into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Scalar,

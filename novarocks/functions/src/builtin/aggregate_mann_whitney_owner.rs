@@ -324,7 +324,7 @@ impl MannOwner {
             }
             let scope = input.environment.is_empty()
                 && (input.proof_scope == CallProofScope::Unconditional
-                    || input.proof_scope == CallProofScope::Region(input.context.region));
+                    || input.proof_scope == input.context.proof_scope());
             work.step().map_err(FunctionEffectOwnerError::Control)?;
             if !scope {
                 return Err(FunctionBindingError::InvalidBinding(

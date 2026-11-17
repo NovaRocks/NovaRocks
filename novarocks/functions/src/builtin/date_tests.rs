@@ -524,7 +524,7 @@ fn date_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_sources
         let uses = [Some(ExpressionUseId::new(42))];
         let params = SemanticParameters::try_new([]).unwrap();
         let input = crate::CallEffectInput {
-            context,
+            context: context.into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
             function_id: owner.binding_declaration().function_id(),
             kind: crate::FunctionKind::Scalar,
@@ -637,7 +637,11 @@ fn date_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_sources
                 .is_err()
         );
         stale = input;
-        stale.context.use_id = ExpressionUseId::new(999);
+        stale.context = novarocks_type_contract::ExpressionEffectContext {
+            use_id: ExpressionUseId::new(999),
+            ..stale.context.expression().unwrap()
+        }
+        .into();
         assert!(
             owner
                 .prepare_scalar(stale, canonical, crate::binding_test_control())
@@ -798,7 +802,7 @@ fn date_invalid_and_null_constants_prepare_without_reading_payload() {
         let uses = [Some(ExpressionUseId::new(42))];
         let parameters = SemanticParameters::try_new([]).unwrap();
         let input = crate::CallEffectInput {
-            context,
+            context: context.into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
             function_id: owner.binding_declaration().function_id(),
             kind: crate::FunctionKind::Scalar,

@@ -65,7 +65,7 @@ fn input<'a>(
     source: Source,
 ) -> CallEffectInput<'a> {
     CallEffectInput {
-        context: context(),
+        context: (context()).into(),
         argument_uses: crate::CallArgumentUses::RegexpCountPattern {
             source,
             channels: uses,

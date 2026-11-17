@@ -157,11 +157,12 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
+            context: (ExpressionEffectContext {
                 use_id: ExpressionUseId::new(0),
                 region: EvaluationRegionId::new(7),
                 demand: EvaluationDemand::Value,
-            },
+            })
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Scalar,
@@ -512,4 +513,53 @@ fn replace_selected_argument_fixture(
     revised[ordinal] = argument;
     *arguments =
         novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(revised.into_boxed_slice());
+}
+
+#[test]
+fn materialized_actual_type_precedes_owner_and_keeps_required_to_nullable_admission() {
+    use novarocks_type_contract::{RelationCallId, RelationEffectContext};
+    let mut fixture = Fixture::new(vec![value(ty(DataType::Int64, true))]);
+    fixture.selected.aggregate = Some(crate::AggregateBindingSelection {
+        state_argument_contract:
+            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+        intermediate_type: ty(DataType::Int64, true),
+        state_format: crate::AggregateStateFormatIdentity::try_new(
+            "fixture/input-types/materialized-state",
+        )
+        .unwrap(),
+    });
+    let call = RelationEffectContext::call(RelationCallId::new(7));
+    let source = RelationEffectContext::materialized_input(RelationCallId::new(7));
+    let wrong = ty(DataType::Utf8, true);
+    let mut input = fixture.input();
+    input.kind = FunctionKind::Aggregate;
+    input.context = call.into();
+    input.proof_scope = CallProofScope::Relation(call.identity);
+    input.argument_uses = CallArgumentUses::MaterializedInput {
+        context: source,
+        input_type: &wrong,
+    };
+    let control = Arc::new(Control::default());
+    let mut owner = Owner::new(ArgumentControl::Aggregate, Arc::clone(&control));
+    owner.declaration.instance_state = FunctionInstanceState::AggregateInstance;
+    owner.declaration.own_row_error = FunctionIntrinsicRowError::NotRowEvaluated;
+    owner.declaration.validate(FunctionKind::Aggregate).unwrap();
+    let error = refine_call_effects(&owner, input, control.as_ref()).unwrap_err();
+    assert!(
+        matches!(error, CallEffectRefinementError::InvalidInput(_)),
+        "{error:?}"
+    );
+    owner.untouched();
+    let required = ty(DataType::Int64, false);
+    input.argument_uses = CallArgumentUses::MaterializedInput {
+        context: source,
+        input_type: &required,
+    };
+    let receipt = refine_call_effects(&owner, input, control.as_ref()).unwrap();
+    assert_eq!(
+        receipt.facts().proof_scope,
+        CallProofScope::Relation(call.identity)
+    );
+    assert!(owner.declarations.load(Ordering::Relaxed) > 0);
+    assert_eq!(owner.refinements.load(Ordering::Relaxed), 1);
 }

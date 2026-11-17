@@ -575,7 +575,7 @@ fn string_find_in_set_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects
             .collect();
         let params = SemanticParameters::try_new([]).unwrap();
         let input = crate::CallEffectInput {
-            context,
+            context: context.into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
             function_id: owner.binding_declaration().function_id(),
             kind: crate::FunctionKind::Scalar,
@@ -707,7 +707,11 @@ fn string_find_in_set_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects
                 .is_err()
         );
         stale = input;
-        stale.context.use_id = ExpressionUseId::new(999);
+        stale.context = novarocks_type_contract::ExpressionEffectContext {
+            use_id: ExpressionUseId::new(999),
+            ..stale.context.expression().unwrap()
+        }
+        .into();
         assert!(
             owner
                 .prepare_scalar(stale, canonical, crate::binding_test_control())
@@ -830,7 +834,7 @@ fn string_find_in_set_constant_null_is_deferred_and_empty_selection_keeps_source
     ];
     let params = SemanticParameters::try_new([]).unwrap();
     let input = crate::CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.binding_declaration().function_id(),
         kind: crate::FunctionKind::Scalar,

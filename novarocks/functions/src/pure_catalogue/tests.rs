@@ -411,7 +411,7 @@ fn call_input<'a>(
     parameters: &'a SemanticParameters,
 ) -> CallEffectInput<'a> {
     CallEffectInput {
-        context: context(),
+        context: (context()).into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
         function_id: function,
         kind: FunctionKind::Scalar,
@@ -1723,7 +1723,7 @@ fn exact_control_intrinsic_coalesce_fresh_frozen_keeps_descriptor_and_skips_ordi
         };
         assert!(Arc::ptr_eq(contract.selected_owner(), &selected));
         assert_eq!(contract.effects(), &frozen_facts);
-        assert_eq!(contract.context(), context());
+        assert_eq!(contract.context(), context().into());
         assert_eq!(contract.function_id(), &id(FUNCTION));
         assert_eq!(
             contract.effects().argument_control,

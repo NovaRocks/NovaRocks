@@ -195,3 +195,28 @@ impl BoundExprSet {
         }
     }
 }
+
+impl PartialEq for BoundExprSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.ports == other.ports
+            && self.definitions == other.definitions
+            && self.roots == other.roots
+            && self.root_uses == other.root_uses
+            && self.control == other.control
+            && self.claims == other.claims
+            && self.requests == other.requests
+    }
+}
+impl BoundExprSet {
+    /// Recheck immutable structure under the enclosing deployment's limits.
+    /// The same unit author owns these rules; this authenticates no installed
+    /// implementation and creates no new work entry, footer or resource grant.
+    pub fn validate_structure_in(
+        &self,
+        limits: crate::UnitLimits,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<(), crate::UnitError> {
+        crate::validation::validate(&self.ports, &self.definitions, &self.roots, limits, work)
+    }
+}
+// Design: ADR-0236-self-contained-expression-units-and-explicit-environments.md

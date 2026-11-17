@@ -473,7 +473,7 @@ fn string_to_base64_source_receipt_is_mandatory_and_frozen_source_cannot_be_subs
     let params = SemanticParameters::try_new([]).unwrap();
     let channels = [Some(ExpressionUseId::new(42))];
     let mut input = crate::CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&channels),
         function_id: owner.binding_declaration().function_id(),
         kind: crate::FunctionKind::Scalar,

@@ -24,11 +24,10 @@ use crate::{
 use arrow_array::{FixedSizeBinaryArray, Int32Array, Int64Array, StringArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CallEffects, CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionEffectDeclaration,
-    FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError,
-    FunctionNullBehavior, FunctionVolatility, ObservableEffects, SemanticParameters,
-    ValueLogicalType,
+    CallEffects, CallProofScope, CompileControlError, DecimalOverflowPolicy, ExpressionUseId,
+    FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
+    FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
+    SemanticParameters, ValueLogicalType,
 };
 use std::{sync::Mutex, time::Duration};
 
@@ -137,11 +136,10 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
-                use_id: ExpressionUseId::new(0),
-                region: EvaluationRegionId::new(7),
-                demand: EvaluationDemand::Value,
-            },
+            context: (novarocks_type_contract::RelationEffectContext::call(
+                novarocks_type_contract::RelationCallId::new(0),
+            ))
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Table,

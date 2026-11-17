@@ -84,12 +84,10 @@ impl Fixture {
             params: SemanticParameters::default(),
         }
     }
-    fn context(&self) -> ExpressionEffectContext {
-        ExpressionEffectContext {
-            use_id: ExpressionUseId::new(17),
-            region: EvaluationRegionId::new(19),
-            demand: EvaluationDemand::Value,
-        }
+    fn context(&self) -> novarocks_type_contract::RelationEffectContext {
+        novarocks_type_contract::RelationEffectContext::call(
+            novarocks_type_contract::RelationCallId::new(17),
+        )
     }
     fn prepare(
         &self,
@@ -105,11 +103,12 @@ impl Fixture {
         } else {
             CallArgumentUses::AggregateMerge {
                 phase,
-                state_context: ExpressionEffectContext {
+                state_context: (ExpressionEffectContext {
                     use_id: ExpressionUseId::new(71),
                     region: EvaluationRegionId::new(73),
                     demand: EvaluationDemand::Value,
-                },
+                })
+                .into(),
                 state_input_type: &state_type,
             }
         };
@@ -124,7 +123,7 @@ impl Fixture {
                     expected_result_type: None,
                 },
                 argument_uses,
-                context,
+                context: context.into(),
                 parameters: &self.params,
                 environment: &[],
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
@@ -132,7 +131,7 @@ impl Fixture {
             },
             self.selected.clone(),
             PureCallPreparation::Aggregate {
-                arguments: ScopedExpressionEffects::pure_value(context),
+                arguments: ScopedRelationalEffects::pure_value(context),
                 options: AggregatePreparationOptions {
                     phase,
                     distinct,
@@ -188,7 +187,7 @@ fn mann_whitney_owner_original_any_profiles_and_four_phases_are_installed() {
                     .prepare(
                         phase,
                         false,
-                        CallProofScope::Region(fixture.context().region),
+                        CallProofScope::Relation(fixture.context().identity),
                         &Control::default(),
                     )
                     .unwrap();
@@ -331,11 +330,12 @@ fn mann_whitney_checked_creator_preserves_four_phases_and_original_control() {
         } else {
             CallArgumentUses::AggregateMerge {
                 phase,
-                state_context: ExpressionEffectContext {
+                state_context: (ExpressionEffectContext {
                     use_id: ExpressionUseId::new(71),
                     region: EvaluationRegionId::new(73),
                     demand: EvaluationDemand::Value,
-                },
+                })
+                .into(),
                 state_input_type: &state_type,
             }
         };
@@ -349,14 +349,14 @@ fn mann_whitney_checked_creator_preserves_four_phases_and_original_control() {
                 expected_result_type: None,
             },
             argument_uses,
-            context,
+            context: context.into(),
             parameters: &fixture.params,
             environment: &[],
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Region(context.region),
+            proof_scope: CallProofScope::Relation(context.identity),
         };
         let options = || PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::pure_value(context),
+            arguments: ScopedRelationalEffects::pure_value(context),
             options: AggregatePreparationOptions {
                 phase,
                 distinct: false,
@@ -370,7 +370,7 @@ fn mann_whitney_checked_creator_preserves_four_phases_and_original_control() {
             .prepare(
                 phase,
                 false,
-                CallProofScope::Region(context.region),
+                CallProofScope::Relation(context.identity),
                 &Control::default(),
             )
             .unwrap();

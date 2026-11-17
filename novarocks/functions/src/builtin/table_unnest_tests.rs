@@ -94,12 +94,10 @@ fn compile_causes() -> [CompileControlError; 3] {
         CompileControlError::ResourceExhausted,
     ]
 }
-fn context() -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(0),
-        region: EvaluationRegionId::new(7),
-        demand: EvaluationDemand::Value,
-    }
+fn context() -> novarocks_type_contract::RelationEffectContext {
+    novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(0),
+    )
 }
 struct Fixture {
     catalog: PureEngineFunctionCatalog,
@@ -173,7 +171,7 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: context(),
+            context: (context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Table,
@@ -186,12 +184,12 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Region(context().region),
+            proof_scope: CallProofScope::Relation(context().identity),
         }
     }
     fn options(&self) -> PureCallPreparation {
         PureCallPreparation::Table {
-            arguments: ScopedExpressionEffects::pure_value(context()),
+            arguments: ScopedRelationalEffects::pure_value(context()),
         }
     }
     fn prepare(
@@ -372,7 +370,13 @@ fn installed_unnest_fresh_and_frozen_keep_exact_selection_full_fields_and_table_
                 fixture.input(),
                 fixture.selected.clone(),
                 PureCallPreparation::Scalar {
-                    arguments: ScopedExpressionEffects::pure_value(context())
+                    arguments: crate::ScopedExpressionEffects::pure_value(
+                        ExpressionEffectContext {
+                            use_id: ExpressionUseId::new(900),
+                            region: EvaluationRegionId::new(901),
+                            demand: EvaluationDemand::Value
+                        }
+                    )
                 },
                 &CompileControl::default()
             )

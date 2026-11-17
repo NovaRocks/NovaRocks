@@ -130,11 +130,12 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
+            context: (ExpressionEffectContext {
                 use_id: ExpressionUseId::new(u32::MAX),
                 region: EvaluationRegionId::new(0),
                 demand: EvaluationDemand::Value,
-            },
+            })
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Scalar,
@@ -416,3 +417,5 @@ fn value_equal_foreign_parameter_table_is_not_the_refined_input_borrow() {
     ));
     assert_eq!(fixture.refinements.load(Ordering::Relaxed), 1);
 }
+
+use novarocks_type_contract::ExpressionEffectContext;

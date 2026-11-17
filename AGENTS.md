@@ -282,6 +282,12 @@ SQL client
   从完成的 planner physical IR 经 `encode_completed_packages` 冻结 package。
   SQL 的精确结果声明、类型与函数准入快照必须随原始输入保留，不能从展示信息猜测。
 
+- `novarocks/expression-contract/src/{unit,builder}.rs`
+  `BoundExprSet` 已冻结有序端口、局部定义、根、控制流、调用声明与静态请求；
+  codec 的中立 parts 构造不要求 SQL 凭据或 DFS 编号。终态 package 在 PhysicalNode
+  信封承载单元，类型、常量与函数绑定仍只有 package 级共享来源；该节点/wire 接入尚待完成。
+  见 [ADR-0236](docs/adr/ADR-0236-self-contained-expression-units-and-explicit-environments.md)。
+
 - `novarocks/plan-codec/src/physical_package_v2/**`
   package 编解码与验证；`frozen_limits.rs` 拥有生产编码/解码上限和常量策略。
   `physical_type_v2.rs` 与 `physical_expression_v2.rs` 拥有对应 frozen vocabulary。
@@ -318,6 +324,12 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `novarocks/execution/src/exec/pipeline/builder/compiled_system_relation.rs`
   拥有独立系统关系的批序列、编解码、降级与 BE 游标源；每次消费批次，不整份拼接，
   不登记为 SQL 常量或借用 `StaticValues`。类型、几何和实际存储责任仍由原作者核对，见 ADR-0226/0227。
+
+- `novarocks/expression-contract/src/**` 与 `novarocks/expression/src/**`
+  前者只依赖中立 contract 与 Arrow schema，拥有单元构造/封存/校验；后者的纯编译依赖闭包
+  已建立，编译入口与 `CompiledExprSet` 尚待接入。两者都不依赖 physical-plan、local-program、
+  local-compiler、SQL 或 Execution。求值器当前仍在 Execution，折叠表示留给后续统一；
+  不在迁移中新增并行 arena、第二张绑定表或默认求值环境。
 
 - `novarocks/local-compiler/src/**`
   只消费已冻结的 package、pure function/provider facts，产生纯 `LocalProgram`；
@@ -684,6 +696,14 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `Chunk`: `novarocks/execution/src/exec/chunk/chunk_impl.rs`
   Arrow `RecordBatch` wrapper with `slot_id -> column_index` mapping and memory accounting.
+
+- `BoundExprSet` / `ExprPort` / `ExprRoot` / `RootOrdinal`：
+  `novarocks/expression-contract/src/unit.rs`；端口声明精确输入，根声明定义、需求与作用域，
+  定义身份局限于单元。常量池在 `novarocks/constant-contract/src/pool_table.rs`，参数与求值区域
+  在 type-contract；它们是显式环境与结构事实，不授予运行能力。
+
+- `CompiledExprSet`（终态，编译实现尚待接入）：`novarocks/expression/src/**`。
+  单元按作用域序号绑定输入；LocalProgram 将保管编译单元表，节点/sink按（单元、根）引用。
 
 - `LocalProgram`: `novarocks/local-program/src/**`
   纯 compiled program；Task 的 exchange、scan、writer 与 sink 能力在 BE preparation 另行绑定。
@@ -1126,11 +1146,12 @@ unless you edited them.
 |---|---|
 | `novarocks/sql/**` (parser, analyzer, optimizer, planner, function registry) | `-p novarocks-sql` |
 | `novarocks/execution/**` (operators, expressions, pipeline, exchange, runtime filter) | `-p novarocks-execution` |
+| `novarocks/expression/**` (pure unit compilation) | `-p novarocks-expression`，并按实际调用接缝选择 LocalCompiler、Execution 或 FE 必需常量 owner |
 | `novarocks/frontend-application/**`, `novarocks/query-application/**`, `novarocks/catalog-application/**` | that crate, plus `-p novarocks-worker -p novarocks-native-adapter` when the change crosses the FE/BE boundary |
 | `novarocks/worker/**`, `novarocks/native-adapter/**` | `-p novarocks-worker -p novarocks-native-adapter` |
 | `novarocks/connector/<name>/**` | that connector crate, plus `-p novarocks-fs` when authorized object-store access changes |
 | `novarocks/state-store/**` | the touched backend crate plus `-p novarocks-state-store-api` |
-| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/coordination-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
+| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/coordination-contract/**`, `novarocks/expression-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
 
 **SQL: choose suites from native declarations** and their generated map in
 `tests/sql/correctness/README.md`. Direct `--only <case>` is useful for diagnosis;
@@ -1223,6 +1244,12 @@ differ.
   保留 facade，`contract_lowering.rs` 在冻结前解除可选 RF 等待或准确拒绝必需数据环。
   FrozenPlan 验证使用同一作者重新核对实际 activation，不静默解除等待；观察式入口的图阶段
   沿原调用者 checkpoint，不能回落到 plain 验证或宣称其他 legacy 验证遍历也已受控。
+- **表达式单元契约/编译**：先读
+  [ADR-0236](docs/adr/ADR-0236-self-contained-expression-units-and-explicit-environments.md)，
+  从 `novarocks/expression-contract/src/{unit,builder,claims,request}.rs` 开始；编译层入口位于
+  `novarocks/expression/src/**`（当前尚待实现）。节点端口/根及关系站点由 physical-plan 核对，
+  关系上下文与 writer 物化输入不得借用单元 use/region。调用声明在 SQL 降级期撰写，
+  不能在 package 冻结或 BE 解码时重猜。P15 前核对节点、wire27与程序接入的实际完成状态。
 - **Package decode / compiled preparation**：从 `novarocks/plan-codec/src/physical_package_v2/**`、
   `novarocks/native-adapter/src/backend_task_execution/{compiled_package.rs,execution_host.rs}`
   与 `novarocks/local-compiler/src/**` 开始；Task 能力投影见 `compiled_scan_binding.rs`、

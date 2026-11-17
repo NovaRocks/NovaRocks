@@ -92,7 +92,7 @@ fn prepared_typed_with_result_storage(
                 selected: &selected,
                 request,
                 argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
-                context,
+                context: context.into(),
                 parameters: &parameters,
                 environment: &[],
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

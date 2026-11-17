@@ -204,7 +204,7 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: self.context(),
+            context: (self.context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Scalar,
@@ -419,8 +419,20 @@ fn abs_checked_loan_keeps_exact_original_input_catalogue_registered_owner_and_po
     for fault in 0..13 {
         let mut input = fixture.input();
         match fault {
-            0 => input.context.use_id = ExpressionUseId::new(43),
-            1 => input.context.region = EvaluationRegionId::new(8),
+            0 => {
+                input.context = novarocks_type_contract::ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(43),
+                    ..input.context.expression().unwrap()
+                }
+                .into()
+            }
+            1 => {
+                input.context = novarocks_type_contract::ExpressionEffectContext {
+                    region: EvaluationRegionId::new(8),
+                    ..input.context.expression().unwrap()
+                }
+                .into()
+            }
             2 => input.argument_uses = crate::CallArgumentUses::SelectedChannels(&copied_uses),
             3 => input.function_id = &copied_function,
             4 => input.kind = FunctionKind::Window,

@@ -147,10 +147,15 @@ impl LambdaBodyContract {
     ) -> Result<Self, KernelFailure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
+        let call_context = call
+            .call()
+            .context()
+            .expression()
+            .ok_or_else(|| invalid("higher-order contract has a non-scalar context"))?;
         // The lambda edge and inner body root can have distinct use IDs.
         // Row expansion must not reuse the outer batch's evaluation domain.
         if context.demand != call.body_demand()
-            || context.region == call.call().context().region
+            || context.region == call_context.region
             || effects.context() != context
         {
             return Err(invalid(

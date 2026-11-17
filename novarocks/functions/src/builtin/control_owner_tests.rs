@@ -123,7 +123,7 @@ fn input<'a>(
     parameters: &'a SemanticParameters,
 ) -> CallEffectInput<'a> {
     CallEffectInput {
-        context: context(),
+        context: (context()).into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Scalar,
@@ -616,9 +616,13 @@ fn actual_fresh_and_frozen_factories_keep_original_control_at_every_boundary() {
     let parameters = SemanticParameters::try_new([]).unwrap();
     let uses = uses(3);
     let mut exact = input(&owner, &selected, &arguments, &uses, &parameters);
-    exact.context.demand = EvaluationDemand::TruthOnly;
+    exact.context = ExpressionEffectContext {
+        demand: EvaluationDemand::TruthOnly,
+        ..exact.context.expression().unwrap()
+    }
+    .into();
     let options = || PureCallPreparation::ControlIntrinsic {
-        arguments: ScopedExpressionEffects::pure_value(exact.context),
+        arguments: ScopedExpressionEffects::pure_value(exact.context.expression().unwrap()),
     };
     let canonical = catalog
         .prepare_fresh(

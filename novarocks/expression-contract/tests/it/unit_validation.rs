@@ -223,6 +223,44 @@ fn semantic_depth_keeps_resource_class_and_truth_only_keeps_boolean_contract() {
         FailureClass::Resource
     );
     drop(pools);
+    // A previously sealed unit must still obey the enclosing deployment's
+    // stricter semantic limit through the same unit validation author.
+    let mut fresh = BoundExprSetBuilder::new(limits());
+    let (source, reference) = i64_source(7);
+    let mut id = fresh
+        .add(None, integer(false), ExprKind::Constant(reference))
+        .unwrap();
+    for _ in 0..2 {
+        id = fresh
+            .add(
+                None,
+                integer(false),
+                ExprKind::Unary {
+                    op: UnaryOperator::Plus,
+                    expr: id,
+                },
+            )
+            .unwrap();
+    }
+    fresh
+        .root(id, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let unit = no_calls(fresh, vec![], &Control::good()).unwrap();
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    assert_eq!(
+        unit.validate_structure_in(
+            UnitLimits {
+                expression_semantic_depth: 2
+            },
+            &mut work
+        )
+        .unwrap_err()
+        .failure_fact()
+        .class(),
+        FailureClass::Resource
+    );
+    drop(source);
     let mut builder = BoundExprSetBuilder::new(limits());
     let (pools, reference) = i64_source(1);
     let id = builder

@@ -192,11 +192,10 @@ impl Owner {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
-                use_id: ExpressionUseId::new(0),
-                region: EvaluationRegionId::new(9),
-                demand: EvaluationDemand::Value,
-            },
+            context: (novarocks_type_contract::RelationEffectContext::call(
+                novarocks_type_contract::RelationCallId::new(0),
+            ))
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Aggregate,
@@ -217,11 +216,12 @@ impl Owner {
         if !phase.consumes_logical_arguments() {
             input.argument_uses = crate::CallArgumentUses::AggregateMerge {
                 phase,
-                state_context: ExpressionEffectContext {
+                state_context: (ExpressionEffectContext {
                     use_id: ExpressionUseId::new(u32::MAX),
                     region: EvaluationRegionId::new(8),
                     demand: EvaluationDemand::Value,
-                },
+                })
+                .into(),
                 state_input_type: &self.selected.aggregate.as_ref().unwrap().intermediate_type,
             };
         }
@@ -274,7 +274,7 @@ impl Owner {
             self,
             input,
             self.selected.clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             self.options(phase),
             &CompileControl::default(),
         )
@@ -600,7 +600,7 @@ fn fresh_and_frozen_prepare_once_without_state_and_preserve_exact_phase_channels
             owner.counts.refine.store(0, Ordering::Relaxed);
             owner.counts.prepare.store(0, Ordering::Relaxed);
             let input = owner.input_for_phase(phase);
-            let child = ScopedExpressionEffects::pure_value(input.context);
+            let child = ScopedRelationalEffects::pure_value(input.context.relation().unwrap());
             let prepared = if frozen {
                 specialize_frozen_aggregate(
                     &owner,
@@ -647,7 +647,7 @@ fn fresh_and_frozen_prepare_once_without_state_and_preserve_exact_phase_channels
             assert!(
                 prepared
                     .effects()
-                    .for_use(input.context)
+                    .for_use(input.context.relation().unwrap())
                     .unwrap()
                     .has_instance_state
             );
@@ -786,7 +786,7 @@ fn equal_foreign_contracts_are_rejected_before_batch_or_state_creation() {
         &owner,
         input,
         owner.selected.clone(),
-        ScopedExpressionEffects::pure_value(input.context),
+        ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
         owner.options(AggregateKernelPhase::Single),
         &CompileControl::default(),
     );
@@ -923,7 +923,7 @@ fn construction_raii_and_retained_overflow_precede_publication() {
         &owner,
         input,
         owner.selected.clone(),
-        ScopedExpressionEffects::pure_value(input.context),
+        ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
         owner.options(AggregateKernelPhase::Single),
         &CompileControl::default(),
     );
@@ -1110,7 +1110,7 @@ fn compile_entry_and_positive_quantum_controls_remain_typed_before_preparation()
                 ..CompileControl::default()
             };
             for frozen in [false, true] {
-                let child = ScopedExpressionEffects::pure_value(input.context);
+                let child = ScopedRelationalEffects::pure_value(input.context.relation().unwrap());
                 let result = if frozen {
                     specialize_frozen_aggregate(
                         &owner,
@@ -1385,7 +1385,7 @@ fn forged_frozen_effects_or_wrong_child_use_never_prepare_aggregate() {
             input,
             owner.selected.clone(),
             &frozen,
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             owner.options(AggregateKernelPhase::Single),
             &CompileControl::default()
         ),
@@ -1393,14 +1393,14 @@ fn forged_frozen_effects_or_wrong_child_use_never_prepare_aggregate() {
             "frozen call effects differ from exact local refinement"
         ))
     ));
-    let mut other = input.context;
-    other.use_id = ExpressionUseId::new(99);
+    let mut other = input.context.relation().unwrap();
+    other.identity.call = novarocks_type_contract::RelationCallId::new(99);
     assert!(matches!(
         specialize_aggregate(
             &owner,
             input,
             owner.selected.clone(),
-            ScopedExpressionEffects::pure_value(other),
+            ScopedRelationalEffects::pure_value(other),
             owner.options(AggregateKernelPhase::Single),
             &CompileControl::default()
         ),

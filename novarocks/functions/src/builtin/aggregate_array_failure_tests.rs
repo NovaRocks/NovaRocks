@@ -150,11 +150,9 @@ fn kernel_source(
         .resolve_bound_user(name, FunctionKind::Aggregate, request, &Compile)
         .unwrap();
     let selected = Arc::new(bound.selected);
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(641),
-        region: EvaluationRegionId::new(69),
-        demand: EvaluationDemand::Value,
-    };
+    let context = novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(641),
+    );
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(644),
         region: EvaluationRegionId::new(70),
@@ -172,7 +170,7 @@ fn kernel_source(
     } else {
         CallArgumentUses::AggregateMerge {
             phase,
-            state_context,
+            state_context: state_context.into(),
             state_input_type: &state_type,
         }
     };
@@ -184,15 +182,15 @@ fn kernel_source(
             selected: &selected,
             request,
             argument_uses,
-            context,
+            context: context.into(),
             parameters: &parameters,
             environment: &[],
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Region(context.region),
+            proof_scope: CallProofScope::Relation(context.identity),
         },
         selected.clone(),
         PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::pure_value(context),
+            arguments: ScopedRelationalEffects::pure_value(context),
             options: AggregatePreparationOptions {
                 state_interpretation: receipt.then(|| {
                     Arc::new(novarocks_type_contract::AggregateStateInterpretation {
@@ -607,11 +605,9 @@ fn ordered_kernel_source(
         .resolve_bound_user(name, FunctionKind::Aggregate, request, &Compile)
         .unwrap();
     let selected = Arc::new(bound.selected);
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(641),
-        region: EvaluationRegionId::new(69),
-        demand: EvaluationDemand::Value,
-    };
+    let context = novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(641),
+    );
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(644),
         region: EvaluationRegionId::new(70),
@@ -632,7 +628,7 @@ fn ordered_kernel_source(
     } else {
         CallArgumentUses::AggregateMerge {
             phase,
-            state_context,
+            state_context: state_context.into(),
             state_input_type: &state_type,
         }
     };
@@ -644,15 +640,15 @@ fn ordered_kernel_source(
             selected: &selected,
             request,
             argument_uses,
-            context,
+            context: context.into(),
             parameters: &parameters,
             environment: &[],
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Region(context.region),
+            proof_scope: CallProofScope::Relation(context.identity),
         },
         selected.clone(),
         PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::pure_value(context),
+            arguments: ScopedRelationalEffects::pure_value(context),
             options: AggregatePreparationOptions {
                 state_interpretation: receipt.then(|| {
                     Arc::new(novarocks_type_contract::AggregateStateInterpretation {

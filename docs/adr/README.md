@@ -125,6 +125,8 @@ code-anchors:
 
 ### pipeline-execution
 
+- [ADR-0236](ADR-0236-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；单元契约已实现，节点、wire与编译接入实施中）
+
 领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
 
 - [ADR-0223](ADR-0223-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
@@ -310,6 +312,8 @@ code-anchors:
 - ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（superseded → ADR-0135）
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
+
+- [ADR-0236](ADR-0236-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；单元契约已实现，节点、wire与编译接入实施中）
 
 
 领域哲学：SQL compiler 只消费一次 statement admission 冻结的 SQL 事实，并只产出 SQL facts；application owner 保留 session、目录观察、topology、native encoding 与 lifecycle assembly。catalog、statistics 与 scan preparation 对同一表必须复用同一 exact Connector binding，缺失事实必须显式失败或保守降级，不能重新读取 latest。
@@ -563,6 +567,8 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0160 — Arrow 留存谱系与 Reservation 共享叶子（superseded → ADR-0166）
 
 ### crate-boundary
+
+- [ADR-0236](ADR-0236-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；单元契约已实现，节点、wire与编译接入实施中）
 
 - [ADR-0229](ADR-0229-rust-test-placement-dependency-direction-and-fixture-ownership.md) — Rust 测试为何按断言 owner 放置、测试依赖为何不越出生产依赖闭包、无生产边的组合为何进接缝测试 package，以及 fixture 与增长规则（active；沿用 ADR-0056/0069/0140/0190，不替代其中任何一条）
 - [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — MV 文档为何不自设容量额度、读方为何覆盖写方、StateStore 为何声明真实能力、REST 为何按期望值核验并把 413 归为确定拒绝（active；部分替代 ADR-0180 的额度与首条重评条件，以及 REST 会话版 ADR-0175 的属性保留量与拒绝集；原存放、身份、生命周期、认证与路由保留；薄清单条目/名字/token固定界由 ADR-0227 部分替代，其余文档与后端边界保留）

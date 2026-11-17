@@ -46,12 +46,10 @@ impl KernelEvaluationControl for RuntimeControl {
     }
 }
 
-fn context() -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(0),
-        region: EvaluationRegionId::new(u32::MAX),
-        demand: EvaluationDemand::Value,
-    }
+fn context() -> novarocks_type_contract::RelationEffectContext {
+    novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(0),
+    )
 }
 
 fn catalog() -> PureEngineFunctionCatalog {
@@ -153,20 +151,21 @@ impl Fixture {
                 expected_result_type: None,
             },
             argument_uses: CallArgumentUses::SelectedChannels(&self.uses),
-            context: context(),
+            context: (context()).into(),
             parameters: &self.parameters,
             environment: &[],
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Region(context().region),
+            proof_scope: CallProofScope::Relation(context().identity),
         };
         if !phase.consumes_logical_arguments() {
             input.argument_uses = CallArgumentUses::AggregateMerge {
                 phase,
-                state_context: ExpressionEffectContext {
+                state_context: (ExpressionEffectContext {
                     use_id: ExpressionUseId::new(u32::MAX),
                     region: EvaluationRegionId::new(u32::MAX - 1),
                     demand: EvaluationDemand::Value,
-                },
+                })
+                .into(),
                 state_input_type: &self.state,
             };
         }
@@ -174,7 +173,7 @@ impl Fixture {
             input,
             self.selected.clone(),
             PureCallPreparation::Aggregate {
-                arguments: ScopedExpressionEffects::pure_value(context()),
+                arguments: ScopedRelationalEffects::pure_value(context()),
                 options: AggregatePreparationOptions {
                     state_interpretation: None,
                     phase,

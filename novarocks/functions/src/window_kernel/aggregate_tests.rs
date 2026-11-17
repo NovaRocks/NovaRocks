@@ -27,11 +27,11 @@ use crate::{
 use arrow_array::{ArrayRef, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    ArgumentControl, CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionEffectDeclaration,
-    FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError,
-    FunctionNullBehavior, FunctionValueType, FunctionVolatility, ObservableEffects,
-    SemanticParameters, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
+    ArgumentControl, CallProofScope, CompileControlError, DecimalOverflowPolicy, ExpressionUseId,
+    FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
+    FunctionIntrinsicRowError, FunctionNullBehavior, FunctionValueType, FunctionVolatility,
+    ObservableEffects, SemanticParameters, WindowBound, WindowFrame, WindowFrameExclusion,
+    WindowFrameUnits,
 };
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
@@ -123,11 +123,10 @@ impl Owner {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
-                use_id: ExpressionUseId::new(0),
-                region: EvaluationRegionId::new(7),
-                demand: EvaluationDemand::Value,
-            },
+            context: (novarocks_type_contract::RelationEffectContext::call(
+                novarocks_type_contract::RelationCallId::new(0),
+            ))
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Aggregate,
@@ -175,7 +174,7 @@ impl Owner {
         control: &dyn PureCompileControl,
     ) -> Result<WindowSpecialization, FunctionSpecializationFailure> {
         let input = self.input();
-        let children = ScopedExpressionEffects::pure_value(input.context);
+        let children = ScopedRelationalEffects::pure_value(input.context.relation().unwrap());
         if frozen {
             specialize_frozen_aggregate_window(
                 self,
@@ -661,7 +660,7 @@ fn non_single_or_state_input_is_rejected_before_any_owner_work() {
             &owner,
             input,
             owner.selected.clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             AggregateWindowPreparationOptions {
                 aggregate: options,
                 window: window_options(),
@@ -695,7 +694,7 @@ fn forged_frozen_effects_cannot_reach_aggregate_or_window_adapter() {
         input,
         owner.selected.clone(),
         &frozen,
-        ScopedExpressionEffects::pure_value(input.context),
+        ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
         AggregateWindowPreparationOptions {
             aggregate: owner.options(),
             window: window_options(),

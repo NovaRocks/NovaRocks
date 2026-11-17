@@ -144,11 +144,12 @@ impl Owner {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
+            context: (ExpressionEffectContext {
                 use_id: ExpressionUseId::new(0),
                 region: EvaluationRegionId::new(7),
                 demand: EvaluationDemand::Value,
-            },
+            })
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Scalar,
@@ -855,7 +856,7 @@ fn body_context_capture_domain_and_compile_observation_are_exact() {
         ..exact
     };
     let outer_domain = ExpressionEffectContext {
-        region: call.call().context().region,
+        region: call.call().context().expression().unwrap().region,
         ..exact
     };
     for (context, effects) in [

@@ -24,7 +24,7 @@ use crate::{
     FunctionResultType, KernelFailure, RefinedCallEffects,
 };
 use novarocks_type_contract::{
-    CallEffects, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, ExpressionEffectContext,
+    CallEffectContext, CallEffects, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy,
     FunctionKind, PureCompileControl, SemanticParameterProjectionError, SemanticParameters,
 };
 use std::sync::Arc;
@@ -36,7 +36,7 @@ pub struct FunctionCallContract {
     function_id: FunctionId,
     kind: FunctionKind,
     logical_argument_count: usize,
-    context: ExpressionEffectContext,
+    context: CallEffectContext,
     decimal_overflow_policy: DecimalOverflowPolicy,
     selected: Arc<FunctionBindingSelection>,
     effects: CallEffects,
@@ -63,7 +63,9 @@ impl FunctionCallContract {
                     "signature owner differs from the exact input borrow",
                 ));
             }
-            if (input.kind == FunctionKind::Aggregate) != input.selected.aggregate.is_some() {
+            if !input.context.matches_kind(input.kind)
+                || (input.kind == FunctionKind::Aggregate) != input.selected.aggregate.is_some()
+            {
                 return Err(invalid(
                     "aggregate state contract differs from the exact function kind",
                 ));
@@ -165,7 +167,7 @@ impl FunctionCallContract {
     pub const fn function_id(&self) -> &FunctionId {
         &self.function_id
     }
-    pub const fn context(&self) -> ExpressionEffectContext {
+    pub const fn context(&self) -> CallEffectContext {
         self.context
     }
     pub const fn decimal_overflow_policy(&self) -> DecimalOverflowPolicy {

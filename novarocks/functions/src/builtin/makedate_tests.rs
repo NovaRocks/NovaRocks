@@ -207,7 +207,7 @@ fn makedate_actual_owner_fresh_frozen_full_facts_and_raw_preparation_are_exact()
     ];
     let parameters = SemanticParameters::try_new([]).unwrap();
     let input = crate::CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.binding_declaration().function_id(),
         kind: crate::FunctionKind::Scalar,
@@ -303,7 +303,11 @@ fn makedate_actual_owner_fresh_frozen_full_facts_and_raw_preparation_are_exact()
             .is_err()
     );
     stale = input;
-    stale.context.region = EvaluationRegionId::new(9);
+    stale.context = novarocks_type_contract::ExpressionEffectContext {
+        region: EvaluationRegionId::new(9),
+        ..stale.context.expression().unwrap()
+    }
+    .into();
     assert!(
         owner
             .prepare_scalar(stale, canonical.clone(), crate::binding_test_control())

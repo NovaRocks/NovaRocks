@@ -116,7 +116,7 @@ fn prepared_arguments_with_result_storage(
     let specialization = catalogue
         .prepare_fresh_selected(
             CallEffectInput {
-                context,
+                context: context.into(),
                 argument_uses: CallArgumentUses::SelectedChannels(&uses),
                 function_id: &bound.function_id,
                 kind: FunctionKind::Scalar,

@@ -60,11 +60,9 @@ fn prepare(
         .resolve_bound_user(name, FunctionKind::Aggregate, request, &Control)
         .unwrap();
     let selected = Arc::new(bound.selected);
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(41),
-        region: EvaluationRegionId::new(51),
-        demand: EvaluationDemand::Value,
-    };
+    let context = novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(41),
+    );
     let parameters = SemanticParameters::default();
     let uses = [
         Some(ExpressionUseId::new(42)),
@@ -76,11 +74,12 @@ fn prepare(
     } else {
         CallArgumentUses::AggregateMerge {
             phase,
-            state_context: ExpressionEffectContext {
+            state_context: (ExpressionEffectContext {
                 use_id: ExpressionUseId::new(61),
                 region: EvaluationRegionId::new(71),
                 demand: EvaluationDemand::Value,
-            },
+            })
+            .into(),
             state_input_type: &state,
         }
     };
@@ -91,15 +90,15 @@ fn prepare(
             selected: &selected,
             request,
             argument_uses,
-            context,
+            context: context.into(),
             parameters: &parameters,
             environment: &[],
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Region(context.region),
+            proof_scope: CallProofScope::Relation(context.identity),
         },
         Arc::clone(&selected),
         PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::pure_value(context),
+            arguments: ScopedRelationalEffects::pure_value(context),
             options: AggregatePreparationOptions {
                 phase,
                 distinct: false,

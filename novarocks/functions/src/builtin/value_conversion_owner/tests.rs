@@ -80,7 +80,7 @@ fn input<'a>(
     policy: DecimalOverflowPolicy,
 ) -> CallEffectInput<'a> {
     CallEffectInput {
-        context: context(),
+        context: (context()).into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Scalar,
@@ -441,7 +441,13 @@ fn frozen_facts_and_prepare_cannot_replace_overload_owner_pointer_scope_context_
     for field in 0..4 {
         let mut wrong = exact;
         match field {
-            0 => wrong.context.use_id = ExpressionUseId::new(99),
+            0 => {
+                wrong.context = novarocks_type_contract::ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(99),
+                    ..wrong.context.expression().unwrap()
+                }
+                .into()
+            }
             1 => wrong.decimal_overflow_policy = DecimalOverflowPolicy::OutputNull,
             2 => wrong.proof_scope = CallProofScope::Unconditional,
             _ => wrong.kind = FunctionKind::Aggregate,
@@ -1065,7 +1071,7 @@ fn conversion_recipe_refuses_a_real_foreign_canonical_kernel_without_a_later_cal
     let parameters = SemanticParameters::default();
     let uses = [Some(ExpressionUseId::new(42))];
     let input = CallEffectInput {
-        context: context(),
+        context: (context()).into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: &bound.function_id,
         kind: FunctionKind::Scalar,

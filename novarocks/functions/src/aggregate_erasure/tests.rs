@@ -28,7 +28,7 @@ use crate::{
 use crate::{AggregateKernelPhase, AggregateOrderKey, EvaluatedArgument};
 use crate::{
     CallEffectInput, FunctionBindingError, FunctionBindingResolver, FunctionBindingSelection,
-    FunctionEffectOwner, ScopedExpressionEffects, Selection,
+    FunctionEffectOwner, ScopedRelationalEffects, Selection,
 };
 use arrow_array::{Int32Array, Int64Array};
 use arrow_schema::DataType;
@@ -751,11 +751,10 @@ impl Owner {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
-                use_id: ExpressionUseId::new(0),
-                region: EvaluationRegionId::new(9),
-                demand: EvaluationDemand::Value,
-            },
+            context: (novarocks_type_contract::RelationEffectContext::call(
+                novarocks_type_contract::RelationCallId::new(0),
+            ))
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Aggregate,
@@ -776,11 +775,12 @@ impl Owner {
         if !phase.consumes_logical_arguments() {
             input.argument_uses = crate::CallArgumentUses::AggregateMerge {
                 phase,
-                state_context: ExpressionEffectContext {
+                state_context: (ExpressionEffectContext {
                     use_id: ExpressionUseId::new(u32::MAX),
                     region: EvaluationRegionId::new(8),
                     demand: EvaluationDemand::Value,
-                },
+                })
+                .into(),
                 state_input_type: &self.selected.aggregate.as_ref().unwrap().intermediate_type,
             };
         }
@@ -833,7 +833,7 @@ impl Owner {
             self,
             input,
             self.selected.clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             self.options(phase),
             &CompileControl::default(),
         )

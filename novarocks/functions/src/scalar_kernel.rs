@@ -99,7 +99,12 @@ impl ScalarCallContract {
         self.0.function_id()
     }
     pub const fn context(&self) -> ExpressionEffectContext {
-        self.0.context()
+        match self.0.context() {
+            novarocks_type_contract::CallEffectContext::Expression(context) => context,
+            novarocks_type_contract::CallEffectContext::Relation(_) => {
+                panic!("scalar contract contains a relation context")
+            }
+        }
     }
     pub const fn decimal_overflow_policy(&self) -> DecimalOverflowPolicy {
         self.0.decimal_overflow_policy()
