@@ -35,22 +35,24 @@ impl From<CompileControlError> for TemporalSourceProjectionError {
     }
 }
 pub use novarocks_type_contract::{NonCanonicalNativeV1FunctionName, native_v1_function_name};
-fn dtype(arena: &[ExprNode], id: ExprId) -> Result<&DataType, TemporalSourceProjectionError> {
-    Ok(arena
-        .get((id).get() as usize)
+fn dtype<'source>(
+    definition: &impl Fn(ExprId) -> Option<&'source ExprNode>,
+    id: ExprId,
+) -> Result<&'source DataType, TemporalSourceProjectionError> {
+    Ok(definition(id)
         .ok_or(TemporalSourceProjectionError::Invalid(
             "temporal source definition is absent",
         ))?
         .ty
         .data_type())
 }
-fn cast_kind(
-    arena: &[ExprNode],
+fn cast_kind<'source>(
+    definition: &impl Fn(ExprId) -> Option<&'source ExprNode>,
     target: &DataType,
     child: ExprId,
 ) -> Result<TemporalCastKind, TemporalSourceProjectionError> {
     Ok(if matches!(target, DataType::Time64(_)) {
-        if matches!(dtype(arena, child)?, DataType::Timestamp(_, _)) {
+        if matches!(dtype(definition, child)?, DataType::Timestamp(_, _)) {
             TemporalCastKind::TimeFromDatetime
         } else {
             TemporalCastKind::Time
@@ -101,6 +103,23 @@ pub fn temporal_source_definitions_observed(
     args: &[ExprId],
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<TemporalSourceDefinitions<ExprId>, TemporalSourceProjectionError> {
+    temporal_source_definitions_from_lookup_observed(
+        kind,
+        |id| arena.get(id.get() as usize),
+        args,
+        work,
+    )
+}
+
+/// Borrow original definitions while their unit is still being constructed.
+/// This is the same source author as the immutable-slice entry: it does not
+/// copy definitions, open a scope, or finish the caller's work.
+pub fn temporal_source_definitions_from_lookup_observed<'source>(
+    kind: TemporalSourceKind,
+    definition: impl Fn(ExprId) -> Option<&'source ExprNode>,
+    args: &[ExprId],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<TemporalSourceDefinitions<ExprId>, TemporalSourceProjectionError> {
     let arity = if kind == TemporalSourceKind::TimeFormat {
         2
     } else {
@@ -112,17 +131,15 @@ pub fn temporal_source_definitions_observed(
         ));
     }
     let normal = args[0];
-    let node = arena
-        .get((normal).get() as usize)
-        .ok_or(TemporalSourceProjectionError::Invalid(
-            "temporal normal definition is absent",
-        ))?;
+    let node = definition(normal).ok_or(TemporalSourceProjectionError::Invalid(
+        "temporal normal definition is absent",
+    ))?;
     work.step()?;
     if kind == TemporalSourceKind::TimeFormat {
         let (facts, defs) = if let ExprKind::Cast { expr, target, .. } = &node.kind {
-            let ordinary = cast_kind(arena, target, *expr)? == TemporalCastKind::Ordinary;
+            let ordinary = cast_kind(&definition, target, *expr)? == TemporalCastKind::Ordinary;
             work.step()?;
-            if ordinary && matches!(dtype(arena, *expr)?, DataType::Utf8) {
+            if ordinary && matches!(dtype(&definition, *expr)?, DataType::Utf8) {
                 (
                     TemporalSourceFacts::FormatUtf8Override,
                     Some([*expr, normal, args[1]]),
@@ -146,8 +163,7 @@ pub fn temporal_source_definitions_observed(
     // strategy. Only the exact immutable trace is copied once at publication.
     let mut casts = [TemporalCastKind::Ordinary; MAX_CONTROL_DEPTH];
     let mut cast_count = 0usize;
-    while let ExprKind::Cast { expr, target, .. } = &arena
-        .get((deepest).get() as usize)
+    while let ExprKind::Cast { expr, target, .. } = &definition(deepest)
         .ok_or(TemporalSourceProjectionError::Invalid(
             "temporal cast definition is absent",
         ))?
@@ -156,7 +172,7 @@ pub fn temporal_source_definitions_observed(
         if cast_count == MAX_CONTROL_DEPTH {
             return Err(CompileControlError::ResourceExhausted.into());
         }
-        let kind = cast_kind(arena, target, *expr)?;
+        let kind = cast_kind(&definition, target, *expr)?;
         work.step()?;
         if immediate.is_none() {
             immediate = Some(*expr)
@@ -165,8 +181,7 @@ pub fn temporal_source_definitions_observed(
         cast_count += 1;
         deepest = *expr;
     }
-    if let ExprKind::FunctionCall { function, args } = &arena
-        .get((deepest).get() as usize)
+    if let ExprKind::FunctionCall { function, args } = &definition(deepest)
         .ok_or(TemporalSourceProjectionError::Invalid(
             "temporal deepest definition is absent",
         ))?
@@ -193,33 +208,34 @@ pub fn temporal_source_definitions_observed(
             return Ok(TemporalSourceDefinitions { facts, definitions });
         }
     }
-    let (facts, defs) = if matches!(dtype(arena, normal)?, DataType::Utf8) || immediate.is_none() {
-        (
-            TemporalSourceFacts::SecondsDirect {
-                cast_chain: own_cast_chain(&casts[..cast_count], work)?,
-            },
-            ([normal, normal, normal], 1),
-        )
-    } else {
-        let immediate = immediate.ok_or(TemporalSourceProjectionError::Invalid(
-            "temporal cast source is absent",
-        ))?;
-        if matches!(dtype(arena, immediate)?, DataType::Utf8) {
+    let (facts, defs) =
+        if matches!(dtype(&definition, normal)?, DataType::Utf8) || immediate.is_none() {
             (
-                TemporalSourceFacts::SecondsCastString {
+                TemporalSourceFacts::SecondsDirect {
                     cast_chain: own_cast_chain(&casts[..cast_count], work)?,
                 },
-                ([normal, immediate, immediate], 2),
+                ([normal, normal, normal], 1),
             )
         } else {
-            (
-                TemporalSourceFacts::SecondsCastOther {
-                    cast_chain: own_cast_chain(&casts[..cast_count], work)?,
-                },
-                ([normal, immediate, deepest], 3),
-            )
-        }
-    };
+            let immediate = immediate.ok_or(TemporalSourceProjectionError::Invalid(
+                "temporal cast source is absent",
+            ))?;
+            if matches!(dtype(&definition, immediate)?, DataType::Utf8) {
+                (
+                    TemporalSourceFacts::SecondsCastString {
+                        cast_chain: own_cast_chain(&casts[..cast_count], work)?,
+                    },
+                    ([normal, immediate, immediate], 2),
+                )
+            } else {
+                (
+                    TemporalSourceFacts::SecondsCastOther {
+                        cast_chain: own_cast_chain(&casts[..cast_count], work)?,
+                    },
+                    ([normal, immediate, deepest], 3),
+                )
+            }
+        };
     work.flush()?;
     let definitions = own_definitions(&defs.0[..defs.1], work)?;
     work.flush()?;

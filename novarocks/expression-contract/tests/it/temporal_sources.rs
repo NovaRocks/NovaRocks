@@ -268,3 +268,67 @@ fn physical_source_author_preserves_three_typed_compile_causes_at_every_callback
         }
     }
 }
+
+#[test]
+fn original_unsealed_unit_loans_temporal_sources_before_control_construction() {
+    use novarocks_expression_contract::{
+        BoundExprSetBuilder, UnitLimits, temporal_source_definitions_from_lookup_observed,
+    };
+    let source = definitions(vec![
+        leaf(1, DataType::Int64),
+        call(2, "builtin.scalar/sec_to_time/v1", 1, DataType::Utf8),
+        cast(3, 2, ts()),
+    ]);
+    let mut draft = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: novarocks_type_contract::MAX_CONTROL_DEPTH,
+    });
+    for node in &source {
+        let id = draft
+            .add(node.lambda_scope, node.ty.clone(), node.kind.clone())
+            .unwrap();
+        assert_eq!(id, node.id);
+    }
+    assert!(draft.roots().is_empty());
+    let run_draft = |control: &Control| {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let result = temporal_source_definitions_from_lookup_observed(
+            Kind::TimeToSec,
+            |id| draft.definition(id),
+            &[ExprId::new(2)],
+            &mut work,
+        );
+        if matches!(result, Err(SourceError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    };
+    let original = Control::default();
+    let expected = run(&source, Kind::TimeToSec, &[3], &original).unwrap();
+    let baseline = Control::default();
+    let actual = run_draft(&baseline).unwrap();
+    assert_eq!(actual.facts, expected.facts);
+    assert_eq!(actual.definitions, expected.definitions);
+    assert_eq!(actual.definitions.as_ref(), &[ExprId::new(0)]);
+    assert_eq!(
+        *baseline.trace.lock().unwrap(),
+        *original.trace.lock().unwrap()
+    );
+    let trace = baseline.trace.lock().unwrap().clone();
+    for at in 0..trace.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control {
+                trace: Mutex::default(),
+                refuse: Some((at, cause.clone())),
+            };
+            assert!(
+                matches!(run_draft(&control), Err(SourceError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+        }
+    }
+}
