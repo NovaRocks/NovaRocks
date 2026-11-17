@@ -51,7 +51,6 @@ pub(crate) fn source_columns_to_table_column_defs(
                 name: column.name.clone(),
                 data_type,
                 nullable: column.value_type.nullable(),
-                aggregation: None,
                 default: None,
             })
         })
@@ -211,7 +210,6 @@ mod tests {
         assert_eq!(cols[0].name, "id");
         assert_eq!(cols[0].data_type, SqlType::Int);
         assert!(cols[0].nullable);
-        assert!(cols[0].aggregation.is_none());
         assert!(cols[0].default.is_none());
         assert_eq!(cols[1].name, "name");
         assert_eq!(cols[1].data_type, SqlType::String);

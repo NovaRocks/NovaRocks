@@ -207,10 +207,8 @@ fn hadoop_fencing_child_process_entry() {
                     name: "id".into(),
                     data_type: ConnectorDataType::BigInt,
                     nullable: false,
-                    aggregation: None,
                     default: None,
                 }],
-                key: None,
                 partitioning: Vec::new(),
                 properties: vec![("format-version".into(), "2".into())],
                 policy: match policy {

@@ -31,12 +31,11 @@ use novarocks_query_application::{
 };
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
-    ConnectorColumnPath, ConnectorColumnPosition, ConnectorDataType, ConnectorDefaultValue,
+    ConnectorCatalogMutationOperation, ConnectorColumnDefinition, ConnectorColumnPath,
+    ConnectorColumnPosition, ConnectorDataType, ConnectorDefaultValue,
     ConnectorDropTableDataDisposition, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorNamespaceIdentity, ConnectorPartitionTransform, ConnectorTableIdentity,
-    ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewIdentity, ConnectorViewRequest,
-    CreatePolicy, DropPolicy,
+    ConnectorViewIdentity, ConnectorViewRequest, CreatePolicy, DropPolicy,
 };
 use novarocks_sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use novarocks_sql::semantic::command::{
@@ -45,8 +44,7 @@ use novarocks_sql::semantic::command::{
     TablePartitionSqlCommand,
 };
 use novarocks_sql::semantic::{
-    ColumnAggregation, DefaultLiteral, IcebergPartitionFieldExpr, ObjectName, TableColumnDef,
-    TableKeyDesc, TableKeyKind,
+    DefaultLiteral, IcebergPartitionFieldExpr, ObjectName, TableColumnDef,
 };
 use novarocks_types::naming::{normalize_identifier, resolve_local_table_name};
 use novarocks_types::schema::SqlType;
@@ -119,33 +117,9 @@ pub(crate) fn execute_create_table_statement(
     match stmt.kind {
         CatalogCreateTableKind::Iceberg {
             columns,
-            key_desc,
-            bucket_count,
-            distribution_columns,
             partition_fields,
             properties,
         } => {
-            // BITMAP / HLL columns cannot be used as distribution keys —
-            // they are opaque blobs with no hash semantics that match a
-            // scalar column. Reject the CREATE TABLE before any catalog
-            // mutation. Column names are case-insensitive in StarRocks.
-            for dist_col in &distribution_columns {
-                let dist_lower = dist_col.to_ascii_lowercase();
-                if let Some(column) = columns
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(&dist_lower))
-                    && matches!(
-                        column.data_type,
-                        novarocks_types::schema::SqlType::Bitmap
-                            | novarocks_types::schema::SqlType::Hll
-                    )
-                {
-                    return Err(format!(
-                        "BITMAP/HLL columns cannot be used as distribution key (column `{}` has type {:?})",
-                        column.name, column.data_type
-                    ).into());
-                }
-            }
             let target = crate::catalog_application::resolver::resolve_table_target(
                 context,
                 &stmt.name,
@@ -153,7 +127,6 @@ pub(crate) fn execute_create_table_statement(
                 current_database,
             )?;
             let instance_id = mutation_instance_id(&target.catalog)?;
-            let _ = bucket_count;
             crate::connector::mutation::execute_catalog_mutation_for_command(
                 context.connector_control(),
                 &instance_id,
@@ -167,7 +140,6 @@ pub(crate) fn execute_create_table_statement(
                         .iter()
                         .map(connector_column)
                         .collect::<Result<_, _>>()?,
-                    key: key_desc.as_ref().map(connector_table_key),
                     partitioning: partition_fields
                         .iter()
                         .map(connector_partition_transform)
@@ -244,7 +216,6 @@ pub(crate) fn lower_semantic_create_table_statement(
                     Ok(TableColumnDef {
                         name: column.name.clone(),
                         nullable: column.nullable.unwrap_or(true),
-                        aggregation: column.aggregation,
                         default: column
                             .default
                             .as_ref()
@@ -254,21 +225,6 @@ pub(crate) fn lower_semantic_create_table_statement(
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
-            key_desc: statement.key.clone(),
-            bucket_count: statement
-                .distribution
-                .as_ref()
-                .and_then(|value| value.buckets)
-                .map(|value| {
-                    u32::try_from(value)
-                        .map_err(|_| "distribution bucket count exceeds u32".to_string())
-                })
-                .transpose()?,
-            distribution_columns: statement
-                .distribution
-                .as_ref()
-                .map(|value| value.columns.clone())
-                .unwrap_or_default(),
             partition_fields,
             properties,
         },
@@ -316,7 +272,6 @@ pub fn connector_column(column: &TableColumnDef) -> Result<ConnectorColumnDefini
         name: Arc::from(column.name.as_str()),
         data_type: connector_data_type(&column.data_type)?,
         nullable: column.nullable,
-        aggregation: column.aggregation.map(connector_column_aggregation),
         default: column.default.as_ref().map(connector_default).transpose()?,
     })
 }
@@ -391,34 +346,6 @@ fn connector_default(value: &DefaultLiteral) -> Result<ConnectorDefaultValue, St
             ConnectorDefaultValue::Binary(Bytes::copy_from_slice(value))
         }
     })
-}
-
-fn connector_column_aggregation(aggregation: ColumnAggregation) -> ConnectorColumnAggregation {
-    match aggregation {
-        ColumnAggregation::Sum => ConnectorColumnAggregation::Sum,
-        ColumnAggregation::Min => ConnectorColumnAggregation::Min,
-        ColumnAggregation::Max => ConnectorColumnAggregation::Max,
-        ColumnAggregation::Replace => ConnectorColumnAggregation::Replace,
-        ColumnAggregation::ReplaceIfNotNull => ConnectorColumnAggregation::ReplaceIfNotNull,
-        ColumnAggregation::BitmapUnion => ConnectorColumnAggregation::BitmapUnion,
-        ColumnAggregation::HllUnion => ConnectorColumnAggregation::HllUnion,
-    }
-}
-
-pub(crate) fn connector_table_key(key: &TableKeyDesc) -> ConnectorTableKey {
-    ConnectorTableKey {
-        kind: match key.kind {
-            TableKeyKind::Duplicate => ConnectorTableKeyKind::Duplicate,
-            TableKeyKind::Unique => ConnectorTableKeyKind::Unique,
-            TableKeyKind::Aggregate => ConnectorTableKeyKind::Aggregate,
-            TableKeyKind::Primary => ConnectorTableKeyKind::Primary,
-        },
-        columns: key
-            .columns
-            .iter()
-            .map(|column| Arc::from(column.as_str()))
-            .collect(),
-    }
 }
 
 pub fn connector_partition_transform(
@@ -1980,9 +1907,6 @@ mod tests {
             .expect("lower semantic catalog request");
         let super::CatalogCreateTableKind::Iceberg {
             columns,
-            key_desc,
-            bucket_count,
-            distribution_columns,
             partition_fields,
             properties,
         } = request.kind;
@@ -2000,12 +1924,6 @@ mod tests {
             columns[2].default,
             Some(super::DefaultLiteral::Binary(vec![0xCA, 0xFE]))
         );
-        assert_eq!(
-            key_desc.expect("duplicate key").kind,
-            super::TableKeyKind::Duplicate
-        );
-        assert_eq!(bucket_count, Some(8));
-        assert_eq!(distribution_columns, ["id"]);
         assert_eq!(
             partition_fields,
             [super::IcebergPartitionFieldExpr::Month {

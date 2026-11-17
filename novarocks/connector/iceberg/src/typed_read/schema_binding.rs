@@ -2832,7 +2832,6 @@ mod sdk_nested_representation_tests {
             name: name.into(),
             data_type,
             nullable: true,
-            aggregation: None,
             default: None,
         };
         let columns = vec![

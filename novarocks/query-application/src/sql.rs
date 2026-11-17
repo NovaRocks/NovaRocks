@@ -26,11 +26,11 @@ use novarocks_sql::semantic::command::{
     IcebergPartitionSqlChange, IcebergPropertiesSqlAction, IcebergReferenceKindSql,
     IcebergReferenceSqlAction, IcebergSchemaSqlChange, IcebergTableSqlAction, MaintenanceValueSql,
     ProcedureArgumentModeSql, ProcedureArgumentSql, ReferenceAnchorSql, TableColumnSqlCommand,
-    TableDistributionSqlCommand, TablePartitionSqlCommand,
+    TablePartitionSqlCommand,
 };
 use novarocks_sql::semantic::{
-    CatalogSqlCommand, ColumnAggregation, IcebergPartitionFieldExpr, MaintenanceSqlCommand,
-    ObjectName, StatisticsSqlCommand, TableKeyDesc, TableKeyKind,
+    CatalogSqlCommand, IcebergPartitionFieldExpr, MaintenanceSqlCommand, ObjectName,
+    StatisticsSqlCommand,
 };
 use novarocks_types::schema::SqlType;
 
@@ -306,6 +306,45 @@ fn lower_table_command(
             })
         }
     };
+    let columns = statement
+        .columns
+        .iter()
+        .map(lower_table_column)
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(key) = &statement.key {
+        for key_column in &key.columns {
+            if !columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(&key_column.value))
+            {
+                return Err(format!(
+                    "Iceberg key column `{}` does not exist",
+                    key_column.value
+                ));
+            }
+        }
+    }
+    if let Some(distribution) = &statement.distribution {
+        for dist_column in &distribution.columns {
+            if let Some(column) = columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(&dist_column.value))
+                && matches!(column.data_type, SqlType::Bitmap | SqlType::Hll)
+            {
+                return Err(format!(
+                    "BITMAP/HLL columns cannot be used as distribution key (column `{}` has type {:?})",
+                    column.name, column.data_type
+                ));
+            }
+        }
+        distribution
+            .buckets
+            .map(|buckets| {
+                u32::try_from(buckets)
+                    .map_err(|_| "distribution bucket count exceeds u32".to_string())
+            })
+            .transpose()?;
+    }
     Ok(CatalogSqlCommand::CreateTable(CreateTableSqlCommand {
         temporary: statement.temporary,
         external: statement.external,
@@ -313,23 +352,7 @@ fn lower_table_command(
         name: lower_object_name(&statement.name),
         engine: statement.engine.as_ref().map(|engine| engine.value.clone()),
         like: statement.like.as_ref().map(lower_object_name),
-        columns: statement
-            .columns
-            .iter()
-            .map(lower_table_column)
-            .collect::<Result<_, _>>()?,
-        key: statement.key.as_ref().map(lower_table_key).transpose()?,
-        distribution: statement.distribution.as_ref().map(|distribution| {
-            TableDistributionSqlCommand {
-                columns: distribution
-                    .columns
-                    .iter()
-                    .map(|column| column.value.clone())
-                    .collect(),
-                random: distribution.random,
-                buckets: distribution.buckets,
-            }
-        }),
+        columns,
         partition,
         order_by: statement
             .order_by
@@ -357,24 +380,23 @@ fn lower_table_command(
 fn lower_table_column(
     column: &novarocks_parser::ast::ColumnDefinition,
 ) -> Result<TableColumnSqlCommand, String> {
+    let data_type = lower_sql_type(&column.data_type)?;
+    if let Some(aggregation) = &column.aggregation {
+        match aggregation.value.to_ascii_lowercase().as_str() {
+            "sum"
+            | "min"
+            | "max"
+            | "replace"
+            | "replace_if_not_null"
+            | "bitmap_union"
+            | "hll_union" => {}
+            other => return Err(format!("unsupported column aggregation `{other}`")),
+        }
+    }
     Ok(TableColumnSqlCommand {
         name: column.name.value.clone(),
-        data_type: lower_sql_type(&column.data_type)?,
+        data_type,
         nullable: column.nullable,
-        aggregation: column
-            .aggregation
-            .as_ref()
-            .map(|value| match value.value.to_ascii_lowercase().as_str() {
-                "sum" => Ok(ColumnAggregation::Sum),
-                "min" => Ok(ColumnAggregation::Min),
-                "max" => Ok(ColumnAggregation::Max),
-                "replace" => Ok(ColumnAggregation::Replace),
-                "replace_if_not_null" => Ok(ColumnAggregation::ReplaceIfNotNull),
-                "bitmap_union" => Ok(ColumnAggregation::BitmapUnion),
-                "hll_union" => Ok(ColumnAggregation::HllUnion),
-                other => Err(format!("unsupported column aggregation `{other}`")),
-            })
-            .transpose()?,
         default: column
             .default
             .as_ref()
@@ -385,24 +407,6 @@ fn lower_table_column(
             .as_ref()
             .map(lower_command_literal)
             .transpose()?,
-    })
-}
-
-fn lower_table_key(key: &novarocks_parser::ast::TableKey) -> Result<TableKeyDesc, String> {
-    use novarocks_parser::ast::TableKeyKind as ParsedKind;
-
-    Ok(TableKeyDesc {
-        kind: match key.kind {
-            ParsedKind::Duplicate => TableKeyKind::Duplicate,
-            ParsedKind::Unique => TableKeyKind::Unique,
-            ParsedKind::Aggregate => TableKeyKind::Aggregate,
-            ParsedKind::Primary => TableKeyKind::Primary,
-        },
-        columns: key
-            .columns
-            .iter()
-            .map(|column| column.value.clone())
-            .collect(),
     })
 }
 
@@ -1408,9 +1412,73 @@ mod tests {
             command.columns[0].comment,
             Some(CommandLiteral::String("key".to_string()))
         );
-        assert_eq!(command.distribution.expect("distribution").buckets, Some(4));
+        let plain = parse_single_statement(
+            "CREATE TABLE IF NOT EXISTS ice.db.orders (id INT NOT NULL DEFAULT 7 COMMENT 'key') \
+             PARTITION BY day(id) ORDER BY (id) COMMENT 'orders' PROPERTIES ('format-version' = '3')",
+        ).expect("same effective CREATE without legacy key/distribution");
+        assert_eq!(
+            Some(ProductSqlCommand::Catalog(Box::new(
+                CatalogSqlCommand::CreateTable(command.clone())
+            ))),
+            lower_product_sql_command(&plain).unwrap()
+        );
         assert_eq!(command.order_by, ["id"]);
         assert_eq!(command.properties.len(), 1);
+    }
+
+    #[test]
+    fn legacy_create_distribution_and_key_admission_remain_before_discarding_facts() {
+        for data_type in ["BITMAP", "HLL"] {
+            let source = format!(
+                "CREATE TABLE ice.db.opaque (payload {data_type}) DISTRIBUTED BY HASH(payload) BUCKETS 4"
+            );
+            let statement = parse_single_statement(&source).expect("old distribution syntax");
+            let error = lower_product_sql_command(&statement).expect_err("opaque distribution key");
+            assert_eq!(
+                error,
+                format!(
+                    "BITMAP/HLL columns cannot be used as distribution key (column `payload` has type {:?})",
+                    if data_type == "BITMAP" {
+                        novarocks_types::schema::SqlType::Bitmap
+                    } else {
+                        novarocks_types::schema::SqlType::Hll
+                    }
+                )
+            );
+        }
+        let statement = parse_single_statement(
+            "CREATE TABLE ice.db.too_many_buckets (id INT) DISTRIBUTED BY HASH(id) BUCKETS 4294967296",
+        ).expect("old bucket syntax retains u64 source value");
+        assert_eq!(
+            lower_product_sql_command(&statement).unwrap_err(),
+            "distribution bucket count exceeds u32"
+        );
+        let statement =
+            parse_single_statement("CREATE TABLE ice.db.missing_key (id INT) PRIMARY KEY(missing)")
+                .expect("old key syntax");
+        assert_eq!(
+            lower_product_sql_command(&statement).unwrap_err(),
+            "Iceberg key column `missing` does not exist"
+        );
+    }
+
+    #[test]
+    fn legacy_known_column_aggregation_does_not_change_effective_create_command() {
+        let decorated = parse_single_statement(
+            "CREATE TABLE ice.db.measures (id BIGINT SUM NOT NULL DEFAULT 7 COMMENT 'id') \
+             AGGREGATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4 \
+             COMMENT 'table' PROPERTIES('format-version'='3')",
+        )
+        .expect("old aggregation syntax");
+        let plain = parse_single_statement(
+            "CREATE TABLE ice.db.measures (id BIGINT NOT NULL DEFAULT 7 COMMENT 'id') \
+             COMMENT 'table' PROPERTIES('format-version'='3')",
+        )
+        .expect("same effective defaults and comments");
+        assert_eq!(
+            lower_product_sql_command(&decorated).unwrap(),
+            lower_product_sql_command(&plain).unwrap()
+        );
     }
 
     #[test]

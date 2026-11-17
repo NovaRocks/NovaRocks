@@ -404,38 +404,12 @@ pub enum ConnectorDefaultValue {
     Binary(Bytes),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorColumnAggregation {
-    Sum,
-    Min,
-    Max,
-    Replace,
-    ReplaceIfNotNull,
-    BitmapUnion,
-    HllUnion,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectorColumnDefinition {
     pub name: Arc<str>,
     pub data_type: ConnectorDataType,
     pub nullable: bool,
-    pub aggregation: Option<ConnectorColumnAggregation>,
     pub default: Option<ConnectorDefaultValue>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorTableKeyKind {
-    Duplicate,
-    Unique,
-    Aggregate,
-    Primary,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorTableKey {
-    pub kind: ConnectorTableKeyKind,
-    pub columns: Vec<Arc<str>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -601,7 +575,6 @@ pub enum ConnectorCatalogMutationOperation {
     CreateTable {
         table: ConnectorTableIdentity,
         columns: Vec<ConnectorColumnDefinition>,
-        key: Option<ConnectorTableKey>,
         partitioning: Vec<ConnectorPartitionTransform>,
         properties: Vec<(Arc<str>, Arc<str>)>,
         policy: CreatePolicy,

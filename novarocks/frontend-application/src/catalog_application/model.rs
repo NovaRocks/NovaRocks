@@ -20,9 +20,7 @@
 //! These requests carry admitted catalog facts only. They are deliberately
 //! separate from source syntax and from connector-owned mutation requests.
 
-use novarocks_sql::semantic::{
-    IcebergPartitionFieldExpr, ObjectName, TableColumnDef, TableKeyDesc,
-};
+use novarocks_sql::semantic::{IcebergPartitionFieldExpr, ObjectName, TableColumnDef};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogCreateTableRequest {
@@ -36,9 +34,6 @@ pub struct CatalogCreateTableRequest {
 pub enum CatalogCreateTableKind {
     Iceberg {
         columns: Vec<TableColumnDef>,
-        key_desc: Option<TableKeyDesc>,
-        bucket_count: Option<u32>,
-        distribution_columns: Vec<String>,
         partition_fields: Vec<IcebergPartitionFieldExpr>,
         properties: Vec<(String, String)>,
     },

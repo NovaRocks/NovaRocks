@@ -404,7 +404,6 @@ fn execute_alter_iceberg_schema(
                 name,
                 data_type,
                 nullable: true,
-                aggregation: None,
                 default,
             };
             novarocks_spi::connector::ConnectorSchemaChange::AddColumn {
@@ -622,9 +621,6 @@ fn execute_create_table_like(
             name: target,
             kind: CatalogCreateTableKind::Iceberg {
                 columns,
-                key_desc: None,
-                bucket_count: None,
-                distribution_columns: Vec::new(),
                 partition_fields: Vec::new(),
                 properties: Vec::new(),
             },
@@ -649,7 +645,6 @@ fn create_like_column(
         data_type: novarocks_types::sql_type_from_value_type(&declared)
             .map_err(|error| error.to_string())?,
         nullable: column.nullable,
-        aggregation: None,
         default: None,
     })
 }
@@ -972,7 +967,6 @@ mod tests {
                     name: "payload".into(),
                     data_type: spi::ConnectorDataType::Variant,
                     nullable: true,
-                    aggregation: None,
                     default: None,
                 },
                 position: spi::ConnectorColumnPosition::Default,

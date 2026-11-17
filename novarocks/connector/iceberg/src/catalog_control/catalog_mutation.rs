@@ -25,16 +25,15 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorCatalogMutation, ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
-    ConnectorColumnAggregation, ConnectorColumnDefinition, ConnectorColumnPath,
-    ConnectorColumnPosition, ConnectorCommittedPartitioning, ConnectorCommittedVersion,
-    ConnectorDataType, ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
+    ConnectorColumnDefinition, ConnectorColumnPath, ConnectorColumnPosition,
+    ConnectorCommittedPartitioning, ConnectorCommittedVersion, ConnectorDataType,
+    ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationOperationId, ConnectorOperationControl, ConnectorPartitionTransform,
     ConnectorPropertyAuthority, ConnectorPropertyChange, ConnectorRefAction,
-    ConnectorRequestContext, ConnectorSchemaChange, ConnectorTableIdentity, ConnectorTableKey,
-    ConnectorTableKeyKind, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    ProviderBindingEpoch,
+    ConnectorRequestContext, ConnectorSchemaChange, ConnectorTableIdentity, CreateOrReplacePolicy,
+    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -65,9 +64,6 @@ mod async_existing;
 #[path = "catalog_mutation/keyed.rs"]
 mod keyed;
 
-const TABLE_KEY_KIND_PROPERTY: &str = "novarocks.table.key_kind";
-const TABLE_KEY_COLUMNS_PROPERTY: &str = "novarocks.table.key_columns";
-const COLUMN_AGGREGATION_PROPERTY_PREFIX: &str = "novarocks.column_agg.";
 const INITIAL_PARTITION_FIELD_ID: i32 = 1000;
 
 impl ConnectorCatalogMutation for IcebergMetadata {
@@ -138,7 +134,6 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         if let ConnectorCatalogMutationOperation::CreateTable {
             table,
             columns,
-            key,
             partitioning,
             properties,
             policy,
@@ -149,7 +144,6 @@ impl ConnectorCatalogMutation for IcebergMetadata {
                 &request,
                 table,
                 columns,
-                key.as_ref(),
                 partitioning,
                 properties,
                 *policy,
@@ -640,11 +634,10 @@ fn view_properties(
 fn prepare_table_creation(
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
-    key: Option<&ConnectorTableKey>,
     partitioning: &[ConnectorPartitionTransform],
     properties: &[(Arc<str>, Arc<str>)],
 ) -> Result<(NamespaceIdent, TableCreation), ConnectorError> {
-    let (format_version, mut properties) = table_properties(columns, key, properties)?;
+    let (format_version, mut properties) = table_properties(columns, properties)?;
     if format_version != FormatVersion::V3
         && columns.iter().any(|column| {
             column.default.as_ref().is_some_and(|value| {
@@ -653,18 +646,6 @@ fn prepare_table_creation(
         })
     {
         return Err(invalid("Iceberg column defaults require format-version 3"));
-    }
-    if let Some(key) = key {
-        for key_column in &key.columns {
-            if !columns
-                .iter()
-                .any(|column| column.name.eq_ignore_ascii_case(key_column))
-            {
-                return Err(invalid(format!(
-                    "Iceberg key column `{key_column}` does not exist"
-                )));
-            }
-        }
     }
     let schema = Schema::builder()
         .with_fields(super::type_mapping::schema_fields(columns).map_err(invalid)?)
@@ -702,7 +683,6 @@ fn execute_create_table(
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
-    key: Option<&ConnectorTableKey>,
     partitioning: &[ConnectorPartitionTransform],
     properties: &[(Arc<str>, Arc<str>)],
     policy: CreatePolicy,
@@ -727,7 +707,7 @@ fn execute_create_table(
         .observe_preparation(
             || -> PreparationResult<PreparedCreate> {
                 ensure_owner(provider, &table.instance_id)?;
-                table_properties(columns, key, properties)?;
+                table_properties(columns, properties)?;
                 request.context.check_active()?;
                 let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
                 let name = normalize_identifier(&table.table).map_err(invalid)?;
@@ -774,7 +754,7 @@ fn execute_create_table(
                     return Err(not_found("Iceberg table namespace does not exist").into());
                 }
                 let (_, creation) =
-                    prepare_table_creation(table, columns, key, partitioning, properties)?;
+                    prepare_table_creation(table, columns, partitioning, properties)?;
                 let frozen = provider
                     .runtime()
                     .novarocks_catalog()
@@ -1099,7 +1079,6 @@ pub(crate) fn default_create_format_version() -> FormatVersion {
 
 pub(crate) fn table_properties(
     columns: &[ConnectorColumnDefinition],
-    key: Option<&ConnectorTableKey>,
     input: &[(Arc<str>, Arc<str>)],
 ) -> Result<(FormatVersion, BTreeMap<String, String>), ConnectorError> {
     reject_variant_shredding_properties(input)?;
@@ -1127,43 +1106,8 @@ pub(crate) fn table_properties(
             return Err(invalid("duplicate Iceberg table property"));
         }
     }
-    if let Some(key) = key {
-        properties.insert(
-            TABLE_KEY_KIND_PROPERTY.to_string(),
-            match key.kind {
-                ConnectorTableKeyKind::Duplicate => "duplicate",
-                ConnectorTableKeyKind::Unique => "unique",
-                ConnectorTableKeyKind::Aggregate => "aggregate",
-                ConnectorTableKeyKind::Primary => "primary",
-            }
-            .to_string(),
-        );
-        properties.insert(
-            TABLE_KEY_COLUMNS_PROPERTY.to_string(),
-            key.columns
-                .iter()
-                .map(|name| normalize_identifier(name).map_err(invalid))
-                .collect::<Result<Vec<_>, _>>()?
-                .join(","),
-        );
-    }
     for column in columns {
-        let name = normalize_identifier(&column.name).map_err(invalid)?;
-        if let Some(aggregation) = column.aggregation {
-            properties.insert(
-                format!("{COLUMN_AGGREGATION_PROPERTY_PREFIX}{name}"),
-                match aggregation {
-                    ConnectorColumnAggregation::Sum => "sum",
-                    ConnectorColumnAggregation::Min => "min",
-                    ConnectorColumnAggregation::Max => "max",
-                    ConnectorColumnAggregation::Replace => "replace",
-                    ConnectorColumnAggregation::ReplaceIfNotNull => "replace_if_not_null",
-                    ConnectorColumnAggregation::BitmapUnion => "bitmap_union",
-                    ConnectorColumnAggregation::HllUnion => "hll_union",
-                }
-                .to_string(),
-            );
-        }
+        normalize_identifier(&column.name).map_err(invalid)?;
     }
     Ok((format_version, properties))
 }
@@ -5311,10 +5255,8 @@ mod tests {
                 name: "id".into(),
                 data_type: ConnectorDataType::BigInt,
                 nullable: false,
-                aggregation: None,
                 default: None,
             }],
-            None,
             &[ConnectorPartitionTransform::Identity {
                 column: "id".into(),
             }],
@@ -5385,7 +5327,6 @@ mod tests {
         provider: &IcebergMetadata,
         table: &ConnectorTableIdentity,
         columns: &[ConnectorColumnDefinition],
-        key: Option<&ConnectorTableKey>,
         partitioning: &[ConnectorPartitionTransform],
         properties: &[(Arc<str>, Arc<str>)],
         policy: CreatePolicy,
@@ -5399,7 +5340,6 @@ mod tests {
             operation: ConnectorCatalogMutationOperation::CreateTable {
                 table: table.clone(),
                 columns: columns.to_vec(),
-                key: key.cloned(),
                 partitioning: partitioning.to_vec(),
                 properties: properties.to_vec(),
                 policy,
@@ -5411,7 +5351,6 @@ mod tests {
             &request,
             table,
             columns,
-            key,
             partitioning,
             properties,
             policy,
@@ -5448,10 +5387,8 @@ mod tests {
                     name: "id".into(),
                     data_type: ConnectorDataType::BigInt,
                     nullable: false,
-                    aggregation: None,
                     default: None,
                 }],
-                key: None,
                 partitioning: Vec::new(),
                 properties: Vec::new(),
                 policy,
@@ -6491,7 +6428,6 @@ mod tests {
         let ConnectorCatalogMutationOperation::CreateTable {
             table,
             columns,
-            key,
             partitioning,
             properties,
             ..
@@ -6500,7 +6436,7 @@ mod tests {
             panic!("create request");
         };
         let (namespace, creation) =
-            prepare_table_creation(table, columns, key.as_ref(), partitioning, properties)
+            prepare_table_creation(table, columns, partitioning, properties)
                 .expect("prepare table creation");
         let frozen = provider
             .runtime()
@@ -6692,10 +6628,8 @@ mod tests {
                 name: "id".into(),
                 data_type: ConnectorDataType::BigInt,
                 nullable: true,
-                aggregation: None,
                 default: None,
             }],
-            None,
             &[],
             &[],
             CreatePolicy::FailIfExists,
@@ -6957,10 +6891,8 @@ mod tests {
                 name: "id".into(),
                 data_type: ConnectorDataType::BigInt,
                 nullable: false,
-                aggregation: None,
                 default: None,
             }],
-            None,
             &[],
             &[],
             CreatePolicy::FailIfExists,
@@ -7074,7 +7006,6 @@ mod tests {
                 name: "name".into(),
                 data_type: ConnectorDataType::String,
                 nullable: true,
-                aggregation: None,
                 default: None,
             },
             position: ConnectorColumnPosition::After {
@@ -7862,7 +7793,6 @@ mod tests {
                     name: "renamed".into(),
                     data_type: ConnectorDataType::Int,
                     nullable: true,
-                    aggregation: None,
                     default: None,
                 },
                 position: ConnectorColumnPosition::Default,
@@ -7963,7 +7893,6 @@ mod tests {
             name: name.into(),
             data_type,
             nullable: true,
-            aggregation: None,
             default: None,
         };
         let columns = vec![
@@ -7975,7 +7904,7 @@ mod tests {
             column("age", ConnectorDataType::SmallInt),
             column("ordinary", ConnectorDataType::Int),
         ];
-        let (_, creation) = prepare_table_creation(&table, &columns, None, &[], &[]).unwrap();
+        let (_, creation) = prepare_table_creation(&table, &columns, &[], &[]).unwrap();
         assert!(
             !creation
                 .properties
@@ -8029,10 +7958,8 @@ mod tests {
                 name: "t".into(),
                 data_type: ConnectorDataType::TinyInt,
                 nullable: true,
-                aggregation: None,
                 default: None,
             }],
-            None,
             &[],
             &[],
             CreatePolicy::FailIfExists,
@@ -8110,10 +8037,8 @@ mod tests {
                     name: "id".into(),
                     data_type: ConnectorDataType::BigInt,
                     nullable: false,
-                    aggregation: None,
                     default: None,
                 }],
-                None,
                 &[ConnectorPartitionTransform::Identity {
                     column: "id".into(),
                 }],
@@ -8179,7 +8104,6 @@ mod tests {
                         name: "extra".into(),
                         data_type: ConnectorDataType::Int,
                         nullable: true,
-                        aggregation: None,
                         default: None,
                     },
                     position: ConnectorColumnPosition::Default,
@@ -8322,7 +8246,6 @@ mod tests {
             name: "payload".into(),
             data_type,
             nullable: true,
-            aggregation: None,
             default: None,
         }
     }
@@ -8402,7 +8325,6 @@ mod tests {
                 name: "deep".into(),
                 data_type,
                 nullable: true,
-                aggregation: None,
                 default: None,
             }
         }
@@ -8415,7 +8337,7 @@ mod tests {
         {
             let definition = column(nesting, arrays);
             let create =
-                prepare_table_creation(&table, std::slice::from_ref(&definition), None, &[], &[]);
+                prepare_table_creation(&table, std::slice::from_ref(&definition), &[], &[]);
             assert_eq!(create.is_ok(), admitted);
             if let Err(error) = create {
                 assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
@@ -8433,8 +8355,7 @@ mod tests {
                 assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
             }
         }
-        let (_, creation) =
-            prepare_table_creation(&table, &[column(41, false)], None, &[], &[]).unwrap();
+        let (_, creation) = prepare_table_creation(&table, &[column(41, false)], &[], &[]).unwrap();
         let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
             creation.schema,
             crate::iceberg::spec::PartitionSpec::unpartition_spec(),
@@ -8778,7 +8699,7 @@ mod tests {
         )];
         let error = reject_variant_shredding_properties(&properties).unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-        assert!(table_properties(&[], None, &properties).is_err());
+        assert!(table_properties(&[], &properties).is_err());
         assert!(reject_variant_shredding_property("write.parquet.compression-codec").is_ok());
     }
     fn keyed_channel_request(
@@ -9001,7 +8922,7 @@ mod tests {
                 );
             }
             assert!(
-                table_properties(&[], None, &[(Arc::from(key), Arc::from("spoofed"))]).is_err(),
+                table_properties(&[], &[(Arc::from(key), Arc::from("spoofed"))]).is_err(),
                 "{key}"
             );
             assert!(
@@ -9229,7 +9150,7 @@ mod tests {
             table: "recursive".into(),
         };
         let columns = nominal_declaration::recursive_tests::columns();
-        let (_, creation) = prepare_table_creation(&table, &columns, None, &[], &[]).unwrap();
+        let (_, creation) = prepare_table_creation(&table, &columns, &[], &[]).unwrap();
         let mut metadata = crate::iceberg::spec::TableMetadataBuilder::new(
             creation.schema,
             crate::iceberg::spec::PartitionSpec::unpartition_spec(),
@@ -9308,7 +9229,6 @@ mod tests {
                     name: "renamed_state".into(),
                     data_type: ConnectorDataType::Array(Box::new(ConnectorDataType::LargeInt)),
                     nullable: true,
-                    aggregation: None,
                     default: None,
                 },
                 position: ConnectorColumnPosition::Default,
@@ -9341,7 +9261,7 @@ mod tests {
         use crate::schema_mapping::nominal_declaration;
         let metadata = nominal_declaration::recursive_tests::metadata();
         for key in [nominal_declaration::PROPERTY, "novarocks.nominal-types.v2"] {
-            assert!(table_properties(&[], None, &[(Arc::from(key), Arc::from("{}"))]).is_err());
+            assert!(table_properties(&[], &[(Arc::from(key), Arc::from("{}"))]).is_err());
             for authority in [
                 ConnectorPropertyAuthority::UserStatement,
                 ConnectorPropertyAuthority::EngineOwned,
@@ -10821,5 +10741,390 @@ mod tests {
             actual.reason(),
             DataSizeFailureReason::Parse(DataSizeParseFailure::Unit)
         );
+    }
+
+    #[test]
+    fn ddl_partitioning_strings_preserve_the_exact_domain_grammar_and_order() {
+        use crate::table_properties::parse_table_partitioning_property as parse;
+        use novarocks_spi::connector::{ConnectorPartitionTransform as P, DdlPropertyValue as V};
+        let fields = [
+            "COL_1",
+            "YeAr(TS)\t\r\n",
+            "month(\"MiX\")",
+            "day(\"a.b\")",
+            "hour(ts)",
+            "bucket(\"a,\"\"b\", \t00016)",
+            "truncate(text,2147483647)",
+            "void(\"α\nβ\")\u{000b}\u{000c}",
+            "YEAR",
+            "\"\"",
+        ];
+        let value = V::ArrayVarchar(fields.into_iter().map(|field| Some(field.into())).collect());
+        let actual = parse(&value, &context()).unwrap();
+        assert_eq!(
+            actual,
+            vec![
+                P::Identity {
+                    column: "col_1".into()
+                },
+                P::Year {
+                    column: "ts".into()
+                },
+                P::Month {
+                    column: "MiX".into()
+                },
+                P::Day {
+                    column: "a.b".into()
+                },
+                P::Hour {
+                    column: "ts".into()
+                },
+                P::Bucket {
+                    column: "a,\"b".into(),
+                    num_buckets: 16
+                },
+                P::Truncate {
+                    column: "text".into(),
+                    width: 2147483647
+                },
+                P::Void {
+                    column: "α\nβ".into()
+                },
+                P::Identity {
+                    column: "year".into()
+                },
+                P::Identity { column: "".into() },
+            ]
+        );
+        assert_eq!(
+            crate::table_properties::parse_table_partitioning_element(
+                "bucket(\"MiX\",08)",
+                &context(),
+            )
+            .unwrap(),
+            P::Bucket {
+                column: "MiX".into(),
+                num_buckets: 8,
+            },
+        );
+        // Matching a quoted identifier is not a schema/source binding claim.
+        assert_eq!(parse(&V::ArrayVarchar(vec![]), &context()).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn ddl_partitioning_strings_reject_wrong_forms_and_leave_schema_binding_original() {
+        use crate::table_properties::parse_table_partitioning_property as parse;
+        use novarocks_spi::connector::{ConnectorPartitionTransform as P, DdlPropertyValue as V};
+        let control = context();
+        for text in [
+            "",
+            " a",
+            "a ",
+            "a.b",
+            "\"a\".\"b\"",
+            "`a`",
+            "α",
+            "\"unterminated",
+            "year (a)",
+            "year( a)",
+            "year(a )",
+            "year(a)\u{00a0}",
+            "identity(a)",
+            "week(a)",
+            "bucket(a ,2)",
+            "bucket(a,2 )",
+            "bucket(a,2) ",
+            "bucket(a,-1)",
+            "bucket(a,+1)",
+            "bucket(a,0)",
+            "truncate(a,0)",
+            "bucket(a,2147483648)",
+            "truncate(a,4294967295)",
+            "bucket(a,٤)",
+            "bucket[16]",
+            "year(a) garbage",
+        ] {
+            let error = parse(&V::ArrayVarchar(vec![Some(text.into())]), &control).unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest, "{text}");
+        }
+        for value in [
+            V::Null,
+            V::Varchar("id".into()),
+            V::ArrayVarchar(vec![None]),
+        ] {
+            assert_eq!(
+                parse(&value, &control).unwrap_err().kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+        }
+        let repeated = parse(
+            &V::ArrayVarchar(vec![Some("id".into()), Some("ID".into())]),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(
+            repeated,
+            vec![
+                P::Identity {
+                    column: "id".into()
+                },
+                P::Identity {
+                    column: "id".into()
+                }
+            ]
+        );
+        assert!(initial_partition_spec(&schema(), &repeated).is_err());
+        let fields = parse(
+            &V::ArrayVarchar(vec![
+                Some("month(ts)".into()),
+                Some("bucket(id, 16)".into()),
+            ]),
+            &control,
+        )
+        .unwrap();
+        let spec = initial_partition_spec(&schema(), &fields).unwrap().unwrap();
+        assert_eq!(spec.fields()[0].source_id, 2);
+        assert_eq!(spec.fields()[0].transform, Transform::Month);
+        assert_eq!(spec.fields()[1].source_id, 1);
+        assert_eq!(spec.fields()[1].transform, Transform::Bucket(16));
+        assert!(initial_partition_spec(&schema(), &[]).unwrap().is_none());
+        let wrong_type = parse(&V::ArrayVarchar(vec![Some("year(id)".into())]), &control).unwrap();
+        assert!(initial_partition_spec(&schema(), &wrong_type).is_err());
+    }
+
+    #[test]
+    fn ddl_partitioning_string_scan_retains_the_original_control_cause() {
+        use crate::table_properties::parse_table_partitioning_property as parse;
+        use novarocks_failure_contract::{FailureFact, FailureProjection};
+        use novarocks_spi::connector::DdlPropertyValue;
+        use std::{
+            error::Error,
+            fmt,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Debug)]
+        struct OriginalControl;
+        impl fmt::Display for OriginalControl {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("original partitioning control stop")
+            }
+        }
+        impl Error for OriginalControl {}
+        impl FailureProjection for OriginalControl {
+            fn failure_fact(&self) -> FailureFact {
+                ConnectorErrorKind::Cancelled.failure_fact()
+            }
+        }
+        struct StopAfter {
+            calls: AtomicUsize,
+            allowed: usize,
+            original: ConnectorError,
+        }
+        impl ConnectorOperationControl for StopAfter {
+            fn check_active(&self) -> Result<(), ConnectorError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) >= self.allowed {
+                    Err(self.original.clone())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for allowed in [0, 7] {
+            let control = StopAfter {
+                calls: AtomicUsize::new(0),
+                allowed,
+                original: ConnectorError::from_domain(
+                    ConnectorErrorKind::Cancelled,
+                    OriginalControl,
+                ),
+            };
+            let value =
+                DdlPropertyValue::ArrayVarchar(vec![Some(format!("\"{}\"", "a".repeat(64)))]);
+            let error = parse(&value, &control).unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+            assert_eq!(error.failure_fact(), control.original.failure_fact());
+            assert_eq!(error.message(), control.original.message());
+            assert!(std::ptr::eq(
+                error.source().unwrap().source().unwrap(),
+                control.original.source().unwrap().source().unwrap()
+            ));
+        }
+    }
+
+    fn evaluated_create_property_defaults()
+    -> Vec<(Arc<str>, novarocks_spi::connector::DdlPropertyValue)> {
+        use novarocks_spi::connector::DdlPropertyValue as V;
+        vec![
+            ("format".into(), V::Varchar("PARQUET".into())),
+            ("format_version".into(), V::Integer(2)),
+            ("partitioning".into(), V::ArrayVarchar(vec![])),
+        ]
+    }
+
+    #[test]
+    fn evaluated_create_properties_keep_dedicated_facts_and_raw_set_author() {
+        use crate::table_properties::prepare_create_table_properties as prepare;
+        use novarocks_spi::connector::DdlPropertyValue as V;
+        let control = context();
+        for (version, expected) in [
+            (1, FormatVersion::V1),
+            (2, FormatVersion::V2),
+            (3, FormatVersion::V3),
+        ] {
+            let mut properties = evaluated_create_property_defaults();
+            properties[1].1 = V::Integer(version);
+            let result = prepare(&properties, &control).unwrap();
+            assert_eq!(result.format_version, expected);
+            assert_eq!(result.location, None);
+            assert!(result.partitioning.is_empty());
+            assert_eq!(result.raw_properties["write.format.default"], "parquet");
+            assert!(!result.raw_properties.contains_key("format-version"));
+            assert!(!result.raw_properties.contains_key("format_version"));
+        }
+        let mut properties = evaluated_create_property_defaults();
+        properties[2].1 = V::ArrayVarchar(vec![
+            Some("bucket(id, 4)".into()),
+            None,
+            Some("not_a_transform(".into()),
+        ]);
+        properties.extend([
+            ("location".into(), V::Varchar("file:///actual/中".into())),
+            ("target_max_file_size".into(), V::Varchar("0B".into())),
+            ("gc_enabled".into(), V::Boolean(false)),
+            (
+                "extra_properties".into(),
+                V::MapVarcharVarchar(vec![
+                    ("Custom.Key".into(), Some("raw".into())),
+                    ("comment".into(), Some("extra text".into())),
+                ]),
+            ),
+        ]);
+        let prepared = prepare(&properties, &control).unwrap();
+        assert_eq!(prepared.location.as_deref(), Some("file:///actual/中"));
+        assert_eq!(
+            prepared.partitioning,
+            [
+                Some("bucket(id, 4)".into()),
+                None,
+                Some("not_a_transform(".into())
+            ]
+        );
+        assert_eq!(prepared.raw_properties["custom.key"], "raw");
+        assert_eq!(prepared.raw_properties["comment"], "extra text");
+        assert_eq!(prepared.raw_properties["gc.enabled"], "false");
+        assert_eq!(prepared.raw_properties["write.target-file-size-bytes"], "0");
+        // COMMENT is not part of this API: the real clause composition owner
+        // must reject a collision with the retained raw extra comment above.
+    }
+
+    #[test]
+    fn evaluated_create_properties_refuse_missing_duplicate_null_and_unrecognized_inputs() {
+        use crate::table_properties::prepare_create_table_properties as prepare;
+        use novarocks_spi::connector::DdlPropertyValue as V;
+        use std::error::Error;
+        let control = context();
+        for required in ["format", "format_version", "partitioning"] {
+            let mut properties = evaluated_create_property_defaults();
+            properties.retain(|(name, _)| name.as_ref() != required);
+            let error = prepare(&properties, &control).err().unwrap();
+            assert_eq!(error.kind(), ConnectorErrorKind::Internal);
+            assert!(error.source().is_some());
+            assert!(error.message().contains(required));
+        }
+        for (name, value) in [
+            ("format", V::Null),
+            ("format", V::Boolean(true)),
+            ("format_version", V::Null),
+            ("format_version", V::Varchar("2".into())),
+            ("format_version", V::Integer(0)),
+            ("format_version", V::Integer(4)),
+            ("partitioning", V::Null),
+            ("partitioning", V::Varchar("id".into())),
+            ("location", V::Null),
+            ("location", V::Integer(1)),
+            ("unknown", V::Varchar("not accepted".into())),
+        ] {
+            let mut properties = evaluated_create_property_defaults();
+            properties.retain(|(key, _)| key.as_ref() != name);
+            properties.push((name.into(), value));
+            let error = prepare(&properties, &control).err().unwrap();
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest, "{name}");
+        }
+        let mut properties = evaluated_create_property_defaults();
+        properties.push(("format".into(), V::Varchar("PARQUET".into())));
+        let error = prepare(&properties, &control).err().unwrap();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.message().contains("Duplicate"));
+        let mut properties = evaluated_create_property_defaults();
+        properties.push(("sorted_by".into(), V::ArrayVarchar(vec![])));
+        assert_eq!(
+            prepare(&properties, &control).err().unwrap().kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        let mut properties = evaluated_create_property_defaults();
+        properties.push((
+            "extra_properties".into(),
+            V::MapVarcharVarchar(vec![("format-version".into(), Some("3".into()))]),
+        ));
+        assert_eq!(
+            prepare(&properties, &control).err().unwrap().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn evaluated_create_property_copy_preserves_original_control_failure() {
+        use crate::table_properties::prepare_create_table_properties as prepare;
+        use novarocks_failure_contract::{FailureFact, FailureProjection};
+        use novarocks_spi::connector::DdlPropertyValue as V;
+        use std::{
+            error::Error,
+            fmt,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Debug)]
+        struct OriginalControl;
+        impl fmt::Display for OriginalControl {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("original CREATE property source failure")
+            }
+        }
+        impl Error for OriginalControl {}
+        impl FailureProjection for OriginalControl {
+            fn failure_fact(&self) -> FailureFact {
+                ConnectorErrorKind::ResourceExhausted.failure_fact()
+            }
+        }
+        struct Refuse {
+            calls: AtomicUsize,
+            original: ConnectorError,
+        }
+        impl ConnectorOperationControl for Refuse {
+            fn check_active(&self) -> Result<(), ConnectorError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 5 {
+                    Err(self.original.clone())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let control = Refuse {
+            calls: AtomicUsize::new(0),
+            original: ConnectorError::from_domain(
+                ConnectorErrorKind::ResourceExhausted,
+                OriginalControl,
+            ),
+        };
+        let mut properties = vec![(Arc::from("location"), V::Varchar("x".repeat(4096)))];
+        properties.extend(evaluated_create_property_defaults());
+        let error = prepare(&properties, &control).err().unwrap();
+        assert_eq!(control.calls.load(Ordering::SeqCst), 6);
+        assert_eq!(error.kind(), control.original.kind());
+        assert_eq!(error.failure_fact(), control.original.failure_fact());
+        assert_eq!(error.message(), control.original.message());
+        assert!(std::ptr::eq(
+            error.source().unwrap().source().unwrap(),
+            control.original.source().unwrap().source().unwrap()
+        ));
     }
 }

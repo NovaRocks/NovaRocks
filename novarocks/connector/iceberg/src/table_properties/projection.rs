@@ -40,6 +40,40 @@ pub fn project_partial_raw_table_property(
     operation: ExtraPropertyWrite,
     control: &dyn ConnectorOperationControl,
 ) -> Result<Vec<ConnectorPropertyChange>, ConnectorError> {
+    let change = match change {
+        DdlPropertyChange::Set(value) => BorrowedChange::Set(value),
+        DdlPropertyChange::Reset(value) => BorrowedChange::Reset(value),
+    };
+    project_raw_table_property(canonical_name, change, operation, control)
+}
+
+/// CREATE already owns the actual evaluated value; borrow its Set intention
+/// without cloning the whole Map or introducing a second projection author.
+pub(crate) fn project_raw_table_property_set(
+    canonical_name: &str,
+    value: &DdlPropertyValue,
+    operation: ExtraPropertyWrite,
+    control: &dyn ConnectorOperationControl,
+) -> Result<Vec<ConnectorPropertyChange>, ConnectorError> {
+    project_raw_table_property(
+        canonical_name,
+        BorrowedChange::Set(value),
+        operation,
+        control,
+    )
+}
+
+enum BorrowedChange<'a> {
+    Set(&'a DdlPropertyValue),
+    Reset(&'a DdlPropertyValue),
+}
+
+fn project_raw_table_property(
+    canonical_name: &str,
+    change: BorrowedChange<'_>,
+    operation: ExtraPropertyWrite,
+    control: &dyn ConnectorOperationControl,
+) -> Result<Vec<ConnectorPropertyChange>, ConnectorError> {
     control.check_active()?;
     if super::is_recognized_unsupported_table_property(canonical_name) {
         return Err(unsupported(canonical_name));
@@ -52,7 +86,7 @@ pub fn project_partial_raw_table_property(
             ));
         }
         "extra_properties" => match change {
-            DdlPropertyChange::Reset(DdlPropertyValue::Null) => {
+            BorrowedChange::Reset(DdlPropertyValue::Null) => {
                 // The reference DEFAULT(NULL) reaches the provider's empty
                 // Optional rejection. This is a compatibility refusal, not a
                 // corrupted request or an instruction to remove stored keys.
@@ -61,7 +95,7 @@ pub fn project_partial_raw_table_property(
                     ReferenceExtraPropertiesDefaultNull,
                 ));
             }
-            DdlPropertyChange::Set(value) | DdlPropertyChange::Reset(value) => {
+            BorrowedChange::Set(value) | BorrowedChange::Reset(value) => {
                 super::extra_property_sets(value, operation)?
             }
         },
@@ -70,16 +104,16 @@ pub fn project_partial_raw_table_property(
                 invalid(format!("Unknown Iceberg table property '{canonical_name}'"))
             })?;
             match change {
-                DdlPropertyChange::Reset(DdlPropertyValue::Null) => {
+                BorrowedChange::Reset(DdlPropertyValue::Null) => {
                     vec![ConnectorPropertyChange::Unset {
                         key: Arc::from(key),
                         if_exists: true,
                     }]
                 }
-                DdlPropertyChange::Set(DdlPropertyValue::Null) => {
+                BorrowedChange::Set(DdlPropertyValue::Null) => {
                     return Err(invalid(format!("Iceberg {canonical_name} cannot be NULL")));
                 }
-                DdlPropertyChange::Set(value) | DdlPropertyChange::Reset(value) => {
+                BorrowedChange::Set(value) | BorrowedChange::Reset(value) => {
                     let value = raw_value(canonical_name, value, control)?;
                     vec![ConnectorPropertyChange::Set {
                         key: Arc::from(key),

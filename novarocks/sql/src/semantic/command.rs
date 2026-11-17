@@ -24,7 +24,7 @@
 //! policy, and maintenance options), but never retain a source span or a SQL
 //! fragment that would invite reparsing at the application boundary.
 
-use super::{ColumnAggregation, IcebergPartitionFieldExpr, ObjectName, TableKeyDesc};
+use super::{IcebergPartitionFieldExpr, ObjectName};
 use novarocks_types::schema::SqlType;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,8 +96,6 @@ pub struct CreateTableSqlCommand {
     pub engine: Option<String>,
     pub like: Option<ObjectName>,
     pub columns: Vec<TableColumnSqlCommand>,
-    pub key: Option<TableKeyDesc>,
-    pub distribution: Option<TableDistributionSqlCommand>,
     pub partition: Option<TablePartitionSqlCommand>,
     pub order_by: Vec<String>,
     pub properties: Vec<CommandProperty>,
@@ -109,16 +107,8 @@ pub struct TableColumnSqlCommand {
     pub name: String,
     pub data_type: SqlType,
     pub nullable: Option<bool>,
-    pub aggregation: Option<ColumnAggregation>,
     pub default: Option<CommandLiteral>,
     pub comment: Option<CommandLiteral>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TableDistributionSqlCommand {
-    pub columns: Vec<String>,
-    pub random: bool,
-    pub buckets: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

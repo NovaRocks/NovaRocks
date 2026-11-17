@@ -1,0 +1,190 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Provider composition of already evaluated CREATE table properties.
+//!
+//! The original schema author still parses and binds partition strings. This
+//! module owns no catalog lookup, schema reconstruction or publication.
+
+use super::{ExtraPropertyWrite, project_raw_table_property_set};
+use crate::iceberg::spec::FormatVersion;
+use novarocks_failure_contract::{FailureFact, FailureProjection};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorPropertyChange,
+    DdlPropertyValue,
+};
+use std::{
+    collections::{BTreeMap, HashSet},
+    error::Error,
+    fmt,
+    sync::Arc,
+};
+
+pub(crate) struct PreparedCreateTableProperties {
+    pub(crate) format_version: FormatVersion,
+    pub(crate) location: Option<String>,
+    pub(crate) partitioning: Vec<Option<String>>,
+    pub(crate) raw_properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+enum CreatePropertyContractFailure {
+    MissingRequired(&'static str),
+    RawSetProducedUnset,
+}
+impl fmt::Display for CreatePropertyContractFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRequired(name) => {
+                write!(f, "Evaluated CREATE properties omit required {name}")
+            }
+            Self::RawSetProducedUnset => {
+                f.write_str("CREATE Set projection produced an Unset instruction")
+            }
+        }
+    }
+}
+impl Error for CreatePropertyContractFailure {}
+impl FailureProjection for CreatePropertyContractFailure {
+    fn failure_fact(&self) -> FailureFact {
+        ConnectorErrorKind::Internal.failure_fact()
+    }
+}
+fn contract(cause: CreatePropertyContractFailure) -> ConnectorError {
+    ConnectorError::from_domain(ConnectorErrorKind::Internal, cause)
+}
+
+/// Required non-NULL defaults come from the declaration/evaluation owner.
+/// Missing values are contract failures, never an instruction to guess them.
+pub(crate) fn prepare_create_table_properties(
+    properties: &[(Arc<str>, DdlPropertyValue)],
+    control: &dyn ConnectorOperationControl,
+) -> Result<PreparedCreateTableProperties, ConnectorError> {
+    control.check_active()?;
+    let mut seen = HashSet::new();
+    let mut has_format = false;
+    let mut format_version = None;
+    let mut partitioning = None;
+    let mut location = None;
+    let mut raw_properties = BTreeMap::new();
+    for (name, value) in properties {
+        control.check_active()?;
+        if !seen.insert(name.as_ref()) {
+            return Err(invalid(format!(
+                "Duplicate Iceberg table property '{name}'"
+            )));
+        }
+        match name.as_ref() {
+            "format_version" => format_version = Some(typed_format_version(value)?),
+            "partitioning" => {
+                let DdlPropertyValue::ArrayVarchar(fields) = value else {
+                    return Err(invalid(
+                        "Iceberg partitioning requires a non-NULL array(varchar)",
+                    ));
+                };
+                let mut retained = Vec::with_capacity(fields.len());
+                for field in fields {
+                    control.check_active()?;
+                    retained.push(
+                        field
+                            .as_deref()
+                            .map(|text| copy_text(text, control))
+                            .transpose()?,
+                    );
+                }
+                partitioning = Some(retained);
+            }
+            "location" => {
+                let DdlPropertyValue::Varchar(value) = value else {
+                    return Err(invalid("Iceberg location requires a non-NULL varchar"));
+                };
+                location = Some(copy_text(value, control)?);
+            }
+            _ => {
+                let changes = project_raw_table_property_set(
+                    name,
+                    value,
+                    ExtraPropertyWrite::Create,
+                    control,
+                )?;
+                for change in changes {
+                    control.check_active()?;
+                    let ConnectorPropertyChange::Set { key, value } = change else {
+                        return Err(contract(CreatePropertyContractFailure::RawSetProducedUnset));
+                    };
+                    if raw_properties.contains_key(key.as_ref()) {
+                        return Err(invalid(format!("Duplicate Iceberg raw property '{key}'")));
+                    }
+                    raw_properties.insert(copy_text(&key, control)?, copy_text(&value, control)?);
+                }
+                if name.as_ref() == "format" {
+                    has_format = true;
+                }
+            }
+        }
+    }
+    if !has_format {
+        return Err(contract(CreatePropertyContractFailure::MissingRequired(
+            "format",
+        )));
+    }
+    let format_version = format_version.ok_or_else(|| {
+        contract(CreatePropertyContractFailure::MissingRequired(
+            "format_version",
+        ))
+    })?;
+    let partitioning = partitioning.ok_or_else(|| {
+        contract(CreatePropertyContractFailure::MissingRequired(
+            "partitioning",
+        ))
+    })?;
+    control.check_active()?;
+    Ok(PreparedCreateTableProperties {
+        format_version,
+        location,
+        partitioning,
+        raw_properties,
+    })
+}
+
+// This is the integer-to-version boundary. The original private internal raw
+// creator keeps its string parser and separate input contract.
+fn typed_format_version(value: &DdlPropertyValue) -> Result<FormatVersion, ConnectorError> {
+    match value {
+        DdlPropertyValue::Integer(1) => Ok(FormatVersion::V1),
+        DdlPropertyValue::Integer(2) => Ok(FormatVersion::V2),
+        DdlPropertyValue::Integer(3) => Ok(FormatVersion::V3),
+        DdlPropertyValue::Integer(_) => Err(invalid("Iceberg format_version must be 1, 2, or 3")),
+        _ => Err(invalid(
+            "Iceberg format_version requires a non-NULL integer",
+        )),
+    }
+}
+fn copy_text(
+    value: &str,
+    control: &dyn ConnectorOperationControl,
+) -> Result<String, ConnectorError> {
+    for _ in value.as_bytes().chunks(256) {
+        control.check_active()?;
+    }
+    let value = value.to_owned();
+    control.check_active()?;
+    Ok(value)
+}
+fn invalid(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
+}

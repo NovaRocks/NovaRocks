@@ -251,7 +251,6 @@ mod tests {
                 nullable: false,
             }]),
             nullable: true,
-            aggregation: None,
             default: None,
         }];
         let fields = schema_fields(&columns).expect("schema fields");

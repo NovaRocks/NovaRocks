@@ -208,7 +208,7 @@ pub(crate) fn prepare_rest_staged_table(
         )
     })?;
     let (format_version, mut properties) =
-        super::catalog_mutation::table_properties(columns, None, properties)?;
+        super::catalog_mutation::table_properties(columns, properties)?;
     if format_version != crate::iceberg::spec::FormatVersion::V3
         && columns.iter().any(|column| {
             column.default.as_ref().is_some_and(|value| {
@@ -1075,7 +1075,7 @@ pub(crate) async fn prepare_rest_staged_table_async(
         )
     })?;
     let (format_version, mut properties) =
-        super::catalog_mutation::table_properties(columns, None, properties)?;
+        super::catalog_mutation::table_properties(columns, properties)?;
     if format_version != crate::iceberg::spec::FormatVersion::V3
         && columns.iter().any(|column| {
             column.default.as_ref().is_some_and(|value| {
@@ -3640,7 +3640,6 @@ mod tests {
             name: "deep".into(),
             data_type,
             nullable: true,
-            aggregation: None,
             default: None,
         }];
         let original = context();
@@ -3738,7 +3737,6 @@ mod tests {
                     name: Arc::from("payload"),
                     data_type,
                     nullable: true,
-                    aggregation: None,
                     default: None,
                 }],
                 &[],
@@ -3809,7 +3807,6 @@ mod tests {
                 name: Arc::from("id"),
                 data_type: novarocks_spi::connector::ConnectorDataType::BigInt,
                 nullable: false,
-                aggregation: None,
                 default: None,
             }],
             partitioning: vec![],

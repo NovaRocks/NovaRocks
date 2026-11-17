@@ -3239,7 +3239,6 @@ async fn iru13b_java_rest_schema_changes_keep_the_column_high_water_mark() {
                     name: "c".into(),
                     data_type: novarocks_spi::connector::ConnectorDataType::String,
                     nullable: true,
-                    aggregation: None,
                     default: None,
                 },
                 position: novarocks_spi::connector::ConnectorColumnPosition::Default,

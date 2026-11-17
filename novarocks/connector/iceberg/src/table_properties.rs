@@ -20,8 +20,15 @@
 //! Declarations do not grant a setter or publication capability. Dedicated
 //! format-version, partition-spec and location changes retain their owners.
 
+mod create;
+pub(crate) use create::{PreparedCreateTableProperties, prepare_create_table_properties};
+
 mod projection;
 pub use projection::project_partial_raw_table_property;
+pub(crate) use projection::project_raw_table_property_set;
+
+mod partitioning;
+pub use partitioning::{parse_table_partitioning_element, parse_table_partitioning_property};
 
 mod data_size;
 pub use data_size::{
