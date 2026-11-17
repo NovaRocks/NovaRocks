@@ -28,6 +28,8 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct ScopeColumn {
     pub value: ValueId,
+    /// Actual column position in the complete runtime schema.
+    pub ordinal: u32,
     pub ty: FunctionValueType,
 }
 #[derive(Clone, Debug)]
@@ -37,7 +39,9 @@ pub struct ScopeLayout {
     storage: ValueTypeStorageLifetime,
 }
 impl ScopeLayout {
-    /// The caller has admitted the supplied immutable buffers. Their order is actual input order.
+    /// The caller has admitted the immutable schema and canonical value map.
+    /// Repeated physical publications remain in the schema; their enclosing
+    /// channel author supplies the proven representative's actual ordinal.
     pub fn try_new(
         schema: SchemaRef,
         columns: Arc<[ScopeColumn]>,
@@ -83,14 +87,23 @@ impl ScopeLayout {
         mut creation: ProgramCreation<'_, H>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, ExprCompileFailure<H>> {
-        if schema.fields().len() != columns.len() {
+        if columns.len() > schema.fields().len()
+            || (columns.is_empty() && !schema.fields().is_empty())
+        {
             return Err(
                 ExprCompileError::Invalid("scope schema and complete columns differ").into(),
             );
         }
         let mut values = std::collections::BTreeSet::new();
-        for (field, column) in schema.fields().iter().zip(columns.iter()) {
+        for column in columns.iter() {
             work.step()?;
+            let field =
+                schema
+                    .fields()
+                    .get(column.ordinal as usize)
+                    .ok_or(ExprCompileError::Invalid(
+                        "scope input ordinal is outside its runtime schema",
+                    ))?;
             creation
                 .before_tree_insert::<ExprCompileError, ValueId, ()>(values.len(), work)
                 .map_err(scope_creation_failure)?;

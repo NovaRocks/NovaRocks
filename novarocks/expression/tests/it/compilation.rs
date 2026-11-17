@@ -127,8 +127,10 @@ fn layouts(values: &[(ValueId, ValueType)]) -> ScopeLayout {
         s,
         values
             .iter()
-            .map(|(value, ty)| ScopeColumn {
+            .enumerate()
+            .map(|(ordinal, (value, ty))| ScopeColumn {
                 value: *value,
+                ordinal: u32::try_from(ordinal).unwrap(),
                 ty: ty.clone(),
             })
             .collect(),
@@ -2235,6 +2237,7 @@ fn late_scope_clone_shares_source_columns_and_retains_only_their_original_owner(
     let weak = Arc::downgrade(&hold);
     let columns: Arc<[ScopeColumn]> = Arc::from([ScopeColumn {
         value: ValueId::new(1),
+        ordinal: 0,
         ty: int(false),
     }]);
     let source_pointer = columns.as_ptr();
@@ -2338,8 +2341,10 @@ fn source_dictionary_ids_do_not_change_complete_static_binding_and_invalid_nomin
 fn scope_layout_creator_funds_only_actual_temporary_duplicate_checks() {
     let columns: Arc<[ScopeColumn]> = (0..32)
         .rev()
-        .map(|value| ScopeColumn {
+        .enumerate()
+        .map(|(ordinal, value)| ScopeColumn {
             value: ValueId::new(value),
+            ordinal: u32::try_from(ordinal).unwrap(),
             ty: int(false),
         })
         .collect();
@@ -2422,6 +2427,7 @@ fn scope_layout_creator_keeps_original_phase_and_every_first_control_cause() {
     let columns: Arc<[ScopeColumn]> = (0..32)
         .map(|value| ScopeColumn {
             value: ValueId::new(value),
+            ordinal: value,
             ty: int(false),
         })
         .collect();
@@ -2472,4 +2478,147 @@ fn scope_layout_creator_keeps_original_phase_and_every_first_control_cause() {
             assert_eq!(control.trace(), original[..=at]);
         }
     }
+}
+
+#[test]
+fn runtime_columns_keep_canonical_value_reads_after_repeated_publications() {
+    // The enclosing channel author proves the repeated publication is the
+    // same value. Its two physical columns remain distinct; the next value
+    // keeps ordinal 2, and the right port starts after all three left columns.
+    let left_value = ValueId::new(10);
+    let other = ValueId::new(30);
+    let right_value = ValueId::new(20);
+    let left = [(left_value, int(false)), (other, int(false))];
+    let right = [(right_value, int(false))];
+    let mut b = builder();
+    for (value, scope) in [
+        (other, RootScope::Port(0)),
+        (right_value, RootScope::Port(1)),
+        (right_value, RootScope::AllPorts),
+    ] {
+        let definition = b.add(None, int(false), ExprKind::Value(value)).unwrap();
+        b.root(definition, EvaluationDemand::Value, scope).unwrap();
+    }
+    let unit = finish(
+        b,
+        vec![
+            ExprPort {
+                values: left.clone().into(),
+            },
+            ExprPort {
+                values: right.clone().into(),
+            },
+        ],
+    );
+    let mapped = |actual: &[(ValueId, ValueType)], representatives: &[u32]| {
+        let schema = Arc::new(Schema::new(
+            actual
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (_, ty))| {
+                    Field::new(
+                        format!("actual{ordinal}"),
+                        ty.data_type().clone(),
+                        ty.nullable(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let columns: Arc<[ScopeColumn]> = representatives
+            .iter()
+            .map(|&ordinal| ScopeColumn {
+                value: actual[ordinal as usize].0,
+                ordinal,
+                ty: actual[ordinal as usize].1.clone(),
+            })
+            .collect();
+        let control = Control::good();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let layout = ScopeLayout::try_new(
+            schema.clone(),
+            columns,
+            ValueTypeStorageLifetime::pure(),
+            &mut work,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        assert!(Arc::ptr_eq(layout.schema(), &schema));
+        layout
+    };
+    let ports = [
+        mapped(
+            &[left[0].clone(), left[0].clone(), left[1].clone()],
+            &[0, 2],
+        ),
+        layouts(&right),
+    ];
+    let combined = mapped(
+        &[
+            left[0].clone(),
+            left[0].clone(),
+            left[1].clone(),
+            right[0].clone(),
+        ],
+        &[0, 2, 3],
+    );
+    let mut wrong = combined.columns().to_vec();
+    wrong[2].ordinal = 4;
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    assert!(matches!(
+        ScopeLayout::try_new(
+            combined.schema().clone(),
+            wrong.into(),
+            ValueTypeStorageLifetime::pure(),
+            &mut work
+        ),
+        Err(ExprCompileError::Invalid(
+            "scope input ordinal is outside its runtime schema"
+        ))
+    ));
+    let program = compile(
+        &unit,
+        &ConstantPools::empty(),
+        &SemanticParameters::default(),
+        ScopeLayouts {
+            ports: &ports,
+            all_ports: Some(&combined),
+        },
+        &Control::good(),
+    )
+    .unwrap();
+    for (root, expected) in program.roots().iter().zip([
+        InputBinding {
+            scope: RootScope::Port(0),
+            ordinal: 2,
+        },
+        InputBinding {
+            scope: RootScope::Port(1),
+            ordinal: 0,
+        },
+        InputBinding {
+            scope: RootScope::AllPorts,
+            ordinal: 3,
+        },
+    ]) {
+        assert_eq!(program.input(root.use_id), Some(expected));
+    }
+    assert_eq!(
+        program
+            .scope(RootScope::Port(0))
+            .unwrap()
+            .schema()
+            .fields()
+            .len(),
+        3
+    );
+    assert_eq!(
+        program
+            .scope(RootScope::AllPorts)
+            .unwrap()
+            .schema()
+            .fields()
+            .len(),
+        4
+    );
 }

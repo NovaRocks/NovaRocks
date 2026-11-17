@@ -180,7 +180,11 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
             }
         }
     }
-    if unit.ports().is_empty() && scopes.all_ports.is_some_and(|l| !l.columns().is_empty()) {
+    if unit.ports().is_empty()
+        && scopes
+            .all_ports
+            .is_some_and(|l| !l.schema().fields().is_empty())
+    {
         return Err(
             ExprCompileError::Invalid("zero-port unit has a nonempty combined layout").into(),
         );
@@ -539,13 +543,13 @@ fn index_scopes<'a, H>(
         .map_err(publication)?;
     for scope in scopes.ports.iter().chain(scopes.all_ports) {
         let mut index = ScopeIndex::new();
-        for (ordinal, column) in scope.columns().iter().enumerate() {
+        for column in scope.columns() {
             work.step()?;
             owner.before_tree_insert::<ProgramPrimitiveError,novarocks_expression_contract::ValueId,(u32,&'a novarocks_type_contract::FunctionValueType)>(index.len(),work).map_err(publication)?;
-            let ordinal = u32::try_from(ordinal).map_err(|_| {
-                ExprCompileError::Invalid("scope input ordinal exceeds its address domain")
-            })?;
-            if index.insert(column.value, (ordinal, &column.ty)).is_some() {
+            if index
+                .insert(column.value, (column.ordinal, &column.ty))
+                .is_some()
+            {
                 return Err(ExprCompileError::Invalid("scope has ambiguous input values").into());
             }
         }
