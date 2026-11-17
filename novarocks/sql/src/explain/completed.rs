@@ -4038,37 +4038,45 @@ mod tests {
         ]
     }
 
-    /// A chain wide enough to exhaust the stack is refused, not aborted on.
-    ///
-    /// The engine cannot report a stack overflow: it aborts the process rather
-    /// than unwinding. So the width that would get there has to be an error a
-    /// client can see, raised before the walks that would consume the stack.
+    /// Wide AND/OR source chains complete compilation on a bounded planning
+    /// stack and preserve their declared result fields.
     #[test]
-    fn an_unboundedly_wide_boolean_chain_is_refused_rather_than_aborted_on() {
-        // Parsing and analysis now keep this chain shallow enough to reject it
-        // on a bounded planning stack.
+    fn wide_boolean_chains_compile_through_the_original_complete_pipeline() {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
-            .spawn(check_wide_boolean_chain_is_refused)
+            .spawn(check_wide_boolean_chains_compile)
             .expect("spawn")
             .join()
-            .expect("refusal thread");
+            .expect("wide Boolean compilation thread");
     }
 
-    fn check_wide_boolean_chain_is_refused() {
-        let conjuncts = (0..crate::analyzer::MAX_BOOLEAN_CHAIN_OPERANDS + 1)
-            .map(|i| format!("c0 <> {i}"))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let sql = format!("SELECT c0 FROM (VALUES (1, 2)) AS t(c0, c1) WHERE {conjuncts}");
-        let error = match request(&sql, SqlCompileIntent::Query, 7).try_into_completion() {
-            Ok(_) => panic!("a chain this wide must be refused"),
-            Err(error) => error,
-        };
-        assert!(
-            format!("{error:?}").contains("exceeds the supported maximum"),
-            "{error:?}"
+    fn check_wide_boolean_chains_compile() {
+        let baseline = completed_sql(
+            "SELECT c0 FROM (VALUES (1, 2)) AS t(c0, c1)",
+            SqlCompileIntent::Query,
+            7,
         );
+        let expected = baseline.plan().result_port().expect("baseline result port");
+        assert_eq!(expected.fields.len(), 1);
+        // These are legal source case sizes; query admission adds no width limit.
+        for (keyword, count) in [("AND", 4_097), ("OR", 20_000)] {
+            let conditions = (0..count)
+                .map(|index| format!("c0 <> {index}"))
+                .collect::<Vec<_>>()
+                .join(&format!(" {keyword} "));
+            let sql = format!("SELECT c0 FROM (VALUES (1, 2)) AS t(c0, c1) WHERE {conditions}");
+            // completed_sql enters SqlCompiler::start and requires Complete;
+            // passing parser or analyzer alone does not satisfy this guard.
+            let completed = completed_sql(&sql, SqlCompileIntent::Query, 7);
+            let physical = completed.plan();
+            assert!(!physical.fragments().is_empty(), "{keyword}");
+            let actual = physical.result_port().expect("wide result port");
+            assert_eq!(actual.fields.len(), expected.fields.len(), "{keyword}");
+            assert_eq!(actual.fields[0].name, expected.fields[0].name, "{keyword}");
+            assert_eq!(actual.fields[0].ty, expected.fields[0].ty, "{keyword}");
+            // Both the completed product and its intermediate owners must exit.
+            drop(completed);
+        }
     }
 
     #[test]

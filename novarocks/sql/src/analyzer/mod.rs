@@ -69,6 +69,7 @@ mod resolve_expr;
 pub(crate) use resolve_expr::{
     unsupported_call_facts, unsupported_control_expression_reason, unsupported_predicate_reason,
 };
+mod resolve_from;
 #[cfg(test)]
 mod scalar_rebind_contract_tests;
 mod value_conversion;
@@ -76,11 +77,6 @@ mod view;
 #[cfg(test)]
 mod window_canonical_tests;
 mod write_assignment;
-/// The analyzer owns this bound and enforces it; it is named outside the
-/// analyzer only where a test has to build a chain that crosses it.
-#[cfg(test)]
-pub(crate) use resolve_expr::MAX_BOOLEAN_CHAIN_OPERANDS;
-mod resolve_from;
 pub use resolve_from::TableNameView;
 mod scope;
 mod subquery_rewrite;

@@ -78,21 +78,6 @@ fn interval_field_name(field: ast::IntervalField) -> &'static str {
     }
 }
 
-/// How many conditions one `AND`/`OR` chain may state.
-///
-/// Analysis no longer recurses per condition, but the rewrites and optimizer
-/// passes that walk the resulting tree still do, so stack use remains
-/// proportional to chain width. Exhausting the stack aborts the process
-/// instead of unwinding, which is not a failure the engine can report - so the
-/// width is bounded here, where exceeding it is an error a client can see.
-///
-/// The number comes from measurement rather than taste: a release build on a
-/// 2 MiB stack compiles 512 conditions and aborts before 1024, and the process
-/// gives its runtime threads 16 MiB, which puts the abort near 4096. This
-/// leaves a factor of two, and is four times the widest shape in the generated
-/// SQL corpus. Removing the bound means making the tree walks iterative too.
-pub const MAX_BOOLEAN_CHAIN_OPERANDS: usize = 2_048;
-
 pub(crate) fn unsupported_predicate_reason(node: &ast::PredicatedExpr) -> Option<&'static str> {
     match &node.predicate {
         ast::Predicate::BooleanTest(p) if p.truth_value == ast::TruthValue::Unknown => {
@@ -304,6 +289,7 @@ fn validate_nested_decimal_cast_policy(expr: &TypedExpr) -> Result<(), &'static 
 
 impl<'a> super::AnalyzerContext<'a> {
     /// Analyze a single expression and produce a TypedExpr.
+    #[recursive::recursive]
     pub(super) fn analyze_expr(
         &self,
         expr: &ast::Expr,
@@ -358,6 +344,7 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok(resolved)
     }
 
+    #[recursive::recursive]
     fn analyze_expr_impl(
         &self,
         expr: &ast::Expr,
@@ -1700,7 +1687,6 @@ impl<'a> super::AnalyzerContext<'a> {
 
     /// Analyze original logical terms in source order, then balance only the
     /// typed IR. Each term keeps its actual materialized-source identity.
-    /// See [`MAX_BOOLEAN_CHAIN_OPERANDS`] for the current downstream width bound.
     fn analyze_boolean_chain(
         &self,
         logical: &ast::LogicalExpr,
@@ -1709,15 +1695,6 @@ impl<'a> super::AnalyzerContext<'a> {
         if logical.terms.len() < 2 {
             return Err(AnalyzeError::unsupported_expression(
                 "a logical expression requires at least two terms",
-                logical.span,
-            ));
-        }
-        if logical.terms.len() > MAX_BOOLEAN_CHAIN_OPERANDS {
-            return Err(AnalyzeError::unsupported_expression(
-                format!(
-                    "boolean chain of {} conditions exceeds the supported maximum of {MAX_BOOLEAN_CHAIN_OPERANDS}",
-                    logical.terms.len()
-                ),
                 logical.span,
             ));
         }
