@@ -283,7 +283,7 @@ impl Writer {
         }
     }
     #[recursive::recursive]
-    fn relation(&mut self, value: &Relation) {
+    pub(super) fn relation(&mut self, value: &Relation) {
         match value {
             Relation::Table(value) => self.table(value),
             Relation::TableSubquery(value) => {
@@ -388,10 +388,10 @@ impl Writer {
             }
             Relation::LegacyTableFunction(_) => legacy("table function"),
             Relation::JsonTable(value) => self.json_table(value),
-            Relation::Pivot(_)
-            | Relation::Nearest(_)
-            | Relation::TableFunction(_)
-            | Relation::PatternRecognition(_) => unsupported("advanced relation vocabulary"),
+            Relation::PatternRecognition(value) => self.pattern_recognition(value),
+            Relation::Pivot(_) | Relation::Nearest(_) | Relation::TableFunction(_) => {
+                unsupported("advanced relation vocabulary")
+            }
         }
     }
 
@@ -435,15 +435,7 @@ impl Writer {
     }
     #[recursive::recursive]
     fn window_frame(&mut self, value: &WindowFrame) {
-        if !value.measures.is_empty()
-            || value.after_match_skip_to.is_some()
-            || value.pattern_search_mode.is_some()
-            || value.pattern.is_some()
-            || !value.subsets.is_empty()
-            || !value.variable_definitions.is_empty()
-        {
-            unsupported("window pattern-recognition metadata");
-        }
+        self.pattern_measures(&value.measures);
         self.text(match value.units {
             WindowFrameUnits::Rows => "ROWS ",
             WindowFrameUnits::Range => "RANGE ",
@@ -463,6 +455,7 @@ impl Writer {
             WindowFrameExclusion::Group => self.text(" EXCLUDE GROUP"),
             WindowFrameExclusion::Ties => self.text(" EXCLUDE TIES"),
         }
+        self.window_pattern_tail(value);
     }
     #[recursive::recursive]
     fn window_bound(&mut self, value: &WindowFrameBound) {

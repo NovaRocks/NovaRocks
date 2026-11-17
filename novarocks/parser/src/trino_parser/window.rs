@@ -109,14 +109,13 @@ impl Parser<'_> {
         } else {
             None
         };
-        if self.at_keyword(Keyword::Measures) {
-            return Err(self.error("window measures and row-pattern syntax (next parser slice)"));
-        }
         let window_frame = if matches!(
             self.peek(0).kind,
-            TokenKind::Keyword(Keyword::Rows | Keyword::Range | Keyword::Groups)
+            TokenKind::Keyword(
+                Keyword::Measures | Keyword::Rows | Keyword::Range | Keyword::Groups
+            )
         ) {
-            Some(self.parse_window_frame()?)
+            Some(self.parse_pattern_window_frame()?)
         } else {
             None
         };
@@ -135,23 +134,10 @@ impl Parser<'_> {
         })
     }
 
-    fn parse_window_frame(&mut self) -> Result<WindowFrame, ParserError> {
-        let token = self.bump();
-        let units = match token.kind {
-            TokenKind::Keyword(Keyword::Rows) => WindowFrameUnits::Rows,
-            TokenKind::Keyword(Keyword::Range) => WindowFrameUnits::Range,
-            TokenKind::Keyword(Keyword::Groups) => WindowFrameUnits::Groups,
-            _ => unreachable!("frame type checked by window specification"),
-        };
-        let between = self.eat_keyword(Keyword::Between).is_some();
-        let start_bound = self.parse_window_bound()?;
-        let end_bound = if between {
-            self.expect_keyword(Keyword::And)?;
-            Some(self.parse_window_bound()?)
-        } else {
-            None
-        };
-        let exclusion = if self.eat_keyword(Keyword::Exclude).is_some() {
+    pub(super) fn parse_pattern_frame_exclusion(
+        &mut self,
+    ) -> Result<WindowFrameExclusion, ParserError> {
+        Ok(if self.eat_keyword(Keyword::Exclude).is_some() {
             if self.eat_keyword(Keyword::Current).is_some() {
                 self.expect_keyword(Keyword::Row)?;
                 WindowFrameExclusion::CurrentRow
@@ -166,32 +152,6 @@ impl Parser<'_> {
             }
         } else {
             WindowFrameExclusion::NoOthers
-        };
-        if matches!(
-            self.peek(0).kind,
-            TokenKind::Keyword(
-                Keyword::After
-                    | Keyword::Initial
-                    | Keyword::Seek
-                    | Keyword::Pattern
-                    | Keyword::Subset
-                    | Keyword::Define
-            )
-        ) {
-            return Err(self.error("window row-pattern syntax (next parser slice)"));
-        }
-        Ok(WindowFrame {
-            units,
-            start_bound,
-            end_bound,
-            exclusion,
-            measures: Vec::new().into(),
-            after_match_skip_to: None,
-            pattern_search_mode: None,
-            pattern: None,
-            subsets: Vec::new().into(),
-            variable_definitions: Vec::new().into(),
-            span: self.span_since(token.span),
         })
     }
 

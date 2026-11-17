@@ -93,8 +93,12 @@ impl Parser<'_> {
     fn parse_sampled_relation(&mut self) -> Result<Relation, ParserError> {
         let start = self.current().span;
         let mut relation = self.parse_aliased_relation()?;
-        if self.at_keyword(Keyword::MatchRecognize) || self.at_keyword(Keyword::Pivot) {
-            return Err(self.error("pattern recognition or pivot syntax (next parser slice)"));
+        if self.at_keyword(Keyword::MatchRecognize) {
+            let input_extent = self.span_since(start);
+            relation = self.parse_pattern_recognition(relation, input_extent)?;
+        }
+        if self.at_keyword(Keyword::Pivot) {
+            return Err(self.error("pivot syntax (next parser slice)"));
         }
         if self.eat_keyword(Keyword::Tablesample).is_some() {
             let kind = if self.eat_keyword(Keyword::Bernoulli).is_some() {
@@ -225,12 +229,22 @@ impl Parser<'_> {
         }
         if self.eat_symbol(Symbol::LParen).is_some() {
             if self.relation_query_ahead() {
-                let query = self.parse_query()?;
-                self.expect_symbol(Symbol::RParen)?;
-                return Ok(Relation::TableSubquery(AstBox::new(TableSubquery {
-                    query: AstBox::new(query),
-                    span: self.span_since(start),
-                })));
+                let checkpoint = self.checkpoint();
+                let query = (|| {
+                    let query = self.parse_query()?;
+                    self.expect_symbol(Symbol::RParen)?;
+                    Ok::<_, ParserError>(query)
+                })();
+                match query {
+                    Ok(query) => {
+                        return Ok(Relation::TableSubquery(AstBox::new(TableSubquery {
+                            query: AstBox::new(query),
+                            span: self.span_since(start),
+                        })));
+                    }
+                    Err(ParserError::Syntax(_)) => self.restore(checkpoint),
+                    Err(error @ ParserError::Construction(_)) => return Err(error),
+                }
             }
             let relation = self.parse_relation()?;
             self.expect_symbol(Symbol::RParen)?;

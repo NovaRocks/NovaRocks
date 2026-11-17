@@ -24,6 +24,7 @@ mod failure;
 mod json;
 mod literal;
 mod parameters;
+mod pattern;
 mod query;
 mod relation;
 mod special;
