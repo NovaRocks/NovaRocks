@@ -15,20 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lower the admitted global and analytic sort representations into the
-//! original local sort owner. An analytic sort orders by its partition keys
-//! first and then by its order keys within each partition; it keeps no
-//! partition limit.
+//! Lower each frozen sort mode into the sole local ordering owner.
 
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use novarocks_local_program::{
-    ProgramExprId, ProgramNodeId, ProgramNodeKind, SortExpression, SortTopNType, StaticLayout,
+    LocalSortMode, PartitionRank, ProgramExprId, ProgramNodeId, ProgramNodeKind, SortExpression,
+    StaticLayout,
 };
 use novarocks_physical_plan::{
     ExprId, NodeKind, NullOrdering, PhysicalNode, SortDirection, SortMode,
 };
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroUsize};
 
 pub(crate) fn lower_sort(
     node: &PhysicalNode,
@@ -52,60 +50,56 @@ fn lower_core(
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
-    let (order_by, partition_by) = match &node.kind {
-        NodeKind::Sort {
-            order_by,
-            mode: SortMode::Global,
-        } => (order_by, &[][..]),
-        NodeKind::Sort {
-            order_by,
-            mode: SortMode::Analytic { partition_by },
-        } => (order_by, &partition_by[..]),
-        _ => {
-            return Err(FragmentCompileError::Unsupported {
-                node: Some(node.id),
-                feature: "partition TopN sort mode",
-            });
+    let NodeKind::Sort { order_by, mode } = &node.kind else {
+        return Err(FragmentCompileError::Invalid("sort physical kind differs"));
+    };
+    let partition_by = match mode {
+        SortMode::Global => &[][..],
+        SortMode::Analytic { partition_by } | SortMode::PartitionTopN { partition_by, .. } => {
+            partition_by
         }
     };
-    // A global sort orders by at least one key; an analytic sort has at least
-    // one partition key, and may have no order key within its partitions.
-    let analytic = matches!(
-        &node.kind,
-        NodeKind::Sort {
-            mode: SortMode::Analytic { .. },
-            ..
-        }
-    );
     if node.inputs.len() != 1
-        || (analytic && partition_by.is_empty())
-        || (!analytic && order_by.is_empty())
+        || match mode {
+            SortMode::Global => order_by.is_empty(),
+            SortMode::Analytic { .. } | SortMode::PartitionTopN { .. } => partition_by.is_empty(),
+        }
         || node.output.columns.len() != layout.slots().len()
     {
         return Err(FragmentCompileError::Invalid(
             "sort input, keys or output width differs",
         ));
     }
-    let keys = lower_sort_keys(order_by, expressions, work)?;
-    let partition_exprs = if analytic {
-        lower_sort_keys(partition_by, expressions, work)?
-    } else {
-        Vec::new()
+    let order_by = lower_sort_keys(order_by, expressions, work)?;
+    let mode = match mode {
+        SortMode::Global => LocalSortMode::Full,
+        SortMode::Analytic { .. } => LocalSortMode::Partitioned {
+            partition_by: lower_sort_keys(partition_by, expressions, work)?,
+        },
+        SortMode::PartitionTopN { limit, kind, .. } => {
+            let limit = usize::try_from(*limit).map_err(|_| {
+                FragmentCompileError::Invalid("partition TopN limit exceeds host range")
+            })?;
+            let limit = NonZeroUsize::new(limit).ok_or(FragmentCompileError::Invalid(
+                "partition TopN limit is zero",
+            ))?;
+            let rank = match kind {
+                novarocks_physical_plan::PartitionTopNType::RowNumber => PartitionRank::RowNumber,
+                novarocks_physical_plan::PartitionTopNType::Rank => PartitionRank::Rank,
+                novarocks_physical_plan::PartitionTopNType::DenseRank => PartitionRank::DenseRank,
+            };
+            LocalSortMode::PartitionTopN {
+                partition_by: lower_sort_keys(partition_by, expressions, work)?,
+                limit,
+                rank,
+            }
+        }
     };
-    // These inactive fields express a full sort, not a guessed buffering cap.
-    // The existing full-sort execution path does not consume ranking semantics.
     Ok((
         ProgramNodeKind::Sort {
             input,
-            use_top_n: false,
-            order_by: keys,
-            limit: None,
-            offset: 0,
-            topn_type: SortTopNType::RowNumber,
-            max_buffered_rows: None,
-            max_buffered_bytes: None,
-            partition_exprs,
-            partition_limit: None,
+            order_by,
+            mode,
         },
         layout.clone(),
     ))

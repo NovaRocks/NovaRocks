@@ -51,12 +51,18 @@ fn contract<H, F: ValueSchemaCreationFactory<H>>(
 ) -> Result<StaticFilterContract, FragmentCreationError<H>> {
     let RuntimeFilterDomain::Ordered {
         key,
-        inclusive: true,
+        inclusive,
         comparator,
     } = &filter.domain
     else {
-        return Err(unsupported(node, "inclusive ordered runtime-filter domain").into());
+        return Err(FragmentCompileError::Invalid(
+            "Aggregate TopN runtime filter requires an ordered domain",
+        )
+        .into());
     };
+    if !inclusive {
+        return Err(unsupported(node, "inclusive ordered runtime-filter domain").into());
+    }
     if *comparator != OrderedComparisonAlgorithm::NativeScalarOrderV1
         || !is_aggregate_topn_key_type(&key.ty)
     {
@@ -65,7 +71,10 @@ fn contract<H, F: ValueSchemaCreationFactory<H>>(
     if filter.lifecycle != RuntimeFilterLifecycle::MonotonicUpdates
         || filter.reduction != RuntimeFilterReduction::TightenOrderedBound
     {
-        return Err(unsupported(node, "monotonic tightening ordered runtime filter").into());
+        return Err(FragmentCompileError::Invalid(
+            "Aggregate TopN runtime filter requires monotonic tightening",
+        )
+        .into());
     }
     let direction = match key.direction {
         SortDirection::Ascending => FilterSortDirection::Ascending,
@@ -164,9 +173,10 @@ fn route<H>(
         ..
     } = producer.target
     else {
-        return Err(
-            unsupported(node, "Aggregate TopN runtime-filter phase, limit or offset").into(),
-        );
+        return Err(FragmentCompileError::Invalid(
+            "Aggregate TopN runtime-filter phase, limit or offset differs",
+        )
+        .into());
     };
     work.step()?;
     let installed_parent = match (grouping, fragment.nodes().get(&topn).map(|node| &node.kind)) {
@@ -197,6 +207,11 @@ fn route<H>(
             "Aggregate TopN runtime-filter aggregate and TopN phases",
         )
         .into());
+    }
+    if limit == 0 {
+        return Err(
+            FragmentCompileError::Invalid("Aggregate TopN runtime-filter limit is zero").into(),
+        );
     }
     let limit = u32::try_from(limit)
         .ok()
@@ -349,17 +364,40 @@ pub(super) fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
     if !matches!(scan.kind, NodeKind::Scan { .. })
         || !scan.inputs.is_empty()
         || consumer.apply_point != RuntimeFilterApplyPoint::ScanSource
-        || consumer.activation
-            != (RuntimeFilterConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch,
-            })
-        || consumer.capabilities.as_ref() != [RuntimeFilterArtifactCapability::OrderedRange]
     {
-        return Err(unsupported(
-            node,
-            "Aggregate TopN runtime-filter live Batch scan consumer",
+        return Err(FragmentCompileError::Invalid(
+            "Aggregate TopN runtime-filter consumer requires a scan source",
         )
         .into());
+    }
+    if consumer.capabilities.as_ref() != [RuntimeFilterArtifactCapability::OrderedRange] {
+        return Err(FragmentCompileError::Invalid(
+            "Aggregate TopN runtime-filter consumer capabilities differ from its channel matrix",
+        )
+        .into());
+    }
+    match consumer.activation {
+        RuntimeFilterConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::Batch,
+        } => {}
+        RuntimeFilterConsumerActivation::NonBlockingLive {
+            late_apply:
+                LateApplyGranularity::RowGroup
+                | LateApplyGranularity::Split
+                | LateApplyGranularity::File,
+        } => {
+            return Err(unsupported(
+                node,
+                "Aggregate TopN runtime-filter live Batch scan consumer",
+            )
+            .into());
+        }
+        _ => {
+            return Err(FragmentCompileError::Invalid(
+                "Aggregate TopN runtime-filter consumer requires live scan activation",
+            )
+            .into());
+        }
     }
     for output in scan.output.columns.iter() {
         work.step()?;

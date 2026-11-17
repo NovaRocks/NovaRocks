@@ -214,7 +214,7 @@ id	int_col
 14	NULL
 
 -- query 39
--- legacy
+-- types	integer	integer
 id	int_col
 1	1000
 5	5000

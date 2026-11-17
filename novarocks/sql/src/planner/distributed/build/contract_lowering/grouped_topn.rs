@@ -175,10 +175,7 @@ impl ContractLoweringVisitor<'_> {
         let mut group_by = Vec::new();
         for value in &keys {
             let ty = self.value_declared_type(*value)?;
-            if !comparator.supports_value_type(&ty)
-                || !novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
-                    .supports_partition_key(ty.data_type())
-            {
+            if !novarocks_physical_plan::grouped_state_topn_key_supported(comparator, &ty) {
                 return Err(grouped_shape(
                     "GroupedStates TopN grouping key lacks NativeScalarOrderV1 comparison equivalence",
                 ));

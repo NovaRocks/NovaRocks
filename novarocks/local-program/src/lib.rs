@@ -95,12 +95,12 @@ pub use frozen_aggregate::{FrozenAggregateSelection, FrozenAggregateSelectionErr
 pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
     ChangeEventSpec, FilterConsumerAtExpr, FilterConsumerAtJoinKey, FilterProducerAtExpr,
-    JoinDistributionMode, JoinType, LocalProgramError, LocalProgramGraph,
+    JoinDistributionMode, JoinType, LocalProgramError, LocalProgramGraph, LocalSortMode,
     MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH, MAX_PROGRAM_NODES,
-    NestedLoopJoinType, ProgramAssertionApplicability, ProgramCompileError, ProgramJoinCondition,
-    ProgramJoinKey, ProgramNode, ProgramNodeKind, ProgramPositionShardInput, ProgramScanSource,
-    ProgramWriteLayoutEffects, ProjectExpressionSlot, ProjectExpressionSlots, RowAssertion,
-    SetOpKind, SortExpression, SortTopNType, StaticAggregateCall, StaticAggregateOrder,
+    NestedLoopJoinType, PartitionRank, ProgramAssertionApplicability, ProgramCompileError,
+    ProgramJoinCondition, ProgramJoinKey, ProgramNode, ProgramNodeKind, ProgramPositionShardInput,
+    ProgramScanSource, ProgramWriteLayoutEffects, ProjectExpressionSlot, ProjectExpressionSlots,
+    RowAssertion, SetOpKind, SortExpression, StaticAggregateCall, StaticAggregateOrder,
     StaticAggregateTypeSignature, StaticWindowFunction, StaticWriterProjection,
     StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant, UnpivotMapping,
     UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind, WindowType,
@@ -124,7 +124,7 @@ pub use runtime_filter::{
     FilterOrderKey, FilterOrderKeys, FilterProducerKind, FilterReduction, FilterSortDirection,
     ScanFilterConsumers, StaticFilterConsumer, StaticFilterContract, StaticFilterError,
     StaticFilterProducer, encode_filter_key_type, is_aggregate_topn_key_carrier,
-    is_aggregate_topn_key_type, is_ordered_filter_flat_payload_type,
+    is_aggregate_topn_key_type, is_filter_key_type, is_ordered_filter_flat_payload_type,
     single_key_ordered_filter_digests_observed, visit_filter_key_type,
 };
 pub use sink::{

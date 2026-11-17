@@ -1,5 +1,5 @@
 -- query 2
--- legacy
+-- types	integer	integer	integer	integer	integer	integer	bigint
 c1	c2	c3	c4	c5	c6	_rowid
 1	1	1	1	1	1	1
 1	1	1	2	1	11	2

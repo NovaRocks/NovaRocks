@@ -723,24 +723,19 @@ fn lower_with_creation<
                     && node.inputs.len() == spec.inputs.len()
             }
             NodeKind::Filter { predicates } => !predicates.is_empty() && node.inputs.len() == 1,
-            // Every row-count TopN phase; a grouped-state reduction has no
-            // local owner.
-            NodeKind::Sort {
-                mode:
-                    novarocks_physical_plan::SortMode::Global
-                    | novarocks_physical_plan::SortMode::Analytic { .. },
-                ..
-            }
+            // Every frozen sort mode and row-count TopN phase has one local owner.
+            NodeKind::Sort { .. }
             | NodeKind::TopN {
                 reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
             } => node.inputs.len() == 1,
             NodeKind::TopN {
                 reduction: novarocks_physical_plan::TopNReduction::GroupedStates { .. },
-                phase: novarocks_physical_plan::TopNPhase::Partial { .. },
-                offset: 0,
                 ..
-            } => node.inputs.len() == 1,
+            } => {
+                crate::topn::admit_grouped_topn_shape(node)?;
+                true
+            }
             // A window, under its own admission: one input and an installed
             // pure window kernel for each call shape.
             NodeKind::Window(_) => {
@@ -977,13 +972,14 @@ fn lower_with_creation<
         // Every row-count TopN phase emits its instance's window as one
         // ordered stream on one driver, so its declared ordering holds for
         // the whole instance output, as the property law states it. An
-        // analytic Sort does the same over its partition keys and then its
-        // order keys.
+        // analytic Sort and partition TopN do the same over partition keys
+        // followed by order keys; pruning preserves that ordering.
         let global = matches!(
             node.kind,
             NodeKind::Sort {
                 mode: novarocks_physical_plan::SortMode::Global
-                    | novarocks_physical_plan::SortMode::Analytic { .. },
+                    | novarocks_physical_plan::SortMode::Analytic { .. }
+                    | novarocks_physical_plan::SortMode::PartitionTopN { .. },
                 ..
             } | NodeKind::TopN { .. }
         );
@@ -2853,8 +2849,8 @@ fn lower_position_shard<H>(
 fn unsupported_node_shape(kind: &NodeKind) -> &'static str {
     match kind {
         NodeKind::Filter { .. } => "filter with other than one predicate or input",
-        NodeKind::Sort { .. } => "sort mode without a local owner",
-        NodeKind::TopN { .. } => "grouped-state TopN reduction",
+        NodeKind::Sort { .. } => "sort with other than one input",
+        NodeKind::TopN { .. } => "TopN with other than one input",
         NodeKind::SetOp { .. } => "INTERSECT or EXCEPT set operation",
         NodeKind::GenerateSeries { .. } => "generate_series source",
         NodeKind::PositionShard(_) => "position shard aggregation",

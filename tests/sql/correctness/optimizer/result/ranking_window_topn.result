@@ -1,5 +1,5 @@
 -- query 5
--- legacy
+-- types	varchar	integer	bigint
 region	amount	rk
 A	200	1
 A	100	2
@@ -19,7 +19,7 @@ C	20	1
 C	10	2
 
 -- query 9
--- legacy
+-- types	varchar	integer	bigint
 region	amount	rn
 A	200	1
 B	400	1

@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compiled runtime filters: a BlockingSnapshot membership consumer at a
-//! compiled scan source and membership producers at a compiled hash join's
-//! build keys.
+//! Compiled runtime filters: blocking and Batch live membership consumers at
+//! compiled scan sources and join probe keys, and join build-key producers.
 //!
-//! The local compiler does not author runtime-filter facts yet, so every
-//! program here is a compiled fixture whose checked chain is rebuilt over the
+//! Programs reuse compiled fixtures whose checked chain is rebuilt over the
 //! same graph with runtime-filter sites, their binding requirements and their
 //! key roots added. The Task's runtime-filter session is a test double that
 //! records what the operators ask of it.
@@ -1099,6 +1097,7 @@ impl execution::RuntimeFilterProducer for RecordingProducer {
 #[derive(Default)]
 struct FakeSession {
     subscriptions: BTreeMap<u32, Arc<ControlledSubscription>>,
+    live_subscriptions: BTreeMap<u32, Arc<ControlledLiveSubscription>>,
     producers: BTreeMap<u32, Arc<RecordingProducer>>,
     subscribed: Mutex<Vec<execution::RuntimeFilterConsumerContract>>,
     opened: Mutex<Vec<execution::RuntimeFilterProducerOpenRequest>>,
@@ -1106,6 +1105,13 @@ struct FakeSession {
 }
 
 impl FakeSession {
+    fn live(subscription: Arc<ControlledLiveSubscription>) -> Arc<Self> {
+        Arc::new(Self {
+            live_subscriptions: BTreeMap::from([(7, subscription)]),
+            ..Self::default()
+        })
+    }
+
     fn consumers(subscriptions: &[(u32, &Arc<ControlledSubscription>)]) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: subscriptions
@@ -1166,6 +1172,18 @@ impl execution::RuntimeFilterSession for FakeSession {
         execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionPin>,
         execution::RuntimeFilterContractViolation,
     > {
+        if let Some(subscription) = self
+            .live_subscriptions
+            .get(&request.contract().binding_id().get())
+        {
+            self.subscribed
+                .lock()
+                .expect("subscribed")
+                .push(request.contract().clone());
+            return Ok(execution::RuntimeFilterBindOutcome::Bound(
+                execution::RuntimeFilterSubscriptionPin::Live(subscription.clone()),
+            ));
+        }
         let subscription = self
             .subscriptions
             .get(&request.contract().binding_id().get())
@@ -1532,20 +1550,28 @@ fn compiled_scan_runtime_filter_shapes_outside_m1_are_refused_by_name() {
     ));
     drop(requests);
 
-    let live = StaticFilterConsumer::try_new(
+    let program = scan_with_consumers(1, vec![(live_consumer(7), V0_OUTPUT)]).unwrap();
+    let message = scan_refusal(&program, session());
+    assert!(
+        message.contains("activation-mismatched subscription"),
+        "{message}"
+    );
+    let non_batch = StaticFilterConsumer::try_new(
         7,
         7,
         FilterConsumerActivation::NonBlockingLive {
-            late_apply: FilterLateApplyGranularity::Batch,
+            late_apply: FilterLateApplyGranularity::Row,
         },
         membership(&DataType::Int64, FilterNullSemantics::NeverMatches),
         FilterReduction::SetUnion,
     )
     .unwrap();
-    let program = scan_with_consumers(1, vec![(live, V0_OUTPUT)]).unwrap();
+    let program = scan_with_consumers(1, vec![(non_batch, V0_OUTPUT)]).unwrap();
     let message = scan_refusal(&program, session());
     assert!(
-        message.contains("runtime-filter binding_id=7 with NonBlockingLive Batch activation is not executable yet"),
+        message.contains(
+            "runtime-filter binding_id=7 with NonBlockingLive Row activation is not executable yet"
+        ),
         "{message}"
     );
 
@@ -3232,4 +3258,295 @@ fn b3_input_keeps_required_key_row_failure_and_fails_rf_without_empty_completion
         )]
     );
     assert!(frame.completion.published().is_err());
+}
+
+/// The CompleteOnce live subscription publishes exactly one final version;
+/// the test chooses the batch boundary without clocks or background writers.
+#[derive(Default)]
+struct ControlledLiveSubscription {
+    publication: Mutex<Option<Arc<execution::RuntimeFilterSnapshot>>>,
+    terminal: Mutex<Option<execution::LiveTerminal>>,
+    polls: Mutex<Vec<Option<execution::LogicalVersion>>>,
+}
+impl ControlledLiveSubscription {
+    fn publish(&self, values: &[i64]) {
+        let execution::SnapshotAcquireOutcome::Published(snapshot) = accepting(7, values) else {
+            unreachable!()
+        };
+        *self.publication.lock().unwrap() = Some(snapshot);
+        *self.terminal.lock().unwrap() = Some(execution::LiveTerminal::Completed);
+    }
+    fn terminate(&self, terminal: execution::LiveTerminal) {
+        *self.terminal.lock().unwrap() = Some(terminal);
+    }
+}
+impl execution::NonBlockingLiveSubscription for ControlledLiveSubscription {
+    fn snapshot(&self) -> Option<Arc<execution::RuntimeFilterSnapshot>> {
+        self.publication.lock().unwrap().clone()
+    }
+    fn poll_after(
+        &self,
+        observed: Option<execution::LogicalVersion>,
+    ) -> execution::LivePollOutcome {
+        self.polls.lock().unwrap().push(observed);
+        let snapshot = self.publication.lock().unwrap().clone();
+        let terminal = *self.terminal.lock().unwrap();
+        match snapshot {
+            Some(snapshot) if observed.is_none() => {
+                execution::LivePollOutcome::Updated { snapshot, terminal }
+            }
+            snapshot => execution::LivePollOutcome::Idle {
+                latest_version: snapshot.map(|snapshot| snapshot.logical_version()),
+                terminal,
+            },
+        }
+    }
+}
+fn live_consumer(binding_id: u32) -> StaticFilterConsumer {
+    StaticFilterConsumer::try_new(
+        binding_id,
+        binding_id,
+        FilterConsumerActivation::NonBlockingLive {
+            late_apply: FilterLateApplyGranularity::Batch,
+        },
+        membership(&DataType::Int64, FilterNullSemantics::NeverMatches),
+        FilterReduction::SetUnion,
+    )
+    .unwrap()
+}
+
+#[test]
+fn compiled_scan_installs_final_membership_as_batch_live() {
+    for dop in [1, 2] {
+        let program = scan_with_consumers(dop, vec![(live_consumer(7), V0_OUTPUT)]).unwrap();
+        let op = FixtureScanOp::new(input(&program), false);
+        let subscription = Arc::new(ControlledLiveSubscription::default());
+        subscription.publish(&[8, 20]);
+        let session = FakeSession::live(subscription);
+        let output = ResultSinkBuffer::new();
+        prepare_scan(
+            &program,
+            &op,
+            &output,
+            state(Some(session.clone()), Duration::ZERO, None),
+            Arc::new(NoopTaskEventSink),
+        )
+        .unwrap()
+        .start()
+        .join()
+        .unwrap();
+        assert_eq!(
+            sorted_rows(&output.take_chunks()),
+            expected(|value, _| [8, 20].contains(&value))
+        );
+        assert_eq!(op.claims(), 1);
+        assert_eq!(op.closes(), 1);
+        let requests = session.subscribed.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            &[
+                super::super::runtime_filter::runtime_filter_consumer_contract(&live_consumer(7))
+                    .unwrap()
+            ]
+        );
+    }
+}
+
+/// The real compiled membership processor consumes the scan/probe root over
+/// each caller-owned batch. The original graph and root identities are reused.
+fn live_batch_outputs(
+    program: &Arc<LocalProgram>,
+    node: ProgramNodeId,
+    owner: &'static str,
+    chunks: Vec<Chunk>,
+    between: impl FnOnce(&ControlledLiveSubscription),
+) -> Vec<Chunk> {
+    use crate::exec::operators::runtime_filter::{
+        CompiledRuntimeFilterConsumers, NativeRuntimeFilterProcessorFactory,
+    };
+    use crate::exec::pipeline::test_driver::TestDriver;
+    let subscription = Arc::new(ControlledLiveSubscription::default());
+    let session = FakeSession::live(subscription.clone());
+    let runtime = state(Some(session.clone()), Duration::ZERO, None);
+    let contract =
+        super::super::runtime_filter::runtime_filter_consumer_contract(&live_consumer(7)).unwrap();
+    let consumers = Arc::new(
+        CompiledRuntimeFilterConsumers::try_new(
+            owner,
+            program.clone(),
+            node,
+            vec![contract.clone()],
+            runtime.error_state(),
+        )
+        .unwrap(),
+    );
+    let factory = NativeRuntimeFilterProcessorFactory::new_compiled(7, consumers.clone());
+    let mut operator = factory.create(1, 0);
+    let tracker = crate::runtime::mem_tracker::MemTracker::new_root("live membership construction");
+    operator.set_mem_tracker(tracker.clone());
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker,
+        runtime.error_state(),
+    ));
+    operator.prepare().unwrap();
+    operator.bind_runtime_state(&runtime).unwrap();
+    operator.activate(&runtime).unwrap();
+    assert!(consumers.state().gate_deadline().is_none());
+    let mut driver = TestDriver::new(operator.as_mut(), &runtime);
+    let mut input = chunks.into_iter();
+    let first = input.next().unwrap();
+    let expected_first = int64_rows(std::slice::from_ref(&first));
+    let mut output = driver.input_and_collect(first).unwrap();
+    assert_eq!(
+        int64_rows(&output),
+        expected_first,
+        "the first batch precedes the final snapshot"
+    );
+    between(&subscription);
+    for chunk in input {
+        output.extend(driver.input_and_collect(chunk).unwrap());
+    }
+    driver.signal_eos().unwrap();
+    output.extend(driver.collect_until_finished().unwrap());
+    drop(driver);
+    operator.close().unwrap();
+    assert_eq!(session.subscribed.lock().unwrap().as_slice(), &[contract]);
+    assert!(!subscription.polls.lock().unwrap().is_empty());
+    output
+}
+
+#[test]
+fn compiled_scan_live_membership_changes_only_the_next_batch_and_terminal_passes_through() {
+    let program = scan_with_consumers(1, vec![(live_consumer(7), V0_OUTPUT)]).unwrap();
+    let scan = *program.scan_inputs().keys().next().unwrap();
+    let output = live_batch_outputs(&program, scan, "Scan", input(&program), |subscription| {
+        subscription.publish(&[20])
+    });
+    // Direct scan output is (v0,v1), before the fixture's projection.
+    assert_eq!(
+        int64_rows(&output),
+        vec![
+            vec![Some(1), Some(10)],
+            vec![Some(8), Some(80)],
+            vec![Some(9), Some(90)],
+            vec![Some(20), Some(200)]
+        ]
+    );
+    for terminal in [
+        execution::LiveTerminal::Unavailable(execution::UnavailableReason::ProducerFailed),
+        execution::LiveTerminal::Cancelled,
+        execution::LiveTerminal::CompletedWithoutArtifact,
+    ] {
+        let original = input(&program);
+        let expected = int64_rows(&original);
+        assert_eq!(
+            int64_rows(&live_batch_outputs(
+                &program,
+                scan,
+                "Scan",
+                original,
+                |subscription| subscription.terminate(terminal)
+            )),
+            expected
+        );
+    }
+}
+
+fn probe_batches(program: &Arc<LocalProgram>) -> Vec<Chunk> {
+    let join = join_node(program);
+    let ProgramNodeKind::Join { left_layout, .. } = program.graph().nodes()[join.index()].kind()
+    else {
+        unreachable!()
+    };
+    let schema = crate::exec::chunk::ChunkSchema::from_compiled_layout(left_layout).unwrap();
+    LEFT_ROWS
+        .chunks(4)
+        .map(|rows| {
+            Chunk::try_new_with_chunk_schema(
+                arrow::record_batch::RecordBatch::try_new(
+                    left_layout.schema().clone(),
+                    vec![
+                        Arc::new(arrow::array::Int64Array::from(
+                            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                        )),
+                        Arc::new(arrow::array::Int64Array::from(
+                            rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .unwrap(),
+                schema.clone(),
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn compiled_probe_live_membership_keeps_the_unfiltered_join_result() {
+    let program = join_with_probe_consumers(&single_join(false), vec![live_consumer(7)]).unwrap();
+    let join = join_node(&program);
+    let build_keys = RIGHT_ROWS
+        .iter()
+        .filter_map(|row| row.0)
+        .collect::<Vec<_>>();
+    let output = live_batch_outputs(
+        &program,
+        join,
+        "Join",
+        probe_batches(&program),
+        |subscription| subscription.publish(&build_keys),
+    );
+    let filtered = int64_rows(&output)
+        .into_iter()
+        .map(|row| (row[0], row[1]))
+        .collect::<Vec<_>>();
+    let expected_probe = LEFT_ROWS[..4]
+        .iter()
+        .copied()
+        .chain(
+            LEFT_ROWS[4..]
+                .iter()
+                .copied()
+                .filter(|row| row.0.is_some_and(|key| build_keys.contains(&key))),
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(
+        filtered, expected_probe,
+        "the probe's next batch consumes the final membership"
+    );
+    assert!(
+        filtered.len() < LEFT_ROWS.len(),
+        "the probe fixture actually filters rows"
+    );
+    let expected = sorted(oracle(hash_spec(false), &LEFT_ROWS, &RIGHT_ROWS));
+    assert_eq!(
+        sorted(oracle(hash_spec(false), &filtered, &RIGHT_ROWS)),
+        expected
+    );
+    // The published final snapshot is also installed through the real join builder.
+    let subscription = Arc::new(ControlledLiveSubscription::default());
+    subscription.publish(&build_keys);
+    assert_eq!(
+        run_join(&program, FakeSession::live(subscription)).unwrap(),
+        expected
+    );
+    for terminal in [
+        execution::LiveTerminal::Unavailable(execution::UnavailableReason::ProducerFailed),
+        execution::LiveTerminal::Cancelled,
+        execution::LiveTerminal::CompletedWithoutArtifact,
+    ] {
+        let original = probe_batches(&program);
+        let original_rows = int64_rows(&original);
+        let output = live_batch_outputs(&program, join, "Join", original, |subscription| {
+            subscription.terminate(terminal)
+        });
+        assert_eq!(int64_rows(&output), original_rows);
+        let subscription = Arc::new(ControlledLiveSubscription::default());
+        subscription.terminate(terminal);
+        assert_eq!(
+            run_join(&program, FakeSession::live(subscription)).unwrap(),
+            expected
+        );
+    }
 }

@@ -831,11 +831,7 @@ impl<H> RootCollector<'_, '_, H> {
                     }
                 }
             }
-            ProgramNodeKind::Sort {
-                order_by,
-                partition_exprs,
-                ..
-            } => {
+            ProgramNodeKind::Sort { order_by, mode, .. } => {
                 for (key, value) in order_by.iter().enumerate() {
                     self.node_root(
                         node,
@@ -844,7 +840,7 @@ impl<H> RootCollector<'_, '_, H> {
                         Value,
                     )?;
                 }
-                for (key, value) in partition_exprs.iter().enumerate() {
+                for (key, value) in mode.partition_by().iter().enumerate() {
                     self.node_root(
                         node,
                         Role::SortPartition { key: ordinal(key)? },
