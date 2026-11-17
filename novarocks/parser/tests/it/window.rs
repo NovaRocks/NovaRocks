@@ -285,3 +285,52 @@ fn public_validation_checks_real_pattern_constructor_invariants_inside_window_op
         })
     );
 }
+
+#[test]
+fn inherited_window_name_allows_trivia_before_specification_clauses() {
+    for (source, partition_count, order_count, has_frame) in [
+        ("f(v) OVER (w ORDER BY k)", 0, 1, false),
+        ("f(v) OVER (w ROWS CURRENT ROW)", 0, 0, true),
+        (
+            "f(v) OVER (`w` /* boundary */ PARTITION BY k ORDER BY v ROWS CURRENT ROW)",
+            1,
+            1,
+            true,
+        ),
+    ] {
+        let expr = expression(source);
+        let Expr::FunctionCall(call) = &expr else {
+            panic!("call");
+        };
+        let Window::Specification(spec) = call.window.as_ref().unwrap() else {
+            panic!("inherited specification");
+        };
+        let name = spec.existing_window_name.as_ref().unwrap();
+        assert_eq!(name.value, "w");
+        assert_eq!(name.quoted, source.contains('`'));
+        assert_eq!(
+            &source[name.span.start()..name.span.end()],
+            if name.quoted { "`w`" } else { "w" }
+        );
+        assert_eq!(
+            &source[spec.span.start()..spec.span.end()],
+            source.split_once("OVER ").unwrap().1
+        );
+        assert_eq!(spec.partition_by.len(), partition_count);
+        assert_eq!(
+            spec.order_by.as_ref().map_or(0, |order| order.items.len()),
+            order_count
+        );
+        assert_eq!(spec.window_frame.is_some(), has_frame);
+        if let Some(frame) = &spec.window_frame {
+            assert_eq!(frame.units, WindowFrameUnits::Rows);
+            assert!(matches!(frame.start_bound, WindowFrameBound::CurrentRow(_)));
+            assert!(frame.end_bound.is_none());
+        }
+        let printed = printer::print_expr(&expr);
+        assert!(
+            expr.syntax_eq(&expression(&printed)),
+            "{source} -> {printed}"
+        );
+    }
+}

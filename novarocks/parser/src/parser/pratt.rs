@@ -2003,6 +2003,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         ) && !self.peek_keyword(1, Keyword::By)
         {
             existing_window_name = Some(self.parse_identifier(self.current_span()));
+            self.skip_trivia();
         }
         if self.current_is_keyword(Keyword::Partition) {
             self.advance();

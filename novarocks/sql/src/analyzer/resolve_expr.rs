@@ -8040,6 +8040,46 @@ mod tests {
     }
 
     #[test]
+    fn parenthesized_typeof_arguments_keep_original_child_errors() {
+        for (sql, expected) in [
+            (
+                "SELECT typeof(CAST(only_missing_child AS integer))",
+                "integer",
+            ),
+            ("SELECT typeof(parse_json(only_missing_child))", "json"),
+        ] {
+            let actual =
+                analyze_projection_expr(sql).expect("direct syntax metadata remains opaque");
+            assert_eq!(
+                actual.value_type,
+                novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                "{sql}"
+            );
+            assert!(
+                matches!(actual.kind, ExprKind::Literal(LiteralValue::String(ref value)) if value == expected),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT typeof((CAST(only_missing_child AS integer)))",
+            "SELECT typeof(((CAST(only_missing_child AS integer))))",
+            "SELECT typeof((parse_json(only_missing_child)))",
+        ] {
+            let statements = novarocks_parser::parse(sql).expect("ordinary old source parses");
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("expected query");
+            };
+            let error = super::super::analyze(query, &EmptyCatalog, "default")
+                .expect_err("parentheses retain ordinary child analysis");
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnknownColumn,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn implicit_boolean_or_preserves_successful_null_cast_obligations() {
         for sql in [
             "select 'DHL' || ',' || 'BARIAN'",
