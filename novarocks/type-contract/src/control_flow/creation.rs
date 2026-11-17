@@ -67,6 +67,48 @@ impl<H: std::error::Error + 'static> std::error::Error for ExpressionControlCrea
         }
     }
 }
+/// Reborrow actual caller scopes without creating or duplicating an owner.
+/// A single scope intentionally keeps its original conservative lifetime for
+/// both validation scratch and independently retained graph backing.
+pub(super) enum ControlCreationScopes<'a, H> {
+    Separate {
+        temporary: &'a mut dyn ValueSchemaCreationScope<H>,
+        retained: &'a mut dyn ValueSchemaCreationScope<H>,
+    },
+    Single(&'a mut dyn ValueSchemaCreationScope<H>),
+}
+impl<H> ControlCreationScopes<'_, H> {
+    pub(super) fn retained_storage(&self) -> crate::ValueTypeStorageLifetime {
+        match self {
+            Self::Separate { retained, .. } => retained.storage_lifetime(),
+            Self::Single(scope) => scope.storage_lifetime(),
+        }
+    }
+    pub(super) fn request_retained_layout(&mut self, layout: Layout) -> Result<(), H> {
+        match self {
+            Self::Separate { retained, .. } => retained.request_layout(layout),
+            Self::Single(scope) => scope.request_layout(layout),
+        }
+    }
+    fn request(&mut self, kind: CreationRetentionKind, geometry: Geometry) -> Result<(), H> {
+        let scope = match (self, kind) {
+            (Self::Separate { temporary, .. }, CreationRetentionKind::Temporary) => {
+                &mut **temporary
+            }
+            (Self::Separate { retained, .. }, CreationRetentionKind::Retained) => &mut **retained,
+            (Self::Single(scope), _) => &mut **scope,
+        };
+        match geometry {
+            Geometry::Exact(layout) => scope.request_layout(layout),
+            Geometry::Opaque(facts) => {
+                scope.observe_opaque_upper_bound(facts.allocation_request_bytes_upper_bound)
+            }
+            Geometry::Trim(_) => {
+                unreachable!("actual root trim is admitted at its original conversion slot")
+            }
+        }
+    }
+}
 #[derive(Clone, Copy)]
 enum CreationRetentionKind {
     Temporary,
@@ -196,8 +238,7 @@ pub(super) fn resource_facts<D>(
 pub(super) fn observe<D, H>(
     n: usize,
     u: usize,
-    temporary: &mut dyn ValueSchemaCreationScope<H>,
-    retained: &mut dyn ValueSchemaCreationScope<H>,
+    creation: &mut ControlCreationScopes<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ExpressionControlCreationFailure<H>> {
     // Same complete numeric header before any creator callback.
@@ -211,22 +252,8 @@ pub(super) fn observe<D, H>(
         }
         work.flush()
             .map_err(ExpressionControlCreationFailure::Control)?;
-        fn request<H>(
-            creation: &mut dyn ValueSchemaCreationScope<H>,
-            geometry: Geometry,
-        ) -> Result<(), H> {
-            match geometry {
-                Geometry::Exact(layout) => creation.request_layout(layout),
-                Geometry::Opaque(facts) => {
-                    creation.observe_opaque_upper_bound(facts.allocation_request_bytes_upper_bound)
-                }
-                Geometry::Trim(_) => unreachable!(),
-            }
-        }
-        match role {
-            CreationRetentionKind::Temporary => request(temporary, g),
-            CreationRetentionKind::Retained => request(retained, g),
-        }
-        .map_err(ExpressionControlCreationFailure::Creator)
+        creation
+            .request(role, g)
+            .map_err(ExpressionControlCreationFailure::Creator)
     })
 }

@@ -275,6 +275,32 @@ impl<D: Copy> ExpressionControlFlow<D> {
         retained: &mut dyn crate::ValueSchemaCreationScope<H>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, ExpressionControlCreationFailure<H>> {
+        let mut creation = creation::ControlCreationScopes::Separate {
+            temporary,
+            retained,
+        };
+        Self::try_new_created_in(regions, uses, definitions, &mut creation, work)
+    }
+    /// Construct the same graph using one existing caller scope. Every
+    /// independently cloneable output Arc retains that actual storage; this
+    /// creates no second scope, factory, grant or control entry.
+    pub fn try_new_with_single_creator_in<H>(
+        regions: Vec<ExpressionEvaluationRegion>,
+        uses: Vec<ExpressionInvocation<D>>,
+        definitions: &impl ExpressionDefinitionMembership<D>,
+        creation: &mut dyn crate::ValueSchemaCreationScope<H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ExpressionControlCreationFailure<H>> {
+        let mut creation = creation::ControlCreationScopes::Single(creation);
+        Self::try_new_created_in(regions, uses, definitions, &mut creation, work)
+    }
+    fn try_new_created_in<H>(
+        regions: Vec<ExpressionEvaluationRegion>,
+        uses: Vec<ExpressionInvocation<D>>,
+        definitions: &impl ExpressionDefinitionMembership<D>,
+        creation: &mut creation::ControlCreationScopes<'_, H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ExpressionControlCreationFailure<H>> {
         use ExpressionControlCreationFailure as Failure;
         // Preserve the existing first header law before any admission/traversal.
         if regions.len() > MAX_CONTROL_DEFINITIONS
@@ -285,12 +311,12 @@ impl<D: Copy> ExpressionControlFlow<D> {
         }
         // The sole constructor geometry visitor also supplies the existing
         // cumulative pure model. It quotes no input payload or source bytes.
-        creation::observe::<D, H>(regions.len(), uses.len(), temporary, retained, work)?;
+        creation::observe::<D, H>(regions.len(), uses.len(), creation, work)?;
         let (regions, uses, roots, references) =
             Self::parts_in(regions, uses, definitions, &mut |_| Ok(()), true, work)
                 .map_err(Failure::from)?;
         work.flush().map_err(Failure::Control)?;
-        let storage = retained.storage_lifetime();
+        let storage = creation.retained_storage();
         let regions = Arc::new(ControlFlowOwned {
             value: regions,
             _storage: storage.clone(),
@@ -304,8 +330,8 @@ impl<D: Copy> ExpressionControlFlow<D> {
         work.step().map_err(Failure::Control)?;
         work.flush().map_err(Failure::Control)?;
         if roots.capacity() != roots.len() && !roots.is_empty() {
-            retained
-                .request_layout(
+            creation
+                .request_retained_layout(
                     std::alloc::Layout::array::<ExpressionUseId>(roots.len()).map_err(|_| {
                         Failure::Resource(
                             crate::owned_resources::layout::LayoutResourceError::Arithmetic,
