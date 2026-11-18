@@ -35,7 +35,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use novarocks_proto_codec::connector_write::ConnectorWriteFragmentDecoder;
+use novarocks_proto_codec::connector_write::{
+    ConnectorWriteFragmentDecoder, ConnectorWriteHandleEncoder,
+};
 use novarocks_proto_models::connector_write as write_dto;
 use novarocks_spi::connector::write_stack::{
     ConnectorWriteBeginRequest, ConnectorWriteFinishPublication, ConnectorWriteQueryIdentity,

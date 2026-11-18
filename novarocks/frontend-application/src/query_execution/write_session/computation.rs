@@ -56,7 +56,7 @@ pub(crate) struct SessionDecodedWriteSegment {
     #[cfg(test)]
     local_targets: Arc<[WriteTargetOrdinal]>,
     delete_verification: Option<DeleteVerificationCounts>,
-    statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
+    statistics: Vec<WriteStatisticsArtifact>,
     retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
 }
 
