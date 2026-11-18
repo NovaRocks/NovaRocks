@@ -180,6 +180,9 @@ async fn live_data_for_test(
 }
 
 #[cfg(test)]
+pub(in crate::commit) use keyed_publication_trace_tests::keyed_session_tests::assert_compact_keyed_unknown_retains_artifacts;
+
+#[cfg(test)]
 mod keyed_publication_trace_tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -811,6 +814,3 @@ mod keyed_publication_trace_tests {
         include!("run/tests.rs");
     }
 }
-
-#[cfg(test)]
-pub(in crate::commit) use keyed_publication_trace_tests::keyed_session_tests::assert_compact_keyed_unknown_retains_artifacts;
