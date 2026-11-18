@@ -252,6 +252,80 @@ async fn real_like_capture_survives_borrowed_wait_drop_and_projects_on_original_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn like_columns_and_create_publish_with_one_original_metadata_admission() {
+    let mut fixture = Fixture::new_with_provider_setup(seed_source);
+    let mut read = original_read(&fixture);
+    let metadata = tokio::time::timeout(
+        WAIT,
+        poll_fn(|cx| {
+            drive(&mut fixture.driver);
+            let result = poll_read(&mut fixture, &mut read, cx);
+            drive(&mut fixture.driver);
+            if result.is_pending() {
+                cx.waker().wake_by_ref();
+            }
+            result
+        }),
+    )
+    .await
+    .expect("source metadata must actually exit")
+    .unwrap();
+    let io = read
+        .take_completed_io()
+        .expect("one original positive I/O Source");
+    let original_io = Arc::downgrade(&io);
+    assert!(read.take_completed_io().is_none());
+    drop(read);
+    let columns = tokio::time::timeout(
+        WAIT,
+        fixture
+            .planning
+            .as_ref()
+            .unwrap()
+            .like_columns(LikeColumnsCpuInput {
+                metadata,
+                control: SqlCompileControl::unbounded(),
+            }),
+    )
+    .await
+    .expect("the original planning CPU must actually exit")
+    .unwrap()
+    .unwrap();
+    let (mut action, operation_id) = fixture
+        .action_for(
+            "CREATE TABLE ice.atomic.events LIKE ice.atomic.like_source",
+            Some(columns),
+            Some(io),
+        )
+        .await;
+    assert!(matches!(
+        fixture.finish_action(&mut action).await.unwrap(),
+        StatementActionValue::Ok(StatementCommandCompletion::Empty)
+    ));
+    {
+        let original = original_io
+            .upgrade()
+            .expect("same I/O Source is still retained");
+        let target = action.source.as_ref().unwrap().io.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&original, target));
+    }
+    let metadata = committed_metadata(&action, operation_id);
+    let schema = metadata.current_schema();
+    let fields = schema.as_struct().fields();
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "narrow", "bytes", "items"]
+    );
+    assert!(fields[0].required);
+    assert!(fields[0].write_default.is_none());
+    fixture.close(action, false).await;
+    assert!(original_io.upgrade().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_like_capture_settles_original_cpu_and_io_after_root_cancellation() {
     let mut fixture = Fixture::new_with_provider_setup(seed_source);
     let mut read = original_read(&fixture);

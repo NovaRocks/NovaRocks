@@ -725,6 +725,18 @@ impl MetadataIoAdmission {
         }
         None
     }
+    pub(crate) fn check_original_positive_owner(&self, owner: &WorkOwner) -> Result<(), WorkError> {
+        let original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let body = original.body.as_ref().ok_or(WorkError::Released)?;
+        if !owner.is_for_scope(&body.root) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        if !body.first_ready || body.payload.is_none() {
+            return Err(WorkError::NotReady);
+        }
+        Ok(())
+    }
+
     pub(crate) fn poll_progress(
         &self,
         owner: &WorkOwner,

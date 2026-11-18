@@ -23,7 +23,7 @@ use crate::query::{
 };
 use crate::query_execution::{
     completion_facts::FrontendPlanningCpuSource,
-    internal_consumer::domain_cpu::root_action_tests::{bind, drive, root_control},
+    internal_consumer::domain_cpu::root_action_tests::{drive, root_control},
     internal_result_cpu::InternalResultCpuOwner,
 };
 use crate::task_execution::blocking_io::tests::{OriginalExecutorsFixture, original_executors};
@@ -183,7 +183,7 @@ impl Fixture {
         let metadata_weak = Arc::downgrade(planning_pin.binding().metadata());
         drop(planning_pin);
         let mut creator = InternalResultCpuOwner::try_new_for_test().unwrap();
-        let (control, _handle, mut driver) = root_control(&mut creator);
+        let (control, _handle, driver) = root_control(&mut creator);
         let (root, window) = control
             .root_admission()
             .try_begin_root_with_result(
@@ -192,7 +192,10 @@ impl Fixture {
             )
             .unwrap();
         let scope = root.owner.scope();
-        bind(&scope, &mut driver);
+        assert!(matches!(
+            creator.runtime().provider_creator_source(&scope),
+            Err(WorkError::Conflict)
+        ));
         let cancellation = scope.cancellation().unwrap();
         let query_cancellation = QueryCancellationView::governed(cancellation.clone(), None);
         let connector_context = crate::connector::connector_request_context_for_query_on_runtime(
@@ -237,6 +240,15 @@ impl Fixture {
         }
     }
     async fn action(&mut self) -> (Action, ConnectorMutationOperationId) {
+        self.action_for(DDL, None, None).await
+    }
+
+    async fn action_for(
+        &mut self,
+        ddl: &str,
+        like_columns: Option<Vec<novarocks_sql::semantic::TableColumnDef>>,
+        continued_io: Option<Arc<MetadataIoAdmission>>,
+    ) -> (Action, ConnectorMutationOperationId) {
         let planning_pin = self.host.acquire_current(&self.key.instance_id).unwrap();
         assert_eq!(planning_pin.binding().incarnation(), self.key.incarnation);
         let binding = CatalogTablePropertyBinding::try_new(
@@ -248,7 +260,7 @@ impl Fixture {
             planning_pin,
         )
         .unwrap();
-        let statement = novarocks_query_application::sql::parse_single_statement(DDL).unwrap();
+        let statement = novarocks_query_application::sql::parse_single_statement(ddl).unwrap();
         let novarocks_parser::ast::Statement::Table(novarocks_parser::ast::TableStatement::Create(
             statement,
         )) = statement
@@ -260,7 +272,7 @@ impl Fixture {
             first_thread: Mutex::new(None),
         });
         let input=TablePropertyCpuInput {
-            source:Arc::from(DDL),statement,binding,command:self.command.as_ref().unwrap().clone(),like_columns:None,
+            source:Arc::from(ddl),statement,binding,command:self.command.as_ref().unwrap().clone(),like_columns,
             context:PropertyCpuContext {
                 current_database:"atomic".into(),sql_semantics:Default::default(),
                 interpreter:Arc::new(crate::query_execution::required_constant_eval::test_required_constant_interpreter()),
@@ -305,6 +317,7 @@ impl Fixture {
         assert_eq!(prepared.original_request.target, self.key);
         let action = prepare_owned(
             prepared,
+            continued_io,
             self.command.as_ref().unwrap().clone(),
             self.creator.runtime(),
             self.query_cancellation.clone(),
@@ -446,10 +459,11 @@ fn assert_actual_closed(action: &Action) {
     assert!(source.reconcile.closed());
     assert!(source.health().is_none());
     let mut cx = Context::from_waker(Waker::noop());
-    assert!(matches!(
-        source.metadata_cpu.as_ref().unwrap().poll_closed(&mut cx),
-        Poll::Ready(Ok(()))
-    ));
+    if let Some(cpu) = source.metadata_cpu.as_ref() {
+        assert!(matches!(cpu.poll_closed(&mut cx), Poll::Ready(Ok(()))));
+    } else {
+        assert!(!source.execute.started);
+    }
     let io = source.io.as_ref().unwrap();
     if matches!(io.root_capacity(), Err(WorkError::Released)) {
         // The same admission already recorded its withdrawal. Reobserving

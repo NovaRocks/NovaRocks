@@ -219,7 +219,6 @@ impl Call {
 struct Source {
     pending: Option<PreparedTableMutationInput>,
     input: Option<Arc<Input>>,
-    execute_request: Option<ConnectorCatalogMutationRequest>,
     command: CommandContext,
     window: ResultWindowAlias,
     cpu: InternalResultCpu,
@@ -228,6 +227,7 @@ struct Source {
     wake: Arc<Wake>,
     io: Option<Arc<MetadataIoAdmission>>,
     metadata_cpu: Option<Arc<dyn ProviderMetadataCpuPort>>,
+    setup_attempted: bool,
     bootstrap_ready: bool,
     execute: Call,
     reconcile: Call,
@@ -283,9 +283,10 @@ impl Source {
         self.before_call_failure.get_or_insert(error);
     }
     fn setup(&mut self, owner: &mut GovernedActionContext<'_>) {
-        if self.io.is_some() || self.before_call_failure.is_some() {
+        if self.setup_attempted || self.before_call_failure.is_some() {
             return;
         }
+        self.setup_attempted = true;
         let result = (|| {
             let pending = self.pending.as_ref().expect("one original table input");
             let dependencies = pending
@@ -300,9 +301,30 @@ impl Source {
             if !original.is_for_scope(self.command.scope()) {
                 return Err(work_command(WorkError::Conflict));
             }
-            let io = MetadataIoAdmission::for_original_source(original, dependencies)
-                .map_err(work_command)?;
-            self.io = Some(io);
+            if let Some(io) = self.io.as_ref() {
+                io.check_original_positive_owner(original)
+                    .map_err(work_command)?;
+                // The original LIKE Source already activated this Root.
+                // The Provider extends that admission when routing each
+                // actual target request.
+                self.bootstrap_ready = true;
+            } else {
+                self.io = Some(
+                    MetadataIoAdmission::for_original_source(original, dependencies)
+                        .map_err(work_command)?,
+                );
+            }
+            Ok::<_, CommandError>(())
+        })();
+        if let Err(error) = result {
+            self.fail_before_call(product_command_service_error(error));
+        }
+    }
+    fn start_execute(&mut self) {
+        // The actual bootstrap installs the original Root's dependencies.
+        // Authenticate the CPU author only after that paid phase is ready.
+        let result = (|| {
+            let pending = self.pending.as_ref().expect("one original table input");
             let port = self
                 .cpu
                 .planning_metadata_cpu_port(
@@ -331,11 +353,12 @@ impl Source {
                 .with_metadata_cpu(port);
             original_request.context = context.clone();
             execute_request.context = context;
-            self.input = Some(Arc::new(Input {
+            let input = Arc::new(Input {
                 binding,
                 request: original_request,
-            }));
-            self.execute_request = Some(execute_request);
+            });
+            self.input = Some(input.clone());
+            self.execute.start_execute(input, execute_request);
             Ok::<_, CommandError>(())
         })();
         if let Err(error) = result {
@@ -557,13 +580,7 @@ impl GovernedStatementAction for Action {
         source.progress_io(owner, cx);
         if source.bootstrap_ready && source.before_call_failure.is_none() && !source.execute.started
         {
-            source.execute.start_execute(
-                source.input.as_ref().unwrap().clone(),
-                source
-                    .execute_request
-                    .take()
-                    .expect("one CPU-prepared execute request"),
-            );
+            source.start_execute();
         }
         source.execute.poll(cx);
         source.select();
@@ -636,17 +653,19 @@ fn work_service(error: WorkError) -> QueryServiceError {
 /// it constructs no parser AST, generation, Root or result window.
 pub(crate) fn prepare(
     prepared: PreparedTableMutationInput,
+    continued_io: Option<Arc<MetadataIoAdmission>>,
     command: CommandContext,
     cpu: InternalResultCpu,
     cancellation: QueryCancellationView,
     runtime: tokio::runtime::Handle,
 ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
-    prepare_owned(prepared, command, cpu, cancellation, runtime)
+    prepare_owned(prepared, continued_io, command, cpu, cancellation, runtime)
         .map(|action| Box::new(action) as Box<dyn GovernedStatementAction>)
 }
 
 fn prepare_owned(
     prepared: PreparedTableMutationInput,
+    continued_io: Option<Arc<MetadataIoAdmission>>,
     command: CommandContext,
     cpu: InternalResultCpu,
     cancellation: QueryCancellationView,
@@ -662,15 +681,15 @@ fn prepare_owned(
         source: Some(Box::new(Source {
             pending: Some(prepared),
             input: None,
-            execute_request: None,
             command,
             window,
             cpu,
             cancellation,
             runtime,
             wake: Arc::new(Wake::default()),
-            io: None,
+            io: continued_io,
             metadata_cpu: None,
+            setup_attempted: false,
             bootstrap_ready: false,
             execute: Call::default(),
             reconcile: Call::default(),

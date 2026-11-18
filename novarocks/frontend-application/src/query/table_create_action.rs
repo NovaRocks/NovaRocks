@@ -109,6 +109,9 @@ impl Tail {
         if let Some(read) = self.read.as_mut() {
             std::task::ready!(read.poll_close(cx));
         }
+        self.poll_cpu_closed(cx)
+    }
+    fn poll_cpu_closed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         std::task::ready!(self.poll_turn(cx));
         match self.cpu.poll_closed(cx) {
             Poll::Pending => Poll::Pending,
@@ -268,13 +271,23 @@ impl Action {
                 }
                 Phase::Properties => {
                     let tail = self.tail.as_mut().expect("same table residual");
-                    std::task::ready!(tail.poll_preparation_closed(cx));
+                    std::task::ready!(tail.poll_cpu_closed(cx));
                     let prepared = tail.prepared.take().expect("original table CPU response")?;
                     let Prepared::Table(prepared) = prepared else {
                         unreachable!("same finite table CPU case")
                     };
+                    let continued_io = tail
+                        .read
+                        .as_mut()
+                        .map(|read| {
+                            read.take_completed_io().ok_or_else(|| {
+                                internal_error("LIKE read lost its original I/O continuation")
+                            })
+                        })
+                        .transpose()?;
                     let inner = table_mutation_action::prepare(
                         prepared,
+                        continued_io,
                         self.command.take().expect("one original table command"),
                         self.cpu.clone(),
                         self.cancellation.clone(),

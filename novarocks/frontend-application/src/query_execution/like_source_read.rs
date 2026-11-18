@@ -99,6 +99,7 @@ pub(crate) struct LikeSourceRead {
     capture: Arc<MetadataCapture>,
     call: Call,
     io: Option<Arc<MetadataIoAdmission>>,
+    completed_io: Option<Arc<MetadataIoAdmission>>,
     port: Option<Arc<dyn ProviderMetadataCpuPort>>,
     setup_attempted: bool,
     bootstrap_ready: bool,
@@ -147,6 +148,7 @@ impl LikeSourceRead {
             ),
             call: Call::default(),
             io: None,
+            completed_io: None,
             port: None,
             setup_attempted: false,
             bootstrap_ready: false,
@@ -216,19 +218,6 @@ impl LikeSourceRead {
             self.io = Some(
                 MetadataIoAdmission::for_original_source(original, dependencies).map_err(work)?,
             );
-            let port = self
-                .cpu
-                .planning_metadata_cpu_port(
-                    self.command.scope(),
-                    self.window.clone(),
-                    self.binding.planning(),
-                    self.cancellation.clone(),
-                    self.runtime.clone(),
-                    self.wake.clone(),
-                )
-                .map_err(work)?;
-            self.port = Some(port);
-            self.port_created = true;
             Ok(())
         })();
         if let Err(error) = result {
@@ -269,6 +258,21 @@ impl LikeSourceRead {
             return;
         }
         let result = (|| {
+            // The provider CPU author needs the positive Root domains
+            // installed by this I/O Source's first actual grant.
+            let port = self
+                .cpu
+                .planning_metadata_cpu_port(
+                    self.command.scope(),
+                    self.window.clone(),
+                    self.binding.planning(),
+                    self.cancellation.clone(),
+                    self.runtime.clone(),
+                    self.wake.clone(),
+                )
+                .map_err(work)?;
+            self.port = Some(port.clone());
+            self.port_created = true;
             let context = context_for_planning_pin_typed(
                 self.binding.planning(),
                 self.command.connector_context().clone(),
@@ -288,11 +292,6 @@ impl LikeSourceRead {
             };
             let original = self.capture.clone();
             let planning = self.binding.planning().clone();
-            let port = self
-                .port
-                .as_ref()
-                .expect("same source metadata CPU port")
-                .clone();
             self.call.future = Some(Box::pin(async move {
                 original.capture_with_port(&planning, port, request).await
             }));
@@ -353,8 +352,23 @@ impl LikeSourceRead {
             .result
             .take()
             .expect("actual LIKE capture result precedes handoff");
-        Poll::Ready(result.map(|binding| binding.metadata).map_err(connector))
+        match result {
+            Ok(binding) => {
+                // Capture, CPU and current I/O requests have actually exited.
+                // Keep the positive Root payload for the caller's next phase.
+                self.completed_io = Some(self.io.take().expect("same positive LIKE I/O Source"));
+                Poll::Ready(Ok(binding.metadata))
+            }
+            Err(error) => Poll::Ready(Err(connector(error))),
+        }
     }
+
+    /// Transfer the same positive I/O Source once after successful read delivery.
+    /// No request from this read remains active in it.
+    pub(crate) fn take_completed_io(&mut self) -> Option<Arc<MetadataIoAdmission>> {
+        self.completed_io.take()
+    }
+
     /// Continue the same existing sources even after the borrowed read waiter
     /// is cancelled. Closing never starts a new capture or supplies a new Root.
     pub(crate) fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<()> {
