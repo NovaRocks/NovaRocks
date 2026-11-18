@@ -589,7 +589,7 @@ mod tests {
             parser.parse_row_pattern(),
             Err(GrammarError::Construction(_))
         ));
-        for source in ["A{}", "PERMUTE()", "A{1,,2}"] {
+        for source in ["A{}", "PERMUTE(, A)", "A{1,,2}"] {
             let mut parser = Parser::new(source).unwrap();
             assert!(
                 matches!(parser.parse_row_pattern(), Err(GrammarError::Syntax(_))),
