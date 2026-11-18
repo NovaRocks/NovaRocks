@@ -218,7 +218,7 @@ group by t1.c0
 ),
 cte1 as(
 select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
-from cte0 CROSS JOIN t0 on t0.c0 = cte0.c0
+from cte0 INNER JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
@@ -237,7 +237,7 @@ group by t1.c0
 ),
 cte1 as(
 select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
-from cte0 CROSS JOIN t0 on t0.c0 = cte0.c0
+from cte0 INNER JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
