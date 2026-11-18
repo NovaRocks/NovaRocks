@@ -42,8 +42,9 @@ use novarocks_query_application::{
 };
 use novarocks_result_contract::ClientPresentationFamily;
 use novarocks_spi::connector::{
-    ConnectorColumnPosition, ConnectorControlPlanningPin, ConnectorInstanceId,
-    ConnectorPropertyChange, ConnectorRequestContext, ConnectorSchemaChange, DdlPropertyValue,
+    ConnectorColumnPosition, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceId, ConnectorPropertyChange, ConnectorRequestContext, ConnectorSchemaChange,
+    DdlPropertyValue,
 };
 use novarocks_table_maintenance::MaintenanceTarget;
 use novarocks_type_contract::PureCompileControl;
@@ -154,6 +155,18 @@ impl MaintenanceCommandExecutor {
             bound,
             statement_started_at,
             &control,
+            |keys, if_exists| {
+                planning
+                    .binding()
+                    .mutation()
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::Unsupported,
+                            "table procedure requires this catalog generation's mutation capability",
+                        )
+                    })?
+                    .prepare_extra_property_unsets(keys, if_exists)
+            },
         )
         .map_err(crate::query::procedure_command_error)?;
 
@@ -393,6 +406,7 @@ fn project_property_unsets(
     span: Span,
     bound: BoundTableProcedure<'_>,
     control: &dyn PureCompileControl,
+    prepare: impl FnOnce(&[String], bool) -> Result<Vec<ConnectorPropertyChange>, ConnectorError>,
 ) -> Result<Vec<ConnectorPropertyChange>, QueryServiceError> {
     let mut arguments = bound.into_arguments();
     let Some((
@@ -451,8 +465,15 @@ fn project_property_unsets(
             ));
         }
     };
-    novarocks_connector_iceberg::table_properties::extra_property_unsets(&non_null_keys, if_exists)
-        .map_err(|error| invalid_procedure_argument(source, key_span, error.to_string()))
+    prepare(&non_null_keys, if_exists).map_err(|error| {
+        if error.kind() == ConnectorErrorKind::InvalidRequest {
+            invalid_procedure_argument(source, key_span, error.to_string())
+        } else {
+            QueryServiceError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(error),
+            )
+        }
+    })
 }
 
 fn project_bound(
@@ -461,6 +482,7 @@ fn project_bound(
     bound: BoundTableProcedure<'_>,
     statement_started_at: SystemTime,
     control: &dyn PureCompileControl,
+    prepare_unsets: impl FnOnce(&[String], bool) -> Result<Vec<ConnectorPropertyChange>, ConnectorError>,
 ) -> Result<Procedure, QueryServiceError> {
     let kind = bound.declaration().kind();
     match kind {
@@ -503,7 +525,7 @@ fn project_bound(
                 .map(Procedure::CatalogMutation);
         }
         TableProcedureKind::UnsetExtraProperties => {
-            return project_property_unsets(source, span, bound, control)
+            return project_property_unsets(source, span, bound, control, prepare_unsets)
                 .map(IcebergTableMutation::UnsetProperties)
                 .map(Procedure::CatalogMutation);
         }
@@ -769,6 +791,7 @@ mod tests {
             bound,
             statement_started_at,
             &control,
+            novarocks_connector_iceberg::table_properties::extra_property_unsets,
         )
     }
 
@@ -866,9 +889,19 @@ mod tests {
                 "ALTER TABLE t EXECUTE unset_extra_properties(ARRAY['custom.key', 'CUSTOM.KEY'])",
                 "duplicate normalized extra property",
             ),
+            (
+                "ALTER TABLE t EXECUTE unset_extra_properties(ARRAY['gc.enabled'], true)",
+                "has a dedicated declared property",
+            ),
         ] {
             let error = project(sql).unwrap_err();
             assert!(error.to_string().contains(message), "{error}");
+            let diagnostic = error.user_error().unwrap();
+            assert_eq!(
+                diagnostic.code().as_str(),
+                "sql.admit.invalid_table_procedure_argument",
+            );
+            assert!(diagnostic.location().is_some());
         }
     }
 

@@ -155,6 +155,14 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         crate::table_properties::check_table_property_name(canonical_name)
     }
 
+    fn prepare_extra_property_unsets(
+        &self,
+        keys: &[String],
+        if_exists: bool,
+    ) -> Result<Vec<ConnectorPropertyChange>, ConnectorError> {
+        crate::table_properties::extra_property_unsets(keys, if_exists)
+    }
+
     fn admit(&self, request: &ConnectorCatalogMutationRequest) -> Result<(), ConnectorError> {
         validate_request(self, request)?;
         self.runtime()

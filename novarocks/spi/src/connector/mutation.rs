@@ -1172,6 +1172,20 @@ pub trait ConnectorCatalogMutation: Send + Sync {
             "connector catalog mutation has no table property name policy",
         ))
     }
+    /// Prepare the exact requested extra-property removals using the original
+    /// generation's key policy. This is pure preparation. Missing-key checks
+    /// against table state and mutation admission still belong to execution.
+    fn prepare_extra_property_unsets(
+        &self,
+        _keys: &[String],
+        _if_exists: bool,
+    ) -> Result<Vec<ConnectorPropertyChange>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector catalog mutation has no extra-property unset preparation",
+        ))
+    }
+
     /// Admit a complete mutation before a consumer decomposes it into reads
     /// and child mutations. This method must perform no external side effect.
     /// Execution must repeat admission; this answer is not a reusable permit.
