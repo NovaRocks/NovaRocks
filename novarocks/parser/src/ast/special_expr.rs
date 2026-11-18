@@ -593,6 +593,17 @@ impl GroupingOperation {
 mod tests;
 
 impl GroupingOperation {
+    /// The legacy parser can move an original leaf when the pinned name
+    /// construction would preserve its value and delimiter fact.
+    pub(crate) fn legacy_identifier_is_canonical(part: &Ident) -> bool {
+        let value = &part.value;
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| (byte.is_ascii_graphic() || byte == b' ') && !byte.is_ascii_uppercase())
+            && part.quoted != grouping_identifier_is_unquoted(value)
+    }
+
     /// Apply this node's QualifiedName-to-expression canonical construction.
     /// This is not the general ObjectName parser or name-resolution policy.
     pub fn new(
@@ -631,13 +642,19 @@ fn grouping_identifier(part: Ident) -> Result<Ident, SpecialExpressionInvariantE
     if value.is_empty() {
         return Err(SpecialExpressionInvariantError::InvalidGroupingColumn);
     }
-    let valid = value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        && !value.as_bytes()[0].is_ascii_digit();
     Ok(Ident {
+        quoted: !grouping_identifier_is_unquoted(&value),
         value,
-        quoted: !valid,
         span: crate::SYNTHETIC,
     })
+}
+
+fn grouping_identifier_is_unquoted(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| !byte.is_ascii_digit())
 }

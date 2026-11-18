@@ -733,7 +733,7 @@ ORDER BY k;
 -- query 75
 -- Inline VALUES FULL OUTER + aggregation
 -- @order_sensitive=true
-SELECT k, COUNT(*) as cnt, COUNT(v1) as cnt_v1, COUNT(v2) as cnt_v2
+SELECT k, COUNT() as cnt, COUNT(v1) as cnt_v1, COUNT(v2) as cnt_v2
 FROM
     (VALUES (1, 'a'), (1, 'aa'), (2, 'b')) AS t(k, v1) FULL OUTER JOIN
     (VALUES (1, 'x'), (3, 'y')) AS u(k, v2) USING (k)

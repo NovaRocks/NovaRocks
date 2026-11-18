@@ -36,9 +36,9 @@ GROUP BY ROLLUP(a)
 ORDER BY g, a NULLS FIRST;
 
 -- query 3
-SELECT GROUPING(a + 1) AS g, a + 1 AS k, sum(a + 1) AS total
-FROM ${case_db}.t_grouping_input
-GROUP BY ROLLUP(a + 1)
+SELECT GROUPING(k) AS g, k AS k, sum(k) AS total
+FROM (SELECT a + 1 AS k FROM ${case_db}.t_grouping_input) AS s
+GROUP BY ROLLUP(k)
 ORDER BY g, k NULLS FIRST;
 
 -- query 4

@@ -1808,17 +1808,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.advance();
         let mut arguments = Vec::new();
         self.skip_trivia();
-        let distinct = if self.current_is_keyword(Keyword::Distinct) {
+        let distinct = self.current_is_keyword(Keyword::Distinct);
+        let has_quantifier = distinct || self.current_is_word("ALL");
+        if has_quantifier {
             self.advance();
             self.skip_trivia();
-            true
-        } else {
-            if self.current_is_word("ALL") {
-                self.advance();
-                self.skip_trivia();
-            }
-            false
-        };
+        }
         let allow_named_arguments =
             self.allow_table_function_named_arguments && self.function_call_depth == 0;
         self.function_call_depth += 1;
@@ -2098,6 +2093,35 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             };
             return Ok(ParsedExpression::authored(
                 expression,
+                self.syntax_extent(begin),
+                call_span,
+            ));
+        }
+        // The standard operation accepts names. Keep the old function form
+        // for computed inputs and any syntax whose call facts would be lost.
+        if !self.allow_table_function_named_arguments
+            && matches!(name.parts.as_slice(), [part]
+                if !part.quoted && part.value.eq_ignore_ascii_case("grouping"))
+            && !has_quantifier
+            && order_by.is_none()
+            && separator.is_none()
+            && filter.is_none()
+            && null_treatment.is_none()
+            && window.is_none()
+            && !arguments.is_empty()
+            && arguments.iter().all(|argument| {
+                matches!(&argument.expression, Expr::Identifier(part)
+                    if crate::ast::GroupingOperation::legacy_identifier_is_canonical(part))
+            })
+        {
+            return Ok(ParsedExpression::authored(
+                Expr::GroupingOperation(AstBox::new(crate::ast::GroupingOperation {
+                    grouping_columns: arguments
+                        .into_iter()
+                        .map(|argument| argument.expression)
+                        .collect(),
+                    span: call_span,
+                })),
                 self.syntax_extent(begin),
                 call_span,
             ));
@@ -3114,6 +3138,103 @@ mod tests {
             .parse()
             .unwrap();
         assert!(matches!(expression, crate::ast::Expr::FunctionCall(_)));
+    }
+
+    #[test]
+    fn plain_grouping_moves_ordered_column_occurrences_into_the_core_operation() {
+        use crate::{
+            Span,
+            ast::{Expr, syntax_eq_expr},
+        };
+
+        let source = "GROUPING(a, b, a)";
+        let old_expression = parse_expression(source, &lex(source).unwrap()).unwrap();
+        let Expr::GroupingOperation(node) = &old_expression else {
+            panic!("expected the standard GROUPING operation");
+        };
+        assert_eq!(node.span, Span::new(0, source.len()));
+        assert_eq!(node.grouping_columns.len(), 3);
+        for (argument, (name, start)) in
+            node.grouping_columns
+                .iter()
+                .zip([("a", 9), ("b", 12), ("a", 15)])
+        {
+            assert!(matches!(argument, Expr::Identifier(ident)
+                if ident.value == name && !ident.quoted && ident.span == Span::new(start, start + 1)));
+        }
+        let new_expression = crate::trino_parser::parse_expression(source).unwrap();
+        assert!(syntax_eq_expr(&old_expression, &new_expression));
+    }
+
+    #[test]
+    fn grouping_moves_only_identifiers_unchanged_by_canonical_construction() {
+        use crate::{
+            Span,
+            ast::{Expr, syntax_eq_expr},
+        };
+        let legacy = "GROUPING(`sum(a)`)";
+        let original = parse_expression(legacy, &lex(legacy).unwrap()).unwrap();
+        let target = crate::trino_parser::parse_expression("GROUPING(\"sum(a)\")").unwrap();
+        let Expr::GroupingOperation(node) = &original else {
+            panic!("canonical quoted punctuation must keep the GROUPING operation");
+        };
+        assert!(
+            matches!(node.grouping_columns.as_slice(), [Expr::Identifier(part)]
+            if part.value == "sum(a)" && part.quoted && part.span == Span::new(9, 17))
+        );
+        assert!(syntax_eq_expr(&original, &target));
+
+        let legacy = "GROUPING(`a`)";
+        let original = parse_expression(legacy, &lex(legacy).unwrap()).unwrap();
+        assert!(matches!(original, Expr::FunctionCall(_)));
+        let Expr::GroupingOperation(canonical) =
+            crate::trino_parser::parse_expression("GROUPING(\"a\")").unwrap()
+        else {
+            panic!("expected the pinned GROUPING operation");
+        };
+        assert!(
+            matches!(canonical.grouping_columns.as_slice(), [Expr::Identifier(part)]
+            if part.value == "a" && !part.quoted)
+        );
+    }
+
+    #[test]
+    fn grouping_extensions_and_table_function_grammar_keep_the_actual_call() {
+        use crate::ast::Expr;
+
+        for source in [
+            "grouping(a + 1)",
+            "grouping()",
+            "grouping(ALL a)",
+            "grouping(DISTINCT a)",
+            "grouping(a ORDER BY b)",
+            "grouping(a) FILTER (WHERE TRUE)",
+            "grouping(a) OVER (PARTITION BY b)",
+            "grouping(A)",
+            "grouping(`a`)",
+            "grouping(`Sum(a)`)",
+            "grouping(t.a)",
+            "grouping_id(a)",
+            "`grouping`(a)",
+            "ns.grouping(a)",
+        ] {
+            assert!(
+                matches!(
+                    parse_expression(source, &lex(source).unwrap()).unwrap(),
+                    Expr::FunctionCall(_)
+                ),
+                "{source}"
+            );
+        }
+        let source = "grouping(a)";
+        let tokens = lex(source).unwrap();
+        assert!(matches!(
+            super::PrattParser::new(source, &tokens)
+                .with_table_function_named_arguments()
+                .parse()
+                .unwrap(),
+            Expr::FunctionCall(_)
+        ));
     }
 
     #[test]

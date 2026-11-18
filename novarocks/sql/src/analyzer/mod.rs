@@ -3684,35 +3684,26 @@ mod tests {
 
     #[test]
     fn dedicated_grouping_reuses_original_repeat_and_public_type_author() {
-        let mut query = parse_native_query(
+        let query = parse_native_query(
             "SELECT grouping(k), count(*) FROM (VALUES (1),(2)) t(k) GROUP BY ROLLUP(k)",
         )
         .unwrap();
-        let original = parse_and_analyze(
-            "SELECT grouping(k), count(*) FROM (VALUES (1),(2)) t(k) GROUP BY ROLLUP(k)",
-        )
-        .unwrap();
-        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+        let mut legacy = query.clone();
+        let ast::SetExpr::Select(select) = legacy.body.as_mut() else {
             panic!("select")
         };
         let ast::SelectItem::SingleColumn(column) = &mut select.projection[0] else {
             panic!("column")
         };
-        let expression =
-            std::mem::replace(&mut column.expression, novarocks_parser::build::integer(0));
-        let ast::Expr::FunctionCall(call) = expression else {
-            panic!("original call")
+        let ast::Expr::GroupingOperation(node) = &column.expression else {
+            panic!("dedicated grouping")
         };
-        let call = call.into_inner();
-        column.expression =
-            ast::Expr::GroupingOperation(ast::AstBox::new(ast::GroupingOperation {
-                grouping_columns: call
-                    .arguments
-                    .into_iter()
-                    .map(|argument| argument.value)
-                    .collect(),
-                span: call.span,
-            }));
+        let name = novarocks_parser::build::object_name(vec![novarocks_parser::build::ident(
+            "grouping", false,
+        )])
+        .unwrap();
+        column.expression = novarocks_parser::build::function(name, node.grouping_columns.to_vec());
+        let (original, _, _) = super::analyze(&legacy, &TestCatalog, "default").unwrap();
         let (actual, _, _) = super::analyze(&query, &TestCatalog, "default").unwrap();
         let QueryBody::Select(expected) = original.body else {
             panic!("select")

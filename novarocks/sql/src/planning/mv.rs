@@ -3362,7 +3362,10 @@ fn expr_contains_aggregate_function(expr: &Expr) -> bool {
         Expr::JsonQuery(node) => {
             expr_contains_aggregate_function(&node.path_invocation.input_expression)
         }
-        Expr::GroupingOperation(_) => true,
+        Expr::GroupingOperation(node) => node
+            .grouping_columns
+            .iter()
+            .any(expr_contains_aggregate_function),
         Expr::Trim(node) => {
             expr_contains_aggregate_function(&node.trim_source)
                 || node

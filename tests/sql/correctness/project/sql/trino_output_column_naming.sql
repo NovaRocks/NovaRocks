@@ -41,7 +41,7 @@ SELECT (x) FROM (VALUES (CAST(1 AS integer))) AS t (x);
 SELECT CAST(x AS bigint) FROM (VALUES (CAST(1 AS integer))) AS t (x);
 
 -- query 8
-SELECT count(*), sum(x) FROM (VALUES (CAST(1 AS integer))) AS t (x);
+SELECT count(), sum(x) FROM (VALUES (CAST(1 AS integer))) AS t (x);
 
 -- query 9
 SELECT row_number() OVER (ORDER BY x) FROM (VALUES (CAST(1 AS integer))) AS t (x);

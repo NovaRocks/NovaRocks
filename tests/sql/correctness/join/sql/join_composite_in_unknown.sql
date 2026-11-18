@@ -74,16 +74,16 @@ SELECT [[1,CAST(NULL AS INT)]] IN (SELECT [[1,2]]) AS unknown_pair,
 
 -- query 12
 -- Nested HAVING probes belong to the grouped row, not the input FROM row.
-SELECT x, count(*) AS n FROM (VALUES (1),(1),(2)) t(x)
-GROUP BY x HAVING [x] IN (SELECT [1]) OR count(*) = 0 ORDER BY x;
+SELECT x, count() AS n FROM (VALUES (1),(1),(2)) t(x)
+GROUP BY x HAVING [x] IN (SELECT [1]) OR count() = 0 ORDER BY x;
 
 -- query 13
-SELECT x, [count(*)] IN (SELECT [2]) AS membership
+SELECT x, [count()] IN (SELECT [2]) AS membership
 FROM (VALUES (1),(1),(2)) t(x) GROUP BY x ORDER BY x;
 
 -- query 14
-SELECT x, count(*) AS n FROM (VALUES (1),(1),(2)) t(x)
-GROUP BY x HAVING [count(*)] IN (SELECT [2]) OR x = 3 ORDER BY x;
+SELECT x, count() AS n FROM (VALUES (1),(1),(2)) t(x)
+GROUP BY x HAVING [count()] IN (SELECT [2]) OR x = 3 ORDER BY x;
 
 -- query 15
 -- A collection attached after a scalar aggregate must preserve its empty-input row.

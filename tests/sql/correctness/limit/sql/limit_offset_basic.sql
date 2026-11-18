@@ -131,15 +131,15 @@ SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 30) x LIM
 
 -- query 17
 -- generate_series 1..100000; skip 50000, take 10
-SELECT count(*) FROM (SELECT * FROM TABLE(generate_series(1, 100000)) LIMIT 50000, 10) x;
+SELECT count() FROM (SELECT * FROM TABLE(generate_series(1, 100000)) LIMIT 50000, 10) x;
 
 -- query 18
 -- generate_series 1..100000; skip 90000, take 20000 → only 10000 remaining
-SELECT count(*) FROM (SELECT * FROM TABLE(generate_series(1, 100000)) LIMIT 90000, 20000) x;
+SELECT count() FROM (SELECT * FROM TABLE(generate_series(1, 100000)) LIMIT 90000, 20000) x;
 
 -- query 19
 -- generate_series 1..100000; skip 1, take 1000
-SELECT count(*) FROM (SELECT * FROM TABLE(generate_series(1, 100000)) LIMIT 1, 1000) x;
+SELECT count() FROM (SELECT * FROM TABLE(generate_series(1, 100000)) LIMIT 1, 1000) x;
 
 -- query 20
 -- @skip_result_check=true
