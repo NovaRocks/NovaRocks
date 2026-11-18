@@ -125,7 +125,8 @@ code-anchors:
 
 ### pipeline-execution
 
-- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，运行验证进行中）
+- [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排）
+- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，其余规则保留）
 
 领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
 
@@ -314,7 +315,8 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
-- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，运行验证进行中）
+- [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排）
+- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，其余规则保留）
 
 
 领域哲学：SQL compiler 只消费一次 statement admission 冻结的 SQL 事实，并只产出 SQL facts；application owner 保留 session、目录观察、topology、native encoding 与 lifecycle assembly。catalog、statistics 与 scan preparation 对同一表必须复用同一 exact Connector binding，缺失事实必须显式失败或保守降级，不能重新读取 latest。
@@ -571,7 +573,8 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 ### crate-boundary
 
 - [ADR-0237](ADR-0237-pure-logical-execution-and-original-host-custody.md) — 逻辑执行与 attempt 为何分别由纯核心决定、QA 为何只监督执行器并保管原注册/退出、FA 为何只承接原载体，以及共享运行时来源/失败交接和宿主一次性清理切点（active；部分替代 ADR-0198 的异步逻辑 actor 妥协及 ADR-0230 的桥，其余业务、协议与原传输规则保留）
-- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，运行验证进行中）
+- [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排）
+- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，其余规则保留）
 - [ADR-0229](ADR-0229-rust-test-placement-dependency-direction-and-fixture-ownership.md) — Rust 测试为何按断言 owner 放置、为何先找公开边界、测试依赖为何只向显式登记的输入契约生产者放宽、无生产边的组合为何进接缝测试 package、测试支持为何按性质暴露，以及 fixture、增长规则与存量随改动迁移（active；沿用 ADR-0056/0069/0140、测试控制 ADR-0175、ADR-0181/0190，不替代其中任何一条）
 - [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — MV 文档为何不自设容量额度、读方为何覆盖写方、StateStore 为何声明真实能力、REST 为何按期望值核验并把 413 归为确定拒绝（active；部分替代 ADR-0180 的额度与首条重评条件，以及 REST 会话版 ADR-0175 的属性保留量与拒绝集；原存放、身份、生命周期、认证与路由保留；薄清单条目/名字/token固定界由 ADR-0227 部分替代，其余文档与后端边界保留）
 - [ADR-0218](ADR-0218-work-credentials-and-credentialed-entries.md) — 查询工作为何把原义务留在 join owner，由身份 owner 签发窄入口，并分开捕获析构、报告退休与真实收敛（active；补充 ADR-0211/0216/0194，第三方内部作业与监督覆盖边界另列）

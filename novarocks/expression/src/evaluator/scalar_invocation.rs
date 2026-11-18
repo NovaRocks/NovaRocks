@@ -18,6 +18,8 @@
 //! The actual prepared lifecycle chooses an instance; the original Frame
 //! remains the sole child/gather/NULL/row-journal author. No name or syntax
 //! classifies an invocation failure, and no alternate allocation host exists.
+
+// Design: ADR-0239 (docs/adr/ADR-0239-expression-evaluation-and-host-admission.md)
 use novarocks_functions::{
     AggregateStateAllocator, EvaluatedArgument, InvocationScalarEvaluationInstance,
     KernelEvaluationControl, KernelFailure, PreparedInvocationScalarKernel, PreparedScalarKernel,

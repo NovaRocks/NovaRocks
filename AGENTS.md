@@ -329,8 +329,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/expression-contract/src/**` 与 `novarocks/expression/src/**`
   前者拥有中立单元构造、封存和校验。后者从显式环境、完整输入布局和安装函数目录纯编译
-  `CompiledExprSet`，依赖闭包止于 Functions、中立契约和 Arrow。求值器在 Execution，
-  通过 `evaluator_view.rs` 消费单元。可选折叠保留独立的既有入口，表示统一由 EXL-03 处理。
+  `CompiledExprSet`，并在 `novarocks/expression/src/evaluator.rs` 及 `evaluator/**` 求值，
+  依赖闭包止于 Functions、中立契约和 Arrow。`evaluator_view.rs` 为关系算子与本地程序提供编译单元的只读视图。
+  求值器撰写叶子调用协议，宿主提供原控制、分配、准入和来源存储，见
+  [ADR-0239](docs/adr/ADR-0239-expression-evaluation-and-host-admission.md)。
 
 - `novarocks/local-compiler/src/**`
   只消费已冻结的 package、pure function/provider facts，产生纯 `LocalProgram`；
@@ -344,17 +346,17 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   compiled 复用的中立值描述、scan/writer 等运行能力；不构造旧执行树。
   不得按目录名删除共享值类型、typed failure 或实际 construction helper。
 
-- `novarocks/execution/src/exec/expr/**`
-  只有 compiled 求值器与保留的真实 SQL/独立预期测试；不保留旧 arena、名字分派或 legacy aggregate adapter。
+- `novarocks/execution/src/exec/operators/compiled_expression.rs` 与 `novarocks/execution/src/runtime/scalar_memory.rs`
+  Execution 在此绑定输入、控制、资源准入、结算与失败投影。`novarocks/execution/src/exec/expr/**` 承接存量测试与 fixture。
   折叠走 SQL `compiler/fold_node.rs` 的 FrozenFoldCall/Intrinsic 与共享 lowering 作者 → FE
-  `query_execution/constant_eval.rs` 端口 → Execution `compiled_program/constant_node.rs` 单节点入口，
+  `query_execution/constant_eval.rs` 端口 → `novarocks/expression/src/evaluator/constant_node.rs` 单节点入口，
   复用 `guarded::Frame` 和 Functions 的实际计算。原 admitted CV 与 canonical runtime 参数分开保留。
   同形常量规范化保留原 pool/ordinal 与实际 creator；source custody 按真实 Arrow 子树的
   geometry/validity 预检并续接。根无 Buffer 不代表后代无 Buffer；来源持有不授予容量。
   控制结果的 carrier 准入、精确宽度/NULL 与布局预检共用 Functions `control_values.rs` 和
   `selected_copy` 作者；`FixedSizeBinary` 保持原宽度字节，不重解释成整数或变长 Binary。
   有符号 IN helper/recipe 在 `novarocks/functions/src/native_inlist.rs`；UTF8 借用比较在
-  `compiled_program/utf8_inlist.rs`。不得恢复旧 evaluator 或用函数名重建调用。
+  `novarocks/expression/src/evaluator/utf8_inlist.rs`。不得恢复旧 evaluator 或用函数名重建调用。
 
 - Iceberg UPDATE 与所有 MERGE 形状在原 v3/类型/ref 准入后只走 MOR，legacy write-mode
   属性不选算法。Provider 同一作者签发规范输入 W 与可选完整存储 T；仅对应 T 的 plain

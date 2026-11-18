@@ -55,6 +55,7 @@ impl ScalarCallRequestFacts {
     }
 }
 
+// Design: ADR-0239 (docs/adr/ADR-0239-expression-evaluation-and-host-admission.md)
 /// Synchronous admission capability supplied by the original evaluator host.
 pub trait ScalarCallHost {
     type Refusal;

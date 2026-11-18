@@ -352,7 +352,7 @@ cfg、`required-features` 或运行模式时，才拆成少数几个按领域命
 
 | owner | 输入契约 | 允许依赖的生产者 | 生产组合点 | 依据 |
 |---|---|---|---|---|
-| `novarocks-execution` | `LocalProgram`（`novarocks-local-program`） | `novarocks-local-compiler`，及其生产闭包内的 `novarocks-physical-plan` | BE 一侧 `novarocks-native-adapter`；FE 一侧 `novarocks-frontend-application` 的常量求值 | 没有测试从零构造 `LocalProgram`；至少 72 个测试文件经物理计划片段与局部编译器取得输入，其中很多是白盒测试 |
+| `novarocks-execution` | `LocalProgram`（`novarocks-local-program`） | `novarocks-local-compiler`，及其生产闭包内的 `novarocks-physical-plan` | BE 一侧 `novarocks-native-adapter` 负责编译并绑定本地程序 | Execution 的算子、管线和宿主测试经物理计划片段与局部编译器取得 `LocalProgram` |
 
 新增一行需要同时满足四个条件，并在改动中给出证据：
 
@@ -370,9 +370,10 @@ cfg、`required-features` 或运行模式时，才拆成少数几个按领域命
 SQL、parser 与应用层 crate 的改动不会因为这张表而选中 Execution 的测试。这一点要等 Execution 的过渡期越界依赖迁走后
 才完全成立，见[接缝测试 package](#接缝测试-package) 末尾。
 
-**Execution 自己的输入。** Execution 的算子与求值器测试经物理计划片段与局部编译器取得 `LocalProgram`，例如
-`novarocks/execution/src/exec/expr/f3_concat_trim_sql_boundary_tests.rs` 里的 `compiled_slot_program`。
-这类测试的 owner 是 Execution，依赖合规，在 Execution 内按第 3 问放置，不进接缝测试 package。
+**Execution 自己的输入。** Execution 的算子、管线与求值宿主绑定可经物理计划片段与局部编译器取得 `LocalProgram`，
+例如 `novarocks/execution/src/exec/expr/fixtures.rs` 的本地程序 fixture。这些断言按第 3 问放在 Execution。
+表达式求值自身的输入是 `CompiledExprSet`。在 `novarocks-expression` 内，用 `BoundExprSetBuilder`、显式环境、冻结输入布局和纯编译入口构造；
+公共求值行为放进 `tests/it`，需要观察私有状态的放在求值器白盒树。
 
 ### 接缝测试 package
 
@@ -383,11 +384,11 @@ SQL、parser 与应用层 crate 的改动不会因为这张表而选中 Executio
 接缝测试 package 的允许范围是接缝两侧、连接两侧所需的中间 crate，以及它们的 testkit 与机械支持。新建一个接缝测试 package
 是新的长期结构决策，先在对应任务中明确设计，不在写测试时顺手新建。
 
-当前唯一的接缝是“编译到执行”：SQL 文本经 SQL 编译、package 编码和局部编译之后，在 Execution 中求值，允许范围即 SQL、
-Plan Codec、局部编译器、物理计划与 Execution 及其 testkit。
+当前唯一的接缝是“编译到执行”：SQL 文本经 SQL 编译、package 编码和局部编译之后，由 `novarocks-expression` 求值。
+Execution 保有算子与真实宿主绑定的原边界。接缝 package 的允许范围沿用两侧、连接两侧所需的中间 crate 和它们的 testkit。
 对应的 package 是 `tests/compile-to-execute`（`novarocks-test-compile-to-execute`）：lib 承接“SQL 计划到 `LocalProgram`”
-这半条链路的 helper（`src/programs.rs`、`src/compiler_results.rs`），`tests/it` 承接测试。从物理计划片段经局部编译器
-取输入的测试不穿过这条接缝，归 Execution。
+这半条链路的 helper（`src/programs.rs`、`src/compiler_results.rs`），`tests/it` 承接期望值相对 SQL 原输入的测试。
+仅依赖物理计划片段的断言按行为 owner 取得输入。
 
 **接缝测试需要一侧的私有项时**，按顺序判断：
 
@@ -398,7 +399,8 @@ Plan Codec、局部编译器、物理计划与 Execution 及其 testkit。
 
 **过渡期的依赖。** 接缝 package 与 SQL 的编译输入建立之前，Execution 里已有不少测试依赖这些输入与链路 helper。
 它们尚未迁走，Execution 因此暂时 dev 依赖 `novarocks-sql-testkit` 与接缝 package 的 lib，并在原位置保留转调，
-例如 `novarocks/execution/src/exec/expr/sql_test_source.rs`。这还不是全部：Execution 的 dev 依赖里，除生产者表中的
+例如 `novarocks/execution/src/exec/expr/sql_test_source.rs` 从 `novarocks-sql-testkit` 转出 SQL 输入与单元定义视图，
+从 `tests/compile-to-execute` 的 lib 转出编译结果视图。Execution 的 dev 依赖里，除生产者表中的
 `novarocks-local-compiler` 与 `novarocks-physical-plan` 外，其余 workspace 成员都越出允许范围，包括 `novarocks-sql`、
 `novarocks-parser`、`novarocks-query-application`、`novarocks-plan-codec` 等。新测试不经由转调，也不使用这些依赖；
 转调与依赖在最后的使用方随改动迁走时删除，已经没有使用方的依赖直接删除。它们迁走之前，改这些 crate 仍会选中
@@ -645,21 +647,18 @@ nextest 用 binary ID 标识测试：lib 单元测试是 `<package>`，集成 ta
 之后只是读取产物，owner 是 SQL。第 2 问：只需要 SQL 闭包内的 crate。第 3 问：断言与输入都能经 SQL 的公共 API 表达。
 第 4 问：不需要。结果：SQL 的 `tests/it/`，输入取自 `novarocks-sql-testkit`。它目前是存量，由改动到它的任务迁走。
 
-**B：搭一个只含 `concat` 的物理计划片段，经局部编译器得到 `LocalProgram`，检查求值器在稀疏选择下按编译出的槽位读写，
-输出行与选择向量一一对应。**
-与 A 在同一个文件里，经 `compiled_slot_program` 取得输入。选层：槽位与选择向量是 Execution 求值器的局部行为。
-第 1 问：链条上最后被调用的是 Execution 的求值入口，owner 是 Execution。第 2 问：物理计划与局部编译器不在 Execution 的
-生产闭包内，但在它的输入契约生产者表里，依赖合规。第 3 问：求值入口与观察的结果都是公共 API。结果：Execution 的
-`tests/it/`，还没有就新建，不进接缝测试 package。如果只检查 `concat` 自己对 NULL 与空串的值，按选层归 Functions 的
-Rust 测试，那里已有同样的用例。A 与 B 同在一个文件却归属不同，所以要按测试函数判定，不按文件判定。
+**B：构造只含 `concat` 根的单元，检查求值器按编译后的输入序号读列，并把输出行与稀疏选择一一对应。**
+这是原 `c12_p2_concat_actual_compiled_slots_and_sparse_null_match_v1` 走查的表达式性质。
+选层：求值入口和结果由 `novarocks-expression` 暴露。按允许的输入范围，用单元构造器和显式输入布局经纯编译取得程序。
+观察稀疏行、NULL 与结果顺序只需公共入口，结果归 Expression 的 `tests/it`。只验证 `concat` 自己的 NULL 与空串规则时，
+结果归 Functions。A 与 B 曾在同一文件里，各测试函数的性质决定归属。
 
 **C：SQL 文本经 SQL 编译、package 编码、局部编译后求值，检查带符号转换的最终结果。**
-第 1 问：沿链依次调用 SQL 编译、package 编码、局部编译和 Execution 求值，最下游是 Execution。第 2 问：SQL 与 Plan Codec
-不在 Execution 的允许范围内；替换检验：期望值相对 SQL 文本陈述。结果：接缝测试 package，即现在的
-`tests/compile-to-execute/tests/it/signed_cast_nullability.rs`。它原先经公开的 `try_new_with_allocator` 传入 Execution
-私有的分配宿主，观察 `MemTracker` 的记账；迁入时按三步次序的第 1 步改为传入测试自己的计数分配器，观察的仍是同一个量，
-即求值结束后没有未释放的分配。生产分配宿主的记账继续由 Execution 的白盒测试断言，例如
-`novarocks/execution/src/exec/expr/compiled_program/` 下的 `scalar_invocation_frame_tests.rs` 与 `input_source_tests.rs`。
+沿链的求值入口由 `novarocks-expression` 提供。SQL 与 Plan Codec 越出 Expression 的测试允许范围。
+期望值相对原 SQL 文本陈述，结果归接缝 package 的 `tests/compile-to-execute/tests/it/signed_cast_nullability.rs`。
+测试通过 `try_new_with_allocator` 和计数分配器观察求值结束后的分配结算。
+真实查询资金的准入与结算继续由 `novarocks/execution/src/runtime/scalar_memory_tests.rs` 断言，
+`Chunk` 输入适配的来源观察归 `novarocks/execution/src/exec/operators/compiled_expression/tests/input_adapter.rs`。
 
 **D：Query Application 冻结 SQL 产出的结果声明，并拒绝与声明不符的输出。**
 第 1 问：它先调用 SQL 编译，再调用 Query Application 的冻结入口，最下游是 Query Application；对 SQL 声明的检查是前置条件，

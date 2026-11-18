@@ -85,7 +85,7 @@ pub struct CompiledExprSet {
     roots: Box<[CompiledRoot]>,
     effects: BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     ids: BTreeMap<ExprId, CompiledExprId>,
-    storage: ValueTypeStorageLifetime,
+    _storage: ValueTypeStorageLifetime,
 }
 #[path = "evaluator_view.rs"]
 pub mod evaluator_view;
@@ -446,7 +446,7 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         roots: roots.into_boxed_slice(),
         effects,
         ids: lowered.ids,
-        storage,
+        _storage: storage,
     }))
 }
 
