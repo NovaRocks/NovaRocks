@@ -27,12 +27,15 @@ use arrow::{
     datatypes::{DataType, Field},
     record_batch::RecordBatch,
 };
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
 use novarocks_expression_contract::ExprKind;
 use novarocks_expression_contract::RootScope;
 use novarocks_functions::{
     ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument, FunctionId, FunctionKind,
     InstalledPureKernel, KernelEvaluationControl, KernelFailure, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi, Selection,
+    PureImplementationId, PureKernelAbi, ScalarInvocationActivation, ScalarInvocationScope,
+    Selection,
 };
 use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_physical_plan::{
@@ -431,7 +434,16 @@ fn assert_selections(
         )
         .unwrap();
         let actual = instance
-            .evaluate(&batch, selection, &HarnessControl)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &HarnessControl,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(actual.selection(), selection);
         assert_eq!(actual.values().data_type(), &DataType::Utf8);
@@ -604,7 +616,18 @@ fn concat_required_trim_child_control_survives_strict_null_and_latches() {
             &HarnessControl,
         )
         .unwrap();
-        let actual = instance.evaluate(&batch, Selection::all(1), &good).unwrap();
+        let actual = instance
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationActivation::Activated,
+                &good,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert!(actual.errors().is_empty());
         assert!(actual.values().is_null(0));
         let trace = good.trace.lock().unwrap().clone();
@@ -635,17 +658,35 @@ fn concat_required_trim_child_control_survives_strict_null_and_latches() {
     .unwrap();
     assert_eq!(
         instance
-            .evaluate(&batch, Selection::all(1), &control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None
+                },
+                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationActivation::Activated,
+                &control,
+                &mut PassThroughCallHost,
+            )
             .unwrap_err(),
-        KernelFailure::Cancelled
+        ExprEvaluationFailure::Kernel(KernelFailure::Cancelled)
     );
     assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
     let after = ChildControl::default();
     assert_eq!(
         instance
-            .evaluate(&batch, Selection::all(1), &after)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None
+                },
+                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationActivation::Activated,
+                &after,
+                &mut PassThroughCallHost,
+            )
             .unwrap_err(),
-        KernelFailure::InstanceFailed
+        ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
     );
     assert!(after.trace.lock().unwrap().is_empty());
 
@@ -658,7 +699,18 @@ fn concat_required_trim_child_control_survives_strict_null_and_latches() {
     )
     .unwrap();
     let selection = Selection::try_sparse(1, &[]).unwrap();
-    let actual = instance.evaluate(&batch, selection, &empty).unwrap();
+    let actual = instance
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &empty,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert_eq!(actual.selection(), selection);
     assert_eq!(actual.values().len(), 0);
     assert!(actual.errors().is_empty());

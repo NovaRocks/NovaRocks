@@ -21,4 +21,7 @@ mod input;
 
 pub use failure::{ExprEvaluationFailure, RequiredExpressionRowError, ScalarCallFailure};
 pub use host::{ScalarCallHost, ScalarCallPhase, ScalarCallRequestFacts};
-pub use input::{EvaluationInput, InputColumnProjection, InputSourceStorage, InputStorageFailure};
+pub use input::{
+    EvaluationInput, InputColumnProjection, InputSourceStorage, InputStorageFailure,
+    ProjectedEvaluationInput,
+};

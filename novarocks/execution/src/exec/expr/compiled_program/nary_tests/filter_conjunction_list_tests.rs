@@ -18,6 +18,8 @@
 //! field changes from one connective definition to its original ordered list.
 use super::*;
 use crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
 fn list_fixture(width: usize) -> Fixture {
     let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let fragment_id = FragmentId::new(91);
@@ -117,9 +119,19 @@ fn filter_conjunction_actual_repeated_definition_distinct_use_order_and_wide_roo
             .iter()
             .map(|reference| (unit.clone(), reference.root))
             .collect::<Vec<_>>();
-        let mut instance = CompiledFilterConjunctionInstance::try_new(&roots, &Control).unwrap();
+        let mut instance =
+            CompiledFilterConjunctionInstance::try_new_with_allocator(&roots, &Control, None)
+                .unwrap();
         let actual = instance
-            .evaluate_required(&input, Selection::all(3), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                Selection::all(3),
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         let boolean = actual.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert_eq!(
@@ -127,7 +139,15 @@ fn filter_conjunction_actual_repeated_definition_distinct_use_order_and_wide_roo
             vec![Some(true), Some(false), Some(false)]
         );
         let sparse = instance
-            .evaluate_required(&input, Selection::try_sparse(3, &[0, 2]).unwrap(), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                Selection::try_sparse(3, &[0, 2]).unwrap(),
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(
             sparse

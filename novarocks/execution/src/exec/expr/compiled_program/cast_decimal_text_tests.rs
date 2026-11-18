@@ -19,6 +19,9 @@
 use super::*;
 use arrow::array::{Decimal128Array, Decimal256Array, StringArray};
 use arrow_buffer::i256;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 
 #[test]
 fn decimal_text_actual_compiler_both_widths_scales_sparse_slice_and_empty() {
@@ -78,7 +81,18 @@ fn decimal_text_actual_compiler_both_widths_scales_sparse_slice_and_empty() {
                             .may_raise_row_error,
                         !wide && scale > 0,
                     );
-                    let result = evaluator.evaluate(&batch, selection, &Control).unwrap();
+                    let result = evaluator
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
+                        .unwrap();
                     // The frozen text owner spells nonpositive scales as the
                     // raw integer. Positive scales place exactly `scale` digits
                     // after the point; these literals are independent of its formatter.
@@ -99,7 +113,19 @@ fn decimal_text_actual_compiler_both_widths_scales_sparse_slice_and_empty() {
                     assert_eq!(result.values().to_data(), expected.to_data());
                     assert!(result.errors().is_empty());
                     let result = evaluator
-                        .evaluate(&batch, Selection::try_sparse(3, &[]).unwrap(), &Control)
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            {
+                                let selection = Selection::try_sparse(3, &[]).unwrap();
+                                ScalarInvocationScope::new(selection, selection)
+                            },
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
                         .unwrap();
                     assert_eq!(
                         result.values().to_data(),

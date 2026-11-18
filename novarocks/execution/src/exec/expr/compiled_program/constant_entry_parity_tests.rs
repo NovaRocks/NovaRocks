@@ -37,6 +37,8 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::{RecordBatch, RecordBatchOptions},
 };
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression::{CompiledExprSet, StaticExprKind};
 use novarocks_expression_contract::RootOrdinal;
 use novarocks_functions::{
@@ -44,6 +46,7 @@ use novarocks_functions::{
     KernelEvaluationControl, KernelFailure, PreparedPureKernel, PureEngineFunctionCatalog,
     Selection,
 };
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef, ProgramUnitId};
 
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
@@ -381,7 +384,16 @@ impl Fixture {
         )
         .unwrap();
         let compiled = instance
-            .evaluate(&batch, Selection::all(1), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         let entry = evaluate_constant_node(
             node,
@@ -1010,7 +1022,18 @@ fn metadata_cv_source_cross_entry(functions: &PureEngineFunctionCatalog, spare_e
                     )
                     .unwrap();
                     let selection = Selection::try_sparse(rows, &selected).unwrap();
-                    let compiled = instance.evaluate(&batch, selection, &Control).unwrap();
+                    let compiled = instance
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
+                        .unwrap();
                     assert!(compiled.errors().is_empty());
                     assert_eq!(compiled.values().data_type(), ty.data_type());
                     let list = compiled

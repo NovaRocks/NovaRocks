@@ -23,9 +23,13 @@ use super::sql_test_source::sql_source_with_single_field_and_core_residuals;
 use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
-use novarocks_expression::StaticExprKind;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure, StaticExprKind};
 use novarocks_expression_contract::RootOrdinal;
-use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
+use novarocks_functions::{
+    KernelDiagnostic, KernelEvaluationControl, KernelFailure, ScalarInvocationActivation,
+    ScalarInvocationScope, Selection,
+};
 use novarocks_local_program::{LocalProgram, ProgramRootRef, ProgramUnitId};
 
 use novarocks_type_contract::{
@@ -195,7 +199,18 @@ fn like_actual_every_constructor_phase_callback_seven_causes_no_footer_or_replay
             &Control,
         )
         .unwrap();
-        frame.evaluate(&data, selection, &record).unwrap();
+        frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &record,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         let trace = record.trace.lock().unwrap().clone();
         for stop in 1..=trace.len() {
             for cause in causes() {
@@ -206,12 +221,33 @@ fn like_actual_every_constructor_phase_callback_seven_causes_no_footer_or_replay
                 )
                 .unwrap();
                 let c = Callback::new(stop, cause.clone());
-                assert!(matches!(frame.evaluate(&data,selection,&c),Err(actual) if actual==cause));
+                let result = frame.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &c,
+                    &mut PassThroughCallHost,
+                );
+                assert!(
+                    matches!(result, Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
+                );
                 assert_eq!(*c.trace.lock().unwrap(), trace[..stop]);
                 let after = Callback::new(usize::MAX, KernelFailure::Cancelled);
                 assert!(matches!(
-                    frame.evaluate(&data, selection, &after),
-                    Err(KernelFailure::InstanceFailed)
+                    frame.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &data,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &after,
+                        &mut PassThroughCallHost,
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
                 assert!(after.trace.lock().unwrap().is_empty());
             }

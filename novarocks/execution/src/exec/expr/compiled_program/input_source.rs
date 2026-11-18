@@ -18,104 +18,35 @@
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSourceAuthorityRef};
+use novarocks_expression::{
+    EvaluationInput, InputColumnProjection, InputSourceStorage, InputStorageFailure,
+};
 
-use novarocks_expression::InputColumnProjection;
-
-/// One synchronous input. The Chunk variant structurally pairs its own batch
-/// and attached owners, without cloning either or accepting another batch.
+/// The evaluator's borrowed input plus its private Slot-read observation.
 #[derive(Clone, Copy)]
-pub(crate) enum CompiledInputLoan<'a> {
-    RecordBatch(&'a RecordBatch),
-    Chunk(&'a Chunk),
-    /// An explicit physical column projection of the original frozen port.
-    /// Ordinals map compact columns back to that declaration; absent columns
-    /// have no Array at all and cannot be read by a Slot.
-    Projected {
-        chunk: &'a Chunk,
-        declared: &'a ChunkSchema,
-        projection: &'a std::sync::Arc<InputColumnProjection>,
-    },
+pub(super) struct FrameInput<'a> {
+    input: EvaluationInput<'a>,
     #[cfg(test)]
-    Observed {
-        input: &'a CompiledInputLoan<'a>,
-        observer: &'a SlotSourceObserver,
-    },
+    observer: Option<&'a SlotSourceObserver>,
 }
 
-impl<'a> CompiledInputLoan<'a> {
-    pub(crate) fn from_chunk(chunk: &'a Chunk) -> Self {
-        Self::Chunk(chunk)
-    }
-
-    pub(crate) fn from_projected_chunk(
-        chunk: &'a Chunk,
-        declared: &'a ChunkSchema,
-        projection: &'a std::sync::Arc<InputColumnProjection>,
-        control: &dyn novarocks_functions::KernelEvaluationControl,
-    ) -> Result<Self, novarocks_functions::KernelFailure> {
-        let ordinals = projection.ordinals();
-        if !chunk.chunk_schema().is_typed()
-            || !declared.is_typed()
-            || chunk.columns().len() != ordinals.len()
-        {
-            return Err(super::invalid(
-                "projected input lacks its exact typed column map",
-            ));
+impl<'a> FrameInput<'a> {
+    pub(super) fn new(input: EvaluationInput<'a>) -> Self {
+        Self {
+            input,
+            #[cfg(test)]
+            observer: None,
         }
-        let actual = chunk.record_batch().schema();
-        let frozen = declared.arrow_schema_ref();
-        let mut previous = None;
-        for (physical, &original) in ordinals.iter().enumerate() {
-            control.checkpoint(1)?;
-            if previous.is_some_and(|p| p >= original)
-                || original >= frozen.fields().len()
-                || chunk.chunk_schema().slots()[physical].slot_id()
-                    != declared.slots()[original].slot_id()
-                || !chunk.chunk_schema().slots()[physical]
-                    .typed_binding()
-                    .borrowed()
-                    .same_physical_binding_ignoring_root_nullability_observed(
-                        declared.slots()[original].typed_binding().borrowed(),
-                        || control.checkpoint(1),
-                    )?
-                || !novarocks_type_contract::arrow_fields_exact_with_nullability_observed(
-                    frozen.field(original),
-                    actual.field(physical),
-                    novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
-                    || control.checkpoint(1),
-                )?
-            {
-                return Err(super::invalid(
-                    "projected input column differs from its original frozen ordinal",
-                ));
-            }
-            previous = Some(original);
-        }
-        Ok(Self::Projected {
-            chunk,
-            declared,
-            projection,
-        })
     }
 
     #[cfg(test)]
-    pub(crate) fn observed<'b>(
-        &'b self,
-        observer: &'b SlotSourceObserver,
-    ) -> CompiledInputLoan<'b> {
-        CompiledInputLoan::Observed {
-            input: self,
-            observer,
-        }
-    }
-
-    fn chunk(self) -> Option<&'a Chunk> {
-        match self {
-            Self::RecordBatch(_) => None,
-            Self::Chunk(chunk) | Self::Projected { chunk, .. } => Some(chunk),
-            #[cfg(test)]
-            Self::Observed { input, .. } => input.chunk(),
+    pub(super) fn observed<'b>(self, observer: &'b SlotSourceObserver) -> FrameInput<'b>
+    where
+        'a: 'b,
+    {
+        FrameInput {
+            input: self.input,
+            observer: Some(observer),
         }
     }
 
@@ -129,37 +60,39 @@ impl<'a> CompiledInputLoan<'a> {
         use novarocks_functions::opaque_memory::OpaqueRetainedCharge;
         use novarocks_functions::{EvaluationCheckpoints, SourceBackingOwner};
         use novarocks_type_contract::ValueTypeStorageLifetime;
-        let Some(chunk) = self.chunk() else {
+        let Some(source) = self.input.source_storage() else {
             return Ok(None);
         };
         let mut work = EvaluationCheckpoints::new(control);
         let mut stock: Option<OpaqueRetainedCharge> = None;
         let mut retained = 0usize;
-        let storage = chunk
-            .source_storage_lifetime_observed::<CaptureFailure>(
-                ValueTypeStorageLifetime::pure(),
-                |layout| {
-                    work.flush()?;
-                    let host = allocator.ok_or_else(|| {
-                        super::invalid(
-                            "compiled input finite custody requires its actual allocation host",
-                        )
-                    })?;
-                    if stock.is_none() {
-                        stock = Some(OpaqueRetainedCharge::try_new(host.clone())?);
-                    }
-                    let charge = stock
-                        .as_mut()
-                        .expect("actual host installed for finite custody");
-                    let mut reservation = charge.reserve_operation(layout.size())?;
-                    retained = retained
-                        .checked_add(layout.size())
-                        .ok_or(novarocks_functions::KernelFailure::ResourceExhausted)?;
-                    charge.reconcile_under_reservation(retained, &mut reservation)?;
-                    Ok(())
-                },
-            )
-            .map_err(CaptureFailure::into_kernel)?;
+        let storage = source
+            .storage_lifetime_observed(ValueTypeStorageLifetime::pure(), &mut |layout| {
+                work.flush()?;
+                let host = allocator.ok_or_else(|| {
+                    super::invalid(
+                        "compiled input finite custody requires its actual allocation host",
+                    )
+                })?;
+                if stock.is_none() {
+                    stock = Some(OpaqueRetainedCharge::try_new(host.clone())?);
+                }
+                let charge = stock
+                    .as_mut()
+                    .expect("actual host installed for finite custody");
+                let mut reservation = charge.reserve_operation(layout.size())?;
+                retained = retained
+                    .checked_add(layout.size())
+                    .ok_or(novarocks_functions::KernelFailure::ResourceExhausted)?;
+                charge.reconcile_under_reservation(retained, &mut reservation)?;
+                Ok(())
+            })
+            .map_err(|cause| match cause {
+                InputStorageFailure::Kernel(cause) => cause,
+                InputStorageFailure::Layout(_) => {
+                    novarocks_functions::KernelFailure::ResourceExhausted
+                }
+            })?;
         // No request callback does not imply pure: a single existing creator
         // hold can be cloned with no new holder allocation.
         if storage.is_pure() {
@@ -184,34 +117,22 @@ impl<'a> CompiledInputLoan<'a> {
         }))
     }
 
-    pub(crate) fn batch(self) -> &'a RecordBatch {
-        match self {
-            Self::RecordBatch(batch) => batch,
-            Self::Chunk(chunk) | Self::Projected { chunk, .. } => chunk.record_batch(),
-            #[cfg(test)]
-            Self::Observed { input, .. } => input.batch(),
-        }
+    pub(super) fn batch(self) -> &'a RecordBatch {
+        self.input.batch()
     }
 
-    pub(crate) fn num_rows(self) -> usize {
+    pub(super) fn num_rows(self) -> usize {
         self.batch().num_rows()
     }
-    pub(crate) fn schema(self) -> arrow::datatypes::SchemaRef {
-        match self {
-            Self::Projected { declared, .. } => declared.arrow_schema_ref(),
-            #[cfg(test)]
-            Self::Observed { input, .. } => input.schema(),
-            _ => self.batch().schema(),
-        }
+
+    pub(super) fn schema(self) -> arrow::datatypes::SchemaRef {
+        self.input.declared_schema()
     }
+
     fn projection(self) -> Option<&'a std::sync::Arc<InputColumnProjection>> {
-        match self {
-            Self::Projected { projection, .. } => Some(projection),
-            #[cfg(test)]
-            Self::Observed { input, .. } => input.projection(),
-            _ => None,
-        }
+        self.input.projection()
     }
+
     fn projected_ordinals(self) -> Option<&'a [usize]> {
         self.projection().map(|projection| projection.ordinals())
     }
@@ -237,45 +158,32 @@ impl<'a> CompiledInputLoan<'a> {
     /// Called only after the original Frame has checked the lexical input
     /// node/role. An absent ordinal remains the original Slot error.
     pub(crate) fn checked_column(self, ordinal: usize) -> Option<BorrowedInputColumn<'a>> {
-        #[cfg(test)]
-        if let Self::Observed { input, observer } = self {
-            let column = input.checked_column(ordinal)?;
-            observer(column);
-            return Some(column);
-        }
         let physical = match self.projected_ordinals() {
             Some(map) => map.binary_search(&ordinal).ok()?,
             None => ordinal,
         };
         let array = self.batch().columns().get(physical)?;
-        let source = match self {
-            Self::RecordBatch(_) => BorrowedInputSource::NoChunkProvided,
-            #[cfg(test)]
-            Self::Observed { .. } => {
-                unreachable!("observed input returned its original checked column")
-            }
-            Self::Chunk(chunk) | Self::Projected { chunk, .. } => {
-                let authority = chunk.source_authority();
-                if authority.is_attached() {
-                    BorrowedInputSource::Attached(authority)
-                } else {
-                    BorrowedInputSource::NoAttachedAuthority
-                }
-            }
+        let source = match self.input.source_storage() {
+            Some(storage) => BorrowedInputSource::Storage(storage),
+            None => BorrowedInputSource::NoStorage,
         };
-        Some(BorrowedInputColumn { array, source })
+        let column = BorrowedInputColumn { array, source };
+        #[cfg(test)]
+        if let Some(observer) = self.observer {
+            observer(column);
+        }
+        Some(column)
     }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum BorrowedInputSource<'a> {
-    NoChunkProvided,
-    NoAttachedAuthority,
+    NoStorage,
     #[allow(
         dead_code,
         reason = "Prepared Slot source view; leaf source consumption is a later slice"
     )]
-    Attached(ChunkSourceAuthorityRef<'a>),
+    Storage(&'a dyn InputSourceStorage),
 }
 
 /// A view of the original checked column and its factual source. It never
@@ -495,31 +403,6 @@ struct FiniteSourceStorage {
     _stock: Option<novarocks_functions::opaque_memory::OpaqueRetainedCharge>,
 }
 
-enum CaptureFailure {
-    Kernel(novarocks_functions::KernelFailure),
-    Layout,
-}
-impl From<novarocks_functions::KernelFailure> for CaptureFailure {
-    fn from(error: novarocks_functions::KernelFailure) -> Self {
-        Self::Kernel(error)
-    }
-}
-impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
-    for CaptureFailure
-{
-    fn from(_: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
-        Self::Layout
-    }
-}
-impl CaptureFailure {
-    fn into_kernel(self) -> novarocks_functions::KernelFailure {
-        match self {
-            Self::Kernel(error) => error,
-            Self::Layout => novarocks_functions::KernelFailure::ResourceExhausted,
-        }
-    }
-}
-
 /// Authored by the real root/control, never reconstructed by a Functions leaf.
 /// The batch is an actual input/filter result; the map gives its original rows.
 pub(super) struct ActualInvocationDomain {
@@ -530,7 +413,7 @@ pub(super) struct ActualInvocationDomain {
 }
 impl ActualInvocationDomain {
     pub(super) fn root(
-        input: CompiledInputLoan<'_>,
+        input: FrameInput<'_>,
         actual: novarocks_functions::Selection<'_>,
         control: &dyn novarocks_functions::KernelEvaluationControl,
     ) -> Result<Self, novarocks_functions::KernelFailure> {

@@ -99,10 +99,10 @@ fn run<T>(
         operation_aborted: AtomicBool::new(false),
     };
     observed.checkpoint(0)?;
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let result = body(&mut work);
     work.finish(result)

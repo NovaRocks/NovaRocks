@@ -19,6 +19,9 @@
 //! Fixed corpus tables replace the removed evaluator/reference calculator.
 use super::*;
 use arrow::array::{Decimal128Array, Decimal256Array, Float64Array};
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 
 // Pure type/data construction only; this helper never evaluates a CAST.
 fn input(wide: bool, p: u8, s: i8, raw: Vec<Option<i128>>) -> ArrayRef {
@@ -156,21 +159,50 @@ fn full(wide: bool) {
                         let b = batch(&program, a.clone());
                         let rows = [0, 1, 3];
                         let selected = Selection::try_sparse(4, &rows).unwrap();
-                        let out = instance(&program).evaluate(&b, selected, &Control).unwrap();
+                        let out = instance(&program)
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &b,
+                                    source: None,
+                                },
+                                ScalarInvocationScope::new(selected, selected),
+                                ScalarInvocationActivation::Activated,
+                                &Control,
+                                &mut PassThroughCallHost,
+                            )
+                            .unwrap();
                         assert_eq!(out.selection(), selected);
                         assert_bits(out.values(), &[expected[0], expected[1], expected[3]]);
                         assert!(out.errors().is_empty());
                         // Full selection also covers raw-1, including wide
                         // Float32 -infinity and negative-underflow-zero cases.
                         let all = instance(&program)
-                            .evaluate(&b, Selection::all(4), &Control)
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &b,
+                                    source: None,
+                                },
+                                ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+                                ScalarInvocationActivation::Activated,
+                                &Control,
+                                &mut PassThroughCallHost,
+                            )
                             .unwrap();
                         assert_eq!(all.selection(), Selection::all(4));
                         assert_bits(all.values(), &expected);
                         assert!(all.errors().is_empty());
                         let empty_selected = Selection::try_sparse(4, &[]).unwrap();
                         let empty = instance(&program)
-                            .evaluate(&b, empty_selected, &Control)
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &b,
+                                    source: None,
+                                },
+                                ScalarInvocationScope::new(empty_selected, empty_selected),
+                                ScalarInvocationActivation::Activated,
+                                &Control,
+                                &mut PassThroughCallHost,
+                            )
                             .unwrap();
                         assert_eq!(empty.selection(), empty_selected);
                         assert_eq!(empty.values().data_type(), &DataType::Float64);
@@ -186,7 +218,16 @@ fn full(wide: bool) {
                         );
                         let cb = batch(&constant, input(wide, p, scale, vec![Some(0); 4]));
                         let out = instance(&constant)
-                            .evaluate(&cb, selected, &Control)
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &cb,
+                                    source: None,
+                                },
+                                ScalarInvocationScope::new(selected, selected),
+                                ScalarInvocationActivation::Activated,
+                                &Control,
+                                &mut PassThroughCallHost,
+                            )
                             .unwrap();
                         assert_eq!(out.selection(), selected);
                         // The genuine compiled fixture authors raw1, so its

@@ -21,20 +21,25 @@
 //! it, as required by the neutral kernel ABI. These controls do not mint a
 //! memory grant. Higher-order and encoded guarded-result protocols remain separate.
 
-use input_source::CompiledInputLoan;
+#[cfg(test)]
+use arrow::record_batch::RecordBatch;
+use input_source::FrameInput;
 
 use arrow::{
     array::{ArrayRef, UInt64Array, new_empty_array, new_null_array},
     compute::{TakeOptions, take},
     datatypes::DataType,
-    record_batch::RecordBatch,
 };
-use novarocks_expression::{ComparisonSite, CompiledExprSet, StaticExprKind};
+use novarocks_expression::{
+    ComparisonSite, CompiledExprSet, EvaluationInput, ExprEvaluationFailure,
+    RequiredExpressionRowError, ScalarCallHost, StaticExprKind,
+};
 use novarocks_expression_contract::{RootOrdinal, RootScope};
 use novarocks_functions::{
     EvaluatedArgument, FunctionArgumentType, KernelDiagnostic, KernelEvaluationControl,
-    KernelFailure, PreparedPureKernel, RowDataError, ScopedExpressionEffects, SelectedValues,
-    Selection, validate_evaluated_argument_observed, visit_selected_nulls,
+    KernelFailure, PreparedPureKernel, RowDataError, ScalarInvocationScope,
+    ScopedExpressionEffects, SelectedValues, Selection, validate_evaluated_argument_observed,
+    visit_selected_nulls,
 };
 use novarocks_type_contract::{
     ControlShape, ExpressionUseId, FunctionNullBehavior,
@@ -98,14 +103,12 @@ impl KernelEvaluationControl for ObservedControl<'_> {
         result
     }
 }
-struct Work<'a, 'scope> {
+struct Work<'a, 'scope, R = std::convert::Infallible> {
     control: &'a ObservedControl<'a>,
     pending: u32,
-    scalar_scope: Option<
-        &'scope mut (dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope + 'scope),
-    >,
+    scalar_host: Option<&'scope mut (dyn ScalarCallHost<Refusal = R> + 'scope)>,
 }
-impl Work<'_, '_> {
+impl<R> Work<'_, '_, R> {
     fn step(&mut self) -> Result<(), KernelFailure> {
         self.pending += 1;
         if self.pending == novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK {
@@ -129,6 +132,17 @@ impl Work<'_, '_> {
         }
         self.flush()?;
         result
+    }
+    fn finish_evaluation<T>(
+        &mut self,
+        result: Result<T, ExprEvaluationFailure<R>>,
+    ) -> Result<T, ExprEvaluationFailure<R>> {
+        // Preserve the first failure. A completion checkpoint can only
+        // interrupt a successful frame.
+        match result {
+            Err(error) => Err(error),
+            Ok(value) => self.finish(Ok(value)).map_err(Into::into),
+        }
     }
 }
 
@@ -193,7 +207,7 @@ impl Value<'_> {
     fn retaining_continuation(
         self,
         owner: input_source::ArrayContinuation,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<Self, KernelFailure> {
         let value = match self {
             Self::Constant(value) => Self::Constant(value),
@@ -219,7 +233,7 @@ impl Value<'_> {
         self,
         selection: Selection<'a>,
         ty: &DataType,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<MaterializedValue<'a>, KernelFailure>
     where
         Self: 'a,
@@ -271,7 +285,7 @@ fn materialized_source_values<'a>(
     expected: &DataType,
     array: ArrayRef,
     errors: Box<[RowDataError]>,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     if !novarocks_type_contract::arrow_data_types_exact_with_profile_and_nullability_observed::<
         KernelFailure,
@@ -302,10 +316,10 @@ impl CompiledExpressionInstance {
             operation_aborted: AtomicBool::new(false),
         };
         observed.checkpoint(0)?;
-        let mut work = Work {
+        let mut work: Work<'_, '_> = Work {
             control: &observed,
             pending: 0,
-            scalar_scope: None,
+            scalar_host: None,
         };
         let result = Self::prepare(program, root, &mut work);
         work.finish(result)
@@ -323,7 +337,7 @@ impl CompiledExpressionInstance {
     fn prepare(
         program: Arc<CompiledExprSet>,
         root: RootOrdinal,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<Self, KernelFailure> {
         let compiled_root = program
             .root(root)
@@ -598,164 +612,38 @@ impl CompiledExpressionInstance {
             allocator: None,
         })
     }
-    /// The caller supplies this root's actual input port, retaining the full
-    /// frozen field order and metadata. Selection always names its batch rows.
-    /// An empty-port root is evaluated over exactly one row with no column.
-    pub fn evaluate<'a>(
+    /// Evaluate a checked root in the actual domain authored by its caller.
+    /// Selected output carries only the independent demand lifetime.
+    pub fn evaluate<'a, R>(
         &mut self,
-        input: &RecordBatch,
-        selection: Selection<'a>,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, KernelFailure> {
-        if self.failed {
-            return Err(KernelFailure::InstanceFailed);
-        }
-        if self.has_invocation_data {
-            self.failed = true;
-            return Err(invalid(
-                "whole-invocation scalar requires the lossless evaluation entry",
-            ));
-        }
-        let observed = ObservedControl {
-            original: control,
-            refused: AtomicBool::new(false),
-            operation_aborted: AtomicBool::new(false),
-        };
-        let mut work = Work {
-            control: &observed,
-            pending: 0,
-            scalar_scope: None,
-        };
-        let result = observed.checkpoint(0).and_then(|()| {
-            self.evaluate_once::<KernelFailure>(
-                CompiledInputLoan::RecordBatch(input),
-                selection,
-                selection,
-                novarocks_functions::ScalarInvocationActivation::Activated,
-                &mut work,
-            )
-        });
-        let result = work.finish(result);
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-    /// Actual caller demand, independent of empty Selection. This entry owns
-    /// atomic invocation Data while the old adapter remains Kernel-only.
-    pub fn evaluate_evaluation<'a>(
-        &mut self,
-        input: &RecordBatch,
-        selection: Selection<'a>,
+        input: EvaluationInput<'_>,
+        invocation: ScalarInvocationScope<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
-    ) -> crate::runtime::task::ExecutionResult<SelectedValues<'a>> {
-        self.evaluate_controlled::<crate::runtime::task::ExecutionFailure>(
-            input, selection, activation, control, None,
-        )
-    }
-    /// Production runtime callers explicitly loan their original synchronous
-    /// operation scope. This uses the SAME Frame tree and demand author.
-    pub fn evaluate_runtime<'a>(
-        &mut self,
-        input: &RecordBatch,
-        selection: Selection<'a>,
-        activation: novarocks_functions::ScalarInvocationActivation,
-        control: &dyn KernelEvaluationControl,
-        scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
-    ) -> crate::runtime::task::ExecutionResult<SelectedValues<'a>> {
-        self.evaluate_input_runtime(
-            CompiledInputLoan::RecordBatch(input),
-            selection,
-            activation,
-            control,
-            scope,
-        )
-    }
-    /// Borrows one structural input through the original runtime evaluator.
-    /// The input lifetime is independent of the returned Selection lifetime.
-    pub(crate) fn evaluate_input_runtime<'a>(
-        &mut self,
-        input: CompiledInputLoan<'_>,
-        selection: Selection<'a>,
-        activation: novarocks_functions::ScalarInvocationActivation,
-        control: &dyn KernelEvaluationControl,
-        scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
-    ) -> crate::runtime::task::ExecutionResult<SelectedValues<'a>> {
+        host: &mut dyn ScalarCallHost<Refusal = R>,
+    ) -> Result<SelectedValues<'a>, ExprEvaluationFailure<R>> {
         self.evaluate_input_controlled(
-            input,
-            selection,
-            selection,
-            activation,
-            control,
-            Some(scope),
-        )
-    }
-    /// Explicit actual root calling domain and independent output demand.
-    /// The caller authors the real root domain; no leaf infers it from lengths.
-    pub fn evaluate_scoped_evaluation<'a>(
-        &mut self,
-        input: &RecordBatch,
-        scope: novarocks_functions::ScalarInvocationScope<'a>,
-        activation: novarocks_functions::ScalarInvocationActivation,
-        control: &dyn KernelEvaluationControl,
-    ) -> crate::runtime::task::ExecutionResult<SelectedValues<'a>> {
-        self.evaluate_input_controlled(
-            CompiledInputLoan::RecordBatch(input),
-            scope.actual_domain(),
-            scope.demand(),
-            activation,
-            control,
-            None,
-        )
-    }
-    pub fn evaluate_scoped_runtime<'a>(
-        &mut self,
-        input: &RecordBatch,
-        invocation: novarocks_functions::ScalarInvocationScope<'a>,
-        activation: novarocks_functions::ScalarInvocationActivation,
-        control: &dyn KernelEvaluationControl,
-        runtime: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
-    ) -> crate::runtime::task::ExecutionResult<SelectedValues<'a>> {
-        self.evaluate_input_controlled(
-            CompiledInputLoan::RecordBatch(input),
+            FrameInput::new(input),
             invocation.actual_domain(),
             invocation.demand(),
             activation,
             control,
-            Some(runtime),
+            host,
         )
     }
     #[cfg(test)]
     pub(crate) fn observe_slot_source(&mut self, observer: Arc<input_source::SlotSourceObserver>) {
         self.slot_source_observer = Some(observer);
     }
-    fn evaluate_controlled<'a, E: scalar_invocation::FrameFailure>(
+    fn evaluate_input_controlled<'a, R>(
         &mut self,
-        input: &RecordBatch,
-        selection: Selection<'a>,
-        activation: novarocks_functions::ScalarInvocationActivation,
-        control: &dyn KernelEvaluationControl,
-        scope: Option<&mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope>,
-    ) -> Result<SelectedValues<'a>, E> {
-        self.evaluate_input_controlled(
-            CompiledInputLoan::RecordBatch(input),
-            selection,
-            selection,
-            activation,
-            control,
-            scope,
-        )
-    }
-    fn evaluate_input_controlled<'a, E: scalar_invocation::FrameFailure>(
-        &mut self,
-        input: CompiledInputLoan<'_>,
+        input: FrameInput<'_>,
         actual_domain: Selection<'a>,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
-        scope: Option<&mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope>,
-    ) -> Result<SelectedValues<'a>, E> {
+        host: &mut dyn ScalarCallHost<Refusal = R>,
+    ) -> Result<SelectedValues<'a>, ExprEvaluationFailure<R>> {
         use novarocks_functions::ScalarInvocationActivation;
         if self.failed {
             return Err(KernelFailure::InstanceFailed.into());
@@ -780,32 +668,32 @@ impl CompiledExpressionInstance {
         let mut work = Work {
             control: &observed,
             pending: 0,
-            scalar_scope: scope,
+            scalar_host: Some(host),
         };
         let result = (|| {
             observed.checkpoint(0)?;
-            self.evaluate_once::<E>(input, actual_domain, selection, activation, &mut work)
+            self.evaluate_once::<R>(input, actual_domain, selection, activation, &mut work)
         })();
         // A positively installed whole-invocation root preserves every first
         // failure, including entry validation before any leaf is created.
         let result = if self.has_invocation_data && result.is_err() {
             result
         } else {
-            E::finish(&mut work, result)
+            work.finish_evaluation(result)
         };
         if result.is_err() {
             self.failed = true;
         }
         result
     }
-    fn evaluate_once<'a, E: scalar_invocation::FrameFailure>(
+    fn evaluate_once<'a, R>(
         &mut self,
-        input: CompiledInputLoan<'_>,
+        input: FrameInput<'_>,
         actual_domain: Selection<'a>,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
-        work: &mut Work<'_, '_>,
-    ) -> Result<SelectedValues<'a>, E> {
+        work: &mut Work<'_, '_, R>,
+    ) -> Result<SelectedValues<'a>, ExprEvaluationFailure<R>> {
         if input.num_rows() != selection.batch_rows() {
             return Err(invalid("selection differs from actual input batch rows").into());
         }
@@ -825,7 +713,7 @@ impl CompiledExpressionInstance {
                     invalid("actual input differs from the root's empty one-row port").into(),
                 );
             }
-            return self.evaluate_root::<E>(input, actual_domain, selection, activation, work);
+            return self.evaluate_root::<R>(input, actual_domain, selection, activation, work);
         }
         work.flush()?;
         let schema = input.schema();
@@ -875,12 +763,12 @@ impl CompiledExpressionInstance {
             )?;
             work.step()?;
         }
-        self.evaluate_root::<E>(input, actual_domain, selection, activation, work)
+        self.evaluate_root::<R>(input, actual_domain, selection, activation, work)
     }
     /// Original checked lexical Slot facts for this actual root. Repeated
     /// occurrences may name one ordinal; consumers deduplicate coordinates.
     /// This exposes no evaluator, value algorithm or resource authority.
-    pub(crate) fn required_input_columns(&self) -> impl Iterator<Item = usize> + '_ {
+    pub fn required_input_columns(&self) -> impl Iterator<Item = usize> + '_ {
         self.effects.keys().filter_map(|occurrence| {
             self.program
                 .input(*occurrence)
@@ -888,15 +776,15 @@ impl CompiledExpressionInstance {
                 .map(|source| source.ordinal as usize)
         })
     }
-    fn evaluate_root<'a, E: scalar_invocation::FrameFailure>(
+    fn evaluate_root<'a, R>(
         &mut self,
-        input: CompiledInputLoan<'_>,
+        input: FrameInput<'_>,
         actual_domain: Selection<'a>,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
-        work: &mut Work<'_, '_>,
-    ) -> Result<SelectedValues<'a>, E> {
-        let result = guarded::evaluate_tree::<E>(
+        work: &mut Work<'_, '_, R>,
+    ) -> Result<SelectedValues<'a>, ExprEvaluationFailure<R>> {
+        let result = guarded::evaluate_tree::<R>(
             &self.program,
             self.root,
             input,
@@ -921,17 +809,17 @@ impl CompiledExpressionInstance {
         else {
             return Err(invalid("actual root is not a value").into());
         };
-        finish_root_value::<E>(result, ty, selection, self.allocator.as_ref(), work)
+        finish_root_value(result, ty, selection, self.allocator.as_ref(), work).map_err(Into::into)
     }
 }
 
-fn finish_root_value<'a, E: scalar_invocation::FrameFailure>(
+fn finish_root_value<'a>(
     result: Value<'a>,
     ty: &novarocks_functions::FunctionValueType,
     selection: Selection<'a>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-    work: &mut Work<'_, '_>,
-) -> Result<SelectedValues<'a>, E> {
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<SelectedValues<'a>, KernelFailure> {
     let result = result.materialize(selection, ty.data_type(), work)?;
     let (_, array, errors) = result.into_parts();
     let array = input_source::retain_result_type(array, ty, allocator, work.control)?;
@@ -961,7 +849,7 @@ fn finish_root_value<'a, E: scalar_invocation::FrameFailure>(
     Ok(result)
 }
 
-fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
+fn evaluate_scalar<'a, R, K: Ord + Clone>(
     occurrence: K,
     prepared: scalar_invocation::PreparedCall<'_>,
     children: &[Value<'a>],
@@ -969,8 +857,8 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
     activation: novarocks_functions::ScalarInvocationActivation,
     instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-    work: &mut Work<'_, '_>,
-) -> Result<SelectedValues<'a>, E> {
+    work: &mut Work<'_, '_, R>,
+) -> Result<SelectedValues<'a>, ExprEvaluationFailure<R>> {
     let mut blocked = Vec::with_capacity(selection.len());
     for _ in 0..selection.len() {
         blocked.push(false);
@@ -1010,8 +898,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
         work.step()?;
     }
     if active_rows.is_empty()
-        && !(E::ACTIVATE_EMPTY
-            && prepared.is_invocation()
+        && !(prepared.is_invocation()
             && selection.is_empty()
             && activation == novarocks_functions::ScalarInvocationActivation::Activated)
     {
@@ -1033,7 +920,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
             errors.into_boxed_slice(),
             || work.step(),
         )
-        .map_err(E::from);
+        .map_err(ExprEvaluationFailure::Kernel);
     }
     let full_call = active_rows.len() == selection.len();
     let call_selection = if full_call {
@@ -1097,7 +984,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
         work.control.checkpoint(0)?;
         entry.insert(instance);
     }
-    let output = match E::invoke(
+    let output = match scalar_invocation::invoke(
         instances
             .get_mut(&occurrence)
             .ok_or_else(|| internal("scalar instance was not installed"))?,
@@ -1152,14 +1039,14 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
         errors.into_boxed_slice(),
         || work.step(),
     )
-    .map_err(E::from)
+    .map_err(ExprEvaluationFailure::Kernel)
 }
 
 fn gather_continued(
     array: &ArrayRef,
     indices: &[Option<u64>],
     continuation: Option<&input_source::ArrayContinuation>,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<ArrayRef, KernelFailure> {
     let output = gather(array, indices, work)?;
     match continuation {
@@ -1171,7 +1058,7 @@ fn gather_continued(
 fn gather(
     array: &ArrayRef,
     indices: &[Option<u64>],
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<ArrayRef, KernelFailure> {
     work.flush()?;
     if indices.is_empty() {
@@ -1209,7 +1096,7 @@ mod copy_tests;
 mod constant_projection;
 mod guarded;
 mod node_recipes;
-mod scalar_invocation;
+pub(crate) mod scalar_invocation;
 pub(crate) mod utf8_inlist;
 
 #[cfg(test)]
@@ -1223,7 +1110,7 @@ mod unary;
 mod nary_tests;
 
 mod filter_conjunction;
-pub(crate) use filter_conjunction::CompiledFilterConjunctionInstance;
+pub use filter_conjunction::CompiledFilterConjunctionInstance;
 
 #[cfg(test)]
 mod runtime_invocation_memory_tests;
@@ -1263,10 +1150,10 @@ mod compile_interruption_footer_tests {
             refused: AtomicBool::new(false),
             operation_aborted: AtomicBool::new(false),
         };
-        let mut work = Work {
+        let mut work: Work<'_, '_> = Work {
             control: &control,
             pending: 1,
-            scalar_scope: None,
+            scalar_host: None,
         };
         let result: Result<(), _> = work.finish(Err(KernelFailure::CompileControl(cause.clone())));
         let KernelFailure::CompileControl(actual) = result.unwrap_err() else {
@@ -1358,8 +1245,7 @@ mod first_cause_settlement_footer_tests {
             allocator: &allocator,
             layout,
         };
-        let expected: ExecutionFailure =
-            KernelFailure::from_domain(LayoutResourceError::SourceModel).into();
+        let expected = KernelFailure::from_domain(LayoutResourceError::SourceModel);
         let late_cancel: ExecutionFailure = KernelFailure::Cancelled.into();
         let mut journal = KernelMemoryJournal::default();
         let result = ready
@@ -1368,7 +1254,7 @@ mod first_cause_settlement_footer_tests {
                 pointer.set(unsafe { allocator.alloc(layout) });
                 assert!(!pointer.get().is_null());
                 stopped.set_error(late_cancel.clone());
-                Err::<(), _>(expected.clone())
+                Err::<(), _>(ExprEvaluationFailure::Kernel(expected.clone()))
             })
             .unwrap();
         // The actual writer has exited before the ordinary Frame footer.
@@ -1385,15 +1271,13 @@ mod first_cause_settlement_footer_tests {
             refused: AtomicBool::new(false),
             operation_aborted: AtomicBool::new(false),
         };
-        let mut work = Work {
+        let mut work: Work<'_, '_> = Work {
             control: &observed,
             pending: 1,
-            scalar_scope: None,
+            scalar_host: None,
         };
-        let actual =
-            <ExecutionFailure as scalar_invocation::FrameFailure>::finish(&mut work, result)
-                .unwrap_err();
-        assert!(actual.same_occurrence(&expected));
+        let actual = work.finish_evaluation(result).unwrap_err();
+        assert_eq!(actual, ExprEvaluationFailure::Kernel(expected));
         assert!(!observed.refused.load(Ordering::Relaxed));
         // Cancellation remains independently observable; it never rewrites
         // the already originating occurrence or the completed settlement.

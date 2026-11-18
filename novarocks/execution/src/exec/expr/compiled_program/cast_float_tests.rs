@@ -17,6 +17,9 @@
 
 use super::*;
 use crate::exec::expr::compiled_program::checked_constants;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 
 fn float_batch(program: &LocalProgram, values: &[Option<f64>]) -> RecordBatch {
     let schema = program.graph().nodes()[1].output_layout().schema().clone();
@@ -157,15 +160,34 @@ fn float_signed_eight_profiles_preserve_arrow_edges_sparse_slices_null_and_both_
                     let mut evaluator = instance(&program);
                     let empty = evaluator
                         .evaluate(
-                            &batch,
-                            Selection::try_sparse(values.len(), &[]).unwrap(),
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            {
+                                let selection = Selection::try_sparse(values.len(), &[]).unwrap();
+                                ScalarInvocationScope::new(selection, selection)
+                            },
+                            ScalarInvocationActivation::Activated,
                             &Control,
+                            &mut PassThroughCallHost,
                         )
                         .unwrap();
                     assert!(empty.values().is_empty());
                     assert!(empty.errors().is_empty());
                     for _ in 0..2 {
-                        let output = evaluator.evaluate(&batch, selection, &Control).unwrap();
+                        let output = evaluator
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &batch,
+                                    source: None,
+                                },
+                                ScalarInvocationScope::new(selection, selection),
+                                ScalarInvocationActivation::Activated,
+                                &Control,
+                                &mut PassThroughCallHost,
+                            )
+                            .unwrap();
                         assert_eq!(output.selection(), selection);
                         assert_eq!(output.values().data_type(), &target);
                         assert_eq!(signed_values(&output), expected.to_vec());
@@ -224,7 +246,19 @@ fn float_nonnullable_source_allows_nonnullable_signed_only_with_actual_allow_tru
             );
             let rows = [0, 1, 2, 3];
             let output = instance(&program)
-                .evaluate(&batch, Selection::try_sparse(4, &rows).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    {
+                        let selection = Selection::try_sparse(4, &rows).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(
                 signed_values(&output),
@@ -467,7 +501,18 @@ fn float_cast_inherits_real_round_journal_without_reinterpreting_error_null_or_f
                 .unwrap()
                 .may_raise_row_error
         }));
-        let output = evaluator.evaluate(&batch, selection, &Control).unwrap();
+        let output = evaluator
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert_eq!(signed_values(&output), vec![None, None, None, None]);
         assert_eq!(
             errors(&output),
@@ -512,10 +557,19 @@ fn float_cast_runtime_every_original_callback_cause_latches_without_retry_includ
     let batch = float_batch(&program, &values);
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let output = instance(&program)
-        .evaluate(&batch, Selection::all(320), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(output.errors().len(), 160);
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
     for stop_at in 1..=trace.len() {
@@ -523,15 +577,24 @@ fn float_cast_runtime_every_original_callback_cause_latches_without_retry_includ
             let mut evaluator = instance(&program);
             let refusal = CallbackControl::new(cause.clone(), stop_at);
             assert!(
-                matches!(evaluator.evaluate(&batch, Selection::all(320), &refusal), Err(actual) if actual == cause)
+                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &refusal, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
             );
-            assert_eq!(*refusal.trace.lock().unwrap(), trace[..stop_at]);
+            assert_eq!(refusal.trace(), trace[..stop_at]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                evaluator.evaluate(&batch, Selection::all(320), &after),
-                Err(KernelFailure::InstanceFailed)
+                evaluator.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
 }
@@ -558,7 +621,7 @@ fn float_cast_compile_three_primary_causes_preserve_success_and_ordinary_false_a
             assert!(!matches!(error, FragmentCompileError::Control(_)));
             assert!(error.to_string().contains("successful-NULL"));
         }
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(!trace.is_empty());
         for stop_at in 1..=trace.len() {
             for cause in [
@@ -570,7 +633,7 @@ fn float_cast_compile_three_primary_causes_preserve_success_and_ordinary_false_a
                 assert!(
                     matches!(compile(&functions, package.clone(), &refusal), Err(FragmentCompileError::Control(actual)) if actual == cause)
                 );
-                assert_eq!(*refusal.trace.lock().unwrap(), trace[..stop_at]);
+                assert_eq!(refusal.trace(), trace[..stop_at]);
             }
         }
     }
@@ -600,7 +663,16 @@ fn float_cast_errors_remain_terminal_under_coalesce_and_is_null_with_full_child_
                 allow
             );
             let output = evaluator
-                .evaluate(&batch, Selection::all(3), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(errors(&output), if allow { vec![0] } else { vec![] });
             if matches!(wrap, Wrap::Coalesce) {

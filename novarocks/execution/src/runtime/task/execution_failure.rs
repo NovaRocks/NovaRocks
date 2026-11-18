@@ -18,7 +18,8 @@
 //! Execution-owned failure payloads. These facts own no terminal latch.
 
 use crate::exec::pipeline::operator::input_construction::ConstructionFailure;
-use novarocks_expression::RequiredExpressionRowError;
+use crate::runtime::scalar_memory::RuntimeScalarMemoryRefusal;
+use novarocks_expression::{ExprEvaluationFailure, RequiredExpressionRowError, ScalarCallFailure};
 use novarocks_functions::KernelFailure;
 use std::{
     error::Error,
@@ -465,20 +466,23 @@ impl From<novarocks_functions::ScalarInvocationFailure> for ExecutionFailure {
         }
     }
 }
-impl From<crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure> for ExecutionFailure {
-    fn from(error: crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure) -> Self {
-        use crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure;
+impl From<ScalarCallFailure<RuntimeScalarMemoryRefusal>> for ExecutionFailure {
+    fn from(error: ScalarCallFailure<RuntimeScalarMemoryRefusal>) -> Self {
+        Self::from(ExprEvaluationFailure::from(error))
+    }
+}
+impl From<ExprEvaluationFailure<RuntimeScalarMemoryRefusal>> for ExecutionFailure {
+    fn from(error: ExprEvaluationFailure<RuntimeScalarMemoryRefusal>) -> Self {
         let cause = match error {
-            RuntimeScalarEvaluationFailure::Kernel(cause) => return cause.into(),
-            RuntimeScalarEvaluationFailure::Data(cause) => {
+            ExprEvaluationFailure::Kernel(cause) => return cause.into(),
+            ExprEvaluationFailure::Data(cause) => {
                 ExecutionFailureCause::ScalarInvocationData(cause)
             }
-            RuntimeScalarEvaluationFailure::Source(cause) => {
+            ExprEvaluationFailure::Source(cause) => {
                 ExecutionFailureCause::RuntimeScalarSource(cause)
             }
-            RuntimeScalarEvaluationFailure::Host(cause) => {
-                ExecutionFailureCause::RuntimeScalarMemory(cause)
-            }
+            ExprEvaluationFailure::Host(cause) => ExecutionFailureCause::RuntimeScalarMemory(cause),
+            ExprEvaluationFailure::RequiredRow(cause) => return cause.into(),
         };
         Self {
             cause: FailureOccurrence::new(cause),
@@ -977,6 +981,32 @@ mod required_row_source_properties {
     use novarocks_expression_contract::RootOrdinal;
     use novarocks_failure_contract::FailureProjection;
     use novarocks_functions::{RowDataError, Selection};
+    #[test]
+    fn scalar_call_and_evaluation_failures_keep_the_original_nominal_cause() {
+        use novarocks_functions::ScalarResourceError;
+        let original = ScalarResourceError::SourceModel("original scalar source refusal");
+        let call = ScalarCallFailure::<RuntimeScalarMemoryRefusal>::Source(original);
+        let inner = ExecutionFailure::from(call.clone());
+        let outer = ExecutionFailure::from(ExprEvaluationFailure::from(call));
+        assert_eq!(
+            inner.cause(),
+            &ExecutionFailureCause::RuntimeScalarSource(original),
+        );
+        assert_eq!(outer.cause(), inner.cause());
+        assert_eq!(outer.failure_fact(), original.failure_fact());
+        assert_eq!(outer.to_string(), original.to_string());
+        assert_eq!(outer.source().unwrap().downcast_ref(), Some(&original));
+
+        let original = RuntimeScalarMemoryRefusal::MissingQueryMemory;
+        let failure = ExecutionFailure::from(ExprEvaluationFailure::Host(original.clone()));
+        assert_eq!(
+            failure.cause(),
+            &ExecutionFailureCause::RuntimeScalarMemory(original.clone()),
+        );
+        assert_eq!(failure.failure_fact(), original.failure_fact());
+        assert_eq!(failure.source().unwrap().downcast_ref(), Some(&original));
+    }
+
     #[test]
     fn required_root_preserves_the_row_error_source_and_selection_address() {
         let rows = [1, 4];

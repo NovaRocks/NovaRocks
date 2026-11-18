@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Public SQL completion inputs for owner and compile-to-execute tests.
+#[cfg(novarocks_dev_controls)]
 mod catalogue;
 mod source;
 mod support;
 
+#[cfg(novarocks_dev_controls)]
 pub use catalogue::installed_builtin_owner_catalogue;
 pub use source::{
     sql_source, sql_source_with_declared_fields, sql_source_with_semantics,

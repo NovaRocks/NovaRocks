@@ -17,7 +17,10 @@
 
 //! Full admitted successful-value shape matrix and real Frame fault/latch probes.
 use super::*;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
 use novarocks_functions::{KernelDiagnostic, KernelFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use std::{sync::Mutex, time::Duration};
 fn compare_profile(dtype: DataType, p: u8, s: i8, expected_full: [Expected; 5]) {
     let (min, max) = bound(&dtype);
@@ -56,7 +59,16 @@ fn compare_profile(dtype: DataType, p: u8, s: i8, expected_full: [Expected; 5]) 
             ] {
                 let selection = Selection::try_sparse(n, &rows).unwrap();
                 let output = instance(&program)
-                    .evaluate(&b, selection, &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &b,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(output.selection(), selection);
                 assert_eq!(output.values().data_type(), &target);
@@ -208,7 +220,19 @@ fn integral_decimal128_actual_after_original_i64_constant_broadcast_exact_source
         )
         .unwrap();
         let output = instance(&program)
-            .evaluate(&b, Selection::try_sparse(5, &[1, 4]).unwrap(), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &b,
+                    source: None,
+                },
+                {
+                    let selection = Selection::try_sparse(5, &[1, 4]).unwrap();
+                    ScalarInvocationScope::new(selection, selection)
+                },
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert!(output.errors().is_empty());
         assert_eq!(values(output.values()), vec![Some(71), Some(71)]);
@@ -277,18 +301,40 @@ fn integral_decimal128_actual_after_every_frame_callback_keeps_seven_causes_and_
     for rows in [vec![0, 1, 2], vec![0, 2], Vec::new()] {
         let selection = Selection::try_sparse(3, &rows).unwrap();
         let record = Callback::new(usize::MAX, KernelFailure::Cancelled);
-        instance(&program).evaluate(&b, selection, &record).unwrap();
+        instance(&program)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &b,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &record,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         let trace = record.trace.lock().unwrap().clone();
         for stop in 1..=trace.len() {
             for cause in causes() {
                 let c = Callback::new(stop, cause.clone());
                 let mut frame = instance(&program);
-                assert!(matches!(frame.evaluate(&b,selection,&c),Err(actual) if actual==cause));
+                assert!(
+                    matches!(frame.evaluate(EvaluationInput::Batch { batch: &b, source: None }, ScalarInvocationScope::new(selection, selection), ScalarInvocationActivation::Activated, &c, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
+                );
                 assert_eq!(*c.trace.lock().unwrap(), trace[..stop]);
                 let after = Callback::new(usize::MAX, KernelFailure::Cancelled);
                 assert!(matches!(
-                    frame.evaluate(&b, selection, &after),
-                    Err(KernelFailure::InstanceFailed)
+                    frame.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &b,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &after,
+                        &mut PassThroughCallHost
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
                 assert!(after.trace.lock().unwrap().is_empty());
             }

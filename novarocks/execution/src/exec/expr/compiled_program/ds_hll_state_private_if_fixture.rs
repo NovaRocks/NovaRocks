@@ -144,7 +144,7 @@ fn program_with_target(target: FunctionValueType) -> Arc<LocalProgram> {
             None,
             result_ty.clone(),
             ExprKind::FunctionCall {
-                function: owner.function.clone(),
+                function: owner.function().clone(),
                 args: children[..3].to_vec().into_boxed_slice(),
             },
         )
@@ -180,7 +180,7 @@ fn program_with_target(target: FunctionValueType) -> Arc<LocalProgram> {
             None,
             result_ty.clone(),
             ExprKind::FunctionCall {
-                function: conditional.function.clone(),
+                function: conditional.function().clone(),
                 args: Box::from([children[3], call, fallback]),
             },
         )

@@ -22,25 +22,27 @@ use arrow::{
     datatypes::DataType,
     record_batch::RecordBatch,
 };
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::{
+    ClaimAuthor, PassThroughCallHost, add_call as call, declare_call_controls, finish_unit,
+    register_call_requests,
+};
 use novarocks_expression::{
     CompiledExprSet, EvaluationEnvironment, ScopeColumn, ScopeLayout, ScopeLayouts,
     compile_expr_set_pure,
 };
 use novarocks_expression_contract::{
-    BoundExprSetBuilder, BoundFunction, DefinitionControl, ExprId, ExprKind, ExprPort,
-    ExpressionCallClaim, PhysicalCallRequest, RootOrdinal, RootScope, UnitLimits, ValueId,
+    BoundExprSetBuilder, ExprKind, ExprPort, RootOrdinal, RootScope, UnitLimits, ValueId,
 };
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
-    FunctionResultType, InstalledPureKernel, KernelEvaluationControl, KernelFailure,
-    PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi, ScopedExpressionEffects, Selection,
+    ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument, FunctionId,
+    FunctionKind, FunctionOverloadId, InstalledPureKernel, KernelEvaluationControl, KernelFailure,
+    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    Selection,
 };
-use novarocks_physical_plan::StaticFunctionArgument;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_type_contract::{
-    ArgumentControl, CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase,
-    ControlShape, DecimalOverflowPolicy, EvaluationDemand, ExpressionUseId, FunctionValueType,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType,
     MAX_CONTROL_DEPTH, PureCompileControl, SemanticParameters, ValueTypeStorageLifetime,
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -105,76 +107,12 @@ fn catalogue() -> PureEngineFunctionCatalog {
     builder.seal_pure(manifest).unwrap()
 }
 
-struct Author {
-    function: BoundFunction,
-    selected: Arc<FunctionBindingSelection>,
-    arguments: Vec<FunctionArgument>,
-    logical_argument_count: usize,
-    constant_policy: ConstantPolicy,
-    control: ControlShape,
-}
-impl Author {
-    fn request(&self) -> FunctionBindingRequest<'_> {
-        FunctionBindingRequest {
-            arguments: &self.arguments,
-            logical_argument_count: self.logical_argument_count,
-            expected_result_type: None,
-        }
-    }
-    fn result(&self) -> FunctionValueType {
-        let FunctionResultType::Scalar(result) = &self.selected.result_type else {
-            panic!("scalar owner")
-        };
-        result.clone()
-    }
-}
 fn author(
     functions: &PureEngineFunctionCatalog,
     name: &str,
     arguments: Vec<FunctionArgument>,
-) -> Author {
-    let logical_argument_count = arguments.len();
-    let request = FunctionBindingRequest {
-        arguments: &arguments,
-        logical_argument_count,
-        expected_result_type: None,
-    };
-    let bound = functions
-        .metadata()
-        .resolve_bound_user(name, FunctionKind::Scalar, request, &Control)
-        .unwrap();
-    let selected = Arc::new(bound.selected.clone());
-    let FunctionResultType::Scalar(result) = &selected.result_type else {
-        panic!("scalar owner")
-    };
-    let declaration = functions
-        .metadata()
-        .pure_overload_declaration_observed(
-            &bound.function_id,
-            bound.kind,
-            &selected.overload,
-            &Control,
-        )
-        .unwrap();
-    let control = match declaration.effects().argument_control {
-        ArgumentControl::Eager => ControlShape::Eager,
-        _ => panic!("the actual ROUND/RAND owners must declare eager control"),
-    };
-    let function = BoundFunction::from_exact_signature(
-        bound.function_id,
-        selected.overload.clone(),
-        bound.kind,
-        selected.argument_types.clone(),
-        result.clone(),
-    );
-    Author {
-        function,
-        selected,
-        arguments,
-        logical_argument_count,
-        constant_policy: constant_policy(),
-        control,
-    }
+) -> ClaimAuthor {
+    ClaimAuthor::with_exact_eager_binding(functions, name, arguments, constant_policy(), &Control)
 }
 fn constant_policy() -> ConstantPolicy {
     ConstantPolicy {
@@ -188,62 +126,6 @@ fn constant_policy() -> ConstantPolicy {
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
-}
-// Transfer the first resolver request; child shapes never reconstruct it.
-fn original_request_sources(
-    builder: &mut BoundExprSetBuilder,
-    authors: &BTreeMap<ExprId, Author>,
-    pools: &mut novarocks_physical_plan::ConstantPools,
-) {
-    for (&definition, owner) in authors {
-        let original = owner.request();
-        let arguments = original
-            .arguments
-            .iter()
-            .map(|argument| match argument {
-                FunctionArgument::Value {
-                    value_type,
-                    constant,
-                } => {
-                    let constant = constant.as_ref().map(|value| {
-                        crate::exec::expr::test_support::register_constant(pools, value)
-                    });
-                    StaticFunctionArgument::Value {
-                        value_type: value_type.clone(),
-                        constant,
-                    }
-                }
-                FunctionArgument::Lambda {
-                    parameter_types,
-                    result_type,
-                } => StaticFunctionArgument::Lambda {
-                    parameter_types: parameter_types.clone(),
-                    result_type: result_type.clone(),
-                },
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        builder
-            .request(
-                definition,
-                PhysicalCallRequest {
-                    arguments,
-                    logical_argument_count: original.logical_argument_count,
-                    expected_result_type: original.expected_result_type.cloned(),
-                    constant_policy: owner.constant_policy,
-                },
-            )
-            .unwrap();
-        builder
-            .definition_control(
-                definition,
-                DefinitionControl {
-                    shape: owner.control,
-                    temporal_sources: None,
-                },
-            )
-            .unwrap();
     }
 }
 fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
@@ -267,26 +149,6 @@ fn argument(ty: FunctionValueType, constant: Option<ConstantValue>) -> FunctionA
         constant,
     }
 }
-fn call(
-    builder: &mut BoundExprSetBuilder,
-    authors: &mut BTreeMap<ExprId, Author>,
-    author: Author,
-    args: Vec<ExprId>,
-) -> ExprId {
-    let id = builder
-        .add(
-            None,
-            author.result(),
-            ExprKind::FunctionCall {
-                function: author.function.clone(),
-                args: args.into_boxed_slice(),
-            },
-        )
-        .unwrap();
-    authors.insert(id, author);
-    id
-}
-
 #[derive(Clone, Copy)]
 enum Shape {
     Single,
@@ -410,9 +272,10 @@ fn program(shape: Shape) -> Program {
                 .unwrap(),
         );
     }
-    original_request_sources(&mut builder, &authors, &mut constants);
+    register_call_requests(&mut builder, &authors, &mut constants);
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    declare_call_controls(&mut builder, &authors, &mut work);
     let sealed = builder
         .seal(
             vec![ExprPort {
@@ -421,75 +284,20 @@ fn program(shape: Shape) -> Program {
             &mut work,
         )
         .unwrap();
-    let mut effects = BTreeMap::<ExpressionUseId, ScopedExpressionEffects>::new();
-    let mut claims = BTreeMap::new();
-    // These fixed definitions were authored after their actual children. Check
-    // that fixture premise instead of interpreting use numbers as a schedule.
-    for definition in sealed.definitions() {
-        for (&use_id, invocation) in sealed
-            .uses()
-            .iter()
-            .filter(|(_, item)| item.definition == definition.id)
-        {
-            let context = invocation.context;
-            let mut children = ScopedExpressionEffects::pure_value(context);
-            for (ordinal, child) in invocation.arguments.iter().enumerate() {
-                assert!(sealed.uses()[child].definition.get() < definition.id.get());
-                children = children
-                    .join_control_argument(effects[child], sealed.control_flow(), ordinal)
-                    .unwrap();
-            }
-            let summary = if let Some(owner) = authors.get(&definition.id) {
-                let argument_uses = invocation
-                    .arguments
-                    .iter()
-                    .map(|id| Some(*id))
-                    .collect::<Vec<_>>();
-                let token = functions
-                    .prepare_fresh(
-                        CallEffectInput {
-                            context: context.into(),
-                            argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
-                                &argument_uses,
-                            ),
-                            function_id: &owner.function.function_id,
-                            kind: FunctionKind::Scalar,
-                            selected: owner.selected.as_ref(),
-                            request: owner.request(),
-                            environment: &[],
-                            parameters: &parameters,
-                            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                            proof_scope: CallProofScope::Region(context.region),
-                        },
-                        owner.selected.clone(),
-                        PureCallPreparation::Scalar {
-                            arguments: children,
-                        },
-                        &Control,
-                    )
-                    .unwrap();
-                claims.insert(
-                    use_id,
-                    ExpressionCallClaim {
-                        context,
-                        effects: token.call_contract().effects().clone(),
-                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        temporal_source: None,
-                        regexp_count_pattern_source: None,
-                        to_base64_byte_source: None,
-                    },
-                );
-                ScopedExpressionEffects::primitive(
-                    context,
-                    token.effects().for_use(context).unwrap(),
-                )
-            } else {
-                children
-            };
-            effects.insert(use_id, summary);
+    // These fixed definitions were authored after their actual children.
+    for invocation in sealed.uses().values() {
+        for child in invocation.arguments.iter() {
+            assert!(sealed.uses()[child].definition.get() < invocation.definition.get());
         }
     }
-    let unit = sealed.finish(claims, &mut work).unwrap();
+    let unit = finish_unit(
+        &functions,
+        sealed,
+        &authors,
+        &parameters,
+        &mut work,
+        |_, _, children| children,
+    );
     work.finish().unwrap();
     let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::LowerProgram).unwrap();
     let schema = Arc::new(arrow::datatypes::Schema::new(
@@ -709,7 +517,18 @@ fn strict_null_and_real_decimal_overflow_remap_to_parent_selected_ordinal() {
     let rows = [1, 2, 4];
     let selection = Selection::try_sparse(5, &rows).unwrap();
     let mut evaluator = instance(&program, 0);
-    let result = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let result = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     let values = result
         .values()
         .as_any()
@@ -726,7 +545,16 @@ fn strict_null_and_real_decimal_overflow_remap_to_parent_selected_ordinal() {
     // Row errors do not poison a successful evaluator instance.
     let clean = batch(&program, vec![Some(25)], vec![None]);
     let next = evaluator
-        .evaluate(&clean, Selection::all(1), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &clean,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert!(next.errors().is_empty());
 }
@@ -741,7 +569,19 @@ fn nested_round_keeps_required_child_error_and_successful_null_distinct() {
     );
     let rows = [1, 2, 3];
     let result = instance(&program, 0)
-        .evaluate(&input, Selection::try_sparse(4, &rows).unwrap(), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            {
+                let selection = Selection::try_sparse(4, &rows).unwrap();
+                ScalarInvocationScope::new(selection, selection)
+            },
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     let values = result
         .values()
@@ -762,18 +602,56 @@ fn eager_rng_child_advances_even_when_parent_strict_digits_are_null() {
     let mut reference = instance(&program, 1);
     let null_digits = batch(&program, vec![None; 2], vec![None; 2]);
     let skipped = parent
-        .evaluate(&null_digits, Selection::all(2), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &null_digits,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(skipped.values().null_count(), 2);
     assert!(skipped.errors().is_empty());
     let first_two = reference
-        .evaluate(&null_digits, Selection::all(2), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &null_digits,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(first_two.values().null_count(), 0);
     let next = batch(&program, vec![None], vec![Some(15)]);
-    let actual = parent.evaluate(&next, Selection::all(1), &Control).unwrap();
+    let actual = parent
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &next,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     let reference = reference
-        .evaluate(&next, Selection::all(1), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &next,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     let source = reference
         .values()

@@ -18,6 +18,7 @@
 //! Single Frame source phase tests; no replacement evaluator or source walker.
 use super::*;
 use arrow::array::{BinaryArray, Date32Array, TimestampMicrosecondArray};
+use novarocks_expression::EvaluationInput;
 use novarocks_type_contract::{ExpressionUseId, TemporalSourceShape as S};
 use std::sync::Mutex;
 struct Control {
@@ -55,7 +56,10 @@ fn source_domain() -> Arc<super::input_source::ActualInvocationDomain> {
     .unwrap();
     Arc::new(
         super::input_source::ActualInvocationDomain::root(
-            super::input_source::CompiledInputLoan::RecordBatch(&batch),
+            super::input_source::FrameInput::new(EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            }),
             Selection::all(7),
             &control(usize::MAX, KernelFailure::Cancelled),
         )
@@ -109,10 +113,10 @@ fn error_placeholders_never_trigger_whole_invocation_null_guard() {
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let mut frame = frame(&mut work);
     normal_with_prior_error(&mut frame, false, &mut work);
@@ -139,10 +143,10 @@ fn demanded_deepest_data_error_projects_all_successes_preserving_prior_child_err
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let mut frame = frame(&mut work);
     normal_with_prior_error(&mut frame, true, &mut work);
@@ -185,10 +189,10 @@ fn binary_safe_null_is_data_not_control_failure_for_exact_sparse_domain() {
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let mut frame = frame(&mut work);
     frame.next = 3;
@@ -239,10 +243,10 @@ fn malformed_timezone_metadata_preserves_parser_source_without_row_permission() 
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let zone = "invalid_zone_".repeat(60);
     let array =
@@ -302,10 +306,10 @@ fn deepest(control: &Control) -> Result<(), KernelFailure> {
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let frame = Frame::new(
         ExpressionUseId::new(1),

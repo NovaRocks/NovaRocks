@@ -16,6 +16,9 @@
 // under the License.
 //! Real compiler/Frame and the original actual production tracker host.
 use super::*;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 #[path = "percentile_raw_private_frame_fixture.rs"]
 mod fixture;
 use crate::runtime::mem_tracker::MemTracker;
@@ -36,7 +39,16 @@ fn percentile_raw_private_frame_original_values_full_rowdata_sparse_and_host_dro
     )
     .unwrap();
     let output = instance
-        .evaluate(&batch, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(output.errors().len(), 1);
     assert_eq!(output.errors()[0].selected_ordinal(), 0);
@@ -62,16 +74,36 @@ fn percentile_raw_private_frame_original_values_full_rowdata_sparse_and_host_dro
     let selected = [2];
     let output = instance
         .evaluate(
-            &batch,
-            Selection::try_sparse(3, &selected).unwrap(),
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            {
+                let selection = Selection::try_sparse(3, &selected).unwrap();
+                ScalarInvocationScope::new(selection, selection)
+            },
+            ScalarInvocationActivation::Activated,
             &Control,
+            &mut PassThroughCallHost,
         )
         .unwrap();
     assert!(output.errors().is_empty());
     assert_eq!(output.selection().row(0), Some(2));
     drop(output);
     let output = instance
-        .evaluate(&batch, Selection::try_sparse(3, &[]).unwrap(), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            {
+                let selection = Selection::try_sparse(3, &[]).unwrap();
+                ScalarInvocationScope::new(selection, selection)
+            },
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(output.values().len(), 0);
     drop(output);
@@ -89,8 +121,19 @@ fn percentile_raw_private_frame_missing_host_and_true_budget_failure_latch() {
     )
     .unwrap();
     assert!(matches!(
-        no_host.evaluate(&batch, Selection::all(3), &Control),
-        Err(KernelFailure::InvalidProgram(_))
+        no_host.evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost
+        ),
+        Err(ExprEvaluationFailure::Kernel(
+            KernelFailure::InvalidProgram(_)
+        ))
     ));
     let tracker = MemTracker::new_root("percentile-raw-refusal");
     tracker.install_limit_once(1).unwrap();
@@ -102,12 +145,30 @@ fn percentile_raw_private_frame_missing_host_and_true_budget_failure_latch() {
     )
     .unwrap();
     let refusal = instance
-        .evaluate(&batch, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap_err();
     crate::runtime_filter::assert_real_tracker_capacity(&refusal, 1);
     assert!(matches!(
-        instance.evaluate(&batch, Selection::all(3), &Control),
-        Err(KernelFailure::InstanceFailed)
+        instance.evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost
+        ),
+        Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
     ));
     drop(instance);
     assert_eq!(tracker.current(), 0);
@@ -203,11 +264,20 @@ fn percentile_raw_private_frame_constructor_host_seven_causes_have_no_footer() {
             .unwrap();
             let control = NoTail(&authority);
             assert!(
-                matches!(instance.evaluate(&batch,Selection::all(3),&control),Err(actual) if actual==cause)
+                matches!(instance.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(3), Selection::all(3)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
             );
             assert!(matches!(
-                instance.evaluate(&batch, Selection::all(3), &control),
-                Err(KernelFailure::InstanceFailed)
+                instance.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                    ScalarInvocationActivation::Activated,
+                    &control,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
             drop(instance);
             assert_eq!(tracker.current(), 0);

@@ -20,7 +20,10 @@ use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{
     ArrayRef, BinaryArray, FixedSizeBinaryBuilder, LargeBinaryArray, LargeStringArray, StringArray,
 };
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
 use novarocks_functions::ComparisonOperator;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 
 #[derive(Clone, Copy)]
 enum Source {
@@ -363,7 +366,16 @@ fn ordered_four_operators_preserve_i64_precision_extremes_sparse_nulls_and_actua
         let rows = [1, 2, 3, 4, 5, 6];
         let selection = Selection::try_sparse(7, &rows).unwrap();
         let output = ordered_instance(&program, false)
-            .evaluate(&input, selection, &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(output.selection(), selection);
         assert_eq!(
@@ -406,7 +418,16 @@ fn ordered_float_total_order_distinguishes_signed_zero_nan_payload_sign_and_infi
             vec![None; 8],
         );
         let output = ordered_instance(&program, false)
-            .evaluate(&input, Selection::all(8), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(8), Selection::all(8)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(
             result(&output),
@@ -495,7 +516,16 @@ fn ordered_bytes_compare_actual_sliced_common_prefix_unsigned_bytes_and_null_spa
             .slice(1, 5);
             let input = ordered_batch(&program, left, right, vec![None; 5]);
             let dense = ordered_instance(&program, false)
-                .evaluate(&input, Selection::all(5), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(5), Selection::all(5)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(
                 result(&dense),
@@ -504,7 +534,16 @@ fn ordered_bytes_compare_actual_sliced_common_prefix_unsigned_bytes_and_null_spa
             let rows = [0, 2, 3, 4];
             let selection = Selection::try_sparse(5, &rows).unwrap();
             let output = ordered_instance(&program, false)
-                .evaluate(&input, selection, &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(
                 result(&output),
@@ -528,7 +567,16 @@ fn ordered_filter_truth_only_root_keeps_value_demand_children_and_successful_nul
             vec![None; 3],
         );
         let output = ordered_instance(&program, true)
-            .evaluate(&input, Selection::all(3), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(
             result(&output),
@@ -550,7 +598,18 @@ fn ordered_eager_right_rand_advances_on_left_null_and_both_instances_keep_indepe
     let rows = [1, 4];
     let selection = Selection::try_sparse(6, &rows).unwrap();
     let mut evaluator = ordered_instance(&program, false);
-    let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let output = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     // Left instance gets r0 only; right gets r0,r1 even for left's NULL row.
     assert_eq!(result(&output), vec![None, Some(true)]);
     assert!(output.errors().is_empty());
@@ -562,7 +621,16 @@ fn ordered_eager_right_rand_advances_on_left_null_and_both_instances_keep_indepe
         vec![Some(true)],
     );
     let output = evaluator
-        .evaluate(&next, Selection::all(1), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &next,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     // Independent locked seed42 oracle: r1=0x3fe15e014267f5aa,
     // r2=0x3fe45dec0e3bca26. Skipping right on NULL would compare r1 to r1.
@@ -603,7 +671,16 @@ fn ordered_both_round_children_preserve_each_compact_error_cursor_and_eager_righ
     let rows = [1, 3, 5, 7, 9];
     let selection = Selection::try_sparse(10, &rows).unwrap();
     let output = ordered_instance(&program, false)
-        .evaluate(&input, selection, &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(result(&output), vec![None, None, None, Some(false), None]);
     assert_eq!(
@@ -648,7 +725,16 @@ fn every_actual_ordered_comparison_callback_keeps_seven_primary_failures_and_ref
     );
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let output = ordered_instance(&program, false)
-        .evaluate(&input, Selection::all(320), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(output.errors().len(), 213);
     assert_eq!(
@@ -657,7 +743,7 @@ fn every_actual_ordered_comparison_callback_keeps_seven_primary_failures_and_ref
             .map(|row| if row % 3 == 0 { Some(true) } else { None })
             .collect::<Vec<_>>()
     );
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
     for index in 1..=trace.len() {
@@ -665,15 +751,24 @@ fn every_actual_ordered_comparison_callback_keeps_seven_primary_failures_and_ref
             let mut evaluator = ordered_instance(&program, false);
             let control = CallbackControl::new(cause.clone(), index);
             assert!(
-                matches!(evaluator.evaluate(&input, Selection::all(320), &control), Err(actual) if actual == cause)
+                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &input, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+            assert_eq!(control.trace(), trace[..index]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                evaluator.evaluate(&input, Selection::all(320), &after),
-                Err(KernelFailure::InstanceFailed)
+                evaluator.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
 }
@@ -736,7 +831,16 @@ fn ordered_largeint_is_signed_i128_while_same_fixed16_physical_and_uuid_keep_byt
                 vec![None; 6],
             );
             let output = ordered_instance(&program, false)
-                .evaluate(&input, Selection::all(6), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(6), Selection::all(6)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             let relations =
                 if domain.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt {

@@ -17,6 +17,9 @@
 //! Actual compiler and selected evaluator for the exact Physical FSB16 profile.
 use super::*;
 use arrow::array::StringArray;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 #[test]
 fn largeint_text_actual_compiler_sparse_slice_null_empty_and_effects() {
     let input =
@@ -56,7 +59,19 @@ fn largeint_text_actual_compiler_sparse_slice_null_empty_and_effects() {
             );
             let rows = [0, 1, 2];
             let result = evaluator
-                .evaluate(&batch, Selection::try_sparse(3, &rows).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    {
+                        let selection = Selection::try_sparse(3, &rows).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(
                 result.values().to_data(),
@@ -71,7 +86,19 @@ fn largeint_text_actual_compiler_sparse_slice_null_empty_and_effects() {
             );
             assert!(result.errors().is_empty());
             let output = evaluator
-                .evaluate(&batch, Selection::try_sparse(3, &[]).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    {
+                        let selection = Selection::try_sparse(3, &[]).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(
                 output.values().to_data(),

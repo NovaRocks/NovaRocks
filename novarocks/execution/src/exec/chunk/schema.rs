@@ -1895,7 +1895,11 @@ impl ChunkSchema {
     }
 
     pub fn arrow_schema_ref(&self) -> SchemaRef {
-        Arc::clone(&self.arrow_schema)
+        Arc::clone(self.borrowed_arrow_schema_ref())
+    }
+
+    pub(crate) fn borrowed_arrow_schema_ref(&self) -> &SchemaRef {
+        &self.arrow_schema
     }
 
     pub fn slot_ids(&self) -> &[SlotId] {

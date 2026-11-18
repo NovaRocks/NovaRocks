@@ -18,6 +18,9 @@
 use super::*;
 use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{ArrayRef, StringArray};
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 fn functions() -> PureEngineFunctionCatalog {
     let actual =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
@@ -154,7 +157,7 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
             None,
             owner.result(),
             ExprKind::FunctionCall {
-                function: owner.function.clone(),
+                function: owner.function().clone(),
                 args: args.into_boxed_slice(),
             },
         )
@@ -239,7 +242,18 @@ fn parse_url_actual_compiler_both_profiles_dynamic_and_native_constants_keep_key
             let rows = [0, 1, 2, 3];
             let selection = Selection::try_sparse(4, &rows).unwrap();
             let mut evaluator = instance(&program);
-            let result = evaluator.evaluate(&batch, selection, &Control).unwrap();
+            let result = evaluator
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
             let expected = match constant_part {
                 Some("HOST") => vec![Some("example.com"), Some("x"), None, None],
                 Some("QUERY") if arity == 2 => {
@@ -263,7 +277,19 @@ fn parse_url_actual_compiler_both_profiles_dynamic_and_native_constants_keep_key
             assert_eq!(result.selection(), selection);
             assert!(result.errors().is_empty());
             let empty = evaluator
-                .evaluate(&batch, Selection::try_sparse(4, &[]).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    {
+                        let selection = Selection::try_sparse(4, &[]).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(empty.values().len(), 0);
             assert_eq!(empty.values().data_type(), &DataType::Utf8);
@@ -287,9 +313,18 @@ fn parse_url_actual_compiler_all_seven_runtime_causes_keep_first_cause_and_insta
         .unwrap();
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
         instance(&program)
-            .evaluate(&batch, Selection::all(2), &recorder)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+                ScalarInvocationActivation::Activated,
+                &recorder,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(trace.contains(&256));
         assert!(trace.iter().all(|units| *units <= 256));
         for index in 1..=trace.len() {
@@ -297,15 +332,24 @@ fn parse_url_actual_compiler_all_seven_runtime_causes_keep_first_cause_and_insta
                 let mut evaluator = instance(&program);
                 let control = CallbackControl::new(cause.clone(), index);
                 assert!(
-                    matches!(evaluator.evaluate(&batch, Selection::all(2), &control), Err(actual) if actual == cause)
+                    matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(2), Selection::all(2)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
                 );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+                assert_eq!(control.trace(), trace[..index]);
                 let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
                 assert!(matches!(
-                    evaluator.evaluate(&batch, Selection::all(2), &after),
-                    Err(KernelFailure::InstanceFailed)
+                    evaluator.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+                        ScalarInvocationActivation::Activated,
+                        &after,
+                        &mut PassThroughCallHost
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
-                assert!(after.trace.lock().unwrap().is_empty());
+                assert!(after.trace().is_empty());
             }
         }
     }

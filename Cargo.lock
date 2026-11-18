@@ -4049,6 +4049,7 @@ dependencies = [
  "novarocks-connector-paimon",
  "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-expression",
  "novarocks-expression-contract",
  "novarocks-failpoint",
  "novarocks-frontend-application",

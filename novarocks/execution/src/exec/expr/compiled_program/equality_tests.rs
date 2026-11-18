@@ -18,7 +18,10 @@
 use super::*;
 use crate::exec::expr::compiled_program::checked_constants;
 use novarocks_expression::ComparisonSite;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
 use novarocks_expression_contract::BinaryOperator;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_type_contract::ExpressionUseId;
 
 #[derive(Clone, Copy)]
@@ -462,7 +465,16 @@ fn ordinary_eq_and_not_eq_preserve_frozen_float_bits_and_nulls_in_sparse_rows() 
         let input = float_batch(&program, left.clone(), right.clone(), vec![None; 10]);
         let selection = Selection::try_sparse(10, &rows).unwrap();
         let output = instance(&program)
-            .evaluate(&input, selection, &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         let eq = [
             Some(true),
@@ -512,7 +524,16 @@ fn simple_case_source_labels_keep_first_match_null_nonmatch_sparse_rows_and_reci
     let rows = [1, 2, 3, 4, 5];
     let selection = Selection::try_sparse(6, &rows).unwrap();
     let output = instance(&program)
-        .evaluate(&input, selection, &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(output.selection(), selection);
     assert_eq!(
@@ -530,13 +551,33 @@ fn simple_case_rand_operand_is_evaluated_once_per_selected_parent_across_all_whe
     let rows = [1, 4];
     let selection = Selection::try_sparse(6, &rows).unwrap();
     let mut evaluator = instance(&program);
-    let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let output = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert_eq!(integers(&output), vec![Some(10), Some(20)]);
     assert!(output.errors().is_empty());
     assert_eq!(evaluator.instances.len(), 1);
     let next = float_batch(&program, vec![None], vec![None], vec![None]);
     let output = evaluator
-        .evaluate(&next, Selection::all(1), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &next,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(integers(&output), vec![Some(30)]);
     assert_eq!(evaluator.instances.len(), 1);
@@ -554,7 +595,18 @@ fn simple_case_rand_when_labels_only_advance_remaining_rows_with_independent_sta
     let rows = [1, 3, 5, 8];
     let selection = Selection::try_sparse(9, &rows).unwrap();
     let mut evaluator = instance(&program);
-    let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let output = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     // WHEN1 samples r0..r3; only row1 matches. WHEN2 samples r0..r2
     // over the three remaining rows; only original row5 matches r1.
     assert_eq!(
@@ -570,7 +622,16 @@ fn simple_case_rand_when_labels_only_advance_remaining_rows_with_independent_sta
         vec![None; 2],
     );
     let output = evaluator
-        .evaluate(&next, Selection::all(2), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &next,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     // WHEN1 now uses r4,r5; WHEN2 uses its own r3,r4.
     assert_eq!(integers(&output), vec![Some(20), Some(30)]);
@@ -605,7 +666,16 @@ fn simple_case_round_operand_and_label_errors_are_terminal_without_null_match_or
         );
         let selection = Selection::try_sparse(8, &rows).unwrap();
         let output = instance(&program)
-            .evaluate(&input, selection, &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(output.selection(), selection);
         assert_eq!(
@@ -631,7 +701,19 @@ fn simple_case_empty_selection_does_not_initialize_operand_or_when_rand_instance
         let mut evaluator = instance(&program);
         let rows = [];
         let output = evaluator
-            .evaluate(&input, Selection::try_sparse(4, &rows).unwrap(), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                {
+                    let selection = Selection::try_sparse(4, &rows).unwrap();
+                    ScalarInvocationScope::new(selection, selection)
+                },
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert!(output.values().is_empty());
         assert!(output.errors().is_empty());
@@ -643,7 +725,16 @@ fn simple_case_empty_selection_does_not_initialize_operand_or_when_rand_instance
             vec![None],
         );
         let output = evaluator
-            .evaluate(&next, Selection::all(1), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &next,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(integers(&output), vec![Some(10)]);
     }
@@ -668,7 +759,16 @@ fn every_actual_simple_case_callback_preserves_all_seven_primary_failures_and_re
     );
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let output = instance(&program)
-        .evaluate(&input, Selection::all(320), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(output.errors().len(), 106);
     assert_eq!(
@@ -681,7 +781,7 @@ fn every_actual_simple_case_callback_preserves_all_seven_primary_failures_and_re
             })
             .collect::<Vec<_>>()
     );
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
     for index in 1..=trace.len() {
@@ -689,15 +789,24 @@ fn every_actual_simple_case_callback_preserves_all_seven_primary_failures_and_re
             let mut evaluator = instance(&program);
             let control = CallbackControl::new(cause.clone(), index);
             assert!(
-                matches!(evaluator.evaluate(&input, Selection::all(320), &control), Err(actual) if actual == cause)
+                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &input, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+            assert_eq!(control.trace(), trace[..index]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                evaluator.evaluate(&input, Selection::all(320), &after),
-                Err(KernelFailure::InstanceFailed)
+                evaluator.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
 }

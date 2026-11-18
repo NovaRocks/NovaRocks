@@ -15,74 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared test controls and constant admission policy, independent of legacy evaluation.
-use novarocks_functions::{ConstantPolicy, KernelEvaluationControl, KernelFailure};
-use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
-use std::time::Duration;
-
-// Transitional re-export for the remaining Execution SQL tests.
-// Shared inputs live in novarocks-sql-testkit; remove this bridge after migration.
+//! Shared support for the remaining Execution tests.
+pub(crate) use novarocks_expression::testkit::{
+    HarnessControl, constant_policy, register_constant,
+};
 pub(crate) use novarocks_sql_testkit::parse_query;
-
-/// Unbounded compile and evaluation control. Waiting returns immediately so a
-/// sleeping kernel cannot stall a differential run.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct HarnessControl;
-
-impl PureCompileControl for HarnessControl {
-    fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-        Ok(())
-    }
-}
-
-impl KernelEvaluationControl for HarnessControl {
-    fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
-        Ok(())
-    }
-
-    fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
-        Ok(())
-    }
-}
-
-/// Generous admission limits for harness constants.
-pub(crate) fn constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 1024,
-        max_array_nodes: 4096,
-        max_logical_elements: 1_000_000,
-        max_retained_buffer_bytes: 4_194_304,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 16,
-        max_metadata_bytes: 1_048_576,
-        max_library_validation_work: 16_777_216,
-        max_library_validation_bytes: 16_777_216,
-    }
-}
-
-/// Keep each fixture reference with its real immutable backing. Pool IDs are
-/// local to this explicit table; selected-value equality is never inferred.
-pub(crate) fn register_constant(
-    pools: &mut novarocks_physical_plan::ConstantPools,
-    value: &novarocks_functions::ConstantValue,
-) -> novarocks_physical_plan::ConstantReference {
-    use novarocks_physical_plan::ConstantPoolId;
-    let identity = value.pool().backing_identity();
-    let existing = pools
-        .entries()
-        .iter()
-        .find_map(|(id, pool)| (pool.backing_identity() == identity).then_some(*id));
-    let pool = existing.unwrap_or_else(|| {
-        let id = (0..=u32::MAX)
-            .map(ConstantPoolId::new)
-            .find(|id| !pools.entries().contains_key(id))
-            .expect("fixture has an available pool identity");
-        pools.insert(id, value.pool().clone()).unwrap();
-        id
-    });
-    novarocks_physical_plan::ConstantReference {
-        pool,
-        ordinal: value.ordinal(),
-    }
-}

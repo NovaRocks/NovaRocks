@@ -29,17 +29,20 @@ use crate::runtime::{
     scalar_memory::{
         RuntimeScalarMemoryJournal, RuntimeScalarMemoryRefusal, RuntimeScalarMemoryScope,
     },
-    task::ExecutionFailureCause,
+    task::{ExecutionFailure, ExecutionFailureCause},
 };
+use arrow::record_batch::RecordBatch;
 use arrow::{
     array::{Array, BooleanArray, Int64Array, StringArray},
     datatypes::Field,
 };
+use novarocks_expression::EvaluationInput;
 use novarocks_expression::{
     StaticExprKind,
     evaluator_view::{UnitStateTemplate, state_template},
 };
 use novarocks_functions::ScalarInvocationActivation as Activation;
+use novarocks_functions::ScalarInvocationScope;
 use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef, ProgramUnitId};
 use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TopUpPolicy};
 
@@ -185,13 +188,21 @@ fn runtime_invocation_memory_actual_sql_compiler_project_common_helper_and_lossl
             )
             .unwrap();
             let mut journal = RuntimeScalarMemoryJournal::default();
-            let result = frame.evaluate_runtime(
-                &input,
-                Selection::try_sparse(3, &[0, 2]).unwrap(),
-                Activation::Activated,
-                &control,
-                &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
-            );
+            let result = frame
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
+                    {
+                        let selection = Selection::try_sparse(3, &[0, 2]).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    Activation::Activated,
+                    &control,
+                    &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                )
+                .map_err(ExecutionFailure::from);
             assert!(journal.preparation.as_ref().unwrap().settlement.is_some());
             assert!(journal.body.settlement.is_some());
             if data {
@@ -206,14 +217,20 @@ fn runtime_invocation_memory_actual_sql_compiler_project_common_helper_and_lossl
                 assert_eq!(data.source_len(), 2);
                 assert_eq!(data.source_row(0), Some(0));
                 assert_eq!(data.source_row(1), Some(2));
-                assert!(matches!(
-                    frame.evaluate_runtime(
-                        &input,
-                        Selection::all(3),
+                let replay = frame
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &input,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
                         Activation::Activated,
                         &control,
-                        &mut RuntimeScalarMemoryScope::new(&control, &mut journal)
-                    ),
+                        &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                    )
+                    .map_err(ExecutionFailure::from);
+                assert!(matches!(
+                    replay,
                     Err(error) if matches!(error.cause(), ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed))
                 ));
             } else {
@@ -247,13 +264,17 @@ fn runtime_invocation_memory_actual_sql_compiler_project_common_helper_and_lossl
                 .unwrap();
                 let mut journal = RuntimeScalarMemoryJournal::default();
                 let output = actual
-                    .evaluate_runtime(
-                        &empty,
-                        Selection::all(0),
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &empty,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(Selection::all(0), Selection::all(0)),
                         Activation::ValidateOnly,
                         &missing,
                         &mut RuntimeScalarMemoryScope::new(&missing, &mut journal),
                     )
+                    .map_err(ExecutionFailure::from)
                     .unwrap();
                 assert!(output.values().is_empty());
                 assert!(actual.instances.is_empty());
@@ -280,13 +301,18 @@ fn runtime_invocation_memory_actual_sql_frame_cached_host_rebind_and_missing_lat
             control.bind_mem_tracker(MemTracker::new_root("rebound-original-controller"));
         }
         let mut journal = RuntimeScalarMemoryJournal::default();
-        let result = frame.evaluate_runtime(
-            &input,
-            Selection::all(3),
-            Activation::Activated,
-            &control,
-            &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
-        );
+        let result = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                Activation::Activated,
+                &control,
+                &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+            )
+            .map_err(ExecutionFailure::from);
         if rebind {
             assert!(matches!(
                 result,
@@ -300,14 +326,20 @@ fn runtime_invocation_memory_actual_sql_frame_cached_host_rebind_and_missing_lat
             ));
         }
         assert!(journal.body.settlement.is_none());
-        assert!(matches!(
-            frame.evaluate_runtime(
-                &input,
-                Selection::all(3),
+        let replay = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
                 Activation::Activated,
                 &control,
-                &mut RuntimeScalarMemoryScope::new(&control, &mut journal)
-            ),
+                &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+            )
+            .map_err(ExecutionFailure::from);
+        assert!(matches!(
+            replay,
             Err(error) if matches!(error.cause(), ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed))
         ));
     }
@@ -366,12 +398,17 @@ fn runtime_invocation_memory_actual_sql_ordered_filter_or_scan_suppresses_and_ma
             )
             .unwrap();
             let mut journal = RuntimeScalarMemoryJournal::default();
-            let result = actual.evaluate_required_runtime(
-                &input,
-                Selection::all(3),
-                &control,
-                &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
-            );
+            let result = actual
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
+                    Selection::all(3),
+                    &control,
+                    &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                )
+                .map_err(ExecutionFailure::from);
             if demanded {
                 use crate::runtime::task::ExecutionFailureCause;
                 let error = result.unwrap_err();

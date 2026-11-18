@@ -18,6 +18,9 @@
 //! Actual LocalCompiler strict float-DATE profiles and native source/first-failure contracts.
 use super::*;
 use arrow::array::{Date32Array, Float32Array, Float64Array};
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 // Pure authored input construction; conversion to f32 defines the source
 // carrier, not the expected DATE. No old evaluator is borrowed.
 fn input(wide: bool, values: Vec<Option<f64>>) -> ArrayRef {
@@ -99,7 +102,18 @@ fn float_date_actual_compiler_all_profiles_root_nullability_allow_policies_slice
                         );
                         let rows = [1, 2, 3, 5];
                         let selection = Selection::try_sparse(values.len(), &rows).unwrap();
-                        let result = evaluator.evaluate(&batch, selection, &Control).unwrap();
+                        let result = evaluator
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &batch,
+                                    source: None,
+                                },
+                                ScalarInvocationScope::new(selection, selection),
+                                ScalarInvocationActivation::Activated,
+                                &Control,
+                                &mut PassThroughCallHost,
+                            )
+                            .unwrap();
                         // YYYYMMDD numeric grammar: 19700102 is epoch day 1;
                         // February 30 is invalid. In f64, 20240229 means leap
                         // day 19_782. f32 has ULP 2 here: ties-to-even rounds
@@ -151,9 +165,18 @@ fn float_date_actual_compiler_all_profiles_root_nullability_allow_policies_slice
                         let empty = [];
                         let result = instance(&program)
                             .evaluate(
-                                &batch,
-                                Selection::try_sparse(values.len(), &empty).unwrap(),
+                                EvaluationInput::Batch {
+                                    batch: &batch,
+                                    source: None,
+                                },
+                                {
+                                    let selection =
+                                        Selection::try_sparse(values.len(), &empty).unwrap();
+                                    ScalarInvocationScope::new(selection, selection)
+                                },
+                                ScalarInvocationActivation::Activated,
                                 &Control,
+                                &mut PassThroughCallHost,
                             )
                             .unwrap();
                         assert_eq!(result.values().data_type(), &DataType::Date32);
@@ -163,9 +186,18 @@ fn float_date_actual_compiler_all_profiles_root_nullability_allow_policies_slice
                             let rows = [values.len() - 1];
                             let result = instance(&program)
                                 .evaluate(
-                                    &batch,
-                                    Selection::try_sparse(values.len(), &rows).unwrap(),
+                                    EvaluationInput::Batch {
+                                        batch: &batch,
+                                        source: None,
+                                    },
+                                    {
+                                        let selection =
+                                            Selection::try_sparse(values.len(), &rows).unwrap();
+                                        ScalarInvocationScope::new(selection, selection)
+                                    },
+                                    ScalarInvocationActivation::Activated,
                                     &Control,
+                                    &mut PassThroughCallHost,
                                 )
                                 .unwrap();
                             assert!(result.values().is_null(0));
@@ -199,7 +231,16 @@ fn float_date_actual_compiler_native_float_constant_negative_zero_is_original_er
                 let rows = [1, 3];
                 let selection = Selection::try_sparse(4, &rows).unwrap();
                 let result = instance(&program)
-                    .evaluate(&batch, selection, &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 // Signed zero truncates to the integer date literal 0, which
                 // has neither a valid month nor day; it is a row error, not a
@@ -237,13 +278,22 @@ fn float_date_actual_compiler_all_seven_runtime_causes_stop_and_latch_without_re
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
         assert_eq!(
             instance(&program)
-                .evaluate(&batch, Selection::all(3), &recorder)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                    ScalarInvocationActivation::Activated,
+                    &recorder,
+                    &mut PassThroughCallHost
+                )
                 .unwrap()
                 .errors()
                 .len(),
             1
         );
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(!trace.is_empty());
         assert!(trace.iter().all(|n| *n <= 256));
         for at in 1..=trace.len() {
@@ -251,15 +301,24 @@ fn float_date_actual_compiler_all_seven_runtime_causes_stop_and_latch_without_re
                 let mut evaluator = instance(&program);
                 let control = CallbackControl::new(cause.clone(), at);
                 assert!(
-                    matches!(evaluator.evaluate(&batch,Selection::all(3),&control),Err(actual) if actual==cause)
+                    matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(3), Selection::all(3)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
                 );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+                assert_eq!(control.trace(), trace[..at]);
                 let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
                 assert!(matches!(
-                    evaluator.evaluate(&batch, Selection::all(3), &after),
-                    Err(KernelFailure::InstanceFailed)
+                    evaluator.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                        ScalarInvocationActivation::Activated,
+                        &after,
+                        &mut PassThroughCallHost
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
-                assert!(after.trace.lock().unwrap().is_empty());
+                assert!(after.trace().is_empty());
             }
         }
     }
@@ -277,7 +336,7 @@ fn float_date_actual_compiler_all_three_compile_causes_preserve_real_callback_pr
         );
         let recorder = CompileCallbacks::new(CompileControlError::Cancelled, usize::MAX);
         compile(&functions, package.clone(), &recorder).unwrap();
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(!trace.is_empty());
         for at in 1..=trace.len() {
             for cause in [
@@ -289,7 +348,7 @@ fn float_date_actual_compiler_all_three_compile_causes_preserve_real_callback_pr
                 assert!(
                     matches!(compile(&functions,package.clone(),&control),Err(FragmentCompileError::Control(actual)) if actual==cause)
                 );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+                assert_eq!(control.trace(), trace[..at]);
             }
         }
     }

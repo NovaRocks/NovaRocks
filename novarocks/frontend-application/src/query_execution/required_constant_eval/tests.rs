@@ -214,23 +214,18 @@ fn required_active_branch_error_preserves_original_data_and_ordinal() {
             FailureClass::Data,
             "{sql}: {cause}"
         );
-        let execution = cause
-            .downcast_ref::<ExecutionFailure>()
-            .expect("original Execution failure");
-        let novarocks_execution::runtime::task::ExecutionFailureCause::RequiredRow(required) =
-            execution.cause()
-        else {
-            panic!("original required row");
-        };
+        let required = cause
+            .downcast_ref::<RequiredExpressionRowError>()
+            .expect("original required row");
         assert_eq!(required.error().selected_ordinal(), 0);
         assert_eq!(required.batch_row(), 0);
         // A producer with the same Data fact arriving through the external
         // evaluator port remains Outer; classification alone cannot erase it.
-        let outer = SqlConstantEvaluationError::outer_domain(execution.clone());
+        let outer = SqlConstantEvaluationError::outer_domain(cause.clone());
         assert!(matches!(&outer, SqlConstantEvaluationError::Outer(actual)
-            if actual.failure_fact().class() == FailureClass::Data));
+            if actual == &cause && actual.failure_fact().class() == FailureClass::Data));
         drop(outer);
-        let independently_retained = execution.clone();
+        let independently_retained = cause.clone();
         drop(cause);
         assert!(
             fixture.window.retained_payload_bytes() > 0,

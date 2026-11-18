@@ -3243,35 +3243,34 @@ pub(crate) mod tests {
     #[test]
     fn runtime_scalar_memory_nominal_categories_preserve_original_transport() {
         use novarocks_execution::runtime::{
-            scalar_memory::{RuntimeScalarEvaluationFailure, RuntimeScalarMemoryRefusal},
+            scalar_memory::RuntimeScalarMemoryRefusal,
             task::{ExecutionFailure, ExecutionFailureCause},
         };
+        use novarocks_expression::ExprEvaluationFailure;
         use novarocks_functions::{KernelFailure, ScalarResourceError};
         for (failure, expected) in [
             (
-                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::Arithmetic),
+                ExprEvaluationFailure::<RuntimeScalarMemoryRefusal>::Source(
+                    ScalarResourceError::Arithmetic,
+                ),
                 TaskFailureCategory::ResourceExhausted,
             ),
             (
-                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::SourceModel(
+                ExprEvaluationFailure::Source(ScalarResourceError::SourceModel(
                     "cancelled ResourceExhausted",
                 )),
                 TaskFailureCategory::Internal,
             ),
             (
-                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::Invariant(
-                    "ResourceExhausted",
-                )),
+                ExprEvaluationFailure::Source(ScalarResourceError::Invariant("ResourceExhausted")),
                 TaskFailureCategory::Internal,
             ),
             (
-                RuntimeScalarEvaluationFailure::Host(
-                    RuntimeScalarMemoryRefusal::MissingQueryMemory,
-                ),
+                ExprEvaluationFailure::Host(RuntimeScalarMemoryRefusal::MissingQueryMemory),
                 TaskFailureCategory::Internal,
             ),
             (
-                RuntimeScalarEvaluationFailure::Host(RuntimeScalarMemoryRefusal::Capacity(
+                ExprEvaluationFailure::Host(RuntimeScalarMemoryRefusal::Capacity(
                     novarocks_memory::CapacityError::Invalid {
                         detail: "cancelled Internal",
                     },
@@ -3279,15 +3278,15 @@ pub(crate) mod tests {
                 TaskFailureCategory::Internal,
             ),
             (
-                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::Cancelled),
+                ExprEvaluationFailure::Kernel(KernelFailure::Cancelled),
                 TaskFailureCategory::Execution,
             ),
             (
-                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::ResourceExhausted),
+                ExprEvaluationFailure::Kernel(KernelFailure::ResourceExhausted),
                 TaskFailureCategory::ResourceExhausted,
             ),
             (
-                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::InstanceFailed),
+                ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed),
                 TaskFailureCategory::Internal,
             ),
         ] {
@@ -3295,15 +3294,15 @@ pub(crate) mod tests {
             assert_eq!(super::failure_category(error.cause()), expected);
             match (failure, error.cause()) {
                 (
-                    RuntimeScalarEvaluationFailure::Source(original),
+                    ExprEvaluationFailure::Source(original),
                     ExecutionFailureCause::RuntimeScalarSource(actual),
                 ) => assert_eq!(&original, actual),
                 (
-                    RuntimeScalarEvaluationFailure::Host(original),
+                    ExprEvaluationFailure::Host(original),
                     ExecutionFailureCause::RuntimeScalarMemory(actual),
                 ) => assert_eq!(&original, actual),
                 (
-                    RuntimeScalarEvaluationFailure::Kernel(original),
+                    ExprEvaluationFailure::Kernel(original),
                     ExecutionFailureCause::Kernel(actual),
                 ) => assert_eq!(&original, actual),
                 _ => {

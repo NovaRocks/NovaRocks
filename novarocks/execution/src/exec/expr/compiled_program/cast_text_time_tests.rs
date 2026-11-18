@@ -20,6 +20,9 @@ use arrow::array::{
     BooleanArray, Int64Array, LargeStringArray, StringArray, StringViewArray,
     Time64MicrosecondArray,
 };
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 // These fixtures contain only authored input data. No retired evaluator is used.
 fn input(dtype: &DataType, strings: &[Option<&str>]) -> ArrayRef {
     match dtype {
@@ -156,7 +159,16 @@ fn check(dtype: DataType) {
                 ] {
                     let selection = Selection::try_sparse(source.len(), &rows).unwrap();
                     let output = instance(&program)
-                        .evaluate(&batch, selection, &Control)
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
                         .unwrap();
                     assert!(output.errors().is_empty());
                     assert_eq!(
@@ -201,12 +213,21 @@ fn text_time_actual_compiler_all_seven_runtime_causes_stop_and_latch_without_rep
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
         assert!(
             instance(&program)
-                .evaluate(&batch, Selection::all(3), &recorder)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                    ScalarInvocationActivation::Activated,
+                    &recorder,
+                    &mut PassThroughCallHost
+                )
                 .unwrap()
                 .errors()
                 .is_empty()
         );
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(trace.contains(&256));
         assert!(trace.iter().all(|units| *units <= 256));
         for at in 1..=trace.len() {
@@ -214,16 +235,24 @@ fn text_time_actual_compiler_all_seven_runtime_causes_stop_and_latch_without_rep
                 let mut evaluator = instance(&program);
                 let control = CallbackControl::new(cause.clone(), at);
                 assert!(
-                    matches!(evaluator.evaluate(&batch, Selection::all(3), &control),
-                    Err(actual) if actual == cause)
+                    matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(3), Selection::all(3)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
                 );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+                assert_eq!(control.trace(), trace[..at]);
                 let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
                 assert!(matches!(
-                    evaluator.evaluate(&batch, Selection::all(3), &after),
-                    Err(KernelFailure::InstanceFailed)
+                    evaluator.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                        ScalarInvocationActivation::Activated,
+                        &after,
+                        &mut PassThroughCallHost
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
-                assert!(after.trace.lock().unwrap().is_empty());
+                assert!(after.trace().is_empty());
             }
         }
     }

@@ -19,6 +19,9 @@
 //! no old evaluator, Arrow cast or replacement conversion calculator is used.
 use super::*;
 use arrow::array::{Decimal128Array, Float64Array};
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 const OVERFLOW: &str =
     "Expr evaluate meet error: The numeric type cast involving decimal overflows";
 fn input(raw: Vec<Option<f64>>) -> ArrayRef {
@@ -116,7 +119,16 @@ fn float64_decimal128_actual_compiler_complete_physical_profiles_and_constant_au
             let selection = Selection::try_sparse(5, &rows).unwrap();
             for selected in [selection, Selection::all(5)] {
                 let out = instance(&program)
-                    .evaluate(&data, selected, &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &data,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selected, selected),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(out.selection(), selected);
                 let mut expected = Vec::new();
@@ -138,7 +150,16 @@ fn float64_decimal128_actual_compiler_complete_physical_profiles_and_constant_au
             }
             let empty_selection = Selection::try_sparse(5, &[]).unwrap();
             let empty = instance(&program)
-                .evaluate(&data, empty_selection, &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(empty_selection, empty_selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(empty.selection(), empty_selection);
             assert_eq!(empty.values().data_type(), &target);
@@ -154,7 +175,16 @@ fn float64_decimal128_actual_compiler_complete_physical_profiles_and_constant_au
             );
             let data = batch(&program, input(vec![Some(7.0); 5]));
             let out = instance(&program)
-                .evaluate(&data, selection, &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             // The real parent source author emits Float64 -0.0 (bits
             // 0x8000000000000000), not the batch's 7.0. Every profile maps

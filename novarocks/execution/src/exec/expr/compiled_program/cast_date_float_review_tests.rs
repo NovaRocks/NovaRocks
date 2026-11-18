@@ -24,6 +24,9 @@
 //! actual compiler instance; a caught panic is never followed by reuse.
 use super::*;
 use arrow::array::{Date32Array, Float32Array, Float64Array};
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +89,16 @@ fn compiled_observation(
     let mut evaluator = instance(program);
     let selection = Selection::try_sparse(source.len(), selected_rows).unwrap();
     let caught = catch_unwind(AssertUnwindSafe(|| {
-        match evaluator.evaluate(&batch, selection, &Control) {
+        match evaluator.evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        ) {
             Ok(values) => Observation::Rows(
                 snapshot(values.values()),
                 values
@@ -95,7 +107,8 @@ fn compiled_observation(
                     .map(|error| (error.selected_ordinal(), error.message().to_owned()))
                     .collect(),
             ),
-            Err(error) => Observation::Kernel(format!("{error:?}")),
+            Err(ExprEvaluationFailure::Kernel(error)) => Observation::Kernel(format!("{error:?}")),
+            Err(error) => panic!("date Cast returned a non-kernel failure: {error:?}"),
         }
     }));
     // Drop the instance after either a normal return or unwind. This probe does

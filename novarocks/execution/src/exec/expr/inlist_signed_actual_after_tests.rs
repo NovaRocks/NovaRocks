@@ -23,9 +23,13 @@ use super::sql_test_source::sql_source_with_single_field_and_core_residuals;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
-use novarocks_expression::StaticExprKind;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure, StaticExprKind};
 use novarocks_expression_contract::RootOrdinal;
-use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
+use novarocks_functions::{
+    KernelDiagnostic, KernelEvaluationControl, KernelFailure, ScalarInvocationActivation,
+    ScalarInvocationScope, Selection,
+};
 use novarocks_local_program::{LocalProgram, ProgramRootRef, ProgramUnitId};
 
 use novarocks_type_contract::{
@@ -225,7 +229,18 @@ fn inlist_signed_actual_all_widths_value_truthonly_null_sparse_sliced_empty() {
                     &Control,
                 )
                 .unwrap();
-                let out = frame.evaluate(&data, selection, &Control).unwrap();
+                let out = frame
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &data,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
+                    .unwrap();
                 assert!(out.errors().is_empty());
                 assert_eq!(
                     values(&out),
@@ -258,7 +273,18 @@ fn inlist_signed_actual_match_never_masks_later_data_error_and_sparse_isolates_i
             &Control,
         )
         .unwrap();
-        let out = frame.evaluate(&data, Selection::all(3), &Control).unwrap();
+        let out = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert_eq!(values(&out), vec![None, Some(!negated), Some(!negated)]);
         assert_eq!(out.errors().len(), 1);
         assert_eq!(out.errors()[0].selected_ordinal(), 0);
@@ -275,7 +301,18 @@ fn inlist_signed_actual_match_never_masks_later_data_error_and_sparse_isolates_i
             &Control,
         )
         .unwrap();
-        let out = frame.evaluate(&data, selection, &Control).unwrap();
+        let out = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert!(out.errors().is_empty());
         assert_eq!(values(&out), vec![Some(!negated); 2]);
     }
@@ -351,7 +388,18 @@ fn inlist_signed_actual_every_constructor_phase_callback_seven_causes_no_footer_
             &Control,
         )
         .unwrap();
-        frame.evaluate(&data, selection, &record).unwrap();
+        frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &record,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         let trace = record.trace.lock().unwrap().clone();
         for stop in 1..=trace.len() {
             for cause in causes() {
@@ -362,12 +410,33 @@ fn inlist_signed_actual_every_constructor_phase_callback_seven_causes_no_footer_
                 )
                 .unwrap();
                 let c = Callback::new(stop, cause.clone());
-                assert!(matches!(frame.evaluate(&data,selection,&c),Err(actual) if actual==cause));
+                let result = frame.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &c,
+                    &mut PassThroughCallHost,
+                );
+                assert!(
+                    matches!(result, Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
+                );
                 assert_eq!(*c.trace.lock().unwrap(), trace[..stop]);
                 let after = Callback::new(usize::MAX, KernelFailure::Cancelled);
                 assert!(matches!(
-                    frame.evaluate(&data, selection, &after),
-                    Err(KernelFailure::InstanceFailed)
+                    frame.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &data,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &after,
+                        &mut PassThroughCallHost,
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
                 assert!(after.trace.lock().unwrap().is_empty());
             }
@@ -526,7 +595,18 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
                     &Control,
                 )
                 .unwrap();
-                let output = frame.evaluate(&data, selection, &Control).unwrap();
+                let output = frame
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &data,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
+                    .unwrap();
                 assert_eq!(output.selection(), selection);
                 assert_eq!(
                     values(&output),
@@ -559,7 +639,16 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
             )
             .unwrap();
             let output = frame
-                .evaluate(&success, Selection::all(4), &record)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &success,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+                    ScalarInvocationActivation::Activated,
+                    &record,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert!(output.errors().is_empty());
             let trace = record.trace.lock().unwrap().clone();
@@ -575,17 +664,35 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
                     let refused = Callback::new(stop, cause.clone());
                     assert_eq!(
                         frame
-                            .evaluate(&success, Selection::all(4), &refused)
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &success,
+                                    source: None
+                                },
+                                ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+                                ScalarInvocationActivation::Activated,
+                                &refused,
+                                &mut PassThroughCallHost,
+                            )
                             .unwrap_err(),
-                        cause
+                        ExprEvaluationFailure::Kernel(cause)
                     );
                     assert_eq!(*refused.trace.lock().unwrap(), trace[..stop]);
                     let after = Callback::new(usize::MAX, KernelFailure::Cancelled);
                     assert_eq!(
                         frame
-                            .evaluate(&success, Selection::all(4), &after)
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &success,
+                                    source: None
+                                },
+                                ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+                                ScalarInvocationActivation::Activated,
+                                &after,
+                                &mut PassThroughCallHost,
+                            )
                             .unwrap_err(),
-                        KernelFailure::InstanceFailed
+                        ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
                     );
                     assert!(after.trace.lock().unwrap().is_empty());
                 }

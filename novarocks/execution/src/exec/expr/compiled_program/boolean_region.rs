@@ -27,7 +27,10 @@ pub(super) struct BooleanRows {
     pending: BTreeMap<usize, RowDataError>,
 }
 impl BooleanRows {
-    pub(super) fn new(rows: usize, work: &mut Work<'_, '_>) -> Result<Self, KernelFailure> {
+    pub(super) fn new(
+        rows: usize,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<Self, KernelFailure> {
         let mut decided = Vec::with_capacity(rows);
         let mut saw_null = Vec::with_capacity(rows);
         for _ in 0..rows {
@@ -45,7 +48,7 @@ impl BooleanRows {
         &mut self,
         terminal: &mut BTreeMap<usize, RowDataError>,
         remaining: &mut Vec<usize>,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<(), KernelFailure> {
         for (ordinal, error) in std::mem::take(&mut self.pending) {
             terminal.insert(ordinal, error);
@@ -69,7 +72,7 @@ impl BooleanRows {
         demand: EvaluationDemand,
         pure: bool,
         terminal: &mut BTreeMap<usize, RowDataError>,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<Vec<usize>, KernelFailure> {
         let values = output
             .values()
@@ -118,7 +121,7 @@ impl BooleanRows {
         shape: ControlShape,
         demand: EvaluationDemand,
         mut terminal: BTreeMap<usize, RowDataError>,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<(ArrayRef, Box<[RowDataError]>), KernelFailure> {
         for (ordinal, error) in self.pending {
             terminal.insert(ordinal, error);

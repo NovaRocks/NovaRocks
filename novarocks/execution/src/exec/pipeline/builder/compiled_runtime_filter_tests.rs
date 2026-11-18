@@ -2239,8 +2239,12 @@ fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observab
 #[test]
 fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latch() {
     use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+    use novarocks_expression::{
+        EvaluationInput, ExprEvaluationFailure, testkit::PassThroughCallHost,
+    };
     use novarocks_functions::{
-        KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection,
+        KernelDiagnostic, KernelEvaluationControl, KernelFailure, ScalarInvocationActivation,
+        ScalarInvocationScope, Selection,
     };
     struct Control {
         calls: Mutex<Vec<u32>>,
@@ -2306,9 +2310,21 @@ fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latc
         calls: Mutex::new(vec![]),
         refusal: None,
     };
+    let input = EvaluationInput::Batch {
+        batch: &batch,
+        source: None,
+    };
+    let selection = Selection::all(3);
+    let invocation = ScalarInvocationScope::new(selection, selection);
     let mut instance = make();
     instance
-        .evaluate(&batch, Selection::all(3), &baseline)
+        .evaluate(
+            input,
+            invocation,
+            ScalarInvocationActivation::Activated,
+            &baseline,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     let trace = baseline.calls.lock().unwrap().clone();
     assert!(!trace.is_empty());
@@ -2329,17 +2345,29 @@ fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latc
             let mut instance = make();
             assert_eq!(
                 instance
-                    .evaluate(&batch, Selection::all(3), &control)
+                    .evaluate(
+                        input,
+                        invocation,
+                        ScalarInvocationActivation::Activated,
+                        &control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap_err(),
-                cause
+                ExprEvaluationFailure::Kernel(cause)
             );
             assert_eq!(*control.calls.lock().unwrap(), trace[..=at]);
             let before = control.calls.lock().unwrap().clone();
             assert_eq!(
                 instance
-                    .evaluate(&batch, Selection::all(3), &control)
+                    .evaluate(
+                        input,
+                        invocation,
+                        ScalarInvocationActivation::Activated,
+                        &control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap_err(),
-                KernelFailure::InstanceFailed
+                ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
             );
             assert_eq!(*control.calls.lock().unwrap(), before);
         }

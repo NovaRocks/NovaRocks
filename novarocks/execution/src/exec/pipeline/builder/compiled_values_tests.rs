@@ -28,7 +28,7 @@ use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
-use novarocks_functions::{ConstantPool, KernelFailure, Selection};
+use novarocks_functions::{ConstantPool, KernelFailure};
 use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_physical_plan::{
     ConstantPoolId, ConstantPools, ConstantReference, FragmentCuts, FragmentId, FragmentPackage,
@@ -44,7 +44,7 @@ use novarocks_type_contract::{
 
 use super::family_fixture::{FixtureControl, compile, constant_policy, int64_rows, run};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-use crate::exec::operators::compiled_expression::RuntimeKernelControl;
+use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
@@ -531,13 +531,9 @@ fn values_cell_root_is_evaluated_only_over_its_empty_one_row_port() {
         &control,
     )
     .unwrap();
-    let output = instance
-        .evaluate(&empty(1), Selection::all(1), &control)
-        .unwrap();
-    assert!(output.errors().is_empty());
+    let output = evaluate_all(&mut instance, site, &empty(1), &control).unwrap();
     assert_eq!(
         output
-            .values()
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap()
@@ -550,7 +546,7 @@ fn values_cell_root_is_evaluated_only_over_its_empty_one_row_port() {
         vec![Arc::new(Int64Array::from(vec![5]))],
     )
     .unwrap();
-    for (input, rows) in [(empty(2), 2), (wide, 1)] {
+    for input in [empty(2), wide] {
         let mut instance = CompiledExpressionInstance::try_new(
             program.unit(site.unit).unwrap().clone(),
             site.root,
@@ -558,8 +554,10 @@ fn values_cell_root_is_evaluated_only_over_its_empty_one_row_port() {
         )
         .unwrap();
         assert!(matches!(
-            instance.evaluate(&input, Selection::all(rows), &control),
-            Err(KernelFailure::InvalidProgram(_))
+            evaluate_all(&mut instance, site, &input, &control)
+                .unwrap_err()
+                .cause(),
+            ExecutionFailureCause::Kernel(KernelFailure::InvalidProgram(_))
         ));
     }
     // A constant cell stays in backing rather than the dynamic-cell execution table.

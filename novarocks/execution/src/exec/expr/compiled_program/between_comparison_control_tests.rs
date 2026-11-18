@@ -94,10 +94,10 @@ fn run<'a>(
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let result = evaluate_comparison(
         if nullsafe {
@@ -214,10 +214,10 @@ fn between_comparison_control_row_data_and_legal_boolean_mask_remain_original() 
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut w = Work {
+    let mut w: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let mut state = BooleanRows::new(2, &mut w).unwrap();
     let mut errors = BTreeMap::new();

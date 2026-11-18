@@ -16,6 +16,9 @@
 // under the License.
 //! Actual compiler/Frame instance and actual production MemTracker allocator.
 use super::*;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 #[path = "ds_hll_state_private_frame_fixture.rs"]
 mod fixture;
 use crate::runtime::mem_tracker::MemTracker;
@@ -32,8 +35,19 @@ fn ds_scalar_private_adapter_frame_every_declared_arity_true_host_and_no_host_re
             CompiledExpressionInstance::try_new(root_unit(&p).clone(), root(&p).root, &Control)
                 .unwrap();
         assert!(matches!(
-            no_host.evaluate(&batch, Selection::all(3), &Control),
-            Err(KernelFailure::InvalidProgram(_))
+            no_host.evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost
+            ),
+            Err(ExprEvaluationFailure::Kernel(
+                KernelFailure::InvalidProgram(_)
+            ))
         ));
         let tracker = MemTracker::new_root("ds-scalar-actual-frame");
         tracker.install_limit_once(2 * 1024 * 1024).unwrap();
@@ -45,7 +59,16 @@ fn ds_scalar_private_adapter_frame_every_declared_arity_true_host_and_no_host_re
         )
         .unwrap();
         let output = instance
-            .evaluate(&batch, Selection::all(3), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         let bytes = output
             .values()
@@ -75,13 +98,31 @@ fn ds_scalar_private_adapter_frame_real_tracker_refusal_and_failure_latch() {
     )
     .unwrap();
     let refusal = instance
-        .evaluate(&batch, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap_err();
     crate::runtime_filter::assert_real_tracker_capacity(&refusal, 1);
     assert_eq!(tracker.current(), 0);
     assert!(matches!(
-        instance.evaluate(&batch, Selection::all(3), &Control),
-        Err(KernelFailure::InstanceFailed)
+        instance.evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost
+        ),
+        Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
     ));
     drop(instance);
     assert_eq!(tracker.current(), 0);
@@ -101,13 +142,36 @@ fn ds_scalar_private_adapter_frame_sparse_original_row_identity_and_empty_select
     .unwrap();
     let rows = [2];
     let selection = Selection::try_sparse(3, &rows).unwrap();
-    let out = instance.evaluate(&batch, selection, &Control).unwrap();
+    let out = instance
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert!(out.errors().is_empty());
     assert_eq!(out.selection().row(0), Some(2));
     let before = tracker.current();
     drop(out);
     let out = instance
-        .evaluate(&batch, Selection::try_sparse(3, &[]).unwrap(), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            {
+                let selection = Selection::try_sparse(3, &[]).unwrap();
+                ScalarInvocationScope::new(selection, selection)
+            },
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(out.values().len(), 0);
     assert_eq!(tracker.current(), before);
@@ -133,7 +197,16 @@ fn ds_scalar_if_type_contract_is_unmaskable_and_numeric_value_is_row_data() {
     )
     .unwrap();
     let error = instance
-        .evaluate(&batch, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap_err();
     let fact = error.failure_fact();
     assert_eq!(fact.class(), FailureClass::Invariant);
@@ -146,8 +219,17 @@ fn ds_scalar_if_type_contract_is_unmaskable_and_numeric_value_is_row_data() {
     );
     assert!(error.to_string().len() <= 512);
     assert!(matches!(
-        instance.evaluate(&batch, Selection::all(3), &Control),
-        Err(KernelFailure::InstanceFailed)
+        instance.evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost
+        ),
+        Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
     ));
     drop(instance);
     assert_eq!(tracker.current(), 0);
@@ -162,7 +244,16 @@ fn ds_scalar_if_type_contract_is_unmaskable_and_numeric_value_is_row_data() {
     )
     .unwrap();
     let output = instance
-        .evaluate(&batch, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(output.errors().len(), 1);
     let error = &output.errors()[0];
@@ -179,7 +270,19 @@ fn ds_scalar_if_type_contract_is_unmaskable_and_numeric_value_is_row_data() {
     drop(output);
     let rows = [0, 2];
     let output = instance
-        .evaluate(&batch, Selection::try_sparse(3, &rows).unwrap(), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            {
+                let selection = Selection::try_sparse(3, &rows).unwrap();
+                ScalarInvocationScope::new(selection, selection)
+            },
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert!(output.errors().is_empty());
     assert_eq!(output.values().null_count(), 2);
@@ -277,7 +380,7 @@ fn ds_scalar_private_adapter_frame_all_seven_originating_host_causes_have_no_foo
         .unwrap();
         let control = NoTail(&authority);
         assert!(
-            matches!(instance.evaluate(&batch,Selection::all(3),&control),Err(actual) if actual==cause)
+            matches!(instance.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(3), Selection::all(3)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
         );
         assert_eq!(
             authority
@@ -286,8 +389,17 @@ fn ds_scalar_private_adapter_frame_all_seven_originating_host_causes_have_no_foo
             2
         );
         assert!(matches!(
-            instance.evaluate(&batch, Selection::all(3), &control),
-            Err(KernelFailure::InstanceFailed)
+            instance.evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                ScalarInvocationActivation::Activated,
+                &control,
+                &mut PassThroughCallHost
+            ),
+            Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
         ));
         drop(instance);
         assert_eq!(tracker.current(), 0);
@@ -319,11 +431,20 @@ fn ds_scalar_private_adapter_frame_constructor_host_seven_causes_have_no_footer(
             .unwrap();
             let control = NoTail(&authority);
             assert!(
-                matches!(instance.evaluate(&batch,Selection::all(3),&control),Err(actual) if actual==cause)
+                matches!(instance.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(3), Selection::all(3)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
             );
             assert!(matches!(
-                instance.evaluate(&batch, Selection::all(3), &control),
-                Err(KernelFailure::InstanceFailed)
+                instance.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                    ScalarInvocationActivation::Activated,
+                    &control,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
             drop(instance);
             assert_eq!(tracker.current(), 0);

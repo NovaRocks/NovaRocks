@@ -22,13 +22,16 @@ use crate::exec::expr::compiled_program::checked_constants;
 use arrow::{array::BooleanArray, datatypes::DataType, record_batch::RecordBatch};
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_expression::StaticExprKind;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
 use novarocks_expression_contract::{ExprId, ExprKind, RootScope};
 use novarocks_functions::{
     ConstantPolicy, EngineFunctionCatalogBuilder, FunctionArgument, FunctionId, FunctionKind,
-    FunctionOverloadId, InstalledPureKernel, KernelDiagnostic, KernelEvaluationControl,
-    KernelFailure, PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId,
-    PureKernelAbi, Selection,
+    FunctionOverloadId, InstalledPureKernel, KernelEvaluationControl, KernelFailure,
+    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    Selection,
 };
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
@@ -42,12 +45,7 @@ use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, EvaluationDemand, FunctionValueType,
     PureCompileControl, SemanticParameters,
 };
-use std::{
-    collections::BTreeMap,
-    num::NonZeroUsize,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 
 struct Control;
 impl PureCompileControl for Control {
@@ -468,7 +466,18 @@ fn nullable_nary_three_and_320_have_independent_sql_truth_results_on_sparse_orig
             let (input, rows) = sparse_batch(&program);
             let selection = Selection::try_sparse(input.num_rows(), &rows).unwrap();
             let mut evaluator = instance(&program, Use::Value);
-            let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+            let output = evaluator
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
             assert_eq!(output.selection(), selection);
             assert!(output.errors().is_empty());
             let values = output
@@ -493,7 +502,16 @@ fn nullable_nary_three_and_320_have_independent_sql_truth_results_on_sparse_orig
                 ],
             );
             let output = evaluator
-                .evaluate(&next, Selection::all(2), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &next,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(
                 output
@@ -517,7 +535,16 @@ fn filter_truth_only_nary_preserves_exact_keep_set_without_claiming_null_and_fal
             let (input, rows) = sparse_batch(&program);
             let selection = Selection::try_sparse(input.num_rows(), &rows).unwrap();
             let output = instance(&program, Use::TruthOnly)
-                .evaluate(&input, selection, &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert!(output.errors().is_empty());
             let expected = match op {
@@ -571,7 +598,18 @@ fn empty_nary_selection_publishes_exact_boolean_empty_without_creating_instances
             let rows = [];
             let selection = Selection::try_sparse(input.num_rows(), &rows).unwrap();
             let mut evaluator = instance(&program, mode);
-            let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+            let output = evaluator
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
             assert_eq!(output.selection(), selection);
             assert_eq!(output.values().data_type(), &DataType::Boolean);
             assert_eq!(output.values().len(), 0);
@@ -580,50 +618,16 @@ fn empty_nary_selection_publishes_exact_boolean_empty_without_creating_instances
         }
     }
 }
-struct CallbackControl {
-    cause: KernelFailure,
-    stop_at: usize,
-    trace: Mutex<Vec<u32>>,
-    refused: Mutex<bool>,
-}
-impl CallbackControl {
-    fn new(cause: KernelFailure, stop_at: usize) -> Self {
-        Self {
-            cause,
-            stop_at,
-            trace: Mutex::new(vec![]),
-            refused: Mutex::new(false),
-        }
-    }
-}
-impl KernelEvaluationControl for CallbackControl {
-    fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
-        let mut refused = self.refused.lock().unwrap();
-        assert!(!*refused, "no callback after primary refusal");
-        let mut trace = self.trace.lock().unwrap();
-        trace.push(units);
-        if trace.len() == self.stop_at {
-            *refused = true;
-            Err(self.cause.clone())
-        } else {
-            Ok(())
-        }
-    }
-    fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
-        panic!("intrinsic Boolean roots must not wait")
-    }
-}
+use novarocks_expression::testkit::{CallbackControl, callback_causes};
+
 fn causes() -> [KernelFailure; 7] {
-    [
-        KernelFailure::Cancelled,
-        KernelFailure::DeadlineExceeded,
-        KernelFailure::ResourceExhausted,
-        KernelFailure::InvalidProgram(KernelDiagnostic::new("nary-original-invalid")),
-        KernelFailure::Internal(KernelDiagnostic::new("nary-original-internal")),
-        KernelFailure::Operational(KernelDiagnostic::new("nary-original-operational")),
-        KernelFailure::InstanceFailed,
-    ]
+    callback_causes([
+        "nary-original-invalid",
+        "nary-original-internal",
+        "nary-original-operational",
+    ])
 }
+
 #[test]
 fn every_nary_constructor_callback_preserves_all_seven_original_failure_categories() {
     let program = program(Connective::And, Use::Value, 320);
@@ -637,7 +641,7 @@ fn every_nary_constructor_callback_preserves_all_seven_original_failure_categori
         &recorder,
     )
     .unwrap();
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
     for index in 1..=trace.len() {
@@ -646,7 +650,7 @@ fn every_nary_constructor_callback_preserves_all_seven_original_failure_categori
             assert!(
                 matches!(CompiledExpressionInstance::try_new(program.unit(root(&program, Use::Value).unit).unwrap().clone(), root(&program, Use::Value).root, &control), Err(actual) if actual == cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+            assert_eq!(control.trace(), trace[..index]);
         }
     }
 }
@@ -688,7 +692,16 @@ fn assert_all_nary_evaluation_callbacks(
 ) {
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let output = instance(&program, Use::Value)
-        .evaluate(&input, Selection::all(320), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert!(output.errors().is_empty());
     assert_eq!(
@@ -701,7 +714,7 @@ fn assert_all_nary_evaluation_callbacks(
             .collect::<Vec<_>>(),
         vec![expected; 320],
     );
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
     for index in 1..=trace.len() {
@@ -709,15 +722,24 @@ fn assert_all_nary_evaluation_callbacks(
             let mut evaluator = instance(&program, Use::Value);
             let control = CallbackControl::new(cause.clone(), index);
             assert!(
-                matches!(evaluator.evaluate(&input, Selection::all(320), &control), Err(actual) if actual == cause)
+                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &input, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+            assert_eq!(control.trace(), trace[..index]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                evaluator.evaluate(&input, Selection::all(320), &after),
-                Err(KernelFailure::InstanceFailed)
+                evaluator.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
             assert!(evaluator.instances.is_empty());
         }
     }
@@ -878,7 +900,18 @@ fn same_nary_definition_in_if_truth_only_and_value_domains_does_not_cache_null_a
     let rows = [1, 3, 5];
     let selection = Selection::try_sparse(6, &rows).unwrap();
     let mut evaluator = instance(&program, Use::Value);
-    let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let output = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert_eq!(output.selection(), selection);
     assert!(output.errors().is_empty());
     assert_eq!(

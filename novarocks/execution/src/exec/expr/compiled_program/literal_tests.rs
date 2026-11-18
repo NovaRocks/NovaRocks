@@ -27,6 +27,9 @@ use arrow::{
     datatypes::{IntervalUnit, TimeUnit},
     record_batch::RecordBatchOptions,
 };
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_local_program::{ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId};
 use novarocks_type_contract::ValueLogicalType;
 
@@ -219,7 +222,16 @@ fn check_literal_roots(cases: Vec<LiteralCase>) {
             CompiledExpressionInstance::try_new(unit, root, &RuntimeControl).unwrap();
         for _ in 0..2 {
             let result = evaluator
-                .evaluate(&batch, selection, &RuntimeControl)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &RuntimeControl,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(result.selection(), selection);
             assert!(result.errors().is_empty());
@@ -227,9 +239,17 @@ fn check_literal_roots(cases: Vec<LiteralCase>) {
         }
         let result = evaluator
             .evaluate(
-                &batch,
-                Selection::try_sparse(6, &[]).unwrap(),
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                {
+                    let selection = Selection::try_sparse(6, &[]).unwrap();
+                    ScalarInvocationScope::new(selection, selection)
+                },
+                ScalarInvocationActivation::Activated,
                 &RuntimeControl,
+                &mut PassThroughCallHost,
             )
             .unwrap();
         assert!(result.selection().is_empty());

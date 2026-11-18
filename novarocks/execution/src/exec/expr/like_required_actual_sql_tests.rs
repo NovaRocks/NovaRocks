@@ -25,8 +25,13 @@ use super::sql_test_source::{
 use arrow::array::{Array, ArrayRef, BooleanArray, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression_contract::ExprKind;
-use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
+use novarocks_functions::{
+    KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
+    Selection,
+};
 use novarocks_local_program::ProgramNodeKind;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -168,7 +173,18 @@ fn evaluate(
             &Control,
         )
         .unwrap();
-        let out = frame.evaluate(&data, selection, &Control).unwrap();
+        let out = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert!(out.errors().is_empty());
         assert_eq!(out.selection(), selection);
         let indices = UInt64Array::from(

@@ -25,8 +25,13 @@ use super::sql_test_source::{
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::{CountingAllocator, PassThroughCallHost};
 use novarocks_expression_contract::ExprKind;
-use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
+use novarocks_functions::{
+    KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
+    Selection,
+};
 use novarocks_local_program::ProgramNodeKind;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -158,13 +163,25 @@ fn evaluate(sql: &str, field: Field, input: ArrayRef, expected: &[Option<bool>],
         Vec::new(),
     ] {
         let selection = Selection::try_sparse(input.len(), &rows).unwrap();
-        let mut frame = CompiledExpressionInstance::try_new(
+        let mut frame = CompiledExpressionInstance::try_new_with_allocator(
             program.unit(site.unit).unwrap().clone(),
             site.root,
             &Control,
+            Some(Arc::new(CountingAllocator::new(usize::MAX))),
         )
         .unwrap();
-        let out = frame.evaluate(&data, selection, &Control).unwrap();
+        let out = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert!(out.errors().is_empty());
         assert_eq!(out.selection(), selection);
         let wanted = BooleanArray::from(rows.iter().map(|row| expected[*row]).collect::<Vec<_>>());

@@ -24,10 +24,9 @@ use arrow::{
     record_batch::{RecordBatch, RecordBatchOptions},
 };
 use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
-use novarocks_execution::runtime::task::ExecutionFailure;
-use novarocks_expression::RequiredExpressionRowError;
 use novarocks_expression::{
-    EvaluationEnvironment, ExprCompileFailure, ExprCreation, ScopeLayouts, compile_expr_set,
+    EvaluationEnvironment, EvaluationInput, ExprCompileFailure, ExprCreation,
+    RequiredExpressionRowError, ScopeLayouts, compile_expr_set,
 };
 use novarocks_expression_contract::RootScope;
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
@@ -211,8 +210,11 @@ impl RequiredConstantInterpreter {
         .map_err(SqlConstantEvaluationError::outer_domain)?;
         let selection = Selection::all(1);
         let values = instance
-            .evaluate_scoped_runtime(
-                &input,
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
                 ScalarInvocationScope::new(selection, selection),
                 ScalarInvocationActivation::Activated,
                 &kernel_control,
@@ -229,10 +231,8 @@ impl RequiredConstantInterpreter {
             let required = RequiredExpressionRowError::try_new(root, selected, error)
                 .map_err(SqlConstantEvaluationError::outer_domain)?;
             // Only the actual selected row-error channel is ordinary Data.
-            // Outer evaluator failures below keep their separate fatal port.
-            return Err(SqlConstantEvaluationError::from_domain(
-                ExecutionFailure::from(required),
-            ));
+            // Failures from the evaluator keep their separate fatal port.
+            return Err(SqlConstantEvaluationError::from_domain(required));
         }
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         if !novarocks_type_contract::arrow_data_types_exact_observed::<SqlConstantEvaluationError>(

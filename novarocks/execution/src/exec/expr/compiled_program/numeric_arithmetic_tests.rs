@@ -21,6 +21,9 @@ use super::*;
 use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{Decimal128Array, Decimal256Array, FixedSizeBinaryBuilder};
 use arrow_buffer::i256;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_type_contract::ValueLogicalType;
 use std::str::FromStr;
 
@@ -406,7 +409,16 @@ fn decimal_and_signed_five_operators_preserve_exact_scale_and_sparse_coefficient
             let rows = [1, 2, 3];
             let selected = Selection::try_sparse(4, &rows).unwrap();
             let output = instance(&program)
-                .evaluate(&batch, selected, &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selected, selected),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             let negative = match (op, &right.data_type()) {
                 (BinaryOperator::Add, DataType::Decimal128(..)) => -12_095,
@@ -466,7 +478,16 @@ fn decimal_and_signed_five_operators_preserve_exact_scale_and_sparse_coefficient
                 &[None],
             );
             let output = instance(&program)
-                .evaluate(&batch, Selection::all(1), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(coefficients(&output), vec![Some(expected)]);
             assert!(output.errors().is_empty());
@@ -543,7 +564,16 @@ fn decimal_precision_factor_and_mul_overflow_keep_independent_policies_and_null_
                     &[None; 3],
                 );
                 let output = instance(&program)
-                    .evaluate(&batch, Selection::all(3), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(
                     coefficients(&output),
@@ -569,7 +599,16 @@ fn decimal_precision_factor_and_mul_overflow_keep_independent_policies_and_null_
                     &[None; 3],
                 );
                 let output = instance(&program)
-                    .evaluate(&batch, Selection::all(3), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(coefficients(&output), vec![None; 3]);
                 assert!(
@@ -597,7 +636,16 @@ fn decimal_precision_factor_and_mul_overflow_keep_independent_policies_and_null_
         &[None; 3],
     );
     let output = instance(&program)
-        .evaluate(&batch, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(coefficients(&output), vec![Some(375), None, Some(0)]);
     assert!(output.errors().is_empty());
@@ -644,7 +692,19 @@ fn accurate_largeint_wraps_four_integral_operations_and_divides_fractionally() {
                 &vec![None; left.len()],
             );
             let output = instance(&program)
-                .evaluate(&batch, Selection::all(left.len()), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    {
+                        let selection = Selection::all(left.len());
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(large_values(&output), expected);
             assert!(output.errors().is_empty());
@@ -674,7 +734,16 @@ fn accurate_largeint_wraps_four_integral_operations_and_divides_fractionally() {
         &[None; 5],
     );
     let output = instance(&program)
-        .evaluate(&batch, Selection::all(5), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(5), Selection::all(5)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(
         output
@@ -727,7 +796,16 @@ fn accurate_largeint_wraps_four_integral_operations_and_divides_fractionally() {
         };
         let batch = typed_input(&program, left, right, &[None]);
         let output = instance(&program)
-            .evaluate(&batch, Selection::all(1), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(
             output
@@ -793,7 +871,16 @@ fn decimal128_and_decimal256_largeint_add_subtract_keep_full_domains_and_slices(
                 };
                 let batch = typed_input(&program, left, right, &[None; 3]);
                 let output = instance(&program)
-                    .evaluate(&batch, Selection::all(3), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 let expected = match (op, reversed) {
                     (BinaryOperator::Add, _) => vec![Some(sum), Some(i256::from_i128(823)), None],
@@ -837,7 +924,16 @@ fn decimal_guarded_rows_keep_terminal_errors_successful_nulls_and_decisive_pure_
             &[Some(false), Some(true), Some(true), None],
         );
         let output = instance(&program)
-            .evaluate(&batch, Selection::all(4), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         match wrap {
             Wrap::If => {
@@ -908,10 +1004,19 @@ fn decimal_selected_rows_preserve_all_seven_primary_refusals_and_failed_latch() 
     );
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let output = instance(&program)
-        .evaluate(&batch, Selection::all(320), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(errors(&output).len(), 107);
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
     for stop_at in 1..=trace.len() {
@@ -919,15 +1024,24 @@ fn decimal_selected_rows_preserve_all_seven_primary_refusals_and_failed_latch() 
             let mut evaluator = instance(&program);
             let control = CallbackControl::new(cause.clone(), stop_at);
             assert!(
-                matches!(evaluator.evaluate(&batch, Selection::all(320), &control), Err(actual) if actual == cause)
+                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..stop_at]);
+            assert_eq!(control.trace(), trace[..stop_at]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                evaluator.evaluate(&batch, Selection::all(320), &after),
-                Err(KernelFailure::InstanceFailed)
+                evaluator.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
 }

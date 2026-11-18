@@ -21,8 +21,13 @@ use super::numeric_unary_owned_transaction_tests::{batch, producer_root, program
 use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, Decimal128Array, Decimal256Array, Float32Array};
 use arrow::datatypes::DataType;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression_contract::ExprKind;
-use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
+use novarocks_functions::{
+    KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
+    Selection,
+};
 use novarocks_query_application::api::QueryExecutionKind;
 use novarocks_query_application::preparation::{CompletedPhysicalPlanCandidate, OutputContract};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -175,7 +180,18 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
         &Control,
     )
     .unwrap();
-    let selected = frame.evaluate(&data, Selection::all(4), &Control).unwrap();
+    let selected = frame
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &data,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert!(selected.errors().is_empty());
     let expected = expected_bits(wide, scale);
     assert_eq!(selected.selection(), Selection::all(4));
@@ -196,13 +212,36 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
     }
     let rows = [0, 1, 3];
     let sparse = frame
-        .evaluate(&data, Selection::try_sparse(4, &rows).unwrap(), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &data,
+                source: None,
+            },
+            {
+                let selection = Selection::try_sparse(4, &rows).unwrap();
+                ScalarInvocationScope::new(selection, selection)
+            },
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(sparse.selection(), Selection::try_sparse(4, &rows).unwrap());
     assert!(sparse.errors().is_empty());
     assert_bits(sparse.values(), &rows.map(|row| expected[row]));
     let empty_selection = Selection::try_sparse(4, &[]).unwrap();
-    let empty = frame.evaluate(&data, empty_selection, &Control).unwrap();
+    let empty = frame
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &data,
+                source: None,
+            },
+            ScalarInvocationScope::new(empty_selection, empty_selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert_eq!(empty.selection(), empty_selection);
     assert!(empty.errors().is_empty());
     assert_bits(empty.values(), &[]);
@@ -336,7 +375,18 @@ fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_p
             &Control,
         )
         .unwrap();
-        let output = frame.evaluate(&port, Selection::all(1), &Control).unwrap();
+        let output = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &port,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert!(output.errors().is_empty());
         let value = output
             .values()
@@ -354,7 +404,19 @@ fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_p
         );
         assert_eq!(
             frame
-                .evaluate(&port, Selection::try_sparse(1, &[]).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &port,
+                        source: None
+                    },
+                    {
+                        let selection = Selection::try_sparse(1, &[]).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap()
                 .values()
                 .len(),

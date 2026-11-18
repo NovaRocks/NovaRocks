@@ -40,9 +40,7 @@ use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailu
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef};
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::{
-    CompiledExpressionInstance, input_source::CompiledInputLoan,
-};
+use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
@@ -51,7 +49,8 @@ use crate::exec::pipeline::{
 };
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
-use novarocks_expression::{InputColumnProjection, RequiredExpressionRowError};
+use novarocks_expression::{EvaluationInput, InputColumnProjection, RequiredExpressionRowError};
+use novarocks_functions::ScalarInvocationScope;
 
 #[cfg(test)]
 pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
@@ -73,6 +72,8 @@ pub(crate) struct RuntimeKernelControl {
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     allocator: Option<Arc<crate::runtime::tracked_state_allocator::TrackedStateAllocator>>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    #[cfg(test)]
+    input_adapter_observer: Option<Arc<InputAdapterObserver>>,
 }
 impl RuntimeKernelControl {
     pub(crate) fn new(error: Arc<RuntimeErrorState>) -> Self {
@@ -83,6 +84,8 @@ impl RuntimeKernelControl {
             query_memory: None,
             allocator: None,
             construction: None,
+            #[cfg(test)]
+            input_adapter_observer: None,
         }
     }
     /// The actual operator supplies diagnostic context outside the evaluator.
@@ -101,6 +104,8 @@ impl RuntimeKernelControl {
             query_memory: self.query_memory.clone(),
             allocator: None,
             construction: self.construction.clone(),
+            #[cfg(test)]
+            input_adapter_observer: self.input_adapter_observer.clone(),
         }
     }
     /// Borrow the already-validated task capability at original operator binding.
@@ -224,6 +229,90 @@ impl KernelEvaluationControl for RuntimeKernelControl {
     }
 }
 
+#[cfg(test)]
+pub(crate) type InputAdapterObserver = dyn for<'a> Fn(&'a Chunk, EvaluationInput<'a>) + Send + Sync;
+
+#[cfg(test)]
+pub(crate) fn assert_original_chunk_input(chunk: &Chunk, input: EvaluationInput<'_>) {
+    assert!(std::ptr::eq(input.batch(), chunk.record_batch()));
+    let storage = input
+        .source_storage()
+        .expect("the adapter keeps the original Chunk source");
+    assert!(std::ptr::addr_eq(storage, chunk));
+}
+
+#[cfg(test)]
+impl RuntimeKernelControl {
+    pub(crate) fn observe_input_adapter(&mut self, observer: Arc<InputAdapterObserver>) {
+        self.input_adapter_observer = Some(observer);
+    }
+}
+
+pub(crate) fn chunk_evaluation_input<'a>(
+    chunk: &'a Chunk,
+    _control: &RuntimeKernelControl,
+) -> EvaluationInput<'a> {
+    let input = EvaluationInput::Batch {
+        batch: chunk.record_batch(),
+        source: Some(chunk),
+    };
+    #[cfg(test)]
+    if let Some(observer) = &_control.input_adapter_observer {
+        observer(chunk, input);
+    }
+    input
+}
+
+pub(crate) fn projected_chunk_evaluation_input<'a>(
+    chunk: &'a Chunk,
+    declared: &'a ChunkSchema,
+    projection: &'a Arc<InputColumnProjection>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<EvaluationInput<'a>, KernelFailure> {
+    let compact = chunk.chunk_schema();
+    if !compact.is_typed() || !declared.is_typed() {
+        return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+            "projected input lacks its exact typed column map",
+        )));
+    }
+    EvaluationInput::try_projected_observed(
+        chunk.record_batch(),
+        declared.borrowed_arrow_schema_ref(),
+        projection,
+        Some(chunk),
+        control,
+        |physical, original| {
+            let actual_slot = &compact.slots()[physical];
+            let original_slot = &declared.slots()[original];
+            if actual_slot.slot_id() != original_slot.slot_id() {
+                return Ok(false);
+            }
+            actual_slot
+                .typed_binding()
+                .borrowed()
+                .same_physical_binding_ignoring_root_nullability_observed(
+                    original_slot.typed_binding().borrowed(),
+                    || control.checkpoint(1),
+                )
+        },
+    )
+}
+
+/// A compact Chunk retains the exact binding checked above.
+fn adapt_projected_chunk<'a>(
+    chunk: &'a Chunk,
+    declared: &'a ChunkSchema,
+    projection: &'a Arc<InputColumnProjection>,
+    control: &RuntimeKernelControl,
+) -> Result<EvaluationInput<'a>, KernelFailure> {
+    let input = projected_chunk_evaluation_input(chunk, declared, projection, control)?;
+    #[cfg(test)]
+    if let Some(observer) = &control.input_adapter_observer {
+        observer(chunk, input);
+    }
+    Ok(input)
+}
+
 /// Evaluate one root over every row of `input` and return the full column.
 /// A row data error of the root is a required error and is returned typed.
 pub(crate) fn evaluate_all(
@@ -235,7 +324,10 @@ pub(crate) fn evaluate_all(
     evaluate_selection(
         instance,
         site,
-        CompiledInputLoan::RecordBatch(input),
+        EvaluationInput::Batch {
+            batch: input,
+            source: None,
+        },
         Selection::all(input.num_rows()),
         if input.num_rows() == 0 {
             novarocks_functions::ScalarInvocationActivation::ValidateOnly
@@ -257,7 +349,7 @@ pub(crate) fn evaluate_chunk_all(
     evaluate_selection(
         instance,
         site,
-        CompiledInputLoan::from_chunk(input),
+        chunk_evaluation_input(input, control),
         Selection::all(input.record_batch().num_rows()),
         if input.record_batch().num_rows() == 0 {
             novarocks_functions::ScalarInvocationActivation::ValidateOnly
@@ -279,7 +371,7 @@ pub(crate) fn evaluate_projected_chunk_all(
     projection: &Arc<InputColumnProjection>,
     control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
-    let loan = CompiledInputLoan::from_projected_chunk(input, declared, projection, control)?;
+    let loan = adapt_projected_chunk(input, declared, projection, control)?;
     evaluate_selection(
         instance,
         site,
@@ -312,7 +404,7 @@ pub(crate) fn evaluate_projected_chunk_rows(
             "compiled root selection is not ordered within its batch",
         )))
     })?;
-    let loan = CompiledInputLoan::from_projected_chunk(input, declared, projection, control)?;
+    let loan = adapt_projected_chunk(input, declared, projection, control)?;
     evaluate_selection(
         instance,
         site,
@@ -348,7 +440,10 @@ pub(crate) fn evaluate_selected(
     evaluate_selection(
         instance,
         site,
-        CompiledInputLoan::RecordBatch(input),
+        EvaluationInput::Batch {
+            batch: input,
+            source: None,
+        },
         selection,
         activation,
         control,
@@ -358,7 +453,7 @@ pub(crate) fn evaluate_selected(
 fn evaluate_selection(
     instance: &mut CompiledExpressionInstance,
     site: ProgramRootRef,
-    input: CompiledInputLoan<'_>,
+    input: EvaluationInput<'_>,
     selection: Selection<'_>,
     activation: novarocks_functions::ScalarInvocationActivation,
     control: &RuntimeKernelControl,
@@ -369,7 +464,14 @@ fn evaluate_selection(
     let mut scope =
         crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(control, &mut journal);
     let result = instance
-        .evaluate_input_runtime(input, selection, activation, control, &mut scope)
+        .evaluate(
+            input,
+            ScalarInvocationScope::new(selection, selection),
+            activation,
+            control,
+            &mut scope,
+        )
+        .map_err(ExecutionFailure::from)
         .map_err(|cause| control.project_required_failure(cause))?;
     let (selection, values, errors) = result.into_parts();
     if let Some(error) = errors.into_vec().into_iter().next() {
@@ -669,7 +771,7 @@ struct CompiledProjectProcessor {
 pub(crate) fn project_chunk_with_source_observer(
     program: Arc<LocalProgram>,
     chunk: Chunk,
-    observer: Arc<crate::exec::expr::compiled_program::input_source::SlotSourceObserver>,
+    observer: Arc<InputAdapterObserver>,
 ) -> ExecutionResult<Chunk> {
     let factory = CompiledProjectProcessorFactory::try_new(
         program,
@@ -704,9 +806,7 @@ pub(crate) fn project_chunk_with_source_observer(
         &processor.sites,
         &processor.control,
     )?;
-    for instance in processor.instances.as_mut().unwrap() {
-        instance.observe_slot_source(Arc::clone(&observer));
-    }
+    processor.control.observe_input_adapter(observer);
     let control = RuntimeErrorState::default();
     let mut turn = crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
@@ -970,7 +1070,7 @@ pub(crate) struct CompiledFilterBody {
 impl CompiledFilterBody {
     pub(crate) fn evaluate(
         &mut self,
-        input: CompiledInputLoan<'_>,
+        input: EvaluationInput<'_>,
         control: &RuntimeKernelControl,
     ) -> ExecutionResult<BooleanArray> {
         if self.instance.is_none() {
@@ -985,12 +1085,13 @@ impl CompiledFilterBody {
             .instance
             .as_mut()
             .expect("instance was created")
-            .evaluate_required_input_runtime(
+            .evaluate(
                 input,
                 Selection::all(input.batch().num_rows()),
                 control,
                 &mut scope,
             )
+            .map_err(ExecutionFailure::from)
             .map_err(|cause| {
                 control.project_required_failure(cause.at_expression_node(self.node))
             })?;
@@ -1088,7 +1189,7 @@ impl crate::exec::pipeline::shape::TransformKernel for CompiledFilterProcessor {
         let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         let truth = self
             .body
-            .evaluate(CompiledInputLoan::from_chunk(&chunk), &self.control)?;
+            .evaluate(chunk_evaluation_input(&chunk, &self.control), &self.control)?;
         let mask = crate::exec::chunk::normalize_filter_mask_observed(&truth, || Ok(()))?;
         let batch = filter_record_batch(chunk.record_batch(), &mask)
             .map_err(|error| ExecutionFailure::from_domain(CompiledFilterArrowFailure(error)))?;
@@ -1398,7 +1499,10 @@ mod mixed_unit_filter_tests {
             let mut body = factory.create_body();
             let truth = body
                 .evaluate(
-                    CompiledInputLoan::RecordBatch(&input),
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
                     &RuntimeKernelControl::new(error),
                 )
                 .unwrap();

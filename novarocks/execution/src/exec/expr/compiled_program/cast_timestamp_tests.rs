@@ -21,7 +21,10 @@ use arrow::array::{
     TimestampSecondArray,
 };
 use arrow::datatypes::TimeUnit;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
 use novarocks_functions::SelectedValues;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 
 const UNITS: [TimeUnit; 4] = [
     TimeUnit::Second,
@@ -218,7 +221,18 @@ fn timestamp_cast_compiler_controller_all_sixteen_pairs_keep_independent_coeffic
                     );
                     let batch = timestamp_batch(&program, &values, &[Some(true); 10]);
                     let mut evaluator = instance(&program);
-                    let output = evaluator.evaluate(&batch, selection, &Control).unwrap();
+                    let output = evaluator
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
+                        .unwrap();
                     assert_eq!(output.selection(), selection);
                     assert_eq!(
                         output.values().data_type(),
@@ -246,9 +260,17 @@ fn timestamp_cast_compiler_controller_all_sixteen_pairs_keep_independent_coeffic
                     }
                     let empty = evaluator
                         .evaluate(
-                            &batch,
-                            Selection::try_sparse(values.len(), &[]).unwrap(),
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            {
+                                let selection = Selection::try_sparse(values.len(), &[]).unwrap();
+                                ScalarInvocationScope::new(selection, selection)
+                            },
+                            ScalarInvocationActivation::Activated,
                             &Control,
+                            &mut PassThroughCallHost,
                         )
                         .unwrap();
                     assert!(empty.values().is_empty());
@@ -290,7 +312,16 @@ fn timestamp_cast_nonnullable_contract_requires_only_five_successful_null_promis
                 let batch =
                     timestamp_batch(&program, &[Some(i64::MAX), Some(-1)], &[Some(true); 2]);
                 let output = instance(&program)
-                    .evaluate(&batch, Selection::all(2), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(
                     errors(&output),
@@ -323,7 +354,19 @@ fn timestamp_cast_literal_broadcast_and_batch_splits_keep_original_coefficients(
             let mut evaluator = instance(&program);
             for _ in 0..2 {
                 let output = evaluator
-                    .evaluate(&batch, Selection::try_sparse(5, &rows).unwrap(), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        {
+                            let selection = Selection::try_sparse(5, &rows).unwrap();
+                            ScalarInvocationScope::new(selection, selection)
+                        },
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(timestamp_values(&output), vec![coefficient; 3]);
                 assert!(output.errors().is_empty());
@@ -354,7 +397,16 @@ fn timestamp_cast_guards_distinguish_successful_nulls_from_required_overflow_err
                     &[Some(true), Some(true), Some(true), Some(false)],
                 );
                 let output = instance(&program)
-                    .evaluate(&batch, Selection::all(4), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(
                     errors(&output),
@@ -399,7 +451,16 @@ fn timestamp_cast_guards_distinguish_successful_nulls_from_required_overflow_err
             let batch =
                 timestamp_batch(&program, &[Some(i64::MAX), None, Some(1)], &[Some(true); 3]);
             let output = instance(&program)
-                .evaluate(&batch, Selection::all(3), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(
                 timestamp_values(&output),
@@ -427,34 +488,61 @@ fn timestamp_cast_actual_runtime_callbacks_preserve_all_seven_causes_and_failed_
     );
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let output = instance(&program)
-        .evaluate(&batch, Selection::all(3), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(errors(&output), vec![0]);
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     for stop_at in 1..=trace.len() {
         for cause in causes() {
             let control = CallbackControl::new(cause.clone(), stop_at);
             let mut evaluator = instance(&program);
             assert!(
-                matches!(evaluator.evaluate(&batch, Selection::all(3), &control), Err(actual) if actual == cause)
+                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(3), Selection::all(3)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..stop_at]);
+            assert_eq!(control.trace(), trace[..stop_at]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                evaluator.evaluate(&batch, Selection::all(3), &after),
-                Err(KernelFailure::InstanceFailed)
+                evaluator.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
     let values = vec![Some(1); 320];
     let batch = timestamp_batch(&program, &values, &[Some(true); 320]);
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let output = instance(&program)
-        .evaluate(&batch, Selection::all(320), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(timestamp_values(&output), vec![Some(1000); 320]);
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
     for stop_at in (1..=trace.len()).filter(|&n| n == 1 || n == trace.len() || trace[n - 1] == 256)
@@ -462,9 +550,9 @@ fn timestamp_cast_actual_runtime_callbacks_preserve_all_seven_causes_and_failed_
         for cause in causes() {
             let control = CallbackControl::new(cause.clone(), stop_at);
             assert!(
-                matches!(instance(&program).evaluate(&batch, Selection::all(320), &control), Err(actual) if actual == cause)
+                matches!(instance(&program).evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..stop_at]);
+            assert_eq!(control.trace(), trace[..stop_at]);
         }
     }
 }

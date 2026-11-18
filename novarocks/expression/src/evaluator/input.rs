@@ -58,12 +58,91 @@ pub enum EvaluationInput<'a> {
         batch: &'a RecordBatch,
         source: Option<&'a dyn InputSourceStorage>,
     },
-    Projected {
+    Projected(ProjectedEvaluationInput<'a>),
+}
+
+/// The compact columns have already been matched to their original declaration.
+#[derive(Clone, Copy)]
+pub struct ProjectedEvaluationInput<'a> {
+    batch: &'a RecordBatch,
+    declared: &'a SchemaRef,
+    projection: &'a Arc<InputColumnProjection>,
+    source: Option<&'a dyn InputSourceStorage>,
+}
+
+impl<'a> EvaluationInput<'a> {
+    /// Validate the physical projection in its original column order. The
+    /// caller may additionally require its own binding for each coordinate.
+    pub fn try_projected_observed(
         batch: &'a RecordBatch,
         declared: &'a SchemaRef,
         projection: &'a Arc<InputColumnProjection>,
         source: Option<&'a dyn InputSourceStorage>,
-    },
+        control: &dyn novarocks_functions::KernelEvaluationControl,
+        mut matches_binding: impl FnMut(usize, usize) -> Result<bool, KernelFailure>,
+    ) -> Result<Self, KernelFailure> {
+        use novarocks_functions::KernelDiagnostic;
+        let ordinals = projection.ordinals();
+        if batch.num_columns() != ordinals.len() {
+            return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                "projected input lacks its exact typed column map",
+            )));
+        }
+        let actual = batch.schema();
+        let mut previous = None;
+        for (physical, &original) in ordinals.iter().enumerate() {
+            control.checkpoint(1)?;
+            if previous.is_some_and(|p| p >= original)
+                || original >= declared.fields().len()
+                || !matches_binding(physical, original)?
+                || !novarocks_type_contract::arrow_fields_exact_with_nullability_observed(
+                    declared.field(original),
+                    actual.field(physical),
+                    novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
+                    || control.checkpoint(1),
+                )?
+            {
+                return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                    "projected input column differs from its original frozen ordinal",
+                )));
+            }
+            previous = Some(original);
+        }
+        Ok(Self::Projected(ProjectedEvaluationInput {
+            batch,
+            declared,
+            projection,
+            source,
+        }))
+    }
+
+    pub fn batch(self) -> &'a RecordBatch {
+        match self {
+            Self::Batch { batch, .. } => batch,
+            Self::Projected(input) => input.batch,
+        }
+    }
+
+    pub fn source_storage(self) -> Option<&'a dyn InputSourceStorage> {
+        match self {
+            Self::Batch { source, .. } => source,
+            Self::Projected(input) => input.source,
+        }
+    }
+
+    pub fn declared_schema(self) -> SchemaRef {
+        match self {
+            Self::Batch { batch, .. } => batch.schema(),
+            Self::Projected(input) => Arc::clone(input.declared),
+        }
+    }
+
+    pub fn projection(self) -> Option<&'a Arc<InputColumnProjection>> {
+        match self {
+            Self::Batch { .. } => None,
+            Self::Projected(input) => Some(input.projection),
+        }
+    }
 }
 
 /// Data-only column coordinates and their actual metadata creator. The caller

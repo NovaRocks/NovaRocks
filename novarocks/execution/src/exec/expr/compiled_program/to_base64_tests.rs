@@ -19,6 +19,9 @@
 use super::*;
 use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{ArrayRef, StringArray};
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_type_contract::{
     SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
     ToBase64ByteSource as Source,
@@ -171,7 +174,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
                 None,
                 owner.result(),
                 ExprKind::FunctionCall {
-                    function: owner.function.clone(),
+                    function: owner.function().clone(),
                     args: Box::from([child]),
                 },
             )
@@ -211,7 +214,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
                 None,
                 owner.result(),
                 ExprKind::FunctionCall {
-                    function: owner.function.clone(),
+                    function: owner.function().clone(),
                     args: Box::from([child]),
                 },
             )
@@ -231,7 +234,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             None,
             owner.result(),
             ExprKind::FunctionCall {
-                function: owner.function.clone(),
+                function: owner.function().clone(),
                 args: Box::from([child]),
             },
         )
@@ -352,7 +355,18 @@ fn to_base64_actual_compiler_source_sensitive_full_profile_matches_rfc4648_vecto
         .unwrap();
         let mut evaluator = instance(&program);
         let selection = Selection::try_sparse(4, &[0, 1, 2, 3]).unwrap();
-        let out = evaluator.evaluate(&batch, selection, &Control).unwrap();
+        let out = evaluator
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         let expected = independent_expected(shape);
         assert_eq!(
             out.values()
@@ -384,7 +398,16 @@ fn to_base64_actual_compiler_source_sensitive_full_profile_matches_rfc4648_vecto
         );
         let sparse = Selection::try_sparse(4, &[0, 3]).unwrap();
         let out = instance(&program)
-            .evaluate(&batch, sparse, &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(sparse, sparse),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(out.selection(), sparse);
         assert_eq!(
@@ -399,7 +422,19 @@ fn to_base64_actual_compiler_source_sensitive_full_profile_matches_rfc4648_vecto
         );
         assert!(
             instance(&program)
-                .evaluate(&batch, Selection::try_sparse(4, &[]).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    {
+                        let selection = Selection::try_sparse(4, &[]).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost
+                )
                 .unwrap()
                 .values()
                 .is_empty()
@@ -464,9 +499,18 @@ fn to_base64_actual_compiler_runtime_seven_causes_keep_source_and_first_failure_
         .unwrap();
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
         instance(&program)
-            .evaluate(&batch, Selection::all(321), &recorder)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(321), Selection::all(321)),
+                ScalarInvocationActivation::Activated,
+                &recorder,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(trace.contains(&256));
         assert!(trace.iter().all(|units| *units <= 256));
         for index in 1..=trace.len() {
@@ -474,15 +518,24 @@ fn to_base64_actual_compiler_runtime_seven_causes_keep_source_and_first_failure_
                 let mut evaluator = instance(&program);
                 let control = CallbackControl::new(cause.clone(), index);
                 assert!(
-                    matches!(evaluator.evaluate(&batch,Selection::all(321),&control),Err(actual)if actual==cause)
+                    matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(321), Selection::all(321)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual))if actual==cause)
                 );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+                assert_eq!(control.trace(), trace[..index]);
                 let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
                 assert!(matches!(
-                    evaluator.evaluate(&batch, Selection::all(321), &after),
-                    Err(KernelFailure::InstanceFailed)
+                    evaluator.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(Selection::all(321), Selection::all(321)),
+                        ScalarInvocationActivation::Activated,
+                        &after,
+                        &mut PassThroughCallHost
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
-                assert!(after.trace.lock().unwrap().is_empty());
+                assert!(after.trace().is_empty());
             }
         }
     }

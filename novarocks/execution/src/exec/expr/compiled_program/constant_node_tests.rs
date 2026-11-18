@@ -18,9 +18,12 @@
 use super::constant_node::*;
 use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array};
 use arrow::datatypes::DataType;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_functions::{
     ConstantPolicy, ConstantValue, FunctionValueType, KernelEvaluationControl,
 };
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_type_contract::{
     ArithmeticOperator, ComparisonOperator, CompileControlError, CompilePhase,
     DecimalOverflowPolicy, PureCompileControl,
@@ -477,7 +480,19 @@ fn numeric_not_actual_sql_program_and_constant_entry_keep_the_same_sparse_values
         )
         .unwrap();
         let output = frame
-            .evaluate(&data, novarocks_functions::Selection::all(4), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(
+                    novarocks_functions::Selection::all(4),
+                    novarocks_functions::Selection::all(4),
+                ),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert!(output.errors().is_empty());
         assert_eq!(
@@ -487,9 +502,17 @@ fn numeric_not_actual_sql_program_and_constant_entry_keep_the_same_sparse_values
         let rows = [0, 2];
         let sparse = frame
             .evaluate(
-                &data,
-                novarocks_functions::Selection::try_sparse(4, &rows).unwrap(),
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                {
+                    let selection = novarocks_functions::Selection::try_sparse(4, &rows).unwrap();
+                    ScalarInvocationScope::new(selection, selection)
+                },
+                ScalarInvocationActivation::Activated,
                 &Control,
+                &mut PassThroughCallHost,
             )
             .unwrap();
         assert!(sparse.errors().is_empty());

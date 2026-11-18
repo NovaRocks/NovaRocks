@@ -22,8 +22,13 @@ use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, BooleanArray, Decimal128Array, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression_contract::ExprKind;
-use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
+use novarocks_functions::{
+    KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
+    Selection,
+};
 use novarocks_local_program::ProgramNodeKind;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -146,7 +151,18 @@ fn evaluate(sql: &str, input: ArrayRef, expected: &[Option<bool>], truth: bool) 
             &Control,
         )
         .unwrap();
-        let out = frame.evaluate(&data, selection, &Control).unwrap();
+        let out = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert!(out.errors().is_empty());
         // The SQL predicate's value channel is three-valued. Its truth-only
         // filter channel maps UNKNOWN to false, independently of Frame output.

@@ -18,6 +18,9 @@
 //! Actual LocalCompiler Binary-to-Utf8 CAST, native constant source and first-failure contracts.
 use super::*;
 use arrow::array::{BinaryArray, StringArray};
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 // Literal bytes and UTF8 validity determine these independent values: NUL
 // and Unicode survive, an empty sequence is empty text, and 0xff is invalid.
 fn input() -> ArrayRef {
@@ -70,7 +73,16 @@ fn binary_text_actual_compiler_full_profile_all_policies_source_nullability_slic
                 let rows = if nullable { vec![0, 2, 3] } else { vec![0, 2] };
                 let selected = Selection::try_sparse(source.len(), &rows).unwrap();
                 let result = instance(&program)
-                    .evaluate(&batch, selected, &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selected, selected),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert!(result.errors().is_empty());
                 let values = [Some("你好\0🙂"), Some(""), None, None];
@@ -82,9 +94,17 @@ fn binary_text_actual_compiler_full_profile_all_policies_source_nullability_slic
                 let empty = [];
                 let result = instance(&program)
                     .evaluate(
-                        &batch,
-                        Selection::try_sparse(source.len(), &empty).unwrap(),
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        {
+                            let selection = Selection::try_sparse(source.len(), &empty).unwrap();
+                            ScalarInvocationScope::new(selection, selection)
+                        },
+                        ScalarInvocationActivation::Activated,
                         &Control,
+                        &mut PassThroughCallHost,
                     )
                     .unwrap();
                 assert_eq!(result.values().data_type(), &DataType::Utf8);
@@ -93,7 +113,16 @@ fn binary_text_actual_compiler_full_profile_all_policies_source_nullability_slic
                 let empty_source = source.slice(0, 0);
                 let batch = binary_batch(&program, empty_source);
                 let result = instance(&program)
-                    .evaluate(&batch, Selection::all(0), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(Selection::all(0), Selection::all(0)),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(result.values().len(), 0);
             }
@@ -119,7 +148,19 @@ fn binary_text_actual_compiler_native_binary_constant_uses_real_emitted_bytes() 
             let batch = binary_batch(&program, source);
             let rows = [1, 3];
             let result = instance(&program)
-                .evaluate(&batch, Selection::try_sparse(4, &rows).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    {
+                        let selection = Selection::try_sparse(4, &rows).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert!(result.errors().is_empty());
             assert_eq!(
@@ -150,27 +191,45 @@ fn binary_text_actual_compiler_all_seven_runtime_causes_stop_and_latch_after_act
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     assert!(
         instance(&program)
-            .evaluate(&batch, Selection::all(3), &recorder)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                ScalarInvocationActivation::Activated,
+                &recorder,
+                &mut PassThroughCallHost
+            )
             .unwrap()
             .errors()
             .is_empty()
     );
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     for at in 1..=trace.len() {
         for cause in causes() {
             let mut evaluator = instance(&program);
             let control = CallbackControl::new(cause.clone(), at);
             assert!(
-                matches!(evaluator.evaluate(&batch,Selection::all(3),&control),Err(actual) if actual==cause)
+                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(3), Selection::all(3)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+            assert_eq!(control.trace(), trace[..at]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                evaluator.evaluate(&batch, Selection::all(3), &after),
-                Err(KernelFailure::InstanceFailed)
+                evaluator.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
 }

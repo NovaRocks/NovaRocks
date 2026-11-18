@@ -26,14 +26,17 @@ use crate::runtime::{
     scalar_memory::{
         RuntimeScalarMemoryJournal, RuntimeScalarMemoryRefusal, RuntimeScalarMemoryScope,
     },
-    task::ExecutionFailureCause,
+    task::{ExecutionFailure, ExecutionFailureCause},
 };
+use arrow::record_batch::RecordBatch;
 use arrow::{
     array::{BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array},
     datatypes::DataType,
 };
 use novarocks_expression::CompiledExprSet;
+use novarocks_expression::{EvaluationInput, testkit::PassThroughCallHost};
 use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
+use novarocks_functions::ScalarInvocationScope;
 use novarocks_functions::{
     EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel, PureEngineFunctionCatalog,
     ScalarInvocationActivation as Activation,
@@ -494,7 +497,16 @@ fn runtime_scalar_memory_original_frame_nested_and_selected_values_match_old_ent
                 )
                 .unwrap();
                 let expected = original
-                    .evaluate_evaluation(&input, selection, Activation::Activated, &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &input,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        Activation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 let mut actual = CompiledExpressionInstance::try_new(
                     program.unit(root(&program).unit).unwrap().clone(),
@@ -504,13 +516,17 @@ fn runtime_scalar_memory_original_frame_nested_and_selected_values_match_old_ent
                 .unwrap();
                 let mut journal = RuntimeScalarMemoryJournal::default();
                 let result = actual
-                    .evaluate_runtime(
-                        &input,
-                        selection,
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &input,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selection, selection),
                         Activation::Activated,
                         &control,
                         &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
                     )
+                    .map_err(ExecutionFailure::from)
                     .unwrap();
                 assert_eq!(result.values().to_data(), expected.values().to_data());
                 assert!(journal.body.settlement.is_some());
@@ -595,13 +611,18 @@ fn runtime_scalar_memory_if_undemanded_validate_only_and_strict_null_bypass_rema
     )
     .unwrap();
     let mut journal = RuntimeScalarMemoryJournal::default();
-    let result = actual.evaluate_runtime(
-        &input,
-        Selection::all(0),
-        Activation::Activated,
-        &control,
-        &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
-    );
+    let result = actual
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(0), Selection::all(0)),
+            Activation::Activated,
+            &control,
+            &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+        )
+        .map_err(ExecutionFailure::from);
     assert_eq!(result.unwrap().values().len(), 0);
     assert!(journal.body.settlement.is_none());
 }
@@ -613,24 +634,44 @@ fn runtime_scalar_memory_direct_ordered_filter_uses_same_loan_and_first_host_fai
         vec![Some(7), Some(3), None],
         vec![Some(true), Some(false), Some(true)],
     );
-    let mut legacy =
-        CompiledFilterConjunctionInstance::try_new(&predicate_units(&program), &Control).unwrap();
+    let mut legacy = CompiledFilterConjunctionInstance::try_new_with_allocator(
+        &predicate_units(&program),
+        &Control,
+        None,
+    )
+    .unwrap();
     let expected = legacy
-        .evaluate_required(&input, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            Selection::all(3),
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     for funded in [false, true] {
         let binding = bound();
         let control = runtime_control(funded.then_some(&binding));
-        let mut actual =
-            CompiledFilterConjunctionInstance::try_new(&predicate_units(&program), &control)
-                .unwrap();
-        let mut journal = RuntimeScalarMemoryJournal::default();
-        let result = actual.evaluate_required_runtime(
-            &input,
-            Selection::all(3),
+        let mut actual = CompiledFilterConjunctionInstance::try_new_with_allocator(
+            &predicate_units(&program),
             &control,
-            &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
-        );
+            None,
+        )
+        .unwrap();
+        let mut journal = RuntimeScalarMemoryJournal::default();
+        let result = actual
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                Selection::all(3),
+                &control,
+                &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+            )
+            .map_err(ExecutionFailure::from);
         if funded {
             assert_eq!(
                 result
@@ -658,12 +699,16 @@ fn runtime_scalar_memory_direct_ordered_filter_uses_same_loan_and_first_host_fai
             let mut journal = RuntimeScalarMemoryJournal::default();
             assert!(matches!(
                 actual
-                    .evaluate_required_runtime(
-                        &input,
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &input,
+                            source: None
+                        },
                         Selection::all(3),
                         &control,
-                        &mut RuntimeScalarMemoryScope::new(&control, &mut journal)
+                        &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
                     )
+                    .map_err(ExecutionFailure::from)
                     .unwrap_err()
                     .cause(),
                 ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
@@ -702,7 +747,16 @@ fn runtime_scalar_memory_nine_narrow_frames_and_direct_filters_use_original_scop
                     )
                     .unwrap();
                     let expected = original
-                        .evaluate_evaluation(&input, selection, Activation::Activated, &Control)
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &input,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            Activation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
                         .unwrap();
                     let mut actual = CompiledExpressionInstance::try_new(
                         program.unit(root(&program).unit).unwrap().clone(),
@@ -712,13 +766,17 @@ fn runtime_scalar_memory_nine_narrow_frames_and_direct_filters_use_original_scop
                     .unwrap();
                     let mut journal = RuntimeScalarMemoryJournal::default();
                     let result = actual
-                        .evaluate_runtime(
-                            &input,
-                            selection,
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &input,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
                             Activation::Activated,
                             &control,
                             &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
                         )
+                        .map_err(ExecutionFailure::from)
                         .unwrap();
                     assert_eq!(result.values().data_type(), &ty);
                     assert_eq!(result.values().to_data(), expected.values().to_data());
@@ -732,27 +790,44 @@ fn runtime_scalar_memory_nine_narrow_frames_and_direct_filters_use_original_scop
                 vec![Some(7), Some(3), None],
                 vec![Some(true), Some(false), Some(true)],
             );
-            let mut original =
-                CompiledFilterConjunctionInstance::try_new(&predicate_units(&program), &Control)
-                    .unwrap();
+            let mut original = CompiledFilterConjunctionInstance::try_new_with_allocator(
+                &predicate_units(&program),
+                &Control,
+                None,
+            )
+            .unwrap();
             let expected = original
-                .evaluate_required(&input, Selection::all(3), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
+                    Selection::all(3),
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             for funded in [false, true] {
                 let binding = bound();
                 let control = runtime_control(funded.then_some(&binding));
-                let mut actual = CompiledFilterConjunctionInstance::try_new(
+                let mut actual = CompiledFilterConjunctionInstance::try_new_with_allocator(
                     &predicate_units(&program),
                     &control,
+                    None,
                 )
                 .unwrap();
                 let mut journal = RuntimeScalarMemoryJournal::default();
-                let result = actual.evaluate_required_runtime(
-                    &input,
-                    Selection::all(3),
-                    &control,
-                    &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
-                );
+                let result = actual
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &input,
+                            source: None,
+                        },
+                        Selection::all(3),
+                        &control,
+                        &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                    )
+                    .map_err(ExecutionFailure::from);
                 if funded {
                     assert_eq!(result.unwrap().to_data(), expected.to_data());
                     assert!(journal.body.settlement.is_some());
@@ -766,12 +841,16 @@ fn runtime_scalar_memory_nine_narrow_frames_and_direct_filters_use_original_scop
                     let mut journal = RuntimeScalarMemoryJournal::default();
                     assert!(matches!(
                         actual
-                            .evaluate_required_runtime(
-                                &input,
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &input,
+                                    source: None
+                                },
                                 Selection::all(3),
                                 &control,
-                                &mut RuntimeScalarMemoryScope::new(&control, &mut journal)
+                                &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
                             )
+                            .map_err(ExecutionFailure::from)
                             .unwrap_err()
                             .cause(),
                         ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
@@ -890,28 +969,43 @@ fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_
                         program.graph().nodes()[2].kind(),
                         novarocks_local_program::ProgramNodeKind::Filter { .. }
                     ));
-                    let mut original = CompiledFilterConjunctionInstance::try_new(
+                    let mut original = CompiledFilterConjunctionInstance::try_new_with_allocator(
                         &predicate_units(&program),
                         &Control,
+                        None,
                     )
                     .unwrap();
                     let expected = original
-                        .evaluate_required(&input, Selection::all(4), &Control)
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &input,
+                                source: None,
+                            },
+                            Selection::all(4),
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
                         .unwrap();
                     for has_binding in [false, true] {
                         let control = runtime_control(has_binding.then_some(&binding));
-                        let mut actual = CompiledFilterConjunctionInstance::try_new(
+                        let mut actual = CompiledFilterConjunctionInstance::try_new_with_allocator(
                             &predicate_units(&program),
                             &control,
+                            None,
                         )
                         .unwrap();
                         let mut journal = RuntimeScalarMemoryJournal::default();
-                        let result = actual.evaluate_required_runtime(
-                            &input,
-                            Selection::all(4),
-                            &control,
-                            &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
-                        );
+                        let result = actual
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &input,
+                                    source: None,
+                                },
+                                Selection::all(4),
+                                &control,
+                                &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                            )
+                            .map_err(ExecutionFailure::from);
                         if has_binding {
                             assert_eq!(result.unwrap().to_data(), expected.to_data());
                             assert_eq!(journal.body.settlement.unwrap().debt, 0);
@@ -925,12 +1019,16 @@ fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_
                             let mut retry = RuntimeScalarMemoryJournal::default();
                             assert!(matches!(
                                 actual
-                                    .evaluate_required_runtime(
-                                        &input,
+                                    .evaluate(
+                                        EvaluationInput::Batch {
+                                            batch: &input,
+                                            source: None
+                                        },
                                         Selection::all(4),
                                         &funded,
-                                        &mut RuntimeScalarMemoryScope::new(&funded, &mut retry)
+                                        &mut RuntimeScalarMemoryScope::new(&funded, &mut retry),
                                     )
+                                    .map_err(ExecutionFailure::from)
                                     .unwrap_err()
                                     .cause(),
                                 ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
@@ -951,7 +1049,16 @@ fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_
                         )
                         .unwrap();
                         let expected = original
-                            .evaluate_evaluation(&input, selection, Activation::Activated, &Control)
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &input,
+                                    source: None,
+                                },
+                                ScalarInvocationScope::new(selection, selection),
+                                Activation::Activated,
+                                &Control,
+                                &mut PassThroughCallHost,
+                            )
                             .unwrap();
                         let mut actual = CompiledExpressionInstance::try_new(
                             program.unit(root(&program).unit).unwrap().clone(),
@@ -961,13 +1068,17 @@ fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_
                         .unwrap();
                         let mut journal = RuntimeScalarMemoryJournal::default();
                         let result = actual
-                            .evaluate_runtime(
-                                &input,
-                                selection,
+                            .evaluate(
+                                EvaluationInput::Batch {
+                                    batch: &input,
+                                    source: None,
+                                },
+                                ScalarInvocationScope::new(selection, selection),
                                 Activation::Activated,
                                 &funded,
                                 &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
                             )
+                            .map_err(ExecutionFailure::from)
                             .unwrap();
                         assert_eq!(result.values().data_type(), &ty);
                         assert_eq!(result.values().to_data(), expected.values().to_data());

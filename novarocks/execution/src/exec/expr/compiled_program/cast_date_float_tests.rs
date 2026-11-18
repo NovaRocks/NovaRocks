@@ -18,6 +18,9 @@
 //! Real LocalCompiler Date32 float profiles, native literal projection and host first-failure evidence.
 use super::*;
 use arrow::array::{Date32Array, Float32Array, Float64Array, UInt32Array};
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 // Proleptic Gregorian day offsets from 1970-01-01: 2024-02-29 is
 // 19_723 + 31 + 28 = 19_782; astronomical -0001-12-31 is -719_529.
 // The date -> float contract encodes year*10000 + month*100 + day, so the
@@ -129,7 +132,18 @@ fn date_float_actual_compiler_profiles_sparse_slice_empty_and_native_constants()
                             .unwrap()
                             .may_raise_row_error
                     );
-                    let output = evaluator.evaluate(&batch, selection, &Control).unwrap();
+                    let output = evaluator
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
+                        .unwrap();
                     let full_expected = expected_date_floats(
                         &target,
                         &[
@@ -150,7 +164,19 @@ fn date_float_actual_compiler_profiles_sparse_slice_empty_and_native_constants()
                     assert!(output.errors().is_empty());
                     let empty = [];
                     let output = instance(&program)
-                        .evaluate(&batch, Selection::try_sparse(5, &empty).unwrap(), &Control)
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            {
+                                let selection = Selection::try_sparse(5, &empty).unwrap();
+                                ScalarInvocationScope::new(selection, selection)
+                            },
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
                         .unwrap();
                     assert_eq!(output.values().data_type(), &target);
                     assert_eq!(output.values().len(), 0);
@@ -165,7 +191,16 @@ fn date_float_actual_compiler_profiles_sparse_slice_empty_and_native_constants()
                     );
                     let batch = date_batch(&constant, Arc::new(Date32Array::from(vec![0; 5])));
                     let output = instance(&constant)
-                        .evaluate(&batch, selection, &Control)
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
                         .unwrap();
                     assert_eq!(
                         output.values().to_data(),
@@ -198,7 +233,16 @@ fn date_float_actual_compiler_selected_error_origin_null_placeholder_and_unselec
         let rows = [1, 2, 3, 4];
         let selection = Selection::try_sparse(5, &rows).unwrap();
         let result = instance(&program)
-            .evaluate(&batch, selection, &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(result.errors().len(), 1);
         assert_eq!(result.errors()[0].selected_ordinal(), 1);
@@ -227,13 +271,22 @@ fn date_float_actual_compiler_every_runtime_cause_keeps_first_failure_without_re
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
         assert_eq!(
             instance(&program)
-                .evaluate(&batch, Selection::all(3), &recorder)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                    ScalarInvocationActivation::Activated,
+                    &recorder,
+                    &mut PassThroughCallHost
+                )
                 .unwrap()
                 .errors()
                 .len(),
             1
         );
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(!trace.is_empty());
         assert!(trace.iter().all(|n| *n <= 256));
         for at in 1..=trace.len() {
@@ -241,15 +294,24 @@ fn date_float_actual_compiler_every_runtime_cause_keeps_first_failure_without_re
                 let control = CallbackControl::new(cause.clone(), at);
                 let mut evaluator = instance(&program);
                 assert!(
-                    matches!(evaluator.evaluate(&batch,Selection::all(3),&control),Err(error) if error==cause)
+                    matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(3), Selection::all(3)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(error)) if error==cause)
                 );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+                assert_eq!(control.trace(), trace[..at]);
                 let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
                 assert!(matches!(
-                    evaluator.evaluate(&batch, Selection::all(3), &after),
-                    Err(KernelFailure::InstanceFailed)
+                    evaluator.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                        ScalarInvocationActivation::Activated,
+                        &after,
+                        &mut PassThroughCallHost
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
-                assert!(after.trace.lock().unwrap().is_empty());
+                assert!(after.trace().is_empty());
             }
         }
     }
@@ -267,7 +329,7 @@ fn date_float_actual_compiler_every_compile_control_refusal_keeps_typed_cause() 
         );
         let recorder = CompileCallbacks::new(CompileControlError::Cancelled, usize::MAX);
         compile(&functions, package.clone(), &recorder).unwrap();
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(!trace.is_empty());
         for at in 1..=trace.len() {
             for cause in [
@@ -279,7 +341,7 @@ fn date_float_actual_compiler_every_compile_control_refusal_keeps_typed_cause() 
                 assert!(
                     matches!(compile(&functions,package.clone(),&control),Err(FragmentCompileError::Control(error)) if error==cause)
                 );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+                assert_eq!(control.trace(), trace[..at]);
             }
         }
     }

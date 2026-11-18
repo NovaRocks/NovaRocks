@@ -78,10 +78,10 @@ fn copy(
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let result = observed
         .checkpoint(0)

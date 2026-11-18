@@ -19,15 +19,16 @@
 // field once. Successful probes use the installed public ARRAY owner. The
 // private diagnostic factory remains limited to the original failure probes;
 // it cannot fund successful computation.
+use super::super::scalar_invocation::{LeafCallObservation, observe_calls};
 use super::*;
 use crate::exec::expr::compiled_program::checked_constants;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::task::ExecutionFailure;
-use crate::runtime::task::ExecutionFailureCause;
 use arrow::array::{ArrayRef, Int32Array, ListArray, StructArray};
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::Field;
+use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_functions::ScalarInvocationActivation as Activation;
+use std::convert::Infallible;
 
 fn actual_functions() -> PureEngineFunctionCatalog {
     static CATALOG: std::sync::OnceLock<PureEngineFunctionCatalog> = std::sync::OnceLock::new();
@@ -720,12 +721,15 @@ fn tracked_instance(program: &Arc<LocalProgram>) -> (CompiledExpressionInstance,
         tracker,
     )
 }
-fn data(error: ExecutionFailure, message: &str) -> novarocks_functions::ScalarInvocationData {
-    let ExecutionFailureCause::ScalarInvocationData(data) = error.cause() else {
+fn data(
+    error: ExprEvaluationFailure<Infallible>,
+    message: &str,
+) -> novarocks_functions::ScalarInvocationData {
+    let ExprEvaluationFailure::Data(data) = error else {
         panic!("expected original atomic Data, got {error:?}")
     };
     assert_eq!(data.message(), message);
-    data.clone()
+    data
 }
 #[test]
 fn scalar_invocation_case_insensitive_required_result_keeps_exact_type_and_clone_drop() {
@@ -778,7 +782,16 @@ fn scalar_invocation_noarguments_keeps_full_definition_n_but_invokes_no_children
         let (mut instance, _tracker) = tracked_instance(&program);
         let actual = data(
             instance
-                .evaluate_evaluation(&batch, Selection::all(4), Activation::Activated, &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+                    Activation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap_err(),
             &format!("array_struct_subfield expects 2 to 2 arguments, got {count}"),
         );
@@ -804,17 +817,30 @@ fn scalar_invocation_actual_empty_if_else_is_activated_and_validation_root_is_no
     let (mut instance, _) = tracked_instance(&program);
     data(
         instance
-            .evaluate_evaluation(&batch, Selection::all(0), Activation::Activated, &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(0), Selection::all(0)),
+                Activation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap_err(),
         "__array_struct_subfield field-name argument is empty",
     );
     let (mut structural, _) = tracked_instance(&program);
     let out = structural
-        .evaluate_evaluation(
-            &batch,
-            Selection::all(0),
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(0), Selection::all(0)),
             Activation::ValidateOnly,
             &Control,
+            &mut PassThroughCallHost,
         )
         .unwrap();
     assert_eq!(out.values().len(), 0);
@@ -827,11 +853,15 @@ fn scalar_invocation_guarded_data_is_atomic_and_inactive_branch_never_instantiat
     let inactive = input(&program, vec![Some(false), None, Some(false)], false);
     let (mut instance, _) = tracked_instance(&program);
     let out = instance
-        .evaluate_evaluation(
-            &inactive,
-            Selection::all(3),
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &inactive,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
             Activation::Activated,
             &Control,
+            &mut PassThroughCallHost,
         )
         .unwrap();
     assert!(out.errors().is_empty());
@@ -841,7 +871,16 @@ fn scalar_invocation_guarded_data_is_atomic_and_inactive_branch_never_instantiat
     let (mut instance, _) = tracked_instance(&program);
     let actual = data(
         instance
-            .evaluate_evaluation(&mixed, Selection::all(3), Activation::Activated, &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &mixed,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                Activation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap_err(),
         "array_struct_subfield expects 2 to 2 arguments, got 3",
     );
@@ -850,23 +889,10 @@ fn scalar_invocation_guarded_data_is_atomic_and_inactive_branch_never_instantiat
     assert_eq!(actual.source_row(0), Some(1));
     let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     assert!(matches!(
-        instance.evaluate_evaluation(&mixed, Selection::all(3), Activation::Activated, &after),
-        Err(error) if matches!(error.cause(), ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed))
+        instance.evaluate(EvaluationInput::Batch { batch: &mixed, source: None }, ScalarInvocationScope::new(Selection::all(3), Selection::all(3)), Activation::Activated, &after, &mut PassThroughCallHost),
+        Err(error) if matches!(&error, ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
     ));
-    assert!(after.trace.lock().unwrap().is_empty());
-}
-#[test]
-fn scalar_invocation_old_kernel_adapter_rejects_before_leaf_or_control() {
-    let program = invocation_program(3, Guard::Direct);
-    let batch = input(&program, vec![Some(true)], false);
-    let (mut instance, _) = tracked_instance(&program);
-    let control = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-    assert!(matches!(
-        instance.evaluate(&batch, Selection::all(1), &control),
-        Err(KernelFailure::InvalidProgram(_))
-    ));
-    assert!(control.trace.lock().unwrap().is_empty());
-    assert!(instance.instances.is_empty());
+    assert!(after.trace().is_empty());
 }
 #[test]
 fn scalar_invocation_every_original_checkpoint_cause_has_no_tail_and_failed_reentry() {
@@ -876,16 +902,20 @@ fn scalar_invocation_every_original_checkpoint_cause_has_no_tail_and_failed_reen
     let (mut instance, _) = tracked_instance(&program);
     data(
         instance
-            .evaluate_evaluation(
-                &batch,
-                Selection::all(320),
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
                 Activation::Activated,
                 &trace_control,
+                &mut PassThroughCallHost,
             )
             .unwrap_err(),
         "array_struct_subfield expects 2 to 2 arguments, got 3",
     );
-    let trace = trace_control.trace.lock().unwrap().clone();
+    let trace = trace_control.trace();
     assert!(!trace.is_empty());
     assert!(trace.iter().all(|n| *n <= 256));
     for stop in 1..=trace.len() {
@@ -893,20 +923,15 @@ fn scalar_invocation_every_original_checkpoint_cause_has_no_tail_and_failed_reen
             let (mut instance, _) = tracked_instance(&program);
             let control = CallbackControl::new(cause.clone(), stop);
             assert!(
-                matches!(instance.evaluate_evaluation(&batch,Selection::all(320),Activation::Activated,&control),Err(error) if matches!(error.cause(), ExecutionFailureCause::Kernel(actual) if actual==&cause))
+                matches!(instance.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), Activation::Activated, &control, &mut PassThroughCallHost),Err(error) if matches!(&error, ExprEvaluationFailure::Kernel(actual) if actual==&cause))
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..stop]);
+            assert_eq!(control.trace(), trace[..stop]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                instance.evaluate_evaluation(
-                    &batch,
-                    Selection::all(320),
-                    Activation::Activated,
-                    &after
-                ),
-                Err(error) if matches!(error.cause(), ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed))
+                instance.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), Activation::Activated, &after, &mut PassThroughCallHost),
+                Err(error) if matches!(&error, ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
 }
@@ -918,7 +943,16 @@ fn scalar_invocation_case_insensitive_result_is_the_same_in_boolean_and_filter_c
         let batch = input(&program, vec![Some(true); 3], false);
         let (mut instance, _) = tracked_instance(&program);
         let output = instance
-            .evaluate_evaluation(&batch, Selection::all(3), Activation::Activated, &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                Activation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert!(output.errors().is_empty());
         assert_eq!(
@@ -953,7 +987,15 @@ fn scalar_invocation_case_insensitive_result_is_the_same_in_boolean_and_filter_c
     )
     .unwrap();
     let output = filter
-        .evaluate_required(&batch, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            Selection::all(3),
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(
         output
@@ -1011,9 +1053,18 @@ fn scalar_invocation_entry_validation_preserves_first_cause_without_footer_or_le
     assert!(instance.has_invocation_data);
     let control = CallbackControl::new(KernelFailure::Cancelled, 2);
     let error = instance
-        .evaluate_evaluation(&batch, Selection::all(2), Activation::Activated, &control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+            Activation::Activated,
+            &control,
+            &mut PassThroughCallHost,
+        )
         .unwrap_err();
-    let ExecutionFailureCause::Kernel(cause) = error.cause() else {
+    let ExprEvaluationFailure::Kernel(cause) = &error else {
         panic!("input validation must preserve its originating Kernel cause: {error:?}")
     };
     assert_eq!(
@@ -1022,14 +1073,14 @@ fn scalar_invocation_entry_validation_preserves_first_cause_without_footer_or_le
             "selection differs from actual input batch rows",
         ))
     );
-    assert_eq!(*control.trace.lock().unwrap(), vec![0]);
+    assert_eq!(control.trace(), vec![0]);
     assert!(instance.instances.is_empty());
     let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     assert!(matches!(
-        instance.evaluate_evaluation(&batch, Selection::all(3), Activation::Activated, &after),
-        Err(error) if matches!(error.cause(), ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed))
+        instance.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(3), Selection::all(3)), Activation::Activated, &after, &mut PassThroughCallHost),
+        Err(error) if matches!(&error, ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
     ));
-    assert!(after.trace.lock().unwrap().is_empty());
+    assert!(after.trace().is_empty());
     assert!(instance.instances.is_empty());
 }
 
@@ -1078,14 +1129,18 @@ fn original_domain_computed_child_covers_actual_three_and_projects_only_outer_tw
     let demand = [3, 5];
     let (mut frame, _) = tracked_instance(&program);
     let output = frame
-        .evaluate_scoped_evaluation(
-            &batch,
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
             novarocks_functions::ScalarInvocationScope::new(
                 Selection::try_sparse(6, &actual).unwrap(),
                 Selection::try_sparse(6, &demand).unwrap(),
             ),
             Activation::Activated,
             &Control,
+            &mut PassThroughCallHost,
         )
         .unwrap();
     assert_eq!(output.selection().iter().collect::<Vec<_>>(), vec![3, 5]);
@@ -1116,14 +1171,18 @@ fn original_domain_case_insensitive_computed_child_projects_outer_demand_and_kee
     let demand = [3, 5];
     let (mut frame, _) = tracked_instance(&program);
     let output = frame
-        .evaluate_scoped_evaluation(
-            &batch,
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
             novarocks_functions::ScalarInvocationScope::new(
                 Selection::try_sparse(6, &actual).unwrap(),
                 Selection::try_sparse(6, &demand).unwrap(),
             ),
             Activation::Activated,
             &Control,
+            &mut PassThroughCallHost,
         )
         .unwrap();
     assert_eq!(output.selection().iter().collect::<Vec<_>>(), demand);
@@ -1145,22 +1204,40 @@ fn original_domain_case_insensitive_computed_child_projects_outer_demand_and_kee
     drop(output);
     let stop = CallbackControl::new(KernelFailure::DeadlineExceeded, 1);
     let error = frame
-        .evaluate_evaluation(&batch, Selection::all(6), Activation::Activated, &stop)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(6), Selection::all(6)),
+            Activation::Activated,
+            &stop,
+            &mut PassThroughCallHost,
+        )
         .unwrap_err();
     assert_eq!(
-        error.cause(),
-        &ExecutionFailureCause::Kernel(KernelFailure::DeadlineExceeded)
+        &error,
+        &ExprEvaluationFailure::Kernel(KernelFailure::DeadlineExceeded)
     );
-    assert_eq!(stop.trace.lock().unwrap().len(), 1);
+    assert_eq!(stop.trace().len(), 1);
     let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let error = frame
-        .evaluate_evaluation(&batch, Selection::all(6), Activation::Activated, &after)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(6), Selection::all(6)),
+            Activation::Activated,
+            &after,
+            &mut PassThroughCallHost,
+        )
         .unwrap_err();
     assert_eq!(
-        error.cause(),
-        &ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
+        &error,
+        &ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
     );
-    assert!(after.trace.lock().unwrap().is_empty());
+    assert!(after.trace().is_empty());
 }
 
 #[test]
@@ -1174,17 +1251,21 @@ fn original_domain_required_child_row_outside_demand_stops_before_parent_instant
     let demand = [3, 5];
     let (mut frame, _) = tracked_instance(&program);
     let error = frame
-        .evaluate_scoped_evaluation(
-            &batch,
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
             novarocks_functions::ScalarInvocationScope::new(
                 Selection::try_sparse(6, &actual).unwrap(),
                 Selection::try_sparse(6, &demand).unwrap(),
             ),
             Activation::Activated,
             &Control,
+            &mut PassThroughCallHost,
         )
         .unwrap_err();
-    let ExecutionFailureCause::RequiredRow(row) = error.cause() else {
+    let ExprEvaluationFailure::RequiredRow(row) = &error else {
         panic!("required child cannot be parent Data or invariant: {error:?}")
     };
     assert_eq!(row.root(), root(&program).root);
@@ -1236,7 +1317,16 @@ fn original_domain_if_real_all_true_and_all_false_keep_sliced_full_child_carrier
         let batch = sliced_full_child_batch(&program, flags);
         let (mut frame, _) = tracked_instance(&program);
         let output = frame
-            .evaluate_evaluation(&batch, Selection::all(2), Activation::Activated, &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+                Activation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         let list = output
             .values()
@@ -1266,7 +1356,16 @@ fn original_domain_if_actual_mixed_mask_filters_even_a_contiguous_true_branch() 
     let batch = sliced_full_child_batch(&program, vec![Some(true), Some(false)]);
     let (mut frame, _) = tracked_instance(&program);
     let output = frame
-        .evaluate_evaluation(&batch, Selection::all(2), Activation::Activated, &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+            Activation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     let list = output
         .values()
@@ -1302,7 +1401,16 @@ fn original_domain_nested_if_uses_its_immediate_filtered_parent_rows() {
     let batch = RecordBatch::try_new(original.schema(), columns).unwrap();
     let (mut frame, _) = tracked_instance(&success);
     let result = frame
-        .evaluate_evaluation(&batch, Selection::all(4), Activation::Activated, &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+            Activation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     let list = result
         .values()
@@ -1335,7 +1443,16 @@ fn original_domain_nested_if_uses_its_immediate_filtered_parent_rows() {
     let batch = RecordBatch::try_new(original.schema(), columns).unwrap();
     let (mut frame, _) = tracked_instance(&program);
     let output = frame
-        .evaluate_evaluation(&batch, Selection::all(4), Activation::Activated, &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+            Activation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     // The outer IF consumes IS NULL(projected), so its result is Boolean.
     assert_eq!(
@@ -1373,13 +1490,15 @@ fn original_domain_mixed_and_selected_root_copies_keep_finite_source_until_last_
             Selection::all(2)
         };
         let result = frame
-            .evaluate_input_controlled::<ExecutionFailure>(
-                super::super::input_source::CompiledInputLoan::from_chunk(&chunk),
-                rows,
-                rows,
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: chunk.record_batch(),
+                    source: Some(&chunk),
+                },
+                ScalarInvocationScope::new(rows, rows),
                 Activation::Activated,
                 &Control,
-                None,
+                &mut PassThroughCallHost,
             )
             .unwrap();
         let list = result
@@ -1417,92 +1536,39 @@ fn original_domain_mixed_and_selected_root_copies_keep_finite_source_until_last_
     }
 }
 
-#[derive(Default)]
-struct ActualScopeSpy {
-    selected: Vec<Vec<usize>>,
-    scoped: Vec<(Vec<usize>, Vec<usize>)>,
-}
-impl crate::runtime::scalar_memory::RuntimeScalarOperationScope for ActualScopeSpy {
-    fn evaluate<'a>(
-        &mut self,
-        instance: &mut novarocks_functions::ScalarEvaluationInstance,
-        selection: Selection<'a>,
-        arguments: &'a [novarocks_functions::EvaluatedArgument<'a>],
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<
-        novarocks_functions::SelectedValues<'a>,
-        crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure,
-    > {
-        self.selected.push(selection.iter().collect());
-        instance
-            .evaluate(selection, arguments, control)
-            .map_err(Into::into)
-    }
-    fn evaluate_invocation<'a>(
-        &mut self,
-        instance: &mut novarocks_functions::InvocationScalarEvaluationInstance,
-        selection: Selection<'a>,
-        arguments: &'a [novarocks_functions::EvaluatedArgument<'a>],
-        activation: Activation,
-        _allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<
-        novarocks_functions::SelectedValues<'a>,
-        crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure,
-    > {
-        self.selected.push(selection.iter().collect());
-        instance
-            .evaluate(selection, arguments, activation, control)
-            .map_err(Into::into)
-    }
-    fn evaluate_scoped_invocation<'a>(
-        &mut self,
-        instance: &mut novarocks_functions::InvocationScalarEvaluationInstance,
-        scope: novarocks_functions::ScalarInvocationScope<'a>,
-        sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
-        activation: Activation,
-        _allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<
-        novarocks_functions::SelectedValues<'a>,
-        crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure,
-    > {
-        self.scoped.push((
-            scope.actual_domain().iter().collect(),
-            scope.demand().iter().collect(),
-        ));
-        instance
-            .evaluate_scoped(scope, sources, activation, control)
-            .map_err(Into::into)
-    }
-}
-
 #[test]
 fn original_domain_policy_does_not_expand_old_volatile_if_inside_coalesce() {
     let program = super::program(super::Shape::Random);
     let batch = super::batch(&program, vec![Some(true); 3], vec![Some(42); 3]);
     let mut frame = super::instance(&program);
     let demand = [0, 2];
-    let mut spy = ActualScopeSpy::default();
-    let output = frame
-        .evaluate_scoped_runtime(
-            &batch,
-            novarocks_functions::ScalarInvocationScope::new(
-                Selection::all(3),
-                Selection::try_sparse(3, &demand).unwrap(),
-            ),
-            Activation::Activated,
-            &Control,
-            &mut spy,
-        )
-        .unwrap();
+    let (output, calls) = observe_calls(|| {
+        frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                novarocks_functions::ScalarInvocationScope::new(
+                    Selection::all(3),
+                    Selection::try_sparse(3, &demand).unwrap(),
+                ),
+                Activation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap()
+    });
     assert_eq!(output.selection().iter().collect::<Vec<_>>(), vec![0, 2]);
     assert_eq!(
-        spy.selected,
-        vec![vec![0, 2]],
+        calls,
+        vec![LeafCallObservation::Rows {
+            explicit_actual_domain: false,
+            actual: vec![0, 2],
+            demand: vec![0, 2],
+        }],
         "real old RAND must evaluate only the two demanded Coalesce/IF rows"
     );
-    assert!(spy.scoped.is_empty());
 }
 
 #[test]
@@ -1523,22 +1589,39 @@ fn original_domain_policy_conditional_mask_uses_actual_parent_not_outer_demand()
     let actual = [1, 3, 5];
     let demand = [3, 5];
     let (mut frame, _) = tracked_instance(&program);
-    let mut spy = ActualScopeSpy::default();
-    let output = frame
-        .evaluate_scoped_runtime(
-            &batch,
-            novarocks_functions::ScalarInvocationScope::new(
-                Selection::try_sparse(6, &actual).unwrap(),
-                Selection::try_sparse(6, &demand).unwrap(),
-            ),
-            Activation::Activated,
-            &Control,
-            &mut spy,
-        )
-        .unwrap();
+    let (output, calls) = observe_calls(|| {
+        frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                novarocks_functions::ScalarInvocationScope::new(
+                    Selection::try_sparse(6, &actual).unwrap(),
+                    Selection::try_sparse(6, &demand).unwrap(),
+                ),
+                Activation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap()
+    });
     assert_eq!(
-        spy.scoped,
-        vec![(vec![1, 5], vec![1, 5])],
+        calls
+            .into_iter()
+            .filter(|call| matches!(
+                call,
+                LeafCallObservation::Rows {
+                    explicit_actual_domain: true,
+                    ..
+                }
+            ))
+            .collect::<Vec<_>>(),
+        vec![LeafCallObservation::Rows {
+            explicit_actual_domain: true,
+            actual: vec![1, 5],
+            demand: vec![1, 5],
+        }],
         "typed original owner needs the actual IF true-mask, including global1 outside output demand"
     );
     assert!(output.errors().is_empty());

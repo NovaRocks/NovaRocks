@@ -21,6 +21,10 @@ use arrow::array::{
     Date32Array, Float32Array, NullArray, StringArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
+use std::sync::Mutex;
 
 fn checked_package(
     functions: &PureEngineFunctionCatalog,
@@ -374,7 +378,18 @@ fn all_fifteen_frozen_nullsafe_profiles_keep_nonnullable_boolean_sparse_rows_and
         let selection = Selection::try_sparse(5, &rows).unwrap();
         let mut evaluator = instance(&program);
         for _ in 0..2 {
-            let output = evaluator.evaluate(&batch, selection, &Control).unwrap();
+            let output = evaluator
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
             let expected = if *ty.data_type() == DataType::Null {
                 vec![Some(true); 4]
             } else {
@@ -385,7 +400,19 @@ fn all_fifteen_frozen_nullsafe_profiles_keep_nonnullable_boolean_sparse_rows_and
             assert_eq!(output.values().null_count(), 0);
         }
         let empty = evaluator
-            .evaluate(&batch, Selection::try_sparse(5, &[]).unwrap(), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                {
+                    let selection = Selection::try_sparse(5, &[]).unwrap();
+                    ScalarInvocationScope::new(selection, selection)
+                },
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert!(empty.values().is_empty());
         assert_eq!(evaluator.instances.len(), 0);
@@ -470,9 +497,14 @@ fn floating_nullsafe_keeps_nan_any_nonnull_and_signed_zero_in_both_operand_order
             };
             let output = instance(&program)
                 .evaluate(
-                    &nullsafe_batch(&program, left, right),
-                    Selection::all(8),
+                    EvaluationInput::Batch {
+                        batch: &nullsafe_batch(&program, left, right),
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(8), Selection::all(8)),
+                    ScalarInvocationActivation::Activated,
                     &Control,
+                    &mut PassThroughCallHost,
                 )
                 .unwrap();
             assert_eq!(boolean_values(&output), expected);
@@ -501,7 +533,19 @@ fn null_left_keeps_required_right_random_state_and_round_row_error() {
     );
     let mut evaluator = instance(&random);
     let empty = evaluator
-        .evaluate(&batch, Selection::try_sparse(4, &[]).unwrap(), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            {
+                let selection = Selection::try_sparse(4, &[]).unwrap();
+                ScalarInvocationScope::new(selection, selection)
+            },
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert!(empty.values().is_empty());
     assert_eq!(evaluator.instances.len(), 0);
@@ -509,7 +553,20 @@ fn null_left_keeps_required_right_random_state_and_round_row_error() {
     let selected = Selection::try_sparse(4, &rows).unwrap();
     for _ in 0..2 {
         assert_eq!(
-            boolean_values(&evaluator.evaluate(&batch, selected, &Control).unwrap()),
+            boolean_values(
+                &evaluator
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(selected, selected),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost
+                    )
+                    .unwrap()
+            ),
             vec![Some(false); 2]
         );
     }
@@ -532,7 +589,16 @@ fn null_left_keeps_required_right_random_state_and_round_row_error() {
         array(vec![Some(raw), Some(10), None, Some(raw)]),
     );
     let output = instance(&decimal)
-        .evaluate(&batch, selected, &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(selected, selected),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(errors(&output), vec![1]);
     assert_eq!(boolean_values(&output), vec![Some(false), None]);
@@ -555,22 +621,31 @@ fn nullsafe_controller_preserves_every_primary_refusal_prefix_and_failed_latch()
         &constructor,
     )
     .unwrap();
-    let construction = constructor.trace.lock().unwrap().clone();
+    let construction = constructor.trace();
     for stop_at in 1..=construction.len() {
         for cause in causes() {
             let refusal = CallbackControl::new(cause.clone(), stop_at);
             assert!(
                 matches!(CompiledExpressionInstance::try_new(root_unit(&program).clone(), root(&program).root, &refusal), Err(actual) if actual == cause)
             );
-            assert_eq!(*refusal.trace.lock().unwrap(), construction[..stop_at]);
+            assert_eq!(refusal.trace(), construction[..stop_at]);
         }
     }
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let output = instance(&program)
-        .evaluate(&batch, Selection::all(320), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(boolean_values(&output), vec![Some(true); 320]);
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
     for stop_at in 1..=trace.len() {
@@ -578,15 +653,24 @@ fn nullsafe_controller_preserves_every_primary_refusal_prefix_and_failed_latch()
             let mut evaluator = instance(&program);
             let refusal = CallbackControl::new(cause.clone(), stop_at);
             assert!(
-                matches!(evaluator.evaluate(&batch, Selection::all(320), &refusal), Err(actual) if actual == cause)
+                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &refusal, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
             );
-            assert_eq!(*refusal.trace.lock().unwrap(), trace[..stop_at]);
+            assert_eq!(refusal.trace(), trace[..stop_at]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                evaluator.evaluate(&batch, Selection::all(320), &after),
-                Err(KernelFailure::InstanceFailed)
+                evaluator.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
 }
@@ -598,6 +682,10 @@ struct CompileCallbacks {
     refused: Mutex<bool>,
 }
 impl CompileCallbacks {
+    pub(super) fn trace(&self) -> Vec<(CompilePhase, u32)> {
+        self.trace.lock().unwrap().clone()
+    }
+
     fn new(cause: CompileControlError, stop_at: usize) -> Self {
         Self {
             cause,
@@ -636,7 +724,7 @@ fn nullsafe_compilation_keeps_all_original_refusals_including_unsupported_tail()
         let recorder = CompileCallbacks::new(CompileControlError::Cancelled, usize::MAX);
         let result = compile(&functions, package.clone(), &recorder);
         assert_eq!(result.is_ok(), supported);
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(!trace.is_empty());
         for stop_at in 1..=trace.len() {
             for cause in [
@@ -649,7 +737,7 @@ fn nullsafe_compilation_keeps_all_original_refusals_including_unsupported_tail()
                 assert!(
                     matches!(failure, novarocks_local_compiler::FragmentCompileError::Control(actual) if actual == cause)
                 );
-                assert_eq!(*refusal.trace.lock().unwrap(), trace[..stop_at]);
+                assert_eq!(refusal.trace(), trace[..stop_at]);
             }
         }
     }
@@ -670,8 +758,19 @@ fn nullsafe_source_carrier_and_logical_metadata_are_checked_before_selected_null
     )
     .unwrap();
     assert!(matches!(
-        instance(&program).evaluate(&foreign, Selection::all(1), &Control),
-        Err(KernelFailure::InvalidProgram(_))
+        instance(&program).evaluate(
+            EvaluationInput::Batch {
+                batch: &foreign,
+                source: None
+            },
+            ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost
+        ),
+        Err(ExprEvaluationFailure::Kernel(
+            KernelFailure::InvalidProgram(_)
+        ))
     ));
     let program = nullsafe_program(FunctionValueType::new(DataType::Utf8, true), Right::Column);
     let fields = program.graph().nodes()[1]
@@ -694,8 +793,19 @@ fn nullsafe_source_carrier_and_logical_metadata_are_checked_before_selected_null
     )
     .unwrap();
     assert!(matches!(
-        instance(&program).evaluate(&foreign, Selection::all(1), &Control),
-        Err(KernelFailure::InvalidProgram(_))
+        instance(&program).evaluate(
+            EvaluationInput::Batch {
+                batch: &foreign,
+                source: None
+            },
+            ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost
+        ),
+        Err(ExprEvaluationFailure::Kernel(
+            KernelFailure::InvalidProgram(_)
+        ))
     ));
 }
 

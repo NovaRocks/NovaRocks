@@ -16,6 +16,7 @@
 // under the License.
 
 //! One frozen SET computation runs on the original supervised planning CPU.
+use novarocks_expression::RequiredExpressionRowError;
 use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
 use novarocks_parser::{Span, ast};
 use novarocks_query_application::sql::session::registry::{
@@ -182,16 +183,7 @@ fn evaluation_error(error: SqlConstantEvaluationError, name: &str) -> QueryServi
         SqlConstantEvaluationError::Outer(cause) => QueryServiceError::from_failure_cause(cause),
         SqlConstantEvaluationError::Source(cause) => {
             let selected_data = cause.failure_fact().class() == FailureClass::Data
-                && cause
-                    .downcast_ref::<novarocks_execution::runtime::task::ExecutionFailure>()
-                    .is_some_and(|error| {
-                        matches!(
-                            error.cause(),
-                            novarocks_execution::runtime::task::ExecutionFailureCause::RequiredRow(
-                                _
-                            )
-                        )
-                    });
+                && cause.downcast_ref::<RequiredExpressionRowError>().is_some();
             let required_capability = cause.downcast_ref::<crate::query_execution::required_constant_eval::RequiredConstantEligibilityFailure>().is_some();
             if selected_data || required_capability {
                 QueryServiceError::from_user_error_with_cause(

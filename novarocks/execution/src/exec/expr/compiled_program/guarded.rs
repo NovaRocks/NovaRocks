@@ -58,7 +58,7 @@ impl OwnedValue {
     fn into_value<'a>(
         self,
         selection: Selection<'a>,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<Value<'a>, KernelFailure> {
         Ok(match self {
             Self::Continued(value, owner) => value
@@ -275,7 +275,7 @@ impl<K> Frame<K> {
         needs_original_domain: bool,
         activation: novarocks_functions::ScalarInvocationActivation,
         parent_ordinals: Vec<usize>,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<Self, KernelFailure> {
         let output_rows = rows.clone();
         // IF's original author evaluates its condition on its actual parent
@@ -360,7 +360,7 @@ impl<K> Frame<K> {
         arity: usize,
         next_is_pure: bool,
         batch_rows: usize,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<Option<Vec<usize>>, KernelFailure> {
         if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction)
             && self.boolean.is_none()
@@ -490,7 +490,7 @@ impl<K> Frame<K> {
         child: Child,
         source_shape: novarocks_type_contract::TemporalSourceShape,
         batch_rows: usize,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<(), KernelFailure> {
         let mut rows = Vec::with_capacity(child.ordinals.len());
         for &ordinal in &child.ordinals {
@@ -566,7 +566,7 @@ impl<K> Frame<K> {
         recipes: &dyn NodeRecipes,
         negated: bool,
         batch_rows: usize,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<(), KernelFailure> {
         let ordinal = self
             .next
@@ -684,7 +684,7 @@ impl<K> Frame<K> {
         child: Child,
         recipes: &dyn NodeRecipes,
         batch_rows: usize,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
         allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<(), KernelFailure> {
         use novarocks_functions::native_inlist::{InRows, signed_equality_observed};
@@ -769,7 +769,7 @@ impl<K> Frame<K> {
             &mut |event| in_event(event, work),
         ))?;
         let equalities = if expected.data_type() == &DataType::Utf8 {
-            if work.scalar_scope.is_some() && allocator.is_none() {
+            if work.scalar_host.is_some() && allocator.is_none() {
                 return Err(invalid(
                     "Task IN comparison has no original allocation owner",
                 ));
@@ -816,7 +816,7 @@ impl<K> Frame<K> {
         demand: EvaluationDemand,
         child_is_pure: bool,
         batch_rows: usize,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
         allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<(), KernelFailure> {
         if let ControlShape::Membership { .. } = shape {
@@ -1138,7 +1138,7 @@ impl CompletionKind {
     clippy::too_many_arguments,
     reason = "The node's recipes, row demand and evaluation owner remain explicit"
 )]
-fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
+fn complete_node<'a, R, K: Ord + Clone>(
     kind: &CompletionKind,
     frame: &mut Frame<K>,
     recipes: &dyn NodeRecipes,
@@ -1149,8 +1149,8 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
     original_domain: bool,
     instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-    work: &mut Work<'_, '_>,
-) -> Result<OwnedValue, E> {
+    work: &mut Work<'_, '_, R>,
+) -> Result<OwnedValue, ExprEvaluationFailure<R>> {
     Ok(match kind {
         CompletionKind::Like { negated } => {
             if frame.children.len() != 2 {
@@ -1426,13 +1426,13 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
                             scalar_invocation::PreparedCall::Invocation(p)
                         }
                         _ => {
-                            return Err(E::from(invalid(
+                            return Err(ExprEvaluationFailure::Kernel(invalid(
                                 "ordinary call changed its prepared lifecycle",
                             )));
                         }
                     };
                     if original_domain {
-                        let result = evaluate_original_invocation::<E, K>(
+                        let result = evaluate_original_invocation::<R, K>(
                             frame.occurrence.clone(),
                             prepared,
                             &frame.children,
@@ -1450,7 +1450,7 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
                             children.push(child.value.into_value(local_selection, work)?);
                             work.step()?;
                         }
-                        OwnedValue::from_selected(evaluate_scalar::<E, K>(
+                        OwnedValue::from_selected(evaluate_scalar::<R, K>(
                             frame.occurrence.clone(),
                             prepared,
                             &children,
@@ -1506,10 +1506,10 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
     clippy::too_many_arguments,
     reason = "Keep the checked root, exact input port, selected domain, use-owned state/effects and caller control explicit"
 )]
-pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
+pub(super) fn evaluate_tree<'a, R>(
     program: &CompiledExprSet,
     root: RootOrdinal,
-    input: CompiledInputLoan<'_>,
+    input: FrameInput<'_>,
     input_scope: RootScope,
     actual_domain: Selection<'a>,
     selection: Selection<'a>,
@@ -1517,8 +1517,8 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
     instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
-    work: &mut Work<'_, '_>,
-) -> Result<Value<'a>, E> {
+    work: &mut Work<'_, '_, R>,
+) -> Result<Value<'a>, ExprEvaluationFailure<R>> {
     let flow = program.control_flow();
     let definitions = program.definitions();
     let root_use = program
@@ -1607,11 +1607,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         rows,
         domain,
         needs_original.contains(&root_use),
-        if E::ACTIVATE_EMPTY {
-            activation
-        } else {
-            novarocks_functions::ScalarInvocationActivation::ValidateOnly
-        },
+        activation,
         Vec::new(),
         work,
     )?];
@@ -1751,7 +1747,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                         unit: program,
                         occurrence: frame.occurrence,
                     };
-                    complete_node::<E, _>(
+                    complete_node::<R, _>(
                         &CompletionKind::from_static(kind)
                             .ok_or_else(|| invalid("unsupported compiled root definition"))?,
                         &mut frame,
@@ -1793,7 +1789,12 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                 work.control
                     .operation_aborted
                     .store(true, Ordering::Relaxed);
-                return Err(E::required(root, output_selection, error.clone()));
+                return Err(RequiredExpressionRowError::try_new(
+                    root,
+                    output_selection,
+                    error.clone(),
+                )?
+                .into());
             }
         }
         // Preserve the original leaf/required-child failure before any new
@@ -1848,7 +1849,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     Some(owner) => value.retaining_continuation(owner, work),
                     None => Ok(value),
                 })
-                .map_err(E::from);
+                .map_err(ExprEvaluationFailure::Kernel);
             }
             return Ok(value);
         }
@@ -1858,7 +1859,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
 
 /// Only the typed owner policy enters this path. Sources are already evaluated
 /// in the exact actual domain; success projects output, never required errors.
-fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
+fn evaluate_original_invocation<'a, R, K: Ord + Clone>(
     occurrence: K,
     prepared: scalar_invocation::PreparedCall<'_>,
     children: &[Child],
@@ -1867,8 +1868,8 @@ fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure, K: Ord +
     activation: novarocks_functions::ScalarInvocationActivation,
     instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-    work: &mut Work<'_, '_>,
-) -> Result<SelectedValues<'a>, E> {
+    work: &mut Work<'_, '_, R>,
+) -> Result<SelectedValues<'a>, ExprEvaluationFailure<R>> {
     use novarocks_functions::{EvaluatedSourceLoan, ScalarInvocationScope, ScalarInvocationSource};
     let actual = domain.selection(work.control)?;
     let mut sources = Vec::with_capacity(children.len());
@@ -1900,14 +1901,13 @@ fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure, K: Ord +
         work.control.checkpoint(0)?;
         entry.insert(instance);
     }
-    let result = E::invoke_scoped(
+    let result = scalar_invocation::invoke_scoped(
         instances
             .get_mut(&occurrence)
             .ok_or_else(|| internal("scoped scalar instance was not installed"))?,
         ScalarInvocationScope::new(actual, demand),
         &sources,
         activation,
-        allocator,
         work,
     );
     let output = match result {
@@ -1928,7 +1928,7 @@ fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure, K: Ord +
         errors,
         || work.step(),
     )
-    .map_err(E::from)
+    .map_err(ExprEvaluationFailure::Kernel)
 }
 
 fn project_owned(
@@ -1936,7 +1936,7 @@ fn project_owned(
     actual_rows: &[usize],
     demand_rows: &[usize],
     batch_rows: usize,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<OwnedValue, KernelFailure> {
     let actual = Selection::try_sparse_observed(batch_rows, actual_rows, || work.step())?;
     let value = value.into_value(actual, work)?;
@@ -1974,7 +1974,7 @@ fn finish_if(
     empty: bool,
     ty: &DataType,
     selection: Selection<'_>,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<OwnedValue, KernelFailure> {
     if row_errors.is_empty() {
         let mut all_true = true;
@@ -2022,7 +2022,7 @@ fn assemble(
     row_errors: &mut BTreeMap<usize, RowDataError>,
     ty: &DataType,
     selection: Selection<'_>,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<OwnedValue, KernelFailure> {
     // The shared pure assembly receives only already-evaluated compact values.
     // Frame scheduling and its original lazy row demand remain in this host.
@@ -2067,7 +2067,7 @@ fn between_comparison_operand<'a>(
     parent_rows: &[usize],
     selection: Selection<'a>,
     batch_rows: usize,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<Value<'a>, KernelFailure> {
     let mut rows = Vec::with_capacity(child.ordinals.len());
     for &parent in &child.ordinals {
@@ -2119,7 +2119,7 @@ fn evaluate_comparison<'a>(
     left: &Value<'_>,
     right: &Value<'_>,
     selection: Selection<'a>,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     // Borrow the original callback; a nested comparison's footer cannot
     // observe again after any of its seven originating refusal categories.
@@ -2216,7 +2216,7 @@ fn evaluate_arithmetic<'a>(
     left: &Value<'_>,
     right: &Value<'_>,
     selection: Selection<'a>,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     use arrow::array::{
         Decimal128Array, Decimal256Array, Float64Array, Int8Array, Int16Array, Int32Array,
@@ -2409,7 +2409,7 @@ fn evaluate_cast<'a>(
     recipe: &novarocks_functions::PreparedCastRecipe,
     child: &Value<'_>,
     selection: Selection<'a>,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     use arrow::array::{
         Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -2683,7 +2683,7 @@ struct TemporalValues {
     result: Option<(ArrayRef, Vec<usize>)>,
 }
 fn temporal_math<T>(
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
     body: impl FnOnce(
         &mut novarocks_functions::EvaluationCheckpoints<'_>,
     ) -> Result<
@@ -2700,7 +2700,7 @@ fn temporal_math<T>(
     Ok(value)
 }
 impl TemporalValues {
-    fn new(rows: usize, work: &mut Work<'_, '_>) -> Result<Self, KernelFailure> {
+    fn new(rows: usize, work: &mut Work<'_, '_, impl Sized>) -> Result<Self, KernelFailure> {
         work.flush()?;
         let mut seconds = Vec::new();
         seconds
@@ -2721,7 +2721,7 @@ impl TemporalValues {
         ordinals: &[usize],
         values: &[Option<i64>],
         fill_null: bool,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<(), KernelFailure> {
         if ordinals.len() != values.len() {
             return Err(invalid("temporal dense source length differs"));
@@ -2763,7 +2763,7 @@ impl TemporalValues {
         domain: Selection<'_>,
         ordinals: &[usize],
         array: ArrayRef,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<
         Option<novarocks_functions::builtin::calendar_time_text_shared::TimeTextDataFailure>,
         KernelFailure,
@@ -2888,7 +2888,7 @@ impl TemporalValues {
         &self,
         errors: &BTreeMap<usize, RowDataError>,
         domain: Selection<'_>,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<bool, KernelFailure> {
         use novarocks_functions::builtin::calendar_time_text_shared as math;
         if self.seconds.len() != domain.len() {
@@ -2910,7 +2910,7 @@ impl TemporalValues {
         shape: ControlShape,
         errors: &mut BTreeMap<usize, RowDataError>,
         domain: Selection<'_>,
-        work: &mut Work<'_, '_>,
+        work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<OwnedValue, KernelFailure> {
         use novarocks_functions::builtin::calendar_time_text_shared as math;
         let ControlShape::TemporalSource(shape) = shape else {
@@ -2973,7 +2973,7 @@ mod between_comparison_control_tests;
 
 fn in_event(
     event: novarocks_functions::native_inlist::InObservation,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<(), KernelFailure> {
     match event {
         novarocks_functions::native_inlist::InObservation::Step => work.step(),
@@ -2992,7 +2992,10 @@ fn in_observed<T>(
         Err(novarocks_functions::native_inlist::InError::Operation(cause)) => Err(cause),
     }
 }
-fn duplicate_child(child: &Child, work: &mut Work<'_, '_>) -> Result<Child, KernelFailure> {
+fn duplicate_child(
+    child: &Child,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<Child, KernelFailure> {
     let mut ordinals = Vec::with_capacity(child.ordinals.len());
     for &ordinal in &child.ordinals {
         ordinals.push(ordinal);
@@ -3028,7 +3031,7 @@ fn validate_membership_phase(
     output: &SelectedValues<'_>,
     selection: Selection<'_>,
     expected: &novarocks_type_contract::FunctionValueType,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<(), KernelFailure> {
     if output.errors().is_empty() {
         return novarocks_functions::validate_evaluated_argument_observed(
@@ -3095,7 +3098,7 @@ fn complete_constant_leaf(
     result: &novarocks_functions::FunctionValueType,
     selection: Selection<'_>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<OwnedValue, KernelFailure> {
     work.flush()?;
     let exact = novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
@@ -3164,7 +3167,7 @@ fn child_context<K>(
     shape: ControlShape,
     ordinals: &[usize],
     original_domain: bool,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<
     (
         Vec<usize>,
@@ -3217,7 +3220,7 @@ fn child_context<K>(
 
 fn complete_undemanded_leaf(
     ty: &DataType,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<OwnedValue, KernelFailure> {
     work.flush()?;
     let array = new_empty_array(ty);
@@ -3438,10 +3441,10 @@ mod result_creator_continuation_tests {
                 refused: AtomicBool::new(false),
                 operation_aborted: AtomicBool::new(false),
             };
-            let mut work = Work {
+            let mut work: Work<'_, '_> = Work {
                 control: &observed,
                 pending: 0,
-                scalar_scope: None,
+                scalar_host: None,
             };
             let value =
                 complete_constant_leaf(&original, &ty, Selection::all(1), Some(&host), &mut work)
@@ -3533,10 +3536,10 @@ mod result_creator_continuation_tests {
                 refused: AtomicBool::new(false),
                 operation_aborted: AtomicBool::new(false),
             };
-            let mut work = Work {
+            let mut work: Work<'_, '_> = Work {
                 control: &observed,
                 pending: 0,
-                scalar_scope: None,
+                scalar_host: None,
             };
             complete_constant_leaf(original, ty, Selection::all(1), Some(host), &mut work)
         }
@@ -3647,10 +3650,10 @@ mod result_creator_continuation_tests {
             refused: AtomicBool::new(false),
             operation_aborted: AtomicBool::new(false),
         };
-        let mut work = Work {
+        let mut work: Work<'_, '_> = Work {
             control: &observed,
             pending: 0,
-            scalar_scope: None,
+            scalar_host: None,
         };
         let actual =
             complete_constant_leaf(&value, &ty, Selection::all(1), Some(&host), &mut work).unwrap();

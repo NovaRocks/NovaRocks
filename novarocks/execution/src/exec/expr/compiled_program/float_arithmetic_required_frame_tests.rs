@@ -18,6 +18,9 @@
 //! Float arithmetic uses the existing full source/effects compiler and Frame owner.
 use super::*;
 use arrow::array::{Array, BooleanArray, Float64Array};
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 
 fn f64_values() -> ArrayRef {
     Arc::new(Float64Array::from(vec![
@@ -130,7 +133,16 @@ fn float_arithmetic_required_actual_compiler_frame_sparse_bits_and_empty_selecti
         for rows in [&[0, 2, 3, 6, 10, 11][..], &[][..]] {
             let selection = Selection::try_sparse(12, rows).unwrap();
             let out = instance(&program)
-                .evaluate(&batch, selection, &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(out.selection(), selection);
             assert!(out.errors().is_empty());
@@ -175,25 +187,43 @@ fn float_arithmetic_required_actual_frame_seven_causes_prefix_and_failed_latch()
     .unwrap();
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let out = instance(&program)
-        .evaluate(&batch, Selection::all(320), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert!(out.errors().is_empty());
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     for stop in 1..=trace.len() {
         for cause in causes() {
             let mut evaluator = instance(&program);
             let control = CallbackControl::new(cause.clone(), stop);
             assert!(
-                matches!(evaluator.evaluate(&batch,Selection::all(320),&control),Err(actual) if actual==cause)
+                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..stop]);
+            assert_eq!(control.trace(), trace[..stop]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                evaluator.evaluate(&batch, Selection::all(320), &after),
-                Err(KernelFailure::InstanceFailed)
+                evaluator.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
 }

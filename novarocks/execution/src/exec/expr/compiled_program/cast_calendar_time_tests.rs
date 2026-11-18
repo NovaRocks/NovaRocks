@@ -21,6 +21,9 @@ use arrow::array::{
     TimestampSecondArray,
 };
 use arrow::datatypes::TimeUnit;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 fn calendar_corpus(dtype: &DataType) -> ArrayRef {
     if dtype == &DataType::Date32 {
         return Arc::new(Date32Array::from(vec![
@@ -150,7 +153,16 @@ fn calendar_check(dtype: DataType) {
                 ] {
                     let selection = Selection::try_sparse(source.len(), &rows).unwrap();
                     let output = instance(&program)
-                        .evaluate(&batch, selection, &Control)
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
                         .unwrap();
                     assert!(output.errors().is_empty());
                     assert_eq!(
@@ -210,10 +222,22 @@ fn calendar_time_actual_compiler_every_cause_stops_at_actual_callback_and_latche
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
         assert!(
             instance(&program)
-                .evaluate(&batch, Selection::all(batch.num_rows()), &recorder)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    {
+                        let selection = Selection::all(batch.num_rows());
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &recorder,
+                    &mut PassThroughCallHost
+                )
                 .is_ok()
         );
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(!trace.is_empty());
         assert!(trace.iter().all(|n| *n <= 256));
         for at in 1..=trace.len() {
@@ -230,19 +254,43 @@ fn calendar_time_actual_compiler_every_cause_stops_at_actual_callback_and_latche
                 let mut runtime = instance(&program);
                 assert_eq!(
                     runtime
-                        .evaluate(&batch, Selection::all(batch.num_rows()), &control)
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None
+                            },
+                            {
+                                let selection = Selection::all(batch.num_rows());
+                                ScalarInvocationScope::new(selection, selection)
+                            },
+                            ScalarInvocationActivation::Activated,
+                            &control,
+                            &mut PassThroughCallHost
+                        )
                         .unwrap_err(),
-                    cause
+                    ExprEvaluationFailure::Kernel(cause)
                 );
-                assert_eq!(control.trace.lock().unwrap().clone(), trace[..at]);
-                let saved = control.trace.lock().unwrap().clone();
+                assert_eq!(control.trace(), trace[..at]);
+                let saved = control.trace();
                 assert_eq!(
                     runtime
-                        .evaluate(&batch, Selection::all(batch.num_rows()), &control)
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None
+                            },
+                            {
+                                let selection = Selection::all(batch.num_rows());
+                                ScalarInvocationScope::new(selection, selection)
+                            },
+                            ScalarInvocationActivation::Activated,
+                            &control,
+                            &mut PassThroughCallHost
+                        )
                         .unwrap_err(),
-                    KernelFailure::InstanceFailed
+                    ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
                 );
-                assert_eq!(control.trace.lock().unwrap().clone(), saved);
+                assert_eq!(control.trace(), saved);
             }
         }
     }

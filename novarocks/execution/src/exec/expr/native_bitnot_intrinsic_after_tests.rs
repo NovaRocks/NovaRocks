@@ -22,7 +22,12 @@ use super::numeric_unary_owned_transaction_tests::{batch, programs_with_catalogu
 use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array};
 use arrow::datatypes::DataType;
-use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{
+    KernelDiagnostic, KernelEvaluationControl, KernelFailure, ScalarInvocationActivation,
+    ScalarInvocationScope, Selection,
+};
 use novarocks_local_program::{ProgramNodeKind, ProgramRootRef, ProgramUnitId};
 
 use novarocks_expression_contract::RootOrdinal;
@@ -133,16 +138,36 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
         )
         .unwrap();
         let all = frame
-            .evaluate(&data, Selection::all(input.len()), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                {
+                    let selection = Selection::all(input.len());
+                    ScalarInvocationScope::new(selection, selection)
+                },
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert!(all.errors().is_empty());
         assert_eq!(all.values().to_data(), expected.to_data());
         let rows = [0, 3, 4];
         let sparse = frame
             .evaluate(
-                &data,
-                Selection::try_sparse(input.len(), &rows).unwrap(),
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                {
+                    let selection = Selection::try_sparse(input.len(), &rows).unwrap();
+                    ScalarInvocationScope::new(selection, selection)
+                },
+                ScalarInvocationActivation::Activated,
                 &Control,
+                &mut PassThroughCallHost,
             )
             .unwrap();
         assert!(sparse.errors().is_empty());
@@ -156,9 +181,17 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
         assert_eq!(
             frame
                 .evaluate(
-                    &data,
-                    Selection::try_sparse(input.len(), &[]).unwrap(),
-                    &Control
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None
+                    },
+                    {
+                        let selection = Selection::try_sparse(input.len(), &[]).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
                 )
                 .unwrap()
                 .values()
@@ -167,7 +200,16 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
         );
         assert_eq!(
             frame
-                .evaluate(&data.slice(1, 0), Selection::all(0), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data.slice(1, 0),
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(0), Selection::all(0)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap()
                 .values()
                 .data_type(),
@@ -194,7 +236,18 @@ fn native_bitnot_intrinsic_actual_sql_largeint_cast_uses_exact_logical_recipe() 
         &Control,
     )
     .unwrap();
-    let out = frame.evaluate(&data, Selection::all(4), &Control).unwrap();
+    let out = frame
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &data,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     // The SQL cast sign-extends each INT64 to 128 bits. Its complement
     // follows ~x = -x - 1 over signed 128-bit values, without narrowing back.
     let expected = novarocks_types::largeint::array_from_i128(&[
@@ -229,7 +282,18 @@ fn native_bitnot_intrinsic_actual_sql_nullable_values_current_domain_matches_ori
         &Control,
     )
     .unwrap();
-    let out = frame.evaluate(&data, Selection::all(3), &Control).unwrap();
+    let out = frame
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &data,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert!(out.errors().is_empty());
     // Complement keeps NULL and maps 1 -> -2, -2 -> 1.
     assert_eq!(
@@ -238,7 +302,19 @@ fn native_bitnot_intrinsic_actual_sql_nullable_values_current_domain_matches_ori
     );
     let rows = [0, 2];
     let sparse = frame
-        .evaluate(&data, Selection::try_sparse(3, &rows).unwrap(), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &data,
+                source: None,
+            },
+            {
+                let selection = Selection::try_sparse(3, &rows).unwrap();
+                ScalarInvocationScope::new(selection, selection)
+            },
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(
         sparse.values().to_data(),
@@ -270,7 +346,19 @@ fn constant_outputs(sql: &str) -> Vec<ArrayRef> {
                 )
                 .unwrap();
                 let out = frame
-                    .evaluate(data, Selection::all(data.num_rows()), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: data,
+                            source: None,
+                        },
+                        {
+                            let selection = Selection::all(data.num_rows());
+                            ScalarInvocationScope::new(selection, selection)
+                        },
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert!(out.errors().is_empty());
                 assert_eq!(out.values().len(), 1);
@@ -416,7 +504,18 @@ fn native_bitnot_intrinsic_actual_frame_every_constructor_and_runtime_callback_k
     )
     .unwrap();
     let recorder = Refuse::new(usize::MAX, KernelFailure::Cancelled);
-    frame.evaluate(&data, Selection::all(5), &recorder).unwrap();
+    frame
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &data,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(5), Selection::all(5)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     let trace = recorder.trace.lock().unwrap().clone();
     assert!(!trace.is_empty());
     for at in 1..=trace.len() {
@@ -428,13 +527,32 @@ fn native_bitnot_intrinsic_actual_frame_every_constructor_and_runtime_callback_k
             )
             .unwrap();
             let control = Refuse::new(at, cause.clone());
+            let result = frame.evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(5), Selection::all(5)),
+                ScalarInvocationActivation::Activated,
+                &control,
+                &mut PassThroughCallHost,
+            );
             assert!(
-                matches!(frame.evaluate(&data,Selection::all(5),&control),Err(actual) if actual==cause)
+                matches!(result, Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
             assert!(matches!(
-                frame.evaluate(&data, Selection::all(5), &Control),
-                Err(KernelFailure::InstanceFailed)
+                frame.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(5), Selection::all(5)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
         }
     }

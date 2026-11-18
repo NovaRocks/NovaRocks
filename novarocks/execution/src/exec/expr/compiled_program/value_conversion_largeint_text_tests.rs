@@ -16,6 +16,9 @@
 // under the License.
 //! Actual frozen hidden conversion: exact nominal source, typed output and old oracle.
 use super::*;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 #[test]
 fn nominal_largeint_text_actual_compiler_matches_v1_sparse_min_max_null_slice_empty() {
     let target = FunctionValueType::new(DataType::Utf8, true);
@@ -27,7 +30,18 @@ fn nominal_largeint_text_actual_compiler_matches_v1_sparse_min_max_null_slice_em
     let selection = Selection::try_sparse(4, &rows).unwrap();
     let mut evaluator = instance(&program);
     for _ in 0..2 {
-        let output = evaluator.evaluate(&batch, selection, &Control).unwrap();
+        let output = evaluator
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert!(output.errors().is_empty());
         assert_eq!(
             output.values().to_data(),
@@ -42,7 +56,19 @@ fn nominal_largeint_text_actual_compiler_matches_v1_sparse_min_max_null_slice_em
         );
     }
     let output = evaluator
-        .evaluate(&batch, Selection::try_sparse(4, &[]).unwrap(), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            {
+                let selection = Selection::try_sparse(4, &[]).unwrap();
+                ScalarInvocationScope::new(selection, selection)
+            },
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(
         output.values().to_data(),

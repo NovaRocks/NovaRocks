@@ -22,6 +22,8 @@
 //! JSON text is parsed and its object keys are ordered, while ordinary text is
 //! quoted. No legacy evaluator or differential harness supplies expected values.
 
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure, StaticExprKind};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, StringArray};
@@ -29,13 +31,12 @@ use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarInvocationActivation,
-    Selection,
+    ScalarInvocationScope, Selection,
 };
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use serde_json::{Value, json};
 
 use crate::exec::expr::sql_test_source::sql_source_with_declared_fields;
-use crate::runtime::task::ExecutionFailureCause;
 
 fn result() -> FunctionValueType {
     FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap()
@@ -242,7 +243,6 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
     use crate::exec::expr::compiled_program::CompiledExpressionInstance;
     use crate::exec::expr::filter_conjunction_actual_sql_compiler_tests::compiler_results;
     use crate::exec::expr::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
-    use novarocks_expression::StaticExprKind;
     use novarocks_expression_contract::ExprKind;
     use novarocks_local_program::ProgramNodeKind;
 
@@ -485,15 +485,19 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
             .unwrap();
             let rows: &[usize] = if scenario == 4 { &[1] } else { &[0, 2] };
             let selection = Selection::try_sparse(3, rows).unwrap();
-            let output = frame.evaluate_evaluation(
-                &batch,
-                selection,
+            let output = frame.evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
                 ScalarInvocationActivation::Activated,
                 &FrameControl,
+                &mut PassThroughCallHost,
             );
             if complex_key {
                 let error = output.unwrap_err();
-                let ExecutionFailureCause::ScalarInvocationData(data) = error.cause() else {
+                let ExprEvaluationFailure::Data(data) = &error else {
                     panic!("whole-call complex-key Data: {error:?}")
                 };
                 let data = data.clone();
@@ -505,13 +509,17 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 assert_eq!(data.source_row(0), Some(0));
                 assert_eq!(data.source_row(1), Some(2));
                 assert!(matches!(
-                    frame.evaluate_evaluation(
-                        &batch,
-                        selection,
+                    frame.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(selection, selection),
                         ScalarInvocationActivation::Activated,
-                        &FrameControl
+                        &FrameControl,
+                        &mut PassThroughCallHost,
                     ),
-                    Err(error) if matches!(error.cause(), ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed))
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
                 drop(frame);
                 assert!(tracker.current() > 0, "Data retains actual host funding");
@@ -559,11 +567,18 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 )
                 .unwrap();
                 let output = empty
-                    .evaluate_evaluation(
-                        &batch,
-                        Selection::try_sparse(3, &[]).unwrap(),
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        {
+                            let selection = Selection::try_sparse(3, &[]).unwrap();
+                            ScalarInvocationScope::new(selection, selection)
+                        },
                         activation,
                         &FrameControl,
+                        &mut PassThroughCallHost,
                     )
                     .unwrap();
                 assert!(output.values().is_empty());

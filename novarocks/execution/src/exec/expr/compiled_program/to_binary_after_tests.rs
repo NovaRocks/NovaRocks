@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use super::*;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 #[path = "to_binary_fixture.rs"]
 mod fixture;
 #[test]
@@ -67,7 +70,18 @@ fn to_binary_corrected_called_on_null_eager_both_overloads_compile_and_evaluate(
                 &Control,
             )
             .unwrap();
-            let out = instance.evaluate(&batch, selection, &Control).unwrap();
+            let out = instance
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
             assert_eq!(fixture::binary_values(out.values()), expected);
             assert!(out.errors().is_empty());
         }
@@ -85,7 +99,7 @@ fn to_binary_both_overloads_constructor_preserves_every_callback_cause() {
             &recorder,
         )
         .unwrap();
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(!trace.is_empty());
         assert!(trace.iter().all(|n| *n <= 256));
         for index in 1..=trace.len() {
@@ -94,7 +108,7 @@ fn to_binary_both_overloads_constructor_preserves_every_callback_cause() {
                 assert!(
                     matches!(CompiledExpressionInstance::try_new(root_unit(&program).clone(),root(&program).root,&control),Err(actual) if actual==cause)
                 );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+                assert_eq!(control.trace(), trace[..index]);
             }
         }
     }
@@ -141,9 +155,18 @@ fn to_binary_both_overloads_evaluation_preserves_every_callback_cause_and_latch(
         )
         .unwrap();
         let _ = evaluator
-            .evaluate(&batch, Selection::all(321), &recorder)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(321), Selection::all(321)),
+                ScalarInvocationActivation::Activated,
+                &recorder,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(trace.contains(&256));
         assert!(trace.iter().all(|n| *n <= 256));
         for index in 1..=trace.len() {
@@ -156,15 +179,24 @@ fn to_binary_both_overloads_evaluation_preserves_every_callback_cause_and_latch(
                 .unwrap();
                 let control = CallbackControl::new(cause.clone(), index);
                 assert!(
-                    matches!(evaluator.evaluate(&batch,Selection::all(321),&control),Err(actual) if actual==cause)
+                    matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(321), Selection::all(321)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
                 );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+                assert_eq!(control.trace(), trace[..index]);
                 let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
                 assert!(matches!(
-                    evaluator.evaluate(&batch, Selection::all(321), &after),
-                    Err(KernelFailure::InstanceFailed)
+                    evaluator.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(Selection::all(321), Selection::all(321)),
+                        ScalarInvocationActivation::Activated,
+                        &after,
+                        &mut PassThroughCallHost
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
-                assert!(after.trace.lock().unwrap().is_empty());
+                assert!(after.trace().is_empty());
             }
         }
     }

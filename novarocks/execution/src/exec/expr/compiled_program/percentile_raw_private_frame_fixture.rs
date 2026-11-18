@@ -131,7 +131,7 @@ pub(super) fn program() -> Arc<LocalProgram> {
             None,
             result_ty.clone(),
             ExprKind::FunctionCall {
-                function: owner.function.clone(),
+                function: owner.function().clone(),
                 args: children.into_boxed_slice(),
             },
         )

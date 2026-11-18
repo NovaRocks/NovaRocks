@@ -20,6 +20,9 @@
 //! No runtime reference calculator or old evaluator supplies expected values.
 use super::*;
 use arrow::array::Decimal128Array;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 
 const OVERFLOW: &str =
     "Expr evaluate meet error: The numeric type cast involving decimal overflows";
@@ -119,7 +122,16 @@ fn compare(
             ] {
                 let selection = Selection::try_sparse(source.len(), &rows).unwrap();
                 let out = instance(&program)
-                    .evaluate(&data, selection, &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &data,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(out.selection(), selection);
                 assert_eq!(out.values().data_type(), &target);
@@ -158,7 +170,16 @@ fn compare(
         let cb = batch(&constant, input(p, s, vec![Some(0); 5]));
         let selected = Selection::try_sparse(5, &[1, 4]).unwrap();
         let out = instance(&constant)
-            .evaluate(&cb, selected, &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &cb,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selected, selected),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(out.selection(), selected);
         assert_eq!(out.values().data_type(), &target);
@@ -313,24 +334,42 @@ fn decimal128_rescale_actual_compiler_every_seven_callback_causes_stop_and_latch
         let data = batch(&program, source);
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
         instance(&program)
-            .evaluate(&data, Selection::all(4), &recorder)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+                ScalarInvocationActivation::Activated,
+                &recorder,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
-        let trace = recorder.trace.lock().unwrap().clone();
+        let trace = recorder.trace();
         assert!(trace.iter().all(|n| *n <= 256));
         for stop in 1..=trace.len() {
             for cause in causes() {
                 let mut frame = instance(&program);
                 let control = CallbackControl::new(cause.clone(), stop);
                 assert!(
-                    matches!(frame.evaluate(&data,Selection::all(4),&control),Err(actual) if actual==cause)
+                    matches!(frame.evaluate(EvaluationInput::Batch { batch: &data, source: None }, ScalarInvocationScope::new(Selection::all(4), Selection::all(4)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
                 );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..stop]);
+                assert_eq!(control.trace(), trace[..stop]);
                 let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
                 assert!(matches!(
-                    frame.evaluate(&data, Selection::all(4), &after),
-                    Err(KernelFailure::InstanceFailed)
+                    frame.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &data,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+                        ScalarInvocationActivation::Activated,
+                        &after,
+                        &mut PassThroughCallHost
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
-                assert!(after.trace.lock().unwrap().is_empty());
+                assert!(after.trace().is_empty());
             }
         }
     }

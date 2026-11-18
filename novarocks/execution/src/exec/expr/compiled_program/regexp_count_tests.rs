@@ -18,6 +18,9 @@
 use super::*;
 use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{Array, ArrayRef, StringArray};
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_type_contract::RegexpCountPatternSource as Source;
 fn functions() -> PureEngineFunctionCatalog {
     let actual =
@@ -152,7 +155,7 @@ fn program(constant: Option<&str>) -> Arc<LocalProgram> {
             None,
             owner.result(),
             ExprKind::FunctionCall {
-                function: owner.function.clone(),
+                function: owner.function().clone(),
                 args: Box::from([text, pattern]),
             },
         )
@@ -226,7 +229,18 @@ fn regexp_count_actual_compiler_emitted_constant_and_dynamic_bytes_keep_original
         .unwrap();
         let selection = Selection::try_sparse(3, &[0, 1, 2]).unwrap();
         let mut instance = instance(&p);
-        let out = instance.evaluate(&batch, selection, &Control).unwrap();
+        let out = instance
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         let expected = match constant {
             None => vec![None, Some(2), Some(1)],
             Some("[") => vec![None, None, None],
@@ -255,7 +269,19 @@ fn regexp_count_actual_compiler_emitted_constant_and_dynamic_bytes_keep_original
         }
         assert!(
             instance
-                .evaluate(&batch, Selection::try_sparse(3, &[]).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None
+                    },
+                    {
+                        let selection = Selection::try_sparse(3, &[]).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost
+                )
                 .unwrap()
                 .errors()
                 .is_empty()

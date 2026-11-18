@@ -18,6 +18,9 @@
 //! Actual frozen package -> LocalCompiler -> Frame, using fixed mathematical expectations.
 use super::*;
 use arrow::array::{Decimal128Array, Int8Array, Int16Array, Int32Array};
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 const OVERFLOW: &str =
     "Expr evaluate meet error: The numeric type cast involving decimal overflows";
 fn modes() -> [(DecimalOverflowPolicy, bool); 4] {
@@ -115,7 +118,16 @@ fn compare_integral(dtype: DataType) {
             ] {
                 let selection = Selection::try_sparse(n, &rows).unwrap();
                 let out = instance(&program)
-                    .evaluate(&b, selection, &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &b,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(out.selection(), selection);
                 assert_eq!(out.values().data_type(), &target);

@@ -21,11 +21,13 @@ use super::filter_conjunction_actual_sql_compiler_tests::{
 };
 use super::ndv_filter_actual_sql_source_tests::ndv_sql_source;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
-use crate::runtime::task::ExecutionFailureCause;
+use crate::runtime::task::{ExecutionFailure, ExecutionFailureCause};
 use arrow::{
     array::{Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array},
     record_batch::RecordBatch,
 };
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_compiler::{FragmentCompileError, compile_fragment};
 use novarocks_local_program::{
@@ -188,7 +190,8 @@ fn predicates(
         .collect()
 }
 fn group(f: &Fixture) -> CompiledFilterConjunctionInstance {
-    CompiledFilterConjunctionInstance::try_new(&predicates(f), &Control).unwrap()
+    CompiledFilterConjunctionInstance::try_new_with_allocator(&predicates(f), &Control, None)
+        .unwrap()
 }
 
 #[test]
@@ -200,7 +203,15 @@ fn filter_conjunction_actual_native_sql_frame_compiled_and_sparse_empty() {
         assert_eq!(
             bits(
                 &instance
-                    .evaluate_required(&input, Selection::all(3), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &input,
+                            source: None
+                        },
+                        Selection::all(3),
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap()
             ),
             vec![Some(true), Some(false), Some(true)]
@@ -208,14 +219,30 @@ fn filter_conjunction_actual_native_sql_frame_compiled_and_sparse_empty() {
         assert_eq!(
             bits(
                 &instance
-                    .evaluate_required(&input, Selection::try_sparse(3, &[0, 2]).unwrap(), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &input,
+                            source: None
+                        },
+                        Selection::try_sparse(3, &[0, 2]).unwrap(),
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap()
             ),
             vec![Some(true), Some(true)]
         );
         assert_eq!(
             instance
-                .evaluate_required(&input, Selection::try_sparse(3, &[]).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None
+                    },
+                    Selection::try_sparse(3, &[]).unwrap(),
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap()
                 .len(),
             0
@@ -224,7 +251,15 @@ fn filter_conjunction_actual_native_sql_frame_compiled_and_sparse_empty() {
         assert_eq!(
             bits(
                 &instance
-                    .evaluate_required(&sliced, Selection::all(2), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &sliced,
+                            source: None
+                        },
+                        Selection::all(2),
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap()
             ),
             vec![Some(false), Some(true)]
@@ -244,16 +279,35 @@ fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latch
     assert_eq!(
         bits(
             &group(&f)
-                .evaluate_required(&input, Selection::try_sparse(3, &[0, 2]).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None
+                    },
+                    Selection::try_sparse(3, &[0, 2]).unwrap(),
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap()
         ),
         vec![Some(false), Some(true)]
     );
     let mut instance = group(&f);
     let error = instance
-        .evaluate_required(&input, Selection::try_sparse(3, &[1, 2]).unwrap(), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            Selection::try_sparse(3, &[1, 2]).unwrap(),
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap_err();
-    let error = error.at_expression_node(f.node);
+    let ExprEvaluationFailure::RequiredRow(error) = error else {
+        panic!("actual required row error");
+    };
+    let error = ExecutionFailure::from(error).at_expression_node(f.node);
     assert_eq!(error.expression_node(), Some(f.node));
     let ExecutionFailureCause::RequiredRow(error) = error.cause() else {
         panic!("actual required row error")
@@ -261,11 +315,19 @@ fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latch
     assert_eq!(error.root(), predicates(&f)[0].1);
     assert_eq!(error.batch_row(), 1);
     let second = instance
-        .evaluate_required(&input, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            Selection::all(3),
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap_err();
     assert!(matches!(
-        second.cause(),
-        ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
+        second,
+        ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
     ));
 }
 #[test]
@@ -277,7 +339,15 @@ fn filter_conjunction_actual_nested_not_is_null_keeps_value_demand() {
     assert_eq!(
         bits(
             &group(&f)
-                .evaluate_required(&input, Selection::all(3), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None
+                    },
+                    Selection::all(3),
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap()
         ),
         vec![Some(false), Some(false), Some(true)]
@@ -294,16 +364,28 @@ fn filter_conjunction_actual_rand_domains_and_cross_batch_state() {
     let rejected = batch(&f, &[0, 1, 0], &[]);
     let a = bits(
         &narrow
-            .evaluate_required(
-                &selected,
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &selected,
+                    source: None,
+                },
                 Selection::try_sparse(3, &[0, 2]).unwrap(),
                 &Control,
+                &mut PassThroughCallHost,
             )
             .unwrap(),
     );
     let b = bits(
         &guarded
-            .evaluate_required(&rejected, Selection::all(3), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &rejected,
+                    source: None,
+                },
+                Selection::all(3),
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap(),
     );
     assert_eq!(a, vec![b[0], b[2]]);
@@ -311,12 +393,28 @@ fn filter_conjunction_actual_rand_domains_and_cross_batch_state() {
     assert_eq!(
         bits(
             &narrow
-                .evaluate_required(&selected, Selection::all(3), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &selected,
+                        source: None
+                    },
+                    Selection::all(3),
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap()
         ),
         bits(
             &guarded
-                .evaluate_required(&selected, Selection::all(3), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &selected,
+                        source: None
+                    },
+                    Selection::all(3),
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap()
         )
     );
@@ -329,9 +427,20 @@ fn filter_conjunction_actual_pending_error_commits_before_rand_boundary() {
     let input = batch(&f, &[0], &[Some(f64::NAN)]);
     let mut instance = group(&f);
     let error = instance
-        .evaluate_required(&input, Selection::all(1), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            Selection::all(1),
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap_err();
-    let error = error.at_expression_node(f.node);
+    let ExprEvaluationFailure::RequiredRow(error) = error else {
+        panic!("actual required row error");
+    };
+    let error = ExecutionFailure::from(error).at_expression_node(f.node);
     assert_eq!(error.expression_node(), Some(f.node));
     let ExecutionFailureCause::RequiredRow(error) = error.cause() else {
         panic!("pending error must become necessary before a nonpure boundary")
@@ -383,7 +492,15 @@ fn filter_conjunction_actual_every_runtime_callback_seven_causes_prefix_no_tail_
         trace: Mutex::new(Vec::new()),
     };
     group(&f)
-        .evaluate_required(&input, Selection::all(3), &success)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            Selection::all(3),
+            &success,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     let trace = success.trace.into_inner().unwrap();
     assert!(!trace.is_empty());
@@ -396,19 +513,32 @@ fn filter_conjunction_actual_every_runtime_callback_seven_causes_prefix_no_tail_
             };
             let mut instance = group(&f);
             let error = instance
-                .evaluate_required(&input, Selection::all(3), &stop)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
+                    Selection::all(3),
+                    &stop,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap_err();
-            assert!(
-                matches!(error.cause(),ExecutionFailureCause::Kernel(actual) if *actual==cause)
-            );
+            assert!(matches!(error, ExprEvaluationFailure::Kernel(actual) if actual == cause));
             assert_eq!(*stop.trace.lock().unwrap(), trace[..index]);
             let len = stop.trace.lock().unwrap().len();
             assert!(matches!(
                 instance
-                    .evaluate_required(&input, Selection::all(3), &stop)
-                    .unwrap_err()
-                    .cause(),
-                ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &input,
+                            source: None
+                        },
+                        Selection::all(3),
+                        &stop,
+                        &mut PassThroughCallHost,
+                    )
+                    .unwrap_err(),
+                ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
             ));
             assert_eq!(stop.trace.lock().unwrap().len(), len);
         }
@@ -425,7 +555,15 @@ fn filter_conjunction_actual_row_quantum_and_empty_schema_validation() {
     };
     assert_eq!(
         group(&f)
-            .evaluate_required(&input, Selection::all(321), &control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None
+                },
+                Selection::all(321),
+                &control,
+                &mut PassThroughCallHost,
+            )
             .unwrap()
             .len(),
         321
@@ -445,7 +583,15 @@ fn filter_conjunction_actual_row_quantum_and_empty_schema_validation() {
     .unwrap();
     assert!(
         group(&f)
-            .evaluate_required(&wrong, Selection::try_sparse(321, &[]).unwrap(), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &wrong,
+                    source: None
+                },
+                Selection::try_sparse(321, &[]).unwrap(),
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .is_err()
     );
 }

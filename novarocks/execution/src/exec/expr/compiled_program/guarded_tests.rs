@@ -26,17 +26,20 @@ use arrow::{
 };
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_expression::CompiledExprSet;
-use novarocks_expression_contract::{
-    BoundFunction, DefinitionControl, ExprId, ExprKind, ExpressionCallClaim, PhysicalCallRequest,
-    RootScope, SealedUnit,
+pub(crate) use novarocks_expression::testkit::ClaimAuthor as Author;
+use novarocks_expression::testkit::{
+    add_call, declare_call_controls, finish_unit, register_call_requests,
 };
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure, testkit::PassThroughCallHost};
+use novarocks_expression_contract::{BoundFunction, ExprId, ExprKind, RootScope, SealedUnit};
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
-    FunctionResultType, InstalledPureKernel, KernelDiagnostic, KernelEvaluationControl,
-    KernelFailure, PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi, ScopedExpressionEffects, Selection,
+    ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
+    FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
+    InstalledPureKernel, KernelDiagnostic, KernelEvaluationControl, KernelFailure,
+    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    ScopedExpressionEffects, Selection,
 };
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
@@ -47,16 +50,11 @@ use novarocks_physical_plan::{
     ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
-    DecimalOverflowPolicy, EvaluationDemand, ExpressionInvocation, FunctionValueType,
-    PureCompileControl, SemanticParameters,
+    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
+    EvaluationDemand, ExpressionInvocation, FunctionValueType, PureCompileControl,
+    SemanticParameters,
 };
-use std::{
-    collections::BTreeMap,
-    num::NonZeroUsize,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 
 struct Control;
 impl PureCompileControl for Control {
@@ -153,87 +151,6 @@ fn options() -> LocalCompileOptions {
         },
     }
 }
-pub(crate) struct Author {
-    function: BoundFunction,
-    selected: Arc<FunctionBindingSelection>,
-    arguments: Vec<FunctionArgument>,
-    logical_argument_count: usize,
-    constant_policy: ConstantPolicy,
-    decimal_policy: DecimalOverflowPolicy,
-    expected_result_type: Option<FunctionValueType>,
-    pub(crate) shape: ControlShape,
-}
-impl Author {
-    pub(crate) fn with_decimal_policy(mut self, policy: DecimalOverflowPolicy) -> Self {
-        self.decimal_policy = policy;
-        self
-    }
-    fn request(&self) -> FunctionBindingRequest<'_> {
-        FunctionBindingRequest {
-            arguments: &self.arguments,
-            logical_argument_count: self.logical_argument_count,
-            expected_result_type: self.expected_result_type.as_ref(),
-        }
-    }
-    pub(crate) fn result(&self) -> FunctionValueType {
-        let FunctionResultType::Scalar(result) = &self.selected.result_type else {
-            panic!("scalar owner")
-        };
-        result.clone()
-    }
-}
-// Transfer the first resolver request; physical child shapes are not request sources.
-fn original_request_sources(
-    builder: &mut FragmentBuilder,
-    author_node: NodeId,
-    authors: &BTreeMap<ExprId, Author>,
-    mut pools: novarocks_physical_plan::ConstantPools,
-) -> novarocks_physical_plan::ConstantPools {
-    use novarocks_physical_plan::StaticFunctionArgument;
-    for (&definition, owner) in authors {
-        let original = owner.request();
-        let arguments = original
-            .arguments
-            .iter()
-            .map(|argument| match argument {
-                FunctionArgument::Value {
-                    value_type,
-                    constant,
-                } => {
-                    let constant = constant.as_ref().map(|value| {
-                        crate::exec::expr::test_support::register_constant(&mut pools, value)
-                    });
-                    StaticFunctionArgument::Value {
-                        value_type: value_type.clone(),
-                        constant,
-                    }
-                }
-                FunctionArgument::Lambda {
-                    parameter_types,
-                    result_type,
-                } => StaticFunctionArgument::Lambda {
-                    parameter_types: parameter_types.clone(),
-                    result_type: result_type.clone(),
-                },
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        builder
-            .unit(author_node)
-            .unwrap()
-            .request(
-                definition,
-                PhysicalCallRequest {
-                    arguments,
-                    logical_argument_count: original.logical_argument_count,
-                    expected_result_type: original.expected_result_type.cloned(),
-                    constant_policy: owner.constant_policy,
-                },
-            )
-            .unwrap();
-    }
-    pools
-}
 fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
     ConstantValue::from_i64(
         Arc::new(ty.try_to_field("fixture").unwrap()),
@@ -287,50 +204,15 @@ fn author_with_target(
     shape: ControlShape,
     expected_result_type: Option<FunctionValueType>,
 ) -> Author {
-    let logical_argument_count = arguments.len();
-    let request = FunctionBindingRequest {
-        arguments: &arguments,
-        logical_argument_count,
-        expected_result_type: expected_result_type.as_ref(),
-    };
-    let bound = if expected_result_type.is_some() {
-        functions
-            .metadata()
-            .resolve_bound_trusted(name, FunctionKind::Scalar, request, &Control)
-    } else {
-        functions
-            .metadata()
-            .resolve_bound_user(name, FunctionKind::Scalar, request, &Control)
-    }
-    .unwrap();
-    let selected = Arc::new(bound.selected.clone());
-    let FunctionResultType::Scalar(result) = &selected.result_type else {
-        panic!("scalar owner")
-    };
-    let function = BoundFunction {
-        function_id: bound.function_id,
-        overload: selected.overload.clone(),
-        kind: bound.kind,
-        argument_types: selected.argument_types.clone(),
-        result_type: result.clone(),
-        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
-            volatility: bound.semantics.volatility,
-            argument_evaluation: bound.semantics.argument_evaluation,
-            failure_behavior: bound.semantics.failure_behavior,
-            intrinsic_row_error: bound.semantics.intrinsic_row_error,
-            semantic_parameters: Box::default(),
-        }),
-    };
-    Author {
-        function,
-        selected,
+    Author::with_legacy_binding(
+        functions,
+        name,
         arguments,
-        logical_argument_count,
-        constant_policy: options().constants,
-        decimal_policy: DecimalOverflowPolicy::ReportError,
-        expected_result_type,
         shape,
-    }
+        expected_result_type,
+        options().constants,
+        &Control,
+    )
 }
 pub(crate) fn call(
     builder: &mut FragmentBuilder,
@@ -338,20 +220,7 @@ pub(crate) fn call(
     owner: Author,
     args: Vec<ExprId>,
 ) -> ExprId {
-    let expr = builder
-        .unit(NodeId::new(0))
-        .unwrap()
-        .add(
-            None,
-            owner.result(),
-            ExprKind::FunctionCall {
-                function: owner.function.clone(),
-                args: args.into_boxed_slice(),
-            },
-        )
-        .unwrap();
-    authors.insert(expr, owner);
-    expr
+    add_call(builder.unit(NodeId::new(0)).unwrap(), authors, owner, args)
 }
 
 fn program(shape: Shape) -> Arc<LocalProgram> {
@@ -620,44 +489,20 @@ pub(crate) fn finish_fixture_units(
         ScopedExpressionEffects,
     ) -> ScopedExpressionEffects,
 ) -> novarocks_physical_plan::ConstantPools {
-    let constants = original_request_sources(builder, author_node, authors, source_pools);
+    let mut constants = source_pools;
+    if !authors.is_empty() {
+        register_call_requests(builder.unit(author_node).unwrap(), authors, &mut constants);
+    }
     let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
-    for (&definition, owner) in authors {
-        let temporal_sources = if let ControlShape::TemporalSource(shape) = owner.shape {
-            let draft = builder.construction_unit(author_node).unwrap();
-            let ExprKind::FunctionCall { args, .. } = &draft.definition(definition).unwrap().kind
-            else {
-                panic!("original temporal call definition")
-            };
-            Some(
-                novarocks_expression_contract::temporal_source_definitions_from_lookup_observed(
-                    shape.kind(),
-                    |id| draft.definition(id),
-                    args,
-                    &mut work,
-                )
-                .unwrap(),
-            )
-        } else {
-            None
-        };
-        builder
-            .unit(author_node)
-            .unwrap()
-            .definition_control(
-                definition,
-                DefinitionControl {
-                    shape: owner.shape,
-                    temporal_sources,
-                },
-            )
-            .unwrap();
+    if !authors.is_empty() {
+        declare_call_controls(builder.unit(author_node).unwrap(), authors, &mut work);
     }
     let nodes = builder
         .construction_nodes()
         .map(|(&node, _)| node)
         .filter(|node| builder.construction_unit(*node).is_some())
         .collect::<Vec<_>>();
+    let no_authors = BTreeMap::new();
     for node in nodes {
         let ports = builder.node_ports(node).unwrap();
         let sealed = builder
@@ -665,178 +510,18 @@ pub(crate) fn finish_fixture_units(
             .unwrap()
             .seal(ports, &mut work)
             .unwrap();
-        let flow = sealed.control_flow();
-        let mut summaries = BTreeMap::new();
-        let mut claims = BTreeMap::new();
-        // Consume only the SDK's actual root/argument graph. Use IDs remain
-        // opaque and never determine dependency or preparation order.
-        let mut pending = sealed
-            .root_use_ids()
-            .iter()
-            .rev()
-            .map(|&id| (id, false))
-            .collect::<Vec<_>>();
-        let mut ordered = Vec::new();
-        while let Some((id, complete)) = pending.pop() {
-            if complete {
-                ordered.push(id);
+        let unit = finish_unit(
+            functions,
+            sealed,
+            if node == author_node {
+                authors
             } else {
-                pending.push((id, true));
-                for &child in sealed.uses()[&id].arguments.iter().rev() {
-                    pending.push((child, false));
-                }
-            }
-            work.step().unwrap();
-        }
-        for id in ordered {
-            let invocation = &sealed.uses()[&id];
-            let context = invocation.context;
-            let mut children = ScopedExpressionEffects::pure_value(context);
-            for (ordinal, child) in invocation.arguments.iter().enumerate() {
-                children = children
-                    .join_control_argument(summaries[child], flow, ordinal)
-                    .unwrap();
-            }
-            let owner = if node == author_node {
-                authors.get(&invocation.definition)
-            } else {
-                None
-            };
-            let summary = if let Some(owner) = owner {
-                let argument_uses = if owner.shape == ControlShape::NoArguments {
-                    vec![None; owner.logical_argument_count]
-                } else {
-                    invocation
-                        .arguments
-                        .iter()
-                        .map(|id| Some(*id))
-                        .collect::<Vec<_>>()
-                };
-                let preparation = if matches!(
-                    owner.shape,
-                    ControlShape::If | ControlShape::Coalesce | ControlShape::TemporalSource(_)
-                ) {
-                    PureCallPreparation::ControlIntrinsic {
-                        arguments: children,
-                    }
-                } else {
-                    PureCallPreparation::Scalar {
-                        arguments: children,
-                    }
-                };
-                let source_plan = sealed.temporal_source(context.use_id).cloned();
-                let source_channels = source_plan
-                    .as_ref()
-                    .map(|source| {
-                        source
-                            .sources
-                            .iter()
-                            .map(|channel| novarocks_functions::TemporalSourceChannel {
-                                role: channel.role,
-                                context: flow.uses()[&channel.use_id].context,
-                                value_type: &sealed.definition(channel.definition).unwrap().ty,
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let definition = sealed.definition(invocation.definition).unwrap();
-                let ExprKind::FunctionCall { args, .. } = &definition.kind else {
-                    panic!("actual authored call")
-                };
-                let regexp_count_pattern_source =
-                    if owner.function.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
-                        Some(
-                            novarocks_expression_contract::regexp_count_pattern_source_observed(
-                                sealed.definitions(),
-                                args,
-                                &mut work,
-                            )
-                            .unwrap(),
-                        )
-                    } else {
-                        None
-                    };
-                let to_base64_byte_source =
-                    if owner.function.function_id.as_str() == "builtin.scalar/to_base64/v1" {
-                        Some(
-                            novarocks_expression_contract::to_base64_byte_source_observed(
-                                sealed.definitions(),
-                                args,
-                                &mut work,
-                            )
-                            .unwrap(),
-                        )
-                    } else {
-                        None
-                    };
-                let token = functions
-                    .prepare_fresh(
-                        CallEffectInput {
-                            context: context.into(),
-                            argument_uses: match &source_plan {
-                                Some(source) => {
-                                    novarocks_functions::CallArgumentUses::TemporalSources {
-                                        facts: &source.facts,
-                                        channels: &source_channels,
-                                    }
-                                }
-                                None => match regexp_count_pattern_source {
-                                    Some(source) => {
-                                        novarocks_functions::CallArgumentUses::RegexpCountPattern {
-                                            source,
-                                            channels: &argument_uses,
-                                        }
-                                    }
-                                    None => match to_base64_byte_source {
-                                        Some(source) => {
-                                            novarocks_functions::CallArgumentUses::ToBase64Bytes {
-                                                source,
-                                                channels: &argument_uses,
-                                            }
-                                        }
-                                        None => {
-                                            novarocks_functions::CallArgumentUses::SelectedChannels(
-                                                &argument_uses,
-                                            )
-                                        }
-                                    },
-                                },
-                            },
-                            function_id: &owner.function.function_id,
-                            kind: FunctionKind::Scalar,
-                            selected: owner.selected.as_ref(),
-                            request: owner.request(),
-                            environment: &[],
-                            parameters,
-                            decimal_overflow_policy: owner.decimal_policy,
-                            proof_scope: CallProofScope::Region(context.region),
-                        },
-                        owner.selected.clone(),
-                        preparation,
-                        &Control,
-                    )
-                    .unwrap();
-                claims.insert(
-                    context.use_id,
-                    ExpressionCallClaim {
-                        context,
-                        effects: token.call_contract().effects().clone(),
-                        decimal_overflow_policy: owner.decimal_policy,
-                        regexp_count_pattern_source,
-                        to_base64_byte_source,
-                        temporal_source: source_plan,
-                    },
-                );
-                ScopedExpressionEffects::primitive(
-                    context,
-                    token.effects().for_use(context).unwrap(),
-                )
-            } else {
-                primitive_effects(&sealed, invocation, children)
-            };
-            summaries.insert(context.use_id, summary);
-        }
-        let unit = sealed.finish(claims, &mut work).unwrap();
+                &no_authors
+            },
+            parameters,
+            &mut work,
+            &mut primitive_effects,
+        );
         builder.install_unit(node, Arc::new(unit)).unwrap();
     }
     work.finish().unwrap();
@@ -1011,7 +696,18 @@ fn nested_if_coalesce_maps_sparse_original_rows_and_constant_versus_column_rng()
     let rows = [1, 3, 5];
     let selection = Selection::try_sparse(6, &rows).unwrap();
     let mut evaluator = instance(&program);
-    let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let output = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert_eq!(output.selection(), selection);
     assert!(output.errors().is_empty());
     let values = output
@@ -1032,7 +728,16 @@ fn nested_if_coalesce_maps_sparse_original_rows_and_constant_versus_column_rng()
         vec![Some(1), None, None],
     );
     let output = evaluator
-        .evaluate(&next, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &next,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     let values = output
         .values()
@@ -1053,7 +758,16 @@ fn guarded_constant_rng_stays_uninstantiated_until_coalesce_really_needs_it() {
     let mut evaluator = instance(&program);
     let true_only = batch(&program, vec![Some(true); 3], vec![Some(42); 3]);
     let output = evaluator
-        .evaluate(&true_only, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &true_only,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     let values = output
         .values()
@@ -1064,7 +778,16 @@ fn guarded_constant_rng_stays_uninstantiated_until_coalesce_really_needs_it() {
     assert_eq!(evaluator.instances.len(), 1);
     let false_only = batch(&program, vec![Some(false); 2], vec![None; 2]);
     let output = evaluator
-        .evaluate(&false_only, Selection::all(2), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &false_only,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     let values = output
         .values()
@@ -1087,14 +810,35 @@ fn empty_guarded_selection_creates_no_kernel_instance_and_does_not_advance_rng()
     let input = batch(&program, vec![Some(false); 3], vec![None; 3]);
     let rows = [];
     let output = evaluator
-        .evaluate(&input, Selection::try_sparse(3, &rows).unwrap(), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            {
+                let rows = Selection::try_sparse(3, &rows).unwrap();
+                ScalarInvocationScope::new(rows, rows)
+            },
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert!(output.values().is_empty());
     assert!(output.errors().is_empty());
     assert!(evaluator.instances.is_empty());
     let one = batch(&program, vec![None], vec![None]);
     let output = evaluator
-        .evaluate(&one, Selection::all(1), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &one,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(
         output
@@ -1137,7 +881,18 @@ fn guarded_round_skips_inactive_overflow_and_remaps_required_error_without_null_
     let rows = [1, 3, 5, 6];
     let selection = Selection::try_sparse(7, &rows).unwrap();
     let mut evaluator = instance(&program);
-    let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let output = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     let values = output
         .values()
         .as_any()
@@ -1152,7 +907,16 @@ fn guarded_round_skips_inactive_overflow_and_remaps_required_error_without_null_
     assert!(output.errors()[0].message().contains("overflow"));
     let clean = decimal_batch(&program, vec![Some(true)], vec![Some(25)], vec![Some(71)]);
     let output = evaluator
-        .evaluate(&clean, Selection::all(1), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &clean,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert!(output.errors().is_empty());
     assert_eq!(
@@ -1176,7 +940,16 @@ fn only_false_or_null_if_rows_never_instantiate_guarded_round_even_with_valid_ov
         vec![Some(17); 2],
     );
     let output = evaluator
-        .evaluate(&input, Selection::all(2), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert!(output.errors().is_empty());
     assert!(evaluator.instances.is_empty());
@@ -1192,50 +965,16 @@ fn only_false_or_null_if_rows_never_instantiate_guarded_round_even_with_valid_ov
     );
 }
 
-struct CallbackControl {
-    cause: KernelFailure,
-    stop_at: usize,
-    trace: Mutex<Vec<u32>>,
-    refused: Mutex<bool>,
-}
-impl CallbackControl {
-    fn new(cause: KernelFailure, stop_at: usize) -> Self {
-        Self {
-            cause,
-            stop_at,
-            trace: Mutex::new(vec![]),
-            refused: Mutex::new(false),
-        }
-    }
-}
-impl KernelEvaluationControl for CallbackControl {
-    fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
-        let mut refused = self.refused.lock().unwrap();
-        assert!(!*refused, "no callback after primary refusal");
-        let mut trace = self.trace.lock().unwrap();
-        trace.push(units);
-        if trace.len() == self.stop_at {
-            *refused = true;
-            Err(self.cause.clone())
-        } else {
-            Ok(())
-        }
-    }
-    fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
-        panic!("guarded numeric calls must not wait")
-    }
-}
+use novarocks_expression::testkit::{CallbackControl, callback_causes};
+
 fn causes() -> [KernelFailure; 7] {
-    [
-        KernelFailure::Cancelled,
-        KernelFailure::DeadlineExceeded,
-        KernelFailure::ResourceExhausted,
-        KernelFailure::InvalidProgram(KernelDiagnostic::new("guarded-origin-invalid")),
-        KernelFailure::Internal(KernelDiagnostic::new("guarded-origin-internal")),
-        KernelFailure::Operational(KernelDiagnostic::new("guarded-origin-operational")),
-        KernelFailure::InstanceFailed,
-    ]
+    callback_causes([
+        "guarded-origin-invalid",
+        "guarded-origin-internal",
+        "guarded-origin-operational",
+    ])
 }
+
 #[test]
 fn every_guarded_constructor_callback_preserves_all_original_failure_categories() {
     let program = program(Shape::Random);
@@ -1246,7 +985,7 @@ fn every_guarded_constructor_callback_preserves_all_original_failure_categories(
         &recorder,
     )
     .unwrap();
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(!trace.is_empty());
     for index in 1..=trace.len() {
         for cause in causes() {
@@ -1254,7 +993,7 @@ fn every_guarded_constructor_callback_preserves_all_original_failure_categories(
             assert!(
                 matches!(CompiledExpressionInstance::try_new(root_unit(&program).clone(), root(&program).root, &control), Err(actual) if actual == cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+            assert_eq!(control.trace(), trace[..index]);
         }
     }
 }
@@ -1276,9 +1015,18 @@ fn every_guarded_evaluation_callback_preserves_primary_failure_and_never_replays
     );
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let _ = instance(&program)
-        .evaluate(&input, Selection::all(320), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
     for index in 1..=trace.len() {
@@ -1286,15 +1034,24 @@ fn every_guarded_evaluation_callback_preserves_primary_failure_and_never_replays
             let mut evaluator = instance(&program);
             let control = CallbackControl::new(cause.clone(), index);
             assert!(
-                matches!(evaluator.evaluate(&input, Selection::all(320), &control), Err(actual) if actual == cause)
+                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &input, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+            assert_eq!(control.trace(), trace[..index]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                evaluator.evaluate(&input, Selection::all(320), &after),
-                Err(KernelFailure::InstanceFailed)
+                evaluator.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
 }

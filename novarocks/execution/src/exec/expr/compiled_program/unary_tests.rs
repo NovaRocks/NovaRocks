@@ -19,8 +19,11 @@ use super::*;
 use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::ArrayRef;
 use novarocks_expression::StaticExprKind;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
 use novarocks_expression_contract::UnaryOperator;
 use novarocks_functions::EvaluatedArgument;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 
 #[derive(Clone, Copy)]
 enum UnaryCase {
@@ -367,14 +370,17 @@ fn next_actual_rand(evaluator: &mut CompiledExpressionInstance) -> u64 {
         .unwrap();
     let seed = Arc::new(Int64Array::from(vec![42])) as ArrayRef;
     let arguments = [EvaluatedArgument::Scalar(&seed)];
-    let output = rand
-        .evaluate(
-            Selection::all(1),
-            &arguments,
-            novarocks_functions::ScalarInvocationActivation::Activated,
-            &Control,
-        )
-        .unwrap();
+    let super::super::scalar_invocation::CallInstance::Kernel(rand) = rand else {
+        panic!("actual RAND uses its scalar kernel");
+    };
+    let output = super::super::scalar_invocation::call_scalar(
+        &mut PassThroughCallHost,
+        rand,
+        Selection::all(1),
+        &arguments,
+        &Control,
+    )
+    .unwrap();
     output
         .values()
         .as_any()
@@ -418,7 +424,18 @@ fn actual_null_tests_distinguish_success_null_from_round_error_placeholder_on_sp
         let rows = [1, 4, 7];
         let selection = Selection::try_sparse(8, &rows).unwrap();
         let mut instance = evaluator(&program, case);
-        let output = instance.evaluate(&input, selection, &Control).unwrap();
+        let output = instance
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert_eq!(booleans(&output), expected);
         assert_eq!(output.selection(), selection);
         assert_eq!(output.errors().len(), 1);
@@ -455,7 +472,18 @@ fn actual_pure_round_boolean_error_is_suppressed_only_by_later_required_decider(
         let rows = [2, 7, 9];
         let selection = Selection::try_sparse(10, &rows).unwrap();
         let mut instance = evaluator(&program, case);
-        let output = instance.evaluate(&input, selection, &Control).unwrap();
+        let output = instance
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert_eq!(booleans(&output), expected);
         assert_eq!(output.errors().len(), 1);
         assert_eq!(output.errors()[0].selected_ordinal(), 1);
@@ -485,7 +513,18 @@ fn actual_rand_null_test_state_boundary_promotes_pending_and_skips_failed_parent
     );
     let rows = [2, 4, 6, 8];
     let selection = Selection::try_sparse(9, &rows).unwrap();
-    let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let output = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert_eq!(
         booleans(&output),
         vec![Some(true), Some(true), Some(true), None]
@@ -523,18 +562,45 @@ fn all_pending_round_errors_stop_before_rand_instantiation_and_do_not_advance_ex
     let mut evaluator = evaluator(&program, UnaryCase::StateBoundary);
     let failing = unary_batch(&program, vec![Some(true); 2], vec![Some(max38()); 2]);
     let output = evaluator
-        .evaluate(&failing, Selection::all(2), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &failing,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(booleans(&output), vec![None, None]);
     assert_eq!(output.errors().len(), 2);
     assert_eq!(rand_instances(&evaluator), 0);
     let clean = unary_batch(&program, vec![Some(true)], vec![Some(25)]);
     evaluator
-        .evaluate(&clean, Selection::all(1), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &clean,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(rand_instances(&evaluator), 1);
     let output = evaluator
-        .evaluate(&failing, Selection::all(2), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &failing,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(output.errors().len(), 2);
     // One successful parent advanced the instance; both failing batches did not.
@@ -589,7 +655,16 @@ fn actual_not_filter_requires_value_child_and_keeps_nullable_truth_semantics() {
     let rows = [1, 3, 5];
     let selection = Selection::try_sparse(6, &rows).unwrap();
     let output = evaluator(&program, UnaryCase::NotFilter)
-        .evaluate(&input, selection, &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(booleans(&output), vec![Some(false), None, Some(true)]);
     assert!(output.errors().is_empty());
@@ -611,10 +686,19 @@ fn every_actual_round_null_rand_boundary_callback_keeps_all_seven_causes_and_no_
     );
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let output = evaluator(&program, UnaryCase::StateBoundary)
-        .evaluate(&input, Selection::all(320), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(output.errors().len(), 107);
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
     for index in 1..=trace.len() {
@@ -622,15 +706,24 @@ fn every_actual_round_null_rand_boundary_callback_keeps_all_seven_causes_and_no_
             let mut instance = evaluator(&program, UnaryCase::StateBoundary);
             let control = CallbackControl::new(cause.clone(), index);
             assert!(
-                matches!(instance.evaluate(&input,Selection::all(320),&control),Err(actual) if actual==cause)
+                matches!(instance.evaluate(EvaluationInput::Batch { batch: &input, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+            assert_eq!(control.trace(), trace[..index]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                instance.evaluate(&input, Selection::all(320), &after),
-                Err(KernelFailure::InstanceFailed)
+                instance.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
 }

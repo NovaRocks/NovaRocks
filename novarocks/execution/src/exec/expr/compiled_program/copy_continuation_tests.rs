@@ -128,10 +128,10 @@ fn copy_chain(all_true: bool, finite: bool) {
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let actual_rows = [1, 3, 5];
     let demand_rows = [1, 5];
@@ -408,10 +408,10 @@ fn scalar_v1_alias_into_pure_b_then_take_keeps_actual_finite_a() {
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let actual_rows = [1, 3, 5];
     let demand_rows = [1, 5];
@@ -543,10 +543,10 @@ fn constant_nonzero_pool_ordinal_take_keeps_actual_a_even_when_current_b_is_pure
             refused: AtomicBool::new(false),
             operation_aborted: AtomicBool::new(false),
         };
-        let mut work = Work {
+        let mut work: Work<'_, '_> = Work {
             control: &observed,
             pending: 0,
-            scalar_scope: None,
+            scalar_host: None,
         };
         let actual_rows = [1, 3, 5];
         let demand_rows = [1, 5];
@@ -607,10 +607,10 @@ fn finite_constant_needs_host_only_when_its_actual_array_is_copied() {
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     let value = OwnedValue::Constant(constant)
         .retaining_result_type(&b, None, &Control)

@@ -30,7 +30,7 @@ pub(super) fn evaluate<'a>(
     kind: UnaryIntrinsic,
     child: &Value<'a>,
     selection: Selection<'a>,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     let argument = child.argument();
     let not = if matches!(kind, UnaryIntrinsic::Not) {

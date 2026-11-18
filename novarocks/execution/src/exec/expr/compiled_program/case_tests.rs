@@ -18,6 +18,9 @@
 use super::*;
 use crate::exec::expr::compiled_program::checked_constants;
 use novarocks_expression::StaticExprKind;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_type_contract::RegionGuard;
 
 #[derive(Clone, Copy)]
@@ -425,7 +428,16 @@ fn searched_case_first_true_wins_and_null_false_when_skip_with_sparse_source_row
     let rows = [1, 3, 5, 6];
     let selection = Selection::try_sparse(8, &rows).unwrap();
     let output = instance(&program)
-        .evaluate(&input, selection, &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(output.selection(), selection);
     assert_eq!(
@@ -452,7 +464,16 @@ fn searched_case_without_else_returns_successful_null_only_for_unmatched_rows() 
         vec![None; 3],
     );
     let output = instance(&program)
-        .evaluate(&input, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(
         output
@@ -501,7 +522,18 @@ fn searched_case_then_and_else_rng_instances_advance_only_actual_matches_across_
     let rows = [1, 3, 5, 9];
     let selection = Selection::try_sparse(10, &rows).unwrap();
     let mut evaluator = instance(&program);
-    let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let output = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert_eq!(
         rand_bits(&output),
         vec![
@@ -520,7 +552,16 @@ fn searched_case_then_and_else_rng_instances_advance_only_actual_matches_across_
         vec![Some(25); 3],
     );
     let output = evaluator
-        .evaluate(&next, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &next,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(
         rand_bits(&output),
@@ -545,7 +586,18 @@ fn searched_case_later_round_when_is_required_only_for_remaining_rows_and_error_
     let rows = [1, 3, 5, 7];
     let selection = Selection::try_sparse(8, &rows).unwrap();
     let mut evaluator = instance(&program);
-    let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let output = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert_eq!(
         rand_bits(&output),
         vec![Some(SEED_42[0]), Some(SEED_42[0]), Some(SEED_42[0]), None]
@@ -563,7 +615,16 @@ fn searched_case_later_round_when_is_required_only_for_remaining_rows_and_error_
         vec![Some(10_i128.pow(38) - 1), None, Some(25)],
     );
     let output = evaluator
-        .evaluate(&next, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &next,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(rand_bits(&output), vec![Some(SEED_42[1]); 3]);
     assert!(output.errors().is_empty());
@@ -584,7 +645,16 @@ fn searched_case_selected_then_round_error_is_terminal_and_inactive_then_overflo
         ],
     );
     let output = instance(&program)
-        .evaluate(&input, Selection::all(4), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(
         output
@@ -613,7 +683,18 @@ fn searched_case_empty_selection_does_not_instantiate_any_then_else_or_when_kern
     let mut evaluator = instance(&program);
     let rows = [];
     let selection = Selection::try_sparse(4, &rows).unwrap();
-    let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let output = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert!(output.values().is_empty());
     assert!(output.errors().is_empty());
     assert!(evaluator.instances.is_empty());
@@ -624,7 +705,16 @@ fn searched_case_empty_selection_does_not_instantiate_any_then_else_or_when_kern
         vec![Some(10_i128.pow(38) - 1), None, Some(25)],
     );
     let output = evaluator
-        .evaluate(&clean, Selection::all(3), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &clean,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(rand_bits(&output), vec![Some(SEED_42[0]); 3]);
 }
@@ -646,10 +736,19 @@ fn every_actual_searched_case_callback_preserves_all_seven_causes_and_refuses_re
     );
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let output = instance(&program)
-        .evaluate(&input, Selection::all(320), &recorder)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+            ScalarInvocationActivation::Activated,
+            &recorder,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(output.errors().len(), 80);
-    let trace = recorder.trace.lock().unwrap().clone();
+    let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
     for index in 1..=trace.len() {
@@ -657,15 +756,24 @@ fn every_actual_searched_case_callback_preserves_all_seven_causes_and_refuses_re
             let mut evaluator = instance(&program);
             let control = CallbackControl::new(cause.clone(), index);
             assert!(
-                matches!(evaluator.evaluate(&input,Selection::all(320),&control),Err(actual) if actual==cause)
+                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &input, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+            assert_eq!(control.trace(), trace[..index]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
-                evaluator.evaluate(&input, Selection::all(320), &after),
-                Err(KernelFailure::InstanceFailed)
+                evaluator.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
+                    ScalarInvocationActivation::Activated,
+                    &after,
+                    &mut PassThroughCallHost
+                ),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert!(after.trace().is_empty());
         }
     }
 }
@@ -684,7 +792,18 @@ fn searched_case_all_rows_match_first_when_still_runs_then_before_empty_remainin
     let mut evaluator = instance(&program);
     // The first WHEN empties the pending row set. Its already matched THEN
     // remains required for every selected row; later WHEN/THEN/ELSE do not.
-    let output = evaluator.evaluate(&input, selection, &Control).unwrap();
+    let output = evaluator
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert_eq!(output.selection(), selection);
     assert_eq!(
         rand_bits(&output),
@@ -694,7 +813,16 @@ fn searched_case_all_rows_match_first_when_still_runs_then_before_empty_remainin
     assert_eq!(evaluator.instances.len(), 1);
     let next = case_batch(&program, vec![Some(true)], vec![Some(true)], vec![None]);
     let output = evaluator
-        .evaluate(&next, Selection::all(1), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &next,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     assert_eq!(rand_bits(&output), vec![Some(SEED_42[3])]);
     assert!(output.errors().is_empty());

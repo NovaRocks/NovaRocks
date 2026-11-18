@@ -28,16 +28,19 @@ use crate::runtime::{
     scalar_memory::{
         RuntimeScalarMemoryJournal, RuntimeScalarMemoryRefusal, RuntimeScalarMemoryScope,
     },
-    task::ExecutionFailureCause,
+    task::{ExecutionFailure, ExecutionFailureCause},
 };
 use arrow::{
     array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array},
     datatypes::DataType,
     record_batch::RecordBatch,
 };
+use novarocks_expression::EvaluationInput;
 use novarocks_expression_contract::ExprKind;
 use novarocks_functions::PureKernelAbi;
-use novarocks_functions::{FunctionKind, KernelFailure, ScalarInvocationActivation, Selection};
+use novarocks_functions::{
+    FunctionKind, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope, Selection,
+};
 use novarocks_local_program::{ProgramNodeKind, ProgramRootRef, ProgramUnitId};
 use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TopUpPolicy};
 use novarocks_physical_plan::FunctionArgumentType;
@@ -305,9 +308,12 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
         .unwrap();
         let mut journal = RuntimeScalarMemoryJournal::default();
         let result = frame
-            .evaluate_runtime(
-                &input,
-                selection,
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
                 ScalarInvocationActivation::Activated,
                 &funded,
                 &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
@@ -403,10 +409,15 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
             .collect::<Vec<_>>();
         for has_binding in [false, true] {
             let control = control(has_binding.then_some(&binding));
-            let mut filter = CompiledFilterConjunctionInstance::try_new(&roots, &control).unwrap();
+            let mut filter =
+                CompiledFilterConjunctionInstance::try_new_with_allocator(&roots, &control, None)
+                    .unwrap();
             let mut journal = RuntimeScalarMemoryJournal::default();
-            let result = filter.evaluate_required_runtime(
-                &input,
+            let result = filter.evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
                 Selection::all(4),
                 &control,
                 &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
@@ -425,7 +436,7 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
                 assert_eq!(journal.body.settlement.unwrap().debt, 0);
             } else {
                 assert_eq!(
-                    result.unwrap_err().cause(),
+                    ExecutionFailure::from(result.unwrap_err()).cause(),
                     &ExecutionFailureCause::RuntimeScalarMemory(
                         RuntimeScalarMemoryRefusal::MissingQueryMemory
                     )

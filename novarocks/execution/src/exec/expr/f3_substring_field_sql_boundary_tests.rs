@@ -28,10 +28,12 @@ use arrow::{
     datatypes::{DataType, Field},
     record_batch::RecordBatch,
 };
-use novarocks_expression::StaticExprKind;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure, StaticExprKind};
 use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{
-    FunctionArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure, Selection,
+    FunctionArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
+    ScalarInvocationActivation, ScalarInvocationScope, Selection,
 };
 use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_physical_plan::StaticFunctionArgument;
@@ -295,7 +297,18 @@ fn c12_p3_substring_index_actual_compiled_slots_constants_strict_null_and_explic
                         &HarnessControl,
                     )
                     .unwrap();
-                    let output = frame.evaluate(&batch, selection, &HarnessControl).unwrap();
+                    let output = frame
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &HarnessControl,
+                            &mut PassThroughCallHost,
+                        )
+                        .unwrap();
                     assert_eq!(output.selection(), selection);
                     let expected = rows
                         .iter()
@@ -364,7 +377,18 @@ fn c12_p3_substring_index_real_required_text_child_control_failure_survives_stri
             &HarnessControl,
         )
         .unwrap();
-        let output = frame.evaluate(&batch, Selection::all(1), &control).unwrap();
+        let output = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationActivation::Activated,
+                &control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert!(output.errors().is_empty());
         assert!(output.values().is_null(0));
         let trace = control.trace.lock().unwrap().clone();
@@ -389,17 +413,35 @@ fn c12_p3_substring_index_real_required_text_child_control_failure_survives_stri
     .unwrap();
     assert_eq!(
         frame
-            .evaluate(&batch, Selection::all(1), &control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None
+                },
+                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationActivation::Activated,
+                &control,
+                &mut PassThroughCallHost,
+            )
             .unwrap_err(),
-        KernelFailure::Cancelled
+        ExprEvaluationFailure::Kernel(KernelFailure::Cancelled)
     );
     assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
     let replay = ChildControl::default();
     assert_eq!(
         frame
-            .evaluate(&batch, Selection::all(1), &replay)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None
+                },
+                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationActivation::Activated,
+                &replay,
+                &mut PassThroughCallHost,
+            )
             .unwrap_err(),
-        KernelFailure::InstanceFailed
+        ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
     );
     assert!(replay.trace.lock().unwrap().is_empty());
 }
@@ -636,7 +678,18 @@ fn pure_differential_field_actual_sql_null_coercion_and_generic_nominal_tags() {
             &HarnessControl,
         )
         .unwrap();
-        let output = frame.evaluate(&batch, selection, &HarnessControl).unwrap();
+        let output = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &HarnessControl,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert!(output.errors().is_empty());
         assert_eq!(output.selection(), selection);
         assert_eq!(output.values().data_type(), &DataType::Int32);
@@ -703,7 +756,18 @@ fn pure_differential_field_actual_sql_null_coercion_and_generic_nominal_tags() {
                 &HarnessControl,
             )
             .unwrap();
-            let output = frame.evaluate(&batch, selection, &HarnessControl).unwrap();
+            let output = frame
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &HarnessControl,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
             assert!(output.errors().is_empty());
             assert_eq!(output.selection(), selection);
             assert_eq!(output.values().data_type(), &DataType::Int32);

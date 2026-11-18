@@ -25,10 +25,14 @@ use arrow::{
     datatypes::DataType,
     record_batch::RecordBatch,
 };
-use novarocks_expression::StaticExprKind;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure, StaticExprKind};
 use novarocks_expression_contract::ExprKind;
 use novarocks_expression_contract::RootOrdinal;
-use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
+use novarocks_functions::{
+    KernelDiagnostic, KernelEvaluationControl, KernelFailure, ScalarInvocationActivation,
+    ScalarInvocationScope, Selection,
+};
 use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef, ProgramUnitId};
 
 use novarocks_type_contract::{ControlShape, FunctionVolatility};
@@ -198,7 +202,18 @@ fn hash_native_n1_actual_sql_source_and_frame_original_n1() {
             Some(host),
         )
         .unwrap();
-        let out = frame.evaluate(&batch, Selection::all(3), &control).unwrap();
+        let out = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                ScalarInvocationActivation::Activated,
+                &control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert!(out.errors().is_empty());
         let actual = out.values().as_any().downcast_ref::<BinaryArray>().unwrap();
         for i in 0..3 {
@@ -212,13 +227,37 @@ fn hash_native_n1_actual_sql_source_and_frame_original_n1() {
         drop(out);
         let rows = [2];
         let out = frame
-            .evaluate(&batch, Selection::try_sparse(3, &rows).unwrap(), &control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                {
+                    let selection = Selection::try_sparse(3, &rows).unwrap();
+                    ScalarInvocationScope::new(selection, selection)
+                },
+                ScalarInvocationActivation::Activated,
+                &control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(out.selection().row(0), Some(2));
         assert_eq!(out.values().null_count(), 0);
         drop(out);
         let out = frame
-            .evaluate(&batch, Selection::try_sparse(3, &[]).unwrap(), &control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                {
+                    let selection = Selection::try_sparse(3, &[]).unwrap();
+                    ScalarInvocationScope::new(selection, selection)
+                },
+                ScalarInvocationActivation::Activated,
+                &control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(out.values().len(), 0);
         drop(out);
@@ -255,7 +294,16 @@ fn hash_native_n1_actual_frame_seven_causes_exact_prefix_and_failed_group_latch(
     )
     .unwrap();
     let out = frame
-        .evaluate(&batch, Selection::all(321), &control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(321), Selection::all(321)),
+            ScalarInvocationActivation::Activated,
+            &control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     drop(out);
     drop(frame);
@@ -278,17 +326,35 @@ fn hash_native_n1_actual_frame_seven_causes_exact_prefix_and_failed_group_latch(
             .unwrap();
             assert_eq!(
                 frame
-                    .evaluate(&batch, Selection::all(321), &control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(Selection::all(321), Selection::all(321)),
+                        ScalarInvocationActivation::Activated,
+                        &control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap_err(),
-                cause
+                ExprEvaluationFailure::Kernel(cause.clone())
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
             let count = control.trace.lock().unwrap().len();
             assert_eq!(
                 frame
-                    .evaluate(&batch, Selection::all(321), &control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(Selection::all(321), Selection::all(321)),
+                        ScalarInvocationActivation::Activated,
+                        &control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap_err(),
-                KernelFailure::InstanceFailed
+                ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
             );
             assert_eq!(control.trace.lock().unwrap().len(), count);
             drop(frame);

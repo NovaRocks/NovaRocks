@@ -20,6 +20,9 @@ use super::*;
 use arrow::array::{Int32Array, ListArray, NullArray, StringArray, UInt64Array};
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::Field;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use std::collections::HashMap;
 fn source_type(null_child: bool) -> DataType {
     DataType::List(Arc::new(Field::new(
@@ -163,7 +166,16 @@ fn compare(null: bool, id: Option<&str>) {
             ] {
                 let selection = Selection::try_sparse(source.len(), &rows).unwrap();
                 let out = instance(&program)
-                    .evaluate(&b, selection, &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &b,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(out.selection(), selection);
                 assert_eq!(out.values().data_type(), &target);

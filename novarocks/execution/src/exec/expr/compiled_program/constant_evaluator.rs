@@ -18,6 +18,7 @@
 //! A depth-one driver over the same Frame and completion owner as program uses.
 use super::super::constant_node::*;
 use super::*;
+use arrow::record_batch::RecordBatch;
 use novarocks_expression::{
     PrimitiveError as ProgramPrimitiveError, prepare_arithmetic_node, prepare_cast_node,
     prepare_comparison_node, prepare_null_safe_comparison_node,
@@ -264,7 +265,7 @@ impl ConstantEvaluator<'_> {
                 None,
             )?;
         }
-        let value = complete_node::<KernelFailure, _>(
+        let value = complete_node(
             &kind,
             &mut frame,
             recipes,
@@ -276,7 +277,16 @@ impl ConstantEvaluator<'_> {
             &mut BTreeMap::new(),
             None,
             work,
-        )?;
+        )
+        .map_err(|cause| match cause {
+            ExprEvaluationFailure::Kernel(cause) => cause,
+            ExprEvaluationFailure::Host(cause) => match cause {},
+            ExprEvaluationFailure::Data(_)
+            | ExprEvaluationFailure::Source(_)
+            | ExprEvaluationFailure::RequiredRow(_) => {
+                internal("constant node produced a non-kernel failure")
+            }
+        })?;
         Ok(TypedValue {
             value,
             ty: result.clone(),
@@ -441,10 +451,10 @@ fn evaluate_with_kernel_control(
         refused: AtomicBool::new(false),
         operation_aborted: AtomicBool::new(false),
     };
-    let mut work = Work {
+    let mut work: Work<'_, '_> = Work {
         control: &observed,
         pending: 0,
-        scalar_scope: None,
+        scalar_host: None,
     };
     work.flush().map_err(ConstantNodeFailure::from)?;
     let outcome = evaluate_inner(node, children, result, control, &mut work);
@@ -477,7 +487,10 @@ fn evaluate_inner(
     )
     .map_err(|_| invalid("constant empty port could not be constructed"))?;
     let domain = Arc::new(input_source::ActualInvocationDomain::root(
-        CompiledInputLoan::RecordBatch(&batch),
+        FrameInput::new(EvaluationInput::Batch {
+            batch: &batch,
+            source: None,
+        }),
         Selection::all(1),
         work.control,
     )?);
@@ -624,7 +637,7 @@ fn evaluate_inner(
         ));
     }
     let value = value.value.into_value(Selection::all(1), work)?;
-    let output = finish_root_value::<KernelFailure>(value, result, Selection::all(1), None, work)?;
+    let output = finish_root_value(value, result, Selection::all(1), None, work)?;
     if let Some(error) = output.errors().first() {
         Ok(ConstantNodeOutcome::RowError(error.clone()))
     } else {

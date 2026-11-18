@@ -21,8 +21,8 @@
 use novarocks_functions::{
     AggregateStateAllocator, EvaluatedArgument, InvocationScalarEvaluationInstance,
     KernelEvaluationControl, KernelFailure, PreparedInvocationScalarKernel, PreparedScalarKernel,
-    ScalarCallContract, ScalarEvaluationInstance, ScalarInvocationActivation,
-    ScalarInvocationFailure, SelectedValues, Selection,
+    ScalarCallContract, ScalarEvaluationInstance, ScalarInvocationActivation, SelectedValues,
+    Selection,
 };
 use std::sync::Arc;
 
@@ -80,170 +80,240 @@ impl CallInstance {
             Self::Invocation(instance) => instance.contract(),
         }
     }
-
-    pub(super) fn evaluate<'a>(
-        &mut self,
-        selection: Selection<'a>,
-        arguments: &'a [EvaluatedArgument<'a>],
-        activation: ScalarInvocationActivation,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, ScalarInvocationFailure> {
-        match self {
-            Self::Kernel(instance) => instance
-                .evaluate(selection, arguments, control)
-                .map_err(ScalarInvocationFailure::from),
-            Self::Invocation(instance) => {
-                instance.evaluate(selection, arguments, activation, control)
-            }
-        }
-    }
 }
 
-/// The generic Frame shares every scheduling/validation operation. Its error
-/// transport is chosen at an explicit public entry, not by names or payloads.
-/// The old adapter cannot invoke a whole-Data leaf at all.
-pub(super) trait FrameFailure: From<KernelFailure> {
-    const ACTIVATE_EMPTY: bool;
-    fn invoke<'a>(
-        instance: &mut CallInstance,
-        selection: Selection<'a>,
-        arguments: &'a [EvaluatedArgument<'a>],
-        activation: ScalarInvocationActivation,
-        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        work: &mut super::Work<'_, '_>,
-    ) -> Result<SelectedValues<'a>, Self>;
-    fn invoke_scoped<'a>(
-        instance: &mut CallInstance,
-        scope: novarocks_functions::ScalarInvocationScope<'a>,
-        sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
-        activation: ScalarInvocationActivation,
-        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        work: &mut super::Work<'_, '_>,
-    ) -> Result<SelectedValues<'a>, Self>;
-    fn required(
-        root: novarocks_expression_contract::RootOrdinal,
-        selection: Selection<'_>,
-        error: novarocks_functions::RowDataError,
-    ) -> Self;
-    fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self>;
+use novarocks_expression::{
+    ExprEvaluationFailure, ScalarCallFailure, ScalarCallHost, ScalarCallPhase,
+    ScalarCallRequestFacts,
+};
+use novarocks_functions::{ScalarInvocationScope, ScalarInvocationSource, ScalarResourceError};
+
+/// Carry the typed phase output outside the object's admission closure.
+fn run_phase<R, T>(
+    host: &mut dyn ScalarCallHost<Refusal = R>,
+    phase: ScalarCallPhase,
+    facts: ScalarCallRequestFacts,
+    body: impl FnOnce() -> Result<T, ScalarCallFailure<R>>,
+) -> Result<T, ScalarCallFailure<R>> {
+    #[cfg(test)]
+    observe(|| LeafCallObservation::Admission(phase, facts));
+
+    let mut body = Some(body);
+    let mut output = None;
+    host.run_admitted(phase, facts, &mut || {
+        let body = body
+            .take()
+            .ok_or_else(|| super::internal("scalar host invoked an admitted phase twice"))?;
+        output = Some(body()?);
+        Ok(())
+    })?;
+    output.ok_or_else(|| super::internal("scalar host did not run an admitted phase").into())
 }
-impl FrameFailure for KernelFailure {
-    const ACTIVATE_EMPTY: bool = false;
-    fn invoke<'a>(
-        instance: &mut CallInstance,
-        selection: Selection<'a>,
-        arguments: &'a [EvaluatedArgument<'a>],
-        _activation: ScalarInvocationActivation,
-        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        work: &mut super::Work<'_, '_>,
-    ) -> Result<SelectedValues<'a>, Self> {
-        match instance {
-            CallInstance::Kernel(instance) => instance.evaluate(selection, arguments, work.control),
-            CallInstance::Invocation(_) => Err(super::invalid(
-                "whole-invocation scalar requires the lossless evaluation entry",
-            )),
+
+pub(crate) fn call_scalar<'a, R>(
+    host: &mut dyn ScalarCallHost<Refusal = R>,
+    instance: &mut ScalarEvaluationInstance,
+    selection: Selection<'a>,
+    arguments: &'a [EvaluatedArgument<'a>],
+    control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, ScalarCallFailure<R>> {
+    host.begin_call();
+    let body = |instance: &mut ScalarEvaluationInstance| {
+        #[cfg(test)]
+        observe(|| LeafCallObservation::Rows {
+            explicit_actual_domain: false,
+            actual: selection.iter().collect(),
+            demand: selection.iter().collect(),
+        });
+        instance
+            .evaluate(selection, arguments, control)
+            .map_err(Into::into)
+    };
+    let Some(profile) = instance.invocation_resource_profile() else {
+        return body(instance);
+    };
+    let facts = profile
+        .requests_for(selection, arguments)
+        .map_err(ScalarCallFailure::Source)?;
+    run_phase(
+        host,
+        ScalarCallPhase::Body,
+        ScalarCallRequestFacts::new(facts.bytes(), facts.requests()),
+        || body(instance),
+    )
+}
+
+pub(crate) fn call_invocation<'a, R>(
+    host: &mut dyn ScalarCallHost<Refusal = R>,
+    instance: &mut InvocationScalarEvaluationInstance,
+    selection: Selection<'a>,
+    arguments: &'a [EvaluatedArgument<'a>],
+    activation: ScalarInvocationActivation,
+    allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, ScalarCallFailure<R>> {
+    host.begin_call();
+    let body = |instance: &mut InvocationScalarEvaluationInstance| {
+        #[cfg(test)]
+        observe(|| LeafCallObservation::Rows {
+            explicit_actual_domain: false,
+            actual: selection.iter().collect(),
+            demand: selection.iter().collect(),
+        });
+        instance
+            .evaluate(selection, arguments, activation, control)
+            .map_err(Into::into)
+    };
+    if instance.is_failed() {
+        return body(instance);
+    }
+    let Some(profile) = instance.invocation_resource_profile() else {
+        return body(instance);
+    };
+    let prefix = profile.preparation_prefix();
+    let requests = run_phase(
+        host,
+        ScalarCallPhase::Preparation,
+        ScalarCallRequestFacts::new(prefix.bytes(), prefix.requests()),
+        || {
+            profile
+                .requests_for(instance, selection, arguments, activation, control)
+                .map_err(Into::into)
+        },
+    )?;
+    let mut facts = ScalarCallRequestFacts::new(requests.bytes(), requests.requests());
+    if requests.requires_host_callback() {
+        facts = facts
+            .checked_add(host.callback_request_facts(allocator)?)
+            .ok_or(ScalarCallFailure::Source(ScalarResourceError::Arithmetic))?;
+    }
+    run_phase(host, ScalarCallPhase::Body, facts, || body(instance))
+}
+
+pub(crate) fn call_scoped_invocation<'a, R>(
+    host: &mut dyn ScalarCallHost<Refusal = R>,
+    instance: &mut InvocationScalarEvaluationInstance,
+    scope: ScalarInvocationScope<'a>,
+    sources: &'a [ScalarInvocationSource<'a>],
+    activation: ScalarInvocationActivation,
+    control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, ScalarCallFailure<R>> {
+    host.begin_call();
+    if !instance.is_failed() && instance.invocation_resource_profile().is_some() {
+        return Err(super::invalid(
+            "scoped invocation has no installed measurement source transport",
+        )
+        .into());
+    }
+    #[cfg(test)]
+    observe(|| LeafCallObservation::Rows {
+        explicit_actual_domain: true,
+        actual: scope.actual_domain().iter().collect(),
+        demand: scope.demand().iter().collect(),
+    });
+    instance
+        .evaluate_scoped(scope, sources, activation, control)
+        .map_err(Into::into)
+}
+
+pub(super) fn invoke<'a, R>(
+    instance: &mut CallInstance,
+    selection: Selection<'a>,
+    arguments: &'a [EvaluatedArgument<'a>],
+    activation: ScalarInvocationActivation,
+    allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+    work: &mut super::Work<'_, '_, R>,
+) -> Result<SelectedValues<'a>, ExprEvaluationFailure<R>> {
+    // Single-node constant evaluation has its own compile control and admits
+    // only the ordinary scalar lifecycle. Every root lends its actual host.
+    match (instance, work.scalar_host.as_deref_mut()) {
+        (CallInstance::Kernel(instance), Some(host)) => {
+            call_scalar(host, instance, selection, arguments, work.control).map_err(Into::into)
         }
-    }
-    fn invoke_scoped<'a>(
-        _instance: &mut CallInstance,
-        _scope: novarocks_functions::ScalarInvocationScope<'a>,
-        _sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
-        _activation: ScalarInvocationActivation,
-        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        _work: &mut super::Work<'_, '_>,
-    ) -> Result<SelectedValues<'a>, Self> {
-        unreachable!("Kernel-only root entry rejects every invocation lifecycle before Frame")
-    }
-    fn required(
-        _root: novarocks_expression_contract::RootOrdinal,
-        _selection: Selection<'_>,
-        _error: novarocks_functions::RowDataError,
-    ) -> Self {
-        unreachable!("Kernel-only root entry rejects every invocation lifecycle before Frame")
-    }
-    fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self> {
-        work.finish(result)
+        (CallInstance::Invocation(instance), Some(host)) => call_invocation(
+            host,
+            instance,
+            selection,
+            arguments,
+            activation,
+            allocator,
+            work.control,
+        )
+        .map_err(Into::into),
+        (CallInstance::Kernel(instance), None) => instance
+            .evaluate(selection, arguments, work.control)
+            .map_err(Into::into),
+        (CallInstance::Invocation(_), None) => Err(super::invalid(
+            "whole-invocation scalar requires the lossless evaluation entry",
+        )
+        .into()),
     }
 }
-impl FrameFailure for crate::runtime::task::ExecutionFailure {
-    const ACTIVATE_EMPTY: bool = true;
-    fn invoke<'a>(
-        instance: &mut CallInstance,
-        selection: Selection<'a>,
-        arguments: &'a [EvaluatedArgument<'a>],
-        activation: ScalarInvocationActivation,
-        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        work: &mut super::Work<'_, '_>,
-    ) -> Result<SelectedValues<'a>, Self> {
-        if let Some(scope) = work.scalar_scope.as_mut() {
-            match instance {
-                CallInstance::Kernel(instance) => scope
-                    .evaluate(instance, selection, arguments, work.control)
-                    .map_err(Into::into),
-                CallInstance::Invocation(instance) => scope
-                    .evaluate_invocation(
-                        instance,
-                        selection,
-                        arguments,
-                        activation,
-                        allocator,
-                        work.control,
-                    )
-                    .map_err(Into::into),
-            }
-        } else {
-            instance
-                .evaluate(selection, arguments, activation, work.control)
-                .map_err(Into::into)
+
+pub(super) fn invoke_scoped<'a, R>(
+    instance: &mut CallInstance,
+    scope: ScalarInvocationScope<'a>,
+    sources: &'a [ScalarInvocationSource<'a>],
+    activation: ScalarInvocationActivation,
+    work: &mut super::Work<'_, '_, R>,
+) -> Result<SelectedValues<'a>, ExprEvaluationFailure<R>> {
+    let CallInstance::Invocation(instance) = instance else {
+        return Err(super::internal(
+            "scoped Frame call differs from its prepared invocation lifecycle",
+        )
+        .into());
+    };
+    let host = work
+        .scalar_host
+        .as_deref_mut()
+        .expect("root evaluation lends its scalar host");
+    call_scoped_invocation(host, instance, scope, sources, activation, work.control)
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum LeafCallObservation {
+    Rows {
+        explicit_actual_domain: bool,
+        actual: Vec<usize>,
+        demand: Vec<usize>,
+    },
+    Admission(ScalarCallPhase, ScalarCallRequestFacts),
+}
+
+#[cfg(test)]
+thread_local! {
+    static OBSERVATIONS: std::cell::RefCell<Option<Vec<LeafCallObservation>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn observe(observation: impl FnOnce() -> LeafCallObservation) {
+    OBSERVATIONS.with_borrow_mut(|slot| {
+        if let Some(observations) = slot {
+            observations.push(observation());
+        }
+    });
+}
+
+#[cfg(test)]
+pub(super) fn observe_calls<T>(run: impl FnOnce() -> T) -> (T, Vec<LeafCallObservation>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            OBSERVATIONS.with_borrow_mut(|slot| *slot = None);
         }
     }
-    fn invoke_scoped<'a>(
-        instance: &mut CallInstance,
-        scope: novarocks_functions::ScalarInvocationScope<'a>,
-        sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
-        activation: ScalarInvocationActivation,
-        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        work: &mut super::Work<'_, '_>,
-    ) -> Result<SelectedValues<'a>, Self> {
-        let CallInstance::Invocation(instance) = instance else {
-            return Err(super::internal(
-                "scoped Frame call differs from its prepared invocation lifecycle",
-            )
-            .into());
-        };
-        if let Some(runtime) = work.scalar_scope.as_mut() {
-            runtime
-                .evaluate_scoped_invocation(
-                    instance,
-                    scope,
-                    sources,
-                    activation,
-                    allocator,
-                    work.control,
-                )
-                .map_err(Into::into)
-        } else {
-            instance
-                .evaluate_scoped(scope, sources, activation, work.control)
-                .map_err(Into::into)
-        }
-    }
-    fn required(
-        root: novarocks_expression_contract::RootOrdinal,
-        selection: Selection<'_>,
-        error: novarocks_functions::RowDataError,
-    ) -> Self {
-        match novarocks_expression::RequiredExpressionRowError::try_new(root, selection, error) {
-            Ok(error) => error.into(),
-            Err(cause) => cause.into(),
-        }
-    }
-    fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self> {
-        match result {
-            // Preserve the original local occurrence; no reconstruction or
-            // additional checkpoint can replace a failed Frame's result.
-            Err(error) => Err(error),
-            Ok(value) => work.finish(Ok(value)).map_err(Into::into),
-        }
-    }
+    OBSERVATIONS.with_borrow_mut(|slot| {
+        assert!(
+            slot.replace(Vec::new()).is_none(),
+            "nested scalar call observation"
+        );
+    });
+    let _reset = Reset;
+    let result = run();
+    let observations = OBSERVATIONS.with_borrow_mut(|slot| slot.take().unwrap());
+    (result, observations)
 }

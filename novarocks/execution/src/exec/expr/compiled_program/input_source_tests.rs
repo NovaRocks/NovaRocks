@@ -15,21 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+};
 
-use crate::runtime::task::{ExecutionFailureCause, ExecutionResult};
 use arrow::array::{Array, BooleanArray, Int64Array};
-use novarocks_expression::StaticExprKind;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{
+    EvaluationInput, ExprEvaluationFailure, InputColumnProjection, StaticExprKind,
+};
 use novarocks_expression_contract::{ExprKind, RootScope};
-use novarocks_functions::ScalarInvocationActivation;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef};
 use novarocks_type_contract::EvaluationDemand;
 
-use super::input_source::{BorrowedInputSource, CompiledInputLoan, SlotSourceObserver};
+use super::input_source::{BorrowedInputSource, FrameInput, SlotSourceObserver};
 use super::tests::{SeedMode, program};
 use super::*;
 use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::operators::compiled_expression::{
+    InputAdapterObserver, RuntimeKernelControl, assert_original_chunk_input,
+    chunk_evaluation_input, projected_chunk_evaluation_input,
+};
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::runtime_state::RuntimeErrorState;
 
 pub(crate) fn input_chunk(program: &LocalProgram, values: Vec<Option<i64>>) -> Chunk {
     let rows = values.len();
@@ -89,22 +99,35 @@ fn evaluator(program: &Arc<LocalProgram>) -> CompiledExpressionInstance {
     .unwrap()
 }
 
+fn batch_input(batch: &RecordBatch) -> EvaluationInput<'_> {
+    EvaluationInput::Batch {
+        batch,
+        source: None,
+    }
+}
+
+fn chunk_input(chunk: &Chunk) -> EvaluationInput<'_> {
+    EvaluationInput::Batch {
+        batch: chunk.record_batch(),
+        source: Some(chunk),
+    }
+}
+
 fn evaluate<'a>(
     instance: &mut CompiledExpressionInstance,
-    input: CompiledInputLoan<'_>,
+    input: EvaluationInput<'_>,
     selection: Selection<'a>,
-) -> ExecutionResult<SelectedValues<'a>> {
-    instance.evaluate_input_controlled(
+) -> Result<SelectedValues<'a>, ExprEvaluationFailure<Infallible>> {
+    instance.evaluate(
         input,
-        selection,
-        selection,
+        ScalarInvocationScope::new(selection, selection),
         if selection.is_empty() {
             ScalarInvocationActivation::ValidateOnly
         } else {
             ScalarInvocationActivation::Activated
         },
         &Control,
-        None,
+        &mut PassThroughCallHost,
     )
 }
 
@@ -118,40 +141,30 @@ fn checked_slot_pairs_exact_column_and_original_chunk_authority() {
     let original_array = Arc::clone(chunk.record_batch().column(1));
     let observed = Arc::new(Mutex::new(0));
     let seen = Arc::clone(&observed);
-    let observer: Arc<SlotSourceObserver> = Arc::new(move |column| {
-        let (array, source) = column.into_parts();
-        assert!(Arc::ptr_eq(array, &original_array));
-        let BorrowedInputSource::Attached(source) = source else {
-            panic!("original attached source is required")
-        };
+    let observer: Arc<InputAdapterObserver> = Arc::new(move |chunk, input| {
+        assert_original_chunk_input(chunk, input);
+        assert!(Arc::ptr_eq(input.batch().column(1), &original_array));
+        let source = chunk.source_authority();
         assert_eq!(source.owner_identity(), owners);
         assert_eq!(source.strong_counts(), (Some(1), None));
         *seen.lock().unwrap() += 1;
     });
+    let mut adapter = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
+    adapter.observe_input_adapter(observer);
+    let input = chunk_evaluation_input(&chunk, &adapter);
     let mut instance = evaluator(&program);
-    instance.observe_slot_source(observer);
-    let result = evaluate(
-        &mut instance,
-        CompiledInputLoan::from_chunk(&chunk),
-        Selection::all(3),
-    )
-    .unwrap();
+    let result = evaluate(&mut instance, input, Selection::all(3)).unwrap();
     assert_eq!(
         result.values().to_data(),
         chunk.record_batch().column(1).to_data()
     );
     assert_eq!(*observed.lock().unwrap(), 1);
     assert!(chunk.source_authority().strong_counts().0.unwrap() > 1);
-    assert!(
-        CompiledInputLoan::from_chunk(&chunk)
-            .checked_column(3)
-            .is_none()
-    );
+    assert!(FrameInput::new(input).checked_column(3).is_none());
 }
 
 #[test]
 fn projected_input_maps_original_slots_through_actual_sparse_domains() {
-    use novarocks_expression::InputColumnProjection;
     use novarocks_type_contract::ValueTypeStorageLifetime;
     let program = program(SeedMode::Input, false);
     let full = input_chunk(&program, vec![Some(11), Some(42), None, Some(7)]);
@@ -178,18 +191,17 @@ fn projected_input_maps_original_slots_through_actual_sparse_domains() {
             ValueTypeStorageLifetime::pure(),
         ));
         let loan =
-            CompiledInputLoan::from_projected_chunk(&compact, &declared, &projection, &Control)
-                .unwrap();
+            projected_chunk_evaluation_input(&compact, &declared, &projection, &Control).unwrap();
         assert_eq!(loan.batch().num_columns(), 1);
-        assert_eq!(loan.schema().fields().len(), 3);
+        assert_eq!(loan.declared_schema().fields().len(), 3);
         for selected in [vec![0, 1, 2, 3], vec![1, 3], vec![]] {
             let selection = Selection::try_sparse(4, &selected).unwrap();
             let mut instance = evaluator(&program);
             let actual = evaluate(&mut instance, loan, selection);
             if ordinals == [0] {
                 assert!(matches!(
-                    actual.unwrap_err().cause(),
-                    ExecutionFailureCause::Kernel(KernelFailure::InvalidProgram(_))
+                    actual.unwrap_err(),
+                    ExprEvaluationFailure::Kernel(KernelFailure::InvalidProgram(_))
                 ));
                 continue;
             }
@@ -210,7 +222,6 @@ fn projected_input_maps_original_slots_through_actual_sparse_domains() {
 
 #[test]
 fn projected_input_does_not_promote_equal_arrow_fields_to_a_logical_binding() {
-    use novarocks_expression::InputColumnProjection;
     use novarocks_type_contract::{FunctionValueType, ValueLogicalType, ValueTypeStorageLifetime};
     use novarocks_types::SlotId;
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
@@ -238,7 +249,7 @@ fn projected_input_does_not_promote_equal_arrow_fields_to_a_logical_binding() {
         vec![0],
         ValueTypeStorageLifetime::pure(),
     ));
-    let actual = CompiledInputLoan::from_projected_chunk(&actual, &declared, &projection, &Control);
+    let actual = projected_chunk_evaluation_input(&actual, &declared, &projection, &Control);
     assert!(matches!(
         actual.err().expect("logical binding was refused"),
         KernelFailure::InvalidProgram(_)
@@ -249,27 +260,26 @@ fn projected_input_does_not_promote_equal_arrow_fields_to_a_logical_binding() {
 fn record_batch_without_chunk_and_chunk_without_authority_are_distinct() {
     let program = program(SeedMode::Input, false);
     let chunk = input_chunk(&program, vec![Some(42)]);
+    assert!(!chunk.source_authority().is_attached());
+    let bare = batch_input(chunk.record_batch());
+    let adapted = chunk_input(&chunk);
     assert!(matches!(
-        CompiledInputLoan::RecordBatch(chunk.record_batch())
+        FrameInput::new(bare)
             .checked_column(1)
             .unwrap()
             .into_parts()
             .1,
-        BorrowedInputSource::NoChunkProvided
+        BorrowedInputSource::NoStorage
     ));
-    assert!(matches!(
-        CompiledInputLoan::from_chunk(&chunk)
-            .checked_column(1)
-            .unwrap()
-            .into_parts()
-            .1,
-        BorrowedInputSource::NoAttachedAuthority
-    ));
-    let results = [
-        CompiledInputLoan::RecordBatch(chunk.record_batch()),
-        CompiledInputLoan::from_chunk(&chunk),
-    ]
-    .map(|input| {
+    let (_, source) = FrameInput::new(adapted)
+        .checked_column(1)
+        .unwrap()
+        .into_parts();
+    let BorrowedInputSource::Storage(source) = source else {
+        panic!("the Chunk supplies its actual source storage");
+    };
+    assert!(std::ptr::addr_eq(source, &chunk));
+    let results = [bare, adapted].map(|input| {
         evaluate(&mut evaluator(&program), input, Selection::all(1))
             .unwrap()
             .values()
@@ -293,24 +303,8 @@ fn chunk_and_batch_entries_keep_full_sparse_empty_null_results() {
     ] {
         let mut old = evaluator(&program);
         let mut actual = evaluator(&program);
-        let before = old
-            .evaluate_evaluation(
-                chunk.record_batch(),
-                selection,
-                if selection.is_empty() {
-                    ScalarInvocationActivation::ValidateOnly
-                } else {
-                    ScalarInvocationActivation::Activated
-                },
-                &Control,
-            )
-            .unwrap();
-        let after = evaluate(
-            &mut actual,
-            CompiledInputLoan::from_chunk(&chunk),
-            selection,
-        )
-        .unwrap();
+        let before = evaluate(&mut old, batch_input(chunk.record_batch()), selection).unwrap();
+        let after = evaluate(&mut actual, chunk_input(&chunk), selection).unwrap();
         assert_eq!(before.selection(), after.selection());
         assert_eq!(before.values().to_data(), after.values().to_data());
         assert_eq!(before.errors(), after.errors());
@@ -328,12 +322,7 @@ fn chunk_and_batch_entries_keep_full_sparse_empty_null_results() {
     // Returned values retain original finite custody. The input Chunk may
     // exit first, but its source charge survives the last real Buffer alias.
     let mut instance = evaluator(&program);
-    let result = evaluate(
-        &mut instance,
-        CompiledInputLoan::from_chunk(&chunk),
-        Selection::all(4),
-    )
-    .unwrap();
+    let result = evaluate(&mut instance, chunk_input(&chunk), Selection::all(4)).unwrap();
     let bytes = tracker.current();
     let buffer = result.values().to_data().buffers()[0].clone();
     drop(chunk);
@@ -373,38 +362,19 @@ fn chunk_entry_keeps_original_validation_and_failed_instance_latch() {
     let bad = Chunk::try_new_with_chunk_schema(bad, bad_schema).unwrap();
     let mut old = evaluator(&program);
     let mut actual = evaluator(&program);
-    let a = old
-        .evaluate_evaluation(
-            bad.record_batch(),
-            Selection::all(1),
-            ScalarInvocationActivation::Activated,
-            &Control,
-        )
-        .unwrap_err();
-    let b = evaluate(
-        &mut actual,
-        CompiledInputLoan::from_chunk(&bad),
-        Selection::all(1),
-    )
-    .unwrap_err();
+    let a = evaluate(&mut old, batch_input(bad.record_batch()), Selection::all(1)).unwrap_err();
+    let b = evaluate(&mut actual, chunk_input(&bad), Selection::all(1)).unwrap_err();
     assert_eq!(format!("{a:?}"), format!("{b:?}"));
-    let a = old
-        .evaluate_evaluation(
-            chunk.record_batch(),
-            Selection::all(1),
-            ScalarInvocationActivation::Activated,
-            &Control,
-        )
-        .unwrap_err();
-    let b = evaluate(
-        &mut actual,
-        CompiledInputLoan::from_chunk(&chunk),
+    let a = evaluate(
+        &mut old,
+        batch_input(chunk.record_batch()),
         Selection::all(1),
     )
     .unwrap_err();
+    let b = evaluate(&mut actual, chunk_input(&chunk), Selection::all(1)).unwrap_err();
     assert!(matches!(
-        a.cause(),
-        ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
+        &a,
+        ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
     ));
     assert_eq!(format!("{a:?}"), format!("{b:?}"));
 }
@@ -421,16 +391,13 @@ fn project_and_writer_entries_observe_original_slot_before_complete_custody_capt
         let expected_array = Arc::as_ptr(chunk.record_batch().column(1)) as *const () as usize;
         let seen = Arc::new(Mutex::new(0));
         let observed = Arc::clone(&seen);
-        // Existing Project intermediates can retain several genuine holders.
-        // Observe the original Slot identity, not an incidental clone count;
-        // checked_slot_pairs_exact_column_and_original_chunk_authority above
-        // separately proves the lazy first-Slot observation precedes capture.
-        let observer: Arc<SlotSourceObserver> = Arc::new(move |column| {
-            let (array, source) = column.into_parts();
+        // Project intermediates can already retain genuine holders. Check the
+        // identity of the original source and the borrowed array at adaptation.
+        let observer: Arc<InputAdapterObserver> = Arc::new(move |chunk, input| {
+            assert_original_chunk_input(chunk, input);
+            let array = input.batch().column(1);
             assert_eq!(Arc::as_ptr(array) as *const () as usize, expected_array);
-            let BorrowedInputSource::Attached(source) = source else {
-                panic!("production entry lost the Chunk source")
-            };
+            let source = chunk.source_authority();
             assert_eq!(source.owner_identity(), expected_owner);
             assert!(source.strong_counts().0.unwrap() >= 1);
             assert_eq!(source.strong_counts().1, None);
@@ -498,12 +465,7 @@ fn input_source_provider_token_survives_actual_frame_and_last_buffer_alias() {
             &tracker,
         );
     let mut instance = evaluator(&program);
-    let output = evaluate(
-        &mut instance,
-        CompiledInputLoan::from_chunk(&chunk),
-        Selection::all(3),
-    )
-    .unwrap();
+    let output = evaluate(&mut instance, chunk_input(&chunk), Selection::all(3)).unwrap();
     let alias = output.values().to_data().buffers()[0].clone();
     drop((chunk, original, output, instance));
     assert_eq!(tracker.current(), bytes as i64);
@@ -532,14 +494,7 @@ fn input_source_no_authority_single_creator_lifetime_is_not_a_pure_source() {
             .retaining_array_type_storage_observed::<LayoutResourceError>(&creator, |_| Ok(()))
             .unwrap();
         drop(creator);
-        assert!(matches!(
-            CompiledInputLoan::from_chunk(&chunk)
-                .checked_column(1)
-                .unwrap()
-                .into_parts()
-                .1,
-            BorrowedInputSource::NoAttachedAuthority
-        ));
+        assert!(!chunk.source_authority().is_attached());
         let mut instance = if has_host {
             evaluator(&program)
         } else {
@@ -550,11 +505,7 @@ fn input_source_no_authority_single_creator_lifetime_is_not_a_pure_source() {
             )
             .unwrap()
         };
-        let result = evaluate(
-            &mut instance,
-            CompiledInputLoan::from_chunk(&chunk),
-            Selection::all(3),
-        );
+        let result = evaluate(&mut instance, chunk_input(&chunk), Selection::all(3));
         if has_host {
             let result = result.unwrap();
             let alias = result.values().to_data().buffers()[0].clone();
@@ -564,8 +515,7 @@ fn input_source_no_authority_single_creator_lifetime_is_not_a_pure_source() {
             assert_eq!(drops.load(Ordering::SeqCst), 1);
         } else {
             let error = result.unwrap_err();
-            let ExecutionFailureCause::Kernel(KernelFailure::InvalidProgram(message)) =
-                error.cause()
+            let ExprEvaluationFailure::Kernel(KernelFailure::InvalidProgram(message)) = &error
             else {
                 panic!("missing real host must remain nominal: {error:?}")
             };
@@ -608,12 +558,7 @@ fn input_source_additional_buffer_ledger_survives_actual_frame_and_last_alias() 
         "additional extent must not become a whole-batch lease"
     );
     let mut instance = evaluator(&program);
-    let result = evaluate(
-        &mut instance,
-        CompiledInputLoan::from_chunk(&filtered),
-        Selection::all(2),
-    )
-    .unwrap();
+    let result = evaluate(&mut instance, chunk_input(&filtered), Selection::all(2)).unwrap();
     assert_eq!(
         result
             .values()
@@ -648,10 +593,7 @@ fn input_source_genuinely_pure_chunk_and_record_batch_keep_no_host_ability() {
         "this no-host positive fixture must actually have no finite creator hold"
     );
     assert_eq!(requests, 0);
-    for input in [
-        CompiledInputLoan::from_chunk(&chunk),
-        CompiledInputLoan::RecordBatch(chunk.record_batch()),
-    ] {
+    for input in [chunk_input(&chunk), batch_input(chunk.record_batch())] {
         let mut instance = CompiledExpressionInstance::try_new(
             program.unit(site(&program).unit).unwrap().clone(),
             site(&program).root,
@@ -886,7 +828,8 @@ fn fixed_binary_case_roots_preserve_values_and_input_lifetime() {
             chunk.try_transfer_to(&source_tracker).unwrap();
             let source_bytes = source_tracker.current();
             assert!(source_bytes > 0);
-            let actual_owner = chunk.source_authority().owner_identity();
+            assert!(chunk.source_authority().is_attached());
+            let original_storage = std::ptr::from_ref(&chunk).addr();
             let actual_array = chunk.record_batch().column(expression as usize).clone();
             let condition_array = chunk.record_batch().column(2).clone();
             let seen = Arc::new(Mutex::new([0usize; 2]));
@@ -902,10 +845,10 @@ fn fixed_binary_case_roots_preserve_values_and_input_lifetime() {
                     );
                     1
                 };
-                let BorrowedInputSource::Attached(source) = source else {
+                let BorrowedInputSource::Storage(source) = source else {
                     panic!("actual input source must survive")
                 };
-                assert_eq!(source.owner_identity(), actual_owner);
+                assert_eq!(std::ptr::from_ref(source).addr(), original_storage);
                 observed.lock().unwrap()[ordinal] += 1;
             });
             let host_tracker = MemTracker::new_root("fixed-case-result-host");
@@ -937,12 +880,9 @@ fn fixed_binary_case_roots_preserve_values_and_input_lifetime() {
             )
             .unwrap();
             instance.observe_slot_source(observer);
-            let output = evaluate(
-                &mut instance,
-                CompiledInputLoan::from_chunk(&chunk),
-                selection,
-            )
-            .expect("the real whole CASE must prepare and materialize with its exact declaration");
+            let output = evaluate(&mut instance, chunk_input(&chunk), selection).expect(
+                "the real whole CASE must prepare and materialize with its exact declaration",
+            );
             assert!(output.errors().is_empty());
             assert_eq!(output.values().len(), selection.len());
             assert_eq!(
@@ -1023,7 +963,6 @@ fn identity_slot_preserves_required_binding_and_null_parent_carrier() {
     use crate::exec::pipeline::operator::input_construction::{
         ConstructionFailure, try_runtime_input_construction_factory,
     };
-    use crate::runtime::runtime_state::RuntimeErrorState;
     use arrow::array::{ArrayRef, FixedSizeBinaryArray, StructArray};
     use arrow::buffer::NullBuffer;
     use arrow::datatypes::Field;
@@ -1210,13 +1149,10 @@ fn identity_slot_preserves_required_binding_and_null_parent_carrier() {
         let original_owner = chunk.source_authority().owner_identity();
         let seen = Arc::new(Mutex::new(0));
         let observed = seen.clone();
-        let observer: Arc<SlotSourceObserver> = Arc::new(move |column| {
-            let (array, source) = column.into_parts();
-            assert!(Arc::ptr_eq(array, &original_array));
-            let BorrowedInputSource::Attached(source) = source else {
-                panic!("original source loan")
-            };
-            assert_eq!(source.owner_identity(), original_owner);
+        let observer: Arc<InputAdapterObserver> = Arc::new(move |chunk, input| {
+            assert_original_chunk_input(chunk, input);
+            assert!(Arc::ptr_eq(input.batch().column(0), &original_array));
+            assert_eq!(chunk.source_authority().owner_identity(), original_owner);
             *observed.lock().unwrap() += 1;
         });
         let host_tracker = MemTracker::new_root("permissive fixed identity result");
@@ -1241,8 +1177,10 @@ fn identity_slot_preserves_required_binding_and_null_parent_carrier() {
             Some(crate::runtime::tracked_state_allocator::expression_allocation_host(host_tracker)),
         )
         .unwrap();
-        instance.observe_slot_source(observer);
-        let output = evaluate(&mut instance, CompiledInputLoan::from_chunk(&chunk), selection)
+        let mut adapter = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
+        adapter.observe_input_adapter(observer);
+        let input = chunk_evaluation_input(&chunk, &adapter);
+        let output = evaluate(&mut instance, input, selection)
             .unwrap_or_else(|failure| panic!(
                 "legal NULL-parent Slot must materialize: selected={selected:?}, expected={expected:?}, actual={actual_type:?}, fact={:?}, failure={failure:?}",
                 failure.failure_fact(),

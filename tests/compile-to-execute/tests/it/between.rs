@@ -20,9 +20,12 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression::{CompiledExprSet, StaticExprKind};
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
 use novarocks_expression_contract::RootOrdinal;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_sql_testkit::sql_source;
 use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
@@ -141,7 +144,18 @@ fn between_actual_after_nullable_case_sparse_sliced_and_empty_three_valued_outpu
             let selection = Selection::try_sparse(4, &rows).unwrap();
             let mut frame =
                 CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
-            let out = frame.evaluate(&data, selection, &Control).unwrap();
+            let out = frame
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
             assert!(out.errors().is_empty());
             assert_eq!(
                 values(&out),
@@ -179,7 +193,18 @@ fn between_actual_after_upper_error_is_required_even_after_false_lower_and_lower
         );
         let mut frame =
             CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
-        let out = frame.evaluate(&data, Selection::all(3), &Control).unwrap();
+        let out = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         assert_eq!(out.errors().len(), 1);
         assert_eq!(out.errors()[0].selected_ordinal(), 0);
         assert_eq!(out.errors()[0].message(), NEGATE_MIN_ERROR);
@@ -209,7 +234,18 @@ fn between_actual_after_seeded_rand_keeps_two_observable_uses_of_one_operand_def
     }
     let data = batch(&program, site, Arc::new(Int64Array::from(vec![17, 23, 41])));
     let mut frame = CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
-    let out = frame.evaluate(&data, Selection::all(3), &Control).unwrap();
+    let out = frame
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &data,
+                source: None,
+            },
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
     assert_eq!(values(&out), vec![Some(true); 3]);
     assert!(out.errors().is_empty());
 }
@@ -275,19 +311,51 @@ fn between_actual_after_every_constructor_and_phase_callback_seven_causes_no_foo
         let record = Callback::new(usize::MAX, KernelFailure::Cancelled);
         let mut frame =
             CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
-        frame.evaluate(&data, selection, &record).unwrap();
+        frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &record,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         let trace = record.trace.lock().unwrap().clone();
         for stop in 1..=trace.len() {
             for cause in causes() {
                 let mut frame =
                     CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
                 let c = Callback::new(stop, cause.clone());
-                assert!(matches!(frame.evaluate(&data,selection,&c),Err(actual) if actual==cause));
+                let result = frame.evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &c,
+                    &mut PassThroughCallHost,
+                );
+                assert!(
+                    matches!(result, Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
+                );
                 assert_eq!(*c.trace.lock().unwrap(), trace[..stop]);
                 let after = Callback::new(usize::MAX, KernelFailure::Cancelled);
                 assert!(matches!(
-                    frame.evaluate(&data, selection, &after),
-                    Err(KernelFailure::InstanceFailed)
+                    frame.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &data,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &after,
+                        &mut PassThroughCallHost
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                 ));
                 assert!(after.trace.lock().unwrap().is_empty());
             }

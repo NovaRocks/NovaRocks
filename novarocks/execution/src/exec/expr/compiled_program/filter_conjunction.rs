@@ -17,13 +17,10 @@
 //! One ordered Filter/Scan conjunct consumer over the actual original root sites.
 //! The expression evaluator and BooleanRows remain their sole existing authors.
 use super::boolean_region::BooleanRows;
-use super::input_source::CompiledInputLoan;
 use super::*;
-use crate::runtime::task::{ExecutionFailure, ExecutionResult};
-use novarocks_expression::RequiredExpressionRowError;
 use novarocks_type_contract::EvaluationDemand;
 
-pub(crate) struct CompiledFilterConjunctionInstance {
+pub struct CompiledFilterConjunctionInstance {
     roots: Vec<CompiledExpressionInstance>,
     failed: bool,
 }
@@ -61,14 +58,7 @@ fn same_input_scope(
     Ok(true)
 }
 impl CompiledFilterConjunctionInstance {
-    #[cfg(test)]
-    pub(crate) fn try_new(
-        predicates: &[(Arc<CompiledExprSet>, RootOrdinal)],
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<Self, KernelFailure> {
-        Self::try_new_with_allocator(predicates, control, None)
-    }
-    pub(crate) fn try_new_with_allocator(
+    pub fn try_new_with_allocator(
         predicates: &[(Arc<CompiledExprSet>, RootOrdinal)],
         control: &dyn KernelEvaluationControl,
         allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
@@ -78,10 +68,10 @@ impl CompiledFilterConjunctionInstance {
             refused: AtomicBool::new(false),
             operation_aborted: AtomicBool::new(false),
         };
-        let mut work = Work {
+        let mut work: Work<'_, '_> = Work {
             control: &observed,
             pending: 0,
-            scalar_scope: None,
+            scalar_host: None,
         };
         let result = (|| {
             work.control.checkpoint(0)?;
@@ -160,12 +150,12 @@ impl CompiledFilterConjunctionInstance {
             .map(|effects| effects.permits_boolean_reordering())
             .map_err(|_| invalid("Filter root effects differ from their original context"))
     }
-    fn evaluate_once<'a, E: scalar_invocation::FrameFailure>(
+    fn evaluate_once<'a, R>(
         &mut self,
-        input: CompiledInputLoan<'_>,
+        input: FrameInput<'_>,
         selection: Selection<'a>,
-        work: &mut Work<'_, '_>,
-    ) -> Result<(SelectedValues<'a>, Box<[RootOrdinal]>), E> {
+        work: &mut Work<'_, '_, R>,
+    ) -> Result<(SelectedValues<'a>, Box<[RootOrdinal]>), ExprEvaluationFailure<R>> {
         if input.num_rows() != selection.batch_rows() {
             return Err(invalid("Filter selection differs from its actual batch").into());
         }
@@ -187,13 +177,15 @@ impl CompiledFilterConjunctionInstance {
                 if selection.is_empty() {
                     // A zero-row invocation validates the entire original port,
                     // but the existing Frame enters no child/kernel constructor.
-                    let output = root.evaluate_input_controlled::<E>(
+                    let output = root.evaluate_input_controlled::<R>(
                         input,
                         selection,
                         selection,
                         novarocks_functions::ScalarInvocationActivation::ValidateOnly,
                         work.control,
-                        work.scalar_scope.as_mut().map(|scope| &mut **scope as &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope),
+                        work.scalar_host
+                            .as_deref_mut()
+                            .expect("Filter lends its scalar host"),
                     )?;
                     work.flush()?;
                     drop(output);
@@ -213,16 +205,15 @@ impl CompiledFilterConjunctionInstance {
             }
             let actual_selection =
                 Selection::try_sparse_observed(input.num_rows(), &batch_rows, || work.step())?;
-            let output = root.evaluate_input_controlled::<E>(
+            let output = root.evaluate_input_controlled::<R>(
                 input,
                 selection,
                 actual_selection,
                 novarocks_functions::ScalarInvocationActivation::Activated,
                 work.control,
-                work.scalar_scope.as_mut().map(|scope| {
-                    &mut **scope
-                        as &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope
-                }),
+                work.scalar_host
+                    .as_deref_mut()
+                    .expect("Filter lends its scalar host"),
             )?;
             for error in output.errors() {
                 let parent = *remaining.get(error.selected_ordinal()).ok_or_else(|| {
@@ -265,60 +256,14 @@ impl CompiledFilterConjunctionInstance {
     }
     /// Public error publication occurs only after the complete legal region.
     /// It preserves the original predicate site and actual batch-row mapping.
-    #[cfg(test)]
-    pub(crate) fn evaluate_required(
+    pub fn evaluate<R>(
         &mut self,
-        input: &RecordBatch,
+        input: EvaluationInput<'_>,
         selection: Selection<'_>,
         control: &dyn KernelEvaluationControl,
-    ) -> ExecutionResult<ArrayRef> {
-        self.evaluate_required_controlled::<ExecutionFailure>(
-            CompiledInputLoan::RecordBatch(input),
-            selection,
-            control,
-            None,
-        )
-    }
-    #[cfg(test)]
-    pub(crate) fn evaluate_required_runtime(
-        &mut self,
-        input: &RecordBatch,
-        selection: Selection<'_>,
-        control: &dyn KernelEvaluationControl,
-        scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
-    ) -> ExecutionResult<ArrayRef> {
-        self.evaluate_required_input_runtime(
-            CompiledInputLoan::RecordBatch(input),
-            selection,
-            control,
-            scope,
-        )
-    }
-    /// Preserve the original structural input through every predicate's same
-    /// evaluator. A Chunk loan keeps its actual attached source pairing.
-    pub(crate) fn evaluate_required_input_runtime(
-        &mut self,
-        input: CompiledInputLoan<'_>,
-        selection: Selection<'_>,
-        control: &dyn KernelEvaluationControl,
-        scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
-    ) -> ExecutionResult<ArrayRef> {
-        self.evaluate_required_controlled::<ExecutionFailure>(
-            input,
-            selection,
-            control,
-            Some(scope),
-        )
-    }
-    fn evaluate_required_controlled<
-        E: scalar_invocation::FrameFailure + Into<crate::runtime::task::ExecutionFailure>,
-    >(
-        &mut self,
-        input: CompiledInputLoan<'_>,
-        selection: Selection<'_>,
-        control: &dyn KernelEvaluationControl,
-        scope: Option<&mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope>,
-    ) -> ExecutionResult<ArrayRef> {
+        host: &mut dyn ScalarCallHost<Refusal = R>,
+    ) -> Result<ArrayRef, ExprEvaluationFailure<R>> {
+        let input = FrameInput::new(input);
         if self.failed {
             return Err(KernelFailure::InstanceFailed.into());
         }
@@ -330,14 +275,14 @@ impl CompiledFilterConjunctionInstance {
         let mut work = Work {
             control: &observed,
             pending: 0,
-            scalar_scope: scope,
+            scalar_host: Some(host),
         };
         let result = (|| {
             work.control.checkpoint(0)?;
-            self.evaluate_once::<E>(input, selection, &mut work)
+            self.evaluate_once::<R>(input, selection, &mut work)
         })();
-        let result = E::finish(&mut work, result);
-        let result = result.map_err(Into::into).and_then(|(selected, sites)| {
+        let result = work.finish_evaluation(result);
+        let result = result.and_then(|(selected, sites)| {
             let (selection, values, errors) = selected.into_parts();
             if let Some(error) = errors.into_vec().into_iter().next() {
                 let site = *sites

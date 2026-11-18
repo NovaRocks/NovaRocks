@@ -89,7 +89,7 @@ pub(super) fn project(
     original: &novarocks_functions::ConstantValue,
     result: &novarocks_functions::FunctionValueType,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-    work: &mut Work<'_, '_>,
+    work: &mut Work<'_, '_, impl Sized>,
 ) -> Result<Option<(CanonicalConstant, Option<input_source::ArrayContinuation>)>, KernelFailure> {
     work.flush()?;
     let stock = RefCell::new(ConstructionStock::new(allocator)?);

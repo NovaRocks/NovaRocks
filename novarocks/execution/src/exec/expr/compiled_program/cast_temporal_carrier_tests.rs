@@ -19,6 +19,9 @@ use super::cast_timestamp_tests::timestamp_array;
 use super::*;
 use arrow::array::{Date32Array, StringArray};
 use arrow::datatypes::TimeUnit;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 
 #[test]
 fn temporal_cast_actual_compiler_sparse_date_profiles_and_constant_producers() {
@@ -61,7 +64,18 @@ fn temporal_cast_actual_compiler_sparse_date_profiles_and_constant_producers() {
                     )
                     .unwrap();
                     let mut evaluator = instance(&program);
-                    let result = evaluator.evaluate(&batch, selection, &Control).unwrap();
+                    let result = evaluator
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
+                        .unwrap();
                     // Unix-day/calendar facts, independent of either cast path.
                     let expected: ArrayRef = match &target {
                         DataType::Utf8 => Arc::new(StringArray::from(vec![
@@ -112,7 +126,16 @@ fn temporal_cast_actual_compiler_sparse_date_profiles_and_constant_producers() {
                     )
                     .unwrap();
                     let result = instance(&constant)
-                        .evaluate(&batch, selection, &Control)
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
                         .unwrap();
                     // Unix day 71 is 1970-03-13, 6_134_400 seconds after epoch.
                     let expected: ArrayRef = match &target {
@@ -169,7 +192,19 @@ fn temporal_cast_actual_timestamp_date_profiles_skip_unselected_error_and_keep_s
                 .unwrap();
                 let rows = [1, 2, 3, 4];
                 let result = instance(&program)
-                    .evaluate(&batch, Selection::try_sparse(5, &rows).unwrap(), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        {
+                            let selection = Selection::try_sparse(5, &rows).unwrap();
+                            ScalarInvocationScope::new(selection, selection)
+                        },
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap();
                 assert_eq!(
                     result.values().to_data(),
@@ -178,7 +213,16 @@ fn temporal_cast_actual_timestamp_date_profiles_skip_unselected_error_and_keep_s
                 assert!(result.errors().is_empty());
                 if unit == TimeUnit::Second {
                     let result = instance(&program)
-                        .evaluate(&batch, Selection::all(5), &Control)
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &batch,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(Selection::all(5), Selection::all(5)),
+                            ScalarInvocationActivation::Activated,
+                            &Control,
+                            &mut PassThroughCallHost,
+                        )
                         .unwrap();
                     assert_eq!(result.errors().len(), 1);
                     assert_eq!(result.errors()[0].selected_ordinal(), 0);

@@ -27,6 +27,8 @@ use arrow::{
     datatypes::{DataType, Field},
     record_batch::RecordBatch,
 };
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::ProgramNodeKind;
 use novarocks_physical_plan::NodeKind;
@@ -115,11 +117,22 @@ fn scan_ordered_required_compiler_conjunction_preserves_true_only_null_and_bound
         Some(20),
     ])) as ArrayRef;
     let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
-    let mut instance =
-        CompiledFilterConjunctionInstance::try_new(&predicate_units(&program, node), &Control)
-            .unwrap();
+    let mut instance = CompiledFilterConjunctionInstance::try_new_with_allocator(
+        &predicate_units(&program, node),
+        &Control,
+        None,
+    )
+    .unwrap();
     let result = instance
-        .evaluate_required(&batch, Selection::all(6), &Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            Selection::all(6),
+            &Control,
+            &mut PassThroughCallHost,
+        )
         .unwrap();
     let truth = result.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert_eq!(
@@ -253,11 +266,22 @@ fn scan_ordered_required_actual_indexed_roots_and_sparse_empty_slices() {
         (vec![2, 3, 4], vec![Some(true); 3]),
         (Vec::new(), Vec::new()),
     ] {
-        let mut instance =
-            CompiledFilterConjunctionInstance::try_new(&predicate_units(&program, node), &Control)
-                .unwrap();
+        let mut instance = CompiledFilterConjunctionInstance::try_new_with_allocator(
+            &predicate_units(&program, node),
+            &Control,
+            None,
+        )
+        .unwrap();
         let output = instance
-            .evaluate_required(&batch, Selection::try_sparse(6, &rows).unwrap(), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                Selection::try_sparse(6, &rows).unwrap(),
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert_eq!(
             output
@@ -272,16 +296,20 @@ fn scan_ordered_required_actual_indexed_roots_and_sparse_empty_slices() {
 }
 #[test]
 fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
-    use crate::runtime::task::ExecutionFailureCause;
     let (program, node) = prepared_scan();
     let record = Callback::new(usize::MAX, KernelFailure::Cancelled);
-    CompiledFilterConjunctionInstance::try_new(&predicate_units(&program, node), &record).unwrap();
+    CompiledFilterConjunctionInstance::try_new_with_allocator(
+        &predicate_units(&program, node),
+        &record,
+        None,
+    )
+    .unwrap();
     let trace = record.trace.lock().unwrap().clone();
     for stop in 1..=trace.len() {
         for cause in causes() {
             let c = Callback::new(stop, cause.clone());
             assert!(
-                matches!(CompiledFilterConjunctionInstance::try_new(&predicate_units(&program, node),&c),Err(actual) if actual==cause)
+                matches!(CompiledFilterConjunctionInstance::try_new_with_allocator(&predicate_units(&program, node), &c, None,),Err(actual) if actual==cause)
             );
             assert_eq!(*c.trace.lock().unwrap(), trace[..stop]);
         }
@@ -306,11 +334,22 @@ fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
     ] {
         let selection = Selection::try_sparse(513, &rows).unwrap();
         let record = Callback::new(usize::MAX, KernelFailure::Cancelled);
-        let mut instance =
-            CompiledFilterConjunctionInstance::try_new(&predicate_units(&program, node), &Control)
-                .unwrap();
+        let mut instance = CompiledFilterConjunctionInstance::try_new_with_allocator(
+            &predicate_units(&program, node),
+            &Control,
+            None,
+        )
+        .unwrap();
         instance
-            .evaluate_required(&batch, selection, &record)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                selection,
+                &record,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         let trace = record.trace.lock().unwrap().clone();
         if rows.len() == 513 {
@@ -322,22 +361,39 @@ fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
         for stop in 1..=trace.len() {
             for cause in causes() {
                 let c = Callback::new(stop, cause.clone());
-                let mut instance = CompiledFilterConjunctionInstance::try_new(
+                let mut instance = CompiledFilterConjunctionInstance::try_new_with_allocator(
                     &predicate_units(&program, node),
                     &Control,
+                    None,
                 )
                 .unwrap();
                 let failure = instance
-                    .evaluate_required(&batch, selection, &c)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        selection,
+                        &c,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap_err();
-                assert_eq!(failure.cause(), &ExecutionFailureCause::Kernel(cause));
+                assert_eq!(failure, ExprEvaluationFailure::Kernel(cause));
                 assert_eq!(*c.trace.lock().unwrap(), trace[..stop]);
                 let again = instance
-                    .evaluate_required(&batch, selection, &c)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        selection,
+                        &c,
+                        &mut PassThroughCallHost,
+                    )
                     .unwrap_err();
                 assert_eq!(
-                    again.cause(),
-                    &ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
+                    again,
+                    ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
                 );
                 assert_eq!(*c.trace.lock().unwrap(), trace[..stop]);
             }

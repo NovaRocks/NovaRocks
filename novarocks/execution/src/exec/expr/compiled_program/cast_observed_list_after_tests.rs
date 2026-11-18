@@ -18,6 +18,9 @@
 //! Actual compiled List CAST failure/admission witnesses, separate from raw oracles.
 use super::observed_list_cast_profile_tests::{input, target_type};
 use super::*;
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 fn list_batch(program: &LocalProgram, source: ArrayRef) -> RecordBatch {
     let len = source.len();
     RecordBatch::try_new(
@@ -48,24 +51,42 @@ fn observed_list_cast_actual_compiler_every_callback_seven_causes_no_footer_or_r
             let selection = Selection::try_sparse(4, &rows).unwrap();
             let record = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             instance(&program)
-                .evaluate(&data, selection, &record)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &record,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
-            let trace = record.trace.lock().unwrap().clone();
+            let trace = record.trace();
             assert!(trace.iter().all(|n| *n <= 256));
             for stop in 1..=trace.len() {
                 for cause in causes() {
                     let mut frame = instance(&program);
                     let control = CallbackControl::new(cause.clone(), stop);
                     assert!(
-                        matches!(frame.evaluate(&data,selection,&control),Err(actual) if actual==cause)
+                        matches!(frame.evaluate(EvaluationInput::Batch { batch: &data, source: None }, ScalarInvocationScope::new(selection, selection), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual==cause)
                     );
-                    assert_eq!(*control.trace.lock().unwrap(), trace[..stop]);
+                    assert_eq!(control.trace(), trace[..stop]);
                     let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
                     assert!(matches!(
-                        frame.evaluate(&data, selection, &after),
-                        Err(KernelFailure::InstanceFailed)
+                        frame.evaluate(
+                            EvaluationInput::Batch {
+                                batch: &data,
+                                source: None
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &after,
+                            &mut PassThroughCallHost
+                        ),
+                        Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
                     ));
-                    assert!(after.trace.lock().unwrap().is_empty());
+                    assert!(after.trace().is_empty());
                 }
             }
         }
