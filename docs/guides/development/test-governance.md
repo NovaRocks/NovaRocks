@@ -213,7 +213,7 @@ nextest 日常使用原生最低版本要求 **0.9.148**，兼容新版不因自
 
 正式材料不受普通 release/GC 影响，继续遵守上文正式保留/交接规则。运行锁及状态目录只支持经实际 FD 检查的本地 APFS/ext/XFS/Btrfs/tmpfs；容器显式 bind-mount 支持的本地状态目录，overlay/网络/未知文件系统不降级。完整范围、嵌套示例、平台验证缺口和 macOS 按需排查入口见 [test-support README](../../../tests/test-support/README.md)。当前 native Linux x86_64 仍缺本轮生命周期/FD及真实消费者证据，文档和 macOS 定向通过不能替代该平台验收。
 
-Hadoop local fencing 保留普通原生测试，内部 child helper 为 ignored 且只能由父测试 `--ignored --exact` 启动；缺输入失败。MinIO、MySQL、FoundationDB 和 Java interop 继续各自专用入口及真实前置，Paimon 暂停边界保留。Loom/Miri 保留专用工具链与 Tree Borrows 等条件。nextest 全量不自动扩展这些矩阵，也不接管 Docker、外部实例或所有 raw spawn 的生命周期。
+Hadoop local fencing 由父测试按准确名称进入同一个测试程序的子进程分支，子进程使用父测试提供的私有输入。默认 Rust 单测无需另行准备 Server、Docker 或外部服务。MinIO、MySQL 和 FoundationDB 依赖由各自的专项入口准备，Paimon 暂停边界保留。Loom/Miri 保留专用工具链与 Tree Borrows 等条件。nextest 全量不自动扩展这些矩阵，也不接管 Docker、外部实例或所有 raw spawn 的生命周期。
 
 ### 兼容专项的选择
 

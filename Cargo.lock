@@ -3272,7 +3272,6 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
- "novarocks-cluster-harness",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
  "novarocks-failpoint",

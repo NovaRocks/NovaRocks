@@ -15,15 +15,3 @@ serde_json.workspace = true
 [package.metadata.novarocks.test]
 runtime-inputs = ["target/debug/build/novarocks-test-support-*/out/novarocks-test-monitor"]
 env-inputs = []
-ignored = [
-  { filter = "test(=caller_lifetime_helper)", class = "helper", reason = "internal exact helper; the outer test owns and waits this process" },
-  { filter = "test(=caller_drop_full_stderr_helper)", class = "helper", reason = "internal exact helper; the outer test owns and waits this process" },
-  { filter = "test(=retention_process_helper)", class = "helper", reason = "internal helper; the outer test supplies private state and owns its actual Child" },
-  { filter = "test(=retention_native_failure_one)", class = "helper", reason = "internal native lease fixture; requires the retained nextest orchestrator" },
-  { filter = "test(=retention_native_failure_two)", class = "helper", reason = "internal native lease fixture; requires the retained nextest orchestrator" },
-  { filter = "test(=retention_native_failure_three)", class = "helper", reason = "internal native lease fixture; requires the retained nextest orchestrator" },
-  { filter = "test(=retention_native_failure_four)", class = "helper", reason = "internal native lease fixture; requires the retained nextest orchestrator" },
-  { filter = "test(=retention_native_raw_gap)", class = "helper", reason = "internal raw native gap fixture; never establishes a retention pin itself" },
-  { filter = "test(=retention_native_nested_boundary)", class = "helper", reason = "internal native nested boundary fixture; requires actual nextest execution" },
-  { filter = "test(=retention_native_nested_child)", class = "helper", reason = "internal raw nested child; an outer native test owns and waits its actual Child" },
-]
