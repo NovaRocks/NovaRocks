@@ -33,9 +33,10 @@ use arrow::datatypes::DataType;
 use novarocks_connector_contract::ConnectorMutationContributionGroupId;
 
 use crate::connector::distributed_rewrite::ConnectorDistributedRewriteShape;
-use crate::connector::write_stack::prepared::ConnectorPreparedWriteSet;
+use crate::connector::write_stack::prepared::ConnectorWriteProductionProof;
 use crate::connector::write_stack::runtime::{
-    ConnectorWriteBinding, ConnectorWriteCommitSession, ConnectorWriterHandle,
+    ConnectorCommitFragment, ConnectorWriteBinding, ConnectorWriteCommitSession,
+    ConnectorWriterHandle,
 };
 use crate::connector::write_stack::target::{WriteTargetOrdinal, validate_dense_target_ordinals};
 use crate::connector::{
@@ -45,7 +46,8 @@ use crate::connector::{
     ConnectorWriteReceipt, ConnectorWriteRouteId, ConnectorWriteTargetRef,
 };
 use crate::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorError, ConnectorErrorKind, ConnectorPayloadRetentionGuard,
+    ConnectorProviderBindingKey, ConnectorRequestContext,
 };
 use crate::connector::{ConnectorMutationRouteInput, ConnectorWriteFieldToken};
 use crate::connector::{
@@ -995,7 +997,7 @@ impl ConnectorWriteSessionPlan {
         &self.targets
     }
 
-    /// The sealed ordinal set a prepared write set must not exceed.
+    /// The sealed ordinal set that this session's queries may use.
     pub fn expected_targets(&self) -> Vec<WriteTargetOrdinal> {
         self.targets
             .iter()
@@ -1008,14 +1010,48 @@ impl ConnectorWriteSessionPlan {
     }
 }
 
-/// Commit one complete prepared write set.
+/// This query's original physical execution and frozen plan.
+///
+/// The session can receive several queries that use the same write target.
+/// This key associates each arrival and completion with its own query.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConnectorWriteQueryIdentity {
+    execution_query_id: [u8; 16],
+    execution_attempt_id: std::num::NonZeroU64,
+    plan_version_id: [u8; 16],
+}
+
+impl ConnectorWriteQueryIdentity {
+    pub fn try_new(
+        execution_query_id: [u8; 16],
+        execution_attempt_id: u64,
+        plan_version_id: [u8; 16],
+    ) -> Result<Self, ConnectorError> {
+        let execution_attempt_id = std::num::NonZeroU64::new(execution_attempt_id)
+            .filter(|_| execution_query_id != [0; 16] && plan_version_id != [0; 16])
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector write query identity must name a nonzero execution and plan version",
+                )
+            })?;
+        Ok(Self {
+            execution_query_id,
+            execution_attempt_id,
+            plan_version_id,
+        })
+    }
+}
+
+/// Publish one write session after its queries completed receiving.
 ///
 /// The commit session is borrowed, never moved: a frontend session keeps it for
 /// a possible abort or reconcile, and nothing else in the process can take
 /// ownership of it.
 pub struct ConnectorWriteFinishRequest<'a> {
     pub commit: &'a ConnectorWriteCommitSession,
-    pub prepared: ConnectorPreparedWriteSet,
+    /// Checked total accepted by the original write roots.
+    pub row_count: u64,
     pub statistics: Vec<WriteStatisticsArtifact>,
     pub publication: ConnectorWriteFinishPublication,
     pub context: ConnectorRequestContext,
@@ -1025,7 +1061,7 @@ pub struct ConnectorWriteFinishRequest<'a> {
 /// Provider future cannot destroy the caller's admitted input or authority.
 pub struct ConnectorWriteFinishRequestRef<'a> {
     pub commit: &'a ConnectorWriteCommitSession,
-    pub prepared: &'a ConnectorPreparedWriteSet,
+    pub row_count: u64,
     pub statistics: &'a [WriteStatisticsArtifact],
     pub publication: &'a ConnectorWriteFinishPublication,
     pub context: &'a ConnectorRequestContext,
@@ -1042,10 +1078,6 @@ pub enum ConnectorWriteFinishPublication {
     KeyedDocuments(crate::connector::KeyedPublicationIntent),
 }
 
-/// Release a begin session that never reached a complete prepared write set.
-///
-/// This is a known-uncommitted path: it may clean up provider-side staging, and
-/// it must never report a commit it did not observe.
 /// Original writer-production evidence, not an object-deletion capability.
 /// Only the frontend's stable Session can prove that no production was ever
 /// registered and that its complete received inventory is still empty.
@@ -1053,19 +1085,17 @@ pub enum ConnectorWriteFinishPublication {
 pub enum ConnectorWriteAbortProduction {
     NotStarted,
     /// The original Session accepted every exact End on its own production
-    /// origin. This is not granted by constructing a prepared set: the caller
-    /// must retain the original received union and its provider binding.
+    /// origin. Cleanup also requires the provider's exact receiving state
+    /// and a known-uncommitted decision.
     CompleteReceived,
     Unproven,
 }
 
+/// Abort using the provider's original receiving state and production evidence.
 pub struct ConnectorWriteSessionAbortRequest<'a> {
     pub commit: &'a ConnectorWriteCommitSession,
     pub context: ConnectorRequestContext,
     pub production: ConnectorWriteAbortProduction,
-    /// Borrow only the original stable, complete received union. The Provider
-    /// additionally checks its own known-uncommitted state and exact binding.
-    pub received: Option<&'a ConnectorPreparedWriteSet>,
 }
 
 /// Resolve a commit whose external outcome is unknown.
@@ -1078,7 +1108,7 @@ pub struct ConnectorWriteSessionReconcileRequest<'a> {
 /// The frontend-only external write authority of one exact provider
 /// generation.
 ///
-/// Admission and prepared-result projection read exact provider facts; terminal
+/// Admission and received-result projection read exact provider facts; terminal
 /// methods own external catalog effects. None is reachable from a backend role
 /// binding.
 pub trait ConnectorWriteControl: Send + Sync {
@@ -1232,25 +1262,55 @@ pub trait ConnectorWriteControl: Send + Sync {
         request: ConnectorWriteBeginRequest,
     ) -> Result<ConnectorWriteSessionPlan, ConnectorError>;
 
-    /// Interpret every commit fragment and perform exactly one external commit.
+    /// Register the frozen targets and optional writer cohort proof before
+    /// the query produces any commit fragments.
+    fn begin_write_query(
+        &self,
+        commit: &ConnectorWriteCommitSession,
+        query: &ConnectorWriteQueryIdentity,
+        targets: &[WriteTargetOrdinal],
+        production: Option<Arc<dyn ConnectorWriteProductionProof>>,
+    ) -> Result<(), ConnectorError>;
+
+    /// Admit one complete root record on the caller's bounded CPU owner.
+    ///
+    /// On success the provider owns the entire record's decoded fragments.
+    /// This call performs no I/O. Any additional retention uses the same
+    /// author that paid for decoding.
+    fn arrive_write_fragments(
+        &self,
+        commit: &ConnectorWriteCommitSession,
+        query: &ConnectorWriteQueryIdentity,
+        fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
+        author: &ConnectorPayloadRetentionGuard,
+    ) -> Result<(), ConnectorError>;
+
+    /// Confirm the query passed the original root, task, and cancellation
+    /// barrier. Receiving all fragments alone does not grant publication.
+    fn confirm_write_received(
+        &self,
+        commit: &ConnectorWriteCommitSession,
+        query: &ConnectorWriteQueryIdentity,
+    ) -> Result<(), ConnectorError>;
+
+    /// Publish the completed write session.
     fn finish_write(
         &self,
         request: ConnectorWriteFinishRequest<'_>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError>;
 
-    /// Project a complete prepared write's exact visible-row change against
+    /// Project the received write's exact visible-row change against
     /// this session's admitted version, without committing or reading data.
     /// None means the provider cannot establish that logical fact; physical
     /// file record totals and writer input counts are not substitutes.
-    fn prepared_logical_row_change(
+    fn received_logical_row_change(
         &self,
         _commit: &ConnectorWriteCommitSession,
-        _prepared: &ConnectorPreparedWriteSet,
         _context: &ConnectorRequestContext,
     ) -> Result<Option<super::prepared::ConnectorWriteRowChange>, ConnectorError> {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
-            "connector does not project prepared logical row changes",
+            "connector does not project received logical row changes",
         ))
     }
 

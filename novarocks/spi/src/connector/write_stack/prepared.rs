@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The bounded, complete result of one distributed write's data plane.
-//!
-//! A prepared write set is complete or it does not exist. There is no partial
-//! set, no truncation, no spill, and no "commit what arrived": the frontend may
-//! call the provider's finish only with a set that the execution graph closed.
+//! Shared validation and row-count facts for a distributed write's results.
 //!
 use crate::connector::write_stack::runtime::ConnectorCommitFragment;
 use crate::connector::write_stack::target::WriteTargetOrdinal;
@@ -83,8 +79,9 @@ impl WriteRowCountAccumulator {
     }
 }
 
-/// Read-only membership in the original writer cohort after receiving its
-/// complete result. A receipt still has to prove its own creation identity.
+/// Read-only membership in the query's registered writer cohort. A receipt
+/// still needs its own creation identity and the query must separately
+/// confirm complete receiving before publication.
 pub trait ConnectorWriteProductionProof: Send + Sync {
     fn admits(
         &self,
@@ -93,106 +90,30 @@ pub trait ConnectorWriteProductionProof: Send + Sync {
     ) -> Result<bool, ConnectorError>;
 }
 
-/// The complete, immutable set the frontend hands to a provider's finish.
-pub struct ConnectorPreparedWriteSet {
-    row_count: u64,
-    fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
-    production: Option<std::sync::Arc<dyn ConnectorWriteProductionProof>>,
-}
-
-impl std::fmt::Debug for ConnectorPreparedWriteSet {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ConnectorPreparedWriteSet")
-            .field("row_count", &self.row_count)
-            .field("fragments", &self.fragments)
-            .field("has_production", &self.production.is_some())
-            .finish()
+/// Validate every fragment against the query's frozen target set.
+///
+/// A query can use a sparse subset of its session's dense target set. This
+/// check borrows the original fragments so a refusal leaves caller custody
+/// unchanged.
+pub fn validate_write_fragment_targets(
+    fragments: &[(WriteTargetOrdinal, ConnectorCommitFragment)],
+    expected_targets: &[WriteTargetOrdinal],
+) -> Result<(), ConnectorError> {
+    crate::connector::write_stack::target::validate_query_target_ordinals(expected_targets)?;
+    let expected = expected_targets
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if fragments
+        .iter()
+        .any(|(target, _)| !expected.contains(target))
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector commit fragment names a write target outside the sealed set",
+        ));
     }
-}
-
-impl ConnectorPreparedWriteSet {
-    /// Build a prepared set from an already-complete aggregation.
-    ///
-    /// `expected_targets` is the target set this set is allowed to name. A
-    /// fragment naming anything outside it means the plan and the session
-    /// disagree, so it fails closed rather than committing a partial or foreign
-    /// artifact.
-    ///
-    /// The expected set is checked for cardinality and duplicates, not for
-    /// denseness from zero. Denseness belongs to the *session's* sealed set
-    /// (`ConnectorWriteSessionPlan::try_new`), and restating it here would
-    /// refuse a legitimate single-query set when query `k` names only target `k`.
-    /// Membership is therefore an exact set test rather than a comparison
-    /// against the highest ordinal.
-    pub fn try_new(
-        row_count: u64,
-        mut fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
-        expected_targets: &[WriteTargetOrdinal],
-    ) -> Result<Self, ConnectorError> {
-        Self::try_new_in(row_count, &mut fragments, expected_targets)
-    }
-
-    /// Validate every original fragment before moving its unique inventory.
-    /// A refusal leaves the caller's receiving slot unchanged.
-    pub fn try_new_in(
-        row_count: u64,
-        fragments: &mut Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
-        expected_targets: &[WriteTargetOrdinal],
-    ) -> Result<Self, ConnectorError> {
-        crate::connector::write_stack::target::validate_query_target_ordinals(expected_targets)?;
-        let expected = expected_targets
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        for (target, _) in fragments.iter() {
-            if !expected.contains(target) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "connector commit fragment names a write target outside the sealed set",
-                ));
-            }
-        }
-        Ok(Self {
-            row_count,
-            fragments: std::mem::take(fragments),
-            production: None,
-        })
-    }
-
-    /// The checked total of rows every writer accepted. It becomes the SQL
-    /// statement's affected row count only after external commit is known to
-    /// have succeeded.
-    pub const fn row_count(&self) -> u64 {
-        self.row_count
-    }
-
-    pub fn with_received_production(
-        mut self,
-        proof: std::sync::Arc<dyn ConnectorWriteProductionProof>,
-    ) -> Self {
-        self.production = Some(proof);
-        self
-    }
-
-    pub fn admits_creation(
-        &self,
-        target: WriteTargetOrdinal,
-        physical: &super::ConnectorWriterPhysicalContext,
-    ) -> Result<bool, ConnectorError> {
-        match &self.production {
-            Some(production) => production.admits(target, physical),
-            None => Ok(false),
-        }
-    }
-
-    pub fn fragments(&self) -> &[(WriteTargetOrdinal, ConnectorCommitFragment)] {
-        &self.fragments
-    }
-
-    pub fn into_fragments(self) -> Vec<(WriteTargetOrdinal, ConnectorCommitFragment)> {
-        self.fragments
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -265,42 +186,6 @@ mod tests {
             .is_err()
         );
     }
-    use crate::connector::write_stack::runtime::{ConnectorWriteBinding, OpaqueWritePayload};
-    use crate::connector::{
-        CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorProviderId,
-    };
-
-    fn binding() -> ConnectorWriteBinding {
-        let instance_id = ConnectorInstanceId::parse("prepared_unit").expect("instance id");
-        ConnectorWriteBinding::new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("fake").expect("provider id"),
-                instance_id: instance_id.clone(),
-            },
-            CatalogHandle::new(instance_id, CatalogVersion::from_bytes([3; 32])),
-        )
-    }
-
-    /// `count` decoded fragments all naming `target`, as a completed
-    /// aggregation would hand them to the frontend.
-    fn fragments(
-        target: WriteTargetOrdinal,
-        count: usize,
-    ) -> Vec<(WriteTargetOrdinal, ConnectorCommitFragment)> {
-        let binding = binding();
-        (0..count)
-            .map(|_| {
-                (
-                    target,
-                    ConnectorCommitFragment::from_parts(
-                        binding.clone(),
-                        OpaqueWritePayload::new(()),
-                    ),
-                )
-            })
-            .collect()
-    }
 
     #[test]
     fn row_count_overflow_is_a_contract_error_not_a_saturating_counter() {
@@ -311,30 +196,5 @@ mod tests {
             ConnectorErrorKind::ResourceExhausted
         );
         assert_eq!(rows.get(), u64::MAX);
-    }
-
-    #[test]
-    fn prepared_set_rejects_a_fragment_outside_the_sealed_target_set() {
-        let targets = [WriteTargetOrdinal::try_new(0).expect("bounded")];
-        assert!(ConnectorPreparedWriteSet::try_new(0, Vec::new(), &targets).is_ok());
-        assert!(ConnectorPreparedWriteSet::try_new(0, Vec::new(), &[]).is_err());
-    }
-
-    /// One query within a sealed session names exactly its own target,
-    /// which is not target zero. That set is a query fact, not a session one,
-    /// so it must be accepted here.
-    #[test]
-    fn prepared_set_accepts_a_single_target_query_set_at_a_non_zero_ordinal() {
-        let targets = [WriteTargetOrdinal::try_new(2).expect("bounded")];
-        assert!(ConnectorPreparedWriteSet::try_new(0, Vec::new(), &targets).is_ok());
-    }
-
-    #[test]
-    fn prepared_set_accepts_more_than_16384_fragments_for_its_exact_target() {
-        let target = WriteTargetOrdinal::try_new(0).expect("bounded");
-        let count = 16_385;
-        let prepared = ConnectorPreparedWriteSet::try_new(0, fragments(target, count), &[target])
-            .expect("complete set for the expected target");
-        assert_eq!(prepared.fragments().len(), count);
     }
 }
