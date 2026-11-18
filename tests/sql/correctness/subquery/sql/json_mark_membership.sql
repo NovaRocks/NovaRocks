@@ -39,7 +39,7 @@ SELECT MAX(id) AS hi FROM json_mark_probe HAVING FALSE OR parse_json(CAST(MAX(id
 -- @expect_error=[sql.analyze.unsupported_query_shape]
 SELECT id FROM json_mark_probe WHERE parse_json(txt) IN (SELECT parse_json(txt) FROM json_mark_rhs);
 -- @expect_error=[sql.analyze.unsupported_query_shape]
-SELECT id FROM json_mark_probe WHERE NOT(parse_json(txt) IN (SELECT parse_json(txt) FROM json_mark_rhs));
+SELECT id FROM json_mark_probe WHERE NOT parse_json(txt) IN (SELECT parse_json(txt) FROM json_mark_rhs);
 -- @expect_error=[sql.analyze.unsupported_query_shape]
 SELECT id FROM json_mark_probe WHERE CASE WHEN parse_json(txt) IN (SELECT parse_json(txt) FROM json_mark_rhs) THEN TRUE ELSE FALSE END;
 -- @expect_error=[sql.analyze.unsupported_query_shape]
