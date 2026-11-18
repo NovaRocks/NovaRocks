@@ -111,7 +111,7 @@ REFRESH MATERIALIZED VIEW or_mv WITH SYNC MODE;
 SELECT lo_orderkey, lo_linenumber, lo_quantity FROM lineorder WHERE lo_orderkey > 10003 OR lo_linenumber < 2;
 
 -- query 10
-SELECT lo_orderkey, lo_linenumber, COUNT(*) AS c
+SELECT lo_orderkey, lo_linenumber, COUNT() AS c
 FROM lineorder WHERE lo_orderkey > 10003 OR lo_linenumber < 2
 GROUP BY lo_orderkey, lo_linenumber ORDER BY lo_orderkey, lo_linenumber;
 
@@ -128,7 +128,7 @@ SELECT lo_orderkey, lo_linenumber FROM lineorder WHERE lo_linenumber < 2 OR lo_o
 SELECT lo_orderkey, lo_quantity FROM lineorder WHERE (lo_orderkey > 10003 OR lo_linenumber < 2) AND lo_quantity >= 30;
 
 -- query 13
-SELECT lo_orderkey, COUNT(*) AS c
+SELECT lo_orderkey, COUNT() AS c
 FROM lineorder WHERE (lo_orderkey > 10003 OR lo_linenumber < 2) AND lo_quantity >= 30
 GROUP BY lo_orderkey ORDER BY lo_orderkey;
 
@@ -139,7 +139,7 @@ GROUP BY lo_orderkey ORDER BY lo_orderkey;
 SELECT lo_orderkey FROM lineorder WHERE lo_orderkey > 10004;
 
 -- query 15
-SELECT lo_orderkey, COUNT(*) AS c FROM lineorder WHERE lo_orderkey > 10004 GROUP BY lo_orderkey ORDER BY lo_orderkey;
+SELECT lo_orderkey, COUNT() AS c FROM lineorder WHERE lo_orderkey > 10004 GROUP BY lo_orderkey ORDER BY lo_orderkey;
 
 -- query 16
 -- single-arm query (the other disjunct alone) is also only implied -> miss
@@ -174,7 +174,7 @@ SELECT lo_orderkey, lo_linenumber FROM lineorder
 WHERE (lo_orderkey > 10003 OR lo_linenumber > 2) AND (lo_orderkey < 10006 OR lo_linenumber < 1);
 
 -- query 21
-SELECT lo_orderkey, lo_linenumber, COUNT(*) AS c FROM lineorder
+SELECT lo_orderkey, lo_linenumber, COUNT() AS c FROM lineorder
 WHERE (lo_orderkey > 10003 OR lo_linenumber > 2) AND (lo_orderkey < 10006 OR lo_linenumber < 1)
 GROUP BY lo_orderkey, lo_linenumber ORDER BY lo_orderkey, lo_linenumber;
 

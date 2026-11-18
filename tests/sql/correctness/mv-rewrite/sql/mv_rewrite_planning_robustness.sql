@@ -110,8 +110,8 @@ dairy_buyers AS (
   SELECT DISTINCT customer_id FROM sales_data WHERE category_l1 = 'Dairy'
 )
 SELECT
-  (SELECT COUNT(*) FROM dairy_buyers) AS dairy_cnt,
-  (SELECT COUNT(*) FROM snack_buyers) AS snack_cnt;
+  (SELECT COUNT() FROM dairy_buyers) AS dairy_cnt,
+  (SELECT COUNT() FROM snack_buyers) AS snack_cnt;
 
 -- query 11
 -- APPROX_COUNT_DISTINCT over the base with the candidate present
@@ -119,7 +119,7 @@ SELECT APPROX_COUNT_DISTINCT(customer_id) AS acd FROM sales_data;
 
 -- query 12
 -- self-join: each branch may rewrite independently; result must be exact
-SELECT a.category_l1, COUNT(*) AS c
+SELECT a.category_l1, COUNT() AS c
 FROM sales_data a
 JOIN sales_data b ON a.order_id = b.order_id
 GROUP BY a.category_l1 ORDER BY a.category_l1;
