@@ -25,7 +25,7 @@ CREATE TABLE weighted_cdf_control (v DOUBLE, w BIGINT) TBLPROPERTIES ("format-ve
 INSERT INTO weighted_cdf_control VALUES (2,1),(3,2),(4,3),(NULL,100),(100,NULL),(200,0),(999,0);
 
 -- query 2
-SELECT COUNT(*) AS rows_seen, COUNT(v) AS values_seen, COUNT(w) AS weights_seen FROM weighted_cdf_control;
+SELECT COUNT() AS rows_seen, COUNT(v) AS values_seen, COUNT(w) AS weights_seen FROM weighted_cdf_control;
 
 -- query 3
 SELECT percentile_approx_weighted(v,w,0.5,10000) AS p FROM weighted_cdf_control;

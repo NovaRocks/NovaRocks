@@ -24,7 +24,7 @@
 -- 1. Build two identical NaN rows via constant SELECTs.
 -- 2. Apply UNION DISTINCT.
 -- 3. Assert only one distinct row remains.
-SELECT COUNT(*) AS distinct_nan_count
+SELECT COUNT() AS distinct_nan_count
 FROM (
     SELECT CAST('NaN' AS DOUBLE) AS v
     UNION
