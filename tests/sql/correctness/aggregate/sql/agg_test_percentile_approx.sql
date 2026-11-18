@@ -145,4 +145,4 @@ insert into t1_convert_to_serialize_format values(1,2,3),(4,5,6),(7,8,9);
 
 -- query 25
 USE ${case_db};
-select  percentile_approx(v2, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';
+select  percentile_approx(v2, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format CROSS JOIN t1_convert_to_serialize_format group by 'a';
