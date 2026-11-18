@@ -24,16 +24,15 @@ use novarocks_connector_contract::{
     PureProviderManifestEntry, PureProviderProgramCatalog, PureProviderProgramDefinition,
 };
 use novarocks_execution::exec::pipeline::executor::run_compiled_write_layout_component_for_test;
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_local_compiler::{compile_fragment, validate_fragment_providers};
-use novarocks_local_program::{
-    DataStreamPartitionType, ProgramNodeKind, StaticExprKind, StaticSinkProgram,
-};
+use novarocks_local_program::{DataStreamPartitionType, ProgramNodeKind, StaticSinkProgram};
 use novarocks_physical_plan::*;
 use novarocks_test_compile_to_execute::compiler_results::compile_options;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    PureCompileControl, SemanticParameters,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, PureCompileControl,
+    SemanticParameters,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -102,14 +101,29 @@ fn sender_package() -> FragmentPackage {
                     ordinal: source.ordinal(),
                 };
                 constants.insert(pool, source.pool().clone()).unwrap();
-                builder
-                    .add_expression(values, ty.clone(), ExprKind::Constant(reference))
+                let draft = builder.unit(values).unwrap();
+                let definition = draft
+                    .add(None, ty.clone(), ExprKind::Constant(reference))
+                    .unwrap();
+                draft
+                    .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
                     .unwrap()
             })) as Box<[_]>
         })
         .collect();
     builder.add_values(values, rows, Box::new(columns)).unwrap();
 
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    let ports = builder.node_ports(values).unwrap();
+    let unit = builder
+        .take_unit_builder(values)
+        .unwrap()
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    builder.install_unit(values, Arc::new(unit)).unwrap();
+    work.finish().unwrap();
     let root = builder.reserve_node_id().unwrap();
     let key = builder
         .add_value(
@@ -145,42 +159,6 @@ fn sender_package() -> FragmentPackage {
         .unwrap();
 
     let control = &Control;
-    let roots = PhysicalExpressionRoots::try_new(&fragment, control).unwrap();
-    let domain = EvaluationRegionId::new(0);
-    let mut invocations = Vec::new();
-    let bindings = roots
-        .sites()
-        .iter()
-        .enumerate()
-        .map(|(index, (&site, root))| {
-            let use_id = ExpressionUseId::new(index as u32);
-            invocations.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    region: domain,
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (site, use_id)
-        })
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        control,
-    )
-    .unwrap();
-    let expression_uses = PhysicalRootUses::try_new(&fragment, flow, bindings, control).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], control).unwrap();
     let pruning = FrozenFragmentPruning::try_new(source_id, vec![], control).unwrap();
 
     let projected = columns.map(|value| CutValue {
@@ -267,8 +245,7 @@ fn sender_package() -> FragmentPackage {
             version: PlanVersionId::try_new([11; 16]).unwrap(),
             required: RequiredContracts::default(),
             fragment,
-            expression_uses,
-            calls,
+            statement_constant_policy: compile_options().constants,
             pruning,
             cuts,
             result: None,
@@ -326,7 +303,7 @@ fn compiled_write_layout_sends_exact_keys_beside_the_logical_write_inputs() {
     let ProgramNodeKind::WriteLayoutKey { output_key, .. } = root.kind() else {
         panic!("expected a compiled layout root");
     };
-    let Some(StaticSinkProgram::DataStream { branch, arena }) = program.graph().sink() else {
+    let Some(StaticSinkProgram::DataStream { branch }) = program.graph().sink() else {
         panic!("expected one stream branch");
     };
     let [partition] = branch.partition_exprs() else {
@@ -336,10 +313,18 @@ fn compiled_write_layout_sends_exact_keys_beside_the_logical_write_inputs() {
         branch.partition_type(),
         DataStreamPartitionType::HashPartitioned
     );
+    let unit = program.unit(partition.unit).unwrap();
+    let key = unit.root(partition.root).unwrap();
     assert!(matches!(
-        arena.nodes()[partition.index()].kind(),
-        StaticExprKind::SlotId(slot) if slot == output_key
+        unit.definitions().node(key.definition).unwrap().kind(),
+        StaticExprKind::Input
     ));
+    let binding = unit.input(key.use_id).expect("actual routing key input");
+    assert_eq!(binding.scope, key.scope);
+    assert_eq!(
+        &root.output_layout().slots()[binding.ordinal as usize],
+        output_key
+    );
     assert_eq!(branch.output_columns(), root.output_layout().slots());
     assert_eq!(branch.output_columns().last(), Some(output_key));
 

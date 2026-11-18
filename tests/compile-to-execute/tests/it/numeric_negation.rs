@@ -80,8 +80,12 @@ mod scalar {
             let programs = programs(&source);
             let (program, root) = producer_root(&programs);
             let data = batch(&program, root, input.clone());
-            let mut frame =
-                CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
+            let mut frame = CompiledExpressionInstance::try_new(
+                program.unit(root.unit).unwrap().clone(),
+                root.root,
+                &Control,
+            )
+            .unwrap();
             let selected = frame.evaluate(&data, Selection::all(2), &Control).unwrap();
             assert_eq!(selected.errors().len(), 1);
             assert_eq!(selected.errors()[0].selected_ordinal(), 0);
@@ -122,7 +126,12 @@ mod scalar {
             let programs = programs(&source);
             let (program, root) = producer_root(&programs);
             let data = batch(&program, root, Arc::new(Int8Array::from(vec![i8::MIN, 1])));
-            let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
+            let mut frame = CompiledExpressionInstance::try_new(
+                program.unit(root.unit).unwrap().clone(),
+                root.root,
+                &Control,
+            )
+            .unwrap();
             let out = frame.evaluate(&data, Selection::all(2), &Control).unwrap();
             if sql.contains("IF(") {
                 assert!(out.errors().is_empty(), "inactive MIN is not evaluated");
@@ -168,8 +177,12 @@ mod scalar {
         );
         let rows = [1];
         let selection = Selection::try_sparse(2, &rows).unwrap();
-        let mut successful =
-            CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
+        let mut successful = CompiledExpressionInstance::try_new(
+            program.unit(root.unit).unwrap().clone(),
+            root.root,
+            &Control,
+        )
+        .unwrap();
         assert!(
             successful
                 .evaluate(&data, selection, &Control)
@@ -201,8 +214,12 @@ mod scalar {
             }
         }
         let success = Trace::default();
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(root.unit).unwrap().clone(),
+            root.root,
+            &Control,
+        )
+        .unwrap();
         frame.evaluate(&data, selection, &success).unwrap();
         let trace = success.events.into_inner().unwrap();
         for at in 0..trace.len() {
@@ -219,8 +236,12 @@ mod scalar {
                     events: Mutex::new(Vec::new()),
                     refusal: Some((at, cause.clone())),
                 };
-                let mut frame =
-                    CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
+                let mut frame = CompiledExpressionInstance::try_new(
+                    program.unit(root.unit).unwrap().clone(),
+                    root.root,
+                    &Control,
+                )
+                .unwrap();
                 assert_eq!(
                     frame.evaluate(&data, selection, &control).unwrap_err(),
                     cause
@@ -238,8 +259,7 @@ mod scalar {
 mod ordered {
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::{
-        FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
-        StaticFunctionArgument,
+        FunctionArgumentType, NodeKind, PhysicalCallSite, StaticFunctionArgument,
     };
     use novarocks_sql_testkit::installed_builtin_owner_catalogue;
     use novarocks_sql_testkit::sql_source_with_semantics;
@@ -264,10 +284,7 @@ mod ordered {
                         node: node.id,
                         call: u32::try_from(ordinal).unwrap(),
                     };
-                    let request = fragment
-                        .call_requests()
-                        .get(PhysicalCallDefinition::Relational(site))
-                        .unwrap();
+                    let request = fragment.call_requests().get(site).unwrap();
                     let logical = request.logical_argument_count;
                     assert_eq!(
                         request.arguments.len() - logical,
@@ -299,8 +316,7 @@ mod ordered {
                         assert_eq!(call.order_by.len(), 1);
                         assert_eq!(
                             fragment
-                                .expressions()
-                                .get(call.order_by[0].expr)
+                                .root_expression(node.id, call.order_by[0].expr)
                                 .unwrap()
                                 .ty,
                             value_type.clone()

@@ -769,11 +769,11 @@ pub(super) fn compiled_fragment(
 ) -> proto::FrozenFragment {
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field};
+    use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
     use novarocks_functions::{ConstantPool, FunctionValueType};
     use novarocks_physical_plan::*;
     use novarocks_type_contract::{
-        CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
-        ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
+        CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand,
         PureCompileControl, SemanticParameters,
     };
     use prost::Message;
@@ -861,7 +861,7 @@ pub(super) fn compiled_fragment(
                 },
             })
             .expect("values output");
-        let mut cells: Vec<Box<[ExprId]>> = Vec::new();
+        let mut cells: Vec<Box<[RootOrdinal]>> = Vec::new();
         if !rows.is_empty() {
             let array = Int64Array::from(rows.to_vec());
             let source = ConstantPool::try_new(
@@ -878,8 +878,10 @@ pub(super) fn compiled_fragment(
                 .expect("constant pool");
             for ordinal in 0..rows.len() {
                 let expression = builder
-                    .add_expression(
-                        root,
+                    .unit(root)
+                    .unwrap()
+                    .add(
+                        None,
                         ty.clone(),
                         ExprKind::Constant(ConstantReference {
                             pool: ConstantPoolId::new(0),
@@ -887,12 +889,30 @@ pub(super) fn compiled_fragment(
                         }),
                     )
                     .expect("constant expression");
-                cells.push(Box::from([expression]));
+                let ordinal = builder
+                    .unit(root)
+                    .unwrap()
+                    .root(expression, EvaluationDemand::Value, RootScope::AllPorts)
+                    .unwrap();
+                cells.push(Box::from([ordinal]));
             }
         }
         builder
             .add_values(root, cells.into_boxed_slice(), Box::from([value]))
             .expect("values node");
+        if !rows.is_empty() {
+            let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+            let ports = builder.node_ports(root).unwrap();
+            let unit = builder
+                .take_unit_builder(root)
+                .unwrap()
+                .seal(ports, &mut work)
+                .unwrap()
+                .finish(BTreeMap::new(), &mut work)
+                .unwrap();
+            builder.install_unit(root, Arc::new(unit)).unwrap();
+            work.finish().unwrap();
+        }
     }
     let sink = match sink {
         RawSink::CountOnly => FragmentSink::RootResult(Box::new(
@@ -981,39 +1001,6 @@ pub(super) fn compiled_fragment(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .expect("checked fragment");
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).expect("expression roots");
-    let domain = EvaluationRegionId::new(0);
-    let mut invocations = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, expression)) in roots.sites().iter().enumerate() {
-        let use_id = ExpressionUseId::new(ordinal as u32);
-        invocations.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id,
-                region: domain,
-                demand: expression.demand,
-            },
-            definition: expression.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, use_id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .expect("expression control");
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).expect("root uses");
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).expect("call-free table");
     let result = matches!(
         fragment.sink(),
         FragmentSink::Result | FragmentSink::RootResult(_)
@@ -1039,8 +1026,8 @@ pub(super) fn compiled_fragment(
             pruning: FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control)
                 .expect("empty pruning"),
             fragment,
-            expression_uses: uses,
-            calls,
+            statement_constant_policy:
+                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
             cuts,
             result,
             parameters: SemanticParameters::try_new([]).expect("parameters"),

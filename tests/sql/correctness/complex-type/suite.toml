@@ -40,6 +40,8 @@ paths = [
     "novarocks/local-compiler/src/array_projection.rs",
     "novarocks/execution/src/exec/expr/compiled_program.rs",
     "novarocks/execution/src/exec/expr/compiled_program/**",
+    "novarocks/expression-contract/**",
+    "novarocks/expression/**",
     "novarocks/execution/src/exec/operators/compiled_expression.rs",
     "novarocks/local-compiler/src/expressions.rs",
     "novarocks/functions/src/lib.rs",

@@ -21,14 +21,13 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{
     KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, Selection,
 };
 use novarocks_local_compiler::compile_fragment;
-use novarocks_local_program::{
-    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind,
-};
-use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition, StaticFunctionArgument};
+use novarocks_local_program::ProgramNodeKind;
+use novarocks_physical_plan::StaticFunctionArgument;
 use novarocks_plan_codec::{
     physical_package_v2::{
         decode_fragment_package, encode_fragment_package,
@@ -36,7 +35,7 @@ use novarocks_plan_codec::{
     },
     resource_preflight_v2::FragmentDecodeResourceModel,
 };
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, author_fragment_package_semantics};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_sql_testkit::installed_builtin_owner_catalogue;
 use novarocks_sql_testkit::sql_source_with_declared_fields;
 use novarocks_test_compile_to_execute::compiler_results::{compile_options, validate_package};
@@ -69,21 +68,20 @@ fn source_packages(
     policy: novarocks_functions::ConstantPolicy,
 ) -> BTreeMap<novarocks_physical_plan::FragmentId, Arc<novarocks_physical_plan::FragmentPackage>> {
     use novarocks_physical_plan::{
-        FragmentPackageAdmission, PlanLimits, PropertyProofProjectionLimits,
+        FragmentPackageAdmission, FrozenFragmentPruning, PlanLimits, PropertyProofProjectionLimits,
         extract_fragment_packages,
     };
-    let semantics = author_fragment_package_semantics(source, policy, &Control).unwrap();
-    let uses = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.expression_uses.clone()))
-        .collect();
-    let calls = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.calls.clone()))
-        .collect();
-    let pruning = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.pruning.clone()))
+    source.require_statement_constant_policy(policy).unwrap();
+    let pruning = source
+        .plan()
+        .fragments()
+        .keys()
+        .map(|&id| {
+            (
+                id,
+                FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
+            )
+        })
         .collect();
     let admissions = source
         .plan()
@@ -108,8 +106,6 @@ fn source_packages(
         source.plan(),
         &frozen_reads_with_explicit_source_shape(source, false, true),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &Control,
@@ -141,15 +137,21 @@ fn check_array_source(
             FunctionValueType::new(DataType::Int32, true)
         );
         let mut indexes = 0;
-        for fragment in source.plan().fragments().values() {
-            for (definition, expression) in fragment.expressions().iter() {
+        for unit in source
+            .plan()
+            .fragments()
+            .values()
+            .flat_map(|f| f.nodes().values())
+            .filter_map(|node| node.expressions.as_deref())
+        {
+            for expression in unit.definitions() {
                 let ExprKind::FunctionCall { function, args } = &expression.kind else {
                     continue;
                 };
                 if function.function_id.as_str() != "builtin.scalar/__array_element_at/v1" {
                     continue;
                 }
-                let index = fragment.expressions().get(args[1]).unwrap();
+                let index = unit.definition(args[1]).unwrap();
                 let expected = FunctionValueType::new(
                     DataType::Int32,
                     expected_index_source.nullable()
@@ -160,10 +162,7 @@ fn check_array_source(
                     function.argument_types[1],
                     FunctionArgumentType::Value(expected.clone())
                 );
-                let request = fragment
-                    .call_requests()
-                    .get(PhysicalCallDefinition::Expression(*definition))
-                    .unwrap();
+                let request = unit.requests().get(&expression.id).unwrap();
                 let StaticFunctionArgument::Value { value_type, .. } = &request.arguments[1] else {
                     panic!("real index source");
                 };
@@ -175,10 +174,7 @@ fn check_array_source(
                         panic!("implicit signed index cast");
                     };
                     assert_eq!(target, &DataType::Int32);
-                    assert_eq!(
-                        fragment.expressions().get(*expr).unwrap().ty,
-                        expected_index_source
-                    );
+                    assert_eq!(unit.definition(*expr).unwrap().ty, expected_index_source);
                 }
                 indexes += 1;
             }
@@ -196,8 +192,7 @@ fn check_array_source(
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         };
-        let semantics = author_fragment_package_semantics(&source, policy, &Control);
-        semantics.unwrap();
+        source.require_statement_constant_policy(policy).unwrap();
         let functions = installed_builtin_owner_catalogue();
         let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
         let mut producer = None;
@@ -215,23 +210,30 @@ fn check_array_source(
                     .encode_to_vec(),
                 encoded
             );
-            for (id, original) in package.fragment().expressions().iter() {
-                let roundtrip = decoded.fragment().expressions().get(*id).unwrap();
-                assert_eq!(roundtrip.ty, original.ty);
-                if let ExprKind::FunctionCall {
-                    function: original, ..
-                } = &original.kind
-                {
-                    let ExprKind::FunctionCall {
-                        function: roundtrip,
-                        ..
-                    } = &roundtrip.kind
-                    else {
-                        panic!("wire retains function call");
-                    };
-                    assert_eq!(roundtrip.argument_types, original.argument_types);
-                    assert_eq!(roundtrip.result_type, original.result_type);
-                    assert!(roundtrip.legacy_metadata.is_none());
+            for node in package.fragment().nodes().values() {
+                let Some(unit) = node.expressions.as_deref() else {
+                    continue;
+                };
+                let decoded_unit = decoded.fragment().unit(node.id).unwrap();
+                assert_eq!(decoded_unit.requests(), unit.requests());
+                for original in unit.definitions() {
+                    let roundtrip = decoded_unit.definition(original.id).unwrap();
+                    assert_eq!(roundtrip.ty, original.ty);
+                    if let ExprKind::FunctionCall {
+                        function: original, ..
+                    } = &original.kind
+                    {
+                        let ExprKind::FunctionCall {
+                            function: roundtrip,
+                            ..
+                        } = &roundtrip.kind
+                        else {
+                            panic!("wire retains function call");
+                        };
+                        assert_eq!(roundtrip.argument_types, original.argument_types);
+                        assert_eq!(roundtrip.result_type, original.result_type);
+                        assert!(roundtrip.legacy_metadata.is_none());
+                    }
                 }
             }
             for (id, original) in package.fragment().values() {
@@ -253,26 +255,13 @@ fn check_array_source(
                     continue;
                 }
             };
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            for site in snapshot.bindings().keys() {
-                let ProgramExpressionRootSite::Node {
-                    node,
-                    role: ProgramNodeExpressionRole::ProjectOutput { .. },
-                } = site
-                else {
+            for node in program.graph().nodes() {
+                let ProgramNodeKind::Project { input, exprs, .. } = node.kind() else {
                     continue;
                 };
-                let ProgramNodeKind::Project { input, .. } =
-                    program.graph().nodes()[node.index()].kind()
-                else {
-                    continue;
-                };
-                assert!(producer.replace((program.clone(), *site, *input)).is_none());
+                for site in exprs {
+                    assert!(producer.replace((program.clone(), *site, *input)).is_none());
+                }
             }
         }
         assert!(failures.is_empty());
@@ -292,8 +281,8 @@ fn check_array_source(
         for rows in [&all[..], &sparse[..], &[1][..], &[][..]] {
             let host = allocator.clone();
             let mut frame = CompiledExpressionInstance::try_new_with_allocator(
-                program.clone(),
-                site,
+                program.unit(site.unit).unwrap().clone(),
+                site.root,
                 &Control,
                 Some(host),
             )
