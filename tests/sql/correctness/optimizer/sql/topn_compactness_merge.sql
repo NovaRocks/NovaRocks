@@ -25,7 +25,7 @@ SET disable_optimizer_rules = 'SplitTopN';
 -- query 2
 -- @explain_contains=TOP-N
 -- @explain_contains=stats={rows=
-EXPLAIN VERBOSE SELECT *
+EXPLAIN VERBOSE SELECT /*+ SET_VAR(explain_detail='VERBOSE') */ *
 FROM (
     SELECT id, score
     FROM (
@@ -45,7 +45,7 @@ SET disable_optimizer_rules = 'SplitTopN,PushTopNThroughProject,MergeConsecutive
 
 -- query 4
 -- @explain_contains=TOP-N
-EXPLAIN VERBOSE SELECT *
+EXPLAIN VERBOSE SELECT /*+ SET_VAR(explain_detail='VERBOSE') */ *
 FROM (
     SELECT id, score
     FROM (
