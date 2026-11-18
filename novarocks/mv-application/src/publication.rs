@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentManagementAdmission, ConnectorDocumentManagementOperation,
+    ConnectorDocumentPublicationSlotUpdate,
 };
 use novarocks_spi::connector::{
     ConnectorCommittedPartitioning, ConnectorCommittedVersion,
@@ -112,6 +113,8 @@ pub struct MvRefreshPublicationIntent {
     target_name: String,
     partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
     expected_committed_partitioning: Option<ConnectorCommittedPartitioning>,
+    storage_projection_digest: Option<[u8; 32]>,
+    configuration_slot_update: Option<ConnectorDocumentPublicationSlotUpdate>,
 }
 
 impl MvRefreshPublicationIntent {
@@ -168,6 +171,8 @@ impl MvRefreshPublicationIntent {
             target_name,
             partition_spec_replacement: None,
             expected_committed_partitioning: None,
+            storage_projection_digest: None,
+            configuration_slot_update: None,
         })
     }
 
@@ -210,9 +215,13 @@ impl MvRefreshPublicationIntent {
         mut self,
         replacement: ConnectorManagedPartitionSpecReplacement,
         expected_committed_partitioning: ConnectorCommittedPartitioning,
+        storage_projection_digest: Option<[u8; 32]>,
+        configuration_slot_update: Option<ConnectorDocumentPublicationSlotUpdate>,
     ) -> Self {
         self.partition_spec_replacement = Some(replacement);
         self.expected_committed_partitioning = Some(expected_committed_partitioning);
+        self.storage_projection_digest = storage_projection_digest;
+        self.configuration_slot_update = configuration_slot_update;
         self
     }
 
@@ -222,6 +231,16 @@ impl MvRefreshPublicationIntent {
 
     pub fn expected_committed_partitioning(&self) -> Option<&ConnectorCommittedPartitioning> {
         self.expected_committed_partitioning.as_ref()
+    }
+
+    pub const fn storage_projection_digest(&self) -> Option<[u8; 32]> {
+        self.storage_projection_digest
+    }
+
+    pub const fn configuration_slot_update(
+        &self,
+    ) -> Option<&ConnectorDocumentPublicationSlotUpdate> {
+        self.configuration_slot_update.as_ref()
     }
 }
 

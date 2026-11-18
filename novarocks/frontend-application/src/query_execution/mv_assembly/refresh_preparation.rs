@@ -92,6 +92,7 @@ struct RetainedRepartitionTarget {
 struct PreparedManagedRepartitionTransition {
     replacement: novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement,
     preview: novarocks_spi::connector::ConnectorManagedPartitionSpecPreview,
+    configuration: Option<novarocks_mv_application::engine_properties::MvRefreshPropertyChanges>,
 }
 
 pub(crate) fn validate_retained_target_identity(

@@ -492,29 +492,43 @@ fn alter_command(
             fields.iter().map(IcebergPartitionFieldExpr::from).collect(),
         )),
         MvAlterAction::StorageProperties { owner, properties }
-            if properties
+        | MvAlterAction::RefreshAndStorageProperties {
+            owner, properties, ..
+        } => {
+            let mut partitioning = properties
                 .iter()
-                .any(|(name, _)| name.as_ref() == "partitioning") =>
-        {
-            let [(_, change)] = properties.as_ref() else {
-                return Err(CommandError::new(
-                    CommandErrorKind::Unsupported,
-                    "MV partition replacement with other storage properties requires a combined managed publication",
-                ));
-            };
-            let value = match change {
-                DdlPropertyChange::Set(value) | DdlPropertyChange::Reset(value) => value,
-            };
-            let DdlPropertyValue::ArrayVarchar(fields) = value else {
-                return Err(CommandError::new(
-                    CommandErrorKind::Invalid,
-                    "Evaluated MV partitioning must be array(varchar)",
-                ));
-            };
-            Some(MvRepartitionFields::Property {
-                owner: owner.clone(),
-                fields: Arc::from(fields.as_slice()),
-            })
+                .enumerate()
+                .filter(|(_, (name, _))| name.as_ref() == "partitioning");
+            if let Some((partitioning_index, (_, change))) = partitioning.next() {
+                if partitioning.next().is_some() {
+                    return Err(CommandError::new(
+                        CommandErrorKind::Invalid,
+                        "Duplicate evaluated MV partitioning property",
+                    ));
+                }
+                let value = match change {
+                    DdlPropertyChange::Set(value) | DdlPropertyChange::Reset(value) => value,
+                };
+                if !matches!(value, DdlPropertyValue::ArrayVarchar(_)) {
+                    return Err(CommandError::new(
+                        CommandErrorKind::Invalid,
+                        "Evaluated MV partitioning must be array(varchar)",
+                    ));
+                }
+                Some(MvRepartitionFields::Property {
+                    owner: owner.clone(),
+                    properties: Arc::clone(properties),
+                    partitioning_index,
+                    configuration: match &statement.action {
+                        MvAlterAction::RefreshAndStorageProperties { changes, .. } => {
+                            Some(changes.clone())
+                        }
+                        _ => None,
+                    },
+                })
+            } else {
+                None
+            }
         }
         _ => None,
     };
@@ -945,29 +959,68 @@ mod tests {
             panic!("partitioning must retain the managed data publication");
         };
         let MvRepartitionFields::Property {
-            fields,
+            properties,
+            partitioning_index,
+            configuration: None,
             owner: actual,
         } = fields
         else {
-            panic!("repartition must receive the original typed property strings");
+            panic!("repartition must receive the original evaluated property");
         };
-        assert_eq!(fields.as_ref(), &[Some("bucket(id, 16)".into())]);
+        assert_eq!(properties.as_ref(), std::slice::from_ref(&partitioning));
+        assert_eq!(partitioning_index, 0);
         assert_eq!(actual, owner);
         let empty = (
             Arc::from("partitioning"),
             DdlPropertyChange::Reset(DdlPropertyValue::ArrayVarchar(vec![])),
         );
         let MvCommandRequest::Repartition {
-            fields: MvRepartitionFields::Property { fields, .. },
+            fields:
+                MvRepartitionFields::Property {
+                    properties,
+                    partitioning_index,
+                    ..
+                },
             ..
-        } = route(vec![empty]).ok().unwrap()
+        } = route(vec![empty.clone()]).ok().unwrap()
         else {
             panic!("an explicit empty default still selects managed repartition");
         };
-        assert!(fields.is_empty());
+        assert_eq!(properties.as_ref(), std::slice::from_ref(&empty));
+        assert_eq!(partitioning_index, 0);
 
-        let error = route(vec![partitioning, storage]).err().unwrap();
-        assert_eq!(error.kind(), CommandErrorKind::Unsupported);
+        let properties: Arc<[(Arc<str>, DdlPropertyChange)]> = vec![storage, partitioning].into();
+        let changes = MvRefreshPropertyChanges::set_paused(true);
+        let MvCommandRequest::Repartition {
+            fields:
+                MvRepartitionFields::Property {
+                    properties: retained,
+                    partitioning_index,
+                    configuration: Some(configuration),
+                    owner: actual,
+                },
+            ..
+        } = alter_command(
+            Some("ice"),
+            "db",
+            MvAlterStatement {
+                name_parts: vec!["t".into()],
+                action: MvAlterAction::RefreshAndStorageProperties {
+                    changes: changes.clone(),
+                    owner: owner.clone(),
+                    properties: Arc::clone(&properties),
+                },
+            },
+        )
+        .ok()
+        .unwrap()
+        else {
+            panic!("combined properties must remain on one data publication");
+        };
+        assert!(Arc::ptr_eq(&retained, &properties));
+        assert_eq!(partitioning_index, 1);
+        assert_eq!(configuration, changes);
+        assert_eq!(actual, owner);
     }
 
     #[test]

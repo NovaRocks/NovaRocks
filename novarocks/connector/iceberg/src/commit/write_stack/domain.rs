@@ -2914,9 +2914,16 @@ impl IcebergWriteCommitSession {
 
     /// The staging directory this session owns, used for recovery evidence.
     pub fn staging_dir(&self) -> String {
+        let prospective_path = self
+            .repartition()
+            .filter(|prepared| prepared.storage_projection_digest().is_some())
+            .map(|prepared| super::control::iceberg_data_location(prepared.prospective_metadata()));
         format!(
             "{}/_staging/{}",
-            self.table.data_location().trim_end_matches('/'),
+            prospective_path
+                .as_deref()
+                .unwrap_or_else(|| self.table.data_location())
+                .trim_end_matches('/'),
             self.session_id
         )
     }

@@ -211,7 +211,9 @@ pub(crate) enum MvRepartitionFields {
     Legacy(Vec<IcebergPartitionFieldExpr>),
     Property {
         owner: ConnectorProviderBindingKey,
-        fields: Arc<[Option<String>]>,
+        properties: Arc<[(Arc<str>, DdlPropertyChange)]>,
+        partitioning_index: usize,
+        configuration: Option<MvRefreshPropertyChanges>,
     },
 }
 

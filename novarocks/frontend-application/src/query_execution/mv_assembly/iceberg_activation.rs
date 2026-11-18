@@ -575,7 +575,7 @@ pub(crate) fn document_publication_declaration(
             ConnectorManagedPublicationTechnique::MetadataOnly
         }
     };
-    novarocks_spi::connector::document_storage::ConnectorDocumentPublicationDeclaration::try_new(
+    let declaration = novarocks_spi::connector::document_storage::ConnectorDocumentPublicationDeclaration::try_new_with_storage_projection(
         publication.publication_id(),
         publication.admission().clone(),
         publication.target_object_id().clone(),
@@ -584,8 +584,17 @@ pub(crate) fn document_publication_declaration(
         empty_input,
         publication.partition_spec_replacement().cloned(),
         publication.expected_committed_partitioning().cloned(),
+        publication.storage_projection_digest(),
     )
-    .map_err(|error| format!("build the MV document publication declaration: {error}"))
+    .map_err(|error| format!("build the MV document publication declaration: {error}"))?;
+    match publication.configuration_slot_update() {
+        Some(update) => declaration
+            .with_slot_update(update.clone())
+            .map_err(|error| {
+                format!("bind the MV configuration to the original publication: {error}")
+            }),
+        None => Ok(declaration),
+    }
 }
 
 /// Ask the exact write generation for the base this publication will commit

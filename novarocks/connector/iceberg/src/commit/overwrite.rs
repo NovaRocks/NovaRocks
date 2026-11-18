@@ -46,6 +46,24 @@ impl super::staging::Preparer for OverwritePreparer {
         view: &super::staging::StagedView<'_>,
         intent: &super::model::OperationIntent,
     ) -> crate::iceberg::Result<super::staging::PreparedChange> {
+        self.prepare_with_snapshot_extension(view, intent, |_| Ok(None))
+            .await
+    }
+}
+
+pub(crate) struct OverwriteSnapshotExtension {
+    pub summary: (String, String),
+    pub update: Option<TableUpdate>,
+}
+
+impl OverwritePreparer {
+    /// The optional extension uses the snapshot selected by this exact data attempt.
+    pub(crate) async fn prepare_with_snapshot_extension(
+        &self,
+        view: &super::staging::StagedView<'_>,
+        intent: &super::model::OperationIntent,
+        extend: impl FnOnce(i64) -> crate::iceberg::Result<Option<OverwriteSnapshotExtension>> + Send,
+    ) -> crate::iceberg::Result<super::staging::PreparedChange> {
         validate_added_data(intent)?;
         let (sources, live) = view.observe_live_sources().await?;
         let removed = live.values().collect::<Vec<_>>();
@@ -53,6 +71,7 @@ impl super::staging::Preparer for OverwritePreparer {
             return Ok(super::staging::PreparedChange::default());
         }
         let snapshot_id = super::staging::new_snapshot_id(view.metadata());
+        let extension = extend(snapshot_id)?;
         let added = write_added_intent_data(view, intent, snapshot_id).await?;
         let manifests = super::manifest_transform::ordinary_manifests(
             view,
@@ -71,7 +90,19 @@ impl super::staging::Preparer for OverwritePreparer {
         // Every old entry is removed, so the new row total is fully known even
         // when the parent's total includes already-deleted rows or is absent.
         summary.insert("total-records".into(), summary["added-records"].clone());
-        prepare_ordinary_snapshot_change(
+        let update = if let Some(extension) = extension {
+            let (key, value) = extension.summary;
+            if intent.summary().contains_key(&key) || summary.insert(key, value).is_some() {
+                return Err(crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::DataInvalid,
+                    "Overwrite extension conflicts with an existing snapshot fact",
+                ));
+            }
+            extension.update
+        } else {
+            None
+        };
+        let mut change = prepare_ordinary_snapshot_change(
             view,
             intent,
             snapshot_id,
@@ -80,7 +111,9 @@ impl super::staging::Preparer for OverwritePreparer {
             summary,
             false,
         )
-        .await
+        .await?;
+        change.updates.extend(update);
+        Ok(change)
     }
 }
 

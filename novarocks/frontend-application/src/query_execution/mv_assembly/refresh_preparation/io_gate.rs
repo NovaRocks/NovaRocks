@@ -44,6 +44,7 @@ use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::staged_create::{
     AdmittedMvPublication, CurrentProjectionRegistration, MvPublicationAdmissionReceiving,
 };
+use novarocks_mv_application::engine_properties::MvRefreshPropertyChanges;
 use novarocks_mv_application::persistence::keyed_documents::{
     MvKeyedObservedCurrentDocuments, StoredKeyedMvProjection,
 };
@@ -91,6 +92,7 @@ enum Request {
         planning_pin: ConnectorControlPlanningPin,
         projection: StoredKeyedMvProjection,
         id: novarocks_spi::connector::LakePublicationId,
+        configuration: Option<MvRefreshPropertyChanges>,
         context: ConnectorRequestContext,
     },
     InstallCurrent {
@@ -470,6 +472,7 @@ impl MvRefreshPreparationIo {
                         planning_pin,
                         projection,
                         id,
+                        configuration,
                         context,
                     } => {
                         let result = match source.management_entrance() {
@@ -479,6 +482,7 @@ impl MvRefreshPreparationIo {
                                     &planning_pin,
                                     &projection,
                                     id,
+                                    configuration.as_ref(),
                                     &context,
                                     async {
                                         let _ = services.cancellation.cancelled().await;
@@ -858,6 +862,7 @@ impl MvRefreshPreparationIo {
         planning_pin: &ConnectorControlPlanningPin,
         projection: &StoredKeyedMvProjection,
         id: novarocks_spi::connector::LakePublicationId,
+        configuration: Option<&MvRefreshPropertyChanges>,
         context: &ConnectorRequestContext,
     ) -> Result<AdmittedMvPublication, MvApplicationError> {
         let Response::Admit(result) = self
@@ -866,6 +871,7 @@ impl MvRefreshPreparationIo {
                 planning_pin: planning_pin.clone(),
                 projection: projection.clone(),
                 id,
+                configuration: configuration.cloned(),
                 context: context.clone(),
             })
             .await

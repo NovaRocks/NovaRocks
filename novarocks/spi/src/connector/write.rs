@@ -842,13 +842,20 @@ pub enum ConnectorManagedPartitionSpecReplacementTarget {
 /// Complete, signed logical facts for replacing the default partition spec in
 /// the same external commit that publishes the managed snapshot. An empty
 /// replacement selects an unpartitioned spec.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ConnectorManagedPartitionSpecReplacement {
     operation_id: ConnectorWriteOperationId,
     replacement_id: ConnectorManagedPartitionSpecReplacementId,
     target: ConnectorManagedPartitionSpecReplacementTarget,
     expected_prior_default: ConnectorManagedPartitionSpecObservation,
     fields: Vec<ConnectorManagedPartitionField>,
+    storage_properties: Option<ManagedRepartitionStorageProperties>,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedRepartitionStorageProperties {
+    ordered: Arc<[(Arc<str>, super::DdlPropertyChange)]>,
+    partitioning_index: usize,
 }
 
 impl ConnectorManagedPartitionSpecReplacement {
@@ -864,6 +871,48 @@ impl ConnectorManagedPartitionSpecReplacement {
             target: ConnectorManagedPartitionSpecReplacementTarget::MainPublication,
             expected_prior_default,
             fields,
+            storage_properties: None,
+        })
+    }
+
+    /// Retain the original evaluated request and the exact slot consumed by
+    /// the partition replacement. Clone shares the backing of every value.
+    pub fn with_storage_properties(
+        mut self,
+        properties: Arc<[(Arc<str>, super::DdlPropertyChange)]>,
+        partitioning_index: usize,
+    ) -> Result<Self, ConnectorError> {
+        if self.storage_properties.is_some() || properties.len() < 2 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "managed storage properties must be attached once with at least one other change",
+            ));
+        }
+        if partitioning_index >= properties.len()
+            || properties.iter().enumerate().any(|(index, (name, _))| {
+                (index == partitioning_index) != (name.as_ref() == "partitioning")
+            })
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "managed storage properties do not identify their single partitioning entry",
+            ));
+        }
+        self.storage_properties = Some(ManagedRepartitionStorageProperties {
+            ordered: properties,
+            partitioning_index,
+        });
+        Ok(self)
+    }
+
+    /// The original ordered entries for the ordinary property author.
+    pub fn storage_properties(
+        &self,
+    ) -> Option<impl Iterator<Item = &(Arc<str>, super::DdlPropertyChange)> + Clone + '_> {
+        self.storage_properties.as_ref().map(|storage| {
+            let (before, partitioning_and_after) =
+                storage.ordered.split_at(storage.partitioning_index);
+            before.iter().chain(&partitioning_and_after[1..])
         })
     }
 
@@ -902,6 +951,51 @@ impl ConnectorManagedPartitionSpecReplacement {
             ));
         }
         Ok(())
+    }
+}
+
+impl PartialEq for ConnectorManagedPartitionSpecReplacement {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation_id == other.operation_id
+            && self.replacement_id == other.replacement_id
+            && self.target == other.target
+            && self.expected_prior_default == other.expected_prior_default
+            && self.fields == other.fields
+            && match (&self.storage_properties, &other.storage_properties) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    left.partitioning_index == right.partitioning_index
+                        && (Arc::ptr_eq(&left.ordered, &right.ordered)
+                            || (left.ordered.len() == right.ordered.len()
+                                && left.ordered.iter().zip(right.ordered.iter()).all(
+                                    |((left_name, left), (right_name, right))| {
+                                        left_name == right_name
+                                            && exact_storage_change_eq(left, right)
+                                    },
+                                )))
+                }
+                _ => false,
+            }
+    }
+}
+
+impl Eq for ConnectorManagedPartitionSpecReplacement {}
+
+fn exact_storage_change_eq(
+    left: &super::DdlPropertyChange,
+    right: &super::DdlPropertyChange,
+) -> bool {
+    use super::{DdlPropertyChange as Change, DdlPropertyValue as Value};
+    match (left, right) {
+        (Change::Set(left), Change::Set(right)) | (Change::Reset(left), Change::Reset(right)) => {
+            match (left, right) {
+                // A publication declaration compares the exact evaluated input,
+                // including signed zero and every representable floating value.
+                (Value::Double(left), Value::Double(right)) => left.to_bits() == right.to_bits(),
+                _ => left == right,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -969,6 +1063,7 @@ pub struct ConnectorManagedPartitionSpecPreview {
     committed_partitioning: ConnectorCommittedPartitioning,
     exact_partition_spec_version: Bytes,
     exact_partition_fields: Vec<MvExactPartitionField>,
+    storage_projection_digest: Option<[u8; 32]>,
 }
 
 impl ConnectorManagedPartitionSpecPreview {
@@ -991,7 +1086,19 @@ impl ConnectorManagedPartitionSpecPreview {
             committed_partitioning,
             exact_partition_spec_version,
             exact_partition_fields,
+            storage_projection_digest: None,
         })
+    }
+
+    /// Binds the prospective writer facts to the original target and operation.
+    /// The provider must derive the same projection again at Begin.
+    pub fn with_storage_projection_digest(mut self, digest: [u8; 32]) -> Self {
+        self.storage_projection_digest = Some(digest);
+        self
+    }
+
+    pub const fn storage_projection_digest(&self) -> Option<[u8; 32]> {
+        self.storage_projection_digest
     }
 
     pub const fn owner(&self) -> &ConnectorProviderBindingKey {
@@ -2060,8 +2167,15 @@ impl ConnectorWrite {
     ) -> Result<ConnectorManagedPartitionSpecPreview, ConnectorError> {
         request.validate(&self.provider_binding_key)?;
         let operation_id = request.operation_id();
+        let combined = request.replacement().storage_properties().is_some();
         let preview = self.control.preview_managed_partition_spec(request)?;
         preview.validate_for_request(&self.provider_binding_key, operation_id)?;
+        if combined != preview.storage_projection_digest().is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "managed partition preview does not retain its exact storage projection",
+            ));
+        }
         Ok(preview)
     }
 
@@ -2466,6 +2580,48 @@ mod tests {
             .parse()
             .expect("UUID v7 attempt text must round-trip");
         assert_eq!(parsed, operation_id);
+    }
+
+    #[test]
+    fn managed_repartition_borrows_original_storage_entries_around_the_partition_slot() {
+        use super::super::{DdlPropertyChange as Change, DdlPropertyValue as Value};
+
+        let operation_id = ConnectorWriteOperationId::new();
+        let prior = ConnectorManagedPartitionSpecObservation::try_from_fields(0, &[]).unwrap();
+        let base =
+            ConnectorManagedPartitionSpecReplacement::try_new(operation_id, prior, vec![]).unwrap();
+        let values: Arc<[_]> = Arc::from([
+            (
+                Arc::from("data_location"),
+                Change::Set(Value::Varchar("s3://b/writes".into())),
+            ),
+            (
+                Arc::from("partitioning"),
+                Change::Set(Value::ArrayVarchar(vec![])),
+            ),
+            (
+                Arc::from("extra_properties"),
+                Change::Set(Value::MapVarcharVarchar(vec![(
+                    "read.split.target-size".into(),
+                    Some("1024".into()),
+                )])),
+            ),
+        ]);
+        assert!(
+            base.clone()
+                .with_storage_properties(Arc::clone(&values), 2)
+                .is_err()
+        );
+        assert!(base.storage_properties().is_none());
+        let combined = base
+            .with_storage_properties(Arc::clone(&values), 1)
+            .unwrap();
+        let cloned = combined.clone();
+        assert_eq!(combined, cloned);
+        let received: Vec<_> = cloned.storage_properties().unwrap().collect();
+        assert!(std::ptr::eq(received[0], &values[0]));
+        assert!(std::ptr::eq(received[1], &values[2]));
+        assert_eq!(received.len(), 2);
     }
 
     #[test]

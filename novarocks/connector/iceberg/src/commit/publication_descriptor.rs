@@ -32,6 +32,13 @@ pub(crate) enum AttributionPlan {
         marker_key: String,
         marker_value: String,
     },
+    ManagedRepartition {
+        table_uuid: Uuid,
+        snapshot_id: i64,
+        parent: Option<i64>,
+        session: String,
+        effect: String,
+    },
     Property {
         table_uuid: Uuid,
         key: String,
@@ -57,6 +64,13 @@ pub(crate) enum PositiveAttributionObservation {
         marker_key: String,
         marker_value: String,
     },
+    ManagedRepartitionSnapshot {
+        table_uuid: Uuid,
+        snapshot_id: i64,
+        parent: Option<i64>,
+        session: String,
+        effect: String,
+    },
     PropertyMarker {
         table_uuid: Uuid,
         key: String,
@@ -72,6 +86,10 @@ pub(crate) enum PositiveAttributionObservation {
         operation_id: String,
     },
 }
+use super::write_stack::control::{
+    ICEBERG_WRITE_SESSION_MARKER_PROPERTY, MANAGED_REPARTITION_EFFECT_SUMMARY_KEY,
+};
+
 impl AttributionPlan {
     /// Extract only the positive probe frozen for this request. Missing markers
     /// and current ref state provide no observation; the journal checks exact
@@ -96,6 +114,31 @@ impl AttributionPlan {
                         .additional_properties
                         .get(marker_key)?
                         .clone(),
+                })
+            }
+            Self::ManagedRepartition {
+                snapshot_id,
+                session,
+                ..
+            } => {
+                let snapshot = metadata.snapshot_by_id(*snapshot_id)?;
+                if metadata.snapshots().any(|candidate| {
+                    candidate.snapshot_id() != *snapshot_id
+                        && candidate
+                            .summary()
+                            .additional_properties
+                            .get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY)
+                            == Some(session)
+                }) {
+                    return None;
+                }
+                let summary = &snapshot.summary().additional_properties;
+                Some(PositiveAttributionObservation::ManagedRepartitionSnapshot {
+                    table_uuid: metadata.uuid(),
+                    snapshot_id: snapshot.snapshot_id(),
+                    parent: snapshot.parent_snapshot_id(),
+                    session: summary.get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY)?.clone(),
+                    effect: summary.get(MANAGED_REPARTITION_EFFECT_SUMMARY_KEY)?.clone(),
                 })
             }
             Self::Property { key, .. } => Some(PositiveAttributionObservation::PropertyMarker {
@@ -123,6 +166,22 @@ impl AttributionPlan {
                     marker_value: z,
                 },
             ) => (a, b, c, d) == (w, x, y, z),
+            (
+                Self::ManagedRepartition {
+                    table_uuid: a,
+                    snapshot_id: b,
+                    parent: c,
+                    session: d,
+                    effect: e,
+                },
+                PositiveAttributionObservation::ManagedRepartitionSnapshot {
+                    table_uuid: v,
+                    snapshot_id: w,
+                    parent: x,
+                    session: y,
+                    effect: z,
+                },
+            ) => (a, b, c, d, e) == (v, w, x, y, z),
             (
                 Self::Property {
                     table_uuid: a,
@@ -163,6 +222,7 @@ impl AttributionPlan {
     fn table_uuid(&self) -> Option<Uuid> {
         match self {
             Self::Snapshot { table_uuid, .. }
+            | Self::ManagedRepartition { table_uuid, .. }
             | Self::Property { table_uuid, .. }
             | Self::ExactMetadata { table_uuid, .. } => Some(*table_uuid),
             _ => None,
@@ -329,9 +389,45 @@ impl PublicationDescriptor {
         // Presence of an old snapshot or a matching ref is not operation
         // attribution. Only markers written by this exact request are probes.
         let mut attribution = AttributionPlan::ObserveOnly;
+        let mut managed = None;
         for update in request.updates() {
             match update {
                 crate::iceberg::TableUpdate::AddSnapshot { snapshot } => {
+                    let summary = &snapshot.summary().additional_properties;
+                    if let Some(effect) = summary.get(MANAGED_REPARTITION_EFFECT_SUMMARY_KEY) {
+                        let BaseIdentity::Existing { parent, .. } = request.base() else {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                "Managed repartition attribution requires its original table",
+                            ));
+                        };
+                        if request.target_ref() != "main"
+                            || request.ref_snapshot_after("main") != Some(snapshot.snapshot_id())
+                            || *parent != snapshot.parent_snapshot_id()
+                            || managed.is_some()
+                        {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                "Managed repartition attribution differs from its selected snapshot or parent",
+                            ));
+                        }
+                        let session = summary
+                            .get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY)
+                            .ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    "Managed repartition attribution lacks its write session",
+                                )
+                            })?;
+                        managed = Some(AttributionPlan::ManagedRepartition {
+                            table_uuid,
+                            snapshot_id: snapshot.snapshot_id(),
+                            parent: *parent,
+                            session: session.clone(),
+                            effect: effect.clone(),
+                        });
+                        continue;
+                    }
                     if let Some((key, value)) = snapshot
                         .summary()
                         .additional_properties
@@ -381,7 +477,7 @@ impl PublicationDescriptor {
             request.artifacts().attempt().operation().to_bytes(),
             vec![format!("{}", request.identifier())],
             bytes,
-            attribution,
+            managed.unwrap_or(attribution),
             key,
         )?;
         descriptor.table_uuid = Some(table_uuid);

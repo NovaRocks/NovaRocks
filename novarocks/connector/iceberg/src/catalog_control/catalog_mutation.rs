@@ -2001,6 +2001,15 @@ fn prepare_set_table_properties(
     properties: &[(Arc<str>, novarocks_spi::connector::DdlPropertyChange)],
     control: &dyn ConnectorOperationControl,
 ) -> Result<crate::commit::staging::PreparedChange, ConnectorError> {
+    prepare_set_table_property_entries(metadata, properties.iter(), control)
+}
+
+pub(crate) fn prepare_set_table_property_entries<'a>(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    properties: impl Iterator<Item = &'a (Arc<str>, novarocks_spi::connector::DdlPropertyChange)>
+    + Clone,
+    control: &dyn ConnectorOperationControl,
+) -> Result<crate::commit::staging::PreparedChange, ConnectorError> {
     use novarocks_spi::connector::InvalidTableProperty;
 
     let prepare = || {
@@ -2008,11 +2017,11 @@ fn prepare_set_table_properties(
         use novarocks_spi::connector::{DdlPropertyChange, DdlPropertyValue};
         use std::collections::HashSet;
         control.check_active()?;
-        if properties.is_empty() {
+        if properties.clone().next().is_none() {
             return Err(invalid("Iceberg property mutation is empty"));
         }
         // Reject unsupported properties before creating any transaction update.
-        for (name, _) in properties {
+        for (name, _) in properties.clone() {
             control.check_active()?;
             if name.as_ref() == "location"
                 || crate::table_properties::is_recognized_unsupported_table_property(name)
@@ -2022,7 +2031,7 @@ fn prepare_set_table_properties(
                 )));
             }
         }
-        let mut seen = HashSet::with_capacity(properties.len());
+        let mut seen = HashSet::with_capacity(properties.size_hint().0);
         let mut raw = Vec::new();
         let mut version = metadata.format_version();
         let mut partitioning = None;

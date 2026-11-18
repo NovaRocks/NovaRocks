@@ -135,6 +135,28 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 "Iceberg metadata tables cannot be repartition targets",
             ));
         }
+        if request.replacement().storage_properties().is_some() {
+            use crate::catalog::admission::{
+                CatalogAdmissionRequest, CatalogOperation, connector_unsupported,
+            };
+            let catalog = self.provider.runtime().novarocks_catalog().as_ref();
+            catalog
+                .admit(&CatalogAdmissionRequest::new(
+                    CatalogOperation::PublishDocuments,
+                    crate::catalog::CatalogTableName::new(
+                        table.namespace.as_str(),
+                        table.table.as_str(),
+                    ),
+                    request.context().initiation(),
+                ))
+                .map_err(connector_unsupported)?;
+            super::write_stack::repartition::admit_storage_alter(
+                catalog,
+                &table.namespace,
+                &table.table,
+                request.context(),
+            )?;
+        }
         let table_info = table.table_info.ok_or_else(|| {
             corrupt("admitted Iceberg repartition target is missing its frozen table descriptor")
         })?;
@@ -149,19 +171,24 @@ impl ConnectorWriteControl for IcebergWriteControl {
         // The same preview the write session runs when it prepares the real
         // transition, so an accepted preview and the transition that follows it
         // cannot disagree about the partitioning they establish.
-        let prepared = super::write_stack::repartition::preview_managed_repartition(
+        let prepared = super::write_stack::repartition::prepare_managed_repartition(
             &metadata,
             request.replacement(),
+            request.context(),
         )?;
         let (exact_partition_spec_version, exact_partition_fields) =
             exact_preview_partition_binding(&prepared, request.context())?;
-        ConnectorManagedPartitionSpecPreview::try_new(
+        let preview = ConnectorManagedPartitionSpecPreview::try_new(
             self.key.clone(),
             request.operation_id(),
             prepared.committed().clone(),
             exact_partition_spec_version,
             exact_partition_fields,
-        )
+        )?;
+        Ok(match prepared.storage_projection_digest() {
+            Some(digest) => preview.with_storage_projection_digest(digest),
+            None => preview,
+        })
     }
 }
 
@@ -421,9 +448,10 @@ mod tests {
             ],
         )
         .expect("replacement");
-        let prepared = super::super::write_stack::repartition::preview_managed_repartition(
+        let prepared = super::super::write_stack::repartition::prepare_managed_repartition(
             &metadata,
             &replacement,
+            &request_context(),
         )
         .expect("prepared repartition");
         let (spec_version, fields) = exact_preview_partition_binding(&prepared, &request_context())
