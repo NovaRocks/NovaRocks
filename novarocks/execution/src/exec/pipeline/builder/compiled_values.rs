@@ -45,7 +45,7 @@ use novarocks_type_contract::{
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;

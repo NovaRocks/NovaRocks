@@ -24,7 +24,7 @@ use novarocks_types::{QueryId, UniqueId};
 
 use super::*;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::compiled_program::tests::{SEED_42_FIRST, SeedMode, program};
+use crate::exec::expr::fixtures::{SEED_42_FIRST, SeedMode, program};
 use crate::exec::fragment::program::FragmentContractVersion;
 use crate::exec::fragment::program::FragmentNodeId;
 use crate::exec::node::scan::{BoundScanRanges, ScanSource};
@@ -240,7 +240,7 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
     Arc::new(
         compile_fragment(
             validated,
-            &crate::exec::expr::compiled_program::tests::rng_subset(),
+            &novarocks_functions::testkit::rng_subset(),
             LocalCompileOptions {
                 pipeline_dop: NonZeroUsize::new(1).unwrap(),
                 root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),

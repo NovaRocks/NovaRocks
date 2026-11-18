@@ -16,7 +16,7 @@
 // under the License.
 //! Actual non-NULL Connector SQL source -> owned transaction -> LocalCompiler -> Frame.
 //! The original declaration is a public obligation, not the internal Cast admission.
-use super::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use super::numeric_unary_owned_transaction_tests::{batch, producer_root, programs};
 use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, Decimal128Array, Decimal256Array, Float32Array};

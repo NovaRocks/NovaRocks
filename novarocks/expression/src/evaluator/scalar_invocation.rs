@@ -82,7 +82,7 @@ impl CallInstance {
     }
 }
 
-use novarocks_expression::{
+use crate::{
     ExprEvaluationFailure, ScalarCallFailure, ScalarCallHost, ScalarCallPhase,
     ScalarCallRequestFacts,
 };
@@ -110,7 +110,7 @@ fn run_phase<R, T>(
     output.ok_or_else(|| super::internal("scalar host did not run an admitted phase").into())
 }
 
-pub(crate) fn call_scalar<'a, R>(
+pub fn call_scalar<'a, R>(
     host: &mut dyn ScalarCallHost<Refusal = R>,
     instance: &mut ScalarEvaluationInstance,
     selection: Selection<'a>,
@@ -143,7 +143,7 @@ pub(crate) fn call_scalar<'a, R>(
     )
 }
 
-pub(crate) fn call_invocation<'a, R>(
+pub fn call_invocation<'a, R>(
     host: &mut dyn ScalarCallHost<Refusal = R>,
     instance: &mut InvocationScalarEvaluationInstance,
     selection: Selection<'a>,
@@ -190,7 +190,7 @@ pub(crate) fn call_invocation<'a, R>(
     run_phase(host, ScalarCallPhase::Body, facts, || body(instance))
 }
 
-pub(crate) fn call_scoped_invocation<'a, R>(
+pub fn call_scoped_invocation<'a, R>(
     host: &mut dyn ScalarCallHost<Refusal = R>,
     instance: &mut InvocationScalarEvaluationInstance,
     scope: ScalarInvocationScope<'a>,

@@ -18,7 +18,7 @@
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 
-use novarocks_expression::{
+use crate::{
     EvaluationInput, InputColumnProjection, InputSourceStorage, InputStorageFailure,
 };
 

@@ -903,7 +903,7 @@ pub(super) fn compile(
     pipeline_dop: usize,
     result: bool,
 ) -> Arc<LocalProgram> {
-    let catalog = crate::exec::expr::compiled_program::tests::rng_subset();
+    let catalog = novarocks_functions::testkit::rng_subset();
     try_compile(package, &catalog, pipeline_dop, result)
         .unwrap_or_else(|error| panic!("join fragment compiles: {error}"))
 }
@@ -2974,9 +2974,9 @@ fn b3_input_and_finalize_operators_preserve_the_first_prepare_refusal() {
 
 #[test]
 fn b3_residual_gathers_only_original_referenced_columns_from_published_pages() {
+    use novarocks_expression::CompiledExpressionInstance;
     use crate::exec::{
-        expr::compiled_program::CompiledExpressionInstance,
-        operators::{
+            operators::{
             compiled_expression::{RuntimeKernelControl, evaluate_projected_chunk_all},
             hashjoin::{
                 JoinPairRow, JoinParticipants, ProjectedJoinGather,

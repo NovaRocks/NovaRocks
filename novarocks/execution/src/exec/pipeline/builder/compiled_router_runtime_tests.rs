@@ -353,7 +353,7 @@ mod router_runtime_tests {
         Arc::new(
             compile_fragment(
                 validated,
-                &crate::exec::expr::compiled_program::tests::rng_subset(),
+                &novarocks_functions::testkit::rng_subset(),
                 config,
                 &FixtureControl,
             )

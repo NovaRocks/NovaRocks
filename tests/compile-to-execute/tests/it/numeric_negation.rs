@@ -19,7 +19,7 @@ mod scalar {
         array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},
         datatypes::DataType,
     };
-    use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
+    use novarocks_expression::CompiledExpressionInstance;
     use novarocks_expression::testkit::PassThroughCallHost;
     use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
     use novarocks_functions::*;

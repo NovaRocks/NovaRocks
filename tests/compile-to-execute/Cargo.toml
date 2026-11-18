@@ -17,6 +17,9 @@ novarocks-physical-plan.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-local-compiler.workspace = true
 novarocks-local-program.workspace = true
+novarocks-expression.workspace = true
+novarocks-expression-contract.workspace = true
+novarocks-types.workspace = true
 novarocks-functions.workspace = true
 novarocks-type-contract.workspace = true
 
@@ -26,8 +29,6 @@ env-inputs = []
 
 [dev-dependencies]
 novarocks-execution.workspace = true
-novarocks-expression.workspace = true
-novarocks-expression-contract.workspace = true
 novarocks-sql-testkit.workspace = true
 novarocks-plan-codec.workspace = true
 prost.workspace = true

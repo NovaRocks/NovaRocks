@@ -59,7 +59,7 @@ use super::unpivot_processor::{
 };
 use super::unpivot_processor::{unpivot_arrow, unpivot_contract};
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputConstructionOwner, InputEncodingPolicy,
     Operator,

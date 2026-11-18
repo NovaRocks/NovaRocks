@@ -18,7 +18,7 @@
 //! Ordered original Scan residuals use the existing conjunction consumer.
 //! This isolated required predicate preserves an explicit optimizer variant;
 //! it does not claim native whole-case or provider execution acceptance.
-use super::compiled_program::CompiledFilterConjunctionInstance;
+use novarocks_expression::CompiledFilterConjunctionInstance;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source;
 use super::sql_test_source::sql_source_with_single_field_and_core_residuals;

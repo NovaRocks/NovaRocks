@@ -240,7 +240,7 @@ impl KernelEvaluationControl for FrameControl {
 
 #[test]
 fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_data() {
-    use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+    use novarocks_expression::CompiledExpressionInstance;
     use crate::exec::expr::filter_conjunction_actual_sql_compiler_tests::compiler_results;
     use crate::exec::expr::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
     use novarocks_expression_contract::ExprKind;

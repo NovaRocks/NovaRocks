@@ -17,7 +17,7 @@
 //! Actual SQL author -> package -> LocalCompiler -> existing single Frame.
 //! Noop folding retains the genuine N1 call; this is separate from real FE fold evidence.
 use super::approx_percentile_actual_sql_source_tests::approx_sql_source;
-use super::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use super::filter_conjunction_actual_sql_compiler_tests::compiler_results;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
 use arrow::{

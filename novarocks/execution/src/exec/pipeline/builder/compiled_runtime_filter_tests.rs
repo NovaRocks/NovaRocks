@@ -211,7 +211,7 @@ fn read_unit_like(program: &LocalProgram, like: ProgramRootRef) -> AuthoredInput
     work.finish().unwrap();
     let pools = novarocks_physical_plan::ConstantPools::empty();
     let parameters = SemanticParameters::try_new([]).unwrap();
-    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let functions = novarocks_functions::testkit::rng_subset();
     let mut work = CompileCheckpoints::try_new(&NoControl, CompilePhase::LowerProgram).unwrap();
     let compiled = compile_expr_set_pure(
         &unit,
@@ -303,7 +303,7 @@ fn read_join_output_unit(
     .unwrap();
     let pools = novarocks_physical_plan::ConstantPools::empty();
     let parameters = SemanticParameters::try_new([]).unwrap();
-    let catalog = crate::exec::expr::compiled_program::tests::rng_subset();
+    let catalog = novarocks_functions::testkit::rng_subset();
     let compiled = compile_expr_set_pure(
         &unit,
         EvaluationEnvironment {
@@ -2238,7 +2238,7 @@ fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observab
 
 #[test]
 fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latch() {
-    use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+    use novarocks_expression::CompiledExpressionInstance;
     use novarocks_expression::{
         EvaluationInput, ExprEvaluationFailure, testkit::PassThroughCallHost,
     };

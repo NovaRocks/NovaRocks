@@ -47,7 +47,7 @@ use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, Prog
 
 use super::compiled_writer_failure as failure;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_write_relation::{
     RootWriteResultRelationTemplate, WriterMultiplexRelationTemplate,

@@ -25,8 +25,8 @@ pub struct CompiledFilterConjunctionInstance {
     failed: bool,
 }
 fn same_input_scope(
-    left: &novarocks_expression::ScopeLayout,
-    right: &novarocks_expression::ScopeLayout,
+    left: &crate::ScopeLayout,
+    right: &crate::ScopeLayout,
     work: &mut Work<'_, '_>,
 ) -> Result<bool, KernelFailure> {
     if std::ptr::eq(left, right) {
@@ -79,7 +79,7 @@ impl CompiledFilterConjunctionInstance {
                 return Err(invalid("Filter conjunction has no original predicate"));
             }
             let mut roots = Vec::with_capacity(predicates.len());
-            let mut actual_input: Option<&novarocks_expression::ScopeLayout> = None;
+            let mut actual_input: Option<&crate::ScopeLayout> = None;
             for (program, site) in predicates {
                 let site = *site;
                 let root = program

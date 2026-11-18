@@ -17,8 +17,8 @@
 
 //! Retained SQL binding and compiled Frame properties with independent values.
 //! Historical required test names are stable retention-map keys, not v1 oracles.
+use novarocks_expression::CompiledExpressionInstance;
 use super::{
-    compiled_program::CompiledExpressionInstance,
     filter_conjunction_actual_sql_compiler_tests::compiler_results,
     numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue,
     sql_test_source::sql_source_with_declared_fields, test_support::HarnessControl,
@@ -454,7 +454,7 @@ fn slot_program(
     types: &[FunctionValueType],
     constant_count: Option<i32>,
 ) -> Arc<LocalProgram> {
-    use super::compiled_program::guarded_tests as host;
+    use super::fixtures as host;
     use novarocks_expression_contract::RootScope;
     use novarocks_physical_plan::{
         FragmentBuilder, FragmentId, NodeId, ResultField, ResultPort, ValueDef, ValueId,

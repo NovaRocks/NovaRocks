@@ -19,9 +19,9 @@
 //! sources; all value copying stays with the existing selected-copy author.
 
 use super::*;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::{
     chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema},
-    expr::compiled_program::CompiledExpressionInstance,
     operators::hashjoin::{
         build_pages::{B3RunId, BuildPageAddress, BuildPageProjection, BuildRowId, BuildRows},
         join_completion::{funded_shared, funded_vec},

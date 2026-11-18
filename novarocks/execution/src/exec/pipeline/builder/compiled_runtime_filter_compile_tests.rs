@@ -547,7 +547,7 @@ fn compile(dop: usize) -> Arc<LocalProgram> {
     .unwrap_or_else(|error| panic!("the runtime-filter package extracts: {error:?}"));
     let package = Arc::new(packages.remove(&FRAGMENT).unwrap());
     let validated = validate_fragment_providers(package, &providers(), &FixtureControl).unwrap();
-    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let functions = novarocks_functions::testkit::rng_subset();
     let options = LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(dop).unwrap(),
         // The result is published by one root sink driver.

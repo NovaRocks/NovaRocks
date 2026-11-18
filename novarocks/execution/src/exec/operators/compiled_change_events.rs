@@ -46,7 +46,7 @@ use super::compiled_expression::{
     RuntimeKernelControl, evaluate_all, evaluate_selected, instances,
 };
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };

@@ -63,7 +63,7 @@ use super::compiled_expression::{
 };
 use super::sort::creation::{CreatedSortColumns, SortCreation};
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{ConstructionFailure, InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{

@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compiled expression runtime and independent boundary tests.
-pub mod compiled_program;
+//! Expression fixtures and independent boundary tests.
+#[cfg(test)]
+pub(crate) mod fixtures;
 
 #[cfg(test)]
 mod cast_decimal_text_oracle_tests;

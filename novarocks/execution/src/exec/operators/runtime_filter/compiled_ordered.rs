@@ -21,7 +21,7 @@
 
 use super::live_cursor::{LiveCursorDisposition, LiveCursorViolation, apply_poll_outcome};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::hash_table::allocation::AggregateVec;
 use crate::exec::operators::compiled_expression::{
     RuntimeKernelControl, evaluate_chunk_all, root_value_type,

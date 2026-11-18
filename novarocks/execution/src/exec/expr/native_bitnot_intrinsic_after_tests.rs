@@ -17,7 +17,7 @@
 //! Actual source journal/effects, original package author, LocalCompiler and
 //! Frame. The shared SQL fixture deliberately disables folding; native whole
 //! cases and production FE folding remain separate acceptance obligations.
-use super::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use super::numeric_unary_owned_transaction_tests::{batch, programs_with_catalogue};
 use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array};

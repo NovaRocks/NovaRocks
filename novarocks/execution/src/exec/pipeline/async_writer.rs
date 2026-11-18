@@ -2729,10 +2729,7 @@ pub(crate) mod tests {
 
     fn compiled_writer_source_loan(provider: bool) {
         use crate::exec::chunk::{record_batch_additional_bytes, record_batch_shared_owner_bytes};
-        use crate::exec::expr::compiled_program::{
-            input_source_tests::input_chunk,
-            tests::{SeedMode, program},
-        };
+        use crate::exec::expr::fixtures::{SeedMode, input_chunk, program};
         use crate::exec::operators::compiled_expression::{
             InputAdapterObserver, assert_original_chunk_input,
         };

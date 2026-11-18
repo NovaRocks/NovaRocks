@@ -45,7 +45,7 @@ use super::native_runtime_filter::{
 };
 use super::typed_gather::JoinGatherError;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::hash_table::partition_keys::source_key_owner;
 use crate::exec::hash_table::{allocation::AggregateAllocator, key_index::BulkWork};
 use crate::exec::node::join::JoinType;

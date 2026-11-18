@@ -18,8 +18,9 @@
 //! Real SQL and checked LocalProgram boundaries retained independently of the
 //! removed evaluator. Expected values below are literal SQL/Unicode examples.
 
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::expr::{
-    compiled_program::{CompiledExpressionInstance, guarded_tests as host},
+    fixtures as host,
     test_support::{HarnessControl, constant_policy},
 };
 use arrow::{

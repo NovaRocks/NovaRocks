@@ -19,7 +19,7 @@
 use super::super::constant_node::*;
 use super::*;
 use arrow::record_batch::RecordBatch;
-use novarocks_expression::{
+use crate::{
     PrimitiveError as ProgramPrimitiveError, prepare_arithmetic_node, prepare_cast_node,
     prepare_comparison_node, prepare_null_safe_comparison_node,
 };
@@ -426,7 +426,7 @@ impl ConstantEvaluator<'_> {
     }
 }
 
-pub(in crate::exec::expr::compiled_program) fn evaluate(
+pub(in crate::evaluator) fn evaluate(
     node: ConstantNode<'_>,
     children: &[ConstantValue],
     result: &FunctionValueType,
@@ -644,11 +644,3 @@ fn evaluate_inner(
         Ok(ConstantNodeOutcome::Value(output.values().clone()))
     }
 }
-
-#[cfg(test)]
-#[path = "constant_evaluator_failure_tests.rs"]
-mod failure_tests;
-
-#[cfg(test)]
-#[path = "constant_recipe_boundary_tests.rs"]
-mod recipe_boundary_tests;

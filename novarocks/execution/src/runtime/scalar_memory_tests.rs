@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::exec::expr::compiled_program::scalar_invocation::{call_invocation, call_scalar};
+use novarocks_expression::testkit::{call_invocation, call_scalar};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use novarocks_functions::{
     AggregateStateAllocator, EvaluatedArgument, InvocationScalarEvaluationInstance,
@@ -1961,6 +1961,101 @@ fn runtime_scalar_memory_original_domain_error_and_late_cancel_keep_real_settlem
     assert!(!domain.snapshot().active);
     assert!(domain.snapshot().sealed);
     assert_eq!(domain.snapshot().live, 1208);
+    drop(release);
+    assert_eq!(domain.snapshot().live, 0);
+    assert!(!domain.snapshot().active);
+}
+
+#[path = "scalar_memory_tests/invocation_custody.rs"]
+mod invocation_custody;
+#[path = "scalar_memory_tests/scalar_custody.rs"]
+mod scalar_custody;
+
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#[test]
+fn original_occurrence_survives_late_cancel_after_real_charged_resource_settlement() {
+    use crate::runtime::task::ExecutionFailure;
+    use novarocks_memory::attribution::AttributingAllocator;
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    struct Release<'a> {
+        pointer: &'a Cell<*mut u8>,
+        allocator: &'a AttributingAllocator<System>,
+        layout: Layout,
+    }
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            let pointer = self.pointer.replace(std::ptr::null_mut());
+            if !pointer.is_null() {
+                // SAFETY: the one actual block is released exactly once
+                // through its original allocator and original Layout.
+                unsafe {
+                    self.allocator.dealloc(pointer, self.layout);
+                }
+            }
+        }
+    }
+    let binding = bound();
+    let stopped = Arc::new(RuntimeErrorState::default());
+    let runtime = control(Some(&binding), stopped.clone());
+    let KernelMemoryAdmission::Granted(ready) = request(&binding, 608) else {
+        panic!("the exact original body requires a real grant");
+    };
+    let domain = ready.domain().clone();
+    let allocator = AttributingAllocator::new(System);
+    let layout = Layout::from_size_align(600, 8).unwrap();
+    let pointer = Cell::new(std::ptr::null_mut());
+    let release = Release {
+        pointer: &pointer,
+        allocator: &allocator,
+        layout,
+    };
+    let expected = KernelFailure::from_domain(LayoutResourceError::SourceModel);
+    let late_cancel: ExecutionFailure = KernelFailure::Cancelled.into();
+    let mut journal = KernelMemoryJournal::default();
+    let result = ready
+        .run(&mut journal, || {
+            // SAFETY: valid nonzero Layout; Release owns the matching free.
+            pointer.set(unsafe { allocator.alloc(layout) });
+            assert!(!pointer.get().is_null());
+            stopped.set_error(late_cancel.clone());
+            Err::<(), _>(expected.clone())
+        })
+        .unwrap();
+    // The actual writer has exited before the ordinary Frame footer.
+    assert_eq!(journal.observation.entry(), AmbientEntryObservation::Bound);
+    assert_eq!(journal.observation.exit(), AmbientExitObservation::Restored);
+    assert_eq!(journal.settlement.as_ref().unwrap().accepted_live, 608);
+    assert_eq!(journal.settlement.as_ref().unwrap().next_step, Ok(()));
+    assert_eq!(journal.stopped, Some(Ok(())));
+    assert!(!domain.snapshot().active);
+    assert!(domain.snapshot().sealed);
+    assert_eq!(domain.snapshot().live, 608);
+    assert_eq!(result.unwrap_err(), expected);
+    // Cancellation remains independently observable; it never rewrites
+    // the already originating occurrence or the completed settlement.
+    assert!(stopped.error().unwrap().same_occurrence(&late_cancel));
+    assert_eq!(
+        KernelEvaluationControl::checkpoint(&runtime, 0),
+        Err(KernelFailure::Cancelled)
+    );
+    drop(ready);
     drop(release);
     assert_eq!(domain.snapshot().live, 0);
     assert!(!domain.snapshot().active);

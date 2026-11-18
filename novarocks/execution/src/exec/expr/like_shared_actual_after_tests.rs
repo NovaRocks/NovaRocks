@@ -17,7 +17,7 @@
 
 //! Actual original LIKE Eager2 source and lifecycle probes.
 //! Formal host MEM grants remain a separate open gate.
-use super::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source;
 use super::sql_test_source::sql_source_with_single_field_and_core_residuals;
 use arrow::array::{Array, ArrayRef, StringArray};

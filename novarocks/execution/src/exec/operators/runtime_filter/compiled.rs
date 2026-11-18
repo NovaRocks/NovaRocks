@@ -31,7 +31,7 @@ use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramRootRef};
 
 use super::{RuntimeFilterApplication, RuntimeFilterConsumerState, RuntimeFilterKeyProvider};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::operators::compiled_expression::{
     RuntimeKernelControl, evaluate_all, evaluate_chunk_all, instances, root_value_type,
 };

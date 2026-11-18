@@ -72,7 +72,7 @@ use super::table_finish::{
 use crate::exec::chunk::{
     ArrayNormalizationStep, Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
 };
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputConstructionOwner, InputEncodingPolicy,
     Operator,

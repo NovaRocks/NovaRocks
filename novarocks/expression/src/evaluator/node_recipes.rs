@@ -16,7 +16,7 @@
 // under the License.
 
 //! Borrowed recipes for one expression node, independent of program traversal.
-use novarocks_expression::{ComparisonSite, CompiledExprSet};
+use crate::{ComparisonSite, CompiledExprSet};
 use novarocks_functions::*;
 use novarocks_type_contract::ExpressionUseId;
 

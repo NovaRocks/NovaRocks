@@ -19,8 +19,8 @@
 //! The Frame entry and the complete-wrapper contract are distinct witnesses.
 
 use super::{RuntimeKernelControl, evaluate_all};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-use crate::exec::expr::compiled_program::scalar_invocation::{call_invocation, call_scalar};
+use novarocks_expression::CompiledExpressionInstance;
+use novarocks_expression::testkit::{call_invocation, call_scalar};
 use crate::runtime::{
     execution_runtime::ExecutionRuntime,
     kernel_memory::KernelMemoryJournal,

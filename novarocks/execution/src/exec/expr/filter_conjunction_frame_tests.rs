@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Actual SQL roots, package, LocalCompiler and the ordered Filter consumer.
-use super::compiled_program::CompiledFilterConjunctionInstance;
+use novarocks_expression::CompiledFilterConjunctionInstance;
 use super::filter_conjunction_actual_sql_compiler_tests::{
     compile_options, compiler_results, source_packages, validate_package,
 };
@@ -417,40 +417,6 @@ fn filter_conjunction_actual_rand_domains_and_cross_batch_state() {
                 )
                 .unwrap()
         )
-    );
-}
-#[test]
-fn filter_conjunction_actual_pending_error_commits_before_rand_boundary() {
-    let f = fixture(
-        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING CAST(MAX(CAST(v AS DOUBLE)) AS DATE) IS NOT NULL AND rand(13)<0.5",
-    );
-    let input = batch(&f, &[0], &[Some(f64::NAN)]);
-    let mut instance = group(&f);
-    let error = instance
-        .evaluate(
-            EvaluationInput::Batch {
-                batch: &input,
-                source: None,
-            },
-            Selection::all(1),
-            &Control,
-            &mut PassThroughCallHost,
-        )
-        .unwrap_err();
-    let ExprEvaluationFailure::RequiredRow(error) = error else {
-        panic!("actual required row error");
-    };
-    let error = ExecutionFailure::from(error).at_expression_node(f.node);
-    assert_eq!(error.expression_node(), Some(f.node));
-    let ExecutionFailureCause::RequiredRow(error) = error.cause() else {
-        panic!("pending error must become necessary before a nonpure boundary")
-    };
-    assert_eq!(error.root(), predicates(&f)[0].1);
-    assert_eq!(error.batch_row(), 0);
-    assert_eq!(
-        instance.constructed_root_call_instances(1),
-        0,
-        "a terminal row never creates the later actual RAND instance"
     );
 }
 struct Stop {

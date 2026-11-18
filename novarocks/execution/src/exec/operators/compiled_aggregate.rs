@@ -65,7 +65,7 @@ use novarocks_local_program::{
 use super::compiled_aggregate_topn::{CompiledAggregateTopN, CompiledAggregateTopNFactory};
 use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances, root_value_type};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::hash_table::allocation::AggregateAllocator;
 use crate::exec::hash_table::key_index::{
     IndexPurpose, KeyIndex, KeyInput, KeyMatch, KeySpec, NullPolicy, PreparedKeyBatch, hash_batch,

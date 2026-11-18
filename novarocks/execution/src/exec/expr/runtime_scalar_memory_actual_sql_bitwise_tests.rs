@@ -17,7 +17,7 @@
 //! Actual SQL author, package, installed scalar and original runtime consumers.
 //! Package compilation here is not a Native wire witness; Server and native
 //! acceptance separately exercise the original v2 codec/interpreter.
-use super::compiled_program::{CompiledExpressionInstance, CompiledFilterConjunctionInstance};
+use novarocks_expression::{CompiledExpressionInstance, CompiledFilterConjunctionInstance};
 use super::filter_conjunction_actual_sql_compiler_tests::{compiler_results, source_packages};
 use super::ndv_filter_actual_sql_source_tests::sql_source_with_columns;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;

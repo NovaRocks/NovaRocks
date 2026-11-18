@@ -17,7 +17,7 @@
 
 //! Signed IN source/ordered lifecycle probes. UNRUN until serialized root tests.
 //! Formal host MEM grants and the Utf8 Variant environment remain separate gates.
-use super::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source;
 use super::sql_test_source::sql_source_with_single_field_and_core_residuals;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array};

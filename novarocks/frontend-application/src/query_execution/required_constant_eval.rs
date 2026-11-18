@@ -23,7 +23,7 @@ use arrow::{
     array::{Array, UInt64Array},
     record_batch::{RecordBatch, RecordBatchOptions},
 };
-use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use novarocks_expression::{
     EvaluationEnvironment, EvaluationInput, ExprCompileFailure, ExprCreation,
     RequiredExpressionRowError, ScopeLayouts, compile_expr_set,

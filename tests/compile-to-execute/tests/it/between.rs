@@ -19,7 +19,7 @@
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression::{CompiledExprSet, StaticExprKind};
 use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};

@@ -16,7 +16,7 @@
 // under the License.
 
 //! Actual SQL/package/Frame witnesses with independent interval truth tables.
-use super::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_scan_residuals;
 use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, BooleanArray, Decimal128Array, Int64Array};

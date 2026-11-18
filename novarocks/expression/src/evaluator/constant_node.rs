@@ -79,7 +79,7 @@ pub enum ConstantNodeFailure {
     Control(CompileControlError),
     InvalidFrozenNode(&'static str),
     Kernel(KernelFailure),
-    Primitive(novarocks_expression::PrimitiveError),
+    Primitive(crate::PrimitiveError),
 }
 impl From<KernelFailure> for ConstantNodeFailure {
     fn from(error: KernelFailure) -> Self {

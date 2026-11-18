@@ -189,7 +189,7 @@ fn check_partition_row_extent(rows: usize) -> ExecutionResult<()> {
 }
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::fragment::sink::{DataStreamPartitionType, DataStreamSinkFactoryInput};
 use crate::exec::operators::compiled_expression::{
     RuntimeKernelControl, evaluate_all, evaluate_selected, instances as compiled_instances,

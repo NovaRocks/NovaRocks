@@ -54,7 +54,7 @@ use super::compiled_grouped_topn_resources::{
 };
 use super::sort::creation::SortCreation;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef, OutputColumnMetadata};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;

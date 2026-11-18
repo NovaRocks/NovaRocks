@@ -424,3 +424,61 @@ pub fn batch(program: &LocalProgram, root: ProgramRootRef, input: ArrayRef) -> R
     )
     .unwrap()
 }
+
+/// Enumerate actual retained roots without a fragment-global expression bank.
+pub fn compiled_roots(
+    program: &novarocks_local_program::LocalProgram,
+) -> impl Iterator<
+    Item = (
+        novarocks_local_program::ProgramRootRef,
+        &std::sync::Arc<novarocks_expression::CompiledExprSet>,
+        &novarocks_expression::CompiledRoot,
+    ),
+> {
+    program
+        .units()
+        .iter()
+        .enumerate()
+        .flat_map(|(index, unit)| {
+            unit.roots().iter().enumerate().map(move |(ordinal, root)| {
+                (
+                    novarocks_local_program::ProgramRootRef::new(
+                        novarocks_local_program::ProgramUnitId::new(index),
+                        novarocks_expression_contract::RootOrdinal::new(
+                            u32::try_from(ordinal).unwrap(),
+                        ),
+                    ),
+                    unit,
+                    root,
+                )
+            })
+        })
+}
+
+/// Resolve a real Input use through its root's actual Project input layout.
+pub fn project_input_slot_for_use(
+    program: &novarocks_local_program::LocalProgram,
+    site: novarocks_local_program::ProgramRootRef,
+    use_id: novarocks_type_contract::ExpressionUseId,
+) -> novarocks_types::SlotId {
+    let unit = program.unit(site.unit).unwrap();
+    let root = unit.root(site.root).unwrap();
+    let binding = unit.input(use_id).expect("actual compiled Input use");
+    assert_eq!(binding.scope, root.scope);
+    let input = program
+        .graph()
+        .nodes()
+        .iter()
+        .find_map(|node| match node.kind() {
+            novarocks_local_program::ProgramNodeKind::Project { input, exprs, .. }
+                if exprs.contains(&site) =>
+            {
+                Some(*input)
+            }
+            _ => None,
+        })
+        .expect("actual root belongs to its producer Project");
+    program.graph().nodes()[input.index()]
+        .output_layout()
+        .slots()[binding.ordinal as usize]
+}

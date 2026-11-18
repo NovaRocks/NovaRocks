@@ -43,7 +43,7 @@ use novarocks_type_contract::{
 };
 
 use super::family_fixture::{FixtureControl, compile, constant_policy, int64_rows, run};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::ExchangeBindings;

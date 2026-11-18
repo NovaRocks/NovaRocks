@@ -28,3 +28,10 @@ pub use source::{
     try_sql_source_with_declared_fields,
 };
 pub use support::{parse_query, sql_fixture_constant_policy};
+
+mod approx_source;
+mod expression_sources;
+mod ndv_source;
+pub use approx_source::approx_sql_source;
+pub use expression_sources::unit_definitions;
+pub use ndv_source::{ndv_sql_source, provider_contract, sql_source_with_columns};
