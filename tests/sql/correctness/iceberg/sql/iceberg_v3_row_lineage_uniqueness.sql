@@ -90,18 +90,18 @@ ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t6;
 -- query 9
 -- I1 — current snapshot intra-snapshot uniqueness.
 -- @db=uniq_${uuid0}.ns_${uuid0}
-SELECT count(*) - count(DISTINCT _row_id) AS row_id_collisions FROM uniq;
+SELECT count() - count(DISTINCT _row_id) AS row_id_collisions FROM uniq;
 
 -- query 10
 -- I1 — same invariant on each historical tag.
 -- @db=uniq_${uuid0}.ns_${uuid0}
 SELECT
-  (SELECT count(*) - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't1') AS t1_collisions,
-  (SELECT count(*) - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't2') AS t2_collisions,
-  (SELECT count(*) - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't3') AS t3_collisions,
-  (SELECT count(*) - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't4') AS t4_collisions,
-  (SELECT count(*) - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't5') AS t5_collisions,
-  (SELECT count(*) - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't6') AS t6_collisions;
+  (SELECT count() - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't1') AS t1_collisions,
+  (SELECT count() - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't2') AS t2_collisions,
+  (SELECT count() - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't3') AS t3_collisions,
+  (SELECT count() - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't4') AS t4_collisions,
+  (SELECT count() - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't5') AS t5_collisions,
+  (SELECT count() - count(DISTINCT _row_id) FROM uniq FOR VERSION AS OF 't6') AS t6_collisions;
 
 -- query 11
 -- I2 — cross-snapshot row-id uniqueness per logical id.

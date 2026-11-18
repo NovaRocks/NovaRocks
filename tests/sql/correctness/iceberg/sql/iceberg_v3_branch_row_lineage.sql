@@ -86,7 +86,7 @@ SELECT count(*) AS n_main_diverged
 -- query 6
 -- branch_feat sees: 1 (unchanged), 2 (UPDATEd, _row_id preserved), 4 (new).
 -- @db=br_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS n_branch_rows, count(DISTINCT _row_id) AS n_branch_unique
+SELECT count() AS n_branch_rows, count(DISTINCT _row_id) AS n_branch_unique
   FROM brlineage FOR VERSION AS OF 'feat';
 
 -- query 7
