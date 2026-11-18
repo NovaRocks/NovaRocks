@@ -17,6 +17,7 @@
 
 mod authorization;
 mod convergence;
+mod fixtures;
 mod phase;
 mod ready;
 mod recovery;

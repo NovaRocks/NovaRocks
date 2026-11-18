@@ -26,6 +26,7 @@ use super::{
     inputs::LogicalInputs,
     installed::LogicalInstalledState,
     links::LogicalAttemptLinks,
+    observation::LogicalObservations,
     source::{LogicalEffectExecutor, LogicalEffectSource, LogicalSourceAssembly},
     work::LogicalJobExecutor,
 };
@@ -227,7 +228,8 @@ impl LogicalRuntimeInstall for LogicalRuntimeInstaller {
             .reserve_reported(WorkKind::Cleanup, 0)
             .expect("original prepaid executor disposal work");
         let core = LogicalExecutionCore::new(start.clone());
-        let adapter = LogicalActor::new(core, funding.step_reservations());
+        let observations = Arc::new(LogicalObservations::new());
+        let adapter = LogicalActor::new(core, funding.step_reservations(), observations.clone());
         let runtime = &process.runtime;
         let registration = runtime
             .register_supervised_bound_with_source_cut(
@@ -289,6 +291,7 @@ impl LogicalRuntimeInstall for LogicalRuntimeInstaller {
         let bootstrap = inputs.bootstrap();
         let inputs = LogicalInputBank::new(inputs, wake.clone());
         let links = LogicalAttemptLinks::new(geometry.attempts, wake.clone(), failure.reporter());
+        links.bind_observations(observations);
         let ports = self.ports.bind(LogicalPortInstallContext {
             #[cfg(test)]
             failure: failure.clone(),

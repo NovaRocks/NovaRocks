@@ -18,6 +18,9 @@
 //! Real logical Core, original Source, paid roles, HostRegistry and Tokio Join.
 //! Fake application facts do not prove Native/Worker or P11 failure projection.
 
+mod actual_logical_metrics;
+mod actual_split_cancellation;
+mod actual_statistics_publication;
 mod fact_credit;
 pub(super) mod fixture;
 use super::*;

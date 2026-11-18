@@ -222,6 +222,10 @@ impl QueryCpuExecutor {
                 let (sender, receiver) = mpsc::channel();
                 let pool = Arc::clone(&self.pool);
                 let work = Arc::clone(&original.work);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "The original CPU pool retains this worker JoinHandle and the same prepared call through actual execution exit."
+                )]
                 match std::thread::Builder::new()
                     .name(format!("novarocks-query-planning-{id}"))
                     .stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)

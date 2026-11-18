@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0237
+    scope: "The compromise of an asynchronous imperative logical-execution actor and distributed authorization decisions. Logical identity, computation readiness, publication, recovery constraints and actual convergence remain active."
+    link: "ADR-0237-pure-logical-execution-and-original-host-custody.md"
   - id: ADR-0230
     scope: "The choice to keep an asynchronous imperative shell as the Native FE attempt decision owner. The logical execution owner, business readiness, publication, recovery and actual convergence rules remain active."
     link: "ADR-0230-frontend-attempt-decisions-and-transport-custody.md"

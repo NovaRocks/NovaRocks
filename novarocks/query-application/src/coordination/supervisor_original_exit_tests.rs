@@ -238,6 +238,10 @@ async fn rejected_late_health_completion_and_callback_panic_return_the_same_bank
         let mut cx = std::task::Context::from_waker(&wake);
         assert!(observer.poll_exit(&mut cx).is_pending());
         let root_retirement = OriginalRootPanic::empty();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This fixture retains the supervisor service JoinHandle and observes its actual shutdown or join failure."
+        )]
         let mut original_join = Handle::current().spawn(run_supervisor_owned(
             registry.handle(),
             bank,
@@ -583,6 +587,10 @@ async fn actual_root_cancel_closes_bank_ingress_after_statement_wake_panics() {
         let retirement = OriginalRootPanic::empty();
         // Tokio spawn never synchronously polls; current-thread abort occurs
         // before yielding, while the real pre-poll guard already exists.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This fixture retains the supervisor service JoinHandle and observes its actual shutdown or join failure."
+        )]
         let join = Handle::current().spawn(run_supervisor_owned(
             registry.handle(),
             bank,

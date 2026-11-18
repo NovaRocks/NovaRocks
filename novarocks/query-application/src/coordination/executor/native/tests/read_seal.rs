@@ -442,6 +442,10 @@ async fn concurrent_read_close_waits_for_original_callback_and_does_not_turn_inf
     let f = Fixture::new(3);
     let native = f.native.clone();
     let effect = f.effect();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This component test retains and joins the original native future or thread to observe its real body and capture exit."
+    )]
     let worker = std::thread::spawn(move || futures::executor::block_on(native.execute(effect)));
     f.probe.entered.wait();
     let row = f.native.cleanup_inventory().unwrap().active[0];
@@ -505,6 +509,10 @@ async fn admitted_ack_survives_close_while_close_never_waits_for_optional_ack_su
         let obligation = std::future::poll_fn(|cx| f.native.poll_tail_work(cx)).await;
         let (future, joined) = obligation.into_future();
         // This is the actual component Tokio Join, not a credentialed FA Join.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This component test retains and joins the original native future or thread to observe its real body and capture exit."
+        )]
         tokio::spawn(future).await.unwrap();
         assert!(!f.native.tails_exited(f.native.initial_activation));
         f.native.tail_joined(joined, Ok(())).unwrap();
@@ -609,7 +617,12 @@ async fn original_ack_join_survives_cancelled_wait_while_original_resource_clean
     let obligation = std::future::poll_fn(|cx| f.native.poll_tail_work(cx)).await;
     let (future, receipt) = obligation.into_future();
     original.receipt = Some(receipt);
-    original.join = Some(tokio::spawn(future));
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This component test retains and joins the original native future or thread to observe its real body and capture exit."
+    )]
+    let join = tokio::spawn(future);
+    original.join = Some(join);
     for _ in 0..64 {
         if entered.load(Ordering::SeqCst) {
             break;

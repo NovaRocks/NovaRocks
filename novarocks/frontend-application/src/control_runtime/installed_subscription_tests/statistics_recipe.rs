@@ -18,6 +18,11 @@
 //! Canonical statistics DATA through the actual QA/LP/AP installation path.
 //! The finite peer authors no statistics query, M5 proof or Worker execution.
 
+#[path = "statistics_recipe/publication.rs"]
+mod publication;
+#[path = "statistics_recipe/publication_outcomes.rs"]
+mod publication_outcomes;
+
 use super::drive_until_with_original_clock;
 use crate::fixtures::native_recipe::{
     ActualLogicalCase, OriginalRecipeContext, OriginalRecipeOperands,
@@ -277,13 +282,21 @@ pub(crate) fn admit_statistics_originals(
 pub(crate) enum StatisticsRecipeCase {
     Success,
     TypedRootSuccess,
+    PublicationWhileCleanupPending,
+    PublicationOutcome(publication_outcomes::PublicationOutcomeCase),
     MissingArtifact,
     ProtocolFailureFirst,
     OriginalFailureStreamAfterEnd,
 }
 impl StatisticsRecipeCase {
     fn is_success(self) -> bool {
-        matches!(self, Self::Success | Self::TypedRootSuccess)
+        matches!(
+            self,
+            Self::Success
+                | Self::TypedRootSuccess
+                | Self::PublicationWhileCleanupPending
+                | Self::PublicationOutcome(_)
+        )
     }
     fn is_task_failure(self) -> bool {
         matches!(
@@ -340,6 +353,13 @@ struct ActualStatisticsRun {
     receiving: Option<ExecutionOutputObligation>,
     ready: Option<ReadyStatisticsComputation>,
     artifact_body: Option<Bytes>,
+    publication: Option<
+        crate::statistics::attempt_executor::publication_fixture::OriginalStatisticsPublication,
+    >,
+    publication_future:
+        Option<crate::statistics::attempt_executor::publication_fixture::PublicationFuture>,
+    publication_cleanup_gate: Option<Arc<crate::fixtures::native_recipe::ReadCloseGate>>,
+    session_publication_close_future: Option<crate::statistics::attempt_executor::publication_fixture::session_close::SessionPublicationCloseFuture>,
     installed: Option<Arc<crate::task_execution::host::install::InstalledAttemptHost>>,
     cpu_owner: InternalResultCpuOwner,
     data: FrontendDataRuntime,
@@ -349,6 +369,17 @@ struct ActualStatisticsRun {
 }
 impl ActualStatisticsRun {
     async fn complete(&mut self, case: StatisticsRecipeCase) {
+        // Release the same original callback on assertion unwind while the
+        // complete unresolved owner remains in RetainedStatisticsRun.
+        let _cleanup_release = if matches!(
+            case,
+            StatisticsRecipeCase::PublicationWhileCleanupPending
+                | StatisticsRecipeCase::PublicationOutcome(_)
+        ) {
+            Some(publication::hold_cleanup(self))
+        } else {
+            None
+        };
         let wait = Duration::from_secs(5);
         let process = self.process.clone();
         self.logical
@@ -637,6 +668,14 @@ impl ActualStatisticsRun {
             assert!(self.ready.is_none() && self.receiving.is_none());
         }
 
+        if case == StatisticsRecipeCase::PublicationWhileCleanupPending {
+            publication::publish_while_cleanup_pending(self).await;
+        }
+
+        if let StatisticsRecipeCase::PublicationOutcome(case) = case {
+            publication_outcomes::publish_outcome(self, case).await;
+        }
+
         // Business result, original CPU close and both actual source exits are
         // independent. A typed domain/Task error is not process-health failure.
         drive_until_with_original_clock(
@@ -812,6 +851,7 @@ impl ActualStatisticsRun {
             assert!(self.ready.is_none());
         }
         drop(self.ready.take());
+        drop(self.publication.take());
         drop(self.artifact_body.take());
         self.cpu_owner
             .shutdown_until(Instant::now() + wait)
@@ -1002,6 +1042,10 @@ pub(crate) async fn run_actual_statistics_case(case: StatisticsRecipeCase) {
         receiving: None,
         ready: None,
         artifact_body: None,
+        publication: None,
+        publication_future: None,
+        publication_cleanup_gate: None,
+        session_publication_close_future: None,
         installed: None,
         cpu_owner,
         data,

@@ -94,6 +94,15 @@ pub(crate) struct InstalledAttemptHost {
     ),
     #[cfg(test)]
     pub(crate) fixture_exit: Arc<crate::control_runtime::host::HostExit>,
+    #[cfg(test)]
+    pub(crate) fixture_admission_failures: std::sync::Weak<
+        std::sync::Mutex<
+            std::collections::BTreeMap<
+                novarocks_attempt_protocol::failure::HostFailureRef,
+                crate::task_execution::error::TaskExecutionError,
+            >,
+        >,
+    >,
     pub(crate) startup: super::startup::AttemptStartup,
 }
 
@@ -101,6 +110,10 @@ pub(crate) struct InstallAttemptHost<'a> {
     pub(crate) initial_now: novarocks_coordination_contract::MonotonicInstant,
     #[cfg(test)]
     pub(crate) fixture_observation_budget: Option<super::observations::ObservationBudget>,
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) fixture_establish_handoff: Option<
+        &'a crate::query_execution::native_execution_adapter::original_install_fixture::OriginalInstallRow,
+    >,
     pub(crate) process: &'a FrontendAttemptRuntime,
     pub(crate) data: &'a FrontendDataRuntime,
     pub(crate) clock: Arc<dyn MonotonicClock>,
@@ -139,6 +152,8 @@ impl InstallAttemptHost<'_> {
             initial_now,
             #[cfg(test)]
             fixture_observation_budget,
+            #[cfg(all(test, novarocks_dev_controls))]
+            fixture_establish_handoff,
             process,
             data,
             clock,
@@ -463,6 +478,8 @@ impl InstallAttemptHost<'_> {
                 geometry.admission_results,
             )
             .expect("prepaid original admission Source");
+        #[cfg(test)]
+        let fixture_admission_failures = admission.failure_records_for_fixture();
         for (reference, original) in creations {
             admission
                 .install_creation(reference, original)
@@ -567,6 +584,21 @@ impl InstallAttemptHost<'_> {
             Ok(prepared) => prepared,
             Err(original) => return Err(retain_install_refusal((original, funding))),
         };
+        #[cfg(all(test, novarocks_dev_controls))]
+        let prepared = if let Some(row) = fixture_establish_handoff {
+            let mut prepared = prepared;
+            let wake = prepared
+                .binding
+                .transport
+                .as_ref()
+                .expect("SAME original Host transport tracker")
+                .host_waker();
+            prepared.binding.executor =
+                row.decorate_original_executor(prepared.binding.executor.clone(), wake);
+            prepared
+        } else {
+            prepared
+        };
         let mut funding = Some(funding);
         let startup = match gate.register_attempt(prepared, &mut funding, original_exit) {
             Ok(startup) => startup,
@@ -595,6 +627,8 @@ impl InstallAttemptHost<'_> {
             fixture_sources,
             #[cfg(test)]
             fixture_exit: exit,
+            #[cfg(test)]
+            fixture_admission_failures,
             startup,
         })
     }

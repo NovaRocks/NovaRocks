@@ -19,10 +19,19 @@
 //! No Ready source, M author, Work, Scope, Source or HostRegistry is retained.
 
 use super::*;
+use crate::control_runtime::host::EffectExecutor;
 use crate::fixtures::native_recipe::ReadCloseGate;
 use crate::query_execution::lifecycle_plan::AttemptCredentialStorage;
+use crate::task_execution::host::transport::OriginalEstablishHandoff;
 use novarocks_coordination_contract::AttemptActivationIdentity;
 use novarocks_execution_contract::TaskIdentity;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OriginalEstablishFixtureRefusal {
+    AlreadyReleased,
+    ForeignParticipation,
+    AlreadyConfigured,
+}
 
 #[derive(Default)]
 pub(crate) struct OriginalInstallProbe {
@@ -49,6 +58,8 @@ pub(crate) struct OriginalInstallRow {
     actual_exit: Mutex<Option<watch::Receiver<bool>>>,
     actual_actor: Mutex<Option<novarocks_control_runtime_core::identity::ActorId>>,
     original_disposal_gate: Mutex<Option<Weak<ReadCloseGate>>>,
+    establish_target: Mutex<Option<ParticipationRef>>,
+    establish_handoff: Mutex<Weak<OriginalEstablishHandoff>>,
 }
 impl OriginalInstallProbe {
     pub(crate) fn row(&self, index: usize) -> Option<Arc<OriginalInstallRow>> {
@@ -100,12 +111,53 @@ impl OriginalInstallProbe {
             actual_exit: Mutex::new(None),
             actual_actor: Mutex::new(None),
             original_disposal_gate: Mutex::new(None),
+            establish_target: Mutex::new(None),
+            establish_handoff: Mutex::new(Weak::new()),
         });
         rows.push(row.clone());
         row
     }
 }
 impl OriginalInstallRow {
+    /// Configure only the SAME preinstall row's real participation.
+    pub(crate) fn hold_original_establish(
+        &self,
+        target: ParticipationRef,
+    ) -> Result<(), OriginalEstablishFixtureRefusal> {
+        let mut configured = self.establish_target.lock().unwrap();
+        if self.released.load(Ordering::Acquire) {
+            return Err(OriginalEstablishFixtureRefusal::AlreadyReleased);
+        }
+        if target.query_execution_id() != self.activation.execution()
+            || !self.participations.contains(&target)
+        {
+            return Err(OriginalEstablishFixtureRefusal::ForeignParticipation);
+        }
+        if configured.is_some() {
+            return Err(OriginalEstablishFixtureRefusal::AlreadyConfigured);
+        }
+        *configured = Some(target);
+        Ok(())
+    }
+
+    pub(crate) fn original_establish_handoff(&self) -> Option<Arc<OriginalEstablishHandoff>> {
+        self.establish_handoff.lock().unwrap().upgrade()
+    }
+
+    pub(crate) fn decorate_original_executor(
+        &self,
+        original: Arc<dyn EffectExecutor>,
+        wake: std::task::Waker,
+    ) -> Arc<dyn EffectExecutor> {
+        let target = { *self.establish_target.lock().unwrap() };
+        let Some(target) = target else {
+            return original;
+        };
+        let decorator = OriginalEstablishHandoff::new(original, target, wake);
+        *self.establish_handoff.lock().unwrap() = Arc::downgrade(&decorator);
+        decorator
+    }
+
     pub(crate) fn hold_original_disposal(&self, original: &Arc<ReadCloseGate>) {
         assert!(!self.released.load(Ordering::Acquire));
         assert!(
@@ -120,7 +172,11 @@ impl OriginalInstallRow {
         self.original_disposal_gate.lock().unwrap().clone()
     }
     pub(crate) fn release(&self) {
-        self.released.store(true, Ordering::Release);
+        {
+            // Serialize the preinstall test configuration against release.
+            let _configuration = self.establish_target.lock().unwrap();
+            self.released.store(true, Ordering::Release);
+        }
         self.changed.notify_waiters();
     }
     pub(super) async fn wait_for_release(&self) {

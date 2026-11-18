@@ -36,7 +36,7 @@ use novarocks_coordination_contract::AttemptActivationIdentity;
 use novarocks_query_application::api::LogicalFuture;
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll, Waker},
 };
 use tokio::sync::Notify;
@@ -73,6 +73,7 @@ pub(crate) struct LogicalAttemptLinks {
     slots: Vec<Arc<Slot>>,
     routes: Mutex<BTreeMap<(u64, novarocks_types::QueryExecutionId, u64), usize>>,
     changes: Arc<Notify>,
+    observations: OnceLock<Arc<super::observation::LogicalObservations>>,
 }
 /// Passive facts from this exact prepaid row. No copied identity can create
 /// a link, child, endpoint, Work or positive remote closure.
@@ -110,6 +111,7 @@ impl LogicalAttemptLinks {
     pub(crate) fn new(count: usize, wake: Waker, failure: FailureReporter) -> Arc<Self> {
         let changes = Arc::new(Notify::new());
         Arc::new(Self {
+            observations: OnceLock::new(),
             routes: Mutex::new(BTreeMap::new()),
             changes: changes.clone(),
             slots: (0..count)
@@ -136,6 +138,22 @@ impl LogicalAttemptLinks {
                 })
                 .collect(),
         })
+    }
+    /// The same neutral diagnostic header as this installed LogicalActor.
+    /// It retains no work, capacity or child and never drives the actor.
+    pub(super) fn bind_observations(
+        &self,
+        observations: Arc<super::observation::LogicalObservations>,
+    ) {
+        assert!(
+            self.observations.set(observations).is_ok(),
+            "one original logical observation header"
+        );
+    }
+    pub(crate) fn try_logical_observation(
+        &self,
+    ) -> Option<super::observation::LogicalObservationSnapshot> {
+        self.observations.get()?.try_sample()
     }
     /// Passive observation of this same original inventory, without custody or
     /// authority. Enable `notified()` before scanning, then await it only if

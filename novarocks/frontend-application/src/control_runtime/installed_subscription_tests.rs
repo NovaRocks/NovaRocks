@@ -25,10 +25,7 @@ use crate::{
 };
 use novarocks_execution_contract::BackendProcessDescriptor;
 use novarocks_types::BackendProcessId;
-use novarocks_workload_control::{
-    ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest, WorkloadControl,
-    joint_admission::JointProgressDriver,
-};
+use novarocks_workload_control::joint_admission::JointProgressDriver;
 use std::{future::Future, task::Poll, time::Duration};
 
 // The original finite queue turns are driven even while the external native
@@ -90,114 +87,11 @@ async fn drive_until_with_original_clock<F: Future>(
     }
 }
 
-use crate::control_runtime::logical::test_fixtures::{
-    FrontendFixture,
-    native_recipe::{
-        ActualLogicalCase, OriginalRecipeContext, OriginalRecipeOperands,
-        PreparedOriginalRecipeProcess, ReadCloseGate, RecipeRoot, count_description,
-        install_original_recipe, prepare_original_recipe_process,
-    },
+use crate::fixtures::native_recipe::{
+    OriginalFixture, ReadCloseGate, count_description, install_original_fixture,
+    install_original_fixture_shape,
 };
-use crate::query_execution::internal_consumer::profile::{
-    ProfileComputationOutput, profile_computation_consumer,
-};
-use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::coordination::LogicalExecutionSupervisor;
-
-struct OriginalFixture {
-    fixture: FrontendFixture,
-    logical: ActualLogicalCase,
-    process: Arc<FrontendAttemptRuntime>,
-    clock: Arc<ManualClock>,
-    joint: JointProgressDriver,
-    workload: WorkloadControl,
-    supervisor: LogicalExecutionSupervisor,
-    scope: novarocks_workload_control::WorkScope,
-    business: novarocks_workload_control::BusinessPermit,
-    capacity: novarocks_workload_control::ResultCapacityHandle,
-    window: novarocks_workload_control::ResultWindowGrant,
-    cohort: crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
-    requester: novarocks_workload_control::WorkCancellationRequester,
-    output: ProfileComputationOutput,
-}
-fn install_original_fixture(
-    data: &FrontendDataRuntime,
-    descriptor: BackendProcessDescriptor,
-    history: novarocks_control_runtime::history::HistoryCapture,
-) -> OriginalFixture {
-    install_original_fixture_shape(data, descriptor, history, false)
-}
-fn install_original_fixture_shape(
-    data: &FrontendDataRuntime,
-    descriptor: BackendProcessDescriptor,
-    history: novarocks_control_runtime::history::HistoryCapture,
-    three_tasks: bool,
-) -> OriginalFixture {
-    let PreparedOriginalRecipeProcess {
-        mut fixture,
-        process,
-        clock,
-        mut joint,
-        workload,
-        supervisor,
-        client,
-        capacity,
-        handle,
-        descriptor,
-    } = prepare_original_recipe_process(data, descriptor, history, ResultCapacityConfig::V1, None);
-    let original = workload
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    let scope = original.owner.scope();
-    let requester = original.owner.cancellation_requester();
-    let window = capacity
-        .try_acquire(&scope, ResultWindowClass::Internal)
-        .unwrap();
-    let (description, plan) = count_description();
-    let (consumer, offers, output) = profile_computation_consumer(&description, plan).unwrap();
-    let (logical, cohort, output) = install_original_recipe(
-        OriginalRecipeContext {
-            fixture: &mut fixture,
-            joint: &mut joint,
-            process: &process,
-            data,
-            clock: &clock,
-            handle,
-            descriptor,
-            client,
-        },
-        OriginalRecipeOperands {
-            owner: original.owner,
-            binding: QueryResultCapacityBinding::try_new(&scope, window.retain_alias()).unwrap(),
-            description,
-            plan,
-            root: if three_tasks {
-                RecipeRoot::EmptyCountOnly.with_three_task_protocol_chain(plan, [2, 3])
-            } else {
-                RecipeRoot::EmptyCountOnly
-            },
-            consumer,
-            offers,
-            output,
-        },
-    );
-    OriginalFixture {
-        fixture,
-        logical,
-        process,
-        clock,
-        joint,
-        workload,
-        supervisor,
-        scope,
-        business: original.business,
-        capacity,
-        window,
-        cohort,
-        requester,
-        output,
-    }
-}
 
 #[tokio::test]
 async fn installed_unstarted_single_participation_closes_all_original_sources() {

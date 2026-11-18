@@ -716,6 +716,10 @@ async fn cancelled_ordinary_read_keeps_original_window_until_future_drop_exits()
         release: gate,
     };
     drop(window);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This test retains and joins the original blocking destructor so its response-window alias is checked through actual Drop exit."
+    )]
     let drop_job = tokio::task::spawn_blocking(move || drop(original));
     observed.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(capacity.snapshot().held_positions.iter().sum::<usize>(), 1);
@@ -1194,3 +1198,6 @@ async fn successor_segment_uses_same_original_global_client_stream_while_predece
         panic!("same original client-window component refused actual shutdown: {error}");
     }
 }
+
+#[path = "tests/carrier_kind.rs"]
+mod carrier_kind;

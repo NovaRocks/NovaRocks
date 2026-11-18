@@ -29,6 +29,7 @@ mod inputs;
 mod install;
 mod installed;
 pub(crate) mod links;
+pub(crate) mod observation;
 mod purpose;
 mod source;
 mod work;

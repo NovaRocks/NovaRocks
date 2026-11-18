@@ -789,6 +789,68 @@ impl HostRegistry {
     pub(super) fn observation_owners(&self) -> (&RuntimeLedger, &ActorRuntime<FrontendActor>) {
         (&self.ledger, &self.runtime)
     }
+    /// Read only the same original logical headers. No machine, ledger, Core,
+    /// callback or Source is driven or reconstructed by an observation.
+    pub(super) fn try_logical_observation(
+        &self,
+    ) -> Result<
+        Option<super::metrics::LogicalProcessObservation>,
+        novarocks_control_runtime::observation::EffectObservationError,
+    > {
+        use novarocks_control_runtime::observation::EffectObservationError;
+        let entries = {
+            let state = match self.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(EffectObservationError::Poisoned);
+                }
+            };
+            state
+                .entries
+                .values()
+                .filter(|entry| entry.kind == FrontendActorKind::Logical)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut result = super::metrics::LogicalProcessObservation::default();
+        for entry in entries {
+            let Some(sample) = entry
+                ._logical_links
+                .as_ref()
+                .and_then(|links| links.try_logical_observation())
+            else {
+                return Ok(None);
+            };
+            let overflow = EffectObservationError::InventoryOverflow;
+            result.actors = result.actors.checked_add(1).ok_or(overflow)?;
+            result.completed_steps = result
+                .completed_steps
+                .checked_add(sample.completed_steps)
+                .ok_or(overflow)?;
+            result.last_step_effects = result
+                .last_step_effects
+                .checked_add(sample.last_step_effects)
+                .ok_or(overflow)?;
+            result.total_effects = result
+                .total_effects
+                .checked_add(sample.total_effects)
+                .ok_or(overflow)?;
+            result.max_step_effects = result.max_step_effects.max(sample.max_step_effects);
+            result.outstanding_actions = result
+                .outstanding_actions
+                .checked_add(sample.outstanding_actions)
+                .ok_or(overflow)?;
+            if let Some(deadline) = sample.next_deadline_ns {
+                result.next_deadline_ns = Some(
+                    result
+                        .next_deadline_ns
+                        .map_or(deadline, |previous| previous.min(deadline)),
+                );
+            }
+        }
+        Ok(Some(result))
+    }
     /// One source per original HostMachine/runtime batch inventory. A host
     /// turn holding its machine or an unavailable runtime read returns Busy;
     /// the observer never reconstructs another pending/capacity table.

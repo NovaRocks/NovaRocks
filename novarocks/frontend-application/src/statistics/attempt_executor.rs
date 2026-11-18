@@ -975,6 +975,10 @@ async fn close_session(
 }
 
 #[cfg(test)]
+#[path = "attempt_executor/publication_fixture.rs"]
+pub(crate) mod publication_fixture;
+
+#[cfg(test)]
 pub(crate) use tests::StatisticsLateSupervisionProbes;
 
 #[cfg(test)]

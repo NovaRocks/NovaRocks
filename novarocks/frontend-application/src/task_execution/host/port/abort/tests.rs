@@ -394,6 +394,19 @@ fn occupied_original_control_position_is_not_a_second_queue_or_a_replacement_rol
     f.close();
 }
 #[test]
+fn closed_abort_ingress_refuses_the_current_ticket_without_consuming_it() {
+    let f = Fixture::new();
+    let ticket = f.ticket(f.lp.actor.actor(), 1);
+    f.ingress.close_external();
+    assert_eq!(
+        f.ingress.deliver(&f.runtime, &ticket),
+        Err(AbortPortError::Closed)
+    );
+    assert!(f.received.lock().unwrap().is_empty());
+    f.complete(ticket);
+    f.close();
+}
+#[test]
 fn ap_actor_identity_cannot_impersonate_the_exact_logical_owner() {
     let f = Fixture::new();
     let ticket = f.ticket(f.ap.actor.actor(), 1);

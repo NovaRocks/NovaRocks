@@ -343,6 +343,7 @@ impl AttemptEstablishMaterial {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod original_quote;
     use crate::{
         query_execution::lifecycle_plan::QueryCredentialLeases,
         task_execution::sources::AttemptEstablishFacts,

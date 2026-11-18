@@ -148,13 +148,14 @@ SQL client
   process allocator installation.
 
 - `novarocks/frontend-application/src/**`
-  FE application composition, SQL admission, catalog projection, native query
-  adapter, supervised statement orchestration and domain publication.
-  `novarocks/attempt-protocol/src/**` owns Native attempt protocol decisions.
-  `control_runtime/**` and `task_execution/host/**` bind the original I/O,
-  observations, reports and actual exit. The logical execution owner and
-  recovery policy remain in `novarocks/query-application/src/**`.
-  See [ADR-0230](docs/adr/ADR-0230-frontend-attempt-decisions-and-transport-custody.md).
+  FE application composition、SQL admission、catalog projection、Native adapter 与领域 publication。
+  `novarocks/logical-execution-protocol/src/**` 拥有纯逻辑执行政策：授权、恢复、可见性、
+  计算就绪与结论；`novarocks/attempt-protocol/src/**` 拥有纯 attempt 协议决定。
+  `novarocks/query-application/src/coordination/executor/**` 执行已决定的动作并回报原事实，
+  `runtime_registry.rs` 保原注册、health 与实际退出；supervisor 只在原准备后安装，不保留安装后驱动循环。
+  FA 的 `control_runtime/logical/**` 与 `task_execution/host/**` 保同原预付端口、I/O、回执、
+  工作报告与受控析构，不能代做恢复或领域完整性决定。两个核心按显式时间、种子和被动输入运行，
+  不持 Session 或资源 owner。见 [ADR-0237](docs/adr/ADR-0237-pure-logical-execution-and-original-host-custody.md)。
   Long-lived Catalog
   generation ownership remains in `novarocks/catalog-application/src/**`.
   `state_family/**` is the closed manifest of every frontend-local state
@@ -177,12 +178,13 @@ SQL client
   runtime that runs under them.
 
 - `novarocks/coordination-contract/src/**`
-  仅共享 FE owner 之间实际使用的身份、时间、消息与中立事实；无 Tokio、领域载荷、
-  session、closure、资源 owner 或恢复算法。Query Application 的 `coordination/supervisor.rs`
-  拥有唯一 query-id 来源、逻辑驱动和恢复政策，`runtime_registry.rs` 与
-  `runtime_registry/health.rs` 保管原任务、真实退出和原始 health；writer/统计完成证明属于
-  Frontend 领域。见 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)；
-  源码结构与局部测试不证明整族原生或最终全工作区验证完成。
+  仅共享 FE owner 之间的准确身份、时间、最终端口消息与被动失败事实；无 Tokio、领域载荷、
+  Session、closure、资源 owner 或恢复算法。唯一逻辑恢复政策在 `logical-execution-protocol`，
+  Query Application 负责原身份/准备与监督执行器，FA 的宿主持原载体和真实退出；writer/统计
+  完成证明仍属 Frontend 领域。共用 `control-runtime` 只核来源、原 Work/票据、失败保管与退休，
+  不识别 FE 负面业务内容；失败清理时刻由宿主一次冻结，已有远端期限只缩短。
+  见 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 与
+  [ADR-0237](docs/adr/ADR-0237-pure-logical-execution-and-original-host-custody.md)；源码结构与局部测试不证明整族原生或最终全工作区验证完成。
 
 ### 4.2 SQL Frontend: Parse, Plan, Admit
 
@@ -610,10 +612,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 ### 5.3 Native Distributed Task Execution Path
 
-1. Query Application 的 `coordination/supervisor.rs` 统一预留 query 与 attempt 身份；
-   `novarocks/frontend-application/src/query_execution/logical_execution.rs` 从同一 reservation
-   续接原凭据与 attempt 责任。`native_execution_adapter.rs` 从一个实际 backend snapshot 冻结
-   Task graph；`novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
+1. Query Application 的 `coordination/supervisor.rs` 保留原 query 身份来源与安装前准备；
+   `novarocks/logical-execution-protocol/src/core.rs` 决定 activation、授权与恢复，FA installer
+   从同一 reservation 续接原凭据。`query_execution/native_execution_adapter.rs` 从准确 backend
+   snapshot 冻结 Task graph；`novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
    ({QueryExecutionId, StageId, TaskId, BackendProcessId}) per placement and a
    `ParticipationRef` ({QueryExecutionId, FrontendProcessId, BackendProcessId})
    per participating backend. A participation exists only where the scheduler placed
@@ -623,12 +625,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    独立决定 source、各 writer route 和 finish 的实例集合；driver DOP 使用同一 query options
    冻结的域。manifest 从同一准确 placement 分别冻结 writer 与按种类的 summary-source Task 集合；
    各集合均属于原 Task graph，同一 Task 可承担多个种类，完成义务不能互相替代或跨 attempt 拼接。
-2. Query Application 的统一逻辑执行 owner 管理各分布式意图的恢复、结果与计算就绪；
-   Frontend Action 编排 prepare、领域 publication 和必要 finalize，Task 驱动只提供协议事实。
-   稳定 Source 在启动前接收原输入、同 Root 责任与访问能力，跨取消和 panic 保管原件；
-   业务 Ready、原 Future 的 poll/Drop 退出和 Unknown 库存的处置分别取证。
-   结构退役不代表整族 Native 通过；实际验证范围、原始失败与验收资格须独立核对。
-   ADR-0198 将内部计算就绪、publication、诊断和收敛分开；就绪不等于语句成功。
+2. 纯逻辑核心决定恢复、结果可见性与计算就绪，纯 attempt 核心推进 Task/Participation 协议；
+   Query Application 的监督执行器和注册表保同原 Native/Relay/Consumer/Governance 与退出。
+   Frontend Action 仍编排 prepare、领域 publication 和必要 finalize，FA 宿主只绑定原端口、
+   工作、回执与实际析构。稳定 Source 在启动前接过同 Root 责任和访问能力，借用取消不丢原件；
+   Ready、正常启动观察返回、原 F/captures 退出、Unknown 处置分别取证，机械 Closed 不当失败。
+   Stop/Cleanup 经端口交给 attempt 由它自己停止 Scope；子 Scope 只表达所有权与退休顺序。
+   ADR-0198 的就绪/publication 分离继续适用，三层分工见 ADR-0237；局部验证不证明整族原生通过。
    `novarocks/attempt-protocol/src/core.rs` drives Establish and Task creation.
    The Frontend host dispatches the original effects through the shared runtime,
    pays each send generation, and retains the actual work and results through exit.
@@ -1126,6 +1129,7 @@ unless you edited them.
 |---|---|
 | `novarocks/sql/**` (parser, analyzer, optimizer, planner, function registry) | `-p novarocks-sql` |
 | `novarocks/execution/**` (operators, expressions, pipeline, exchange, runtime filter) | `-p novarocks-execution` |
+| `novarocks/logical-execution-protocol/**` | `-p novarocks-logical-execution-protocol`; port or host changes also cover their actual AP/QA/FA consumers |
 | `novarocks/frontend-application/**`, `novarocks/query-application/**`, `novarocks/catalog-application/**` | that crate, plus `-p novarocks-worker -p novarocks-native-adapter` when the change crosses the FE/BE boundary |
 | `novarocks/worker/**`, `novarocks/native-adapter/**` | `-p novarocks-worker -p novarocks-native-adapter` |
 | `novarocks/connector/<name>/**` | that connector crate, plus `-p novarocks-fs` when authorized object-store access changes |
@@ -1302,19 +1306,22 @@ the guide differ.
   business-gate and async background custody. Provider publication, Current projection,
   cumulative effect, necessary finalization and physical retirement retain separate facts.
   MV query rewrite is an optimizer concern under `novarocks/sql/src/optimizer/**`.
-- **Native distributed task execution**: start with the common execution owner in
-  `novarocks/query-application/src/coordination/**` and the minimal boundary in
-  `novarocks/coordination-contract/**` (minimal neutral facts; ADR-0198), then inspect
-  `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs`,
-  `novarocks/attempt-protocol/src/**`,
-  `novarocks/frontend-application/src/task_execution/{bridge,host}/**`,
-  `novarocks/worker-protocol/src/**`, `novarocks/worker/src/control_runtime/**`,
-  `novarocks/control-runtime{,-core}/src/**`,
-  `novarocks/native-adapter/src/{backend_application,task_protocol}.rs`, and
-  `novarocks/execution/src/task_execution/**`. Preserve the Installed/normal-close
-  gated edge-open barrier and the per-domain Apply / Idempotent / Older /
-  Conflict verdict; do not add a protocol shim, a standalone direct-call path,
-  or a no-runtime-filter retry inside an attempt. See ADR-0161.
+- **Native distributed task execution**: 先读
+  `novarocks/logical-execution-protocol/src/**` 的逻辑授权/恢复政策、
+  `novarocks/attempt-protocol/src/**` 的单次协议与 `novarocks/coordination-contract/src/**` 的被动消息；
+  QA 的 `novarocks/query-application/src/coordination/{supervisor,runtime_registry}.rs` 与
+  `coordination/executor/**` 只准备、安装、监督执行并保原注册/退出。FA 的
+  `novarocks/frontend-application/src/control_runtime/logical/**`、
+  `novarocks/frontend-application/src/task_execution/host/port/**` 和
+  `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs` 持原链接、
+  端口与受控 I/O/析构。随后看 `novarocks/worker/src/control_runtime/**`、
+  `novarocks/control-runtime/src/**`、`novarocks/control-runtime-core/src/**`、
+  `novarocks/native-adapter/src/task_protocol.rs` 与 `novarocks/execution/src/runtime/task/**`。
+  保持 Installed/normal-close 的准确 edge-open 门与各域 Apply/Idempotent/Older/Conflict；
+  不能恢复桥、第二 owner 或 standalone direct-call。共享运行时不承载领域决定，宿主 failure cut
+  冻结一次且不续远端预算；见 ADR-0198、ADR-0230 与
+  [ADR-0237](docs/adr/ADR-0237-pure-logical-execution-and-original-host-custody.md)。
+
 - **Connector behavior**：读取 `novarocks/connector/**` 与 `novarocks/fs/**`。
   sealed manifest 注册 Iceberg 与 Paimon，Paimon 能力已暂停；
   恢复须待上游支持 Arrow 60 与 zstd 0.14，并满足 ADR-0138，见 ADR-0204。

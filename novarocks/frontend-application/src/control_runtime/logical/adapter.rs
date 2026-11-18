@@ -18,7 +18,9 @@
 //! Pure decisions run on the same FE actor carrier as attempts. This adapter
 //! binds actual step guards; it executes no application future or destructor.
 
-use super::{funding::LogicalStepReservations, geometry::OUTPUT_UNITS};
+use super::{
+    funding::LogicalStepReservations, geometry::OUTPUT_UNITS, observation::LogicalObservations,
+};
 use crate::control_runtime::actor::{FrontendEffect, FrontendInput};
 use novarocks_control_runtime::actor::ActorStep;
 use novarocks_control_runtime_core::{
@@ -85,6 +87,7 @@ pub(crate) struct LogicalActor {
     core: LogicalExecutionCore,
     funding: LogicalStepReservations,
     join_ready: bool,
+    observations: Arc<LogicalObservations>,
 }
 struct Budget {
     remaining: usize,
@@ -108,11 +111,16 @@ impl EffectSink for Sink {
 }
 
 impl LogicalActor {
-    pub(super) fn new(core: LogicalExecutionCore, funding: LogicalStepReservations) -> Self {
+    pub(super) fn new(
+        core: LogicalExecutionCore,
+        funding: LogicalStepReservations,
+        observations: Arc<LogicalObservations>,
+    ) -> Self {
         Self {
             core,
             funding,
             join_ready: false,
+            observations,
         }
     }
     pub(crate) fn handle(
@@ -122,6 +130,12 @@ impl LogicalActor {
         value: FrontendInput,
         step: &mut ActorStep<'_, FrontendEffect>,
     ) {
+        // This carrier-only settlement does not enter or change the Core.
+        if matches!(&value, FrontendInput::LogicalHostSettled) {
+            return;
+        }
+        // No failed or unfinished Core turn may expose the preceding sample.
+        self.observations.begin_step();
         let value = match value {
             FrontendInput::Timer => LogicalInput::Timer,
             FrontendInput::Logical(value) => *value,
@@ -211,6 +225,7 @@ impl LogicalActor {
             .unwrap_or(0)
             .checked_add(1)
             .expect("normal batch action identity exhausted");
+        let mut emitted = out.0.len();
         for effect in out.0 {
             let id = effect.action.get();
             self.emit(id, LogicalHostEffect::Protocol(Box::new(effect)), step);
@@ -219,7 +234,15 @@ impl LogicalActor {
         if ready != self.join_ready {
             self.emit(notice_id, LogicalHostEffect::JoinReadiness(ready), step);
             self.join_ready = ready;
+            emitted += 1;
         }
+        self.observations.complete_step(
+            emitted,
+            self.core.facts().outstanding_actions(),
+            self.core
+                .next_deadline()
+                .map(|at| at.since_origin().as_nanos()),
+        );
     }
     fn emit(&self, id: u64, body: LogicalHostEffect, step: &mut ActorStep<'_, FrontendEffect>) {
         let (work_kind, effect_kind) = match body.work_kind() {

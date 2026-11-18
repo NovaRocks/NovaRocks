@@ -20,13 +20,19 @@
 use super::*;
 use crate::fixtures::history::{CapturedHistory, WorkExpectation, WorkObservation};
 use crate::fixtures::native_recipe::{
-    OriginalRecipeProcessPolicy, prepare_original_recipe_process_with_policy,
+    ActualLogicalCase, OriginalRecipeContext, OriginalRecipeOperands, OriginalRecipeProcessPolicy,
+    PreparedOriginalRecipeProcess, RecipeRoot, install_original_recipe,
+    prepare_original_recipe_process_with_policy,
+};
+use crate::query_execution::internal_consumer::profile::{
+    ProfileComputationOutput, profile_computation_consumer,
 };
 use novarocks_control_runtime::actor_turn::ActorTurnError;
 use novarocks_control_runtime_core::history::HistoryFact;
 use novarocks_coordination_contract::SelectedTaskTermination;
 use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason};
 use novarocks_execution_contract::{TaskFailure, TaskFailurePhase, TerminationDetail};
+use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::{
     BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
     ExecutionOutputObligation, QueryExecutionError,
@@ -34,6 +40,7 @@ use novarocks_query_application::api::{
 use novarocks_query_application::coordination::{
     LogicalExecutionExitReceipt, LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig,
 };
+use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest};
 use std::{
     mem::ManuallyDrop,
     num::NonZeroU16,

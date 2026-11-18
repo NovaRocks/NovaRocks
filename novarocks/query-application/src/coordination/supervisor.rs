@@ -586,6 +586,10 @@ impl LogicalExecutionSupervisor {
         };
         let original_root = OriginalRootPanic::empty();
         let statements = crate::session_control::StatementProgressSlot::empty();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The process supervisor service retains its original shutdown channel and JoinHandle; execution effects use the credentialed host."
+        )]
         let join = runtime.spawn(run_supervisor_owned(
             registry_handle,
             bank,

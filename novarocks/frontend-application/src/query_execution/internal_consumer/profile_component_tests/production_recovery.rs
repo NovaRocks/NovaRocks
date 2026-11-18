@@ -16,7 +16,11 @@
 // under the License.
 
 //! SAME production Launcher, preparation, qualifier and Native/AP/LP Sources.
-//! Two finite RPC peers supply explicit external facts, not BE execution/M5.
+//! Finite RPC peers supply explicit external facts, not BE execution/M5.
+#[path = "production_recovery/authorized_establish.rs"]
+mod authorized_establish;
+#[path = "production_recovery/growing.rs"]
+mod growing;
 use super::*;
 use crate::fixtures::native_recipe::{
     OriginalRecipeProcessPolicy, PreparedOriginalRecipeProcess, ReadCloseGate,
@@ -64,16 +68,16 @@ use std::{
 /// Actual independent peer processes remain Current at their frozen endpoints.
 /// Future eligibility moves to B without claiming that A exited or was replaced.
 struct OriginalPeers {
-    descriptors: [BackendProcessDescriptor; 2],
+    descriptors: Vec<BackendProcessDescriptor>,
     snapshot: Mutex<BackendTopologySnapshot>,
     changes: tokio::sync::watch::Sender<u64>,
     process_changes: tokio::sync::watch::Sender<u64>,
 }
 impl OriginalPeers {
-    fn new(descriptors: [BackendProcessDescriptor; 2]) -> Arc<Self> {
+    fn new(descriptors: Vec<BackendProcessDescriptor>) -> Arc<Self> {
         let (changes, _) = tokio::sync::watch::channel(1);
         let (process_changes, _) = tokio::sync::watch::channel(0);
-        let snapshot = Self::snapshot_for(1, &descriptors[0]);
+        let snapshot = Self::snapshot_for(1, &descriptors[..1]);
         Arc::new(Self {
             descriptors,
             snapshot: Mutex::new(snapshot),
@@ -83,20 +87,26 @@ impl OriginalPeers {
     }
     fn snapshot_for(
         revision: u64,
-        descriptor: &BackendProcessDescriptor,
+        descriptors: &[BackendProcessDescriptor],
     ) -> BackendTopologySnapshot {
         BackendTopologySnapshot::try_new(
             revision,
-            vec![LiveBackendTarget::new(
-                0,
-                descriptor.clone(),
-                AdmissionEpochCapability::try_from_bytes([0x61; 16]).unwrap(),
-            )],
+            descriptors
+                .iter()
+                .enumerate()
+                .map(|(index, descriptor)| {
+                    LiveBackendTarget::new(
+                        index,
+                        descriptor.clone(),
+                        AdmissionEpochCapability::try_from_bytes([0x61; 16]).unwrap(),
+                    )
+                })
+                .collect(),
         )
         .unwrap()
     }
     fn admit_only_successor(&self) {
-        *self.snapshot.lock().unwrap() = Self::snapshot_for(2, &self.descriptors[1]);
+        *self.snapshot.lock().unwrap() = Self::snapshot_for(2, &self.descriptors[1..]);
         self.changes.send_replace(2);
     }
 }
@@ -168,7 +178,7 @@ impl BackendProcessObservationPort for OriginalPeers {
 struct OriginalRecoveryRun {
     bootstrap: PreparedOriginalRecipeProcess,
     data: FrontendDataRuntime,
-    peers: [Loopback; 2],
+    peers: Vec<Loopback>,
     root: Option<RootWork>,
     metadata: Option<Arc<MetadataIoAdmission>>,
     stage: Option<StatementStageAdmission>,
@@ -178,6 +188,8 @@ struct OriginalRecoveryRun {
     output: Option<crate::query_execution::internal_consumer::profile::ProfileComputationOutput>,
     receiving: Option<ExecutionOutputObligation>,
     ready: Option<ReadyProfileComputation>,
+    held_establish: Option<Arc<crate::task_execution::host::transport::OriginalEstablishHandoff>>,
+    captured_history: Option<crate::fixtures::history::CapturedHistory>,
 }
 struct RetainOriginalRecovery(Option<Box<OriginalRecoveryRun>>);
 impl Drop for RetainOriginalRecovery {
@@ -185,6 +197,10 @@ impl Drop for RetainOriginalRecovery {
         if let Some(original) = self.0.take() {
             // Assertion unwind preserves SAME unresolved originals, without
             // asynchronous cleanup, forgotten owners or any claimed exit.
+            #[expect(
+                clippy::vec_box,
+                reason = "Retain the same allocated whole-run owner after unproven teardown"
+            )]
             static UNKNOWN: OnceLock<Mutex<Vec<Box<OriginalRecoveryRun>>>> = OnceLock::new();
             UNKNOWN
                 .get_or_init(Default::default)
@@ -197,7 +213,7 @@ impl Drop for RetainOriginalRecovery {
 async fn drive<F: Future>(
     phase: &'static str,
     probe: Option<&OriginalInstallProbe>,
-    originals: Option<(&OriginalComputationStart, &[Loopback; 2])>,
+    originals: Option<(&OriginalComputationStart, &[Loopback])>,
     original: &mut PreparedOriginalRecipeProcess,
     metadata: &Arc<MetadataIoAdmission>,
     advance_indexed_clock: bool,
@@ -405,13 +421,26 @@ fn configure_original_peer(peer: &Loopback, root: TaskIdentity, tasks: &[TaskIde
 }
 
 pub(super) async fn run() {
+    run_with_successor_participations(1).await;
+}
+
+async fn run_with_successor_participations(successor_participations: usize) {
+    run_original(successor_participations, false).await;
+}
+
+async fn run_original(successor_participations: usize, cancel_after_handoff: bool) {
+    assert!(matches!(successor_participations, 1 | 2));
     let data = FrontendDataRuntime::new(tokio::runtime::Handle::current());
     let first_peer = Loopback::start_with_original_root_connection_control().await;
     let next_peer = Loopback::start().await;
-    let descriptors = [
-        first_peer.bounded_root_descriptor(BackendProcessId::new_v7()),
-        next_peer.bounded_root_descriptor(BackendProcessId::new_v7()),
-    ];
+    let mut peers = vec![first_peer, next_peer];
+    if successor_participations == 2 {
+        peers.push(Loopback::start().await);
+    }
+    let descriptors = peers
+        .iter()
+        .map(|peer| peer.bounded_root_descriptor(BackendProcessId::new_v7()))
+        .collect::<Vec<_>>();
     let topology = OriginalPeers::new(descriptors.clone());
     let config = LogicalExecutionSupervisorConfig::new(
         NonZeroUsize::MIN,
@@ -440,7 +469,7 @@ pub(super) async fn run() {
     let mut retained = RetainOriginalRecovery(Some(Box::new(OriginalRecoveryRun {
         bootstrap,
         data,
-        peers: [first_peer, next_peer],
+        peers,
         root: None,
         metadata: None,
         stage: None,
@@ -450,6 +479,8 @@ pub(super) async fn run() {
         output: None,
         receiving: None,
         ready: None,
+        held_establish: None,
+        captured_history: None,
     })));
     let original = retained.0.as_mut().unwrap();
     original.root = Some(
@@ -482,8 +513,13 @@ pub(super) async fn run() {
         novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
         novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
     );
-    let (description, plan, encoded) = crate::query_execution::internal_consumer::test_fixture::internal_profile_recovery_encoded_description(
-        &root.owner.scope(), &carrier, crate::application::test_constant_policy(), &novarocks_sql::compiler::SqlCompileControl::unbounded()).await.unwrap();
+    let (description, plan, encoded) = if successor_participations == 1 {
+        // The existing Profile scenario keeps its original SELECT 1 author.
+        crate::query_execution::internal_consumer::test_fixture::internal_profile_recovery_encoded_description(
+            &root.owner.scope(), &carrier, crate::application::test_constant_policy(), &novarocks_sql::compiler::SqlCompileControl::unbounded()).await.unwrap()
+    } else {
+        growing::description(&carrier)
+    };
     assert_eq!(
         description.kind(),
         novarocks_query_application::api::QueryExecutionKind::Read
@@ -632,8 +668,23 @@ pub(super) async fn run() {
         .unwrap();
     let held_originals = Arc::new(ReadCloseGate::default());
     let _release_on_unwind = held_originals.release_guard();
-    first.hold_original_disposal(&held_originals);
+    if cancel_after_handoff {
+        assert_eq!(first.participations.len(), 1);
+        first
+            .hold_original_establish(first.participations[0])
+            .unwrap();
+    } else {
+        first.hold_original_disposal(&held_originals);
+    }
     first.release();
+    if cancel_after_handoff {
+        authorized_establish::cancel_original_authorized_handoff(
+            original, &probe, &metadata, &first,
+        )
+        .await;
+        finish_original_run(retained, &probe, metadata, launcher, None, true).await;
+        return;
+    }
     let peer = &original.peers[0];
     drive(
         "actual A Root RPC entered",
@@ -712,12 +763,59 @@ pub(super) async fn run() {
         first.activation.execution().query_id()
     );
     assert_ne!(candidate.execution, first.activation.execution());
-    assert_eq!(
-        candidate.root.backend_process_id(),
-        descriptors[1].process_id()
-    );
-    configure_original_peer(&original.peers[1], candidate.root, &candidate.tasks);
-    original.peers[1].defer_single_root_terminal().unwrap();
+    assert_eq!(first.participations.len(), 1);
+    assert_eq!(candidate.participations.len(), successor_participations);
+    if successor_participations == 1 {
+        assert_eq!(
+            candidate.root.backend_process_id(),
+            descriptors[1].process_id()
+        );
+    } else {
+        assert!(candidate.participations.len() > first.participations.len());
+        assert_eq!(
+            candidate
+                .participations
+                .iter()
+                .map(|part| part.backend_process_id())
+                .collect::<std::collections::BTreeSet<_>>(),
+            descriptors[1..]
+                .iter()
+                .map(|descriptor| descriptor.process_id())
+                .collect()
+        );
+    }
+    let root_peer = descriptors
+        .iter()
+        .position(|descriptor| descriptor.process_id() == candidate.root.backend_process_id())
+        .unwrap();
+    assert!(root_peer > 0);
+    for (index, peer) in original.peers.iter().enumerate().skip(1) {
+        let descriptor = &descriptors[index];
+        let local_tasks = candidate
+            .tasks
+            .iter()
+            .copied()
+            .filter(|task| task.backend_process_id() == descriptor.process_id())
+            .collect::<Vec<_>>();
+        assert!(!local_tasks.is_empty());
+        if index == root_peer {
+            configure_original_peer(peer, candidate.root, &local_tasks);
+            peer.defer_single_root_terminal().unwrap();
+        } else {
+            let participation = candidate
+                .participations
+                .iter()
+                .copied()
+                .find(|part| part.backend_process_id() == descriptor.process_id())
+                .unwrap();
+            peer.enable_original_participation_lifecycle(descriptor, participation, &local_tasks)
+                .unwrap();
+            for task in local_tasks {
+                peer.enable_original_final_task_info(task, Vec::new(), false)
+                    .unwrap();
+            }
+        }
+    }
     candidate.release();
     let next = drive(
         "actual B Source install",
@@ -800,7 +898,7 @@ pub(super) async fn run() {
     let next_credentials = next.credentials.upgrade().unwrap();
     assert!(!Arc::ptr_eq(&old_credentials, &next_credentials));
     next.release();
-    let peer = &original.peers[1];
+    let successor_peers = &original.peers[1..];
     let original_statuses = drive(
         "actual B Creates and leaf Finished before Root terminal",
         Some(&probe),
@@ -810,7 +908,10 @@ pub(super) async fn run() {
         false,
         async {
             loop {
-                let statuses = peer.original_created_task_statuses();
+                let statuses = successor_peers
+                    .iter()
+                    .flat_map(Loopback::original_created_task_statuses)
+                    .collect::<Vec<_>>();
                 if statuses.len() == next.tasks.len()
                     && statuses.iter().all(|status| {
                         next.tasks.contains(&status.identity())
@@ -830,7 +931,9 @@ pub(super) async fn run() {
     )
     .await;
     assert_eq!(original_statuses.len(), next.tasks.len());
-    peer.publish_single_root_terminal(None).unwrap();
+    original.peers[root_peer]
+        .publish_single_root_terminal(None)
+        .unwrap();
     let ready_future = original.start.ready.take().unwrap();
     original.receiving = Some(
         drive(
@@ -897,7 +1000,7 @@ pub(super) async fn run() {
             };
             (*task, observation)
         }).collect::<Vec<_>>(),
-        original.peers[1].original_final_task_info_reads(),
+        original.peers[1..].iter().flat_map(Loopback::original_final_task_info_reads).collect::<Vec<_>>(),
         snapshot.split,
         snapshot.runtime_filters.is_complete(),
         snapshot.runtime_filters.contributions().iter().map(|(backend, telemetry)| {
@@ -914,7 +1017,10 @@ pub(super) async fn run() {
             .all(|(task, info)| next.tasks.contains(task)
                 && matches!(info, ProfileTaskDiagnostic::Available(_)))
     );
-    let actual_reads = original.peers[1].original_final_task_info_reads();
+    let actual_reads = original.peers[1..]
+        .iter()
+        .flat_map(Loopback::original_final_task_info_reads)
+        .collect::<Vec<_>>();
     assert_eq!(actual_reads.len(), next.tasks.len());
     assert_eq!(
         actual_reads
@@ -932,7 +1038,10 @@ pub(super) async fn run() {
     // ONE real qualification Acquire, never a replacement initial acquisition.
     let mut acquired = Vec::new();
     let mut established = Vec::new();
-    for request in original.peers[1].applied_requests() {
+    for request in original.peers[1..]
+        .iter()
+        .flat_map(Loopback::applied_requests)
+    {
         for operation in request.operations {
             match novarocks_task_codec::operation::decode_operation(
                 &operation,
@@ -961,11 +1070,24 @@ pub(super) async fn run() {
         assert_eq!(acquire.valid_for(), receipt.valid_for());
         assert_eq!(
             acquire.native_compatibility_id(),
-            descriptors[1].native_compatibility_id()
+            descriptors
+                .iter()
+                .find(|descriptor| descriptor.process_id() == participation.backend_process_id())
+                .unwrap()
+                .native_compatibility_id()
         );
         assert_eq!(
             acquire.admission_epoch_capability(),
-            topology.snapshot().unwrap().targets()[0].admission_epoch_capability()
+            topology
+                .snapshot()
+                .unwrap()
+                .targets()
+                .iter()
+                .find(
+                    |target| target.descriptor().process_id() == participation.backend_process_id()
+                )
+                .unwrap()
+                .admission_epoch_capability()
         );
         assert_ne!(acquire.envelope().operation_id(), qualification.operation);
         let establish = established
@@ -1023,7 +1145,15 @@ pub(super) async fn run() {
     assert!(first.actual_exit_observed() && next.actual_exit_observed());
     assert!(
         original.peers[0].single_root_abort_observed()
-            && original.peers[1].single_root_release_observed(),
+            && original.peers[root_peer].single_root_release_observed()
+            && next.participations.iter().all(|part| {
+                let index = descriptors
+                    .iter()
+                    .position(|descriptor| descriptor.process_id() == part.backend_process_id())
+                    .unwrap();
+                index == root_peer
+                    || original.peers[index].original_participation_release_observed(*part)
+            }),
         "original failed A Abort and successful B Release were observed, separately from their exact Worker closure and actual FE exits"
     );
     assert_eq!(
@@ -1039,8 +1169,25 @@ pub(super) async fn run() {
         &snapshot,
         &observer.current(token).unwrap().unwrap()
     ));
-    assert_eq!(original.peers[1].single_root_result_progress(), (true, 1));
+    assert_eq!(
+        original.peers[root_peer].single_root_result_progress(),
+        (true, 1)
+    );
     drop((receipt, exit, observer, snapshot));
+    let actual_children = (successor_participations == 2)
+        .then(|| [first.actual_actor().unwrap(), next.actual_actor().unwrap()]);
+    finish_original_run(retained, &probe, metadata, launcher, actual_children, false).await;
+}
+
+async fn finish_original_run(
+    mut retained: RetainOriginalRecovery,
+    probe: &Arc<OriginalInstallProbe>,
+    metadata: Arc<MetadataIoAdmission>,
+    launcher: FrontendNativeLogicalExecutionLauncher,
+    actual_children: Option<[novarocks_control_runtime_core::identity::ActorId; 2]>,
+    cancelled: bool,
+) {
+    let original = retained.0.as_mut().unwrap();
     original.stage.as_mut().unwrap().release_capacity_alias();
     original.stage.as_mut().unwrap().retire_unlaunched();
     drop(original.stage.take());
@@ -1049,7 +1196,7 @@ pub(super) async fn run() {
     let root_owner = &original.root.as_ref().unwrap().owner;
     drive(
         "original metadata quiescence",
-        Some(&probe),
+        Some(probe),
         None,
         &mut original.bootstrap,
         &metadata,
@@ -1081,19 +1228,58 @@ pub(super) async fn run() {
         .process
         .close_original_host_registration_for_fixture();
     original.bootstrap.fixture.finish().await;
-    let history = crate::fixtures::history::CapturedHistory::drain(
-        &original.bootstrap.fixture.history(),
-        usize::MAX,
-    );
+    let capture = original.bootstrap.fixture.history();
+    let history = match original.captured_history.take() {
+        Some(mut history) => {
+            history.append_from(&capture, usize::MAX);
+            history
+        }
+        None => crate::fixtures::history::CapturedHistory::drain(&capture, usize::MAX),
+    };
     history
         .check_completed_runtime(
             original.bootstrap.fixture.runtime(),
             original.bootstrap.fixture.ledger(),
         )
         .unwrap();
+    if let Some(actual_children) = actual_children {
+        use novarocks_control_runtime_core::history::HistoryFact;
+        let mut parents = Vec::new();
+        for actual in actual_children {
+            let child = history
+                .entries()
+                .iter()
+                .find_map(|entry| match entry.fact {
+                    HistoryFact::InputConsumed { target, .. } if target.actor == actual => {
+                        Some(target.scope_origin)
+                    }
+                    _ => None,
+                })
+                .expect("SAME actual AP actor consumed its original input");
+            let parent = history
+                .entries()
+                .iter()
+                .find_map(|entry| match entry.fact {
+                    HistoryFact::ScopeOpened {
+                        scope,
+                        parent: Some(parent),
+                        ..
+                    } if scope == child => Some(parent.scope),
+                    _ => None,
+                })
+                .expect("SAME activation child retains its original parent link");
+            history.check_child_scope_removed(child, parent).unwrap();
+            parents.push(parent);
+        }
+        assert_eq!(parents[0], parents[1]);
+    }
     let root = original.root.take().unwrap();
     let scope = root.owner.scope();
-    root.owner.complete();
+    if cancelled {
+        root.owner.complete_after_terminal_cancel_settled();
+    } else {
+        root.owner.complete();
+    }
     root.business.release();
     crate::query_execution::native_execution_adapter::source_cohort::tests::drive(
         &mut original.bootstrap.joint,
@@ -1129,5 +1315,17 @@ pub(super) async fn run() {
     // owner and disarming the assertion-unwind custody guard.
     drop(scope);
     let completed = *retained.0.take().unwrap();
-    assert!(completed.bootstrap.workload.shutdown().is_ok());
+    if let Err(failure) = completed.bootstrap.workload.shutdown() {
+        let (error, owner) = failure.into_parts();
+        // All actual Source/peer joins above were observed. Preserve the
+        // remaining SAME WC owner if its independent final drain refuses.
+        static UNRESOLVED_WC: OnceLock<Mutex<Vec<novarocks_workload_control::WorkloadControl>>> =
+            OnceLock::new();
+        UNRESOLVED_WC
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .push(owner);
+        panic!("same original workload shutdown failed: {error:?}");
+    }
 }

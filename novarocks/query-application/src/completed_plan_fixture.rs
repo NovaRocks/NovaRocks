@@ -85,6 +85,10 @@ pub(crate) async fn completed_literal_query(
 }
 
 /// Synchronous entry for lifecycle tests whose request factories are not async.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "This test fixture owns and joins the isolated runtime thread that completes the original plan."
+)]
 pub(crate) fn completed_values_plan_blocking(version: [u8; 16]) -> CompletedPlanWithAccess<()> {
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()

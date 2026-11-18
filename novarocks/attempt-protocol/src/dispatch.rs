@@ -1662,4 +1662,6 @@ mod indexed_queue_tests {
         );
         assert!(dispatcher.tracks_input(first_id, grant(1)));
     }
+
+    mod original_pressure_tests;
 }

@@ -2139,6 +2139,10 @@ async fn original_old_and_successor_consumer_causes_stay_separate_through_their_
         )
         .await;
         let (future, joined) = OriginalTailWorkObligation { slot: slot.clone() }.into_future();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This component test retains and joins the original native future or thread to observe its real body and capture exit."
+        )]
         let task = tokio::spawn(future);
         entry.await.unwrap();
         originals.push((slot, Some(joined), task, Some(release), drops));
@@ -2264,6 +2268,10 @@ async fn opaque_consumer_receipt_join_cause_survives_actual_p1_release_until_ori
     let (future, joined) = OriginalTailWorkObligation { slot: slot.clone() }.into_future();
     cut.native_body_exited().unwrap();
     let (release, released) = tokio::sync::oneshot::channel();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This component test retains and joins the original native future or thread to observe its real body and capture exit."
+    )]
     let mut original_task = tokio::spawn(async move {
         released.await.expect("same original Join probe release");
         future.await;
@@ -2438,6 +2446,10 @@ async fn assert_original_consumer_script(mode: ConsumerScript) {
     cut.native_body_exited().unwrap();
     drive_paid_native_fixture(&mut driver);
     assert_eq!(capacity.snapshot().held_positions[2], 1);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This component test retains and joins the original native future or thread to observe its real body and capture exit."
+    )]
     let actual_join = tokio::spawn(future).await;
     let expected = if mode.factory_panics() || mode.poll_panics() {
         consumer_panic()
@@ -3840,3 +3852,6 @@ async fn initial_and_successor_rows_stay_in_same_original_return_slot_after_dorm
         }
     }
 }
+
+#[path = "tests/qualification_windows.rs"]
+mod qualification_windows;

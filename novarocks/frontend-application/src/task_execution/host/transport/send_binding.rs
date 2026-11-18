@@ -669,6 +669,7 @@ impl ResolvedBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod nonempty_split;
     use crate::native::task_transport::wire::{
         AttemptWireFacts, encode_operation, is_lease_renewal,
     };

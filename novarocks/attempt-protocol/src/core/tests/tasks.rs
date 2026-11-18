@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+mod covered_lifetime;
+mod original_properties;
 use crate::port_output::{AttemptAuthorization, AttemptToLogicalBody};
 use crate::{
     AttemptCore,

@@ -220,6 +220,9 @@ impl Loopback {
     /// No declared-but-uncreated Task is made observable by this snapshot.
     pub(crate) fn original_created_task_statuses(&self) -> Vec<TaskStatus> {
         let state = self.peer.state.lock().expect("peer state");
+        if let Some(original) = state.participation_only.as_ref() {
+            return original.statuses();
+        }
         let Some(script) = state.single_root.as_ref() else {
             return Vec::new();
         };

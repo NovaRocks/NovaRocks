@@ -466,6 +466,7 @@ enum TailCase {
     StrictSourceFailure,
     StrictCancellation,
     OrdinaryCompletion,
+    RunningRootBeforeSeal,
     SealVsNativeFailure { seal_first: bool },
 }
 
@@ -486,6 +487,11 @@ async fn demand_driven_tail_completes_at_original_seal_with_live_siblings() {
 }
 
 #[tokio::test]
+async fn same_root_seal_waits_for_running_flushing_and_exact_finished_with_live_siblings() {
+    run_tail_cases([TailCase::RunningRootBeforeSeal]).await;
+}
+
+#[tokio::test]
 async fn original_root_seal_reply_and_native_advance_failure_follow_their_cut_order() {
     run_tail_cases([true, false].map(|seal_first| TailCase::SealVsNativeFailure { seal_first }))
         .await;
@@ -495,7 +501,9 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
     for case in cases {
         let strict = !matches!(
             case,
-            TailCase::OrdinaryCompletion | TailCase::SealVsNativeFailure { .. }
+            TailCase::OrdinaryCompletion
+                | TailCase::RunningRootBeforeSeal
+                | TailCase::SealVsNativeFailure { .. }
         );
         let graph = delivery_chain_graph(if strict {
             ExchangeDeliveryRequirement::MustDrain
@@ -643,8 +651,20 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
         };
         let started = tail.input(sources.actor, AttemptInput::Bootstrap);
         assert_eq!(started.selection, InputSelection::Prefer(sources.native));
+        let root_initial = if matches!(case, TailCase::RunningRootBeforeSeal) {
+            TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(2).unwrap(),
+                TaskState::Running,
+                None,
+                TaskOutputFacts::default(),
+            )
+            .unwrap()
+        } else {
+            finished(root)
+        };
         let initial = tail.observe(vec![
-            observation(finished(root)),
+            observation(root_initial),
             observation(TaskStatus::created(writer)),
             observation(TaskStatus::created(summary)),
         ]);
@@ -772,9 +792,43 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
         }
         let step = tail.input(sources.observation, seal_request());
         assert!(step.root_control_processed.is_some());
-        let reply = tail
-            .drive(step)
-            .expect("the Root seal is independent of strict Task terminal facts");
+        let reply = if matches!(case, TailCase::RunningRootBeforeSeal) {
+            assert!(
+                tail.drive(step).is_none(),
+                "a running Root cannot seal success"
+            );
+            assert!(tail.terminal().is_none());
+            if let Some(delta) = facts.take_changes(activation, root, plan).unwrap() {
+                assert!(!delta.root_success_sealed());
+            }
+            let flushing = TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(3).unwrap(),
+                TaskState::Flushing,
+                None,
+                TaskOutputFacts::default(),
+            )
+            .unwrap();
+            let step = tail.observe(vec![observation(flushing)]);
+            assert!(
+                tail.drive(step).is_none(),
+                "Flushing preserves the SAME pending Seal"
+            );
+            let delta = facts.take_changes(activation, root, plan).unwrap().unwrap();
+            assert!(!delta.root_success_sealed());
+            assert!(delta.tasks().iter().any(|change| {
+                change.identity() == root
+                    && change
+                        .status()
+                        .is_some_and(|status| status.state() == TaskState::Flushing)
+            }));
+            let step = tail.observe(vec![observation(finished(root))]);
+            tail.drive(step)
+                .expect("only exact Root Finished settles the original Seal")
+        } else {
+            tail.drive(step)
+                .expect("the Root seal is independent of strict Task terminal facts")
+        };
         assert_eq!(reply.token, token);
         if strict {
             assert!(reply.withdrawals.is_empty());
@@ -977,7 +1031,7 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
                 }
             }
             TailCase::SealVsNativeFailure { .. } => {}
-            TailCase::OrdinaryCompletion => {
+            TailCase::OrdinaryCompletion | TailCase::RunningRootBeforeSeal => {
                 assert!(matches!(tail.terminal(), Some(PassiveTerminal::Completed)));
                 assert!(sealed.tasks().iter().all(|change| {
                     ![writer, summary].contains(&change.identity())

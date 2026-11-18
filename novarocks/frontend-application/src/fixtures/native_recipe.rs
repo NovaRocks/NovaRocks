@@ -19,6 +19,9 @@
 //! This recipe has no catalog preparation, Native Ready or manifest-access
 //! owner. Its real protocol Sources use the sole production installer.
 
+#[path = "native_recipe/split.rs"]
+pub(crate) mod split;
+
 use super::{FrontendFixture, ProgressBudget, ProgressSelection};
 use crate::control_runtime::FrontendAttemptRuntime;
 use crate::native::{
@@ -149,6 +152,7 @@ impl RecipeGraphSnapshot {
 
 #[derive(Default)]
 pub(crate) struct RecipeObservation {
+    pub(crate) split: Mutex<Option<Arc<split::OriginalSplitObservation>>>,
     #[cfg(novarocks_dev_controls)]
     pub(crate) handoff_binding_gate: Mutex<Option<Arc<OriginalHandoffBindingGate>>>,
     #[cfg(novarocks_dev_controls)]
@@ -1132,6 +1136,22 @@ impl DormantNativeAttemptOwner for RecipeDormant {
                 .expect("same original fixture process");
             let logical = self.logical.bound().unwrap();
             let link = logical.links.borrow(activation).unwrap();
+            let split_observation = { self.observation.split.lock().unwrap().take() };
+            let mut split = match split_observation {
+                Some(observation) => Some(
+                    split::original_plan(
+                        actual.root(),
+                        fragment_id,
+                        task_key,
+                        &self.scope,
+                        &self.window,
+                        &self.data,
+                        observation,
+                    )
+                    .await,
+                ),
+                None => None,
+            };
             let mut inputs = logical.inputs.loan().await.unwrap();
             if self
                 .observation
@@ -1171,10 +1191,11 @@ impl DormantNativeAttemptOwner for RecipeDormant {
                 );
             }
             let lease = RequestedLeaseDurations::DEFAULT;
-            let mut split = None;
             let installed = Arc::new(
                 InstallAttemptHost {
                     fixture_observation_budget: self.fixture_observation_budget,
+                    #[cfg(novarocks_dev_controls)]
+                    fixture_establish_handoff: None,
                     initial_now: novarocks_coordination_contract::MonotonicClock::now(
                         self.clock.as_ref(),
                     ),
@@ -2018,5 +2039,118 @@ impl
             );
             tokio::task::yield_now().await;
         }
+    }
+}
+
+/// SAME concrete assembly used by the installed Source regressions and P14.
+pub(crate) struct OriginalFixture {
+    pub(crate) fixture: FrontendFixture,
+    pub(crate) logical: ActualLogicalCase,
+    pub(crate) process: Arc<FrontendAttemptRuntime>,
+    pub(crate) clock: Arc<ManualClock>,
+    pub(crate) joint: novarocks_workload_control::joint_admission::JointProgressDriver,
+    pub(crate) workload: novarocks_workload_control::WorkloadControl,
+    pub(crate) supervisor: novarocks_query_application::coordination::LogicalExecutionSupervisor,
+    pub(crate) scope: novarocks_workload_control::WorkScope,
+    pub(crate) business: novarocks_workload_control::BusinessPermit,
+    pub(crate) capacity: novarocks_workload_control::ResultCapacityHandle,
+    pub(crate) window: novarocks_workload_control::ResultWindowGrant,
+    pub(crate) cohort:
+        crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
+    pub(crate) requester: novarocks_workload_control::WorkCancellationRequester,
+    pub(crate) output: crate::query_execution::internal_consumer::profile::ProfileComputationOutput,
+}
+pub(crate) fn install_original_fixture(
+    data: &FrontendDataRuntime,
+    descriptor: BackendProcessDescriptor,
+    history: novarocks_control_runtime::history::HistoryCapture,
+) -> OriginalFixture {
+    install_original_fixture_shape(data, descriptor, history, false)
+}
+pub(crate) fn install_original_fixture_shape(
+    data: &FrontendDataRuntime,
+    descriptor: BackendProcessDescriptor,
+    history: novarocks_control_runtime::history::HistoryCapture,
+    three_tasks: bool,
+) -> OriginalFixture {
+    let PreparedOriginalRecipeProcess {
+        mut fixture,
+        process,
+        clock,
+        mut joint,
+        workload,
+        supervisor,
+        client,
+        capacity,
+        handle,
+        descriptor,
+    } = prepare_original_recipe_process(
+        data,
+        descriptor,
+        history,
+        novarocks_workload_control::ResultCapacityConfig::V1,
+        None,
+    );
+    let original = workload
+        .try_begin_root(novarocks_workload_control::WorkRequest::new(
+            novarocks_workload_control::WorkClass::Query,
+        ))
+        .unwrap();
+    let scope = original.owner.scope();
+    let requester = original.owner.cancellation_requester();
+    let window = capacity
+        .try_acquire(
+            &scope,
+            novarocks_workload_control::ResultWindowClass::Internal,
+        )
+        .unwrap();
+    let (description, plan) = count_description();
+    let (consumer, offers, output) =
+        crate::query_execution::internal_consumer::profile::profile_computation_consumer(
+            &description,
+            plan,
+        )
+        .unwrap();
+    let (logical, cohort, output) = install_original_recipe(
+        OriginalRecipeContext {
+            fixture: &mut fixture,
+            joint: &mut joint,
+            process: &process,
+            data,
+            clock: &clock,
+            handle,
+            descriptor,
+            client,
+        },
+        OriginalRecipeOperands {
+            owner: original.owner,
+            binding: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&scope, window.retain_alias()).unwrap(),
+            description,
+            plan,
+            root: if three_tasks {
+                RecipeRoot::EmptyCountOnly.with_three_task_protocol_chain(plan, [2, 3])
+            } else {
+                RecipeRoot::EmptyCountOnly
+            },
+            consumer,
+            offers,
+            output,
+        },
+    );
+    OriginalFixture {
+        fixture,
+        logical,
+        process,
+        clock,
+        joint,
+        workload,
+        supervisor,
+        scope,
+        business: original.business,
+        capacity,
+        window,
+        cohort,
+        requester,
+        output,
     }
 }

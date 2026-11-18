@@ -195,6 +195,172 @@ pub(crate) fn encode_completed_plan_for_test(
     )
 }
 
+/// Explicit component input for the two-core scheduling fixture only. An
+/// empty Values -> Exchange program has no SQL calls, Provider reads/writes
+/// or constant values to reconstruct. Production SQL still requires its SAME
+/// immutable source journal through extract_checked_packages.
+#[cfg(test)]
+pub(crate) fn encode_empty_values_exchange_program_for_test(
+    paired: CompletedPlanWithAccess<FrozenProviderRead>,
+    carrier: &CompiledPackageCarrier,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    use novarocks_physical_plan as p;
+    use novarocks_type_contract::{CompilePhase, ExpressionControlFlow};
+    let (candidate, reads) = paired.into_parts();
+    let plan = candidate.plan();
+    control.checkpoint(CompilePhase::Encode, 0)?;
+    if !reads.is_empty()
+        || plan.fragments().len() != 2
+        || plan.edges().len() != 1
+        || !plan.runtime_filters().is_empty()
+        || !plan.constants().entries().is_empty()
+        || !completed_plan_write_targets(plan).is_empty()
+    {
+        return Err("empty two-core fixture requires exactly one Values/Exchange edge and no runtime access".into());
+    }
+    let edge = plan.edges().values().next().expect("one checked edge");
+    let source = &plan.fragments()[&edge.source.fragment];
+    let destination = &plan.fragments()[&edge.destination.fragment];
+    let source_empty = source.nodes().len() == 1
+        && source
+            .nodes()
+            .values()
+            .all(|node| matches!(&node.kind, NodeKind::Values { rows } if rows.is_empty()));
+    let destination_exchange = destination.nodes().len() == 1
+        && destination.nodes().values().all(|node| matches!(&node.kind, NodeKind::ExchangeSource { edge: original, .. } if *original == edge.id));
+    if edge.kind != p::EdgeKind::Stream
+        || edge.role != p::OutputRole::Relational
+        || edge.delivery != p::DeliveryRequirement::DemandDriven
+        || !source_empty
+        || !destination_exchange
+        || !matches!(source.sink(), p::FragmentSink::Stream { edge: original } if *original == edge.id)
+        || !matches!(
+            source.stage_placement(),
+            p::StagePlacementPolicy::Spread {
+                max_instances: None
+            }
+        )
+        || !matches!(
+            destination.stage_placement(),
+            p::StagePlacementPolicy::Singleton
+        )
+        || !matches!(destination.sink(), p::FragmentSink::RootResult(root) if root.kind() == novarocks_result_contract::RootOutputKind::CountOnly)
+        || plan
+            .result_port()
+            .is_none_or(|port| port.fragment != destination.id())
+        || plan.fragments().values().any(|fragment| {
+            !fragment.expressions().is_empty()
+                || !fragment.summaries().is_empty()
+                || !fragment.runtime_filters().is_empty()
+        })
+    {
+        return Err("empty two-core fixture requires its original zero-expression Values -> CountOnly Exchange program".into());
+    }
+    refuse_uncompiled_plan_shapes(plan)?;
+    let topology = completed_plan_topology(plan)?;
+    let (encodings, capabilities) = split_frozen_reads(reads);
+    if !encodings.is_empty() || !capabilities.is_empty() {
+        return Err("empty two-core fixture retained unexpected Provider access".into());
+    }
+    let mut uses = BTreeMap::new();
+    let mut calls = BTreeMap::new();
+    let mut pruning = BTreeMap::new();
+    let mut admissions = BTreeMap::new();
+    for (&id, fragment) in plan.fragments() {
+        let flow = ExpressionControlFlow::try_new(
+            Vec::new(),
+            Vec::new(),
+            fragment.expressions(),
+            CompilePhase::Validate,
+            control,
+        )
+        .map_err(|error| match error {
+            novarocks_type_contract::ExpressionControlFlowError::Control(cause) => {
+                novarocks_plan_codec::PhysicalEncodeError::Control(cause)
+            }
+            other => format!("empty fixture expression flow: {other:?}").into(),
+        })?;
+        let roots =
+            p::PhysicalRootUses::try_new(fragment, flow, Vec::new(), control).map_err(|error| {
+                match error {
+                    p::RootUseBindingError::Control(cause) => {
+                        novarocks_plan_codec::PhysicalEncodeError::Control(cause)
+                    }
+                    other => format!("empty fixture root uses: {other:?}").into(),
+                }
+            })?;
+        let frozen_calls = p::FrozenFragmentCalls::try_new(fragment, &roots, Vec::new(), control)
+            .map_err(|error| match error {
+            p::FrozenCallError::Control(cause) => {
+                novarocks_plan_codec::PhysicalEncodeError::Control(cause)
+            }
+            other => format!("empty fixture calls: {other:?}").into(),
+        })?;
+        let frozen_pruning = p::FrozenFragmentPruning::try_new(id, Vec::new(), control).map_err(
+            |error| match error {
+                p::FrozenPruningError::Control(cause) => {
+                    novarocks_plan_codec::PhysicalEncodeError::Control(cause)
+                }
+                other => format!("empty fixture pruning: {other:?}").into(),
+            },
+        )?;
+        uses.insert(id, roots);
+        calls.insert(id, frozen_calls);
+        pruning.insert(id, frozen_pruning);
+        admissions.insert(id, *carrier.admission());
+    }
+    let packages = p::extract_fragment_packages(
+        plan,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &uses,
+        &calls,
+        &pruning,
+        &admissions,
+        control,
+    )
+    .map_err(|error| match error {
+        p::FragmentPackageExtractionError::Control(cause) => {
+            novarocks_plan_codec::PhysicalEncodeError::Control(cause)
+        }
+        other => format!("empty fixture package extraction: {other:?}").into(),
+    })?;
+    // These are the SAME production Native facts, frozen-carrier/codec and
+    // capability-binding authors. No alternate installer or runtime is built.
+    let submission = compiled_plan_submission_facts(&candidate, &topology)?;
+    let provenance = mint_native_encoding_provenance();
+    let native = NativeFragmentAttachment::for_completed_plan(
+        freeze_completed_packages(
+            packages,
+            plan,
+            &submission,
+            topology.anchor,
+            carrier,
+            control,
+            EncodingAuthor::SemanticFixture,
+        )?,
+        topology.anchor,
+    )?;
+    let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
+    let plan_facts = AttemptPlanFacts::from_completed(
+        scheduling,
+        completed_plan_edge_facts(plan)?,
+        completed_plan_scan_facts(plan, &encodings)?,
+        submission,
+        AttemptRuntimeFilterFacts::from_completed(plan)?,
+        completed_plan_write_root_facts(plan, false)?,
+    );
+    control.checkpoint(CompilePhase::Encode, 0)?;
+    EncodedStaticPlan {
+        candidate,
+        native,
+        topology,
+        plan_facts,
+    }
+    .bind_capabilities(capabilities)
+}
+
 fn encode_completed_plan_authored(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,

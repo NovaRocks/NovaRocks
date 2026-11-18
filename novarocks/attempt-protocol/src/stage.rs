@@ -973,3 +973,6 @@ mod aggregate_tests {
 pub(crate) mod derivation;
 
 pub(crate) mod demand;
+
+#[cfg(test)]
+mod original_properties;

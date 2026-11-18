@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+mod original_properties;
 use crate::port_output::{AbortIssueSettlement, AttemptTerminal, AttemptToLogicalBody};
 use crate::{
     AttemptCore,

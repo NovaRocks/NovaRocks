@@ -1790,6 +1790,8 @@ impl ProjectedManifestAttempt {
         let original = InstallAttemptHost {
             #[cfg(test)]
             fixture_observation_budget: None,
+            #[cfg(all(test, novarocks_dev_controls))]
+            fixture_establish_handoff: fixture_row.as_deref(),
             initial_now,
             process: &process,
             data: &host.runtime.data_runtime,

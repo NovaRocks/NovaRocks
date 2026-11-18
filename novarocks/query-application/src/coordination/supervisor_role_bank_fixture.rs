@@ -322,7 +322,11 @@ impl TestProgressOwner {
             failure: None,
             joined: false,
         };
-        owner.join = Some(Handle::current().spawn(async move {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This fixture retains the supervisor service JoinHandle and observes its actual shutdown or join failure."
+        )]
+        let join = Handle::current().spawn(async move {
             let interval = Duration::from_millis(1);
             let mut recheck = tokio::time::Instant::now() + interval;
             let mut timer = Box::pin(tokio::time::sleep_until(recheck));
@@ -352,7 +356,8 @@ impl TestProgressOwner {
                     }
                 }
             }
-        }));
+        });
+        owner.join = Some(join);
         owner
     }
     async fn finish(&mut self) {

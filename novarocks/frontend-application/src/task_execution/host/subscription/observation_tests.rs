@@ -4043,3 +4043,6 @@ mod native_blackhole;
 
 #[path = "observation_tests/native_unread.rs"]
 mod native_unread;
+
+#[path = "observation_tests/oversized_receive.rs"]
+mod oversized_receive;

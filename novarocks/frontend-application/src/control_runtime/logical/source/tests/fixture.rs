@@ -330,9 +330,11 @@ pub(in crate::control_runtime::logical) fn assemble_logical(
     let scope = funding.scope().clone();
     let failure_work = funding.reserve_reported(WorkKind::Cleanup, 0).unwrap();
     let disposal_work = funding.reserve_reported(WorkKind::Cleanup, 0).unwrap();
+    let observations = Arc::new(super::super::super::observation::LogicalObservations::new());
     let actor = wrap(LogicalActor::new(
         LogicalExecutionCore::new(start.clone()),
         funding.step_reservations(),
+        observations.clone(),
     ));
     let registration = runtime
         .register_supervised_bound_with_source_cut(
@@ -389,6 +391,7 @@ pub(in crate::control_runtime::logical) fn assemble_logical(
     let bootstrap = inputs.bootstrap();
     let inputs = LogicalInputBank::new(inputs, wake.clone());
     let links = LogicalAttemptLinks::new(geometry.attempts, wake.clone(), failure.reporter());
+    links.bind_observations(observations);
     let parts = LogicalParts {
         registration: registration.clone(),
         geometry: geometry.clone(),

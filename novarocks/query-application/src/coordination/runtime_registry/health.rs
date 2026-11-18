@@ -351,6 +351,10 @@ mod tests {
         let registry = LogicalExecutionHealth::new(Arc::new(Notify::new()));
         let drops = Arc::new(AtomicUsize::new(0));
         let original = Arc::clone(&drops);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This test awaits the actual task JoinError and checks that its original panic payload remains in health custody."
+        )]
         let error = tokio::spawn(async move {
             std::panic::panic_any(PanicPayload(original));
         })

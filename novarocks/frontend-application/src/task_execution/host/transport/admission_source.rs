@@ -342,6 +342,27 @@ impl AdmissionSource {
         self.failures.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn failure_records_for_fixture(
+        &self,
+    ) -> std::sync::Weak<Mutex<BTreeMap<HostFailureRef, TaskExecutionError>>> {
+        Arc::downgrade(&self.failures)
+    }
+
+    /// Borrow the exact admission failure without taking its rich owner.
+    #[cfg(test)]
+    pub(crate) fn workload_failure_for_fixture(
+        records: &std::sync::Weak<Mutex<BTreeMap<HostFailureRef, TaskExecutionError>>>,
+        reference: HostFailureRef,
+    ) -> Option<novarocks_workload_control::WorkError> {
+        let original = records.upgrade()?;
+        let records = original.lock().expect("original admission failure records");
+        match records.get(&reference)? {
+            TaskExecutionError::Workload(error) => Some(error.clone()),
+            _ => None,
+        }
+    }
+
     pub(super) fn take_unselected_failure(
         &mut self,
     ) -> Option<(HostFailureRef, TaskExecutionError)> {

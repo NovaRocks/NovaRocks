@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(not(loom))]
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, ActorStep, InputSourceCut},
     actor_turn::{ActorRuntime, TimerSourceState},

@@ -705,7 +705,9 @@ impl SingleRootLifecycle {
 struct PeerState {
     original_root_socket: Option<std::net::SocketAddr>,
     single_root: Option<SingleRootLifecycle>,
+    participation_only: Option<participation_recipe::ParticipationOnly>,
     applied: Vec<proto::ApplyTaskOperationsRequest>,
+    single_root_abort_refusals: Vec<(TaskOperationId, tonic::Code)>,
     control_requests: usize,
     heartbeat_descriptor: Option<BackendProcessDescriptor>,
     heartbeats: Vec<proto::HeartbeatRequest>,
@@ -736,6 +738,15 @@ impl TaskWirePeer {
         request: Request<proto::ApplyTaskOperationsRequest>,
     ) -> Result<Response<proto::ApplyTaskOperationsResponse>, Status> {
         let request = request.into_inner();
+        if self
+            .state
+            .lock()
+            .expect("peer state")
+            .participation_only
+            .is_some()
+        {
+            return self.apply_participation_only(request);
+        }
         let (scripted, create_gate) = {
             let state = self.state.lock().expect("peer state");
             let script = state.single_root.as_ref();
@@ -859,7 +870,10 @@ impl TaskWirePeer {
         let mut state = self.state.lock().expect("peer state");
         state.applied.push(request.clone());
         let PeerState {
-            single_root, held, ..
+            single_root,
+            held,
+            single_root_abort_refusals,
+            ..
         } = &mut *state;
         let script = single_root
             .as_mut()
@@ -1050,7 +1064,13 @@ impl TaskWirePeer {
                     ))
                 }
                 D::AbortParticipation(abort) => {
-                    script.require_participation(abort.participation())?;
+                    if let Err(error) = script.require_participation(abort.participation()) {
+                        // Preserve the actual refusal code of this same RPC;
+                        // this is not a Worker acknowledgement or close fact.
+                        single_root_abort_refusals
+                            .push((abort.envelope().operation_id(), error.code()));
+                        return Err(error);
+                    }
                     if !script.released {
                         script.abort_cause = Some(abort.cause());
                     } else {
@@ -1520,6 +1540,15 @@ impl NovaRocksGrpc for TaskWirePeer {
         if !NativeRpcMethod::SubscribeTaskStatus.is_allowed_at(self.domain) {
             return Err(Self::rejected("wrong endpoint domain"));
         }
+        if self
+            .state
+            .lock()
+            .expect("peer state")
+            .participation_only
+            .is_some()
+        {
+            return self.subscribe_participation_only(request.into_inner());
+        }
         let (scripted, first_response) = {
             let mut state = self.state.lock().expect("peer state");
             let script = state.single_root.as_mut();
@@ -1582,6 +1611,9 @@ impl NovaRocksGrpc for TaskWirePeer {
         request: Request<proto::GetFinalTaskInfoRequest>,
     ) -> Result<Response<proto::GetFinalTaskInfoResponse>, Status> {
         let mut state = self.state.lock().expect("peer state");
+        if let Some(original) = state.participation_only.as_mut() {
+            return original.final_info(request.into_inner());
+        }
         let Some(script) = state
             .single_root
             .as_mut()
@@ -2034,6 +2066,7 @@ impl Loopback {
         let mut state = self.peer.state.lock().expect("peer state");
         assert!(
             state.single_root.is_none()
+                && state.participation_only.is_none()
                 && state.applied.is_empty()
                 && state.subscribed.is_empty()
                 && state.apply_answers.is_empty()
@@ -2088,6 +2121,9 @@ impl Loopback {
             ));
         }
         let mut state = self.peer.state.lock().expect("peer state");
+        if let Some(original) = state.participation_only.as_mut() {
+            return original.declare_final_info(task, operators, truncated);
+        }
         let script = state.single_root.as_mut().ok_or_else(|| {
             Status::failed_precondition("declare the original root before its diagnostic payload")
         })?;
@@ -2113,6 +2149,9 @@ impl Loopback {
     /// Actual successful codec/RPC reads, without exposing any Source or owner.
     pub(crate) fn original_final_task_info_reads(&self) -> Vec<TaskIdentity> {
         let state = self.peer.state.lock().expect("peer state");
+        if let Some(original) = state.participation_only.as_ref() {
+            return original.final_info_reads();
+        }
         state.single_root.as_ref().map_or_else(Vec::new, |script| {
             script
                 .final_info
@@ -2370,6 +2409,14 @@ impl Loopback {
 
     pub(crate) fn applied_requests(&self) -> Vec<proto::ApplyTaskOperationsRequest> {
         self.peer.applied()
+    }
+    pub(crate) fn single_root_abort_refusals(&self) -> Vec<(TaskOperationId, tonic::Code)> {
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root_abort_refusals
+            .clone()
     }
 
     pub(crate) fn expect_transport_unknown(&self) {
@@ -4778,3 +4825,6 @@ async fn a_cancel_settles_on_its_outcome_and_ignores_its_status_body() {
 mod original_root_connection;
 #[path = "tests/three_task_recipe.rs"]
 mod three_task_recipe;
+
+#[path = "tests/participation_recipe.rs"]
+mod participation_recipe;
