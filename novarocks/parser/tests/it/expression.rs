@@ -310,13 +310,59 @@ fn parenthesized_query_and_expression_alternatives_preserve_the_complete_context
 }
 
 #[test]
-fn array_constructor_requires_its_array_keyword() {
-    for source in ["[]", "[1,2]", "f([?])"] {
-        assert!(parse_expression(source).is_err(), "{source}");
+fn array_constructor_spellings_share_the_same_ast_and_keep_the_real_span() {
+    for (bare, explicit, length) in [("[]", "ARRAY[]", 0), ("[1,2]", "ARRAY[1,2]", 2)] {
+        let bare_expression = parse_expression(bare).unwrap();
+        let explicit_expression = parse_expression(explicit).unwrap();
+        let Expr::Array(array) = &bare_expression else {
+            panic!("bare array constructor");
+        };
+        assert_eq!(array.values.len(), length);
+        assert_eq!(array.span, Span::new(0, bare.len()));
+        assert_eq!(explicit_expression.span(), Span::new(0, explicit.len()));
+        assert!(bare_expression.syntax_eq(&explicit_expression));
     }
-    for source in ["ARRAY[]", "ARRAY[1,2]", "f(ARRAY[?])"] {
-        assert!(parse_expression(source).is_ok(), "{source}");
-    }
+
+    let call = parse_expression("f([?])").unwrap();
+    let Expr::FunctionCall(arguments) = &call else {
+        panic!("function call");
+    };
+    let Expr::Array(array) = &arguments.arguments[0].value else {
+        panic!("bare array argument");
+    };
+    assert_eq!(array.span, Span::new(2, 5));
+    assert!(
+        matches!(&array.values[0], Expr::Parameter(value) if value.position == 0 && value.span == Span::new(3, 4))
+    );
+    assert!(call.syntax_eq(&parse_expression("f(ARRAY[?])").unwrap()));
+}
+
+#[test]
+fn array_and_subscript_bind_as_distinct_primary_and_postfix_nodes() {
+    let source = "[1,2][1] + x[2]";
+    let Expr::Binary(sum) = parse_expression(source).unwrap() else {
+        panic!("sum");
+    };
+    assert_eq!(sum.operator, BinaryOperator::Add);
+    let (Expr::Subscript(left), Expr::Subscript(right)) = (sum.left.as_ref(), sum.right.as_ref())
+    else {
+        panic!("two independent subscripts");
+    };
+    assert!(matches!(&left.base, Expr::Array(value) if value.values.len() == 2));
+    assert_eq!(left.base.span(), Span::new(0, 5));
+    assert_eq!(left.span, Span::new(0, 8));
+    assert!(matches!(&right.base, Expr::Identifier(name) if name.value == "x"));
+    assert_eq!(right.span, Span::new(11, 15));
+    assert!(parse_expression("[1,]").is_err());
+    assert!(parse_expression("x[1,2]").is_err());
+}
+
+#[test]
+fn parenthesized_values_accepts_a_bare_array_in_its_row() {
+    use novarocks_parser::trino_parser::parse_query;
+    let actual = parse_query("SELECT x[1] FROM (VALUES ROW([11,12])) AS t(x)").unwrap();
+    let explicit = parse_query("SELECT x[1] FROM (VALUES ROW(ARRAY[11,12])) AS t(x)").unwrap();
+    assert!(syntax_eq_query(&actual, &explicit));
 }
 
 #[test]

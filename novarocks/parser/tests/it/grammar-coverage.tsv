@@ -567,9 +567,9 @@ alternative	primaryExpression	21	cast	0	VALUES TRY_CAST ( ? AS x )	supported	acc
 optional	primaryExpression	22		1	VALUES ARRAY [ ? , ? ]	supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	22		2	VALUES ARRAY [ ? ]	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	22	arrayConstructor	0	VALUES ARRAY [ ]	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	23		1	VALUES ARRAY[ ? , ? ]	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	23		2	VALUES ARRAY[ ? ]	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	23	arrayConstructor	0	VALUES ARRAY[ ]	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	23		1	VALUES [ ? , ? ]	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	23		2	VALUES [ ? ]	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	23	arrayConstructor	0	VALUES [ ]	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	24	subscript	0	VALUES ? [ ? ]	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	25	arrayWildcardSubscript	0	VALUES ? [ * ]	parsed-not-supported	accept	reviewed-grammar-path	upstream-formatter-missing
 alternative	primaryExpression	26	columnReference	0	VALUES x	supported	accept	reviewed-grammar-path	none
@@ -2180,8 +2180,8 @@ alternative	primaryExpression	18		g1.b1	VALUES CASE ? WHEN ? THEN ? ELSE ? END	s
 alternative	primaryExpression	19		g1.b1	VALUES CASE WHEN ? THEN ? ELSE ? END	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	22		g1.b1.g1.b1	VALUES ARRAY [ ? , ? ]	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	22		g1.b1	VALUES ARRAY [ ? ]	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	23		g1.b1.g1.b1	VALUES ARRAY[ ? , ? ]	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	23		g1.b1	VALUES ARRAY[ ? ]	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	23		g1.b1.g1.b1	VALUES [ ? , ? ]	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	23		g1.b1	VALUES [ ? ]	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	30		g1.b1	VALUES CURRENT_TIME ( 1 )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	31		g1.b1	VALUES CURRENT_TIMESTAMP ( 1 )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	32		g1.b1	VALUES LOCALTIME ( 1 )	supported	accept	reviewed-grammar-path	none

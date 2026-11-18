@@ -588,6 +588,7 @@ impl Parser<'_> {
                 self.bump();
                 self.array_expression(start)?
             }
+            T::Symbol(S::LBracket) => self.array_expression(start)?,
             T::Keyword(K::Row) if self.peek(1).kind == T::Symbol(S::LParen) => {
                 self.bump();
                 self.expect_symbol(S::LParen)?;
