@@ -576,21 +576,46 @@ impl WritePublicationDispatch {
         }
     }
 }
+pub(super) struct ReceivedOperation {
+    operation: IcebergCommitOperation,
+    journal: PublicationJournal<ConnectorWriteReceipt>,
+    recipe: Result<WriteRecipe, ConnectorError>,
+}
+
 impl IcebergWriteSessionControl {
-    pub(super) async fn dispatch_operation_async(
+    pub(super) fn prepare_received_operation(
         &self,
         handle: &IcebergWriteCommitSession,
         validated: &[ValidatedFragment<'_>],
-        statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
         documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
         context: &ConnectorRequestContext,
-    ) -> Result<WritePublicationDispatch, ConnectorError> {
+    ) -> Result<ReceivedOperation, ConnectorError> {
         let (operation, journal) = self.adopt_received_operation(handle, validated, context)?;
         let recipe = WriteRecipe::freeze(handle, validated, documents);
+        Ok(ReceivedOperation {
+            operation,
+            journal,
+            recipe,
+        })
+    }
+
+    pub(super) async fn dispatch_operation_async(
+        &self,
+        handle: &IcebergWriteCommitSession,
+        prepared: ReceivedOperation,
+        statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
+        publishes_documents: bool,
+        context: &ConnectorRequestContext,
+    ) -> WritePublicationDispatch {
+        let ReceivedOperation {
+            operation,
+            journal,
+            recipe,
+        } = prepared;
         let recipe = match recipe {
             Ok(recipe) => recipe,
             Err(error) => {
-                let error = if documents.is_some() {
+                let error = if publishes_documents {
                     crate::document_storage::keyed::write::refusal_with_retained_bytes_async(
                         &self.runtime,
                         handle.table().namespace(),
@@ -602,35 +627,35 @@ impl IcebergWriteSessionControl {
                 } else {
                     error
                 };
-                return Ok(WritePublicationDispatch::settled(
+                return WritePublicationDispatch::settled(
                     self.reject_operation(handle, &operation, error).await,
-                ));
+                );
             }
         };
         let data = match recipe.preparer() {
             Ok(data) => data,
             Err(error) => {
-                return Ok(WritePublicationDispatch::settled(
+                return WritePublicationDispatch::settled(
                     self.reject_operation(handle, &operation, error).await,
-                ));
+                );
             }
         };
         let policy = match RetryPolicy::from_properties(recipe.source.properties()) {
             Ok(policy) => policy,
             Err(error) => {
-                return Ok(WritePublicationDispatch::settled(
+                return WritePublicationDispatch::settled(
                     self.reject_operation(handle, &operation, format_error_to_connector(error))
                         .await,
-                ));
+                );
             }
         };
         let template =
             match RecoveryTemplate::from_handle(&self.descriptor, self.key.incarnation, handle) {
                 Ok(template) => template,
                 Err(error) => {
-                    return Ok(WritePublicationDispatch::settled(
+                    return WritePublicationDispatch::settled(
                         self.reject_operation(handle, &operation, error).await,
-                    ));
+                    );
                 }
             };
         let preflight_journal = journal.clone();
@@ -759,10 +784,10 @@ impl IcebergWriteSessionControl {
             mut finalization,
         } = outcome
         else {
-            return Ok(WritePublicationDispatch {
+            return WritePublicationDispatch {
                 outcome,
                 cleanup: None,
-            });
+            };
         };
         let snapshot_id =
             journal
@@ -818,7 +843,7 @@ impl IcebergWriteSessionControl {
         if let Some(entry) = journal.current_entry() {
             journal.record_entry_finalization(entry, finalization.clone());
         }
-        Ok(WritePublicationDispatch {
+        WritePublicationDispatch {
             outcome: WritePublicationVerdict::KnownCommitted {
                 cleanup,
                 effect,
@@ -826,7 +851,7 @@ impl IcebergWriteSessionControl {
                 finalization,
             },
             cleanup: Some((operation, journal)),
-        })
+        }
     }
 
     fn adopt_received_operation(
@@ -854,7 +879,6 @@ impl IcebergWriteSessionControl {
             operation.token(),
             self.runtime.resources().catalog_runtime(),
         );
-        handle.retain_publication(operation.clone(), journal.clone())?;
         // Physical ownership deduplicates objects, while intent keeps full DV identities.
         let objects: BTreeSet<_> = validated
             .iter()
@@ -865,13 +889,16 @@ impl IcebergWriteSessionControl {
                 .adopt_session_data(ObjectIdentity::new(path).map_err(|e| corrupt(e.to_string()))?)
                 .map_err(|e| internal(e.to_string()))?;
         }
+        // Publish the original owner only after adoption has completed, with
+        // no asynchronous boundary or created side effect in between.
+        handle.retain_publication(operation.clone(), journal.clone())?;
         Ok((operation, journal))
     }
 
     pub(super) async fn cleanup_received_set_async(
         &self,
         handle: &IcebergWriteCommitSession,
-        received: &ConnectorPreparedWriteSet,
+        received: IcebergReceiving,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationFinalization, ConnectorError> {
         if !matches!(
@@ -887,11 +914,12 @@ impl IcebergWriteSessionControl {
                 "staged target publication retains its own sealed object cleanup authority",
             ));
         }
-        // The caller must have transferred the exact completed Session union;
-        // the same Provider additionally checks binding/targets/fragment facts.
-        // No ref/live-set scan and no old-reference path is adopted for deletion.
-        let validated = validate_prepared_set(handle, &self.adapter, received)?;
+        // This is the original confirmed receiver won by the release or
+        // refused finish. No ref/live-set scan or old reference grants deletion.
+        let validated = validate_received_set(handle, &self.adapter, &received)?;
         let (operation, _) = self.adopt_received_operation(handle, &validated, context)?;
+        drop(validated);
+        drop(received);
         let cleanup = {
             let mut original = std::pin::pin!(operation.cleanup(CleanupScope::EntireOperation));
             let report =

@@ -44,6 +44,7 @@ pub(crate) mod flavor;
 pub mod old_delete;
 pub mod planning;
 pub(crate) mod program_recipe;
+pub(crate) mod receiving;
 pub(crate) mod repartition;
 pub(crate) mod runtime;
 

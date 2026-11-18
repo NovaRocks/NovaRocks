@@ -147,7 +147,6 @@ fn provider_position_rewrite_preparation_begins_with_its_exact_identity_roles() 
                 commit: session.commit_session(),
                 production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
                 context: request_context(),
-                received: None,
             })
             .unwrap(),
         ConnectorWriteAbortOutcome::KnownUncommitted { .. }
@@ -418,7 +417,6 @@ fn empty_delete_session(version: crate::iceberg::spec::FormatVersion, variant: b
                 commit: session.commit_session(),
                 production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
                 context,
-                received: None,
             })
             .unwrap(),
         ConnectorWriteAbortOutcome::KnownUncommitted { .. }
@@ -521,8 +519,7 @@ fn ordinary_equality_delete_sessions_apply_the_existing_table_shape_guards() {
                         commit: session.commit_session(),
                         production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
                         context,
-                        received: None,
-                    })
+                            })
                     .unwrap();
                 assert!(
                     expected.is_none(),

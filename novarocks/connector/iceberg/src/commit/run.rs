@@ -185,15 +185,14 @@ mod keyed_publication_trace_tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use crate::commit::write_stack::test_support::receive_write_query;
     use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
+    use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
     use novarocks_spi::connector::write_stack::session::{
         ConnectorWriteBeginRequest, ConnectorWriteControl, ConnectorWriteFinishPublication,
         ConnectorWriteFinishRequest, ConnectorWriteSessionFlavor,
         ConnectorWriteSessionReconcileRequest,
-    };
-    use novarocks_spi::connector::write_stack::{
-        ConnectorManagedPublicationShape, ConnectorPreparedWriteSet,
     };
     use novarocks_spi::connector::{
         CatalogProperties, ConnectorControlBinding, ConnectorControlPlanningPin,
@@ -748,15 +747,17 @@ mod keyed_publication_trace_tests {
             })
             .expect("begin zero-row ordinary append");
         let session_marker = iceberg_handle(&fixture, &plan).session_id().to_string();
+        receive_write_query(
+            &control,
+            plan.commit_session(),
+            &plan.expected_targets(),
+            Vec::new(),
+        )
+        .expect("complete empty write query");
         let outcome = control
             .finish_write(ConnectorWriteFinishRequest {
                 commit: plan.commit_session(),
-                prepared: ConnectorPreparedWriteSet::try_new(
-                    0,
-                    Vec::new(),
-                    &plan.expected_targets(),
-                )
-                .expect("complete empty write set"),
+                row_count: 0,
                 statistics: Vec::new(),
                 publication: ConnectorWriteFinishPublication::None,
                 context: context(),
@@ -807,6 +808,6 @@ mod keyed_publication_trace_tests {
 
     mod keyed_session_tests {
         use super::*;
-        include!("run/keyed_session_tests.rs");
+        include!("run/tests.rs");
     }
 }

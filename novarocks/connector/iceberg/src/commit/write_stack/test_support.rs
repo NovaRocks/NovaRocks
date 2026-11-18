@@ -40,7 +40,9 @@ use crate::delete_file::IcebergFileFormat;
 use crate::write_descriptor::IcebergPartitionDescriptor;
 
 use novarocks_spi::connector::write_stack::{
-    ConnectorWriteProductionProof, ConnectorWriterPhysicalContext, WriteTargetOrdinal,
+    ConnectorCommitFragment, ConnectorWriteCommitSession, ConnectorWriteControl,
+    ConnectorWriteProductionProof, ConnectorWriteQueryIdentity, ConnectorWriterPhysicalContext,
+    WriteTargetOrdinal,
 };
 use std::sync::Arc;
 
@@ -62,6 +64,27 @@ pub(crate) fn received_write_proof(
         }
     }
     Arc::new(ExactWriter { target, physical })
+}
+
+pub(crate) fn write_query_identity() -> ConnectorWriteQueryIdentity {
+    ConnectorWriteQueryIdentity::try_new(*uuid::Uuid::now_v7().as_bytes(), 1, [2; 16]).unwrap()
+}
+
+pub(crate) fn receive_write_query(
+    control: &dyn ConnectorWriteControl,
+    commit: &ConnectorWriteCommitSession,
+    targets: &[WriteTargetOrdinal],
+    fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
+) -> Result<(), ConnectorError> {
+    let query = write_query_identity();
+    control.begin_write_query(commit, &query, targets, None)?;
+    control.arrive_write_fragments(
+        commit,
+        &query,
+        fragments,
+        &novarocks_spi::connector::ConnectorPayloadRetentionGuard::new(()),
+    )?;
+    control.confirm_write_received(commit, &query)
 }
 
 pub(crate) fn writer_resources() -> ConnectorExecutionResources {

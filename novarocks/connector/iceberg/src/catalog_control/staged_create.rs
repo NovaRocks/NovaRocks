@@ -4562,12 +4562,11 @@ mod tests {
             IcebergWriteSessionPlanInput, plan_write_session,
         };
         use crate::commit::write_stack::test_support::{
-            data_branch_plan, sample_metrics, sample_partition,
+            data_branch_plan, receive_write_query, sample_metrics, sample_partition,
         };
         use crate::rest_protocol::test_server::{Script, TestServer};
         use novarocks_spi::connector::write_stack::{
-            ConnectorPreparedWriteSet, ConnectorWriteControl, ConnectorWriteFinishRequest,
-            WriteTargetOrdinal,
+            ConnectorWriteControl, ConnectorWriteFinishRequest, WriteTargetOrdinal,
         };
         use novarocks_spi::connector::{
             ConnectorWriteAdmissionPurpose, ConnectorWriteReceipt, ExternalMutationOutcome,
@@ -4711,17 +4710,18 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let set = ConnectorPreparedWriteSet::try_new(
-                3,
+            receive_write_query(
+                &control,
+                &commit,
+                &expected,
                 vec![(
                     WriteTargetOrdinal::try_new(0).unwrap(),
                     source_adapter.wrap_commit_fragment(fragment),
                 )],
-                &expected,
             )
             .unwrap();
             let outcome = control.finish_write(ConnectorWriteFinishRequest {
-                commit: &commit, prepared: set, statistics: vec![],
+                commit: &commit, row_count: 3, statistics: vec![],
                 publication: novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
                 context: context(),
             }).unwrap();

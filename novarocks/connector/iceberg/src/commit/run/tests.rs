@@ -197,12 +197,22 @@ fn keyed_begin(prepared: &PreparedKeyed) -> ConnectorWriteBeginRequest {
 }
 
 fn empty_keyed_finish<'a>(
+    control: &dyn ConnectorWriteControl,
     plan: &'a novarocks_spi::connector::write_stack::session::ConnectorWriteSessionPlan,
     prepared: &PreparedKeyed,
 ) -> ConnectorWriteFinishRequest<'a> {
+    if prepared.declaration.technique() != ConnectorManagedPublicationTechnique::MetadataOnly {
+        receive_write_query(
+            control,
+            plan.commit_session(),
+            &plan.expected_targets(),
+            Vec::new(),
+        )
+        .unwrap();
+    }
     ConnectorWriteFinishRequest {
         commit: plan.commit_session(),
-        prepared: ConnectorPreparedWriteSet::try_new(0, vec![], &plan.expected_targets()).unwrap(),
+        row_count: 0,
         statistics: vec![],
         publication: ConnectorWriteFinishPublication::KeyedDocuments(prepared.intent.clone()),
         context: context(),
@@ -276,7 +286,7 @@ async fn real_keyed_empty_full_begin_finish_reasserts_closure_with_v4_evidence()
         let control = write_control(&fixture);
         let plan = control.begin_write(keyed_begin(&prepared)).unwrap();
         let result = control
-            .finish_write(empty_keyed_finish(&plan, &prepared))
+            .finish_write(empty_keyed_finish(&control, &plan, &prepared))
             .unwrap();
         let ExternalMutationOutcome::KnownCommitted {
             receipt,
@@ -365,7 +375,7 @@ async fn keyed_full_zero_output_that_removes_live_files_is_delete() {
     let plan = control.begin_write(keyed_begin(&prepared)).unwrap();
     assert!(matches!(
         control
-            .finish_write(empty_keyed_finish(&plan, &prepared))
+            .finish_write(empty_keyed_finish(&control, &plan, &prepared))
             .unwrap(),
         ExternalMutationOutcome::KnownCommitted { .. }
     ));
@@ -390,7 +400,8 @@ async fn keyed_data_finish<'a>(
     prepared: &PreparedKeyed,
 ) -> (ConnectorWriteFinishRequest<'a>, String) {
     use crate::commit::write_stack::execution::IcebergWriteStackExecution;
-    use crate::commit::write_stack::test_support::received_write_proof;
+    use crate::commit::write_stack::test_support::{received_write_proof, write_query_identity};
+    use novarocks_spi::connector::ConnectorPayloadRetentionGuard;
     use novarocks_spi::connector::write_stack::{
         ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterPhysicalContext,
     };
@@ -431,6 +442,16 @@ async fn keyed_data_finish<'a>(
         0,
         target.ordinal().get(),
     );
+    let control = write_control(fixture);
+    let query = write_query_identity();
+    control
+        .begin_write_query(
+            plan.commit_session(),
+            &query,
+            &[target.ordinal()],
+            Some(received_write_proof(target.ordinal(), physical)),
+        )
+        .unwrap();
     let mut writer = execution
         .open_writer(ConnectorOpenWriterRequest {
             resources: Some(crate::commit::write_stack::test_support::writer_resources()),
@@ -453,20 +474,24 @@ async fn keyed_data_finish<'a>(
         .new_object_path()
         .unwrap()
         .to_owned();
-    let received = ConnectorPreparedWriteSet::try_new(
-        1,
-        fragments
-            .into_iter()
-            .map(|fragment| (target.ordinal(), fragment))
-            .collect(),
-        &plan.expected_targets(),
-    )
-    .unwrap()
-    .with_received_production(received_write_proof(target.ordinal(), physical));
+    control
+        .arrive_write_fragments(
+            plan.commit_session(),
+            &query,
+            fragments
+                .into_iter()
+                .map(|fragment| (target.ordinal(), fragment))
+                .collect(),
+            &ConnectorPayloadRetentionGuard::new(()),
+        )
+        .unwrap();
+    control
+        .confirm_write_received(plan.commit_session(), &query)
+        .unwrap();
     (
         ConnectorWriteFinishRequest {
             commit: plan.commit_session(),
-            prepared: received,
+            row_count: 1,
             statistics: vec![],
             publication: ConnectorWriteFinishPublication::KeyedDocuments(prepared.intent.clone()),
             context: context(),
@@ -811,7 +836,7 @@ async fn real_keyed_incremental_row_mutation_prepares_begins_and_finishes_one_ex
     );
     assert!(fixture.catalog.commits().is_empty());
     let result = control
-        .finish_write(empty_keyed_finish(&plan, &prepared))
+        .finish_write(empty_keyed_finish(&control, &plan, &prepared))
         .unwrap();
     let ExternalMutationOutcome::KnownCommitted {
         receipt,
@@ -917,7 +942,7 @@ async fn real_keyed_eager_repartition_prepares_begins_and_finishes_one_exact_pub
         .unwrap();
     assert!(fixture.catalog.commits().is_empty());
     let result = control
-        .finish_write(empty_keyed_finish(&plan, &prepared))
+        .finish_write(empty_keyed_finish(&control, &plan, &prepared))
         .unwrap();
     let ExternalMutationOutcome::KnownCommitted {
         receipt,
