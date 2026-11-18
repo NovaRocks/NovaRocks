@@ -24,7 +24,7 @@
 -- 1. Evaluate BITNOT on negative/zero/positive BIGINT literals.
 -- 2. Assert scalar output matches StarRocks semantics.
 SELECT
-  ~CAST(-1 AS BIGINT) AS n_neg1,
-  ~CAST(0 AS BIGINT) AS n_zero,
-  ~CAST(1 AS BIGINT) AS n_pos1,
-  ~CAST(1024 AS BIGINT) AS n_1024;
+  bitnot(CAST(-1 AS BIGINT)) AS n_neg1,
+  bitnot(CAST(0 AS BIGINT)) AS n_zero,
+  bitnot(CAST(1 AS BIGINT)) AS n_pos1,
+  bitnot(CAST(1024 AS BIGINT)) AS n_1024;
