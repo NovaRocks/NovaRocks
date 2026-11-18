@@ -274,12 +274,21 @@ impl Parser<'_> {
     }
 
     fn predicate_start(&self) -> bool {
+        // MATCH is non-reserved. A projection may use it as an alias when
+        // the next token cannot begin the predicate's tail.
+        let match_predicate = self.at_keyword(K::Match)
+            && (!self.alias_follow
+                || matches!(
+                    self.peek(1).kind,
+                    T::Symbol(S::LParen) | T::Keyword(K::Unique | K::Simple | K::Partial | K::Full)
+                ));
         matches!(
             self.peek(0).kind,
             T::Symbol(S::Eq | S::Neq | S::Lt | S::Lte | S::Gt | S::Gte)
-                | T::Keyword(K::Between | K::In | K::Like | K::Is | K::Overlaps | K::Match)
+                | T::Keyword(K::Between | K::In | K::Like | K::Is | K::Overlaps)
         ) || (self.at_keyword(K::Not)
             && matches!(self.peek(1).kind, T::Keyword(K::Between | K::In | K::Like)))
+            || match_predicate
     }
 
     fn comparison_operator(&mut self) -> Result<ComparisonOperator, ParserError> {

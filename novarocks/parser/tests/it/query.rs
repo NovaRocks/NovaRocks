@@ -44,6 +44,31 @@ fn parameter(expression: &Expr) -> usize {
 }
 
 #[test]
+fn match_can_name_a_projection_or_start_a_predicate() {
+    let implicit = query("SELECT (ARRAY[1] IN (SELECT ARRAY[1])) match");
+    let explicit = query("SELECT ARRAY[1] IN (SELECT ARRAY[1]) AS match");
+    assert!(implicit.syntax_eq(&explicit));
+    let SelectItem::SingleColumn(item) = &select(&implicit).projection[0] else {
+        panic!("expected a single column");
+    };
+    assert_eq!(item.alias.as_ref().unwrap().value, "match");
+
+    for clause in [
+        "MATCH",
+        "MATCH UNIQUE SIMPLE",
+        "MATCH PARTIAL",
+        "MATCH FULL",
+    ] {
+        let parsed = query(&format!("SELECT 1 {clause} (SELECT 1) AS found"));
+        let Expr::Predicated(value) = expression(&select(&parsed).projection[0]) else {
+            panic!("expected a predicate for {clause}");
+        };
+        assert!(matches!(value.predicate, Predicate::Match(_)));
+    }
+    assert!(trino_parser::parse_query("SELECT 1 MATCH UNIQUE").is_err());
+}
+
+#[test]
 fn trino_query_suffix_has_the_actual_query_body_owner() {
     let parsed = query("SELECT a FROM t ORDER BY a OFFSET 2 ROWS FETCH FIRST ROW ONLY");
     assert!(parsed.modifiers.is_empty());
