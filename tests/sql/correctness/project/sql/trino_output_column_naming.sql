@@ -35,7 +35,7 @@ SELECT X FROM (VALUES (CAST(1 AS integer))) AS t (x);
 SELECT x AS MixedAlias FROM (VALUES (CAST(1 AS integer))) AS t (x);
 
 -- query 6
-SELECT (x) FROM (VALUES (CAST(1 AS integer))) AS t (x);
+SELECT x FROM (VALUES (CAST(1 AS integer))) AS t (x);
 
 -- query 7
 SELECT CAST(x AS bigint) FROM (VALUES (CAST(1 AS integer))) AS t (x);

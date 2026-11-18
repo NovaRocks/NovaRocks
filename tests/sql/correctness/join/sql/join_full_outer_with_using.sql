@@ -821,7 +821,7 @@ ORDER BY k1;
 SELECT * FROM
     (VALUES (1, 10), (2, 20), (3, 30)) AS t(k, v1) FULL OUTER JOIN
     (VALUES (2, 100), (3, 200), (4, 300)) AS u(k, v2) USING (k)
-WHERE (k IS NULL) OR (k BETWEEN 2 AND 3 AND (v1 > 15 OR v2 > 150))
+WHERE k IS NULL OR (k BETWEEN 2 AND 3 AND (v1 > 15 OR v2 > 150))
 ORDER BY k;
 
 -- query 85
