@@ -37,6 +37,7 @@ mod iceberg_orphan_fixture;
 mod mv_rest_document_graph;
 mod namespace_guard;
 mod parser;
+mod prepared_ast_observation;
 mod publication_catalog;
 mod publication_service;
 mod query_stats_contract;
@@ -583,6 +584,14 @@ pub(crate) struct Cli {
 
     #[arg(long, action = ArgAction::SetTrue)]
     dry_run: bool,
+
+    /// Record source bindings and old-parser facts for the prepared dry-run input.
+    #[arg(long, requires = "dry_run", conflicts_with_all = ["list_extensions", "list_suites", "list_declarations", "list_legacy_goldens"])]
+    observe_prepared_ast: bool,
+
+    /// Observe a read-only mirror of the declared SQL paths in the same dry run.
+    #[arg(long, requires = "observe_prepared_ast", conflicts_with_all = ["sql_dir", "sql_glob", "result_dir", "convert_legacy", "update_expected"])]
+    prepared_ast_peer_root: Option<PathBuf>,
 
     #[arg(long, action = ArgAction::SetTrue)]
     fail_fast: bool,
@@ -6334,6 +6343,17 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             return Ok(1);
         }
     };
+    let prepared_ast_peer_root = cli
+        .prepared_ast_peer_root
+        .as_deref()
+        .map(|root| {
+            ensure!(
+                cli.mode == Mode::Verify,
+                "prepared AST peer observation requires verify mode"
+            );
+            prepared_ast_observation::PeerRoot::bind(&base_dir, root)
+        })
+        .transpose()?;
     let failure_artifact_override = cli
         .failure_artifact_dir
         .clone()
@@ -6469,6 +6489,9 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         }
     }
     results_writer.write(run_record.clone())?;
+    if let Some(root) = &prepared_ast_peer_root {
+        root.record_scope(&results_writer);
+    }
     let (mut isolated_rest_catalog, publication_control_uri) = results_record::fixture_start(
         &results_writer,
         fixture_root.as_deref(),
@@ -6645,6 +6668,12 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             snapshot_config.result_dir = result_dir.clone();
             snapshot_config.sql_glob = sql_glob.clone();
             let parse_start = results_record::suite_inputs(&snapshot_config)?;
+            let prepared_ast =
+                cli.observe_prepared_ast
+                    .then_some(prepared_ast_observation::Observer::new(
+                        &results_writer,
+                        &suite.name,
+                    ));
             let mut placeholder_vars = placeholder_variables(&runner_config, &suite.name)?;
             if let Some(binding) = dataset_bindings.get(suite_name) {
                 placeholder_vars.insert(
@@ -6659,16 +6688,22 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     binding.exact_warehouse
                 );
             }
-            let suite_init_hook =
-                load_suite_hook(suite.init_sql.as_deref(), &meta_re, &placeholder_vars)
-                    .with_context(|| {
-                        format!("failed to load suite init hook for {}", suite.name)
-                    })?;
-            let suite_cleanup_hook =
-                load_suite_hook(suite.cleanup_sql.as_deref(), &meta_re, &placeholder_vars)
-                    .with_context(|| {
-                        format!("failed to load suite cleanup hook for {}", suite.name)
-                    })?;
+            let suite_init_hook = load_suite_hook(
+                suite.init_sql.as_deref(),
+                &meta_re,
+                &placeholder_vars,
+                prepared_ast.as_ref().map(|observer| (observer, "init")),
+                prepared_ast_peer_root.as_ref(),
+            )
+            .with_context(|| format!("failed to load suite init hook for {}", suite.name))?;
+            let suite_cleanup_hook = load_suite_hook(
+                suite.cleanup_sql.as_deref(),
+                &meta_re,
+                &placeholder_vars,
+                prepared_ast.as_ref().map(|observer| (observer, "cleanup")),
+                prepared_ast_peer_root.as_ref(),
+            )
+            .with_context(|| format!("failed to load suite cleanup hook for {}", suite.name))?;
 
             let catalog = suite_init_hook
                 .as_ref()
@@ -6721,6 +6756,16 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             let mut load_failures: Vec<CaseLoadFailure> = Vec::new();
             for sql_file in sql_files {
                 if suite.manifest.case_input.is_some() {
+                    if let Some(observer) = &prepared_ast {
+                        observer.case_outcome(&sql_file, "external_recipe_unresolved");
+                        if prepared_ast_peer_root.is_some() {
+                            observer.peer_not_prepared(
+                                &sql_file,
+                                "case",
+                                "external_recipe_unresolved",
+                            );
+                        }
+                    }
                     match hms_case_input::Definition::load(&sql_file, &meta_re, &marker_re) {
                         Ok(definition) => input_definitions.push(definition),
                         Err(error) => load_failures.push(CaseLoadFailure {
@@ -6731,12 +6776,25 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     }
                     continue;
                 }
-                match parser::load_sql_case_from_file(
+                let loaded = parser::load_sql_case_from_file_observed(
                     &sql_file,
                     &meta_re,
                     &marker_re,
                     &placeholder_vars,
-                ) {
+                    prepared_ast.as_ref(),
+                    prepared_ast_peer_root.as_ref(),
+                );
+                if let Some(observer) = &prepared_ast {
+                    observer.case_outcome(
+                        &sql_file,
+                        match &loaded {
+                            Ok(Some(_)) => "loaded",
+                            Ok(None) => "empty",
+                            Err(_) => "load_rejected",
+                        },
+                    );
+                }
+                match loaded {
                     Ok(Some(case)) => cases.push(case),
                     Ok(None) => {
                         load_failures.push(CaseLoadFailure {
@@ -6952,6 +7010,9 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 "suite {} inputs changed during loading",
                 suite.name
             );
+            if let Some(observer) = &prepared_ast {
+                observer.suite_checked(&parse_start["inputs_sha256"]);
+            }
             suite_facts.insert(suite.name.clone(), (snapshot_config, parse_start));
             prepared_inputs.push(PreparedSqlInputs {
                 suite_name: suite.name.clone(),

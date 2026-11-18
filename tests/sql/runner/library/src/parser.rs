@@ -17,6 +17,7 @@
 
 use crate::config::{case_placeholder_variables, parse_bool, substitute_placeholders};
 use crate::engine_error_codes::EngineErrorCode;
+use crate::prepared_ast_observation::{Observer as PreparedAstObserver, PeerRoot};
 use crate::production_sql_error_descriptors;
 use crate::sql_error_codes::{SqlErrorDescriptor, SqlErrorPhase, lookup_sql_error_descriptor};
 use crate::types::*;
@@ -1478,18 +1479,44 @@ pub fn load_sql_case_from_file(
     marker_re: &Regex,
     variables: &HashMap<String, String>,
 ) -> Result<Option<SqlCase>> {
+    load_sql_case_from_file_observed(sql_path, meta_re, marker_re, variables, None, None)
+}
+
+pub(crate) fn load_sql_case_from_file_observed(
+    sql_path: &Path,
+    meta_re: &Regex,
+    marker_re: &Regex,
+    variables: &HashMap<String, String>,
+    observer: Option<&PreparedAstObserver<'_>>,
+    peer_root: Option<&PeerRoot>,
+) -> Result<Option<SqlCase>> {
     let case_id = sql_path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid SQL file name: {}", sql_path.display()))?;
     let case_variables = case_placeholder_variables(variables, case_id)?;
-    load_sql_case_from_file_with_variables(
+    let original = load_sql_case_from_file_with_variables(
         sql_path,
         meta_re,
         marker_re,
         &case_variables,
         MetadataNameBinding::Bound,
-    )
+        observer,
+    );
+    if let (Some(observer), Some(root)) = (observer, peer_root) {
+        observer.observe_peer(root, sql_path, "case", |path, source, peer| {
+            prepare_sql_case(
+                path,
+                source,
+                meta_re,
+                marker_re,
+                &case_variables,
+                MetadataNameBinding::Bound,
+                Some(peer),
+            )
+        });
+    }
+    original
 }
 
 /// Load a case while preserving supplied placeholder tokens. This is used by
@@ -1509,6 +1536,7 @@ pub fn load_sql_case_from_file_preserving_placeholders(
         marker_re,
         variables,
         MetadataNameBinding::LiteralDefinition,
+        None,
     )
 }
 
@@ -1518,17 +1546,42 @@ fn load_sql_case_from_file_with_variables(
     marker_re: &Regex,
     case_variables: &HashMap<String, String>,
     name_binding: MetadataNameBinding,
+    observer: Option<&PreparedAstObserver<'_>>,
+) -> Result<Option<SqlCase>> {
+    let content = fs::read_to_string(sql_path)
+        .with_context(|| format!("read SQL case {}", sql_path.display()))?;
+    prepare_sql_case(
+        sql_path,
+        &content,
+        meta_re,
+        marker_re,
+        case_variables,
+        name_binding,
+        observer,
+    )
+}
+
+fn prepare_sql_case(
+    sql_path: &Path,
+    content: &str,
+    meta_re: &Regex,
+    marker_re: &Regex,
+    case_variables: &HashMap<String, String>,
+    name_binding: MetadataNameBinding,
+    observer: Option<&PreparedAstObserver<'_>>,
 ) -> Result<Option<SqlCase>> {
     let base_name = sql_path
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid SQL file name: {}", sql_path.display()))?
         .to_string();
-    let content = fs::read_to_string(sql_path)
-        .with_context(|| format!("read SQL case {}", sql_path.display()))?;
-    let case_dbs = detect_case_dbs(&content, case_variables);
+    let raw_sha = observer.map(|observer| {
+        let original_frames = frame_case_source(content, marker_re).ok();
+        observer.raw_case(sql_path, content, original_frames.as_ref())
+    });
+    let case_dbs = detect_case_dbs(content, case_variables);
     let content = substitute_placeholders(
-        &content,
+        content,
         case_variables,
         &format!("{}: placeholder substitution", sql_path.display()),
     )?;
@@ -1540,6 +1593,7 @@ fn load_sql_case_from_file_with_variables(
     let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
     let frames = frame_case_source(&content, marker_re)
         .map_err(|error| anyhow::anyhow!("{}: {error}", sql_path.display()))?;
+    let prepared_sha = observer.map(|_| crate::results_record::digest(content.as_bytes()));
     let file_meta_lines: Vec<_> = content[frames.file_preface.clone()]
         .lines()
         .map(ToString::to_string)
@@ -1554,7 +1608,8 @@ fn load_sql_case_from_file_with_variables(
 
     let mut steps = Vec::new();
     for (query_number, range) in frames.sections {
-        let section: Vec<_> = content[range].lines().map(ToString::to_string).collect();
+        let prepared_section = &content[range.clone()];
+        let section: Vec<_> = prepared_section.lines().map(ToString::to_string).collect();
         let section_id = if query_number == 1 {
             base_name.as_str().to_string()
         } else {
@@ -1569,6 +1624,21 @@ fn load_sql_case_from_file_with_variables(
         if sql.is_empty() {
             let meta = merge_meta(&file_meta, &section_meta);
             validate_trino_error_expectation(&meta, Some(&sql))?;
+            if let (Some(observer), Some(raw_sha), Some(prepared_sha)) =
+                (observer, &raw_sha, &prepared_sha)
+            {
+                observer.step(
+                    sql_path,
+                    raw_sha,
+                    prepared_sha,
+                    query_number,
+                    range,
+                    prepared_section,
+                    &sql,
+                    &meta,
+                    &[],
+                );
+            }
             continue;
         }
         let sql = crate::fixture_context::rewrite_metadata_filters(&sql, &namespace_rewrites);
@@ -1614,11 +1684,27 @@ fn load_sql_case_from_file_with_variables(
                 section_id
             )
         })?;
-        steps.push(SqlStep {
+        let step = SqlStep {
             query_number,
             sql,
             meta: merged_meta,
-        });
+        };
+        if let (Some(observer), Some(raw_sha), Some(prepared_sha)) =
+            (observer, &raw_sha, &prepared_sha)
+        {
+            observer.step(
+                sql_path,
+                raw_sha,
+                prepared_sha,
+                query_number,
+                range,
+                prepared_section,
+                &step.sql,
+                &step.meta,
+                &crate::results_record::required(&step),
+            );
+        }
+        steps.push(step);
     }
 
     if steps.is_empty() {
@@ -1693,18 +1779,42 @@ pub fn load_suite_hook(
     hook_path: Option<&Path>,
     meta_re: &Regex,
     variables: &HashMap<String, String>,
+    observer: Option<(&PreparedAstObserver<'_>, &str)>,
+    peer_root: Option<&PeerRoot>,
 ) -> Result<Option<SuiteHook>> {
     let Some(path) = hook_path else {
         return Ok(None);
     };
-    if !path.exists() {
-        return Ok(None);
+    let original = if path.exists() {
+        fs::read_to_string(path)
+            .with_context(|| format!("read failed: {}", path.display()))
+            .and_then(|source| prepare_suite_hook(path, &source, meta_re, variables, observer))
+    } else {
+        Ok(None)
+    };
+    if let (Some((observer, role)), Some(root)) = (observer, peer_root) {
+        observer.observe_peer(root, path, role, |path, source, peer| {
+            prepare_suite_hook(path, source, meta_re, variables, Some((peer, role)))
+        });
     }
+    original
+}
 
-    let content =
-        fs::read_to_string(path).with_context(|| format!("read failed: {}", path.display()))?;
+fn prepare_suite_hook(
+    path: &Path,
+    content: &str,
+    meta_re: &Regex,
+    variables: &HashMap<String, String>,
+    observer: Option<(&PreparedAstObserver<'_>, &str)>,
+) -> Result<Option<SuiteHook>> {
+    let raw = observer.map(|(observer, role)| {
+        let source_range = [0, content.len()];
+        let digest = crate::results_record::digest(content.as_bytes());
+        observer.raw_hook(path, role, source_range, &digest);
+        (source_range, digest)
+    });
     let content = substitute_placeholders(
-        &content,
+        content,
         variables,
         &format!("{}: placeholder substitution", path.display()),
     )?;
@@ -1712,10 +1822,16 @@ pub fn load_suite_hook(
     let (mut catalog, db, sql) = extract_suite_hook(&lines, meta_re)
         .with_context(|| format!("{}: invalid suite hook metadata", path.display()))?;
     if sql.is_empty() {
+        if let (Some((observer, role)), Some((range, digest))) = (observer, &raw) {
+            observer.hook(path, role, *range, digest, &content, &sql);
+        }
         return Ok(None);
     }
     let catalogs = crate::catalog_symbol::CatalogSymbols::from_variables(variables)?;
     let sql = catalogs.rewrite_source(&sql)?;
+    if let (Some((observer, role)), Some((range, digest))) = (observer, &raw) {
+        observer.hook(path, role, *range, digest, &content, &sql);
+    }
     if let Some(value) = &mut catalog
         && let Some(mapped) = catalogs.lookup(value)
     {
