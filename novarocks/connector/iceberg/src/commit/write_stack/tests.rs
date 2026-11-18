@@ -187,7 +187,9 @@ fn another_catalog_generation_cannot_recover_a_fragment() {
 // Prepared-set validation and the single-commit latch.
 // -------------------------------------------------------------------------
 
-fn fixed_delete_recipe(table: &IcebergWriteTableFacts) -> super::domain::IcebergMutationReadRecipe {
+pub(super) fn fixed_delete_recipe(
+    table: &IcebergWriteTableFacts,
+) -> super::domain::IcebergMutationReadRecipe {
     super::domain::IcebergMutationReadRecipe::try_new(
         table,
         "s3://b/wh/db/t/metadata/v4.metadata.json".to_owned(),
@@ -203,7 +205,7 @@ fn fixed_delete_recipe(table: &IcebergWriteTableFacts) -> super::domain::Iceberg
     .unwrap()
 }
 
-fn dv_session() -> (IcebergWriteCommitSession, IcebergWriteAdapter) {
+pub(super) fn dv_session() -> (IcebergWriteCommitSession, IcebergWriteAdapter) {
     let (handle, _plans) = plan_write_session(
         IcebergWriteSessionId::new(),
         IcebergWriteSessionPlanInput {
@@ -264,7 +266,9 @@ fn dv_fragment(path: &str, referenced: &str, merged: Vec<EntryIdentity>) -> Iceb
     )
 }
 
-fn final_vector(vector: super::domain::IcebergDeletionVectorArtifact) -> IcebergCommitFragment {
+pub(super) fn final_vector(
+    vector: super::domain::IcebergDeletionVectorArtifact,
+) -> IcebergCommitFragment {
     let target = super::domain::IcebergDeleteTargetLocator::try_new(
         "s3://b/wh/db/t/metadata/snap-77.avro".to_owned(),
         "s3://b/wh/db/t/metadata/manifest.avro".to_owned(),
@@ -285,7 +289,7 @@ fn final_vector(vector: super::domain::IcebergDeletionVectorArtifact) -> Iceberg
     )
 }
 
-fn fixed_dv_fragment(
+pub(super) fn fixed_dv_fragment(
     path: &str,
     referenced: &str,
     merged: Vec<EntryIdentity>,

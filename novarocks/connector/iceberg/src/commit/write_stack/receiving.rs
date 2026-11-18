@@ -17,6 +17,8 @@
 
 //! Provider custody of root write records before the publication handoff.
 
+pub(crate) mod validation;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
