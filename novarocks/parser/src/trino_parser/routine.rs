@@ -26,6 +26,7 @@ impl Parser<'_> {
         &mut self,
     ) -> Result<FunctionSpecification, ParserError> {
         let start = self.expect_keyword(K::Function)?;
+        self.routine_started = true;
         let parameter_start = self.next_parameter;
         let name = self.qualified_name()?;
         self.expect_symbol(S::LParen)?;

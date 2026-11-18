@@ -36,6 +36,7 @@ mod prepared_statement;
 mod query;
 mod relation;
 mod routine;
+mod script;
 mod show_statement;
 mod special;
 mod statement;
@@ -54,6 +55,8 @@ use crate::trino_token::{Token, TokenKind};
 use crate::{ParserError, Span, trino_lexer};
 use failure::GrammarError;
 
+pub use script::{StatementFrame, frame_statements};
+
 struct Parser<'source> {
     source: &'source str,
     tokens: Vec<Token>,
@@ -67,19 +70,27 @@ struct Parser<'source> {
     grammar_boundary: Option<usize>,
     // SELECT items and ROW fields admit an implicit alias after the expression.
     alias_follow: bool,
+    // A script frame can have an internal semicolon only when its real
+    // grammar entered a function specification.
+    routine_started: bool,
 }
 
 impl<'source> Parser<'source> {
     fn new(source: &'source str) -> Result<Self, GrammarError> {
-        Ok(Self {
+        Ok(Self::from_tokens(source, trino_lexer::lex(source)?))
+    }
+
+    fn from_tokens(source: &'source str, tokens: Vec<Token>) -> Self {
+        Self {
             source,
-            tokens: trino_lexer::lex(source)?,
+            tokens,
             position: 0,
             next_parameter: 0,
             parameter_events: Vec::new(),
             grammar_boundary: None,
             alias_follow: false,
-        })
+            routine_started: false,
+        }
     }
 
     fn finish(&self) -> Result<(), GrammarError> {

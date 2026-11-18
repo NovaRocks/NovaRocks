@@ -27,121 +27,177 @@ use crate::{LexError, ParseError, ParserError, Span};
 /// Unicode escape clauses, binary contents, literal conversion, and identifier
 /// use. This scanner only rejects identifier forms forbidden by the language.
 pub fn lex(source: &str) -> Result<Vec<Token>, ParserError> {
-    Lexer {
-        source,
-        position: 0,
-        tokens: Vec::new(),
+    let mut lexer = Lexer::new(source);
+    let mut tokens = Vec::new();
+    while lexer.position < source.len() {
+        tokens.push(lexer.token()?);
     }
-    .run()
+    tokens.push(lexer.end_token());
+    Ok(tokens)
+}
+
+/// A lexer-owned rejection within a provable source range.
+pub(crate) struct FramingRejection {
+    pub(crate) span: Span,
+    pub(crate) error: ParserError,
+}
+
+pub(crate) struct FramingTokens {
+    pub(crate) tokens: Vec<Token>,
+    pub(crate) rejections: Vec<FramingRejection>,
+}
+
+/// Keeps the scanner's real token boundaries around a proved rejection.
+/// This opt-in stream proves framing only. The strict lexer still stops at
+/// the first rejection and is the sole authority for parsing a statement.
+pub(crate) fn lex_for_framing(source: &str) -> Result<FramingTokens, ParserError> {
+    let mut lexer = Lexer::new(source);
+    let mut tokens = Vec::new();
+    let mut rejections = Vec::new();
+    while lexer.position < source.len() {
+        let start = lexer.position;
+        match lexer.token() {
+            Ok(token) => tokens.push(token),
+            Err(
+                error @ (ParserError::Lex(LexError::UnexpectedCharacter { .. })
+                | ParserError::Parse(ParseError::UnexpectedToken { .. })),
+            ) => rejections.push(FramingRejection {
+                span: Span::new(start, lexer.position),
+                error,
+            }),
+            Err(
+                error @ ParserError::Lex(
+                    LexError::UnterminatedString { .. }
+                    | LexError::UnterminatedQuotedIdentifier { .. }
+                    | LexError::UnterminatedComment { .. },
+                ),
+            ) if !source.as_bytes()[start..].contains(&b';') => {
+                // Nothing after this malformed opening token can be a
+                // delimiter. Submit the exact terminal bytes only to a
+                // caller that already owns an enrolled error expectation.
+                lexer.position = source.len();
+                rejections.push(FramingRejection {
+                    span: Span::new(start, source.len()),
+                    error,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    tokens.push(lexer.end_token());
+    Ok(FramingTokens { tokens, rejections })
 }
 
 struct Lexer<'a> {
     source: &'a str,
     position: usize,
-    tokens: Vec<Token>,
 }
 
-impl Lexer<'_> {
-    fn run(mut self) -> Result<Vec<Token>, ParserError> {
-        while self.position < self.source.len() {
-            let start = self.position;
-            let rest = &self.source[start..];
-            let first = rest.as_bytes()[0];
-            let kind = if is_whitespace(first) {
-                self.position += rest.bytes().take_while(|b| is_whitespace(*b)).count();
-                TokenKind::Trivia(TriviaKind::Whitespace)
-            } else if rest.starts_with("--") {
-                self.position += 2;
-                while self.position < self.source.len()
-                    && !matches!(self.source.as_bytes()[self.position], b'\r' | b'\n')
-                {
-                    self.position += 1;
-                }
-                if self.byte() == Some(b'\r') {
-                    self.position += 1;
-                }
-                if self.byte() == Some(b'\n') {
-                    self.position += 1;
-                }
-                TokenKind::Trivia(TriviaKind::LineComment)
-            } else if rest.starts_with("/*") {
-                match rest[2..].find("*/") {
-                    Some(end) => self.position += end + 4,
-                    None => {
-                        return Err(LexError::UnterminatedComment {
-                            span: Span::new(start, self.source.len()),
-                        }
-                        .into());
+impl<'a> Lexer<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            position: 0,
+        }
+    }
+
+    fn end_token(&self) -> Token {
+        Token::new(TokenKind::End, Span::new(self.position, self.position))
+    }
+
+    fn token(&mut self) -> Result<Token, ParserError> {
+        let start = self.position;
+        let rest = &self.source[start..];
+        let first = rest.as_bytes()[0];
+        let kind = if is_whitespace(first) {
+            self.position += rest.bytes().take_while(|b| is_whitespace(*b)).count();
+            TokenKind::Trivia(TriviaKind::Whitespace)
+        } else if rest.starts_with("--") {
+            self.position += 2;
+            while self.position < self.source.len()
+                && !matches!(self.source.as_bytes()[self.position], b'\r' | b'\n')
+            {
+                self.position += 1;
+            }
+            if self.byte() == Some(b'\r') {
+                self.position += 1;
+            }
+            if self.byte() == Some(b'\n') {
+                self.position += 1;
+            }
+            TokenKind::Trivia(TriviaKind::LineComment)
+        } else if rest.starts_with("/*") {
+            match rest[2..].find("*/") {
+                Some(end) => self.position += end + 4,
+                None => {
+                    return Err(LexError::UnterminatedComment {
+                        span: Span::new(start, self.source.len()),
                     }
+                    .into());
                 }
-                TokenKind::Trivia(TriviaKind::BlockComment)
-            } else if rest.starts_with('"') {
-                self.consume_quote(start, start, b'"', true)?;
-                if self.position == start + 2 {
+            }
+            TokenKind::Trivia(TriviaKind::BlockComment)
+        } else if rest.starts_with('"') {
+            self.consume_quote(start, start, b'"', true)?;
+            if self.position == start + 2 {
+                return Err(self.syntax_error(
+                    "a non-empty quoted identifier",
+                    "zero-length delimited identifier",
+                    start,
+                ));
+            }
+            TokenKind::QuotedIdentifier
+        } else if first == b'`' {
+            self.consume_quote(start, start, b'`', true)?;
+            return Err(self.syntax_error(
+                "double quotes around identifiers",
+                "backquoted identifiers are not supported",
+                start,
+            ));
+        } else if first == b'\'' {
+            self.consume_quote(start, start, b'\'', true)?;
+            TokenKind::String
+        } else if rest.get(..3).is_some_and(|s| s.eq_ignore_ascii_case("U&'")) {
+            self.consume_quote(start, start + 2, b'\'', true)?;
+            TokenKind::UnicodeString
+        } else if rest.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("X'")) {
+            self.consume_quote(start, start + 1, b'\'', false)?;
+            TokenKind::BinaryLiteral
+        } else if let Some(end) = rest.strip_prefix("$$").and_then(|rest| rest.find("$$")) {
+            self.position += end + 4;
+            TokenKind::DollarString
+        } else if first.is_ascii_digit()
+            || (first == b'.' && rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
+        {
+            let (length, kind) = number(rest.as_bytes());
+            self.position += length;
+            match kind {
+                Some(kind) => kind,
+                None => {
                     return Err(self.syntax_error(
-                        "a non-empty quoted identifier",
-                        "zero-length delimited identifier",
+                        "an identifier beginning with a letter or underscore",
+                        "identifiers must not start with a digit; surround the identifier with double quotes",
                         start,
                     ));
                 }
-                TokenKind::QuotedIdentifier
-            } else if first == b'`' {
-                self.consume_quote(start, start, b'`', true)?;
-                return Err(self.syntax_error(
-                    "double quotes around identifiers",
-                    "backquoted identifiers are not supported",
-                    start,
-                ));
-            } else if first == b'\'' {
-                self.consume_quote(start, start, b'\'', true)?;
-                TokenKind::String
-            } else if rest.get(..3).is_some_and(|s| s.eq_ignore_ascii_case("U&'")) {
-                self.consume_quote(start, start + 2, b'\'', true)?;
-                TokenKind::UnicodeString
-            } else if rest.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("X'")) {
-                self.consume_quote(start, start + 1, b'\'', false)?;
-                TokenKind::BinaryLiteral
-            } else if let Some(end) = rest.strip_prefix("$$").and_then(|rest| rest.find("$$")) {
-                self.position += end + 4;
-                TokenKind::DollarString
-            } else if first.is_ascii_digit()
-                || (first == b'.' && rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
-            {
-                let (length, kind) = number(rest.as_bytes());
-                self.position += length;
-                match kind {
-                    Some(kind) => kind,
-                    None => {
-                        return Err(self.syntax_error(
-                            "an identifier beginning with a letter or underscore",
-                            "identifiers must not start with a digit; surround the identifier with double quotes",
-                            start,
-                        ));
-                    }
-                }
-            } else if is_identifier_start(first) {
-                self.position += rest.bytes().take_while(|b| is_identifier_part(*b)).count();
-                let word = &self.source[start..self.position];
-                trino_keyword::lookup(word).map_or(TokenKind::Identifier, TokenKind::Keyword)
-            } else if let Some((length, symbol)) = symbol(rest) {
-                self.position += length;
-                TokenKind::Symbol(symbol)
-            } else {
-                let character = rest.chars().next().expect("nonempty source remainder");
-                return Err(LexError::UnexpectedCharacter {
-                    character,
-                    span: Span::new(start, start + character.len_utf8()),
-                }
-                .into());
-            };
-            self.tokens
-                .push(Token::new(kind, Span::new(start, self.position)));
-        }
-        self.tokens.push(Token::new(
-            TokenKind::End,
-            Span::new(self.position, self.position),
-        ));
-        Ok(self.tokens)
+            }
+        } else if is_identifier_start(first) {
+            self.position += rest.bytes().take_while(|b| is_identifier_part(*b)).count();
+            let word = &self.source[start..self.position];
+            trino_keyword::lookup(word).map_or(TokenKind::Identifier, TokenKind::Keyword)
+        } else if let Some((length, symbol)) = symbol(rest) {
+            self.position += length;
+            TokenKind::Symbol(symbol)
+        } else {
+            let character = rest.chars().next().expect("nonempty source remainder");
+            self.position += character.len_utf8();
+            return Err(LexError::UnexpectedCharacter {
+                character,
+                span: Span::new(start, self.position),
+            }
+            .into());
+        };
+        Ok(Token::new(kind, Span::new(start, self.position)))
     }
 
     fn byte(&self) -> Option<u8> {

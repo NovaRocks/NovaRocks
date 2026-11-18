@@ -471,46 +471,41 @@ fn format_statement_failure(
     )
 }
 
-/// Splits a script using the Trino lexer while retaining source comments.
-///
-/// This explicit entry is not used by the production session until cutover.
-/// Lexical errors are returned to the caller, not represented as FE outcomes.
-/// A FUNCTION token requires grammar-owned statement boundaries: SQL routines
-/// can contain semicolons, and this lexical slice cannot classify their extent.
-/// This includes conservative rejection of an ordinary FUNCTION identifier;
-/// it does not mean that such SQL is grammatically invalid.
+/// Splits a script using the Trino lexer and its real routine grammar.
 pub fn split_trino_sql_statements(sql: &str) -> Result<Vec<String>> {
-    use novarocks_parser::trino_token::{Keyword, Symbol, TokenKind};
+    split_trino_step_sql(sql, None)
+}
 
-    let tokens = novarocks_parser::trino_lexer::lex(sql)
-        .context("tokenizing Trino SQL batch for statement splitting")?;
-    if tokens
-        .iter()
-        .any(|token| token.kind == TokenKind::Keyword(Keyword::Function))
-    {
-        bail!("grammar-owned statement boundaries required for SQL containing FUNCTION");
+/// Prepares exactly the same bytes for validation, control hashes, and POST.
+/// A declared syntax-error probe may submit one completely framed rejected
+/// token. The FE must produce its own typed error from the unmodified bytes.
+pub(crate) fn split_trino_step_sql(
+    sql: &str,
+    expected_error: Option<&TrinoErrorExpectation>,
+) -> Result<Vec<String>> {
+    let frames =
+        novarocks_parser::trino_parser::frame_statements(sql).context("framing Trino SQL batch")?;
+    if expected_error.is_some() {
+        ensure!(
+            frames.len() == 1,
+            "@expect_trino_error requires exactly one executable SQL statement"
+        );
     }
-
-    let mut statements = Vec::new();
-    let mut start = 0;
-    let mut has_sql = false;
-    for token in tokens {
-        match token.kind {
-            TokenKind::Symbol(Symbol::Semicolon) => {
-                if has_sql {
-                    statements.push(sql[start..token.span.start()].trim().to_owned());
+    let allow_lexical_refusal = expected_error
+        .is_some_and(|error| error.name == "SYNTAX_ERROR" && error.error_type == "USER_ERROR");
+    frames
+        .into_iter()
+        .map(|frame| {
+            let raw = &sql[frame.source.start()..frame.source.end()];
+            if let Some(error) = frame.lexical_failure {
+                if allow_lexical_refusal {
+                    return Ok(raw.to_owned());
                 }
-                start = token.span.end();
-                has_sql = false;
+                return Err(anyhow::Error::new(error).context("tokenizing Trino SQL batch"));
             }
-            TokenKind::Trivia(_) | TokenKind::End => {}
-            _ => has_sql = true,
-        }
-    }
-    if has_sql {
-        statements.push(sql[start..].trim().to_owned());
-    }
-    Ok(statements)
+            Ok(raw.trim().to_owned())
+        })
+        .collect()
 }
 
 pub(crate) fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
@@ -936,18 +931,21 @@ mod splitter_tests {
     }
 
     #[test]
-    fn trino_split_requires_grammar_boundaries_for_function_tokens() {
-        for sql in [
-            "CREATE FUNCTION f() RETURNS BIGINT BEGIN RETURN 1; END; SELECT 2;",
-            "SELECT function FROM t;",
-        ] {
-            let error = split_trino_sql_statements(sql).expect_err("grammar boundaries missing");
-            assert!(
-                error
-                    .to_string()
-                    .contains("grammar-owned statement boundaries required")
-            );
-        }
+    fn trino_split_follows_actual_routine_grammar_and_ordinary_function_identifiers() {
+        let create = "CREATE FUNCTION f() RETURNS BIGINT BEGIN RETURN 1; END";
+        let inline = "WITH FUNCTION n() RETURNS BIGINT BEGIN RETURN 2; END SELECT n()";
+        let identifier = "SELECT function FROM t";
+        assert_eq!(
+            split_trino_sql_statements(&format!("{create}; {inline}; {identifier};"))
+                .expect("grammar-owned routine boundaries"),
+            [create, inline, identifier]
+        );
+        assert!(
+            split_trino_sql_statements(
+                "CREATE FUNCTION f() RETURNS BIGINT BEGIN RETURN 1; SELECT 2;"
+            )
+            .is_err()
+        );
         assert_eq!(
             split_trino_sql_statements("SELECT 'FUNCTION', \"function\";")
                 .expect("literal and identifier"),
