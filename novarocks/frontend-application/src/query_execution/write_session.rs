@@ -590,7 +590,8 @@ impl ConnectorWriteSession {
         }
     }
 
-    /// The sealed ordinal set a prepared write set may not exceed.
+    /// The session target set reused by explicit relation and packet fixtures.
+    #[cfg(test)]
     pub(crate) fn expected_targets(&self) -> Vec<WriteTargetOrdinal> {
         self.plan.expected_targets()
     }

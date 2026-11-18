@@ -894,7 +894,10 @@ impl TaskManifestBinding {
     pub(crate) fn write_root_targets(
         &self,
     ) -> Option<&[novarocks_spi::connector::write_stack::WriteTargetOrdinal]> {
-        self.native_template.template.plan_facts().write_root_targets()
+        self.native_template
+            .template
+            .plan_facts()
+            .write_root_targets()
     }
 
     /// Borrow the existing frozen occurrence list; no per-Task list is cloned.

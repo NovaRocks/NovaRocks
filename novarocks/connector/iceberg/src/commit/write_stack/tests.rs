@@ -5279,7 +5279,7 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
             } = release_session_state(
                 &descriptor("unit"),
                 ProviderBindingEpoch::from_bytes([9; 16]),
-                &handle,
+                handle,
             )
             .unwrap()
             else {

@@ -140,6 +140,12 @@ fn encoded_payload(
 
 // ---- the session control under test ----------------------------------
 
+type RecordedQueryRegistration = (
+    ConnectorWriteQueryIdentity,
+    Vec<WriteTargetOrdinal>,
+    Option<Arc<dyn ConnectorWriteProductionProof>>,
+);
+
 #[derive(Default)]
 pub(crate) struct Recorded {
     decoded_fragments: usize,
@@ -176,11 +182,7 @@ pub(crate) struct Recorded {
     pub(crate) abort_production:
         Option<novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction>,
     pub(crate) abort_received_fragments: Option<usize>,
-    pub(crate) received_query_registrations: Vec<(
-        ConnectorWriteQueryIdentity,
-        Vec<WriteTargetOrdinal>,
-        Option<Arc<dyn ConnectorWriteProductionProof>>,
-    )>,
+    pub(crate) received_query_registrations: Vec<RecordedQueryRegistration>,
     pub(crate) query_registration_failure: Option<ConnectorError>,
     pub(crate) panic_query_registration: bool,
     pub(crate) fragment_arrivals: usize,
