@@ -1749,7 +1749,6 @@ fn projected_addition_len(mut wire: dto::IcebergCommitFragment) -> Option<usize>
 
 /// Reuse the existing artifact DTO, moving the decoded strings, metrics and
 /// buffers rather than projecting a second owned graph from borrowed values.
-#[allow(dead_code, reason = "The compact receiving caller lands in RWM-16 P08")]
 pub(super) fn encode_compact_addition(
     artifact: IcebergCommitArtifact,
     bytes: usize,
