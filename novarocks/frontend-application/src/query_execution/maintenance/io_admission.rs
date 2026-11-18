@@ -77,6 +77,8 @@ impl std::task::Wake for MetadataWake {
 pub(crate) struct MetadataIoAdmission {
     wake: Arc<MetadataWake>,
     original: Mutex<Option<Body>>,
+    // Only a progress observer that missed the original Body waits here.
+    body_returned: AtomicWaker,
     // Same Source receiving storage, including its Vec backing, remains in
     // original per-root storage. Registration grants neither I/O nor capacity.
     requests: Mutex<RequestIngress>,
@@ -210,12 +212,17 @@ struct StreamBody {
 struct Loan<'a, T> {
     source: &'a Mutex<Option<T>>,
     body: Option<T>,
+    on_return: Option<&'a AtomicWaker>,
 }
 impl<T> Drop for Loan<'_, T> {
     fn drop(&mut self) {
         let mut slot = self.source.lock().unwrap_or_else(|p| p.into_inner());
         assert!(slot.is_none(), "original metadata loan restored once");
         *slot = self.body.take();
+        drop(slot);
+        if let Some(observer) = self.on_return {
+            observer.wake();
+        }
     }
 }
 fn loan<T>(source: &Mutex<Option<T>>) -> Option<Loan<'_, T>> {
@@ -223,6 +230,7 @@ fn loan<T>(source: &Mutex<Option<T>>) -> Option<Loan<'_, T>> {
     Some(Loan {
         source,
         body: Some(body),
+        on_return: None,
     })
 }
 fn error(error: &WorkError) -> ConnectorError {
@@ -615,6 +623,7 @@ impl MetadataIoAdmission {
         let provider_owned_floor = initial_owned_bytes.get();
         Ok(Arc::new(Self {
             wake,
+            body_returned: AtomicWaker::new(),
             requests: Mutex::new(RequestIngress::default()),
             payload_retention: OnceLock::new(),
             settlement: AtomicBool::new(false),
@@ -735,6 +744,13 @@ impl MetadataIoAdmission {
         }
         None
     }
+    fn loan_body(&self) -> Option<Loan<'_, Body>> {
+        let mut original = loan(&self.original)?;
+        original.on_return = Some(&self.body_returned);
+        Some(original)
+    }
+
+    /// A false result asks the caller to poll again before proceeding.
     pub(crate) fn poll_progress(
         &self,
         owner: &WorkOwner,
@@ -769,19 +785,35 @@ impl MetadataIoAdmission {
             if requests.withdrawing {
                 return Err(WorkError::Released);
             }
-            let Some(mut original) = loan(&self.original) else {
-                return Err(WorkError::Conflict);
+            let Some(mut original) = self.loan_body() else {
+                if observation == ProgressObservation::ActualExit {
+                    return Err(WorkError::Conflict);
+                }
+                drop(requests);
+                self.body_returned.register(cx.waker());
+                // The borrower may have returned between the failed loan and
+                // registration. Recheck without holding a lock during wake.
+                let available = self
+                    .original
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_some();
+                if available {
+                    self.body_returned.wake();
+                }
+                return Ok(false);
             };
             let body = original.body.as_mut().unwrap();
-            body.cells
-                .try_reserve(requests.pending.len())
-                .map_err(|_| {
-                    WorkError::Capacity("metadata request record allocation was refused")
-                })?;
-            // Move the SAME Arc; no receiving alias can keep a retired cell live.
-            body.cells.append(&mut requests.pending);
+            let reserve = body.cells.try_reserve(requests.pending.len());
+            if reserve.is_ok() {
+                // Move the SAME Arc; no receiving alias can keep a retired cell live.
+                body.cells.append(&mut requests.pending);
+            }
             // All WC, foreign polls/destructors and wakes follow this short gate.
             drop(requests);
+            reserve.map_err(|_| {
+                WorkError::Capacity("metadata request record allocation was refused")
+            })?;
             body.changed = false;
             body.reobserve = false;
             let mut result = Self::progress(
@@ -1267,7 +1299,7 @@ impl MetadataIoAdmission {
         novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         WorkError,
     > {
-        let loan = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let loan = self.loan_body().ok_or(WorkError::Conflict)?;
         let body = loan.body.as_ref().ok_or(WorkError::NotReady)?;
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
@@ -1296,7 +1328,7 @@ impl MetadataIoAdmission {
         root: &WorkScope,
     ) -> Result<novarocks_workload_control::joint_admission::InternalCpuActionSource, WorkError>
     {
-        let original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let original = self.loan_body().ok_or(WorkError::Conflict)?;
         let body = original.body.as_ref().ok_or(WorkError::NotReady)?;
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
@@ -1337,7 +1369,7 @@ impl MetadataIoAdmission {
         &self,
         root: &WorkScope,
     ) -> Result<(), WorkError> {
-        let original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let original = self.loan_body().ok_or(WorkError::Conflict)?;
         let body = original.body.as_ref().ok_or(WorkError::NotReady)?;
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
@@ -1367,7 +1399,7 @@ impl MetadataIoAdmission {
         if !requests.pending.is_empty() {
             return Err(WorkError::NotReady);
         }
-        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let mut original = self.loan_body().ok_or(WorkError::Conflict)?;
         // Later requests remain ungranted and observe the later capacity.
         drop(requests);
         let body = original.body.as_mut().ok_or(WorkError::Released)?;
@@ -1405,7 +1437,7 @@ impl MetadataIoAdmission {
         &self,
         stage: &WorkOwner,
     ) -> Result<novarocks_workload_control::joint_admission::RootStageSource, WorkError> {
-        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let mut original = self.loan_body().ok_or(WorkError::Conflict)?;
         let body = original.body.as_mut().ok_or(WorkError::Released)?;
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
@@ -1422,7 +1454,7 @@ impl MetadataIoAdmission {
         stage: &WorkOwner,
         target: &mut Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
     ) -> Result<novarocks_workload_control::WorkloadProgressNotification, WorkError> {
-        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let mut original = self.loan_body().ok_or(WorkError::Conflict)?;
         let body = original.body.as_mut().ok_or(WorkError::Released)?;
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
@@ -1443,7 +1475,7 @@ impl MetadataIoAdmission {
         novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         WorkError,
     > {
-        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let mut original = self.loan_body().ok_or(WorkError::Conflict)?;
         let body = original.body.as_mut().ok_or(WorkError::Released)?;
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
@@ -1460,7 +1492,7 @@ impl MetadataIoAdmission {
             novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         >,
     ) -> Result<(), WorkError> {
-        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let mut original = self.loan_body().ok_or(WorkError::Conflict)?;
         let body = original.body.as_mut().ok_or(WorkError::Released)?;
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
@@ -1479,7 +1511,7 @@ impl MetadataIoAdmission {
             novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         >,
     ) -> Result<(), WorkError> {
-        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let mut original = self.loan_body().ok_or(WorkError::Conflict)?;
         let body = original.body.as_mut().ok_or(WorkError::Released)?;
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
@@ -1504,7 +1536,7 @@ impl MetadataIoAdmission {
     /// Withdraw only a never-installed original bootstrap, preserving refusal facts.
     pub(crate) fn withdraw_unstarted_in(&self) -> Result<Option<MetadataIoQuiescence>, WorkError> {
         let retired = {
-            let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+            let mut original = self.loan_body().ok_or(WorkError::Conflict)?;
             let body = original.body.as_mut().ok_or(WorkError::Released)?;
             if body.started {
                 return Ok(None);
@@ -1574,8 +1606,8 @@ impl MetadataIoAdmission {
                 }
             }
             if live {
-                drop(original);
                 drop(requests);
+                drop(original);
                 for cell in wake {
                     cell.wake();
                 }
@@ -1595,7 +1627,7 @@ impl MetadataIoAdmission {
         // original Statement Source keeps its raw cause and whole Action;
         // `withdrawing` remains poisoned rather than reporting false exit.
         drop(retired);
-        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let mut original = self.loan_body().ok_or(WorkError::Conflict)?;
         let body = original.body.as_mut().ok_or(WorkError::Released)?;
         if body.started || !body.unstarted_withdrawing || body.payload.is_some() {
             return Err(WorkError::Conflict);
@@ -1671,7 +1703,7 @@ impl MetadataIoAdmission {
         if let Err(error) = self.poll_with_original_owner(owner, cx, observation) {
             return Poll::Ready(Err(error));
         }
-        let Some(mut original) = loan(&self.original) else {
+        let Some(mut original) = self.loan_body() else {
             return Poll::Ready(Err(WorkError::Conflict));
         };
         let body = original.body.as_mut().unwrap();
@@ -1734,7 +1766,7 @@ impl MetadataIoAdmission {
             return Err(error(&WorkError::Released));
         }
         let source = if requests.pending.is_empty() {
-            loan(&self.original)
+            self.loan_body()
         } else {
             None
         };
@@ -1763,6 +1795,8 @@ impl MetadataIoAdmission {
             return Ok(request);
         };
         drop(requests);
+        #[cfg(test)]
+        original_governor_tests::pause_borrowed_request();
         let body = source.body.as_mut().unwrap();
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(error(&WorkError::Released));
@@ -1850,7 +1884,7 @@ impl ConnectorIoAdmissionPort for MetadataIoAdmission {
         &self,
         profile: &ConnectorMetadataMaintenanceIoProfile,
     ) -> Result<(), ConnectorError> {
-        let mut original = loan(&self.original).ok_or_else(busy)?;
+        let mut original = self.loan_body().ok_or_else(busy)?;
         let body = original.body.as_mut().expect("same original source loan");
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(error(&WorkError::Released));
@@ -1948,6 +1982,124 @@ mod original_governor_tests {
         sync::atomic::{AtomicUsize, Ordering},
         task::{Wake, Waker},
     };
+
+    thread_local! {
+        static PAUSE_BORROWED_REQUEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn pause_borrowed_request() {
+        let pause = PAUSE_BORROWED_REQUEST.with(|cell| cell.borrow_mut().take());
+        if let Some(pause) = pause {
+            pause();
+        }
+    }
+
+    #[test]
+    fn business_progress_does_not_refuse_a_live_request_body_loan() {
+        let (control, mut driver, root) = original_governor();
+        let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
+        let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(source_bytes).unwrap(),
+            NonZeroU64::new(128).unwrap(),
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let source = MetadataIoAdmission::new(root.owner.scope(), profile, source_bytes).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut bootstrap = Ok(false);
+        for _ in 0..256 {
+            bootstrap = source.poll_progress(&root.owner, &mut cx);
+            if bootstrap != Ok(false) {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+
+        let (during_loan, request) = std::thread::scope(|threads| {
+            let (borrowed, observe_loan) = std::sync::mpsc::sync_channel(0);
+            let (resume, wait_to_resume) = std::sync::mpsc::sync_channel(0);
+            let request_source = Arc::clone(&source);
+            let request_worker = threads.spawn(move || {
+                PAUSE_BORROWED_REQUEST.with(|cell| {
+                    *cell.borrow_mut() = Some(Box::new(move || {
+                        if borrowed.send(()).is_ok() {
+                            let _ = wait_to_resume.recv();
+                        }
+                    }));
+                });
+                request_source.request(SharedDependency::LocalHost)
+            });
+            let observed = if observe_loan.recv().is_ok() {
+                let observed = source.poll_progress(&root.owner, &mut cx);
+                let _ = resume.send(());
+                Some(observed)
+            } else {
+                None
+            };
+            (observed, request_worker.join())
+        });
+
+        let mut permit = None;
+        let mut admitted = None;
+        if let Ok(Ok(request)) = &request {
+            for _ in 0..256 {
+                if let Poll::Ready(result) = request.poll_admitted_in(&mut permit, &mut cx) {
+                    admitted = Some(result);
+                    break;
+                }
+                drive_original(&mut driver);
+                let _ = source.poll_actual_progress_continuing(&mut cx);
+            }
+        }
+        let returned_body = source.loan_body().unwrap();
+        let wake = Arc::new(OriginalWake::default());
+        let waker = Waker::from(Arc::clone(&wake));
+        let waiting_for_return =
+            source.poll_progress(&root.owner, &mut Context::from_waker(&waker));
+        let before_return = wake.0.load(std::sync::atomic::Ordering::SeqCst);
+        drop(returned_body);
+        let after_return = wake.0.load(std::sync::atomic::Ordering::SeqCst);
+
+        let positive_permit = permit.is_some();
+        let held_permit_blocks_exit = positive_permit
+            && source
+                .poll_actual_quiescent_continuing(&mut cx)
+                .is_pending();
+        drop((request, permit));
+
+        let mut quiescence = Poll::Pending;
+        for _ in 0..256 {
+            quiescence = source.poll_actual_quiescent_continuing(&mut cx);
+            if quiescence.is_ready() {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+        let healthy = source.health_failure().is_none() && source.failure().is_none();
+        drop(source);
+        root.business.release();
+        root.owner.complete_after_terminal_cancel_settled();
+        control.close_admission();
+        drive_original(&mut driver);
+        let drained = control.shutdown().is_ok();
+
+        let no_terminal_failure = match quiescence {
+            Poll::Ready(Ok(closure)) => closure.into_ordinary_failure().is_none(),
+            _ => false,
+        };
+        assert!(no_terminal_failure && healthy && drained);
+        assert_eq!(bootstrap, Ok(true));
+        assert!(matches!(admitted, Some(Ok(()))) && held_permit_blocks_exit);
+        assert_eq!(
+            during_loan,
+            Some(Ok(false)),
+            "a live same-Source request loan must defer the statement observer"
+        );
+        assert_eq!(waiting_for_return, Ok(false));
+        assert_eq!((before_return, after_return), (0, 1));
+    }
 
     #[derive(Default)]
     struct OriginalWake(AtomicUsize);
