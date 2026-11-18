@@ -372,46 +372,60 @@ This supply-chain policy does not establish architectural direction, reject loca
 path replacements or prove product compatibility; source requirements outside
 its coverage need review and behavioral evidence.
 
-`Cargo dependency advisories` is a separate `full`-tier native stage, following
-[ADR-0200](../../docs/adr/ADR-0200-advisory-discovery-is-independent-of-admission.md).
-It runs `cargo deny --format json --locked check advisories` against the latest
-online database and the same `deny.toml`, including yanked checks and unused
-exception checks. It is absent from `--cargo-only` and the admission enabled
-scope. Its three discovery entries share the same native stage:
+Advisory discovery is a manual local check. A maintainer runs it on a regular
+cadence. It is not a PR check, not an admission stage, not a dev-verify
+selection, and not part of any verification layer. See
+[ADR-0239](../../docs/adr/ADR-0239-advisory-discovery-is-a-manual-local-check.md).
 
-- PRs run the independent `dependency-advisories` workflow as a non-required
-  check. Findings and input errors retain a failed check; required-check settings
-  must keep it outside admission. No `continue-on-error` masks the result.
-- The same workflow supports `workflow_dispatch` with an optional ref. It has
-  read-only permissions, publishes a summary and raw artifacts, and opens no
-  issues. Scheduled discovery remains future work.
-- Locally, run the stage with a fresh output directory:
+```bash
+python3 tools/ci/dependency-advisories.py [--output DIR] [--repo DIR]
+```
 
-  ```bash
-  tools/ci/local-full-ci.sh --run-stage "Cargo dependency advisories" \
-    /absolute/unused-artifact-receipt.json /absolute/new/advisories-attempt
-  ```
+`--repo` defaults to the repository that contains the script. `--output`
+defaults to `<repo>/logs/dependency-advisories/<UTC yyyymmddTHHMMSSZ>/`. The
+directory is created if absent. A nonempty directory is rejected (exit 2) and
+previous results are never overwritten. `logs/` is gitignored.
 
-The stage stores `dependency-advisories/cargo-deny.stdout`, `cargo-deny.stderr`,
-`exit`, `summary.json` and `summary.md` below that output directory. It preserves
-raw streams and the cargo-deny exit code. The summary distinguishes `pass`,
-`findings` and `input-error`; removable exceptions are listed separately from
-advisory findings, and input diagnostics remain visible even with findings.
-Database commit, commit time and fetch time describe the observed input; an
-unreadable or ambiguous local database is recorded as unknown. They do not pin
-the database or change the result. A nonempty result directory is rejected.
+The command writes `cargo-update.stdout`, `cargo-update.stderr`,
+`cargo-deny.stdout`, `cargo-deny.stderr`, `exit`, `summary.json` and
+`summary.md`. `summary.md` is also printed to stdout.
 
-The stage domain covers `Cargo.lock`, `deny.toml`, its script and its workflow.
-`dev-verify` selects it as a heavy author obligation when those inputs change;
-the full layer includes it. Online findings remain raw failures in composition,
-even when the CI change itself behaves correctly. The database is outside the
-stage identity, so development reuse in one verification root can retain an
-older observation: inspect the summary timestamp and database commit, or use a
-new root for fresh discovery. Local results do not prove remote trigger,
-permission or required-check configuration.
+It checks `cargo deny --version` against the single
+`NOVA_CI_CARGO_DENY_VERSION` declaration in `.github/workflows/admission.yml`,
+refreshes the index with `cargo update --dry-run`, then runs
+`cargo deny --format json --locked check advisories`. A version mismatch, a
+missing or duplicate declaration, or a failed refresh is exit 2 and does not
+run the check.
 
-`NOVA_CI_CARGO_DENY_VERSION` must stay identical in `admission.yml` and
-`dependency-advisories.yml`; update and verify both when changing cargo-deny.
+Exit codes: `0` is pass; when the check ran, the process exit code is
+cargo-deny's; `2` is a command-level input error. The exit code is not
+rewritten to match the summary label.
+
+Outcomes are `pass`, `findings` (vulnerability, unsound, unmaintained, notice,
+yanked) and `input-error`. Removable exceptions (`advisory-not-detected`,
+`yanked-not-detected`) are listed separately. Input errors stay visible when
+findings are also present.
+
+Each finding includes the direct inbound crate names and a fix class.
+`compatible` means a candidate version from the dry-run satisfies patched or
+unaffected, or a yanked crate has a compatible candidate.
+`major-or-exception` means there is no newer compatible version, or the
+candidate is still affected. `unknown` means ranges or the advisory database
+could not be read. Apply the candidate and run the command again to confirm
+it; the dry-run candidate can differ from `cargo update -p`.
+
+Provenance is recorded per field: advisory database URL, full commit, commit
+time, fetch time, index refresh, declared and actual cargo-deny version, and
+start time. One unreadable field does not blank the others.
+
+The command records whether `Cargo.lock` and `deny.toml` were unchanged. It
+does not modify them, and it does not restore them.
+
+A fix is an ordinary PR. Use `cargo update -p <crate>` for a compatible
+candidate. When a major bump or an exception is required, add an exact
+`deny.toml` exception that names the inbound edge, the owner and the exit
+path. Delete exceptions the summary lists as removable. Put the before and
+after summaries in the PR description. Admission does not check advisories.
 
 The next two stages, in order, are `unused dependencies` and
 `unused dependencies tests`. They run in local full CI, admission and
