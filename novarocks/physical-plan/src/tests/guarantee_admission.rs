@@ -62,8 +62,9 @@ fn admission() -> FragmentPackageAdmission {
 #[derive(Clone, Copy)]
 enum Predicate {
     Primitive,
+    PrimitiveWithIndependentVolatileResidual,
     Function(FunctionVolatility),
-    IntrinsicDescendant,
+    IntrinsicDescendant(FunctionVolatility),
 }
 
 fn function(volatility: FunctionVolatility) -> BoundFunction {
@@ -81,6 +82,23 @@ fn function(volatility: FunctionVolatility) -> BoundFunction {
             semantic_parameters: Box::default(),
         }),
     }
+}
+
+fn define_call(
+    builder: &mut FragmentBuilder,
+    scan: NodeId,
+    volatility: FunctionVolatility,
+) -> ExprId {
+    builder
+        .define(
+            scan,
+            ty(DataType::Boolean, false),
+            ExprKind::FunctionCall {
+                function: function(volatility),
+                args: Box::default(),
+            },
+        )
+        .unwrap()
 }
 
 // This explicit fixture owner declares a zero-argument, non-NULL Boolean
@@ -315,8 +333,8 @@ fn fixture_with_guarantee_count(
             },
         )
         .unwrap();
-    let predicate = match predicate {
-        Predicate::Primitive => {
+    let predicate_definition = match predicate {
+        Predicate::Primitive | Predicate::PrimitiveWithIndependentVolatileResidual => {
             let value = builder
                 .define(scan, ty(DataType::Int64, false), ExprKind::Value(source))
                 .unwrap();
@@ -331,27 +349,9 @@ fn fixture_with_guarantee_count(
                 )
                 .unwrap()
         }
-        Predicate::Function(volatility) => builder
-            .define(
-                scan,
-                ty(DataType::Boolean, false),
-                ExprKind::FunctionCall {
-                    function: function(volatility),
-                    args: Box::default(),
-                },
-            )
-            .unwrap(),
-        Predicate::IntrinsicDescendant => {
-            let call = builder
-                .define(
-                    scan,
-                    ty(DataType::Boolean, false),
-                    ExprKind::FunctionCall {
-                        function: function(FunctionVolatility::Immutable),
-                        args: Box::default(),
-                    },
-                )
-                .unwrap();
+        Predicate::Function(volatility) => define_call(&mut builder, scan, volatility),
+        Predicate::IntrinsicDescendant(volatility) => {
+            let call = define_call(&mut builder, scan, volatility);
             let negation = builder
                 .define(
                     scan,
@@ -374,7 +374,6 @@ fn fixture_with_guarantee_count(
                 .unwrap()
         }
     };
-    let predicate_definition = predicate;
     let predicate_root = (guarantee.is_some() || residual).then(|| {
         builder.root_definition(
             scan,
@@ -416,6 +415,22 @@ fn fixture_with_guarantee_count(
         };
         metadata.predicate_guarantees = guarantees.into_boxed_slice();
     }
+    let mut residuals = Vec::new();
+    if residual {
+        residuals.push(predicate_root.unwrap());
+    }
+    if matches!(
+        predicate,
+        Predicate::PrimitiveWithIndependentVolatileResidual
+    ) {
+        let call = define_call(&mut builder, scan, FunctionVolatility::Volatile);
+        residuals.push(builder.root_definition(
+            scan,
+            call,
+            EvaluationDemand::TruthOnly,
+            RootScope::Port(0),
+        ));
+    }
     let mut columns = vec![source];
     let derived_values = if derived {
         let derived_root = builder.root_definition(
@@ -454,11 +469,7 @@ fn fixture_with_guarantee_count(
                 relation: Box::new(relation),
                 read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, source)]),
-                residuals: if residual {
-                    Box::from([predicate_root.unwrap()])
-                } else {
-                    Box::default()
-                },
+                residuals: residuals.into_boxed_slice(),
                 derived_values,
             },
         })
@@ -620,7 +631,7 @@ fn guarantee_only_function_refuses_missing_proof_independent_of_legacy_stability
 #[test]
 fn guarantee_intrinsic_descendants_and_actual_row_calls_cannot_supply_own_proof() {
     assert_missing_proof(fixture(
-        Predicate::IntrinsicDescendant,
+        Predicate::IntrinsicDescendant(FunctionVolatility::Immutable),
         Some(PredicateGuaranteeKind::Exact),
         false,
         false,
@@ -691,6 +702,55 @@ fn primitive_guarantees_and_ordinary_function_residuals_keep_actual_package_capa
     }
 }
 
+#[test]
+fn scan_guarantee_checks_its_own_root_with_independent_volatile_residual() {
+    let accepted = fixture(
+        Predicate::PrimitiveWithIndependentVolatileResidual,
+        Some(PredicateGuaranteeKind::PruningOnly),
+        true,
+        false,
+    );
+    let scan = accepted.fragment.root();
+    let NodeKind::Scan {
+        relation,
+        residuals,
+        ..
+    } = &accepted.fragment.nodes()[&scan].kind
+    else {
+        unreachable!()
+    };
+    let guaranteed = relation.predicate_guarantees()[0].predicate;
+    assert_eq!(residuals.len(), 2);
+    assert_eq!(residuals[0], guaranteed);
+    let source = unit(&accepted);
+    let guarantee_use = source.root_use(guaranteed).unwrap();
+    let volatile_use = source.root_use(residuals[1]).unwrap();
+    assert_ne!(guarantee_use, volatile_use);
+    assert_eq!(source.claims().len(), 1);
+    assert_eq!(
+        source.claims()[&volatile_use].effects.value_stability,
+        FunctionVolatility::Volatile,
+    );
+    crate::validate_fragment(&accepted.fragment, &accepted.cuts).unwrap();
+    FragmentPackage::try_new(accepted, admission(), &Control).unwrap();
+
+    let rejected = fixture(
+        Predicate::IntrinsicDescendant(FunctionVolatility::Volatile),
+        Some(PredicateGuaranteeKind::Exact),
+        false,
+        false,
+    );
+    let errors = crate::validate_fragment(&rejected.fragment, &rejected.cuts).unwrap_err();
+    assert!(errors.errors().iter().any(|error| {
+        error.category() == ValidationErrorCategory::StructuralInvariant
+            && error
+                .path()
+                .contains(&format!("nodes[{}]", rejected.fragment.root().get()))
+            && error.message() == "relation predicate guarantee must be replica deterministic"
+    }));
+    assert_missing_proof(rejected);
+}
+
 struct Trace {
     events: Mutex<Vec<(CompilePhase, u32)>>,
     fail_at: Option<usize>,
@@ -747,7 +807,7 @@ fn guarantee_admission_original_control_prefix_includes_success_and_ordinary_fai
             false,
         ),
         fixture(
-            Predicate::IntrinsicDescendant,
+            Predicate::IntrinsicDescendant(FunctionVolatility::Immutable),
             Some(PredicateGuaranteeKind::Exact),
             false,
             false,

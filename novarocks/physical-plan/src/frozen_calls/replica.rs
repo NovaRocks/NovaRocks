@@ -16,8 +16,8 @@
 // under the License.
 
 use super::*;
-use crate::Distribution;
-use novarocks_type_contract::{FunctionInstanceState, FunctionVolatility};
+use crate::{BoundExprSet, Distribution, RootOrdinal};
+use novarocks_type_contract::{ExpressionUseId, FunctionInstanceState, FunctionVolatility};
 
 // One criterion for both claimed-broadcast validation and the private
 // occurrence property proof. Relational lifecycle state is not scalar state;
@@ -26,6 +26,38 @@ pub(crate) fn call_is_replica_equivalent(kind: FunctionKind, effects: &CallEffec
     effects.value_stability == FunctionVolatility::Immutable
         && (kind != FunctionKind::Scalar || effects.instance_state == FunctionInstanceState::None)
         && effects.observable_effects.is_empty()
+}
+
+pub(crate) fn root_calls_are_replica_equivalent(
+    unit: &BoundExprSet,
+    root: RootOrdinal,
+) -> Result<bool, FrozenCallError> {
+    let invocation = unit.root_use(root).ok_or(FrozenCallError::InvalidSite)?;
+    use_calls_are_replica_equivalent(unit, invocation)
+}
+
+// A sealed unit has an acyclic, depth-bounded occurrence forest. Scan
+// guarantees use one tree, while node broadcast checks every occurrence.
+fn use_calls_are_replica_equivalent(
+    unit: &BoundExprSet,
+    id: ExpressionUseId,
+) -> Result<bool, FrozenCallError> {
+    let invocation = unit
+        .control_flow()
+        .uses()
+        .get(&id)
+        .ok_or(FrozenCallError::InvalidSite)?;
+    if let Some(claim) = unit.claims().get(&id)
+        && !call_is_replica_equivalent(FunctionKind::Scalar, &claim.effects)
+    {
+        return Ok(false);
+    }
+    for argument in invocation.arguments.iter().copied() {
+        if !use_calls_are_replica_equivalent(unit, argument)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 impl FrozenFragmentCalls {

@@ -25,9 +25,9 @@ use novarocks_connector_contract::{
 };
 
 use crate::{
-    AggregatePhase, Distribution, ExprKind, Fragment, FunctionKind, NodeId, NodeKind, PhysicalNode,
-    ProviderColumnReference, ProviderReadReference, Relation, RootOrdinal, RowMultiplicity,
-    ValueDef, ValueId, ValueOrigin,
+    AggregatePhase, Distribution, ExprKind, Fragment, FrozenCallError, FunctionKind, NodeId,
+    NodeKind, PhysicalNode, ProviderColumnReference, ProviderReadReference, Relation, RootOrdinal,
+    RowMultiplicity, ValueDef, ValueId, ValueOrigin,
 };
 
 pub(crate) fn writer_result_proof_matches_finish(
@@ -3272,12 +3272,16 @@ pub(crate) fn validate_scan_predicate_contract(
             ));
         }
         if errors.checks_output_and_effect_proofs() {
-            match node_expressions_are_replica_deterministic(
-                fragment,
-                scan,
-                std::iter::once(guarantee.predicate),
-                true,
-            ) {
+            let deterministic = fragment
+                .unit(scan)
+                .ok_or(FrozenCallError::InvalidSite)
+                .and_then(|unit| {
+                    crate::frozen_calls::replica::root_calls_are_replica_equivalent(
+                        unit,
+                        guarantee.predicate,
+                    )
+                });
+            match deterministic {
                 Ok(true) => {}
                 Ok(false) => errors.push(ValidationError::new(
                     path,
