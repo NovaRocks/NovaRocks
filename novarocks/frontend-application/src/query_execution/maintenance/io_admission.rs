@@ -77,8 +77,7 @@ impl std::task::Wake for MetadataWake {
 pub(crate) struct MetadataIoAdmission {
     wake: Arc<MetadataWake>,
     original: Mutex<Option<Body>>,
-    // Only a progress observer that missed the original Body waits here.
-    body_returned: AtomicWaker,
+    body_returned: BodyReturn,
     // Same Source receiving storage, including its Vec backing, remains in
     // original per-root storage. Registration grants neither I/O nor capacity.
     requests: Mutex<RequestIngress>,
@@ -209,19 +208,34 @@ struct StreamBody {
     poll_failure: Option<Box<dyn Any + Send>>,
     drop_failure: Option<Box<dyn Any + Send>>,
 }
+#[derive(Default)]
+struct BodyReturn {
+    // Read and written only while holding the original Body mutex.
+    borrowed: AtomicBool,
+    wake: AtomicWaker,
+}
+
+enum BodyLoanError {
+    Borrowed,
+    Missing,
+}
+
 struct Loan<'a, T> {
     source: &'a Mutex<Option<T>>,
     body: Option<T>,
-    on_return: Option<&'a AtomicWaker>,
+    on_return: Option<&'a BodyReturn>,
 }
 impl<T> Drop for Loan<'_, T> {
     fn drop(&mut self) {
         let mut slot = self.source.lock().unwrap_or_else(|p| p.into_inner());
         assert!(slot.is_none(), "original metadata loan restored once");
         *slot = self.body.take();
+        if let Some(observer) = self.on_return {
+            observer.borrowed.store(false, AtomicOrdering::Relaxed);
+        }
         drop(slot);
         if let Some(observer) = self.on_return {
-            observer.wake();
+            observer.wake.wake();
         }
     }
 }
@@ -623,7 +637,7 @@ impl MetadataIoAdmission {
         let provider_owned_floor = initial_owned_bytes.get();
         Ok(Arc::new(Self {
             wake,
-            body_returned: AtomicWaker::new(),
+            body_returned: BodyReturn::default(),
             requests: Mutex::new(RequestIngress::default()),
             payload_retention: OnceLock::new(),
             settlement: AtomicBool::new(false),
@@ -745,9 +759,42 @@ impl MetadataIoAdmission {
         None
     }
     fn loan_body(&self) -> Option<Loan<'_, Body>> {
-        let mut original = loan(&self.original)?;
-        original.on_return = Some(&self.body_returned);
-        Some(original)
+        self.try_loan_body().ok()
+    }
+
+    fn try_loan_body(&self) -> Result<Loan<'_, Body>, BodyLoanError> {
+        let mut slot = self.original.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(body) = slot.take() else {
+            return Err(
+                if self.body_returned.borrowed.load(AtomicOrdering::Relaxed) {
+                    BodyLoanError::Borrowed
+                } else {
+                    BodyLoanError::Missing
+                },
+            );
+        };
+        self.body_returned
+            .borrowed
+            .store(true, AtomicOrdering::Relaxed);
+        Ok(Loan {
+            source: &self.original,
+            body: Some(body),
+            on_return: Some(&self.body_returned),
+        })
+    }
+
+    fn observe_body_return(&self, cx: &Context<'_>) {
+        self.body_returned.wake.register(cx.waker());
+        // Return may race waiter registration. Observe the slot before waking
+        // and release its lock before notifying the observer.
+        let available = self
+            .original
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some();
+        if available {
+            self.body_returned.wake.wake();
+        }
     }
 
     /// A false result asks the caller to poll again before proceeding.
@@ -756,52 +803,55 @@ impl MetadataIoAdmission {
         owner: &WorkOwner,
         cx: &mut Context<'_>,
     ) -> Result<bool, WorkError> {
-        self.poll_with_original_owner(Some(owner), cx, ProgressObservation::Business)
+        self.poll_readiness(Some(owner), cx, ProgressObservation::Business)
     }
     /// Only the same already-positive Root Source may continue after its owner
     /// moved into a stable statement/protocol receiver. Initial construction
     /// still requires that actual owner; aliases cannot enable this method.
     pub(crate) fn poll_continuing(&self, cx: &mut Context<'_>) -> Result<bool, WorkError> {
-        self.poll_with_original_owner(None, cx, ProgressObservation::Business)
+        self.poll_readiness(None, cx, ProgressObservation::Business)
     }
     /// Advance the original requests while another actual-exit observer is
-    /// pending. False still means the first grant never became ready; neither
-    /// readiness nor quiescence is inferred from an ordinary refusal.
+    /// pending. False leaves readiness unobserved while the first grant or
+    /// the original Body is pending.
     pub(crate) fn poll_actual_progress_continuing(
         &self,
         cx: &mut Context<'_>,
     ) -> Result<bool, WorkError> {
-        self.poll_with_original_owner(None, cx, ProgressObservation::ActualExit)
+        self.poll_readiness(None, cx, ProgressObservation::ActualExit)
     }
-    fn poll_with_original_owner(
+    fn poll_readiness(
         &self,
         owner: Option<&WorkOwner>,
         cx: &mut Context<'_>,
         observation: ProgressObservation,
     ) -> Result<bool, WorkError> {
+        match self.poll_with_original_owner(owner, cx, observation) {
+            Poll::Ready(observed) => observed,
+            Poll::Pending => Ok(false),
+        }
+    }
+
+    fn poll_with_original_owner(
+        &self,
+        owner: Option<&WorkOwner>,
+        cx: &mut Context<'_>,
+        observation: ProgressObservation,
+    ) -> Poll<Result<bool, WorkError>> {
         self.wake.register(cx.waker());
         let (result, cells, changed, reobserve) = {
             let mut requests = self.requests.lock().unwrap_or_else(|p| p.into_inner());
             if requests.withdrawing {
-                return Err(WorkError::Released);
+                return Poll::Ready(Err(WorkError::Released));
             }
-            let Some(mut original) = self.loan_body() else {
-                if observation == ProgressObservation::ActualExit {
-                    return Err(WorkError::Conflict);
+            let mut original = match self.try_loan_body() {
+                Ok(original) => original,
+                Err(BodyLoanError::Borrowed) => {
+                    drop(requests);
+                    self.observe_body_return(cx);
+                    return Poll::Pending;
                 }
-                drop(requests);
-                self.body_returned.register(cx.waker());
-                // The borrower may have returned between the failed loan and
-                // registration. Recheck without holding a lock during wake.
-                let available = self
-                    .original
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .is_some();
-                if available {
-                    self.body_returned.wake();
-                }
-                return Ok(false);
+                Err(BodyLoanError::Missing) => return Poll::Ready(Err(WorkError::Conflict)),
             };
             let body = original.body.as_mut().unwrap();
             let reserve = body.cells.try_reserve(requests.pending.len());
@@ -852,7 +902,7 @@ impl MetadataIoAdmission {
         if reobserve {
             self.wake.wake();
         }
-        result
+        Poll::Ready(result)
     }
     fn progress(
         body: &mut Body,
@@ -1700,11 +1750,14 @@ impl MetadataIoAdmission {
                 None => Poll::Pending,
             };
         }
-        if let Err(error) = self.poll_with_original_owner(owner, cx, observation) {
-            return Poll::Ready(Err(error));
-        }
-        let Some(mut original) = self.loan_body() else {
-            return Poll::Ready(Err(WorkError::Conflict));
+        std::task::ready!(self.poll_with_original_owner(owner, cx, observation))?;
+        let mut original = match self.try_loan_body() {
+            Ok(original) => original,
+            Err(BodyLoanError::Borrowed) => {
+                self.observe_body_return(cx);
+                return Poll::Pending;
+            }
+            Err(BodyLoanError::Missing) => return Poll::Ready(Err(WorkError::Conflict)),
         };
         let body = original.body.as_mut().unwrap();
         if body.growth.is_some()
@@ -1996,7 +2049,7 @@ mod original_governor_tests {
     }
 
     #[test]
-    fn business_progress_does_not_refuse_a_live_request_body_loan() {
+    fn metadata_observers_wait_for_a_live_request_body_loan() {
         let (control, mut driver, root) = original_governor();
         let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
         let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
@@ -2032,9 +2085,13 @@ mod original_governor_tests {
                 request_source.request(SharedDependency::LocalHost)
             });
             let observed = if observe_loan.recv().is_ok() {
-                let observed = source.poll_progress(&root.owner, &mut cx);
+                let business = source.poll_progress(&root.owner, &mut cx);
+                let exit_progress = source.poll_actual_progress_continuing(&mut cx);
+                let exit_pending = source
+                    .poll_actual_quiescent_continuing(&mut cx)
+                    .is_pending();
                 let _ = resume.send(());
-                Some(observed)
+                Some((business, exit_progress, exit_pending))
             } else {
                 None
             };
@@ -2057,7 +2114,7 @@ mod original_governor_tests {
         let wake = Arc::new(OriginalWake::default());
         let waker = Waker::from(Arc::clone(&wake));
         let waiting_for_return =
-            source.poll_progress(&root.owner, &mut Context::from_waker(&waker));
+            source.poll_actual_progress_continuing(&mut Context::from_waker(&waker));
         let before_return = wake.0.load(std::sync::atomic::Ordering::SeqCst);
         drop(returned_body);
         let after_return = wake.0.load(std::sync::atomic::Ordering::SeqCst);
@@ -2094,8 +2151,8 @@ mod original_governor_tests {
         assert!(matches!(admitted, Some(Ok(()))) && held_permit_blocks_exit);
         assert_eq!(
             during_loan,
-            Some(Ok(false)),
-            "a live same-Source request loan must defer the statement observer"
+            Some((Ok(false), Ok(false), true)),
+            "the live request loan must defer both progress and quiescence observations"
         );
         assert_eq!(waiting_for_return, Ok(false));
         assert_eq!((before_return, after_return), (0, 1));
