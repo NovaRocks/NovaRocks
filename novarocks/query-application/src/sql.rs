@@ -392,7 +392,8 @@ fn lower_iceberg_action(
             } => IcebergSchemaSqlChange::AddColumn {
                 path: lower_column_path(path),
                 data_type: lower_sql_type(data_type)?,
-                nullable: *nullable,
+                // The catalog admits an omitted nullability clause as nullable.
+                nullable: Some(nullable.unwrap_or(true)),
                 default: default.as_ref().map(lower_command_literal).transpose()?,
                 position: lower_column_position(position),
             },
@@ -1268,6 +1269,7 @@ mod tests {
             command.action,
             novarocks_sql::semantic::command::IcebergTableSqlAction::Schema(
                 novarocks_sql::semantic::command::IcebergSchemaSqlChange::AddColumn {
+                    nullable: Some(true),
                     position: novarocks_sql::semantic::command::ColumnPositionSql::First,
                     ..
                 }
