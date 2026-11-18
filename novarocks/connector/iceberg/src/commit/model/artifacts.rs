@@ -40,8 +40,6 @@ pub enum ArtifactKind {
     Statistics,
     #[cfg(test)]
     DeletionVector,
-    #[cfg(test)]
-    Metadata,
 }
 impl ArtifactKind {
     pub const fn extension(self) -> &'static str {
@@ -50,8 +48,6 @@ impl ArtifactKind {
             Self::Statistics => "puffin",
             #[cfg(test)]
             Self::DeletionVector => "puffin",
-            #[cfg(test)]
-            Self::Metadata => "json",
         }
     }
 }

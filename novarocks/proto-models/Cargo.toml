@@ -35,9 +35,6 @@ syn.workspace = true
 [package.metadata.novarocks.test]
 runtime-inputs = []
 env-inputs = []
-ignored = [
-  { filter = "test(=release_fixtures::print_release_fixture_hex)", class = "manual", reason = "manual release fixture recorder; paste output into checked-in constants" },
-]
 
 [package.metadata.cargo-machete]
 ignored = [

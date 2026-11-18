@@ -107,6 +107,3 @@ env-inputs = [
     { name = "XDG_STATE_HOME", kind = "value" },
     { name = "NOVA_FIXTURE_STORE", kind = "value" },
 ]
-ignored = [
-    { filter = "test(=actors::catalog::tests::reads_live_fixture_trace_and_metrics)", class = "heavy", requires = ["fixture:docker"], reason = "Owns an isolated publication-hook fixture; requires Docker and locally provisioned fixture inputs" },
-]

@@ -24,7 +24,6 @@ futures.workspace = true
 novarocks-execution-contract.workspace = true
 novarocks-execution.workspace = true
 novarocks-memory.workspace = true
-novarocks-memory-failure.workspace = true
 novarocks-result-contract.workspace = true
 novarocks-spi.workspace = true
 novarocks-types.workspace = true
