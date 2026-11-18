@@ -33,4 +33,4 @@ SELECT 1;
 -- @retry_count=5
 -- @retry_interval_ms=2000
 -- @result_contains=1000000
-SELECT COUNT(*) FROM TABLE(generate_series(1, 1000000));
+SELECT COUNT() FROM TABLE(generate_series(1, 1000000));

@@ -69,7 +69,7 @@ WHERE sleep(delay_s);
 -- query 3
 -- @heartbeat_delay_ms=3000
 -- @result_contains=1000000
-SELECT COUNT(*) FROM TABLE(generate_series(1, 1000000));
+SELECT COUNT() FROM TABLE(generate_series(1, 1000000));
 
 -- query 4
 -- @cleanup=true
