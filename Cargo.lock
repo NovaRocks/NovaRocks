@@ -3229,7 +3229,6 @@ dependencies = [
  "novarocks-secret",
  "novarocks-task-codec",
  "novarocks-test-support",
- "novarocks-test-trino-client",
  "novarocks-types",
  "percent-encoding",
  "prost 0.13.5",
