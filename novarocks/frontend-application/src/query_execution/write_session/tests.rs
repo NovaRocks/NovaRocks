@@ -182,6 +182,7 @@ pub(crate) struct Recorded {
         Option<Arc<dyn ConnectorWriteProductionProof>>,
     )>,
     pub(crate) query_registration_failure: Option<ConnectorError>,
+    pub(crate) panic_query_registration: bool,
     pub(crate) fragment_arrivals: usize,
     pub(crate) write_confirmations: usize,
     pub(crate) arrival_refusal: Option<ConnectorError>,
@@ -571,6 +572,8 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
         targets: &[WriteTargetOrdinal],
         production: Option<Arc<dyn ConnectorWriteProductionProof>>,
     ) -> Result<(), ConnectorError> {
+        let panic = self.recorded.lock().unwrap().panic_query_registration;
+        assert!(!panic, "scripted Provider query registration panic");
         let mut receiving = self.adapter.commit_session(commit)?.0.lock().unwrap();
         if receiving.closed || receiving.queries.contains_key(query) {
             return Err(ConnectorError::new(
