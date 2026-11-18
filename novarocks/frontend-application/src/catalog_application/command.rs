@@ -23,15 +23,19 @@
 //! returns its parser/admission error.
 
 use crate::connector::schema_creation::FrontendSchemaLoad;
-use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorInstanceId};
+use novarocks_spi::connector::{
+    ConnectorCatalogMutationOperation, ConnectorControlPlanningPin, ConnectorControlRegistry,
+    ConnectorInstanceId, ConnectorPropertyAuthority, ConnectorPropertyChange,
+    ConnectorRequestContext, ConnectorSchemaChange, ConnectorTableIdentity,
+};
 use novarocks_types::naming::normalize_identifier;
 use std::sync::Arc;
 
 use crate::catalog_application::create_table_ddl::build_iceberg_create_table_ddl;
 use crate::catalog_application::query_catalog::{CatalogServiceSource, QueryCatalogService};
-use crate::catalog_application::resolver::CatalogAdmission;
+use crate::catalog_application::resolver::{CatalogAdmission, TargetBackend};
 use crate::catalog_application::statement::{
-    CatalogDropContext, CatalogMutationContext, execute_create_database_statement,
+    CatalogDropContext, CatalogMutationContext, ColumnPath, execute_create_database_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
     lower_semantic_iceberg_partition_change, lower_semantic_iceberg_properties_action,
     lower_semantic_iceberg_schema_change,
@@ -530,39 +534,118 @@ fn execute_alter_iceberg_schema(
         connector_context,
     );
     let change = bind_legacy_column_procedure(&target.provider_id, change, &control)?;
-    execute_admitted_alter_schema(
-        executor.connector_control.as_ref(),
-        &instance_id,
-        novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterSchema {
-            table: novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: Arc::from(target.namespace.as_str()),
-                table: Arc::from(target.table.as_str()),
-            },
-            changes: vec![change],
-        },
-        connector_context.clone(),
-        |planning| {
+    let planning = executor
+        .connector_control
+        .acquire_current(&instance_id)
+        .map_err(|error| error.to_string())?;
+    PreparedIcebergTableMutation {
+        target,
+        instance_id,
+        planning,
+        mutation: IcebergTableMutation::Schema(change),
+        catalog_service: executor.catalog_service.clone(),
+        storage_observation: executor.mv_storage_observation.clone(),
+        readiness: executor.mv_readiness.clone(),
+    }
+    .execute_with_drop_guard(connector_context, dropped_path.as_ref())
+}
+
+/// Owns the catalog generation selected by the statement's preparation.
+pub(crate) struct PreparedIcebergTableMutation {
+    pub(crate) target: TargetBackend,
+    pub(crate) instance_id: ConnectorInstanceId,
+    pub(crate) planning: ConnectorControlPlanningPin,
+    pub(crate) mutation: IcebergTableMutation,
+    pub(crate) catalog_service: Arc<QueryCatalogService>,
+    pub(crate) storage_observation: Arc<dyn MvStorageObservationPort>,
+    pub(crate) readiness: Arc<MvReadinessPort>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum IcebergTableMutation {
+    Schema(ConnectorSchemaChange),
+    UnsetProperties(Vec<ConnectorPropertyChange>),
+}
+
+impl PreparedIcebergTableMutation {
+    pub(crate) fn execute(
+        self,
+        connector_context: &ConnectorRequestContext,
+    ) -> Result<StatementResult, CommandError> {
+        self.execute_with_drop_guard(connector_context, None)
+    }
+
+    fn execute_with_drop_guard(
+        self,
+        connector_context: &ConnectorRequestContext,
+        dropped_path: Option<&ColumnPath>,
+    ) -> Result<StatementResult, CommandError> {
+        let Self {
+            target,
+            instance_id,
+            planning,
+            mutation,
+            catalog_service,
+            storage_observation,
+            readiness,
+        } = self;
+        let table = ConnectorTableIdentity {
+            instance_id,
+            namespace: Arc::from(target.namespace.as_str()),
+            table: Arc::from(target.table.as_str()),
+        };
+        let is_unset = matches!(&mutation, IcebergTableMutation::UnsetProperties(_));
+        let operation = match mutation {
+            IcebergTableMutation::Schema(change) => {
+                ConnectorCatalogMutationOperation::AlterSchema {
+                    table,
+                    changes: vec![change],
+                }
+            }
+            IcebergTableMutation::UnsetProperties(changes) => {
+                ConnectorCatalogMutationOperation::AlterProperties {
+                    table,
+                    changes,
+                    authority: ConnectorPropertyAuthority::UserStatement,
+                    expected_committed_partitioning: None,
+                }
+            }
+        };
+        let guard = |planning: &ConnectorControlPlanningPin| {
             crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context(
-                executor.mv_storage_observation.as_ref(),
+                storage_observation.as_ref(),
                 planning,
-                executor.mv_readiness.as_ref(),
+                readiness.as_ref(),
                 &target,
                 crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
                 connector_context.clone(),
-            )?;
-            if let Some(path) = &dropped_path {
-                crate::mv::domain::iceberg_guard::reject_drop_column_mv_dependencies_with_readiness(
-                    executor.mv_readiness.as_ref(),
-                    &target,
-                    path,
-                )?;
-            }
-            Ok(())
-        },
-    )?;
-    crate::catalog_application::resolver::invalidate_iceberg_caches(executor, &target)?;
-    Ok(StatementResult::Ok)
+            )
+        };
+        // Raw property mutations guard the target before provider admission.
+        if is_unset {
+            guard(&planning)?;
+        }
+        execute_admitted_table_mutation_on_pin(
+            &planning,
+            operation,
+            connector_context.clone(),
+            |planning| {
+                if !is_unset {
+                    guard(planning)?;
+                }
+                if let Some(path) = dropped_path {
+                    crate::mv::domain::iceberg_guard::reject_drop_column_mv_dependencies_with_readiness(
+                        readiness.as_ref(),
+                        &target,
+                        path,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        catalog_service.invalidate_table(&target.catalog, &target.namespace, &target.table)?;
+        Ok(StatementResult::Ok)
+    }
 }
 
 fn bind_legacy_column_procedure(
@@ -680,6 +763,7 @@ fn bind_legacy_column_procedure(
 /// Admit the complete schema mutation before any metadata-dependent guard.
 /// Both guards and publication retain the same control generation even if the
 /// catalog's current generation changes while the statement is in progress.
+#[cfg(test)]
 fn execute_admitted_alter_schema(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     instance_id: &ConnectorInstanceId,
@@ -690,6 +774,15 @@ fn execute_admitted_alter_schema(
     let planning = controls
         .acquire_current(instance_id)
         .map_err(|error| error.to_string())?;
+    execute_admitted_table_mutation_on_pin(&planning, operation, context, guard)
+}
+
+fn execute_admitted_table_mutation_on_pin(
+    planning: &ConnectorControlPlanningPin,
+    operation: ConnectorCatalogMutationOperation,
+    context: ConnectorRequestContext,
+    guard: impl FnOnce(&ConnectorControlPlanningPin) -> Result<(), String>,
+) -> Result<crate::connector::mutation::CompletedCatalogMutation, String> {
     let mutation = planning
         .derive_mutation_lease()
         .map_err(|error| error.to_string())?;
@@ -697,7 +790,7 @@ fn execute_admitted_alter_schema(
     mutation
         .admit_operation(operation_id, operation.clone(), context.clone())
         .map_err(|error| error.to_string())?;
-    guard(&planning)?;
+    guard(planning)?;
     crate::connector::mutation::execute_catalog_mutation_with_lease(
         &mutation,
         operation_id,

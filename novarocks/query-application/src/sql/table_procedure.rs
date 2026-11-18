@@ -312,6 +312,16 @@ pub fn resolve_legacy_table_procedure(
     resolve_table_procedure_name(provider, name, false)
 }
 
+/// Classify a declared statement shape before catalog admission. The provider
+/// still resolves the procedure against the retained catalog generation.
+pub fn declared_table_procedure_kind(name: &Ident) -> Option<TableProcedureKind> {
+    lookup_iceberg_procedure(&canonical(&name.value, name.quoted)).map(TableProcedure::kind)
+}
+
+fn lookup_iceberg_procedure(canonical: &str) -> Option<&'static TableProcedure> {
+    ICEBERG.iter().find(|procedure| procedure.name == canonical)
+}
+
 fn resolve_table_procedure_name(
     provider: &ConnectorProviderId,
     name: &str,
@@ -319,7 +329,7 @@ fn resolve_table_procedure_name(
 ) -> Result<&'static TableProcedure, QueryServiceError> {
     let canonical = canonical(name, quoted);
     if provider.as_str() == "iceberg"
-        && let Some(procedure) = ICEBERG.iter().find(|procedure| procedure.name == canonical)
+        && let Some(procedure) = lookup_iceberg_procedure(&canonical)
     {
         return Ok(procedure);
     }

@@ -76,6 +76,8 @@ fn completion_for_statement(statement: &OwnedDeleteStatement) -> WriteCompletion
     match statement {
         OwnedDeleteStatement::Predicate(_) => WriteCompletion::Counted,
         OwnedDeleteStatement::Equality(_) => WriteCompletion::Empty,
+        #[cfg(novarocks_dev_controls)]
+        OwnedDeleteStatement::TrinoEquality { .. } => WriteCompletion::Empty,
     }
 }
 
@@ -103,16 +105,27 @@ pub(crate) fn prepare(
         .result_capacity()
         .ok_or_else(|| "DELETE has no original Root result capacity".to_owned())?;
     let root = root_capacity.root_scope().clone();
-    let (target, reference) = delete::resolve_target(
-        &kernel,
-        &input.statement,
-        input.context.session().current_catalog(),
-        input.context.session().current_database(),
-    )?;
-    let planning_pin = crate::connector::acquire_metadata_planning_pin(
-        kernel.connector_control().as_ref(),
-        &target.catalog,
-    )?;
+    let (target, reference, planning_pin) = match &input.statement {
+        #[cfg(novarocks_dev_controls)]
+        OwnedDeleteStatement::TrinoEquality { resolved, .. } => (
+            resolved.target.clone(),
+            "main".to_owned(),
+            resolved.planning.clone(),
+        ),
+        original => {
+            let (target, reference) = delete::resolve_target(
+                &kernel,
+                original,
+                input.context.session().current_catalog(),
+                input.context.session().current_database(),
+            )?;
+            let planning = crate::connector::acquire_metadata_planning_pin(
+                kernel.connector_control().as_ref(),
+                &target.catalog,
+            )?;
+            (target, reference, planning)
+        }
+    };
     let stack = kernel
         .typed_connector_control()
         .acquire_exact_write_stack(planning_pin.control_runtime_id())

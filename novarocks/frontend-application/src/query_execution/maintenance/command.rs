@@ -34,7 +34,7 @@ use novarocks_query_application::{
 use novarocks_table_maintenance::runtime::TerminalError;
 
 mod table_execute;
-pub(crate) use table_execute::PreparedTableExecute;
+pub(crate) use table_execute::{PreparedTableExecute, PreparedTableProcedureMutation};
 
 /// Foreground maintenance command capability.  Each invocation creates a
 /// short-lived engine carrying only the Frontend-composed maintenance ports

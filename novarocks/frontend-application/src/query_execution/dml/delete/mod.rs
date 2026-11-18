@@ -60,6 +60,27 @@ impl PreparedPredicateDelete {
 pub(crate) enum OwnedDeleteStatement {
     Predicate(PreparedPredicateDelete),
     Equality(novarocks_parser::ast::AddEqualityDelete),
+    #[cfg(novarocks_dev_controls)]
+    TrinoEquality {
+        statement: equality::PreparedEqualityDelete,
+        resolved: ResolvedEqualityDeleteTarget,
+    },
+}
+
+#[cfg(novarocks_dev_controls)]
+#[derive(Clone)]
+pub(crate) struct ResolvedEqualityDeleteTarget {
+    pub(crate) target: crate::catalog_application::resolver::TargetBackend,
+    pub(crate) planning: novarocks_spi::connector::ConnectorControlPlanningPin,
+}
+
+#[cfg(novarocks_dev_controls)]
+impl std::fmt::Debug for ResolvedEqualityDeleteTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedEqualityDeleteTarget")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Resolve only local catalog admission and parser-owned target facts. The
@@ -80,6 +101,12 @@ pub(crate) fn resolve_target(
         OwnedDeleteStatement::Equality(statement) => {
             equality::resolve_target(state, statement, current_catalog, current_database)
         }
+        #[cfg(novarocks_dev_controls)]
+        OwnedDeleteStatement::TrinoEquality { .. } => Err(
+            "Trino equality delete requires its retained target and planning pin"
+                .to_owned()
+                .into(),
+        ),
     }
 }
 
@@ -208,7 +235,21 @@ pub(crate) async fn prepare_delete_write_async(
         OwnedDeleteStatement::Equality(statement) => {
             equality::prepare_equality_delete_statement_async(
                 state,
-                statement,
+                equality::EqualityDeleteStatement::Legacy(statement),
+                target,
+                target_ref,
+                planning_pin,
+                execution,
+                connector_context,
+                begin_receiving,
+            )
+            .await
+        }
+        #[cfg(novarocks_dev_controls)]
+        OwnedDeleteStatement::TrinoEquality { statement, .. } => {
+            equality::prepare_equality_delete_statement_async(
+                state,
+                equality::EqualityDeleteStatement::Trino(statement),
                 target,
                 target_ref,
                 planning_pin,

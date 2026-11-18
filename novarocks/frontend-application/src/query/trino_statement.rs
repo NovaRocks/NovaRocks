@@ -313,6 +313,9 @@ fn preparation_plan(
     use StatementKind::*;
     use StatementOutputShape::{Empty, ResultSet, UndeterminedCall};
     use TrinoStatementPreparation as Prep;
+    use novarocks_query_application::sql::table_procedure::{
+        TableProcedureKind as Procedure, declared_table_procedure_kind,
+    };
 
     let management = |kind| CommandPlan::management(kind, Empty, true);
     let result = match preparation {
@@ -331,8 +334,8 @@ fn preparation_plan(
         Prep::SetTableProperties { .. } => management(SetTableProperties),
         Prep::CommentTable(_) => management(CommentTable),
         Prep::CommentColumn(_) => management(CommentColumn),
-        Prep::TableExecute(node) => match node.procedure_name.value.to_ascii_lowercase().as_str() {
-            "optimize" => CommandPlan {
+        Prep::TableExecute(node) => match declared_table_procedure_kind(&node.procedure_name) {
+            Some(Procedure::Optimize) => CommandPlan {
                 admission: StatementAdmission {
                     kind: Optimize,
                     shape: ResultSet,
@@ -342,11 +345,24 @@ fn preparation_plan(
                 publication_deadline: true,
                 waits_for_topology: false,
             },
-            "rewrite_manifests" => management(RewriteManifests),
-            "expire_snapshots" => management(ExpireSnapshots),
-            "remove_orphan_files" => management(RemoveOrphanFiles),
-            "add_files" => CommandPlan::management(AddFiles, ResultSet, true),
-            _ => CommandPlan::management(Call, UndeterminedCall, true),
+            Some(Procedure::OptimizeManifests) => management(RewriteManifests),
+            Some(Procedure::ExpireSnapshots) => management(ExpireSnapshots),
+            Some(Procedure::RemoveOrphanFiles) => management(RemoveOrphanFiles),
+            Some(Procedure::AddFiles) => CommandPlan::management(AddFiles, ResultSet, true),
+            Some(Procedure::MoveColumn) => management(ReorderColumn),
+            Some(Procedure::SetColumnNotNull) => management(SetColumnNotNull),
+            Some(Procedure::UnsetExtraProperties) => management(UnsetTableProperties),
+            Some(Procedure::CreateTag) => management(CreateTag),
+            Some(Procedure::DropTag) => management(DropTag),
+            #[cfg(novarocks_dev_controls)]
+            Some(Procedure::AddEqualityDelete) => CommandPlan {
+                admission: StatementAdmission {
+                    kind: AddEqualityDelete,
+                    shape: Empty,
+                },
+                ..CommandPlan::write(AddEqualityDelete, true)
+            },
+            None => CommandPlan::management(Call, UndeterminedCall, true),
         },
         Prep::Analyze(_) => CommandPlan::write(Analyze, false),
         Prep::CreateBranch(_) => management(CreateBranch),
@@ -1223,6 +1239,9 @@ impl FrontendQuerySession {
         let request = input.request.clone();
         let command = input.command.clone();
         let statement_started_at = input.statement_started_at;
+        let node = Arc::new(node);
+        #[cfg(novarocks_dev_controls)]
+        let equality_source = source.clone();
         #[cfg(novarocks_dev_controls)]
         let observation = input.observation.clone();
         let (result, execution_owner, window) = execute_synchronous_stage(
@@ -1256,7 +1275,51 @@ impl FrontendQuerySession {
                     .execute_observed_statement_action(statement, action)
                     .await;
             }
+            Ok(PreparedTrinoTableExecute::Mutation(prepared)) => {
+                let execution_owner = statement
+                    .take_execution_owner()
+                    .expect("same original table procedure owner");
+                let executor = self.service.query_blocking_executor.clone();
+                let cancellation = input.cancellation.clone();
+                let connector = input.command.connector_context().clone();
+                let mut worker = Box::pin(async move {
+                    execute_synchronous_stage(
+                        executor,
+                        cancellation,
+                        execution_owner,
+                        window,
+                        move || prepared.execute(&connector).map_err(product_command_error),
+                    )
+                    .await
+                    .map(|(result, owner, _window)| (result, owner))
+                }) as TypedCommandWorker;
+                return self
+                    .finish_command_worker(
+                        statement,
+                        input.cancellation,
+                        input.timeout_duration,
+                        &mut worker,
+                    )
+                    .await;
+            }
             Ok(PreparedTrinoTableExecute::AddFiles(resolved)) => resolved,
+            #[cfg(novarocks_dev_controls)]
+            Ok(PreparedTrinoTableExecute::EqualityDelete(prepared)) => {
+                use crate::query_execution::dml::delete::DeleteStatementInput;
+                let action = self
+                    .service
+                    .delete_engine
+                    .prepare_statement_action(DeleteStatementInput {
+                        statement: prepared,
+                        sql: equality_source.to_string(),
+                        context: input.request,
+                        query_options: input.options,
+                        launcher: self.statement_logical_execution_launcher(),
+                        observation: input.observation,
+                    })
+                    .map_err(|error| error.into_service());
+                return self.run_trino_action(statement, action).await;
+            }
             Err(error) => {
                 return Ok(
                     self.governed_typed_error(routed_execution_service_error(error), statement)

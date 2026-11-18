@@ -1043,7 +1043,6 @@ impl ColumnPath {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn parse(input: &str) -> Result<Self, String> {
         if input.is_empty() {
             return Err("column path is empty".to_string());

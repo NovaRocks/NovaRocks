@@ -23,25 +23,32 @@
 
 use std::sync::Arc;
 
+use novarocks_parser::Span;
 use novarocks_query_application::{
     api::{CommandError, CommandErrorKind},
     protocol_delivery::QuerySessionOutput as StatementResult,
+    session_error::{QueryServiceError, QueryServiceErrorKind},
     sql::table_procedure::{
-        BoundProcedureArgument, BoundProcedureValue, LegacyProcedureValue,
-        bind_legacy_procedure_arguments, resolve_legacy_table_procedure,
+        BoundProcedureArgument, BoundProcedureValue, BoundTableProcedure, LegacyProcedureValue,
+        ProcedureArgumentDefault, TableProcedureArgument, TableProcedureKind,
+        bind_legacy_procedure_arguments, invalid_procedure_argument,
+        resolve_legacy_table_procedure,
     },
 };
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationSession,
     ConnectorControlPlanningPin, ConnectorInstanceId, ConnectorProviderId, ConnectorRefAction,
-    ConnectorRefKind, ConnectorTableIdentity, CreateOrReplacePolicy, DdlPropertyValue, DropPolicy,
-    ExternalMutationFinalization,
+    ConnectorRefKind, ConnectorRequestContext, ConnectorTableIdentity, CreateOrReplacePolicy,
+    DdlPropertyValue, DropPolicy, ExternalMutationFinalization, MvStorageObservationPort,
 };
 use novarocks_sql::semantic::ObjectName;
 use novarocks_sql::semantic::command::{
     AlterIcebergTableSqlCommand, IcebergReferenceKindSql, IcebergReferenceSqlAction,
     IcebergTableSqlAction,
 };
+
+use crate::catalog_application::resolver::{TargetBackend, require_external_target};
+use crate::mv::domain::readiness::MvReadinessPort;
 
 pub(crate) struct RefMutationBinding {
     pin: ConnectorControlPlanningPin,
@@ -58,6 +65,49 @@ impl RefMutationBinding {
 pub(crate) struct PreparedRefMutation {
     binding: RefMutationBinding,
     action: ConnectorRefAction,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct TrinoTagAction(ConnectorRefAction);
+
+pub(crate) fn project_trino_tag(
+    source: &str,
+    span: Span,
+    bound: BoundTableProcedure<'_>,
+) -> Result<TrinoTagAction, QueryServiceError> {
+    project_tag(bound, Some((source, span))).map(TrinoTagAction)
+}
+
+/// The procedure binder and the ref mutation retain the same planning pin.
+pub(crate) fn prepare_resolved_tag(
+    storage_observation: &dyn MvStorageObservationPort,
+    readiness: &MvReadinessPort,
+    target: &TargetBackend,
+    planning: ConnectorControlPlanningPin,
+    action: TrinoTagAction,
+    connector_context: &ConnectorRequestContext,
+) -> Result<PreparedRefMutation, CommandError> {
+    crate::connector::validate_request_context(connector_context)?;
+    require_external_target(&target.catalog, &target.namespace)?;
+    if target.provider_id.as_str() != "iceberg"
+        || planning.binding().descriptor().provider_id != target.provider_id
+    {
+        return Err(CommandError::new(
+            CommandErrorKind::Conflict,
+            "Tag procedure target does not match its retained Iceberg generation",
+        ));
+    }
+    let binding = bind_resolved_target(
+        storage_observation,
+        readiness,
+        target,
+        planning,
+        connector_context,
+    )?;
+    Ok(PreparedRefMutation {
+        binding,
+        action: action.0,
+    })
 }
 
 /// Execute an Iceberg ref mutation using only the explicit connector-control
@@ -94,45 +144,59 @@ pub(crate) fn prepare_target(
 ) -> Result<RefMutationBinding, CommandError> {
     crate::connector::validate_request_context(connector_context)?;
     let (catalog_name, namespace, table_name) = resolve_table_parts(table)?;
-    crate::catalog_application::resolver::require_external_target(&catalog_name, &namespace)?;
-
-    // Retain one exact generation across MV admission and the ref mutation.
-    // The application never decodes the provider-owned table handle.
+    require_external_target(&catalog_name, &namespace)?;
     let exact_lease =
         crate::connector::acquire_metadata_planning_pin(connector_control, &catalog_name)?;
-    let target = crate::catalog_application::resolver::TargetBackend {
-        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-            .expect("static Iceberg provider ID"),
-        catalog: catalog_name.clone(),
-        namespace: namespace.clone(),
-        table: table_name.clone(),
+    let target = TargetBackend {
+        provider_id: ConnectorProviderId::parse("iceberg").expect("static Iceberg provider ID"),
+        catalog: catalog_name,
+        namespace,
+        table: table_name,
     };
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context(
+    bind_resolved_target(
         storage_observation,
-        &exact_lease,
         readiness,
         &target,
+        exact_lease,
+        connector_context,
+    )
+}
+
+fn bind_resolved_target(
+    storage_observation: &dyn MvStorageObservationPort,
+    readiness: &MvReadinessPort,
+    target: &TargetBackend,
+    planning: ConnectorControlPlanningPin,
+    connector_context: &ConnectorRequestContext,
+) -> Result<RefMutationBinding, CommandError> {
+    // Retain one exact generation across MV admission and the ref mutation.
+    // The application never decodes the provider-owned table handle.
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context(
+        storage_observation,
+        &planning,
+        readiness,
+        target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
         connector_context.clone(),
     )
     .map_err(|error| format!("guard ALTER TABLE reference: {error}"))?;
     let instance_id =
-        ConnectorInstanceId::parse(&catalog_name).map_err(|error| error.to_string())?;
-    if exact_lease.binding().descriptor().instance_id != instance_id {
+        ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
+    if planning.binding().descriptor().instance_id != instance_id {
         return Err(
             ("connector planning pin identity changed during ALTER TABLE ref".to_string()).into(),
         );
     }
-    let mutation_lease = exact_lease
+    let mutation = planning
         .derive_mutation_lease()
         .map_err(|error| error.to_string())?;
     Ok(RefMutationBinding {
-        pin: exact_lease,
-        mutation: mutation_lease,
+        pin: planning,
+        mutation,
         table: ConnectorTableIdentity {
             instance_id,
-            namespace: Arc::from(namespace),
-            table: Arc::from(table_name),
+            namespace: Arc::from(target.namespace.as_str()),
+            table: Arc::from(target.table.as_str()),
         },
     })
 }
@@ -216,16 +280,7 @@ fn connector_ref_action(
     provider: &ConnectorProviderId,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ConnectorRefAction, CommandError> {
-    let policy = |replace: bool, if_not_exists: bool| {
-        if replace {
-            CreateOrReplacePolicy::ReplaceIfExists
-        } else if if_not_exists {
-            CreateOrReplacePolicy::NoOpIfExists
-        } else {
-            CreateOrReplacePolicy::FailIfExists
-        }
-    };
-    Ok(match action {
+    match action {
         IcebergReferenceSqlAction::Create {
             kind,
             name,
@@ -233,124 +288,134 @@ fn connector_ref_action(
             if_not_exists,
             or_replace,
         } => {
-            let (name, snapshot_id, or_replace, if_not_exists) =
-                if *kind == IcebergReferenceKindSql::Tag {
-                    let mut inputs = Vec::with_capacity(4);
-                    inputs.push(("name", LegacyProcedureValue::Varchar(name)));
-                    if let Some(snapshot_id) = snapshot_id {
-                        inputs.push(("snapshot_id", LegacyProcedureValue::Bigint(*snapshot_id)));
-                    }
-                    inputs.push(("replace", LegacyProcedureValue::Boolean(*or_replace)));
-                    inputs.push((
-                        "if_not_exists",
-                        LegacyProcedureValue::Boolean(*if_not_exists),
-                    ));
-                    let bound = bind_tag(provider, "create_tag", &inputs, control)?;
-                    let mut slots = bound.into_arguments();
-                    let (
-                        Some(DdlPropertyValue::Varchar(name)),
-                        snapshot,
-                        Some(DdlPropertyValue::Boolean(or_replace)),
-                        Some(DdlPropertyValue::Boolean(if_not_exists)),
-                    ) = (
-                        tag_argument(&mut slots, "name")?,
-                        tag_argument(&mut slots, "snapshot_id")?,
-                        tag_argument(&mut slots, "replace")?,
-                        tag_argument(&mut slots, "if_not_exists")?,
-                    )
-                    else {
-                        return Err(tag_binding_invariant());
-                    };
-                    let snapshot = match snapshot {
-                        Some(DdlPropertyValue::Bigint(id)) => Some(id),
-                        None => None,
-                        _ => return Err(tag_binding_invariant()),
-                    };
-                    (Arc::from(name), snapshot, or_replace, if_not_exists)
-                } else {
-                    (
-                        Arc::from(name.as_str()),
-                        *snapshot_id,
-                        *or_replace,
-                        *if_not_exists,
-                    )
-                };
-            ConnectorRefAction::Create {
-                kind: connector_ref_kind(*kind),
-                name,
-                snapshot_id,
-                policy: policy(or_replace, if_not_exists),
-                expected_table_uuid: None,
+            if *kind == IcebergReferenceKindSql::Branch {
+                return Ok(create_ref(
+                    ConnectorRefKind::Branch,
+                    Arc::from(name.as_str()),
+                    *snapshot_id,
+                    *or_replace,
+                    *if_not_exists,
+                ));
             }
+            let mut inputs = Vec::with_capacity(4);
+            inputs.push(("name", LegacyProcedureValue::Varchar(name)));
+            if let Some(snapshot_id) = snapshot_id {
+                inputs.push(("snapshot_id", LegacyProcedureValue::Bigint(*snapshot_id)));
+            }
+            inputs.push(("replace", LegacyProcedureValue::Boolean(*or_replace)));
+            inputs.push((
+                "if_not_exists",
+                LegacyProcedureValue::Boolean(*if_not_exists),
+            ));
+            bind_tag(provider, "create_tag", &inputs, control)
         }
         IcebergReferenceSqlAction::Drop {
             kind,
             name,
             if_exists,
         } => {
-            let (name, if_exists) = if *kind == IcebergReferenceKindSql::Tag {
-                let bound = bind_tag(
-                    provider,
-                    "drop_tag",
-                    &[
-                        ("name", LegacyProcedureValue::Varchar(name)),
-                        ("if_exists", LegacyProcedureValue::Boolean(*if_exists)),
-                    ],
-                    control,
-                )?;
-                let mut slots = bound.into_arguments();
-                let (
-                    Some(DdlPropertyValue::Varchar(name)),
-                    Some(DdlPropertyValue::Boolean(if_exists)),
-                ) = (
-                    tag_argument(&mut slots, "name")?,
-                    tag_argument(&mut slots, "if_exists")?,
-                )
-                else {
-                    return Err(tag_binding_invariant());
-                };
-                (Arc::from(name), if_exists)
-            } else {
-                (Arc::from(name.as_str()), *if_exists)
-            };
-            ConnectorRefAction::Drop {
-                kind: connector_ref_kind(*kind),
-                name,
-                policy: if if_exists {
-                    DropPolicy::NoOpIfMissing
-                } else {
-                    DropPolicy::FailIfMissing
-                },
+            if *kind == IcebergReferenceKindSql::Branch {
+                return Ok(drop_ref(
+                    ConnectorRefKind::Branch,
+                    Arc::from(name.as_str()),
+                    *if_exists,
+                ));
             }
+            bind_tag(
+                provider,
+                "drop_tag",
+                &[
+                    ("name", LegacyProcedureValue::Varchar(name)),
+                    ("if_exists", LegacyProcedureValue::Boolean(*if_exists)),
+                ],
+                control,
+            )
         }
-    })
+    }
 }
 
-fn bind_tag<'a>(
+fn bind_tag(
     provider: &ConnectorProviderId,
     procedure: &str,
-    arguments: &[(&str, LegacyProcedureValue<'a>)],
+    inputs: &[(&str, LegacyProcedureValue<'_>)],
     control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<novarocks_query_application::sql::table_procedure::BoundTableProcedure<'a>, CommandError>
-{
+) -> Result<ConnectorRefAction, CommandError> {
     let procedure = resolve_legacy_table_procedure(provider, procedure)
         .map_err(crate::query::procedure_command_error)?;
-    bind_legacy_procedure_arguments(procedure, arguments, control)
-        .map_err(crate::query::procedure_command_error)
+    let bound = bind_legacy_procedure_arguments(procedure, inputs, control)
+        .map_err(crate::query::procedure_command_error)?;
+    project_tag(bound, None).map_err(crate::query::procedure_command_error)
+}
+
+fn project_tag(
+    bound: BoundTableProcedure<'_>,
+    location: Option<(&str, Span)>,
+) -> Result<ConnectorRefAction, QueryServiceError> {
+    let declaration = bound.declaration();
+    let mut slots = bound.into_arguments();
+    let name = match tag_argument(&mut slots, "name")? {
+        Some(DdlPropertyValue::Varchar(name)) => Arc::from(name),
+        None => {
+            return Err(match location {
+                Some((source, span)) => invalid_procedure_argument(
+                    source,
+                    span,
+                    format!("Table procedure {} requires 'name'", declaration.name()),
+                ),
+                None => tag_binding_invariant(),
+            });
+        }
+        _ => return Err(tag_binding_invariant()),
+    };
+    match declaration.kind() {
+        TableProcedureKind::CreateTag => {
+            let snapshot_id = match tag_argument(&mut slots, "snapshot_id")? {
+                Some(DdlPropertyValue::Bigint(id)) => Some(id),
+                None => None,
+                _ => return Err(tag_binding_invariant()),
+            };
+            let (
+                Some(DdlPropertyValue::Boolean(replace)),
+                Some(DdlPropertyValue::Boolean(if_not_exists)),
+            ) = (
+                tag_argument(&mut slots, "replace")?,
+                tag_argument(&mut slots, "if_not_exists")?,
+            )
+            else {
+                return Err(tag_binding_invariant());
+            };
+            Ok(create_ref(
+                ConnectorRefKind::Tag,
+                name,
+                snapshot_id,
+                replace,
+                if_not_exists,
+            ))
+        }
+        TableProcedureKind::DropTag => {
+            let Some(DdlPropertyValue::Boolean(if_exists)) = tag_argument(&mut slots, "if_exists")?
+            else {
+                return Err(tag_binding_invariant());
+            };
+            Ok(drop_ref(ConnectorRefKind::Tag, name, if_exists))
+        }
+        _ => Err(tag_binding_invariant()),
+    }
 }
 
 fn tag_argument<'a>(
-    slots: &mut impl Iterator<
-        Item = (
-            &'static novarocks_query_application::sql::table_procedure::TableProcedureArgument,
-            BoundProcedureArgument<'a>,
-        ),
-    >,
+    slots: &mut impl Iterator<Item = (&'static TableProcedureArgument, BoundProcedureArgument<'a>)>,
     name: &str,
-) -> Result<Option<DdlPropertyValue>, CommandError> {
+) -> Result<Option<DdlPropertyValue>, QueryServiceError> {
     match slots.next() {
         Some((slot, argument)) if slot.name == name => match argument {
-            BoundProcedureArgument::Omitted => Ok(None),
+            BoundProcedureArgument::Omitted => match slot.default {
+                Some(ProcedureArgumentDefault::Boolean(value)) => {
+                    Ok(Some(DdlPropertyValue::Boolean(value)))
+                }
+                None => Ok(None),
+                _ => Err(tag_binding_invariant()),
+            },
             BoundProcedureArgument::Present {
                 value: BoundProcedureValue::Value(value),
                 ..
@@ -361,17 +426,45 @@ fn tag_argument<'a>(
     }
 }
 
-fn tag_binding_invariant() -> CommandError {
-    CommandError::new(
-        CommandErrorKind::Failed,
-        "Legacy tag binding differs from its original procedure declaration",
+fn tag_binding_invariant() -> QueryServiceError {
+    QueryServiceError::new(
+        QueryServiceErrorKind::Internal,
+        "Tag binding differs from its original procedure declaration",
     )
 }
 
-const fn connector_ref_kind(kind: IcebergReferenceKindSql) -> ConnectorRefKind {
-    match kind {
-        IcebergReferenceKindSql::Branch => ConnectorRefKind::Branch,
-        IcebergReferenceKindSql::Tag => ConnectorRefKind::Tag,
+fn create_ref(
+    kind: ConnectorRefKind,
+    name: Arc<str>,
+    snapshot_id: Option<i64>,
+    replace: bool,
+    if_not_exists: bool,
+) -> ConnectorRefAction {
+    let policy = if replace {
+        CreateOrReplacePolicy::ReplaceIfExists
+    } else if if_not_exists {
+        CreateOrReplacePolicy::NoOpIfExists
+    } else {
+        CreateOrReplacePolicy::FailIfExists
+    };
+    ConnectorRefAction::Create {
+        kind,
+        name,
+        snapshot_id,
+        policy,
+        expected_table_uuid: None,
+    }
+}
+
+fn drop_ref(kind: ConnectorRefKind, name: Arc<str>, if_exists: bool) -> ConnectorRefAction {
+    ConnectorRefAction::Drop {
+        kind,
+        name,
+        policy: if if_exists {
+            DropPolicy::NoOpIfMissing
+        } else {
+            DropPolicy::FailIfMissing
+        },
     }
 }
 
@@ -484,6 +577,152 @@ mod tests {
         assert_eq!(kind, ConnectorRefKind::Tag);
         assert_eq!(name.as_ref(), "release");
         assert_eq!(policy, DropPolicy::NoOpIfMissing);
+    }
+
+    struct LiteralConstants;
+
+    impl novarocks_query_application::sql::property_evaluation::DdlPropertyConstantPort
+        for LiteralConstants
+    {
+        fn evaluate(
+            &mut self,
+            expression: &novarocks_parser::ast::Expr,
+            target: novarocks_sql::compiler::RequiredConstantTarget,
+        ) -> Result<
+            novarocks_functions::ConstantValue,
+            novarocks_query_application::sql::property_evaluation::DdlPropertyConstantError,
+        > {
+            use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
+            use novarocks_parser::ast::{Expr, LiteralKind};
+            use novarocks_sql::compiler::RequiredConstantTarget;
+
+            let Expr::Literal(literal) = expression else {
+                panic!("expected a literal in tag procedure test");
+            };
+            let data = match (target, &literal.kind) {
+                (RequiredConstantTarget::Varchar, LiteralKind::String(value)) => {
+                    StringArray::from(vec![value.as_str()]).to_data()
+                }
+                (RequiredConstantTarget::Bigint, LiteralKind::Long { parsed_value, .. }) => {
+                    Int64Array::from(vec![*parsed_value]).to_data()
+                }
+                (RequiredConstantTarget::Boolean, LiteralKind::Boolean(value)) => {
+                    BooleanArray::from(vec![*value]).to_data()
+                }
+                _ => panic!("unexpected tag procedure literal"),
+            };
+            let data_type = data.data_type().clone();
+            let pool = novarocks_functions::ConstantPool::try_new(
+                Arc::new(arrow::datatypes::Field::new(
+                    "tag argument",
+                    data_type.clone(),
+                    false,
+                )),
+                novarocks_type_contract::FunctionValueType::new(data_type, false),
+                data,
+                crate::application::test_constant_policy(),
+                novarocks_type_contract::CompilePhase::Validate,
+                &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            Ok(pool.value(0).unwrap())
+        }
+    }
+
+    struct NoTimestampArguments;
+
+    impl novarocks_query_application::sql::table_procedure::TableProcedureAbsoluteTimePort
+        for NoTimestampArguments
+    {
+        fn legacy_timestamp_literal_millis(
+            &mut self,
+            _text: &str,
+            _span: Span,
+        ) -> Result<i64, QueryServiceError> {
+            panic!("tag procedures do not accept timestamps");
+        }
+    }
+
+    fn project_sql(source: &str) -> Result<ConnectorRefAction, QueryServiceError> {
+        use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+        use novarocks_query_application::sql::trino_table_command::bind_trino_table_execute;
+
+        let TrinoStatement::TableExecute(statement) = parse_statement(source).unwrap() else {
+            panic!("expected a Trino table procedure");
+        };
+        let bound = bind_trino_table_execute(
+            source,
+            &statement,
+            &ConnectorProviderId::parse("iceberg").unwrap(),
+            &mut LiteralConstants,
+            &mut NoTimestampArguments,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )?;
+        project_trino_tag(source, statement.span, bound).map(|action| action.0)
+    }
+
+    #[test]
+    fn trino_tag_procedure_retains_exact_anchor_and_create_policy() {
+        let expected = |snapshot_id, policy| ConnectorRefAction::Create {
+            kind: ConnectorRefKind::Tag,
+            name: Arc::from("Release-v1"),
+            snapshot_id,
+            policy,
+            expected_table_uuid: None,
+        };
+        assert_eq!(
+            project_sql("ALTER TABLE ice.db.orders EXECUTE create_tag('Release-v1')").unwrap(),
+            expected(None, CreateOrReplacePolicy::FailIfExists),
+        );
+        assert_eq!(
+            project_sql(
+                "ALTER TABLE ice.db.orders EXECUTE create_tag(snapshot_id => 9223372036854775806, if_not_exists => true, name => 'Release-v1')",
+            )
+            .unwrap(),
+            expected(Some(i64::MAX - 1), CreateOrReplacePolicy::NoOpIfExists),
+        );
+        assert_eq!(
+            project_sql(
+                "ALTER TABLE ice.db.orders EXECUTE create_tag(name => 'Release-v1', replace => true, if_not_exists => true)",
+            )
+            .unwrap(),
+            expected(None, CreateOrReplacePolicy::ReplaceIfExists),
+        );
+    }
+
+    #[test]
+    fn trino_tag_procedure_retains_drop_policy_and_locates_missing_name() {
+        for (sql, policy) in [
+            (
+                "ALTER TABLE ice.db.orders EXECUTE drop_tag('Release-v1')",
+                DropPolicy::FailIfMissing,
+            ),
+            (
+                "ALTER TABLE ice.db.orders EXECUTE DROP_TAG(if_exists => true, name => 'Release-v1')",
+                DropPolicy::NoOpIfMissing,
+            ),
+        ] {
+            assert_eq!(
+                project_sql(sql).unwrap(),
+                ConnectorRefAction::Drop {
+                    kind: ConnectorRefKind::Tag,
+                    name: Arc::from("Release-v1"),
+                    policy,
+                },
+            );
+        }
+        let source = "ALTER TABLE ice.db.orders EXECUTE create_tag(replace => true)";
+        let error = project_sql(source).unwrap_err();
+        let user = error.user_error().unwrap();
+        assert_eq!(
+            user.code().as_str(),
+            "sql.admit.invalid_table_procedure_argument"
+        );
+        assert_eq!(
+            user.location(),
+            Some(&Span::new(0, source.len()).to_user_error_location(source)),
+        );
+        assert!(user.message().contains("requires 'name'"));
     }
 
     #[test]

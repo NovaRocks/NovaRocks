@@ -40,6 +40,172 @@ use novarocks_sql::semantic::{Literal as SqlLiteral, ObjectName as SqlObjectName
 
 type Literal = SqlLiteral;
 
+#[cfg(novarocks_dev_controls)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PreparedEqualityDelete {
+    columns: Vec<String>,
+    statement: Arc<ast::TrinoTableExecute>,
+    rows_argument: usize,
+}
+
+#[cfg(novarocks_dev_controls)]
+impl PreparedEqualityDelete {
+    pub(crate) fn from_bound(
+        source: &str,
+        statement: &Arc<ast::TrinoTableExecute>,
+        bound: novarocks_query_application::sql::table_procedure::BoundTableProcedure<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, novarocks_query_application::session_error::QueryServiceError> {
+        use novarocks_query_application::{
+            session_error::{QueryServiceError, QueryServiceErrorKind},
+            sql::table_procedure::{
+                BoundProcedureArgument as Argument, BoundProcedureValue as Value,
+                TableProcedureKind, invalid_procedure_argument,
+            },
+        };
+        use novarocks_spi::connector::DdlPropertyValue;
+        use novarocks_type_contract::CompilePhase;
+
+        let invariant = || {
+            QueryServiceError::new(
+                QueryServiceErrorKind::Internal,
+                "Equality-delete input differs from its original procedure declaration",
+            )
+        };
+        if bound.declaration().kind() != TableProcedureKind::AddEqualityDelete {
+            return Err(invariant());
+        }
+        let mut arguments = bound.into_arguments();
+        let checkpoint = |units| {
+            control
+                .checkpoint(CompilePhase::Validate, units)
+                .map_err(QueryServiceError::from_compile_control)
+        };
+        let missing = |span, slot: &str| {
+            invalid_procedure_argument(
+                source,
+                span,
+                format!("Table procedure ADD_EQUALITY_DELETE argument '{slot}' is required"),
+            )
+        };
+        checkpoint(0)?;
+        let (columns, columns_span) = match arguments.next() {
+            Some((
+                _,
+                Argument::Present {
+                    value: Value::Value(DdlPropertyValue::ArrayVarchar(columns)),
+                    span,
+                },
+            )) => (columns, span.unwrap_or(statement.span)),
+            Some((_, Argument::Omitted)) => return Err(missing(statement.span, "columns")),
+            Some((_, Argument::ExplicitDefault(span))) => return Err(missing(span, "columns")),
+            _ => return Err(invariant()),
+        };
+        if columns.is_empty() {
+            return Err(invalid_procedure_argument(
+                source,
+                columns_span,
+                "ADD EQUALITY DELETE requires at least one equality column",
+            ));
+        }
+        let columns = columns
+            .into_iter()
+            .map(|value| {
+                checkpoint(1)?;
+                value.ok_or_else(|| {
+                    invalid_procedure_argument(
+                        source,
+                        columns_span,
+                        "ADD EQUALITY DELETE columns cannot contain NULL",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (rows, rows_span) = match arguments.next() {
+            Some((
+                _,
+                Argument::Present {
+                    value: Value::EqualityRows(rows),
+                    span,
+                },
+            )) => (rows, span.unwrap_or(statement.span)),
+            Some((_, Argument::Omitted)) => return Err(missing(statement.span, "rows")),
+            Some((_, Argument::ExplicitDefault(span))) => return Err(missing(span, "rows")),
+            _ => return Err(invariant()),
+        };
+        if arguments.next().is_some() {
+            return Err(invariant());
+        }
+        let rows_argument = statement
+            .arguments
+            .iter()
+            .position(|argument| std::ptr::eq(&argument.value, rows))
+            .ok_or_else(invariant)?;
+        let Expr::Array(array) = rows else {
+            return Err(invalid_procedure_argument(
+                source,
+                rows_span,
+                "ADD EQUALITY DELETE rows must be ARRAY[ROW(...), ...]",
+            ));
+        };
+        if array.values.is_empty() {
+            return Err(invalid_procedure_argument(
+                source,
+                rows_span,
+                "ADD EQUALITY DELETE requires at least one row",
+            ));
+        }
+        for row in &array.values {
+            checkpoint(1)?;
+            let Expr::Row(row) = row else {
+                return Err(invalid_procedure_argument(
+                    source,
+                    row.span(),
+                    "ADD EQUALITY DELETE rows must be ROW constructors",
+                ));
+            };
+            for field in &row.fields {
+                checkpoint(1)?;
+                if field.name.is_some() {
+                    return Err(invalid_procedure_argument(
+                        source,
+                        field.span,
+                        "ADD EQUALITY DELETE rows must have unnamed fields",
+                    ));
+                }
+            }
+        }
+        checkpoint(0)?;
+        Ok(Self {
+            columns,
+            statement: Arc::clone(statement),
+            rows_argument,
+        })
+    }
+
+    fn row_cells(
+        &self,
+    ) -> impl ExactSizeIterator<Item = impl ExactSizeIterator<Item = &Expr>> + Clone {
+        // The bound slot points into this retained immutable AST. Its array,
+        // row boundaries and unnamed fields were checked by the constructor.
+        let Expr::Array(array) = &self.statement.arguments[self.rows_argument].value else {
+            unreachable!("admitted equality-delete row array")
+        };
+        array.values.iter().map(|row| {
+            let Expr::Row(row) = row else {
+                unreachable!("admitted equality-delete row")
+            };
+            row.fields.iter().map(|field| &field.expression)
+        })
+    }
+}
+
+pub(super) enum EqualityDeleteStatement<'a> {
+    Legacy(&'a AddEqualityDelete),
+    #[cfg(novarocks_dev_controls)]
+    Trino(&'a PreparedEqualityDelete),
+}
+
 pub(super) fn resolve_target(
     state: &DmlExecutionKernel,
     stmt: &AddEqualityDelete,
@@ -51,6 +217,13 @@ pub(super) fn resolve_target(
 > {
     let table = sql_object_name(&stmt.target);
     let target = resolve_existing_table_target(state, &table, current_catalog, current_database)?;
+    require_iceberg_target(&target)?;
+    Ok((target, "main".to_string()))
+}
+
+fn require_iceberg_target(
+    target: &crate::catalog_application::resolver::TargetBackend,
+) -> Result<(), crate::catalog_application::resolver::TargetResolutionError> {
     if target.provider_id.as_str() != "iceberg" {
         return Err((format!(
             "ADD EQUALITY DELETE only supports iceberg backends, got `{}`",
@@ -58,12 +231,12 @@ pub(super) fn resolve_target(
         ))
         .into());
     }
-    Ok((target, "main".to_string()))
+    Ok(())
 }
 
 pub(super) async fn prepare_equality_delete_statement_async(
     state: &DmlExecutionKernel,
-    stmt: &AddEqualityDelete,
+    statement: EqualityDeleteStatement<'_>,
     target: &crate::catalog_application::resolver::TargetBackend,
     target_ref: &str,
     planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
@@ -71,6 +244,13 @@ pub(super) async fn prepare_equality_delete_statement_async(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
 ) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
+    #[cfg(novarocks_dev_controls)]
+    if matches!(&statement, EqualityDeleteStatement::Trino(_)) {
+        require_iceberg_target(target)?;
+        if target_ref != "main" {
+            return Err("ADD EQUALITY DELETE procedure requires its admitted main target".into());
+        }
+    }
     // Preserve the original MV guard before metadata loading and admission.
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
         state.mv_storage_observation().as_ref(),
@@ -82,33 +262,79 @@ pub(super) async fn prepare_equality_delete_statement_async(
     ).await?;
     let target_binding =
         super::load_delete_target_async(target, planning_pin, connector_context).await?;
-    let (columns, row_expressions) = (stmt.columns.as_slice(), stmt.rows.as_slice());
-    #[cfg(novarocks_dev_controls)]
-    let (columns, row_expressions) = bind_original_equality_delete_inputs(
-        &target_binding
-            .planning_pin()
-            .binding()
-            .descriptor()
-            .provider_id,
-        columns,
-        row_expressions,
-        &crate::query_execution::planning::sql_compile_control_from_connector_request(
-            connector_context,
-        ),
-    )?;
-    let column_names = columns
-        .iter()
-        .map(|column| column.value.clone())
-        .collect::<Vec<_>>();
+    let preparation = EqualityDeletePreparation {
+        state,
+        target,
+        target_ref,
+        target_binding,
+        execution,
+        connector_context,
+        begin_receiving,
+    };
+    match statement {
+        EqualityDeleteStatement::Legacy(stmt) => {
+            let (columns, rows) = (stmt.columns.as_slice(), stmt.rows.as_slice());
+            #[cfg(novarocks_dev_controls)]
+            let (columns, rows) = bind_original_equality_delete_inputs(
+                &preparation
+                    .target_binding
+                    .planning_pin()
+                    .binding()
+                    .descriptor()
+                    .provider_id,
+                columns,
+                rows,
+                &crate::query_execution::planning::sql_compile_control_from_connector_request(
+                    connector_context,
+                ),
+            )?;
+            let columns = columns
+                .iter()
+                .map(|column| column.value.clone())
+                .collect::<Vec<_>>();
+            prepare_equality_delete_rows(preparation, &columns, rows.iter().map(|row| row.iter()))
+                .await
+        }
+        #[cfg(novarocks_dev_controls)]
+        EqualityDeleteStatement::Trino(stmt) => {
+            prepare_equality_delete_rows(preparation, &stmt.columns, stmt.row_cells()).await
+        }
+    }
+}
+
+struct EqualityDeletePreparation<'a> {
+    state: &'a DmlExecutionKernel,
+    target: &'a crate::catalog_application::resolver::TargetBackend,
+    target_ref: &'a str,
+    target_binding: crate::connector::write_target::ConnectorWriteTargetBinding,
+    execution: QueryExecutionContext,
+    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+    begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
+}
+
+async fn prepare_equality_delete_rows<'a>(
+    preparation: EqualityDeletePreparation<'_>,
+    column_names: &[String],
+    row_expressions: impl ExactSizeIterator<Item = impl ExactSizeIterator<Item = &'a Expr>> + Clone,
+) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
+    let EqualityDeletePreparation {
+        state,
+        target,
+        target_ref,
+        target_binding,
+        execution,
+        connector_context,
+        begin_receiving,
+    } = preparation;
     let rows = row_expressions
-        .iter()
-        .map(|row| row.iter().map(lower_literal).collect())
+        .clone()
+        .map(|row| row.map(lower_literal).collect())
         .collect::<Result<Vec<Vec<_>>, _>>()?;
     let write_lease = target_binding
         .planning_pin()
         .derive_write_lease()
         .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
-    let input = resolve_equality_delete_input(target_binding.metadata(), &column_names, &rows)?;
+    let input = resolve_equality_delete_input(target_binding.metadata(), column_names, &rows)?;
     // Keep RefHead observation on this exact generation before actual begin.
     crate::connector::metadata_read_reference_facts_with_planning_pin_async(
         target_binding.planning_pin().clone(),
@@ -138,7 +364,7 @@ pub(super) async fn prepare_equality_delete_statement_async(
     // Provider admission deliberately precedes literal carrier checks. A
     // rejection here leaves the accepted session in the original receiving.
     let delete_fields = input.validate(&rows)?;
-    let delete_query = build_equality_delete_sink_query(&delete_fields, row_expressions)?;
+    let delete_query = equality_delete_sink_query_ast(&delete_fields, row_expressions)?;
     let (sql_write_input, table_bindings) =
         bind_equality_delete_write(target, target_binding.planning_pin(), &write_session)?;
     Ok(super::PreparedDeleteWrite {
@@ -285,22 +511,22 @@ fn bind_equality_delete_write(
     Ok((sql_write_input, table_bindings))
 }
 
+#[cfg(test)]
 fn build_equality_delete_sink_query(
     delete_columns: &[ConnectorWriteFieldRequest],
     rows: &[Vec<Expr>],
 ) -> Result<Query, String> {
-    let query = equality_delete_sink_query_ast(delete_columns, rows)?;
-    Ok(query)
+    equality_delete_sink_query_ast(delete_columns, rows.iter().map(|row| row.iter()))
 }
 
-fn equality_delete_sink_query_ast(
+fn equality_delete_sink_query_ast<'a>(
     delete_columns: &[ConnectorWriteFieldRequest],
-    rows: &[Vec<Expr>],
+    rows: impl ExactSizeIterator<Item = impl ExactSizeIterator<Item = &'a Expr>>,
 ) -> Result<Query, String> {
     if delete_columns.is_empty() {
         return Err("ADD EQUALITY DELETE requires at least one equality column".to_string());
     }
-    if rows.is_empty() {
+    if rows.len() == 0 {
         return Err("ADD EQUALITY DELETE sink query requires at least one row".to_string());
     }
     let mut values = Vec::with_capacity(rows.len());
@@ -313,8 +539,7 @@ fn equality_delete_sink_query_ast(
             ));
         }
         values.push(
-            row.iter()
-                .zip(delete_columns)
+            row.zip(delete_columns)
                 .map(|(value, column)| {
                     equality_delete_literal_ast(value, column.field().data_type())
                 })
@@ -413,7 +638,7 @@ fn equality_delete_input_fields(
 ///
 /// This used to build an Arrow `RecordBatch` from the same literals. Nothing
 /// consumed that batch: the values reach the writer as the `VALUES` syntax
-/// [`build_equality_delete_sink_query`] constructs, and the only thing the caller
+/// [`equality_delete_sink_query_ast`] constructs, and the only thing the caller
 /// read off the batch was `num_rows() == 0`. What the array builder did
 /// contribute was literal validation, so that is all this keeps.
 ///
@@ -1323,7 +1548,7 @@ mod tests {
             FunctionValueType::new(data_type, true),
         )
         .unwrap();
-        let query = super::equality_delete_sink_query_ast(&[field], rows).unwrap();
+        let query = super::build_equality_delete_sink_query(&[field], rows).unwrap();
         assert_sink_rows(&query, rows);
 
         let other = ConnectorProviderId::parse("paimon").unwrap();
@@ -1363,7 +1588,7 @@ mod tests {
                 )
                 .unwrap(),
             ];
-            let query = super::equality_delete_sink_query_ast(&fields, &rows).unwrap();
+            let query = super::build_equality_delete_sink_query(&fields, &rows).unwrap();
             assert_sink_rows(&query, &rows);
         }
     }

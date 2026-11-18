@@ -93,6 +93,9 @@ pub(super) fn prepare(
 pub(super) enum PreparedTrinoTableExecute {
     Action(Box<dyn GovernedStatementAction>),
     AddFiles(crate::query_execution::dml::add_files::ResolvedAddFiles),
+    Mutation(crate::query_execution::maintenance::command::PreparedTableProcedureMutation),
+    #[cfg(novarocks_dev_controls)]
+    EqualityDelete(crate::query_execution::dml::delete::OwnedDeleteStatement),
 }
 
 /// The caller schedules this on the original planning CPU and starts the
@@ -100,7 +103,7 @@ pub(super) enum PreparedTrinoTableExecute {
 pub(super) fn prepare_trino_table_execute(
     executor: &MaintenanceCommandExecutor,
     source: &str,
-    statement: &novarocks_parser::ast::TrinoTableExecute,
+    statement: &Arc<novarocks_parser::ast::TrinoTableExecute>,
     context: &RequestContext,
     command_context: &CommandContext,
     statement_started_at: std::time::SystemTime,
@@ -140,6 +143,11 @@ pub(super) fn prepare_trino_table_execute(
             prepare_metadata_action(context, command_context, family, || Ok(call))?,
         ),
         PreparedTableExecute::AddFiles(add_files) => PreparedTrinoTableExecute::AddFiles(add_files),
+        PreparedTableExecute::Mutation(mutation) => PreparedTrinoTableExecute::Mutation(mutation),
+        #[cfg(novarocks_dev_controls)]
+        PreparedTableExecute::EqualityDelete(statement) => {
+            PreparedTrinoTableExecute::EqualityDelete(statement)
+        }
     })
 }
 

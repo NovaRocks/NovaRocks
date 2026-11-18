@@ -20,7 +20,10 @@
 use std::time::SystemTime;
 
 use super::*;
+use crate::catalog_application::command::{IcebergTableMutation, PreparedIcebergTableMutation};
+use crate::catalog_application::statement::{ColumnPath, connector_schema_path};
 use crate::connector::metadata_maintenance::MetadataMaintenanceIntent;
+use crate::mv::domain::ref_flow::{self, PreparedRefMutation, TrinoTagAction};
 use crate::table_maintenance::{ParsedMaintenanceAction, ParsedMaintenanceStatement};
 use novarocks_parser::{Span, ast::TrinoTableExecute};
 use novarocks_query_application::{
@@ -34,13 +37,13 @@ use novarocks_query_application::{
             BoundTableProcedure, ProcedureArgumentDefault, ProcedureRetentionDuration,
             TableProcedureAbsoluteTimePort, invalid_procedure_argument,
         },
-        trino_admission::unsupported_statement,
         trino_table_command::bind_trino_table_execute,
     },
 };
 use novarocks_result_contract::ClientPresentationFamily;
 use novarocks_spi::connector::{
-    ConnectorControlPlanningPin, ConnectorInstanceId, ConnectorRequestContext, DdlPropertyValue,
+    ConnectorColumnPosition, ConnectorControlPlanningPin, ConnectorInstanceId,
+    ConnectorPropertyChange, ConnectorRequestContext, ConnectorSchemaChange, DdlPropertyValue,
 };
 use novarocks_table_maintenance::MaintenanceTarget;
 use novarocks_type_contract::PureCompileControl;
@@ -49,6 +52,26 @@ pub(crate) enum PreparedTableExecute {
     Action(Box<dyn GovernedStatementAction>),
     Metadata(MaintenanceCommandCall),
     AddFiles(crate::query_execution::dml::add_files::ResolvedAddFiles),
+    Mutation(PreparedTableProcedureMutation),
+    #[cfg(novarocks_dev_controls)]
+    EqualityDelete(crate::query_execution::dml::delete::OwnedDeleteStatement),
+}
+
+pub(crate) enum PreparedTableProcedureMutation {
+    Table(PreparedIcebergTableMutation),
+    Reference(PreparedRefMutation),
+}
+
+impl PreparedTableProcedureMutation {
+    pub(crate) fn execute(
+        self,
+        connector: &ConnectorRequestContext,
+    ) -> Result<StatementResult, CommandError> {
+        match self {
+            Self::Table(mutation) => mutation.execute(connector),
+            Self::Reference(mutation) => mutation.execute(connector),
+        }
+    }
 }
 
 pub(super) struct MetadataPreparation {
@@ -63,7 +86,7 @@ impl MaintenanceCommandExecutor {
     pub(crate) fn prepare_trino_table_execute(
         &self,
         source: &str,
-        statement: &TrinoTableExecute,
+        statement: &Arc<TrinoTableExecute>,
         context: MaintenanceRequestContext<'_>,
         execution: &QueryExecutionContext,
         connector: &ConnectorRequestContext,
@@ -90,11 +113,12 @@ impl MaintenanceCommandExecutor {
             .acquire_current(&instance)
             .map_err(TerminalError::from_original_cause)
             .map_err(crate::query::maintenance_command_error)?;
-        let provider = &planning.binding().descriptor().provider_id;
-        if provider != &target.provider_id {
+        let descriptor = planning.binding().descriptor();
+        let provider = &descriptor.provider_id;
+        if provider != &target.provider_id || descriptor.instance_id != instance {
             return Err(CommandError::new(
                 CommandErrorKind::Conflict,
-                "Table procedure catalog admission and retained generation selected different providers",
+                "Table procedure catalog admission does not match its retained generation",
             ));
         }
         let control =
@@ -109,6 +133,21 @@ impl MaintenanceCommandExecutor {
             &control,
         )
         .map_err(crate::query::procedure_command_error)?;
+        #[cfg(novarocks_dev_controls)]
+        if bound.declaration().kind() == TableProcedureKind::AddEqualityDelete {
+            use crate::query_execution::dml::delete::{
+                OwnedDeleteStatement, ResolvedEqualityDeleteTarget,
+                equality::PreparedEqualityDelete,
+            };
+            let statement = PreparedEqualityDelete::from_bound(source, statement, bound, &control)
+                .map_err(crate::query::procedure_command_error)?;
+            return Ok(PreparedTableExecute::EqualityDelete(
+                OwnedDeleteStatement::TrinoEquality {
+                    statement,
+                    resolved: ResolvedEqualityDeleteTarget { target, planning },
+                },
+            ));
+        }
         let procedure = project_bound(
             source,
             statement.span,
@@ -125,6 +164,34 @@ impl MaintenanceCommandExecutor {
                     planning,
                     location,
                 },
+            ));
+        }
+
+        if let Procedure::CatalogMutation(mutation) = procedure {
+            return Ok(PreparedTableExecute::Mutation(
+                PreparedTableProcedureMutation::Table(PreparedIcebergTableMutation {
+                    target,
+                    instance_id: instance,
+                    planning,
+                    mutation,
+                    catalog_service: self.kernel.catalog_service().clone(),
+                    storage_observation: self.kernel.mv_storage_observation().clone(),
+                    readiness: self.kernel.mv_readiness().clone(),
+                }),
+            ));
+        }
+
+        if let Procedure::Tag(action) = procedure {
+            let prepared = ref_flow::prepare_resolved_tag(
+                self.kernel.mv_storage_observation().as_ref(),
+                self.kernel.mv_readiness().as_ref(),
+                &target,
+                planning,
+                action,
+                connector,
+            )?;
+            return Ok(PreparedTableExecute::Mutation(
+                PreparedTableProcedureMutation::Reference(prepared),
             ));
         }
 
@@ -188,6 +255,10 @@ impl MaintenanceCommandExecutor {
                 },
             ),
             Procedure::AddFiles(_) => unreachable!("ADD FILES has its original DML owner"),
+            Procedure::CatalogMutation(_) => {
+                unreachable!("table mutations have their catalog owner")
+            }
+            Procedure::Tag(_) => unreachable!("tags have their reference mutation owner"),
         }
     }
 
@@ -249,6 +320,139 @@ enum Procedure {
     },
     RemoveOrphanFiles(i64),
     AddFiles(String),
+    CatalogMutation(IcebergTableMutation),
+    Tag(TrinoTagAction),
+}
+
+fn project_schema_change(
+    source: &str,
+    span: Span,
+    bound: BoundTableProcedure<'_>,
+) -> Result<ConnectorSchemaChange, QueryServiceError> {
+    let kind = bound.declaration().kind();
+    let mut arguments = bound.into_arguments();
+    let mut next_text = || match arguments.next().map(|(_, argument)| argument) {
+        Some(BoundProcedureArgument::Present {
+            value: BoundProcedureValue::Value(DdlPropertyValue::Varchar(text)),
+            span: argument_span,
+        }) => Ok(Some((text, argument_span.unwrap_or(span)))),
+        Some(BoundProcedureArgument::Omitted | BoundProcedureArgument::ExplicitDefault(_)) => {
+            Ok(None)
+        }
+        _ => Err(invariant()),
+    };
+    let invalid = |location, message: &str| invalid_procedure_argument(source, location, message);
+    let (column, column_span) = next_text()?.ok_or_else(|| invalid(span, "Column is required"))?;
+    let path = ColumnPath::parse(&column).map_err(|error| invalid(column_span, &error))?;
+    let path = connector_schema_path(path);
+    if kind == TableProcedureKind::SetColumnNotNull {
+        return Ok(ConnectorSchemaChange::SetColumnNullability {
+            path,
+            nullable: false,
+        });
+    }
+
+    let (position, position_span) =
+        next_text()?.ok_or_else(|| invalid(span, "Position is required"))?;
+    let reference = next_text()?;
+    let position = match (position.to_ascii_uppercase().as_str(), reference) {
+        ("FIRST", None) => ConnectorColumnPosition::First,
+        ("FIRST", Some((_, reference_span))) => {
+            return Err(invalid(
+                reference_span,
+                "FIRST does not take a reference column",
+            ));
+        }
+        (order @ ("AFTER" | "BEFORE"), Some((reference, reference_span))) => {
+            let reference =
+                ColumnPath::parse(&reference).map_err(|error| invalid(reference_span, &error))?;
+            // The existing schema mutation selects the reference leaf in the
+            // moved column's parent. The authored path is validated first.
+            let column = Arc::from(reference.last().ok_or_else(invariant)?);
+            if order == "AFTER" {
+                ConnectorColumnPosition::After { column }
+            } else {
+                ConnectorColumnPosition::Before { column }
+            }
+        }
+        ("AFTER" | "BEFORE", None) => {
+            return Err(invalid(span, "AFTER and BEFORE require a reference column"));
+        }
+        _ => {
+            return Err(invalid(
+                position_span,
+                "Position must be FIRST, AFTER, or BEFORE",
+            ));
+        }
+    };
+    Ok(ConnectorSchemaChange::ReorderColumn { path, position })
+}
+
+fn project_property_unsets(
+    source: &str,
+    span: Span,
+    bound: BoundTableProcedure<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<Vec<ConnectorPropertyChange>, QueryServiceError> {
+    let mut arguments = bound.into_arguments();
+    let Some((
+        _,
+        BoundProcedureArgument::Present {
+            value: BoundProcedureValue::Value(DdlPropertyValue::ArrayVarchar(keys)),
+            span: key_span,
+        },
+    )) = arguments.next()
+    else {
+        return Err(invalid_procedure_argument(
+            source,
+            span,
+            "A keys array is required",
+        ));
+    };
+    let key_span = key_span.unwrap_or(span);
+    if keys.is_empty() {
+        return Err(invalid_procedure_argument(
+            source,
+            key_span,
+            "Keys must not be empty",
+        ));
+    }
+    let mut non_null_keys = Vec::with_capacity(keys.len());
+    for key in keys {
+        control
+            .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+            .map_err(QueryServiceError::from_compile_control)?;
+        non_null_keys.push(key.ok_or_else(|| {
+            invalid_procedure_argument(source, key_span, "Keys must not contain NULL")
+        })?);
+    }
+    let Some((slot, argument)) = arguments.next() else {
+        return Err(invariant());
+    };
+    let if_exists = match argument {
+        BoundProcedureArgument::Present {
+            value: BoundProcedureValue::Value(DdlPropertyValue::Boolean(value)),
+            ..
+        } => value,
+        BoundProcedureArgument::Omitted | BoundProcedureArgument::ExplicitDefault(_) => {
+            let Some(ProcedureArgumentDefault::Boolean(value)) = slot.default else {
+                return Err(invariant());
+            };
+            value
+        }
+        BoundProcedureArgument::Present {
+            span: argument_span,
+            ..
+        } => {
+            return Err(invalid_procedure_argument(
+                source,
+                argument_span.unwrap_or(span),
+                "If_exists requires a non-null BOOLEAN",
+            ));
+        }
+    };
+    novarocks_connector_iceberg::table_properties::extra_property_unsets(&non_null_keys, if_exists)
+        .map_err(|error| invalid_procedure_argument(source, key_span, error.to_string()))
 }
 
 fn project_bound(
@@ -293,14 +497,22 @@ fn project_bound(
             }
             return Err(invariant());
         }
-        TableProcedureKind::ExpireSnapshots | TableProcedureKind::RemoveOrphanFiles => {}
-        _ => {
-            return Err(unsupported_statement(
-                source,
-                span,
-                bound.declaration().name(),
-            ));
+        TableProcedureKind::MoveColumn | TableProcedureKind::SetColumnNotNull => {
+            return project_schema_change(source, span, bound)
+                .map(IcebergTableMutation::Schema)
+                .map(Procedure::CatalogMutation);
         }
+        TableProcedureKind::UnsetExtraProperties => {
+            return project_property_unsets(source, span, bound, control)
+                .map(IcebergTableMutation::UnsetProperties)
+                .map(Procedure::CatalogMutation);
+        }
+        TableProcedureKind::CreateTag | TableProcedureKind::DropTag => {
+            return ref_flow::project_trino_tag(source, span, bound).map(Procedure::Tag);
+        }
+        TableProcedureKind::ExpireSnapshots | TableProcedureKind::RemoveOrphanFiles => {}
+        #[cfg(novarocks_dev_controls)]
+        TableProcedureKind::AddEqualityDelete => return Err(invariant()),
     }
 
     let mut older_than_ms = None;
@@ -465,7 +677,10 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use arrow::{
-        array::{Array, ArrayData, Int32Array, Int64Array, StringArray},
+        array::{
+            Array, ArrayData, BooleanArray, Int32Array, Int64Array, ListBuilder, StringArray,
+            StringBuilder,
+        },
         datatypes::{DataType, Field},
     };
     use novarocks_functions::{ConstantPool, ConstantValue};
@@ -474,7 +689,7 @@ mod tests {
         trino_parser::parse_statement,
     };
     use novarocks_query_application::sql::property_evaluation::DdlPropertyConstantError;
-    use novarocks_spi::connector::ConnectorProviderId;
+    use novarocks_spi::connector::{ConnectorColumnPath, ConnectorProviderId};
     use novarocks_sql::compiler::{RequiredConstantTarget, SqlCompileControl};
     use novarocks_type_contract::{CompilePhase, FunctionValueType};
 
@@ -485,20 +700,38 @@ mod tests {
             expression: &Expr,
             target: RequiredConstantTarget,
         ) -> Result<ConstantValue, DdlPropertyConstantError> {
-            let Expr::Literal(literal) = expression else {
-                panic!("the test port only supplies checked literal values");
-            };
-            let data: ArrayData = match (target, &literal.kind) {
-                (RequiredConstantTarget::Varchar, LiteralKind::String(text)) => {
-                    StringArray::from(vec![text.as_str()]).to_data()
+            let data: ArrayData = match expression {
+                Expr::Literal(literal) => match (target, &literal.kind) {
+                    (RequiredConstantTarget::Varchar, LiteralKind::String(text)) => {
+                        StringArray::from(vec![text.as_str()]).to_data()
+                    }
+                    (RequiredConstantTarget::Integer, LiteralKind::Long { parsed_value, .. }) => {
+                        Int32Array::from(vec![i32::try_from(*parsed_value).unwrap()]).to_data()
+                    }
+                    (RequiredConstantTarget::Bigint, LiteralKind::Long { parsed_value, .. }) => {
+                        Int64Array::from(vec![*parsed_value]).to_data()
+                    }
+                    (RequiredConstantTarget::Boolean, LiteralKind::Boolean(value)) => {
+                        BooleanArray::from(vec![*value]).to_data()
+                    }
+                    _ => panic!("unexpected required-constant target"),
+                },
+                Expr::Array(array) if target == RequiredConstantTarget::ArrayVarchar => {
+                    let mut builder = ListBuilder::new(StringBuilder::new());
+                    for element in &array.values {
+                        let Expr::Literal(literal) = element else {
+                            panic!("expected literal array element");
+                        };
+                        match &literal.kind {
+                            LiteralKind::String(value) => builder.values().append_value(value),
+                            LiteralKind::Null => builder.values().append_null(),
+                            _ => panic!("expected optional string literal"),
+                        }
+                    }
+                    builder.append(true);
+                    builder.finish().to_data()
                 }
-                (RequiredConstantTarget::Integer, LiteralKind::Long { parsed_value, .. }) => {
-                    Int32Array::from(vec![i32::try_from(*parsed_value).unwrap()]).to_data()
-                }
-                (RequiredConstantTarget::Bigint, LiteralKind::Long { parsed_value, .. }) => {
-                    Int64Array::from(vec![*parsed_value]).to_data()
-                }
-                _ => panic!("unexpected required-constant target"),
+                _ => panic!("the test port only supplies checked literal values"),
             };
             let data_type: DataType = data.data_type().clone();
             let pool = ConstantPool::try_new(
@@ -544,6 +777,99 @@ mod tests {
             source,
             SystemTime::UNIX_EPOCH + Duration::from_millis(800_000_123),
         )
+    }
+
+    #[test]
+    fn schema_procedures_preserve_nested_paths_and_reference_leaf() {
+        let path = ConnectorColumnPath {
+            segments: vec![Arc::from("address"), Arc::from("zip")],
+        };
+        let schema = |change| Procedure::CatalogMutation(IcebergTableMutation::Schema(change));
+        assert_eq!(
+            project("ALTER TABLE lake.ns.t EXECUTE move_column(column => 'Address.Zip', position => 'BEFORE', reference => 'Address.Street')").unwrap(),
+            schema(ConnectorSchemaChange::ReorderColumn {
+                path: path.clone(),
+                position: ConnectorColumnPosition::Before {
+                    column: Arc::from("street"),
+                },
+            }),
+        );
+        assert_eq!(
+            project("ALTER TABLE lake.ns.t EXECUTE move_column('address.zip', 'FIRST')").unwrap(),
+            schema(ConnectorSchemaChange::ReorderColumn {
+                path: path.clone(),
+                position: ConnectorColumnPosition::First,
+            }),
+        );
+        assert_eq!(
+            project("ALTER TABLE lake.ns.t EXECUTE set_column_not_null('address.zip')").unwrap(),
+            schema(ConnectorSchemaChange::SetColumnNullability {
+                path,
+                nullable: false,
+            }),
+        );
+    }
+
+    #[test]
+    fn schema_procedures_reject_incomplete_paths_and_reference_shapes() {
+        for (source, message) in [
+            (
+                "ALTER TABLE t EXECUTE move_column('a', 'AFTER')",
+                "require a reference column",
+            ),
+            (
+                "ALTER TABLE t EXECUTE move_column('a', 'FIRST', 'b')",
+                "does not take a reference",
+            ),
+            (
+                "ALTER TABLE t EXECUTE set_column_not_null('a..b')",
+                "empty segment",
+            ),
+        ] {
+            let error = project(source).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn unset_property_procedure_keeps_provider_key_rules_and_default() {
+        for (sql, if_exists) in [
+            (
+                "ALTER TABLE t EXECUTE unset_extra_properties(ARRAY['Custom.Key'])",
+                false,
+            ),
+            (
+                "ALTER TABLE t EXECUTE unset_extra_properties(keys => ARRAY['Custom.Key'], if_exists => true)",
+                true,
+            ),
+        ] {
+            assert_eq!(
+                project(sql).unwrap(),
+                Procedure::CatalogMutation(IcebergTableMutation::UnsetProperties(vec![
+                    ConnectorPropertyChange::Unset {
+                        key: Arc::from("custom.key"),
+                        if_exists
+                    },
+                ]))
+            );
+        }
+        for (sql, message) in [
+            (
+                "ALTER TABLE t EXECUTE unset_extra_properties(ARRAY[])",
+                "must not be empty",
+            ),
+            (
+                "ALTER TABLE t EXECUTE unset_extra_properties(ARRAY[NULL])",
+                "must not contain NULL",
+            ),
+            (
+                "ALTER TABLE t EXECUTE unset_extra_properties(ARRAY['custom.key', 'CUSTOM.KEY'])",
+                "duplicate normalized extra property",
+            ),
+        ] {
+            let error = project(sql).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
     }
 
     #[test]

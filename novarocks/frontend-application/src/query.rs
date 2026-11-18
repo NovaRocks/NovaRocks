@@ -2074,6 +2074,8 @@ impl FrontendQuerySession {
             let borrowed = match &delete_statement {
                 OwnedDeleteStatement::Predicate(value) => DeleteStatement::Predicate(value),
                 OwnedDeleteStatement::Equality(_) => DeleteStatement::Equality,
+                #[cfg(novarocks_dev_controls)]
+                OwnedDeleteStatement::TrinoEquality { .. } => DeleteStatement::Equality,
             };
             if let Err(error) = dml.admit_delete_shape(borrowed, &sql) {
                 return Ok(self.governed_typed_error(
