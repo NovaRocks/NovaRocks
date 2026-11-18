@@ -891,6 +891,12 @@ impl TaskManifestBinding {
         self.topology_revision
     }
 
+    pub(crate) fn write_root_targets(
+        &self,
+    ) -> Option<&[novarocks_spi::connector::write_stack::WriteTargetOrdinal]> {
+        self.native_template.template.plan_facts().write_root_targets()
+    }
+
     /// Borrow the existing frozen occurrence list; no per-Task list is cloned.
     /// Binding already proved that every Task's fragment is in this template.
     pub(crate) fn writer_cohorts(&self) -> impl Iterator<Item = BoundWriterCohort> + '_ {

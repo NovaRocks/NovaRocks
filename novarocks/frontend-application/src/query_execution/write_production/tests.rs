@@ -83,15 +83,15 @@ fn bind(scope: &WorkScope, driver: &mut JointProgressDriver) {
     drop(reply);
     drive(driver);
 }
-fn register_original(
+fn allocate_paid_cohorts(
     session: &ConnectorWriteSession,
     scope: &WorkScope,
     driver: &mut JointProgressDriver,
 ) -> (
     QueryExecutionId,
     PlanSeal,
-    UnreceivedProductionOwner,
-    Vec<u8>,
+    UnreceivedProductionReady,
+    Option<Arc<[u8]>>,
 ) {
     let cohorts = TaskManifestBinding::original_writer_occurrences_for_test();
     assert_eq!(
@@ -111,18 +111,40 @@ fn register_original(
         .begin_unreceived_productions(Arc::downgrade(&origin), quote.quote)
         .unwrap();
     drive(driver);
-    let mut ready = receive(&mut admission).unwrap();
-    // Actual checked cohort bytes are allocated only after the original grant.
-    let mut facts = Some(encode_occurrences(cohorts.into_iter(), quote).unwrap());
+    let ready = receive(&mut admission).unwrap();
+    // Reverse the exact placements to exercise sorting in the paid storage.
+    let facts = Some(encode_occurrences(cohorts.into_iter().rev(), quote).unwrap());
+    (execution, plan, ready, facts)
+}
+
+fn register_original(
+    session: &ConnectorWriteSession,
+    scope: &WorkScope,
+    driver: &mut JointProgressDriver,
+) -> (
+    QueryExecutionId,
+    PlanSeal,
+    UnreceivedProductionOwner,
+    Vec<u8>,
+) {
+    let (execution, plan, mut ready, mut facts) = allocate_paid_cohorts(session, scope, driver);
     let expected = facts.as_ref().unwrap().to_vec();
-    let notification = session
-        .register_production_ready_in(execution, plan, &mut ready, &mut facts)
+    let (notification, result) = session
+        .register_production_ready_in(
+            execution,
+            plan,
+            &[WriteTargetOrdinal::try_new(0).unwrap()],
+            &mut ready,
+            &mut facts,
+        )
         .unwrap();
-    drop((ready, admission, facts));
+    drop((ready, facts));
     notification.notify();
+    result.unwrap();
     let owner = session.productions.lock().unwrap().owner.clone().unwrap();
     (execution, plan, owner, expected)
 }
+
 fn decoder(
     session: &ConnectorWriteSession,
     execution: QueryExecutionId,
@@ -140,6 +162,164 @@ fn decoder(
     decoder.bind_production_execution(execution, plan);
     decoder
 }
+/// The exact provider registration can verify writer membership before End,
+/// independently of the frontend production mutex and the paid grant's phase.
+#[test]
+fn original_writer_index_is_available_before_first_record_and_without_frontend_lock() {
+    let (control, mut driver) = original_runtime();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = work.owner.scope();
+    bind(&scope, &mut driver);
+    let fixture = fixture_with_outcome(2, 1, known_committed());
+    let session = &fixture.session;
+    let (execution, plan, owner, facts) = register_original(session, &scope, &mut driver);
+    let target = WriteTargetOrdinal::try_new(0).unwrap();
+    let proof = {
+        let recorded = fixture.recorded.lock().unwrap();
+        let [(query, targets, proof)] = recorded.received_query_registrations.as_slice() else {
+            panic!("exactly one provider registration must precede arrivals");
+        };
+        assert_eq!(
+            *query,
+            super::super::write_query_identity(execution, plan).unwrap()
+        );
+        assert_eq!(targets, &[target]);
+        Arc::clone(proof.as_ref().unwrap())
+    };
+    assert_eq!(owner.pending_records().unwrap(), 2);
+    assert_eq!(fixture.received_fragment_count(), 0);
+
+    let (done, completed) = std::sync::mpsc::sync_channel(1);
+    let lock = session.productions.lock().unwrap();
+    let checker = std::thread::spawn(move || {
+        let cohorts = TaskManifestBinding::original_writer_occurrences_for_test();
+        for cohort in cohorts {
+            let mut query = [0; 16];
+            query[..8].copy_from_slice(&execution.query_id().high().to_be_bytes());
+            query[8..].copy_from_slice(&execution.query_id().low().to_be_bytes());
+            let attempt = execution.attempt_id().get();
+            let mut key = [0; 16];
+            key[..8].copy_from_slice(&cohort.task_key().high().to_be_bytes());
+            key[8..].copy_from_slice(&cohort.task_key().low().to_be_bytes());
+            let mut foreign_query = query;
+            foreign_query[0] ^= 1;
+            let mut foreign_key = key;
+            foreign_key[0] ^= 1;
+            let physical = |query, attempt, task, writer_ordinal| {
+                ConnectorWriterPhysicalContext::new(query, attempt, task, 17, writer_ordinal)
+            };
+            assert!(
+                proof
+                    .admits(target, &physical(query, attempt, key, 0))
+                    .unwrap()
+            );
+            for other in [
+                physical(foreign_query, attempt, key, 0),
+                physical(query, attempt + 1, key, 0),
+                physical(query, attempt, foreign_key, 0),
+                physical(query, attempt, key, 1),
+            ] {
+                assert!(!proof.admits(target, &other).unwrap());
+            }
+            assert!(
+                !proof
+                    .admits(
+                        WriteTargetOrdinal::try_new(1).unwrap(),
+                        &physical(query, attempt, key, 0),
+                    )
+                    .unwrap()
+            );
+        }
+        drop(proof);
+        let _ = done.send(());
+    });
+    let completed_under_lock = completed.recv_timeout(std::time::Duration::from_secs(5));
+    drop(lock);
+    checker.join().unwrap();
+    completed_under_lock.expect("writer proof must not require the frontend production lock");
+
+    let mut root = decoder(session, execution, plan);
+    let mut decode = session.computation_decode(&[target]).unwrap();
+    decode
+        .apply_body(
+            &mut root,
+            &crate::query_execution::write_result::tests::component_write_body(
+                commit_fragment_bytes(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(fixture.received_fragment_count(), 1);
+    assert_eq!(owner.pending_records().unwrap(), 2);
+    root.check_relay_end(2).unwrap();
+    root.observe_root_eof().unwrap();
+    let segment = decode.complete_root(root.finish().unwrap()).unwrap();
+    session.receiving_port().accept(segment).unwrap();
+    assert_eq!(owner.pending_records().unwrap(), 0);
+    assert!(owner.retains_facts(&facts).unwrap());
+    session.abort_for_test(request_context()).unwrap();
+    assert!(!owner.retains_facts(&facts).unwrap());
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+    assert_eq!(control.snapshot().root_responsibilities, 0);
+}
+
+/// A definite provider registration refusal before dispatch cannot leave an
+/// unknown production in the original workload ledger.
+#[test]
+fn provider_registration_refusal_withdraws_only_its_undispatched_production() {
+    let (control, mut driver) = original_runtime();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = work.owner.scope();
+    bind(&scope, &mut driver);
+    let fixture = fixture_with_outcome(1, 1, known_committed());
+    let session = &fixture.session;
+    fixture.recorded.lock().unwrap().query_registration_failure = Some(ConnectorError::new(
+        ConnectorErrorKind::CorruptData,
+        "scripted provider rejected the original query registration",
+    ));
+    let (execution, plan, mut ready, mut facts) =
+        allocate_paid_cohorts(session, &scope, &mut driver);
+    let (notice, result) = session
+        .register_production_ready_in(
+            execution,
+            plan,
+            &[WriteTargetOrdinal::try_new(0).unwrap()],
+            &mut ready,
+            &mut facts,
+        )
+        .unwrap();
+    assert!(
+        facts.is_none(),
+        "the paid cohort reached the original ledger"
+    );
+    drop(ready);
+    notice.notify();
+    assert_eq!(result.unwrap_err().kind(), ConnectorErrorKind::CorruptData);
+    assert!(session.production_never_registered().unwrap());
+    assert!(
+        fixture
+            .recorded
+            .lock()
+            .unwrap()
+            .received_query_registrations
+            .is_empty()
+    );
+    assert_eq!(
+        session.abort_production().unwrap(),
+        novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
+    );
+    session.abort_for_test(request_context()).unwrap();
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+    assert_eq!(control.snapshot().root_responsibilities, 0);
+}
+
 #[test]
 fn checked_writer_prefix_without_end_keeps_actual_record_and_refuses_cleanup_complete() {
     for targets in [1, 2] {
@@ -285,31 +465,26 @@ fn terminal_decision_during_paid_registration_keeps_both_original_sources() {
     bind(&scope, &mut driver);
     let fixture = fixture_with_outcome(1, 1, known_committed());
     let session = fixture.session;
-    let cohorts = TaskManifestBinding::original_writer_occurrences_for_test();
-    let execution = cohorts[0].task().query_execution_id();
-    let plan = cohorts[0].plan();
-    let quote = WriteProductionQuote::for_occurrences(cohorts.len())
-        .unwrap()
-        .unwrap();
-    let origin: Arc<dyn Send + Sync> = session.decode_origin.clone();
-    let mut admission = scope
-        .begin_unreceived_productions(Arc::downgrade(&origin), quote.quote)
-        .unwrap();
-    drive(&mut driver);
-    let mut ready = receive(&mut admission).unwrap();
-    let mut facts = Some(encode_occurrences(cohorts.into_iter(), quote).unwrap());
+    let (execution, plan, mut ready, mut facts) =
+        allocate_paid_cohorts(&session, &scope, &mut driver);
     let expected = facts.as_ref().unwrap().to_vec();
     let _actual_abort = session.abort_for_test(request_context()).unwrap();
     assert!(
         session
-            .register_production_ready_in(execution, plan, &mut ready, &mut facts)
+            .register_production_ready_in(
+                execution,
+                plan,
+                &[WriteTargetOrdinal::try_new(0).unwrap()],
+                &mut ready,
+                &mut facts,
+            )
             .is_err()
     );
     assert_eq!(facts.as_ref().unwrap().as_ref(), expected);
     assert!(session.productions.lock().unwrap().current.is_none());
     // No writer could have been dispatched: this is a rejected, uninstalled
     // grant, so its original ordinary rollback is still the correct author.
-    drop((ready, admission, facts));
+    drop((ready, facts));
     work.business.release();
     work.owner.complete();
     drive(&mut driver);
@@ -367,7 +542,6 @@ fn complete_original_end_transfers_same_union_to_abort_call_and_retires_canonica
             novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::CompleteReceived
         )
     );
-    assert_eq!(recorded.abort_received_rows, Some(3));
     assert_eq!(recorded.abort_received_fragments, Some(1));
     assert_eq!(recorded.finish, 0);
     drop(recorded);
@@ -412,6 +586,7 @@ fn cancel_between_precheck_and_claim_hands_same_complete_end_to_original_abort()
         .accept(decode.interpret(decoder.finish().unwrap()).unwrap())
         .unwrap();
     assert!(accepted.belongs_to(&session));
+    assert_eq!(session.accumulated_row_count().unwrap(), 3);
     let stop = novarocks_spi::connector::ConnectorStopOwner::new();
     let context = ConnectorRequestContext::try_new(
         std::time::Instant::now() + std::time::Duration::from_secs(60),
@@ -452,7 +627,6 @@ fn cancel_between_precheck_and_claim_hands_same_complete_end_to_original_abort()
             novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::CompleteReceived
         )
     );
-    assert_eq!(recorded.abort_received_rows, Some(3));
     assert_eq!(recorded.abort_received_fragments, Some(1));
     assert_eq!(recorded.finish, 0);
     drop(recorded);

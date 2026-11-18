@@ -66,7 +66,7 @@ enum Phase {
 /// No Inner, session, credentials, callback, payload or deletion authority.
 pub(in crate::joint_admission::ledger) struct ProductionRecord {
     origin: Weak<dyn Send + Sync>,
-    facts: Box<[u8]>,
+    facts: Arc<[u8]>,
     records: u64,
     phase: Phase,
 }
@@ -155,6 +155,7 @@ impl Future for UnreceivedProductionAdmission {
                 scope: self.scope.clone(),
                 origin: self.origin.clone(),
                 quote: self.quote,
+                registered: None,
             })
         })
     }
@@ -165,6 +166,7 @@ pub struct UnreceivedProductionReady {
     scope: WorkScope,
     origin: Weak<dyn Send + Sync>,
     quote: UnreceivedProductionQuote,
+    registered: Option<(u64, u64)>,
 }
 /// Unique receiving authority. Its ordinary destructor NEVER refunds either
 /// unknown output responsibility or the later exact publication record.
@@ -181,14 +183,16 @@ impl UnreceivedProductionReady {
             && Weak::ptr_eq(&self.origin, &owner.origin)
     }
     /// Caller allocates/fills pure metadata only after this paid Ready exists.
+    /// Views may share the allocation while the original record pays for it.
     /// All fallible checks precede moves. Notify/Drop Ready outside all caller
     /// receiving locks, after the grant is installed in its stable destination.
     pub fn register_in(
         &mut self,
-        facts: &mut Option<Box<[u8]>>,
+        facts: &mut Option<Arc<[u8]>>,
         destination: &mut Option<UnreceivedProductionGrant>,
     ) -> Result<WorkloadProgressNotification, WorkError> {
-        if destination.is_some()
+        if self.registered.is_some()
+            || destination.is_some()
             || self.origin.strong_count() == 0
             || facts
                 .as_ref()
@@ -204,7 +208,7 @@ impl UnreceivedProductionReady {
         }
         let id = original.id.ok_or(WorkError::Released)?;
         let inner = Arc::clone(&self.scope.inner);
-        inner.update_facts_silent(|state| {
+        let epoch = inner.update_facts_silent(|state| {
             let full = control_facts(state, &self.scope)?;
             let ledger = state.joint.as_ref().unwrap();
             let row = ledger.claims.get(&id).ok_or(WorkError::Released)?;
@@ -243,8 +247,40 @@ impl UnreceivedProductionReady {
                 epoch,
                 origin: self.origin.clone(),
             });
+            Ok(epoch)
+        })?;
+        self.registered = Some((id, epoch));
+        Ok(WorkloadProgressNotification::new(inner))
+    }
+
+    /// Withdraw the exact registration just installed through this Ready.
+    /// Call only after the synchronous provider registration refused, while
+    /// the original owner still excludes every path to dispatch and knows the
+    /// provider retained none of the facts. This is not a cleanup authority for
+    /// a grant that may have produced any output.
+    pub fn reject_before_dispatch_in(
+        &mut self,
+        destination: &mut Option<UnreceivedProductionGrant>,
+    ) -> Result<WorkloadProgressNotification, WorkError> {
+        let grant = destination.as_ref().ok_or(WorkError::Conflict)?;
+        if self.registered != Some((grant.id, grant.epoch))
+            || !Arc::ptr_eq(&self.scope.inner, &grant.inner)
+            || !Weak::ptr_eq(&self.origin, &grant.origin)
+        {
+            return Err(WorkError::Conflict);
+        }
+        let inner = Arc::clone(&grant.inner);
+        inner.update_facts_silent(|state| {
+            let row = grant.check(state)?;
+            let record = row.production.as_ref().ok_or(WorkError::Conflict)?;
+            if Arc::strong_count(&record.facts) != 1 {
+                return Err(WorkError::Conflict);
+            }
+            remove_claim(state, grant.id);
             Ok(())
         })?;
+        *destination = None;
+        self.registered = None;
         Ok(WorkloadProgressNotification::new(inner))
     }
 }
@@ -332,42 +368,6 @@ impl UnreceivedProductionOwner {
                     .ok_or(WorkError::ArithmeticOverflow)
             })
     }
-    /// Check one original occurrence in a complete received production.
-    pub fn received_facts_have_prefix(
-        &self,
-        record_size: std::num::NonZeroUsize,
-        prefix: &[u8],
-    ) -> Result<bool, WorkError> {
-        if prefix.is_empty() || prefix.len() > record_size.get() {
-            return Err(WorkError::Conflict);
-        }
-        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
-        let state = inner.state.lock().unwrap();
-        let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
-        for record in ledger
-            .claims
-            .values()
-            .filter_map(|row| row.production.as_ref())
-        {
-            if record.phase != Phase::Received || !Weak::ptr_eq(&record.origin, &self.origin) {
-                continue;
-            }
-            let chunks = record.facts.chunks_exact(record_size.get());
-            if !chunks.remainder().is_empty()
-                || u64::try_from(chunks.len()).ok() != Some(record.records)
-            {
-                return Err(WorkError::Conflict);
-            }
-            if chunks
-                .into_iter()
-                .any(|occurrence| occurrence.starts_with(prefix))
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// Pure diagnostic equality; bytes are retained even after every FE grant
     /// and session strong alias exits. The data itself grants no object access.
     pub fn retains_facts(&self, facts: &[u8]) -> Result<bool, WorkError> {
@@ -387,7 +387,8 @@ impl UnreceivedProductionOwner {
     }
     /// Only the original Provider/publication terminal owner may call this
     /// after a positive, sufficiently scoped disposition. Unknown records
-    /// refuse before any mutation. No timeout/Task terminal/Drop invokes it.
+    /// and live views of the paid facts refuse before any mutation. No
+    /// timeout, task terminal event, or Drop invokes it.
     pub fn settle_received_in(&self) -> Result<WorkloadProgressNotification, WorkError> {
         let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
         inner.update_facts_silent(|state| {
@@ -395,7 +396,9 @@ impl UnreceivedProductionOwner {
             if ledger.claims.values().any(|row| {
                 row.production.as_ref().is_some_and(|record| {
                     Weak::ptr_eq(&record.origin, &self.origin)
-                        && (record.phase == Phase::Unknown || row.pending.is_some())
+                        && (record.phase == Phase::Unknown
+                            || row.pending.is_some()
+                            || Arc::strong_count(&record.facts) != 1)
                 })
             }) {
                 return Err(WorkError::Conflict);

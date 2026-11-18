@@ -878,7 +878,7 @@ fn unknown_production_survives_last_handle_and_received_keeps_publication_until_
         Poll::Ready(Ok(ready)) => ready,
         _ => panic!("original production grant"),
     };
-    let mut facts = Some(vec![7; 16].into_boxed_slice());
+    let mut facts = Some(Arc::<[u8]>::from([7; 16]));
     let mut grant = None;
     ready.register_in(&mut facts, &mut grant).unwrap().notify();
     drop((ready, pending));
@@ -911,7 +911,7 @@ fn unknown_production_survives_last_handle_and_received_keeps_publication_until_
         Poll::Ready(Ok(ready)) => ready,
         _ => panic!("original second production grant"),
     };
-    let mut facts = Some(vec![9; 16].into_boxed_slice());
+    let mut facts = Some(Arc::<[u8]>::from([9; 16]));
     ready.register_in(&mut facts, &mut grant).unwrap().notify();
     drop((ready, pending));
     let retirement = work.owner.retirement_observer().unwrap();
@@ -922,6 +922,66 @@ fn unknown_production_survives_last_handle_and_received_keeps_publication_until_
     assert!(owner.retains_facts(&[9; 16]).unwrap());
     assert_eq!(held(&control, JointResource::UnreceivedProductions), 2);
     assert!(!retirement.is_reclaimed().unwrap());
+}
+
+/// Withdrawal releases only the exact paid record after every borrowed view of
+/// its facts has exited. The terminal owner likewise requires those views gone.
+#[test]
+fn undispatched_withdrawal_and_received_settlement_wait_for_paid_fact_views() {
+    let (control, _, mut driver) = fixture();
+    let work = root(&control);
+    let scope = work.owner.scope();
+    bind(&scope, &[fact("writer")], &mut driver);
+    let origin: Arc<dyn Send + Sync> = Arc::new(());
+    let quote = UnreceivedProductionQuote::new(
+        std::num::NonZeroU64::new(1).unwrap(),
+        std::num::NonZeroUsize::new(16).unwrap(),
+    )
+    .unwrap();
+
+    for received in [false, true] {
+        let mut pending = scope
+            .begin_unreceived_productions(Arc::downgrade(&origin), quote)
+            .unwrap();
+        drive(&mut driver);
+        let Poll::Ready(Ok(mut ready)) =
+            Pin::new(&mut pending).poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("original production grant expected");
+        };
+        let alias = Arc::<[u8]>::from([3; 16]);
+        let mut facts = Some(Arc::clone(&alias));
+        let mut destination = None;
+        ready
+            .register_in(&mut facts, &mut destination)
+            .unwrap()
+            .notify();
+        let grant = destination.as_ref().unwrap();
+        let owner = grant.owner();
+        let retired = if received {
+            grant.receive_in().unwrap().notify();
+            let refusal = owner.settle_received_in();
+            assert!(matches!(refusal, Err(WorkError::Conflict)));
+            assert!(owner.retains_facts(&[3; 16]).unwrap());
+            drop(alias);
+            owner.settle_received_in().unwrap()
+        } else {
+            let refusal = ready.reject_before_dispatch_in(&mut destination);
+            assert!(matches!(refusal, Err(WorkError::Conflict)));
+            assert_eq!(owner.pending_records().unwrap(), 1);
+            assert!(owner.retains_facts(&[3; 16]).unwrap());
+            drop(alias);
+            let notice = ready.reject_before_dispatch_in(&mut destination).unwrap();
+            assert!(destination.is_none());
+            notice
+        };
+        retired.notify();
+        assert!(!owner.retains_facts(&[3; 16]).unwrap());
+        assert_eq!(owner.pending_records().unwrap(), 0);
+    }
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
 }
 
 #[test]
@@ -945,7 +1005,7 @@ fn production_registration_rechecks_cancel_after_real_grant_before_metadata_move
         _ => panic!("original grant before cancellation"),
     };
     work.owner.cancel(crate::CancellationReason::ServerShutdown);
-    let mut facts = Some(vec![3; 16].into_boxed_slice());
+    let mut facts = Some(Arc::<[u8]>::from([3; 16]));
     let mut grant = None;
     assert!(matches!(
         ready.register_in(&mut facts, &mut grant),
@@ -978,7 +1038,7 @@ fn registered_production(
         Poll::Ready(Ok(ready)) => ready,
         _ => panic!("actual production Ready"),
     };
-    let mut facts = Some(vec![31; 8].into_boxed_slice());
+    let mut facts = Some(Arc::<[u8]>::from([31; 8]));
     let mut target = None;
     ready.register_in(&mut facts, &mut target).unwrap().notify();
     drop((ready, admission));
@@ -1113,7 +1173,7 @@ fn an_already_granted_new_record_cannot_register_across_pending_control_growth()
     growth.push_dependency(&fact("additional")).unwrap();
     growth.end_change().unwrap();
     let mut admission = growth.submit().unwrap();
-    let mut facts = Some(vec![55; 8].into_boxed_slice());
+    let mut facts = Some(Arc::<[u8]>::from([55; 8]));
     let mut destination = None;
     assert!(raw_ready.register_in(&mut facts, &mut destination).is_err());
     assert!(facts.is_some() && destination.is_none());
