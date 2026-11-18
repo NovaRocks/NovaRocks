@@ -558,9 +558,9 @@ fn ddl_map_uses_original_key_then_value_children_and_preserves_null_values() {
         )
         .unwrap_err();
         assert!(error.message().contains(if nullable_key {
-            "key cannot be NULL"
+            "Map property key cannot be NULL in property 'extra_properties'"
         } else {
-            "Duplicate map"
+            "Duplicate map property key 'a' in property 'extra_properties'"
         }));
         port.exhausted();
     }
@@ -1350,7 +1350,7 @@ fn authored_property_input_errors_keep_scope_span_and_original_name_duplicate_pr
         (
             Type::MapVarcharVarchar,
             &duplicate_map,
-            "Duplicate map property key",
+            "Duplicate map property key 'key' in property 'known'",
         ),
     ] {
         let mut port = Port::new(vec![]);

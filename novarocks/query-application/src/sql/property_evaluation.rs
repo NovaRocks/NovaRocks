@@ -545,7 +545,12 @@ fn evaluate_properties(
                         checkpoint(control, 1)?;
                         observe_bytes(key, control)?;
                         if !keys.insert(key.as_str()) {
-                            return Err(invalid(scope, source, span, "Duplicate map property key"));
+                            return Err(invalid(
+                                scope,
+                                source,
+                                span,
+                                format!("Duplicate map property key '{key}' in property '{name}'"),
+                            ));
                         }
                     }
                 }
@@ -557,7 +562,7 @@ fn evaluate_properties(
             }
             DdlPropertyAssignmentValue::Expression(expression) => {
                 let value = if value_type == DdlPropertyType::MapVarcharVarchar {
-                    evaluate_map(scope, source, expression, port, control)?
+                    evaluate_map(scope, source, &name, expression, port, control)?
                 } else {
                     evaluate_value(scope, source, expression, value_type, port, control)?
                 };
@@ -739,6 +744,7 @@ pub(super) fn evaluate_required_property_value(
 fn evaluate_map(
     scope: DdlPropertyScope,
     source: &str,
+    property_name: &str,
     expression: &Expr,
     port: &mut dyn DdlPropertyConstantPort,
     control: &dyn PureCompileControl,
@@ -748,7 +754,9 @@ fn evaluate_map(
             scope,
             source,
             expression.span(),
-            "Map property requires MAP with two equal-length ARRAY constructors",
+            format!(
+                "Map property '{property_name}' requires MAP with two equal-length ARRAY constructors"
+            ),
         )
     };
     let Expr::FunctionCall(call) = expression else {
@@ -822,7 +830,7 @@ fn evaluate_map(
                 scope,
                 source,
                 expression.span(),
-                "Map property key cannot be NULL",
+                format!("Map property key cannot be NULL in property '{property_name}'"),
             ));
         };
         if !seen.insert(copy_string(&key, control)?) {
@@ -830,7 +838,7 @@ fn evaluate_map(
                 scope,
                 source,
                 expression.span(),
-                "Duplicate map property key",
+                format!("Duplicate map property key '{key}' in property '{property_name}'"),
             ));
         }
         entries.push((key, value));
