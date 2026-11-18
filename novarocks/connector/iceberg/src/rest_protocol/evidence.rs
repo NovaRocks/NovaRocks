@@ -23,6 +23,7 @@
 //! interprets status codes; classification never performs I/O.
 
 use std::fmt;
+use std::sync::Arc;
 
 use novarocks_spi::connector::{
     ConnectorMutationFailure, ConnectorMutationFailureKind, ExternalMutationEffect,
@@ -262,13 +263,14 @@ impl From<ViewRequestError> for ExpectationError {
 ///
 /// The endpoint is part of the expectation, so the classifier can never pair
 /// an observation with another endpoint's checks.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct AttributionExpectation {
     endpoint: MutationEndpoint,
     identity: ExpectedIdentity,
     snapshot: Option<ExpectedSnapshot>,
     /// CTAS supplementary expectations: NovaRocks-named properties.
     properties: Vec<(String, String)>,
+    final_table_location: Option<Arc<str>>,
     /// What the table-response scan must retain; `Some` for table shapes.
     view_request: Option<TableViewRequest>,
     retention: Option<RetentionExpectation>,
@@ -303,6 +305,7 @@ impl AttributionExpectation {
             snapshot,
             properties,
             view_request,
+            final_table_location: None,
             retention: None,
         })
     }
@@ -316,6 +319,7 @@ impl AttributionExpectation {
             snapshot: None,
             properties: Vec::new(),
             view_request,
+            final_table_location: None,
             retention: None,
         }
     }
@@ -386,6 +390,14 @@ impl AttributionExpectation {
             snapshot,
             properties,
         )
+    }
+
+    pub(crate) fn with_final_table_location(mut self, expected: Option<Arc<str>>) -> Self {
+        if expected.is_some() {
+            self.view_request = self.view_request.map(TableViewRequest::with_table_location);
+        }
+        self.final_table_location = expected;
+        self
     }
 
     pub(crate) fn create_table() -> Self {
@@ -515,6 +527,7 @@ pub(crate) enum AnomalyCause {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum UnattributableCause {
     SnapshotAbsent,
+    FinalTableLocationMismatch,
     RetentionPostconditionMismatch,
     /// A NovaRocks-named property is absent or differs.
     PropertyMismatch {
@@ -529,6 +542,8 @@ pub(crate) enum UnknownReason {
     Unattributable(UnattributableCause),
     /// 400 or 404: the server may have failed after publishing.
     PostPublishPossible,
+    /// A failed custom-location registration may already have written metadata.
+    RemoteMetadataWritePossible,
     /// Any other non-success status, including 3xx and non-success 2xx.
     Status,
     NoStatus(NoStatusCause),
@@ -656,6 +671,13 @@ pub(crate) fn classify(
             }
             let rejected = |kind| RestEvidence::Rejected { status: code, kind };
             match code {
+                409 if expect.final_table_location.is_some() => unknown(
+                    expect,
+                    UnknownReason::RemoteMetadataWritePossible,
+                    Some(code),
+                    header_names,
+                    RefRelation::NotTracked,
+                ),
                 409 if endpoint.creates() => rejected(ConnectorMutationFailureKind::AlreadyExists),
                 409 => rejected(ConnectorMutationFailureKind::Conflict),
                 401 | 419 => rejected(ConnectorMutationFailureKind::Unauthenticated),
@@ -865,6 +887,18 @@ fn attribute_table(
             relation,
         ));
     }
+    // The independent table root is authoritative; the JSON file URI is
+    // still required for a usable response but does not prove this value.
+    if expect
+        .final_table_location
+        .as_deref()
+        .is_some_and(|expected| view.table_location.as_deref() != Some(expected))
+    {
+        return Err(Failed::Unattributable(
+            UnattributableCause::FinalTableLocationMismatch,
+            relation,
+        ));
+    }
     // Item 6: CTAS supplementary expectations.
     for ((key, expected), (_, observed)) in expect.properties.iter().zip(&view.properties) {
         let matches = matches!(
@@ -992,6 +1026,10 @@ impl RestEvidence {
                     (UnknownReason::NoStatus(NoStatusCause::Other), _) => format!(
                         "REST catalog {target} failed after the request was written; \
                          the outcome is unknown"
+                    ),
+                    (UnknownReason::RemoteMetadataWritePossible, Some(status)) => format!(
+                        "REST catalog answered the {target} with HTTP {status}; the server \
+                         may have created a metadata object before rejecting registration"
                     ),
                     (UnknownReason::PostPublishPossible, Some(status)) => format!(
                         "REST catalog answered the {target} with HTTP {status}; the server \
@@ -1547,6 +1585,69 @@ mod tests {
     }
 
     #[test]
+    fn final_staged_table_location_is_attributed_independently_of_the_metadata_file() {
+        let expected = AttributionExpectation::ctas_final_commit(
+            Uuid::parse_str(TABLE_UUID).unwrap(),
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .with_final_table_location(Some("s3://user/custom".into()));
+        for (location, applied) in [
+            (Some("s3://user/custom"), true),
+            (Some("s3://warehouse/table"), false),
+            (None, false),
+        ] {
+            let mut body = serde_json::json!({
+                "metadata-location":"s3://user/custom/metadata/v1.json",
+                "metadata": {"table-uuid": TABLE_UUID}
+            });
+            if let Some(location) = location {
+                body["metadata"]["location"] = location.into();
+            }
+            let result = classify(
+                &DispatchStage::Status {
+                    code: 200,
+                    header_names: vec![],
+                },
+                read(&expected, &body.to_string()),
+                &expected,
+            );
+            if applied {
+                assert!(matches!(result, RestEvidence::Applied { .. }));
+            } else {
+                assert!(matches!(
+                    result,
+                    RestEvidence::Unknown {
+                        diagnosis: UnknownDiagnosis {
+                            reason: UnknownReason::Unattributable(
+                                UnattributableCause::FinalTableLocationMismatch
+                            ),
+                            ..
+                        }
+                    }
+                ));
+            }
+        }
+        assert!(matches!(
+            classify(
+                &DispatchStage::Status {
+                    code: 409,
+                    header_names: vec![]
+                },
+                BodyRead::NotRead,
+                &expected,
+            ),
+            RestEvidence::Unknown {
+                diagnosis: UnknownDiagnosis {
+                    reason: UnknownReason::RemoteMetadataWritePossible,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
     fn missing_or_unexpected_metadata_location() {
         for endpoint in [E::TableCommit, E::CtasFinalCommit, E::CreateTable] {
             let expect = expectation(endpoint);
@@ -1992,13 +2093,13 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
+        assert!(matches!(
             AttributionExpectation::table_commit(
                 uuid(TABLE_UUID),
                 Some(ExpectedSnapshot::new(S, Some("r".repeat(2048)))),
             ),
             Err(ExpectationError::View(ViewRequestError::RefNameTooLong))
-        );
+        ));
         assert!(expectation(E::DropTable).table_view_request().is_none());
         assert!(expectation(E::StageCreate).table_view_request().is_some());
     }

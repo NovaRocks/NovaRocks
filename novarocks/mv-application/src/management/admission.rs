@@ -1726,7 +1726,11 @@ impl ManagementEntranceObligation {
         use novarocks_spi::connector::UnknownCommitIdentity;
         if self.request.operation != ConnectorDocumentManagementOperation::SingleTargetUpdate
             || self.request.effect_scope != EffectScope::CATALOG_COMMIT
-            || !matches!(evidence.identity, UnknownCommitIdentity::SlotWriter { .. })
+            || !matches!(
+                evidence.identity,
+                UnknownCommitIdentity::SlotWriter { .. }
+                    | UnknownCommitIdentity::SlotStorageEffect { .. }
+            )
             || evidence.preselected_snapshot <= 0
         {
             return Err(ManagementAdmissionError::InvalidEffect);

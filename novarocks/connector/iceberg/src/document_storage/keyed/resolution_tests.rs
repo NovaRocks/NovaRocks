@@ -300,3 +300,66 @@ fn mismatched_scope_rejects_cross_table_evidence() {
         ConnectorErrorKind::InvalidRequest
     );
 }
+
+#[test]
+fn combined_slot_recovery_requires_the_selected_immutable_property_effect() {
+    let old = Some(10);
+    let effect_digest = [7; 32];
+    let evidence = UnknownCommitEvidence {
+        identity: UnknownCommitIdentity::SlotStorageEffect {
+            effect_digest,
+            request_fingerprint: [11; 32],
+        },
+        ..evidence(old)
+    };
+    let mut selected = full(
+        Some(20),
+        vec![Snapshot::new(10, None), Snapshot::new(20, old)],
+        HashMap::new(),
+        vec![],
+    );
+    assert_eq!(
+        resolve(&selected.current, None, &evidence).unwrap(),
+        Resolution::NeedFull
+    );
+    assert_eq!(
+        conclusion(resolve(&selected.current, Some(&selected), &evidence).unwrap()),
+        CommitConclusion::StillUnknown,
+    );
+    let target = selected
+        .snapshots
+        .iter_mut()
+        .find(|snapshot| snapshot.snapshot_id == 20)
+        .unwrap();
+    target.slot_storage_effect_digest = Some([8; 32]);
+    assert_eq!(
+        conclusion(resolve(&selected.current, Some(&selected), &evidence).unwrap()),
+        CommitConclusion::StillUnknown,
+    );
+
+    let mut advanced = full(
+        Some(40),
+        vec![
+            Snapshot::new(10, None),
+            Snapshot::new(20, old),
+            Snapshot::new(40, Some(20)),
+        ],
+        HashMap::new(),
+        vec![],
+    );
+    assert_eq!(
+        conclusion(resolve(&advanced.current, Some(&advanced), &evidence).unwrap()),
+        CommitConclusion::StillUnknown,
+        "a parent pointer proves snapshot identity alone",
+    );
+    let target = advanced
+        .snapshots
+        .iter_mut()
+        .find(|snapshot| snapshot.snapshot_id == 20)
+        .unwrap();
+    target.slot_storage_effect_digest = Some(effect_digest);
+    assert_eq!(
+        conclusion(resolve(&advanced.current, Some(&advanced), &evidence).unwrap()),
+        CommitConclusion::Committed(CommitProof::Snapshot),
+    );
+}

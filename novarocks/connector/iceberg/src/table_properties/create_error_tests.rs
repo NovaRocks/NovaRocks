@@ -249,11 +249,8 @@ fn staged_mv_storage_keeps_data_location_but_requires_managed_metadata_root() {
     ));
     let ordinary = prepare_create_table_properties(&input, None, &Active).unwrap();
     assert_eq!(ordinary.location.as_deref(), Some("s3://storage/table"));
-    let error = prepare_mv_staged_storage(&input, &Active)
-        .err()
-        .expect("custom staged metadata location");
-    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-    assert!(error.message().contains("location"));
+    let managed = prepare_mv_staged_storage(&input, &Active).unwrap();
+    assert_eq!(managed.location.as_deref(), Some("s3://storage/table"));
 
     for version in [1, 2] {
         let mut input = properties();

@@ -49,6 +49,7 @@ pub(crate) use partitioning_binding::{
 };
 
 mod partitioning;
+pub(crate) use partitioning::parse_optional_partitioning_element;
 pub use partitioning::{parse_table_partitioning_element, parse_table_partitioning_property};
 
 mod data_size;

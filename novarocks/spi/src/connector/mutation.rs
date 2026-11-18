@@ -611,7 +611,7 @@ pub enum ConnectorCatalogMutationOperation {
     /// User-supplied declared properties evaluated for this table generation.
     SetTableProperties {
         table: ConnectorTableIdentity,
-        properties: Vec<(Arc<str>, super::DdlPropertyChange)>,
+        properties: Arc<[(Arc<str>, super::DdlPropertyChange)]>,
     },
     AlterProperties {
         table: ConnectorTableIdentity,
@@ -2585,9 +2585,12 @@ mod tests {
                 .expect_err("negative spec ID must fail closed");
         assert_eq!(invalid_spec.kind(), ConnectorErrorKind::InvalidRequest);
 
-        let empty = ConnectorCommittedPartitioning::try_new(4, Vec::new())
-            .expect_err("empty canonical partitioning must fail closed");
-        assert_eq!(empty.kind(), ConnectorErrorKind::InvalidRequest);
+        let duplicated = ConnectorCommittedPartitioning::try_new(
+            4,
+            vec![committed_partition_field(), committed_partition_field()],
+        )
+        .expect_err("an exact spec cannot repeat a physical field");
+        assert_eq!(duplicated.kind(), ConnectorErrorKind::InvalidRequest);
     }
 
     #[test]

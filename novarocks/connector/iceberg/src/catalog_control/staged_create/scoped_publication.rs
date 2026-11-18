@@ -215,7 +215,7 @@ impl PublicationOriginal {
         )?;
         let intent = publication::create_intent(prepared, operation.token())
             .map_err(|error| corrupt(error.to_string()))?;
-        let prefix = publication::create_prefix(prepared);
+        let prefix = publication::create_prefix(prepared)?;
         let policy =
             attempt::RetryPolicy::from_properties(prepared.staged.table.metadata().properties())
                 .map_err(|error| invalid(error.to_string()))?;

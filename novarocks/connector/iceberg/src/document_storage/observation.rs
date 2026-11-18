@@ -264,7 +264,8 @@ fn decode_keyed_slot_evidence(
     let payload =
         crate::reconcile_payload::decode_mutation_evidence(evidence.provider_payload())
             .map_err(|message| ConnectorError::new(ConnectorErrorKind::CorruptData, message))?;
-    let crate::reconcile_payload::IcebergMutationEvidenceTarget::KeyedSlotChange {
+    use crate::reconcile_payload::IcebergMutationEvidenceTarget;
+    let (
         namespace,
         table,
         table_uuid,
@@ -272,9 +273,50 @@ fn decode_keyed_slot_evidence(
         asserted_parent,
         preselected_snapshot,
         slots,
-    } = payload.target
-    else {
-        return Err(invalid("evidence does not describe a slot change"));
+        storage,
+    ) = match payload.target {
+        IcebergMutationEvidenceTarget::KeyedSlotChange {
+            namespace,
+            table,
+            table_uuid,
+            operation_id,
+            asserted_parent,
+            preselected_snapshot,
+            slots,
+        } => (
+            namespace,
+            table,
+            table_uuid,
+            operation_id,
+            asserted_parent,
+            preselected_snapshot,
+            slots,
+            None,
+        ),
+        IcebergMutationEvidenceTarget::KeyedSlotStorageChange {
+            namespace,
+            table,
+            table_uuid,
+            operation_id,
+            asserted_parent,
+            preselected_snapshot,
+            slots,
+            effect_digest,
+            request_fingerprint,
+        } => (
+            namespace,
+            table,
+            table_uuid,
+            operation_id,
+            asserted_parent,
+            preselected_snapshot,
+            slots,
+            Some(UnknownCommitIdentity::SlotStorageEffect {
+                effect_digest,
+                request_fingerprint,
+            }),
+        ),
+        _ => return Err(invalid("evidence does not describe a slot change")),
     };
     if namespace != request.target.namespace.as_ref()
         || table != request.target.table.as_ref()
@@ -296,9 +338,9 @@ fn decode_keyed_slot_evidence(
     Ok(UnknownCommitEvidence {
         asserted_parent,
         preselected_snapshot,
-        identity: UnknownCommitIdentity::SlotWriter {
+        identity: storage.unwrap_or_else(|| UnknownCommitIdentity::SlotWriter {
             slot: slots[0].clone(),
-        },
+        }),
     })
 }
 

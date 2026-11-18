@@ -298,6 +298,14 @@ impl FrozenRequest {
     pub fn updates(&self) -> &[TableUpdate] {
         &self.parts.updates
     }
+    /// The last location update is the table root this request would publish.
+    pub(crate) fn final_table_location_update(&self) -> Option<&str> {
+        self.updates().iter().rev().find_map(|update| match update {
+            TableUpdate::SetLocation { location } => Some(location.as_str()),
+            _ => None,
+        })
+    }
+
     pub fn artifacts(&self) -> &AttemptArtifacts {
         &self.parts.artifacts
     }
@@ -333,6 +341,18 @@ impl FrozenRequest {
         })
         .map(canonical_json)
     }
+
+    pub(crate) fn canonical_rest_bytes(&self) -> Result<Vec<u8>> {
+        self.to_rest_json()
+            .and_then(|envelope| serde_json::to_vec(&envelope))
+            .map_err(|error| {
+                crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::DataInvalid,
+                    "Cannot encode frozen publication",
+                )
+                .with_source(error)
+            })
+    }
 }
 
 /// Ref maintenance carries no data/schema mutation or arbitrary table property.
@@ -360,7 +380,7 @@ pub(crate) fn validate_ref_retention_update(update: &TableUpdate) -> Result<()> 
     }
 }
 
-fn canonical_json(value: Value) -> Value {
+pub(crate) fn canonical_json(value: Value) -> Value {
     match value {
         Value::Object(map) => {
             let sorted: std::collections::BTreeMap<_, _> = map

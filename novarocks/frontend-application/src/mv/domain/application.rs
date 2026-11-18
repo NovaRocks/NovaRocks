@@ -26,7 +26,7 @@ use novarocks_mv_application::repository::InitialMvRefreshConfiguration;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
 };
-use novarocks_spi::connector::DdlPropertyValue;
+use novarocks_spi::connector::{ConnectorProviderBindingKey, DdlPropertyChange, DdlPropertyValue};
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,15 +189,34 @@ pub struct MvDropStatement {
 }
 
 /// Frontend-owned admitted materialized-view alteration.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MvAlterAction {
     RefreshProperties(MvRefreshPropertyChanges),
+    RefreshAndStorageProperties {
+        changes: MvRefreshPropertyChanges,
+        owner: ConnectorProviderBindingKey,
+        properties: Arc<[(Arc<str>, DdlPropertyChange)]>,
+    },
     LegacyStorageProperties(Vec<(String, String)>),
+    StorageProperties {
+        owner: ConnectorProviderBindingKey,
+        properties: Arc<[(Arc<str>, DdlPropertyChange)]>,
+    },
     Repartition(Vec<MvCreatePartitionField>),
 }
 
+/// Inputs to the managed replacement of the default spec and its data.
+#[derive(Clone, Debug)]
+pub(crate) enum MvRepartitionFields {
+    Legacy(Vec<IcebergPartitionFieldExpr>),
+    Property {
+        owner: ConnectorProviderBindingKey,
+        fields: Arc<[Option<String>]>,
+    },
+}
+
 /// Frontend-owned request for altering one admitted materialized view.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MvAlterStatement {
     pub name_parts: Vec<String>,
     pub action: MvAlterAction,

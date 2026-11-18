@@ -256,6 +256,7 @@ impl ConnectorCatalogMutation for IcebergMetadata {
             ConnectorCatalogMutationOperation::CreateTable { .. }
                 | ConnectorCatalogMutationOperation::DropTable { .. }
                 | ConnectorCatalogMutationOperation::AlterProperties { .. }
+                | ConnectorCatalogMutationOperation::SetTableProperties { .. }
         ) {
             return async_existing::execute_async(self, request, receiving);
         }
@@ -3793,7 +3794,8 @@ fn reconcile_evidence(
                 )
             };
         }
-        IcebergMutationEvidenceTarget::KeyedSlotChange { .. } => {
+        IcebergMutationEvidenceTarget::KeyedSlotChange { .. }
+        | IcebergMutationEvidenceTarget::KeyedSlotStorageChange { .. } => {
             return Err(unsupported(
                 "slot outcomes are resolved through the retained document lease",
             ));
@@ -7468,6 +7470,138 @@ mod tests {
     }
 
     #[test]
+    fn async_typed_storage_affects_one_metadata_version_without_a_new_snapshot() {
+        use novarocks_spi::connector::{
+            ConnectorCatalogMutationReceiving, DdlPropertyChange, DdlPropertyValue,
+            InvalidTableProperty,
+        };
+        let (executor, warehouse, provider) = provider();
+        let table = guarded_table(&provider);
+        let pin = document_control_planning_pin(&provider);
+        let lease = pin.derive_mutation_lease().unwrap();
+        let request = |value| ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: ConnectorProviderBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            operation: ConnectorCatalogMutationOperation::SetTableProperties {
+                table: table.clone(),
+                properties: Arc::from([("extra_properties".into(), DdlPropertyChange::Set(value))]),
+            },
+            context: context(),
+        };
+        let before = provider
+            .runtime()
+            .observe_table_for_request(&table.namespace, &table.table, &context())
+            .unwrap();
+        let property = "read.split.target-size";
+        assert_ne!(
+            before
+                .table
+                .metadata()
+                .properties()
+                .get(property)
+                .map(String::as_str),
+            Some("16777216")
+        );
+
+        let call = request(DdlPropertyValue::MapVarcharVarchar(vec![(
+            property.into(),
+            Some("16777216".into()),
+        )]));
+        let operation = call.operation_id;
+        let receiving = ConnectorCatalogMutationReceiving::new();
+        executor
+            .block_on(lease.execute_async_in(call, &receiving))
+            .unwrap();
+        {
+            let observed = receiving.observation();
+            assert!(observed.provider_exited());
+            let needed = observed
+                .needed_committed()
+                .expect("actual applied metadata update");
+            assert_eq!(needed.effect(), ExternalMutationEffect::Applied);
+            assert_eq!(needed.receipt().operation_id(), operation);
+            assert_eq!(needed.receipt().operation_kind(), "set-table-properties");
+            assert_eq!(
+                needed.finalization(),
+                &ExternalMutationFinalization::Complete
+            );
+        }
+        let after = provider
+            .runtime()
+            .observe_table_for_request(&table.namespace, &table.table, &context())
+            .unwrap();
+        assert_eq!(
+            after.table.metadata().uuid(),
+            before.table.metadata().uuid()
+        );
+        assert_eq!(
+            after.table.metadata().current_snapshot_id(),
+            before.table.metadata().current_snapshot_id()
+        );
+        assert_eq!(
+            after.table.metadata().default_partition_spec(),
+            before.table.metadata().default_partition_spec()
+        );
+        assert_eq!(
+            after
+                .table
+                .metadata()
+                .properties()
+                .get(property)
+                .map(String::as_str),
+            Some("16777216")
+        );
+        let committed_location = after.table.metadata_location().unwrap();
+        assert!(committed_location.ends_with("/v2.metadata.json"));
+        assert!(
+            !warehouse
+                .path()
+                .join(format!(
+                    "{}/{}/metadata/v3.metadata.json",
+                    table.namespace, table.table
+                ))
+                .exists()
+        );
+
+        let rejected = ConnectorCatalogMutationReceiving::new();
+        executor
+            .block_on(lease.execute_async_in(
+                request(DdlPropertyValue::Varchar("not a map".into())),
+                &rejected,
+            ))
+            .unwrap();
+        {
+            let observed = rejected.observation();
+            assert!(observed.provider_exited());
+            assert!(observed.dispatched());
+            assert!(observed.applied_receipt().is_none());
+            assert!(observed.needed_committed().is_none());
+            let Some(Ok(ExternalMutationOutcome::KnownUncommitted { failure, .. })) =
+                observed.validated_outcome()
+            else {
+                panic!("typed property error is known uncommitted");
+            };
+            let marker =
+                InvalidTableProperty::from_connector_error(failure.connector_source().unwrap())
+                    .unwrap();
+            assert!(
+                marker
+                    .source_error()
+                    .message()
+                    .contains("map(varchar, varchar)")
+            );
+        }
+        let current = provider
+            .runtime()
+            .observe_table_for_request(&table.namespace, &table.table, &context())
+            .unwrap();
+        assert_eq!(current.table.metadata_location(), Some(committed_location));
+    }
+
+    #[test]
     fn evaluated_table_properties_publish_one_version_and_preserve_old_spec() {
         use novarocks_spi::connector::{DdlPropertyChange::Set, DdlPropertyValue};
 
@@ -7507,7 +7641,7 @@ mod tests {
             },
             operation: ConnectorCatalogMutationOperation::SetTableProperties {
                 table,
-                properties: vec![
+                properties: Arc::from([
                     ("gc_enabled".into(), Set(DdlPropertyValue::Boolean(false))),
                     ("format_version".into(), Set(DdlPropertyValue::Integer(2))),
                     (
@@ -7516,7 +7650,7 @@ mod tests {
                             "bucket(id, 8)".into(),
                         )])),
                     ),
-                ],
+                ]),
             },
             context: context(),
         };
@@ -9756,6 +9890,154 @@ mod tests {
             )]),
             markers_remove: Default::default(),
         })
+    }
+
+    #[test]
+    fn combined_slot_and_storage_publish_one_metadata_version_with_one_slot_snapshot() {
+        use novarocks_spi::connector::{
+            ConnectorCatalogMutationReceiving, ConnectorSlotName, DdlPropertyChange,
+            DdlPropertyValue, DocumentIdentity, InvalidTableProperty, KeyedMutation,
+        };
+        let (executor, warehouse, provider) = document_provider();
+        let table = guarded_table(&provider);
+        let planning = document_control_planning_pin(&provider);
+        let lease = planning.derive_mutation_lease().unwrap();
+        let property = "read.split.target-size";
+        let make = |value| {
+            let mut request =
+                keyed_channel_request(&provider, &table, keyed_configuration_change());
+            let ConnectorCatalogMutationOperation::KeyedDocuments { intent } =
+                &mut request.operation
+            else {
+                unreachable!()
+            };
+            let KeyedMutation::SlotChange(change) = keyed_configuration_change() else {
+                unreachable!()
+            };
+            intent.mutation = KeyedMutation::SlotChangeWithTableProperties {
+                change,
+                properties: vec![("extra_properties".into(), DdlPropertyChange::Set(value))].into(),
+            };
+            request
+        };
+        let storage = || {
+            DdlPropertyValue::MapVarcharVarchar(vec![(property.into(), Some("16777216".into()))])
+        };
+        let stale = make(storage());
+        let before = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+
+        let rejected = ConnectorCatalogMutationReceiving::new();
+        executor
+            .block_on(lease.execute_async_in(
+                make(DdlPropertyValue::Varchar("not a map".into())),
+                &rejected,
+            ))
+            .unwrap();
+        {
+            let outcome = rejected.observation();
+            assert!(outcome.provider_exited());
+            assert!(outcome.dispatched());
+            assert!(outcome.original_owner().is_none());
+            assert!(outcome.applied_receipt().is_none());
+            let Some(Ok(ExternalMutationOutcome::KnownUncommitted { failure, .. })) =
+                outcome.validated_outcome()
+            else {
+                panic!("property validation must precede publication")
+            };
+            assert!(
+                InvalidTableProperty::from_connector_error(failure.connector_source().unwrap())
+                    .is_some()
+            );
+        }
+        let after_rejection = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        assert_eq!(
+            after_rejection.table.metadata_location(),
+            before.table.metadata_location()
+        );
+
+        let applied = ConnectorCatalogMutationReceiving::new();
+        executor
+            .block_on(lease.execute_async_in(make(storage()), &applied))
+            .unwrap();
+        {
+            let outcome = applied.observation();
+            assert!(outcome.provider_exited());
+            let needed = outcome
+                .needed_committed()
+                .expect("original combined applied receipt");
+            assert_eq!(needed.effect(), ExternalMutationEffect::Applied);
+            assert_eq!(needed.receipt().operation_kind(), "keyed-documents");
+            assert_eq!(
+                needed.finalization(),
+                &ExternalMutationFinalization::Complete
+            );
+        }
+        let loaded = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let metadata = loaded.table.metadata();
+        assert_eq!(
+            metadata.properties().get(property).map(String::as_str),
+            Some("16777216")
+        );
+        assert_eq!(metadata.snapshots().len(), 1);
+        let selected = metadata.current_snapshot().unwrap();
+        let observed =
+            crate::document_storage::keyed::view::parse_properties(metadata.properties()).unwrap();
+        assert_eq!(
+            observed.slots[&ConnectorSlotName::try_new("novarocks.mv", "configuration").unwrap()]
+                .writer,
+            Some(selected.snapshot_id()),
+        );
+        let witness = &selected.summary().additional_properties
+            [crate::commit::slot_change::SLOT_STORAGE_EFFECT_SUMMARY_KEY];
+        assert!(DocumentIdentity::parse_hex(witness).is_ok());
+        assert!(
+            loaded
+                .table
+                .metadata_location()
+                .unwrap()
+                .ends_with("/v2.metadata.json")
+        );
+        assert!(
+            !warehouse
+                .path()
+                .join(format!(
+                    "{}/{}/metadata/v3.metadata.json",
+                    table.namespace, table.table
+                ))
+                .exists()
+        );
+
+        let stale_outcome = ConnectorCatalogMutationReceiving::new();
+        executor
+            .block_on(lease.execute_async_in(stale, &stale_outcome))
+            .unwrap();
+        let outcome = stale_outcome.observation();
+        assert!(outcome.provider_exited());
+        assert!(outcome.dispatched());
+        assert!(outcome.original_owner().is_none());
+        assert!(outcome.applied_receipt().is_none());
+        assert!(matches!(
+            outcome.validated_outcome(),
+            Some(Ok(ExternalMutationOutcome::KnownUncommitted { failure, .. }))
+                if failure.kind() == ConnectorMutationFailureKind::Conflict
+        ));
+        let after_stale = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        assert_eq!(
+            after_stale.table.metadata_location(),
+            loaded.table.metadata_location()
+        );
     }
 
     #[test]
@@ -12727,6 +13009,7 @@ mod tests {
             raw_change("comment", "hello"),
             raw_change("gc.enabled", "true"),
             raw_change("write.parquet.compression-codec", "zstd"),
+            raw_change("read.split.target-size", "16777216"),
             raw_change("novarocks.statistics.collect-on-write", "true"),
         ];
         let original = prepare_raw(&changes);
@@ -12745,6 +13028,7 @@ mod tests {
                             "write.parquet.compression-codec".into(),
                             Some("zstd".into())
                         ),
+                        ("read.split.target-size".into(), Some("16777216".into())),
                     ])),
                 ),
                 (Arc::from("gc_enabled"), Set(V::Boolean(true))),
@@ -12762,6 +13046,11 @@ mod tests {
             panic!("typed SET must publish exactly one raw update");
         };
         assert_eq!(typed, original);
+
+        assert_eq!(
+            typed.get("read.split.target-size").map(String::as_str),
+            Some("16777216"),
+        );
 
         for (key, value) in [
             ("Case.Key", "original case"),

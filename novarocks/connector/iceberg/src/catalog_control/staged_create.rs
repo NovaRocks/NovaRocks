@@ -90,6 +90,8 @@ pub(crate) struct RestStagedTableCreate {
     pub(crate) initialization_updates: Vec<TableUpdate>,
     /// Changes layered over the exact REST initialization by canonical staging.
     publication_updates: Vec<TableUpdate>,
+    /// Final table root, separately from the warehouse-rooted staged metadata.
+    final_table_location: Option<Arc<str>>,
 }
 
 /// One request journal survives both initial staging and final publication.
@@ -162,6 +164,7 @@ impl From<ConnectorError> for RestStagedPrepareFailure {
 }
 
 struct PreparedStagedTable {
+    final_table_location: Option<Arc<str>>,
     format_version: FormatVersion,
     properties: BTreeMap<String, String>,
     schema: Schema,
@@ -203,6 +206,12 @@ fn prepare_mv_staged_table(
         control.check_active()?;
         super::catalog_mutation::validate_create_raw_property_key(key)?;
         super::catalog_mutation::reject_variant_shredding_property(key)?;
+        if key.as_ref() == "write.metadata.path" {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "A custom write.metadata.path is unsupported for staged materialized-view storage",
+            ));
+        }
         if key.eq_ignore_ascii_case("format-version")
             || key.eq_ignore_ascii_case("format_version")
             || [
@@ -261,6 +270,7 @@ fn prepare_mv_staged_table(
     };
     control.check_active()?;
     Ok(Some(PreparedStagedTable {
+        final_table_location: storage_facts.location.map(Arc::from),
         format_version: storage_facts.format_version,
         properties: storage_facts.raw_properties,
         schema,
@@ -296,6 +306,7 @@ fn prepare_legacy_staged_table(
     })?;
     let partition_spec = super::catalog_mutation::initial_partition_spec(&schema, partitioning)?;
     Ok(PreparedStagedTable {
+        final_table_location: None,
         format_version,
         properties,
         schema,
@@ -356,6 +367,7 @@ fn prepare_rest_staged_table(
         )
     })?;
     let PreparedStagedTable {
+        final_table_location,
         format_version,
         mut properties,
         schema,
@@ -616,6 +628,7 @@ fn prepare_rest_staged_table(
         table,
         initialization_updates,
         publication_updates,
+        final_table_location,
     })
 }
 
@@ -817,6 +830,8 @@ struct PublishEvidenceV1 {
     operation_marker: String,
     table_uuid: String,
     expected_snapshot_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_table_location: Option<String>,
     handle_digest: [u8; 32],
     namespace: String,
     table: String,
@@ -1211,6 +1226,7 @@ async fn prepare_rest_staged_table_async(
         )
     })?;
     let PreparedStagedTable {
+        final_table_location,
         format_version,
         mut properties,
         schema,
@@ -1468,6 +1484,7 @@ async fn prepare_rest_staged_table_async(
         table,
         initialization_updates,
         publication_updates,
+        final_table_location,
     })
 }
 
@@ -3145,6 +3162,8 @@ fn validate_publish_evidence(
     if evidence.version != EVIDENCE_VERSION
         || evidence.operation_marker != publication_marker(prepared.publication_id)
         || evidence.handle_digest != prepared.handle_digest
+        || evidence.final_table_location.as_deref()
+            != prepared.staged.final_table_location.as_deref()
         || evidence.table_uuid != prepared.staged.table.metadata().uuid().to_string()
         || evidence.namespace != ident.namespace.to_url_string()
         || evidence.table != ident.name
@@ -3178,6 +3197,7 @@ fn publication_expectation(
     crate::catalog::StagedPublicationExpectation {
         staged_table_uuid: prepared.staged.table.metadata().uuid(),
         snapshot_id: expected_snapshot_id,
+        final_table_location: prepared.staged.final_table_location.clone(),
         properties,
     }
 }
@@ -3190,6 +3210,11 @@ fn publication_matches(
 ) -> bool {
     let metadata = table.metadata();
     metadata.uuid() == prepared.staged.table.metadata().uuid()
+        && prepared
+            .staged
+            .final_table_location
+            .as_deref()
+            .is_none_or(|expected| metadata.location() == expected)
         && metadata
             .properties()
             .get(CTAS_OPERATION_MARKER)
@@ -3558,6 +3583,7 @@ mod tests {
                 table,
                 initialization_updates: Vec::new(),
                 publication_updates: Vec::new(),
+                final_table_location: None,
             },
             policy: CreatePolicy::FailIfExists,
             planning: None,

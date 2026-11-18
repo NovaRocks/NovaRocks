@@ -25,6 +25,7 @@ pub(crate) use control::MvControlRequest;
 mod native;
 mod step;
 
+use crate::mv::domain::application::MvRepartitionFields;
 use crate::mv::domain::{application::MvRefreshRequest, iceberg_refresh::IcebergMvCorePorts};
 use crate::query_execution::{
     completion_facts::CompletionFactOwners, logical_execution::LogicalExecutionLauncher,
@@ -49,7 +50,7 @@ use novarocks_query_application::{
     session_error::{QueryServiceError, QueryServiceErrorKind},
 };
 use novarocks_spi::connector::{ConnectorInstanceId, ConnectorRequestContext};
-use novarocks_sql::{planning::mv::SqlMvTarget, semantic::IcebergPartitionFieldExpr};
+use novarocks_sql::planning::mv::SqlMvTarget;
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::{
     sync::Arc,
@@ -139,7 +140,7 @@ pub(crate) enum MvCommandRequest {
     Repartition {
         statement: MvRefreshRequest,
         target: SqlMvTarget,
-        fields: Vec<IcebergPartitionFieldExpr>,
+        fields: MvRepartitionFields,
     },
 }
 impl MvCommandRequest {
@@ -167,7 +168,7 @@ pub(super) enum StepRequest {
     Iceberg {
         target: SqlMvTarget,
         statement: MvRefreshRequest,
-        repartition: Option<Vec<IcebergPartitionFieldExpr>>,
+        repartition: Option<MvRepartitionFields>,
     },
     Unsupported {
         display_name: String,

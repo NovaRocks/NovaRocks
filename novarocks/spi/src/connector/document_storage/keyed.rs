@@ -20,12 +20,15 @@
 use super::document::invalid;
 use super::{ConnectorDocumentFormat, ConnectorManagedObjectMarker};
 use crate::connector::{
-    ConnectorCommittedVersion, ConnectorError, ConnectorProviderBindingKey, ConnectorTableIdentity,
-    ConnectorTableObjectId,
+    ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey,
+    ConnectorTableIdentity, ConnectorTableObjectId, DdlPropertyChange,
 };
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 pub fn validate_document_token(value: &str) -> Result<(), ConnectorError> {
     let bytes = value.as_bytes();
@@ -468,6 +471,8 @@ pub struct KeyedSnapshotObservation {
     pub snapshot_id: i64,
     pub parent: Option<i64>,
     pub records: Vec<ConnectorSnapshotRecord>,
+    /// Immutable provider witness on a combined slot and table-property snapshot.
+    pub slot_storage_effect_digest: Option<[u8; 32]>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FullKeyedDocumentView {
@@ -481,6 +486,10 @@ pub struct FullKeyedDocumentView {
 pub enum UnknownCommitIdentity {
     SlotWriter {
         slot: ConnectorSlotName,
+    },
+    SlotStorageEffect {
+        effect_digest: [u8; 32],
+        request_fingerprint: [u8; 32],
     },
     RecordBytes {
         owner: String,
@@ -516,13 +525,18 @@ pub enum CommitConclusion {
     clippy::large_enum_variant,
     reason = "The public keyed-mutation union carries exact owned intents by value; boxing a payload would change the shared SPI contract"
 )]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum KeyedMutation {
     Markers(KeyedMarkerWrite),
     SlotChange(KeyedSlotChange),
+    /// A single admitted slot change and evaluated user property update.
+    SlotChangeWithTableProperties {
+        change: KeyedSlotChange,
+        properties: Arc<[(Arc<str>, DdlPropertyChange)]>,
+    },
     Expiry(KeyedExpiry),
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KeyedMutationIntent {
     pub admission: super::ConnectorDocumentManagementAdmission,
     pub expected_metadata: ConnectorCommittedVersion,
@@ -549,6 +563,24 @@ impl KeyedMutationIntent {
         match &self.mutation {
             KeyedMutation::Markers(write) => write.validate(),
             KeyedMutation::SlotChange(change) => change.validate(),
+            KeyedMutation::SlotChangeWithTableProperties { change, properties } => {
+                change.validate()?;
+                if properties.is_empty() {
+                    return Err(invalid(
+                        "combined slot and table-property mutation requires evaluated properties",
+                    ));
+                }
+                if properties
+                    .iter()
+                    .any(|(name, _)| name.as_ref() == "partitioning")
+                {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "combined slot change cannot replace partitioning without its managed write",
+                    ));
+                }
+                Ok(())
+            }
             KeyedMutation::Expiry(expiry) => {
                 expiry.observation.validate_sealed()?;
                 if expiry.observation.owner() != owner

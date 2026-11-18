@@ -19,7 +19,7 @@
 
 use crate::mv::domain::application::{
     MvAlterAction, MvAlterStatement, MvCreatePartitionField, MvCreateStatement, MvCreateStorage,
-    MvDropStatement, MvRefreshRequest,
+    MvDropStatement, MvRefreshRequest, MvRepartitionFields,
 };
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use novarocks_mv_application::engine_properties::{
@@ -36,10 +36,11 @@ use novarocks_parser::ast::{
 };
 use novarocks_query_application::admitted_query_context::RequestContext;
 use novarocks_query_application::api::{
-    CommandContext, MaterializedViewCommand, MaterializedViewCommandConsumer,
+    CommandContext, CommandError, CommandErrorKind, MaterializedViewCommand,
+    MaterializedViewCommandConsumer,
 };
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
-use novarocks_spi::connector::MvStorageObservationPort;
+use novarocks_spi::connector::{DdlPropertyChange, DdlPropertyValue, MvStorageObservationPort};
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 use novarocks_types::naming::normalize_identifier;
 
@@ -128,7 +129,7 @@ impl MvCommandExecutor {
                 })?,
             );
         }
-        use crate::query::mv_action::{CreateRequest, MvCommandRequest, prepare};
+        use crate::query::mv_action::{CreateRequest, MvCommandRequest};
         let catalog = context.session().current_catalog();
         let database = context.session().current_database();
         let request = match statement {
@@ -140,23 +141,6 @@ impl MvCommandExecutor {
                     statement,
                     requested,
                     session_properties: Arc::clone(context.session().property_inputs()),
-                }
-            }
-            MaterializedViewStatement::Alter(alter)
-                if matches!(&alter.action, TypedAlterAction::Repartition(_)) =>
-            {
-                let alter = lower_typed_alter(alter)?;
-                let MvAlterAction::Repartition(fields) = alter.action else {
-                    unreachable!()
-                };
-                let target = resolve_refresh_mv_target(catalog, database, &alter.name_parts)?;
-                MvCommandRequest::Repartition {
-                    statement: MvRefreshRequest {
-                        name_parts: alter.name_parts,
-                        full: false,
-                    },
-                    target,
-                    fields: fields.iter().map(IcebergPartitionFieldExpr::from).collect(),
                 }
             }
             MaterializedViewStatement::Create(create) => {
@@ -187,17 +171,45 @@ impl MvCommandExecutor {
                 })
             }
             MaterializedViewStatement::Alter(alter) => {
-                let statement = lower_typed_alter(alter)?;
-                let target = resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
-                MvCommandRequest::Control(crate::query::mv_action::MvControlRequest::Alter {
-                    target,
-                    statement,
-                })
+                alter_command(catalog, database, lower_typed_alter(alter)?)?
             }
             MaterializedViewStatement::ExplainRefresh(_) => {
                 unreachable!("MV read statements were selected before the mutation action")
             }
         };
+        self.prepare_command_request(request, context, command_context)
+    }
+
+    /// Start the original governed Alter after the final SQL caller has
+    /// completed property evaluation against the admitted target scope.
+    pub(crate) fn prepare_evaluated_alter(
+        &self,
+        statement: MvAlterStatement,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        CommandError,
+    > {
+        let request = alter_command(
+            context.session().current_catalog(),
+            context.session().current_database(),
+            statement,
+        )?;
+        self.prepare_command_request(request, context, command_context)
+    }
+
+    fn prepare_command_request(
+        &self,
+        request: crate::query::mv_action::MvCommandRequest,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        CommandError,
+    > {
+        let catalog = context.session().current_catalog();
+        let database = context.session().current_database();
         let services = self.execution_services.clone().ok_or_else(|| {
             novarocks_query_application::api::CommandError::new(
                 novarocks_query_application::api::CommandErrorKind::Unsupported,
@@ -205,7 +217,7 @@ impl MvCommandExecutor {
             )
         })?;
         let (product, activation) = self.refresh_service.original_refresh_ports();
-        prepare(
+        crate::query::mv_action::prepare(
             catalog.map(str::to_owned),
             database.to_owned(),
             self.ports.clone(),
@@ -466,6 +478,58 @@ pub(crate) fn lower_typed_create_for_tests(
     statement: &novarocks_parser::ast::CreateMaterializedView,
 ) -> Result<MvCreateStatement, String> {
     lower_typed_create(statement)
+}
+
+fn alter_command(
+    catalog: Option<&str>,
+    database: &str,
+    statement: MvAlterStatement,
+) -> Result<crate::query::mv_action::MvCommandRequest, CommandError> {
+    use crate::query::mv_action::{MvCommandRequest, MvControlRequest};
+    let target = resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
+    let fields = match &statement.action {
+        MvAlterAction::Repartition(fields) => Some(MvRepartitionFields::Legacy(
+            fields.iter().map(IcebergPartitionFieldExpr::from).collect(),
+        )),
+        MvAlterAction::StorageProperties { owner, properties }
+            if properties
+                .iter()
+                .any(|(name, _)| name.as_ref() == "partitioning") =>
+        {
+            let [(_, change)] = properties.as_ref() else {
+                return Err(CommandError::new(
+                    CommandErrorKind::Unsupported,
+                    "MV partition replacement with other storage properties requires a combined managed publication",
+                ));
+            };
+            let value = match change {
+                DdlPropertyChange::Set(value) | DdlPropertyChange::Reset(value) => value,
+            };
+            let DdlPropertyValue::ArrayVarchar(fields) = value else {
+                return Err(CommandError::new(
+                    CommandErrorKind::Invalid,
+                    "Evaluated MV partitioning must be array(varchar)",
+                ));
+            };
+            Some(MvRepartitionFields::Property {
+                owner: owner.clone(),
+                fields: Arc::from(fields.as_slice()),
+            })
+        }
+        _ => None,
+    };
+    Ok(if let Some(fields) = fields {
+        MvCommandRequest::Repartition {
+            statement: MvRefreshRequest {
+                name_parts: statement.name_parts,
+                full: false,
+            },
+            target,
+            fields,
+        }
+    } else {
+        MvCommandRequest::Control(MvControlRequest::Alter { target, statement })
+    })
 }
 
 fn lower_typed_alter(
@@ -822,6 +886,88 @@ mod tests {
             panic!("expected one typed MV statement for {source}");
         };
         statement.clone()
+    }
+
+    #[test]
+    fn evaluated_mv_storage_and_partitioning_take_their_original_distinct_commands() {
+        use crate::query::mv_action::{MvCommandRequest, MvControlRequest};
+        use novarocks_spi::connector::{
+            ConnectorInstanceId, ConnectorProviderBindingKey, ProviderBindingEpoch,
+        };
+
+        let owner = ConnectorProviderBindingKey {
+            instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+            incarnation: ProviderBindingEpoch::new(),
+        };
+        let storage = (
+            Arc::from("extra_properties"),
+            DdlPropertyChange::Set(DdlPropertyValue::MapVarcharVarchar(vec![(
+                "read.split.target-size".into(),
+                Some("16777216".into()),
+            )])),
+        );
+        let partitioning = (
+            Arc::from("partitioning"),
+            DdlPropertyChange::Set(DdlPropertyValue::ArrayVarchar(vec![Some(
+                "bucket(id, 16)".into(),
+            )])),
+        );
+        let route = |properties: Vec<_>| {
+            alter_command(
+                Some("ice"),
+                "db",
+                MvAlterStatement {
+                    name_parts: vec!["t".into()],
+                    action: MvAlterAction::StorageProperties {
+                        owner: owner.clone(),
+                        properties: properties.into(),
+                    },
+                },
+            )
+        };
+        let MvCommandRequest::Control(MvControlRequest::Alter { statement, .. }) =
+            route(vec![storage.clone()]).ok().unwrap()
+        else {
+            panic!("storage properties use the original metadata control");
+        };
+        let MvAlterAction::StorageProperties {
+            properties,
+            owner: actual,
+        } = statement.action
+        else {
+            panic!("the typed property must reach the control request");
+        };
+        assert_eq!(properties.as_ref(), std::slice::from_ref(&storage));
+        assert_eq!(actual, owner);
+        let MvCommandRequest::Repartition { fields, .. } =
+            route(vec![partitioning.clone()]).ok().unwrap()
+        else {
+            panic!("partitioning must retain the managed data publication");
+        };
+        let MvRepartitionFields::Property {
+            fields,
+            owner: actual,
+        } = fields
+        else {
+            panic!("repartition must receive the original typed property strings");
+        };
+        assert_eq!(fields.as_ref(), &[Some("bucket(id, 16)".into())]);
+        assert_eq!(actual, owner);
+        let empty = (
+            Arc::from("partitioning"),
+            DdlPropertyChange::Reset(DdlPropertyValue::ArrayVarchar(vec![])),
+        );
+        let MvCommandRequest::Repartition {
+            fields: MvRepartitionFields::Property { fields, .. },
+            ..
+        } = route(vec![empty]).ok().unwrap()
+        else {
+            panic!("an explicit empty default still selects managed repartition");
+        };
+        assert!(fields.is_empty());
+
+        let error = route(vec![partitioning, storage]).err().unwrap();
+        assert_eq!(error.kind(), CommandErrorKind::Unsupported);
     }
 
     #[test]

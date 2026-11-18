@@ -439,6 +439,12 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 }
                 if expected.staged_table_uuid != staged.initial_metadata().uuid()
                     || expected.snapshot_id != request.ref_snapshot_after(request.target_ref())
+                    || expected
+                        .final_table_location
+                        .as_deref()
+                        .is_some_and(|location| {
+                            request.final_table_location_update() != Some(location)
+                        })
                     || !expected
                         .properties
                         .iter()
@@ -455,6 +461,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                     snapshot,
                     expected.properties,
                 )
+                .map(|expect| expect.with_final_table_location(expected.final_table_location))
             }
         }
         .map_err(|_| {
@@ -2573,6 +2580,7 @@ mod evidence_tests {
                 Some(StagedPublicationExpectation {
                     staged_table_uuid: staged_uuid,
                     snapshot_id: Some(30),
+                    final_table_location: None,
                     properties: vec![marker.clone()],
                 }),
             )

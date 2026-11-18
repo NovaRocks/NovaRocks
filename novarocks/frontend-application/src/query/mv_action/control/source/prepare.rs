@@ -91,6 +91,17 @@ impl ControlSource {
             &instance,
         )
         .map_err(connector)?;
+        if let MvControlRequest::Alter { statement, .. } = &self.request
+            && let (MvAlterAction::StorageProperties { owner, .. }
+            | MvAlterAction::RefreshAndStorageProperties { owner, .. }) = &statement.action
+            && (owner.instance_id != planning.binding().descriptor().instance_id
+                || owner.incarnation != planning.binding().incarnation())
+        {
+            return Err(MvProviderFailure::new(
+                MvProviderFailureKind::TargetReplaced,
+                "MV storage property scope belongs to a different connector generation",
+            ));
+        }
         body.planning = Some(planning.clone());
         let table = ConnectorTableIdentity {
             instance_id: instance,
@@ -233,7 +244,22 @@ impl ControlSource {
                         expected_committed_partitioning: None,
                     });
                 }
-                MvAlterAction::RefreshProperties(changes) => {
+                MvAlterAction::StorageProperties { properties, .. } => {
+                    if properties
+                        .iter()
+                        .any(|(name, _)| name.as_ref() == "partitioning")
+                    {
+                        return Err(invalid(
+                            "MV partitioning requires its original data-producing step",
+                        ));
+                    }
+                    body.operation = Some(ConnectorCatalogMutationOperation::SetTableProperties {
+                        table,
+                        properties: Arc::clone(properties),
+                    });
+                }
+                MvAlterAction::RefreshProperties(changes)
+                | MvAlterAction::RefreshAndStorageProperties { changes, .. } => {
                     ready
                         .candidate_reader()
                         .observe_current_application_async(&documents, request.clone())
@@ -315,15 +341,25 @@ impl ControlSource {
                             .map_err(connector)?,
                         )
                         .map_err(connector)?;
+                    let change =
+                        keyed_configuration_slot_change(&configuration).map_err(document)?;
+                    let mutation =
+                        if let MvAlterAction::RefreshAndStorageProperties { properties, .. } =
+                            &statement.action
+                        {
+                            KeyedMutation::SlotChangeWithTableProperties {
+                                change,
+                                properties: Arc::clone(properties),
+                            }
+                        } else {
+                            KeyedMutation::SlotChange(change)
+                        };
                     body.operation = Some(ConnectorCatalogMutationOperation::KeyedDocuments {
                         intent: KeyedMutationIntent {
                             admission,
                             expected_metadata: observed.view.metadata_version.clone(),
                             expected_snapshot: observed.view.current_snapshot,
-                            mutation: KeyedMutation::SlotChange(
-                                keyed_configuration_slot_change(&configuration)
-                                    .map_err(document)?,
-                            ),
+                            mutation,
                         },
                     });
                 }

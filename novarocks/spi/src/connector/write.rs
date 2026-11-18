@@ -747,11 +747,8 @@ impl ConnectorManagedPartitionField {
 
 fn validate_managed_partition_fields(
     fields: &[ConnectorManagedPartitionField],
-    allow_empty: bool,
 ) -> Result<(), ConnectorError> {
-    if (!allow_empty && fields.is_empty())
-        || fields.len() > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS
-    {
+    if fields.len() > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS {
         return Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
             "connector managed partition spec field count is invalid or exceeds its bound",
@@ -793,7 +790,7 @@ impl ConnectorManagedPartitionSpecObservation {
                 "connector managed prior partition spec ID must be non-negative",
             ));
         }
-        validate_managed_partition_fields(fields, true)?;
+        validate_managed_partition_fields(fields)?;
         let mut hasher = Sha256::new();
         hasher.update(CONNECTOR_MANAGED_PARTITION_SPEC_OBSERVATION_DOMAIN);
         hasher.update(provider_spec_id.to_be_bytes());
@@ -843,7 +840,8 @@ pub enum ConnectorManagedPartitionSpecReplacementTarget {
 }
 
 /// Complete, signed logical facts for replacing the default partition spec in
-/// the same external commit that publishes the managed snapshot.
+/// the same external commit that publishes the managed snapshot. An empty
+/// replacement selects an unpartitioned spec.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorManagedPartitionSpecReplacement {
     operation_id: ConnectorWriteOperationId,
@@ -859,7 +857,7 @@ impl ConnectorManagedPartitionSpecReplacement {
         expected_prior_default: ConnectorManagedPartitionSpecObservation,
         fields: Vec<ConnectorManagedPartitionField>,
     ) -> Result<Self, ConnectorError> {
-        validate_managed_partition_fields(&fields, false)?;
+        validate_managed_partition_fields(&fields)?;
         Ok(Self {
             operation_id,
             replacement_id: ConnectorManagedPartitionSpecReplacementId::derive(operation_id),
@@ -893,7 +891,7 @@ impl ConnectorManagedPartitionSpecReplacement {
         &self,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<(), ConnectorError> {
-        validate_managed_partition_fields(&self.fields, false)?;
+        validate_managed_partition_fields(&self.fields)?;
         if self.operation_id != operation_id
             || self.replacement_id
                 != ConnectorManagedPartitionSpecReplacementId::derive(operation_id)
@@ -1167,7 +1165,7 @@ impl ConnectorCommittedPartitionField {
 fn validate_committed_partition_fields(
     fields: &[ConnectorCommittedPartitionField],
 ) -> Result<(), ConnectorError> {
-    if fields.is_empty() || fields.len() > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS {
+    if fields.len() > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS {
         return Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
             "connector committed partition field count is invalid or exceeds its bound",
@@ -1200,7 +1198,8 @@ fn validate_committed_partition_fields(
 }
 
 /// Exact partitioning facts returned after an atomic managed publication.
-/// The physical spec and partition field IDs are provider-assigned.
+/// The physical spec and partition field IDs are provider-assigned. An exact
+/// spec with zero fields is distinct from a receipt with no partitioning fact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorCommittedPartitioning {
     spec_id: i32,
@@ -1659,8 +1658,7 @@ impl ConnectorWriteReceipt {
                         .try_into()
                         .expect("fixed-width committed partition digest");
                     let field_count = read_u32(&mut offset)?;
-                    if field_count == 0 || field_count > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS
-                    {
+                    if field_count > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS {
                         return Err(ConnectorError::new(
                             ConnectorErrorKind::CorruptData,
                             "connector committed partition field count is invalid",
@@ -1814,6 +1812,20 @@ pub trait ConnectorWriteControl: Send + Sync {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
             "connector write control does not implement row-mutation preparation",
+        ))
+    }
+
+    /// Decode a managed repartition property element using this provider's
+    /// partition grammar. Schema binding follows at managed partition preview.
+    fn parse_managed_partitioning_element(
+        &self,
+        _field: Option<&str>,
+        _index: usize,
+        _control: &dyn super::ConnectorOperationControl,
+    ) -> Result<super::ConnectorPartitionTransform, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector write control does not implement managed partition property parsing",
         ))
     }
 
@@ -2022,6 +2034,24 @@ impl ConnectorWrite {
             }
         }
         Ok(outcome)
+    }
+
+    pub fn parse_managed_partitioning_element(
+        &self,
+        table: &ConnectorTableHandle,
+        field: Option<&str>,
+        index: usize,
+        control: &dyn super::ConnectorOperationControl,
+    ) -> Result<super::ConnectorPartitionTransform, ConnectorError> {
+        if !self.matches_provider_instance(table.owner()) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "managed partition property table does not match the connector instance",
+            ));
+        }
+        control.check_active()?;
+        self.control
+            .parse_managed_partitioning_element(field, index, control)
     }
 
     pub fn preview_managed_partition_spec(
@@ -2478,14 +2508,14 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(
-            ConnectorManagedPartitionSpecReplacement::try_new(
-                ConnectorWriteOperationId::new(),
-                prior,
-                Vec::new(),
-            )
-            .is_err()
-        );
+        let unpartitioned = ConnectorManagedPartitionSpecReplacement::try_new(
+            ConnectorWriteOperationId::new(),
+            prior,
+            Vec::new(),
+        )
+        .expect("explicit unpartitioned replacement");
+        assert!(unpartitioned.fields().is_empty());
+        assert_eq!(unpartitioned.expected_prior_default(), prior);
 
         let operation_id = ConnectorWriteOperationId::new();
         let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
@@ -2585,6 +2615,44 @@ mod tests {
                 .expect("decode repartition receipt");
         assert_eq!(decoded, receipt);
         assert_eq!(decoded.committed_partitioning(), Some(&partitioning));
+    }
+
+    #[test]
+    fn receipt_wire_distinguishes_unpartitioned_replacement_from_no_transition() {
+        let version =
+            ConnectorCommittedVersion::try_new(Bytes::from_static(b"version"), Some(8)).unwrap();
+        let payload = Bytes::from_static(b"provider receipt");
+        let ordinary = ConnectorWriteReceipt::try_new_with_committed_facts(
+            payload.clone(),
+            version.clone(),
+            Some(14),
+        )
+        .unwrap();
+        let committed = ConnectorCommittedPartitioning::try_new(4, vec![]).unwrap();
+        let exact = ConnectorWriteReceipt::try_new_with_committed_facts_and_partitioning(
+            payload,
+            version,
+            Some(14),
+            committed.clone(),
+        )
+        .unwrap();
+        let wire = exact.try_to_wire_v1().unwrap();
+        let decoded = ConnectorWriteReceipt::try_from_wire_v1(&wire).unwrap();
+        assert_eq!(decoded, exact);
+        assert_eq!(decoded.committed_partitioning(), Some(&committed));
+        assert!(
+            ConnectorWriteReceipt::try_from_wire_v1(&ordinary.try_to_wire_v1().unwrap())
+                .unwrap()
+                .committed_partitioning()
+                .is_none()
+        );
+        // The zero field count occupies the final four bytes. Corrupt the
+        // preceding digest to prove the decoded empty fact is still checked.
+        let mut tampered = wire.to_vec();
+        let digest_end = tampered.len() - 5;
+        tampered[digest_end] ^= 1;
+        let error = ConnectorWriteReceipt::try_from_wire_v1(&tampered).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }
 
     #[test]

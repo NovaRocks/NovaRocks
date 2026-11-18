@@ -344,6 +344,7 @@ impl PublicationDescriptor {
                                     | "novarocks.connector.maintenance.v1"
                                     | "novarocks.connector.maintenance.v2"
                                     | "novarocks.mv.publication_id"
+                                    | crate::commit::slot_change::SLOT_STORAGE_EFFECT_SUMMARY_KEY
                             )
                         })
                     {
@@ -375,14 +376,7 @@ impl PublicationDescriptor {
                 _ => {}
             }
         }
-        let bytes = serde_json::to_vec(&request.to_rest_json().map_err(|error| {
-            Error::new(ErrorKind::DataInvalid, "Cannot encode frozen publication")
-                .with_source(error)
-        })?)
-        .map_err(|error| {
-            Error::new(ErrorKind::DataInvalid, "Cannot encode frozen publication")
-                .with_source(error)
-        })?;
+        let bytes = request.canonical_rest_bytes()?;
         let mut descriptor = Self::catalog_with_key(
             request.artifacts().attempt().operation().to_bytes(),
             vec![format!("{}", request.identifier())],

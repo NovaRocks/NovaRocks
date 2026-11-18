@@ -115,11 +115,12 @@ pub(crate) fn prepare_mv_staged_storage(
             "Iceberg materialized-view storage requires format_version = 3",
         ));
     }
-    if storage.location.is_some() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "A custom location is unsupported for staged materialized-view storage",
-        ));
+    if storage.location.as_deref().is_some_and(str::is_empty) {
+        return Err(
+            novarocks_spi::connector::InvalidTableProperty::from_property_error(invalid(
+                "Iceberg materialized-view location cannot be empty",
+            )),
+        );
     }
     if storage.raw_properties.contains_key("write.metadata.path") {
         return Err(ConnectorError::new(

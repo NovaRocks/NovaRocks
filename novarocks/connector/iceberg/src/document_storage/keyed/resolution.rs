@@ -47,17 +47,27 @@ pub(crate) fn resolve(
             "commit observations belong to different provider or table scopes",
         ));
     }
-    if let Some(proof) = immediate_proof(refs, evidence) {
+    let combined_effect = match &evidence.identity {
+        UnknownCommitIdentity::SlotStorageEffect { effect_digest, .. } => Some(effect_digest),
+        _ => None,
+    };
+    if combined_effect.is_none()
+        && let Some(proof) = immediate_proof(refs, evidence)
+    {
         return Ok(committed(proof));
     }
     let Some(full) = full else {
-        return Ok(if refs.current_snapshot == evidence.asserted_parent {
-            Resolution::Conclusion(CommitConclusion::StillUnknown)
-        } else {
-            Resolution::NeedFull
-        });
+        return Ok(
+            if combined_effect.is_none() && refs.current_snapshot == evidence.asserted_parent {
+                Resolution::Conclusion(CommitConclusion::StillUnknown)
+            } else {
+                Resolution::NeedFull
+            },
+        );
     };
-    if let Some(proof) = immediate_proof(&full.current, evidence) {
+    if combined_effect.is_none()
+        && let Some(proof) = immediate_proof(&full.current, evidence)
+    {
         return Ok(committed(proof));
     }
     let mut snapshots = BTreeMap::new();
@@ -68,6 +78,23 @@ pub(crate) fn resolve(
                 "full commit observation repeats a snapshot ID",
             ));
         }
+    }
+    if let Some(digest) = combined_effect {
+        // Main, SlotWriter and a parent edge do not independently identify
+        // the frozen storage effect. Missing history leaves this unknown.
+        return Ok(
+            if snapshots
+                .get(&evidence.preselected_snapshot)
+                .is_some_and(|snapshot| {
+                    snapshot.parent == evidence.asserted_parent
+                        && snapshot.slot_storage_effect_digest.as_ref() == Some(digest)
+                })
+            {
+                committed(CommitProof::Snapshot)
+            } else {
+                Resolution::Conclusion(CommitConclusion::StillUnknown)
+            },
+        );
     }
     if let Some(snapshot) = snapshots.get(&evidence.preselected_snapshot) {
         let matches = match &evidence.identity {

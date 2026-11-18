@@ -113,6 +113,16 @@ impl ConnectorWriteControl for IcebergWriteControl {
         ConnectorPreReadyWritePlanningProof::try_issue(self.key.clone(), &request)
     }
 
+    fn parse_managed_partitioning_element(
+        &self,
+        field: Option<&str>,
+        index: usize,
+        control: &dyn novarocks_spi::connector::ConnectorOperationControl,
+    ) -> Result<novarocks_spi::connector::ConnectorPartitionTransform, ConnectorError> {
+        crate::table_properties::parse_optional_partitioning_element(field, index, control)
+            .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
+    }
+
     fn preview_managed_partition_spec(
         &self,
         request: ConnectorManagedPartitionSpecPreviewRequest,
@@ -328,6 +338,46 @@ mod tests {
         proof
             .validates(&owner, &request)
             .expect("proof binds the exact owner and activation request");
+    }
+
+    #[test]
+    fn repartition_property_parsing_uses_the_admitted_write_control() {
+        use novarocks_spi::connector::{
+            ConnectorPartitionTransform, ConnectorWrite, InvalidTableProperty,
+        };
+
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let lease = ConnectorWrite::new(owner.clone(), Arc::new(control), || {}).expect("lease");
+        let table =
+            ConnectorTableHandle::try_new(owner.instance_id, Bytes::from_static(b"admitted-table"))
+                .expect("table handle");
+        let context = request_context();
+        assert_eq!(
+            lease
+                .parse_managed_partitioning_element(&table, Some("bucket(id, 16)"), 0, &context)
+                .expect("partitioning property"),
+            ConnectorPartitionTransform::Bucket {
+                column: "id".into(),
+                num_buckets: 16
+            },
+        );
+        let null = lease
+            .parse_managed_partitioning_element(&table, None, 2, &context)
+            .expect_err("NULL partitioning property");
+        assert!(InvalidTableProperty::from_connector_error(&null).is_some());
+        assert!(null.message().contains("index 2"));
+
+        let foreign_table = ConnectorTableHandle::try_new(
+            ConnectorInstanceId::parse("foreign").expect("instance"),
+            Bytes::from_static(b"admitted-table"),
+        )
+        .expect("foreign table handle");
+        let foreign = lease
+            .parse_managed_partitioning_element(&foreign_table, None, 2, &context)
+            .expect_err("foreign connector instance");
+        assert_eq!(foreign.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(InvalidTableProperty::from_connector_error(&foreign).is_none());
     }
 
     #[test]

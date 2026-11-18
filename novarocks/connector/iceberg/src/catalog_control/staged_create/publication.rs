@@ -121,17 +121,33 @@ pub(super) fn create_intent(
     })
 }
 
-pub(super) fn create_prefix(prepared: &PreparedOperation) -> PreparedChange {
+pub(super) fn create_prefix(
+    prepared: &PreparedOperation,
+) -> Result<PreparedChange, ConnectorError> {
     let mut updates = prepared.staged.publication_updates.clone();
     if let Some(properties) = &prepared.document_properties {
         updates.push(TableUpdate::SetProperties {
             updates: properties.clone(),
         });
     }
-    PreparedChange {
+    if let Some(location) = &prepared.staged.final_table_location {
+        let empty = prepared
+            .write
+            .as_ref()
+            .is_some_and(|write| write.write.row_count() == 0 && write.files.is_empty());
+        if !empty || prepared.document_properties.is_none() {
+            return Err(invalid(
+                "Final MV location requires a document-managed create with a zero-row sealed write and no data artifacts",
+            ));
+        }
+        updates.push(TableUpdate::SetLocation {
+            location: location.to_string(),
+        });
+    }
+    Ok(PreparedChange {
         updates,
         requirements: vec![],
-    }
+    })
 }
 
 pub(super) struct CreatePublisher {
@@ -173,11 +189,35 @@ impl PublicationPreparer for CreatePublisher {
         )?;
         let ident = request.identifier();
         let expected_snapshot_id = request.ref_snapshot_after("main");
+        if let Some(expected) = self.prepared.staged.final_table_location.as_deref() {
+            if request.final_table_location_update() != Some(expected)
+                || request.requirements() != [crate::iceberg::TableRequirement::NotExist]
+                || request.updates().iter().any(|update| {
+                    matches!(
+                        update,
+                        TableUpdate::AddSnapshot { .. } | TableUpdate::SetSnapshotRef { .. }
+                    )
+                })
+                || !request.artifacts().attempt_owned().is_empty()
+                || !request.artifacts().session_references().is_empty()
+            {
+                return Err(iceberg_error(
+                    "Frozen final MV location requires assert-absent publication without data or attempt artifacts",
+                ));
+            }
+            facts.validate_no_session_data()?;
+        }
         let payload = serde_json::to_vec(&PublishEvidenceV1 {
             version: EVIDENCE_VERSION,
             operation_marker: publication_marker(self.prepared.publication_id),
             table_uuid: self.prepared.staged.table.metadata().uuid().to_string(),
             expected_snapshot_id,
+            final_table_location: self
+                .prepared
+                .staged
+                .final_table_location
+                .as_deref()
+                .map(str::to_owned),
             handle_digest: self.prepared.handle_digest,
             namespace: ident.namespace.to_url_string(),
             table: ident.name.clone(),
@@ -262,7 +302,7 @@ pub(super) fn publish(
     let operation = ensure_operation(adapter, prepared, operation_id, context)?;
     let intent =
         create_intent(prepared, operation.token()).map_err(|error| corrupt(error.to_string()))?;
-    let prefix = create_prefix(prepared);
+    let prefix = create_prefix(prepared)?;
     let policy = RetryPolicy::from_properties(prepared.staged.table.metadata().properties())
         .map_err(|error| invalid(error.to_string()))?;
     let journal = prepared
@@ -333,7 +373,7 @@ pub(super) async fn publish_async(
     let operation = ensure_operation(adapter, prepared, operation_id, context)?;
     let intent =
         create_intent(prepared, operation.token()).map_err(|error| corrupt(error.to_string()))?;
-    let prefix = create_prefix(prepared);
+    let prefix = create_prefix(prepared)?;
     let policy = RetryPolicy::from_properties(prepared.staged.table.metadata().properties())
         .map_err(|error| invalid(error.to_string()))?;
     let journal = prepared
@@ -626,6 +666,7 @@ mod tests {
                     publication_updates: vec![TableUpdate::SetProperties {
                         updates: provenance,
                     }],
+                    final_table_location: None,
                 },
                 policy: CreatePolicy::FailIfExists,
                 planning: None,
@@ -657,6 +698,167 @@ mod tests {
                 _stop: stop,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn custom_mv_location_is_frozen_only_for_a_sealed_empty_managed_create() {
+        use crate::commit::attempt::observation::{DispatchEvidence, MemoryDispatchBarrier};
+
+        let mut fixture = Fixture::new(false);
+        let custom = url::Url::from_file_path(fixture.directory.path().join("external"))
+            .unwrap()
+            .to_string();
+        let stage = fixture
+            .prepared
+            .staged
+            .table
+            .metadata()
+            .location()
+            .to_owned();
+        let finalization_path = fixture.provenance_path();
+        let sentinel = fixture.directory.path().join("external").join("existing");
+        std::fs::create_dir(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, b"outside the operation").unwrap();
+        fixture.prepared.staged.final_table_location = Some(custom.as_str().into());
+        let operation_id = fixture.prepared.operation_id();
+
+        let mut with_rows = fixture.prepared.clone();
+        let write = with_rows.write.as_mut().unwrap();
+        write.write = ConnectorStagedWriteProof::try_new(write.write.receipt().clone(), 1).unwrap();
+        assert!(create_prefix(&with_rows).is_err());
+
+        let mut with_artifact = Fixture::new(true).prepared;
+        with_artifact.staged.final_table_location = Some(custom.as_str().into());
+        let write = with_artifact.write.as_mut().unwrap();
+        write.write = ConnectorStagedWriteProof::try_new(write.write.receipt().clone(), 0).unwrap();
+        assert!(!write.files.is_empty());
+        assert!(create_prefix(&with_artifact).is_err());
+
+        let mut without_documents = fixture.prepared.clone();
+        without_documents.document_properties = None;
+        assert!(create_prefix(&without_documents).is_err());
+
+        let operation = ensure_operation(
+            &fixture.adapter,
+            &mut fixture.prepared,
+            operation_id,
+            &fixture.context,
+        )
+        .unwrap();
+        let intent = create_intent(&fixture.prepared, operation.token()).unwrap();
+        assert!(intent.changes().added.is_empty());
+        let prefix = create_prefix(&fixture.prepared).unwrap();
+        let journal = fixture
+            .prepared
+            .stage_publication
+            .journal
+            .next_frontier()
+            .unwrap();
+        let publisher = CreatePublisher {
+            adapter: fixture.adapter.clone(),
+            prepared: Arc::new(fixture.prepared.clone()),
+            operation_id,
+            journal: journal.clone(),
+        };
+        fixture.prepared.final_publication = Some(journal.clone());
+        let attempt = operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            publisher.load_target(&attempt).await.unwrap(),
+            &intent,
+            &attempt,
+        )
+        .unwrap();
+        engine.stage_change(prefix).unwrap();
+        let metadata = engine.metadata().clone();
+        let references = operation.publication_references().unwrap();
+        let request = engine.freeze(&references).unwrap();
+        assert_eq!(
+            request.requirements(),
+            &[crate::iceberg::TableRequirement::NotExist]
+        );
+        assert_eq!(request.final_table_location_update(), Some(custom.as_str()));
+        assert!(request.ref_snapshot_after("main").is_none());
+        assert!(request.artifacts().attempt_owned().is_empty());
+        assert!(request.artifacts().session_references().is_empty());
+        assert_eq!(
+            request
+                .updates()
+                .iter()
+                .filter_map(|update| match update {
+                    TableUpdate::SetLocation { location } => Some(location.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [stage.as_str(), custom.as_str()],
+        );
+        publisher.preflight_recovery(&request, &operation).unwrap();
+        let entry = journal.current_entry().unwrap();
+        journal
+            .claim_dispatch()
+            .unwrap()
+            .begin_dispatch(&fixture.context, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        journal.conclude_entry(
+            entry,
+            DispatchEvidence::Unknown {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                    "lost custom-location response",
+                ),
+                observation: Default::default(),
+            },
+        );
+        let fresh_table = |metadata| {
+            crate::iceberg::table::Table::builder()
+                .runtime(
+                    fixture
+                        .adapter
+                        .runtime
+                        .resources()
+                        .catalog_runtime()
+                        .iceberg_runtime()
+                        .clone(),
+                )
+                .identifier(fixture.prepared.staged.table.identifier().clone())
+                .file_io(fixture.prepared.staged.table.file_io().clone())
+                .metadata(metadata)
+                .build()
+                .unwrap()
+        };
+        let wrong_location = fresh_table(
+            metadata
+                .clone()
+                .into_builder(None)
+                .set_location(stage.clone())
+                .build()
+                .unwrap()
+                .metadata,
+        );
+        assert!(!publication_matches(
+            &wrong_location,
+            operation_id,
+            &fixture.prepared,
+            None
+        ));
+        assert!(matches!(
+            journal.catalog_entry_outcome(entry),
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+        let exact_location = fresh_table(metadata);
+        assert!(publication_matches(
+            &exact_location,
+            operation_id,
+            &fixture.prepared,
+            None
+        ));
+        assert!(matches!(
+            record_observed_publication(&fixture.prepared, &exact_location).unwrap(),
+            ExternalMutationOutcome::KnownCommitted { .. },
+        ));
+        assert_eq!(fixture.prepared.staged.table.metadata().location(), stage);
+        assert!(finalization_path.exists());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside the operation");
     }
 
     // Only the prepare/bind setup is pure here. Publication uses the actual
@@ -1001,7 +1203,7 @@ mod tests {
             )
             .unwrap();
             engine
-                .stage_change(create_prefix(&fixture.prepared))
+                .stage_change(create_prefix(&fixture.prepared).unwrap())
                 .unwrap();
             if with_data {
                 engine
@@ -1114,7 +1316,7 @@ mod tests {
                 )
                 .unwrap();
                 engine
-                    .stage_change(create_prefix(&fixture.prepared))
+                    .stage_change(create_prefix(&fixture.prepared).unwrap())
                     .unwrap();
                 assert_eq!(
                     engine.metadata().current_schema(),
@@ -1180,6 +1382,12 @@ mod tests {
                     operation_marker: publication_marker(fixture.prepared.publication_id),
                     table_uuid: original.uuid().to_string(),
                     expected_snapshot_id: request.ref_snapshot_after("main"),
+                    final_table_location: fixture
+                        .prepared
+                        .staged
+                        .final_table_location
+                        .as_deref()
+                        .map(str::to_owned),
                     handle_digest: fixture.prepared.handle_digest,
                     namespace: request.identifier().namespace.to_url_string(),
                     table: request.identifier().name.clone(),
@@ -1311,7 +1519,7 @@ mod tests {
             )
             .unwrap();
             engine
-                .stage_change(create_prefix(&fixture.prepared))
+                .stage_change(create_prefix(&fixture.prepared).unwrap())
                 .unwrap();
             let request = engine
                 .freeze(&operation.publication_references().unwrap())

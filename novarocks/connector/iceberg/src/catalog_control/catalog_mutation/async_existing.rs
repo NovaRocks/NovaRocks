@@ -74,10 +74,11 @@ pub(super) fn execute_async<'a>(
             ConnectorCatalogMutationOperation::DropTable { .. } => {
                 drop_table(&original, receiving).await
             }
-            ConnectorCatalogMutationOperation::AlterProperties { .. } => {
+            ConnectorCatalogMutationOperation::AlterProperties { .. }
+            | ConnectorCatalogMutationOperation::SetTableProperties { .. } => {
                 properties(&original, receiving).await
             }
-            _ => unreachable!("only the three closed leaves construct this original"),
+            _ => unreachable!("only admitted async existing leaves construct this original"),
         }
     })
 }
@@ -232,14 +233,11 @@ async fn properties(
 ) -> Result<Outcome, ConnectorError> {
     let provider = &original.provider;
     let request = &original.request;
-    let ConnectorCatalogMutationOperation::AlterProperties {
-        table,
-        changes,
-        authority,
-        expected_committed_partitioning,
-    } = &request.operation
-    else {
-        unreachable!()
+    use ConnectorCatalogMutationOperation::{AlterProperties, SetTableProperties};
+
+    let table = match &request.operation {
+        AlterProperties { table, .. } | SetTableProperties { table, .. } => table,
+        _ => unreachable!("properties preparation requires a property operation"),
     };
     let prepared = provider
         .runtime()
@@ -262,13 +260,24 @@ async fn properties(
                     unreachable!("property preparation retains its original physical table")
                 };
                 let metadata = loaded.table.metadata();
-                let change = prepare_legacy_property_change(
-                    metadata,
-                    changes,
-                    *authority,
-                    expected_committed_partitioning.as_ref(),
-                    &request.context,
-                )?;
+                let change = match &request.operation {
+                    AlterProperties {
+                        changes,
+                        authority,
+                        expected_committed_partitioning,
+                        ..
+                    } => prepare_legacy_property_change(
+                        metadata,
+                        changes,
+                        *authority,
+                        expected_committed_partitioning.as_ref(),
+                        &request.context,
+                    )?,
+                    SetTableProperties { properties, .. } => {
+                        prepare_set_table_properties(metadata, properties, &request.context)?
+                    }
+                    _ => unreachable!("properties preparation requires a property operation"),
+                };
                 let frozen = crate::commit::staging::freeze_existing_change(
                     loaded.table.identifier().clone(),
                     "main",

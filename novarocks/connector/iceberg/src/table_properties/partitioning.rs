@@ -62,7 +62,7 @@ fn parse_table_partitioning_property_inner(
     Ok(result)
 }
 
-pub(super) fn parse_optional_partitioning_element(
+pub(crate) fn parse_optional_partitioning_element(
     field: Option<&str>,
     index: usize,
     control: &dyn ConnectorOperationControl,

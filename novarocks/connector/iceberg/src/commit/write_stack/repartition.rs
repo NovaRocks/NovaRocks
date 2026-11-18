@@ -529,6 +529,131 @@ mod tests {
         assert_eq!(observed, identity_on_id());
     }
     #[tokio::test]
+    async fn full_replacement_can_publish_an_unpartitioned_spec_with_its_new_snapshot() {
+        use crate::commit::fast_append::FastAppendPreparer;
+        use crate::commit::model::AddedContent;
+        use crate::commit::overwrite::{
+            OverwritePreparer,
+            preparer_tests::{Fixture, data, raw_entries},
+        };
+        use crate::commit::staging::{StagingBase, StagingEngine};
+        use crate::iceberg::{
+            TableRequirement, TableUpdate,
+            spec::{FormatVersion, Literal, ManifestStatus, Struct},
+        };
+
+        let fixture = Fixture::new();
+        let base = fixture.metadata(FormatVersion::V3);
+        let unpartitioned_spec_id = base.default_partition_spec_id();
+        let partitioned = preview_managed_repartition(
+            &base,
+            &replacement(prior_observation(&base), identity_on_id()),
+        )
+        .unwrap()
+        .prospective_metadata;
+        let original_spec_id = partitioned.default_partition_spec_id();
+        let old = "s3://b/partitioned.parquet";
+        let seed = fixture.intent(
+            &partitioned,
+            "main",
+            vec![
+                AddedContent::new_logical_data(
+                    data(old, 3, Struct::from_iter([Some(Literal::long(7))])),
+                    original_spec_id,
+                )
+                .unwrap(),
+            ],
+        );
+        let (partitioned, _) = fixture.stage(partitioned, &seed, &FastAppendPreparer).await;
+        let parent = partitioned.current_snapshot().unwrap().snapshot_id();
+        let clear = replacement(prior_observation(&partitioned), vec![]);
+        // The original exact prior fence also applies to an empty input.
+        let stale = preview_managed_repartition(&base, &clear).unwrap_err();
+        assert!(stale.message().contains("exact managed observation"));
+        let prepared = preview_managed_repartition(&partitioned, &clear).unwrap();
+        assert_eq!(prepared.committed().spec_id(), unpartitioned_spec_id);
+        assert!(prepared.committed().fields().is_empty());
+        assert!(
+            prepared
+                .prospective_metadata()
+                .default_partition_spec()
+                .is_unpartitioned()
+        );
+
+        let next = "s3://b/unpartitioned.parquet";
+        let intent = fixture.intent(
+            &partitioned,
+            "main",
+            vec![
+                AddedContent::new_logical_data(
+                    data(next, 2, Struct::empty()),
+                    prepared.committed().spec_id(),
+                )
+                .unwrap(),
+            ],
+        );
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: partitioned.clone(),
+                metadata_location: "s3://b/partitioned.metadata.json".into(),
+            },
+            &intent,
+            &attempt,
+        )
+        .unwrap();
+        engine.stage_change(prepared.prepared_change()).unwrap();
+        engine.stage(&OverwritePreparer).await.unwrap();
+        let after = engine.metadata().clone();
+        let frozen = engine.freeze(&[]).unwrap();
+        assert_eq!(after.default_partition_spec_id(), unpartitioned_spec_id);
+        assert_eq!(
+            after.partition_spec_by_id(original_spec_id),
+            partitioned.partition_spec_by_id(original_spec_id),
+        );
+        assert_eq!(
+            after.current_snapshot().unwrap().parent_snapshot_id(),
+            Some(parent)
+        );
+        assert!(
+            frozen
+                .requirements()
+                .contains(&TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: original_spec_id,
+                })
+        );
+        assert!(frozen.updates().contains(&TableUpdate::SetDefaultSpec {
+            spec_id: unpartitioned_spec_id,
+        }));
+        assert!(
+            frozen
+                .updates()
+                .iter()
+                .any(|update| matches!(update, TableUpdate::AddSnapshot { .. }))
+        );
+        let entries = raw_entries(&after, "main", &attempt).await;
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.data_file().file_path() == old
+                    && entry.status == ManifestStatus::Deleted)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.data_file().file_path() == next
+                    && entry.status == ManifestStatus::Added)
+        );
+        let no_op = replacement(prior_observation(&after), vec![]);
+        assert!(
+            preview_managed_repartition(&after, &no_op)
+                .unwrap_err()
+                .message()
+                .contains("identical to the current default spec")
+        );
+    }
+
+    #[tokio::test]
     async fn repartition_staging_binds_new_ids_and_reuses_an_exact_historical_spec() {
         use crate::commit::model::{
             FileChanges, IsolationLevel, OperationIntent, OperationIntentParts, RequestShape,

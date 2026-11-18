@@ -484,6 +484,7 @@ mod tests {
         KeyedSnapshotObservation {
             snapshot_id: id,
             parent,
+            slot_storage_effect_digest: None,
             records: Vec::new(),
         }
     }

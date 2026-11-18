@@ -28,13 +28,16 @@ use crate::commit::model::{
     OperationIntentParts, OperationToken, RequestShape, StartSnapshot, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
-use crate::commit::slot_change::{SlotChangePreparer, document_error};
+use crate::commit::slot_change::{
+    SLOT_STORAGE_EFFECT_SUMMARY_KEY, SlotChangePreparer, document_error,
+};
 use crate::commit::staging::{PreparedChange, Preparer, StagedView, StagingBase};
 use crate::document_storage::{keyed, observation};
 use novarocks_spi::connector::{
-    ConnectorProviderBindingKey, KeyedDocumentObservationRequest, KeyedMarkerWrite, KeyedMutation,
-    KeyedMutationIntent,
+    ConnectorProviderBindingKey, DocumentIdentity, KeyedDocumentObservationRequest,
+    KeyedMarkerWrite, KeyedMutation, KeyedMutationIntent, KeyedSlotChange,
 };
+use sha2::{Digest, Sha256};
 
 struct MarkerPreparer(KeyedMarkerWrite);
 #[async_trait::async_trait]
@@ -49,6 +52,100 @@ impl Preparer for MarkerPreparer {
         Ok(PreparedChange {
             requirements: vec![],
             updates: vec![TableUpdate::SetProperties { updates }],
+        })
+    }
+}
+
+fn prepare_slot_storage_prefix(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+    documents: &KeyedMutationIntent,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    original_prefix: PreparedChange,
+) -> Result<(PreparedChange, Option<[u8; 32]>), ConnectorError> {
+    let KeyedMutation::SlotChangeWithTableProperties { properties, .. } = &documents.mutation
+    else {
+        return Ok((original_prefix, None));
+    };
+    let target = documents.admission.target();
+    provider
+        .runtime()
+        .novarocks_catalog()
+        .admit(&crate::catalog::admission::CatalogAdmissionRequest::new(
+            CatalogOperation::AlterProperties,
+            CatalogTableName::new(target.namespace.clone(), target.table.clone()),
+            request.context.initiation(),
+        ))
+        .map_err(connector_unsupported)?;
+    let prefix = prepare_set_table_properties(metadata, properties, &request.context)?;
+    let encoded = serde_json::to_value(&prefix.updates)
+        .map(crate::commit::model::canonical_json)
+        .and_then(|value| serde_json::to_vec(&value))
+        .map_err(|error| internal(format!("encode combined property effect: {error}")))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.slot-storage-effect.v1\0");
+    hasher.update(request.operation_id.to_bytes());
+    hasher.update(&encoded);
+    let digest = hasher.finalize().into();
+    request.context.check_active()?;
+    Ok((prefix, Some(digest)))
+}
+
+fn slot_change_evidence_target(
+    frozen: &FrozenRequest,
+    change: &KeyedSlotChange,
+    target: &ConnectorTableIdentity,
+    operation_id: [u8; 16],
+    uuid: uuid::Uuid,
+    parent: Option<i64>,
+    storage: Option<(&[TableUpdate], [u8; 32])>,
+) -> crate::iceberg::Result<IcebergMutationEvidenceTarget> {
+    let snapshot = frozen
+        .ref_snapshot_after("main")
+        .ok_or_else(|| document_error(internal("slot mutation has no selected snapshot")))?;
+    let slots = change
+        .slots
+        .keys()
+        .map(|slot| (slot.owner.clone(), slot.name.clone()))
+        .collect();
+    let namespace = target.namespace.to_string();
+    let table = target.table.to_string();
+    let table_uuid = uuid.to_string();
+    if let Some((prefix, effect_digest)) = storage {
+        let encoded = DocumentIdentity::from_bytes(effect_digest).to_hex();
+        if !frozen.updates().starts_with(prefix)
+            || !frozen.updates().iter().any(|update| {
+                matches!(update, TableUpdate::AddSnapshot { snapshot: added }
+                    if added.snapshot_id() == snapshot
+                        && added.summary().additional_properties
+                            .get(SLOT_STORAGE_EFFECT_SUMMARY_KEY) == Some(&encoded))
+            })
+        {
+            return Err(document_error(internal(
+                "combined slot mutation lost its exact property prefix or snapshot witness",
+            )));
+        }
+        let request_fingerprint = Sha256::digest(frozen.canonical_rest_bytes()?).into();
+        Ok(IcebergMutationEvidenceTarget::KeyedSlotStorageChange {
+            namespace,
+            table,
+            table_uuid,
+            operation_id,
+            asserted_parent: parent,
+            preselected_snapshot: snapshot,
+            slots,
+            effect_digest,
+            request_fingerprint,
+        })
+    } else {
+        Ok(IcebergMutationEvidenceTarget::KeyedSlotChange {
+            namespace,
+            table,
+            table_uuid,
+            operation_id,
+            asserted_parent: parent,
+            preselected_snapshot: snapshot,
+            slots,
         })
     }
 }
@@ -120,6 +217,21 @@ pub(super) fn execute(
             "keyed document mutation snapshot does not match its observation",
         ));
     }
+    let (prefix, storage_effect) =
+        match prepare_slot_storage_prefix(provider, request, documents, &metadata, prefix) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+    let summary = storage_effect
+        .into_iter()
+        .map(|digest| {
+            (
+                SLOT_STORAGE_EFFECT_SUMMARY_KEY.to_owned(),
+                DocumentIdentity::from_bytes(digest).to_hex(),
+            )
+        })
+        .collect();
+    let preflight_property_updates = storage_effect.map(|digest| (prefix.updates.clone(), digest));
     let operation = IcebergCommitOperation::new(
         OperationToken::from_mutation(request.operation_id),
         metadata.location(),
@@ -131,7 +243,9 @@ pub(super) fn execute(
     .map_err(|error| invalid(error.to_string()))?;
     let shape = match &documents.mutation {
         KeyedMutation::Markers(_) => RequestShape::MetadataOnly,
-        KeyedMutation::SlotChange(_) => RequestShape::SnapshotProducing,
+        KeyedMutation::SlotChange(_) | KeyedMutation::SlotChangeWithTableProperties { .. } => {
+            RequestShape::SnapshotProducing
+        }
         KeyedMutation::Expiry(_) => RequestShape::DocumentExpiry,
     };
     let intent = OperationIntent::new(OperationIntentParts {
@@ -152,7 +266,7 @@ pub(super) fn execute(
         }],
         isolation: IsolationLevel::Snapshot,
         shape,
-        summary: BTreeMap::new(),
+        summary,
         token: operation.token(),
     })
     .map_err(|error| invalid(error.to_string()))?
@@ -193,23 +307,19 @@ pub(super) fn execute(
                         properties,
                     }
                 }
-                KeyedMutation::SlotChange(change) => {
-                    let snapshot = frozen.ref_snapshot_after("main").ok_or_else(|| {
-                        document_error(internal("slot mutation has no selected snapshot"))
-                    })?;
-                    IcebergMutationEvidenceTarget::KeyedSlotChange {
-                        namespace: target.namespace.to_string(),
-                        table: target.table.to_string(),
-                        table_uuid: uuid.to_string(),
+                KeyedMutation::SlotChange(change)
+                | KeyedMutation::SlotChangeWithTableProperties { change, .. } => {
+                    slot_change_evidence_target(
+                        frozen,
+                        change,
+                        target,
                         operation_id,
-                        asserted_parent: *parent,
-                        preselected_snapshot: snapshot,
-                        slots: change
-                            .slots
-                            .keys()
-                            .map(|slot| (slot.owner.clone(), slot.name.clone()))
-                            .collect(),
-                    }
+                        *uuid,
+                        *parent,
+                        preflight_property_updates
+                            .as_ref()
+                            .map(|(updates, digest)| (updates.as_slice(), *digest)),
+                    )?
                 }
                 KeyedMutation::Expiry(_) => IcebergMutationEvidenceTarget::KeyedExpiry {
                     namespace: target.namespace.to_string(),
@@ -259,9 +369,12 @@ pub(super) fn execute(
     let publisher = journal.observe_prepared(inner);
     let preparer: Option<Box<dyn Preparer + Send + Sync>> = match &documents.mutation {
         KeyedMutation::Markers(markers) => Some(Box::new(MarkerPreparer(markers.clone()))),
-        KeyedMutation::SlotChange(change) => Some(Box::new(SlotChangePreparer {
-            change: change.clone(),
-        })),
+        KeyedMutation::SlotChange(change)
+        | KeyedMutation::SlotChangeWithTableProperties { change, .. } => {
+            Some(Box::new(SlotChangePreparer {
+                change: change.clone(),
+            }))
+        }
         KeyedMutation::Expiry(_) => None,
     };
     let run_operation = operation.clone();
@@ -482,6 +595,21 @@ pub(super) async fn execute_async(
             "keyed document mutation snapshot does not match its observation",
         ));
     }
+    let (prefix, storage_effect) =
+        match prepare_slot_storage_prefix(provider, request, documents, &metadata, prefix) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+    let summary = storage_effect
+        .into_iter()
+        .map(|digest| {
+            (
+                SLOT_STORAGE_EFFECT_SUMMARY_KEY.to_owned(),
+                DocumentIdentity::from_bytes(digest).to_hex(),
+            )
+        })
+        .collect();
+    let preflight_property_updates = storage_effect.map(|digest| (prefix.updates.clone(), digest));
     let operation = IcebergCommitOperation::new(
         OperationToken::from_mutation(request.operation_id),
         metadata.location(),
@@ -493,7 +621,9 @@ pub(super) async fn execute_async(
     .map_err(|error| invalid(error.to_string()))?;
     let shape = match &documents.mutation {
         KeyedMutation::Markers(_) => RequestShape::MetadataOnly,
-        KeyedMutation::SlotChange(_) => RequestShape::SnapshotProducing,
+        KeyedMutation::SlotChange(_) | KeyedMutation::SlotChangeWithTableProperties { .. } => {
+            RequestShape::SnapshotProducing
+        }
         KeyedMutation::Expiry(_) => RequestShape::DocumentExpiry,
     };
     let intent = OperationIntent::new(OperationIntentParts {
@@ -514,7 +644,7 @@ pub(super) async fn execute_async(
         }],
         isolation: IsolationLevel::Snapshot,
         shape,
-        summary: BTreeMap::new(),
+        summary,
         token: operation.token(),
     })
     .map_err(|error| invalid(error.to_string()))?
@@ -555,23 +685,19 @@ pub(super) async fn execute_async(
                         properties,
                     }
                 }
-                KeyedMutation::SlotChange(change) => {
-                    let snapshot = frozen.ref_snapshot_after("main").ok_or_else(|| {
-                        document_error(internal("slot mutation has no selected snapshot"))
-                    })?;
-                    IcebergMutationEvidenceTarget::KeyedSlotChange {
-                        namespace: target.namespace.to_string(),
-                        table: target.table.to_string(),
-                        table_uuid: uuid.to_string(),
+                KeyedMutation::SlotChange(change)
+                | KeyedMutation::SlotChangeWithTableProperties { change, .. } => {
+                    slot_change_evidence_target(
+                        frozen,
+                        change,
+                        target,
                         operation_id,
-                        asserted_parent: *parent,
-                        preselected_snapshot: snapshot,
-                        slots: change
-                            .slots
-                            .keys()
-                            .map(|slot| (slot.owner.clone(), slot.name.clone()))
-                            .collect(),
-                    }
+                        *uuid,
+                        *parent,
+                        preflight_property_updates
+                            .as_ref()
+                            .map(|(updates, digest)| (updates.as_slice(), *digest)),
+                    )?
                 }
                 KeyedMutation::Expiry(_) => IcebergMutationEvidenceTarget::KeyedExpiry {
                     namespace: target.namespace.to_string(),
@@ -620,9 +746,12 @@ pub(super) async fn execute_async(
     let publisher = journal.observe_catalog_prepared(inner, receiving, &request.context);
     let preparer: Option<Box<dyn Preparer + Send + Sync>> = match &documents.mutation {
         KeyedMutation::Markers(markers) => Some(Box::new(MarkerPreparer(markers.clone()))),
-        KeyedMutation::SlotChange(change) => Some(Box::new(SlotChangePreparer {
-            change: change.clone(),
-        })),
+        KeyedMutation::SlotChange(change)
+        | KeyedMutation::SlotChangeWithTableProperties { change, .. } => {
+            Some(Box::new(SlotChangePreparer {
+                change: change.clone(),
+            }))
+        }
         KeyedMutation::Expiry(_) => None,
     };
     let preparers: Vec<&dyn Preparer> = preparer
