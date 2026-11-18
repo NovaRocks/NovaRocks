@@ -131,6 +131,16 @@ class CommandOwner:
             self.owner_lost = os.read(self.control_fd, 1) == b""
         return not self.owner_lost
 
+    def signal_group(self, pid, signum):
+        try:
+            os.killpg(pid, signum)
+        except ProcessLookupError:
+            pass
+        except PermissionError as error:
+            # Keep the unreaped leader, the flock, and the native exit check.
+            self.fact.setdefault("group_signal_refusals", []).append(
+                dict(pid=pid, signal=signum.name, errno=error.errno))
+
     def command(self, args, output, *, creating=False, cleanup=False, settle_create=False, host=False):
         if settle_create and (not creating or cleanup or args[0] != "create"
                               or self.request.get("operation") == "control"):
@@ -185,15 +195,9 @@ class CommandOwner:
                         or (not owner_alive and not creating and not cleanup)):
                     timed_out = timed_out or now >= deadline
                     stopping = now
-                    try:
-                        os.killpg(process.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                    self.signal_group(process.pid, signal.SIGTERM)
                 if stopping is not None and now >= stopping + 2 and not killed:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    self.signal_group(process.pid, signal.SIGKILL)
                     killed = True
                 # Even after escalation or expiry the supervisor retains the
                 # lock and unreaped Child until actual group exit is observed.
