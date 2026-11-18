@@ -33,6 +33,9 @@ mod decode;
 mod definition_sources;
 mod encode;
 mod encode_error;
+mod unit_creation;
+mod unit_headers;
+mod unit_totals;
 pub use encode_error::PhysicalEncodeError;
 
 mod frozen_limits;
@@ -139,6 +142,11 @@ impl PreparedPackageWire<'_, '_> {
         if self.projection.status != ResourceCursorStatus::Complete {
             return Err(PackageWireError::InvalidSource(
                 "generated package decoder accepted an incomplete resource projection",
+            ));
+        }
+        if self.projection.contains_retired_field {
+            return Err(PackageWireError::InvalidSource(
+                "package contains a retired wire field",
             ));
         }
         work.step()?;

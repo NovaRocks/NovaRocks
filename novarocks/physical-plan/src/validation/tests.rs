@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -23,144 +25,13 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 
 use crate::{
-    AggregatePhase, Distribution, EdgeId, ExprId, ExprKind, FragmentCuts, FragmentId, FragmentSink,
-    NodeId, NodeKind, PhysicalNode, RowMultiplicity, ValueId, ValueOrigin, ValueType,
+    AggregatePhase, Distribution, EdgeId, ExprKind, FragmentCuts, FragmentId, FragmentSink, NodeId,
+    NodeKind, PhysicalNode, RowMultiplicity, ValueId, ValueOrigin, ValueType,
 };
 
 #[cfg(test)]
 mod validation_error_tests {
     use super::*;
-
-    #[test]
-    fn uuid_is_not_a_numeric_largeint_domain() {
-        use novarocks_type_contract::ValueLogicalType;
-        let expression = |id, logical_type| crate::ExprNode {
-            id: ExprId::new(id),
-            owner: NodeId::new(1),
-            lambda_scope: None,
-            ty: ValueType::try_with_logical_type(
-                DataType::FixedSizeBinary(16),
-                false,
-                logical_type,
-            )
-            .unwrap(),
-            kind: ExprKind::Literal(crate::LiteralValue::LargeInt(1)),
-        };
-        let uuid = expression(1, ValueLogicalType::Uuid);
-        for op in [crate::BinaryOperator::Add, crate::BinaryOperator::BitAnd] {
-            let mut errors = ValidationContext::new();
-            validate_binary_types(&uuid, op, &uuid, &uuid, "uuid", &mut errors);
-            assert!(!errors.is_empty());
-        }
-        let mut errors = ValidationContext::new();
-        validate_literal_type(
-            &crate::LiteralValue::LargeInt(1),
-            &uuid.ty,
-            "uuid",
-            &mut errors,
-        );
-        assert!(!errors.is_empty());
-        let integer = expression(2, ValueLogicalType::LargeInt);
-        let plain = expression(3, ValueLogicalType::Physical);
-        for (input, output, valid) in [
-            (&integer, &integer, true),
-            (&integer, &plain, false),
-            (&plain, &integer, false),
-        ] {
-            let mut errors = ValidationContext::new();
-            validate_binary_types(
-                input,
-                crate::BinaryOperator::Add,
-                input,
-                output,
-                "largeint",
-                &mut errors,
-            );
-            assert_eq!(errors.is_empty(), valid);
-        }
-    }
-
-    #[test]
-    fn comparison_refuses_equal_carriers_with_different_root_domains() {
-        use novarocks_type_contract::ValueLogicalType;
-        let expression = |id, logical_type| crate::ExprNode {
-            id: ExprId::new(id),
-            owner: NodeId::new(1),
-            lambda_scope: None,
-            ty: ValueType::try_with_logical_type(DataType::Utf8, true, logical_type).unwrap(),
-            kind: ExprKind::Literal(crate::LiteralValue::Null),
-        };
-        let json = expression(1, ValueLogicalType::Json);
-        let plain = expression(2, ValueLogicalType::Physical);
-        let output = crate::ExprNode {
-            id: ExprId::new(3),
-            owner: NodeId::new(1),
-            lambda_scope: None,
-            ty: ValueType::new(DataType::Boolean, true),
-            kind: ExprKind::Literal(crate::LiteralValue::Null),
-        };
-        let mut errors = ValidationContext::new();
-        validate_binary_types(
-            &json,
-            crate::BinaryOperator::Eq,
-            &plain,
-            &output,
-            "comparison",
-            &mut errors,
-        );
-        assert!(!errors.is_empty());
-        let mut errors = ValidationContext::new();
-        validate_binary_types(
-            &json,
-            crate::BinaryOperator::Eq,
-            &json,
-            &output,
-            "comparison",
-            &mut errors,
-        );
-        assert!(errors.is_empty());
-    }
-
-    #[test]
-    fn mixed_decimal_largeint_validates_only_exact_new_add_sub_output() {
-        let expression = |id, value_type| crate::ExprNode {
-            id: ExprId::new(id),
-            owner: NodeId::new(1),
-            lambda_scope: None,
-            ty: value_type,
-            kind: ExprKind::Literal(crate::LiteralValue::Null),
-        };
-        let decimal = expression(1, ValueType::new(DataType::Decimal128(38, 15), true));
-        let integer = expression(
-            2,
-            ValueType::try_with_logical_type(
-                DataType::FixedSizeBinary(16),
-                true,
-                novarocks_type_contract::ValueLogicalType::LargeInt,
-            )
-            .unwrap(),
-        );
-        for op in [crate::BinaryOperator::Add, crate::BinaryOperator::Subtract] {
-            let exact = expression(3, ValueType::new(DataType::Decimal256(55, 15), true));
-            let mut errors = ValidationContext::new();
-            validate_binary_types(&decimal, op, &integer, &exact, "binary", &mut errors);
-            assert!(errors.is_empty());
-            let wrong = expression(3, ValueType::new(DataType::Decimal128(38, 15), true));
-            let mut errors = ValidationContext::new();
-            validate_binary_types(&decimal, op, &integer, &wrong, "binary", &mut errors);
-            assert!(!errors.is_empty());
-        }
-        for op in [
-            crate::BinaryOperator::Multiply,
-            crate::BinaryOperator::Divide,
-            crate::BinaryOperator::Modulo,
-        ] {
-            let exact = expression(3, ValueType::new(DataType::Decimal256(55, 15), true));
-            let mut errors = ValidationContext::new();
-            validate_binary_types(&decimal, op, &integer, &exact, "binary", &mut errors);
-            assert!(!errors.is_empty());
-        }
-    }
 
     #[test]
     fn validation_diagnostics_have_a_fixed_cardinality_and_display_bound() {
@@ -181,51 +52,6 @@ mod validation_error_tests {
                 .all(|error| error.category() == ValidationErrorCategory::StructuralInvariant)
         );
         assert!(errors.to_string().len() < 16 * 1024);
-    }
-
-    #[test]
-    fn binary_arithmetic_uses_the_type_contract_largeint_domain() {
-        let expression = |id, value_type| crate::ExprNode {
-            id: ExprId::new(id),
-            owner: NodeId::new(1),
-            lambda_scope: None,
-            ty: value_type,
-            kind: ExprKind::Literal(crate::LiteralValue::Null),
-        };
-        let largeint = DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH);
-        let largeint_type = ValueType::try_with_logical_type(
-            largeint.clone(),
-            false,
-            novarocks_type_contract::ValueLogicalType::LargeInt,
-        )
-        .unwrap();
-        let left = expression(1, largeint_type.clone());
-        let right = expression(2, ValueType::new(DataType::Int64, false));
-        let output = expression(3, largeint_type);
-        let mut errors = ValidationContext::new();
-        validate_binary_types(
-            &left,
-            crate::BinaryOperator::Add,
-            &right,
-            &output,
-            "binary",
-            &mut errors,
-        );
-        assert!(errors.is_empty());
-
-        let opaque = expression(4, ValueType::new(largeint, false));
-        for (input, result) in [(&opaque, &output), (&left, &opaque)] {
-            let mut errors = ValidationContext::new();
-            validate_binary_types(
-                input,
-                crate::BinaryOperator::Add,
-                &right,
-                result,
-                "binary",
-                &mut errors,
-            );
-            assert!(!errors.is_empty());
-        }
     }
 
     #[test]
@@ -322,6 +148,7 @@ mod validation_error_tests {
             .collect::<Vec<_>>();
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: node,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -340,7 +167,7 @@ mod validation_error_tests {
             })
             .unwrap();
         let fragment = builder
-            .finish_definition(
+            .finish_fixture_definition(
                 node,
                 FragmentSink::Noop,
                 crate::PipelineDopDomain {
@@ -415,6 +242,7 @@ mod validation_error_tests {
         };
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: input,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -433,14 +261,21 @@ mod validation_error_tests {
             .iter()
             .map(|input_value| {
                 let expression = builder
-                    .add_expression(project, value_type.clone(), ExprKind::Value(*input_value))
+                    .define(project, value_type.clone(), ExprKind::Value(*input_value))
                     .unwrap();
+                let expression = builder.root_definition(
+                    project,
+                    expression,
+                    novarocks_type_contract::EvaluationDemand::Value,
+                    crate::RootScope::Port(0),
+                );
                 (expression, *input_value)
             })
             .collect::<Vec<_>>();
         let output_values = input_values.clone();
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: project,
                 inputs: Box::from([input]),
                 required_inputs: Box::from([singleton.clone()]),
@@ -455,7 +290,7 @@ mod validation_error_tests {
             })
             .unwrap();
         let fragment = builder
-            .finish_definition(
+            .finish_fixture_definition(
                 project,
                 FragmentSink::Noop,
                 crate::PipelineDopDomain {
@@ -644,6 +479,7 @@ mod validation_error_tests {
         };
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: source,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -663,10 +499,17 @@ mod validation_error_tests {
         for value in source_values.iter().take(256) {
             let project = builder.reserve_node_id().unwrap();
             let expression = builder
-                .add_expression(project, value_type.clone(), ExprKind::Value(*value))
+                .define(project, value_type.clone(), ExprKind::Value(*value))
                 .unwrap();
+            let expression = builder.root_definition(
+                project,
+                expression,
+                novarocks_type_contract::EvaluationDemand::Value,
+                crate::RootScope::Port(0),
+            );
             builder
                 .insert_node_unchecked(PhysicalNode {
+                    expressions: None,
                     id: project,
                     inputs: Box::from([source]),
                     required_inputs: Box::from([singleton.clone()]),
@@ -696,6 +539,7 @@ mod validation_error_tests {
             .unwrap();
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: union,
                 inputs: projects.clone().into_boxed_slice(),
                 required_inputs: vec![singleton.clone(); projects.len()].into_boxed_slice(),
@@ -711,7 +555,7 @@ mod validation_error_tests {
             })
             .unwrap();
         let fragment = builder
-            .finish_definition(
+            .finish_fixture_definition(
                 union,
                 FragmentSink::Noop,
                 crate::PipelineDopDomain {

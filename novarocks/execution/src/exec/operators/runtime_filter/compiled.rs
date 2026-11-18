@@ -27,9 +27,7 @@
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
-use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-};
+use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramRootRef};
 
 use super::{RuntimeFilterApplication, RuntimeFilterConsumerState, RuntimeFilterKeyProvider};
 use crate::exec::chunk::Chunk;
@@ -45,54 +43,25 @@ use crate::runtime_filter::RuntimeFilterExecutionContract;
 /// The runtime-filter consumers of one compiled node, shared by its drivers:
 /// the consumer state and the key root of every binding, in binding order.
 pub(crate) struct CompiledRuntimeFilterConsumers {
+    node: ProgramNodeId,
     state: RuntimeFilterConsumerState,
     program: Arc<LocalProgram>,
-    sites: Arc<[ProgramExpressionRootSite]>,
+    sites: Arc<[ProgramRootRef]>,
     error: Arc<RuntimeErrorState>,
 }
 
 impl CompiledRuntimeFilterConsumers {
-    /// `contracts` are the runtime contracts of `node`'s runtime-filter
-    /// bindings in their frozen order; binding `i` is keyed by the node's
-    /// `RuntimeFilter { binding: i }` root, whose static type must be exactly
-    /// the binding's membership key type.
-    #[cfg(test)]
-    #[cfg(test)]
+    /// Each consumer keeps its actual frozen unit/root reference.
     pub(crate) fn try_new(
         owner: &'static str,
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
-        contracts: Vec<execution::RuntimeFilterConsumerContract>,
-        error: Arc<RuntimeErrorState>,
-    ) -> ExecutionResult<Self> {
-        let contracts = contracts
-            .into_iter()
-            .enumerate()
-            .map(|(index, contract)| {
-                let ordinal = u32::try_from(index).map_err(|_| {
-                    super::contract_failure("compiled runtime-filter binding count exceeds u32")
-                })?;
-                Ok((ordinal, contract))
-            })
-            .collect::<ExecutionResult<Vec<_>>>()?;
-        Self::try_new_at_ordinals(owner, program, node, contracts, error)
-    }
-
-    /// A Scan splits ordered and membership consumers without changing any
-    /// root's ordinal in the original complete binding list.
-    pub(crate) fn try_new_at_ordinals(
-        owner: &'static str,
-        program: Arc<LocalProgram>,
-        node: ProgramNodeId,
-        contracts: Vec<(u32, execution::RuntimeFilterConsumerContract)>,
+        contracts: Vec<(ProgramRootRef, execution::RuntimeFilterConsumerContract)>,
         error: Arc<RuntimeErrorState>,
     ) -> ExecutionResult<Self> {
         let sites = contracts
             .iter()
-            .map(|(binding, _)| ProgramExpressionRootSite::Node {
-                node,
-                role: ProgramNodeExpressionRole::RuntimeFilter { binding: *binding },
-            })
+            .map(|(reference, _)| *reference)
             .collect::<Arc<[_]>>();
         let contracts = contracts
             .into_iter()
@@ -123,6 +92,7 @@ impl CompiledRuntimeFilterConsumers {
             },
         )?;
         Ok(Self {
+            node,
             state,
             program,
             sites,
@@ -152,7 +122,8 @@ impl CompiledRuntimeFilterConsumers {
         CompiledRuntimeFilterKeys {
             program: Arc::clone(&self.program),
             sites: Arc::clone(&self.sites),
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.node),
             instances: None,
             controlled_host: None,
         }
@@ -162,7 +133,7 @@ impl CompiledRuntimeFilterConsumers {
 /// One driver's instances of a compiled consumer's key roots.
 pub(crate) struct CompiledRuntimeFilterKeys {
     program: Arc<LocalProgram>,
-    sites: Arc<[ProgramExpressionRootSite]>,
+    sites: Arc<[ProgramRootRef]>,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
     controlled_host: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,

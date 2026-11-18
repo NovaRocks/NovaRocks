@@ -13,9 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use novarocks_physical_plan::{
-    ExprId, ExprKind, FragmentId, LiteralValue, NodeKind, PhysicalPlan, ValueId, ValueOrigin,
-};
+use novarocks_expression_contract::{BoundExprSet, ExprId, ExprKind, RootOrdinal};
+use novarocks_physical_plan::{FragmentId, NodeId, NodeKind, PhysicalPlan, ValueId, ValueOrigin};
 
 // These are compiler witnesses, not a second evaluator. Literal relations
 // replace provider reads; production SQL analysis, folding, optimization and
@@ -85,7 +84,7 @@ fn compile_selected_action(
 
 // Follow only value bindings and imports, never reconstruct a SQL expression
 // from its display name. This finds the actual selected-action expression.
-fn selected_action_author(plan: &PhysicalPlan) -> (FragmentId, ExprId) {
+fn selected_action_author(plan: &PhysicalPlan) -> (FragmentId, NodeId, RootOrdinal) {
     let result = plan.result_port().unwrap();
     let field = result
         .fields
@@ -97,11 +96,11 @@ fn selected_action_author(plan: &PhysicalPlan) -> (FragmentId, ExprId) {
     loop {
         let owner = &plan.fragments()[&fragment];
         match &owner.values()[&value].origin {
-            ValueOrigin::Expr { expr, .. } => {
-                if let ExprKind::Value(next) = owner.expressions().get(*expr).unwrap().kind {
+            ValueOrigin::Expr { node, root } => {
+                if let ExprKind::Value(next) = owner.root_expression(*node, *root).unwrap().kind {
                     value = next;
                 } else {
-                    return (fragment, *expr);
+                    return (fragment, *node, *root);
                 }
             }
             ValueOrigin::ExchangeImport { edge, source_value } => {
@@ -113,25 +112,20 @@ fn selected_action_author(plan: &PhysicalPlan) -> (FragmentId, ExprId) {
     }
 }
 
-fn expression_occurrences(plan: &PhysicalPlan, fragment: FragmentId, root: ExprId) -> Vec<ExprId> {
-    fn visit(arena: &novarocks_physical_plan::ExprArena, id: ExprId, out: &mut Vec<ExprId>) {
+fn expression_occurrences(unit: &BoundExprSet, root: ExprId) -> Vec<ExprId> {
+    fn visit(unit: &BoundExprSet, id: ExprId, out: &mut Vec<ExprId>) {
         out.push(id);
-        arena
-            .get(id)
+        unit.definition(id)
             .unwrap()
             .kind
             .invocation_references_observed(|child| {
-                visit(arena, child, out);
+                visit(unit, child, out);
                 Ok::<_, std::convert::Infallible>(())
             })
             .unwrap();
     }
     let mut occurrences = Vec::new();
-    visit(
-        plan.fragments()[&fragment].expressions(),
-        root,
-        &mut occurrences,
-    );
+    visit(unit, root, &mut occurrences);
     occurrences
 }
 
@@ -146,18 +140,14 @@ fn volatile_when_has_one_physical_author_per_clause() {
         let authored =
             compile_selected_action(Some(matched), "rand(17) > 0.5", "rand(29) > 0.5", true);
         let plan = authored.plan();
-        let (fragment, action) = selected_action_author(plan);
-        let action_occurrences = expression_occurrences(plan, fragment, action);
+        let (fragment, owner, action) = selected_action_author(plan);
+        let unit = plan.fragments()[&fragment].unit(owner).unwrap();
+        let action_occurrences =
+            expression_occurrences(unit, unit.root(action).unwrap().definition);
         assert_eq!(
             action_occurrences
                 .iter()
-                .filter(|id| is_rand(
-                    &plan.fragments()[&fragment]
-                        .expressions()
-                        .get(**id)
-                        .unwrap()
-                        .kind
-                ))
+                .filter(|id| is_rand(&unit.definition(**id).unwrap().kind))
                 .count(),
             2
         );
@@ -173,12 +163,14 @@ fn volatile_when_has_one_physical_author_per_clause() {
             for node in fragment.nodes().values() {
                 if let NodeKind::Project { expressions } = &node.kind {
                     for (root, _) in expressions {
-                        let calls = expression_occurrences(plan, *fragment_id, *root)
-                            .iter()
-                            .filter(|id| is_rand(&fragment.expressions().get(**id).unwrap().kind))
-                            .count();
+                        let unit = node.expressions.as_deref().unwrap();
+                        let calls =
+                            expression_occurrences(unit, unit.root(*root).unwrap().definition)
+                                .iter()
+                                .filter(|id| is_rand(&unit.definition(**id).unwrap().kind))
+                                .count();
                         if calls != 0 {
-                            authors.push((*fragment_id, *root, calls));
+                            authors.push((*fragment_id, node.id, *root, calls));
                         }
                     }
                 }
@@ -186,7 +178,7 @@ fn volatile_when_has_one_physical_author_per_clause() {
         }
         assert_eq!(
             authors,
-            vec![(fragment, action, 2)],
+            vec![(fragment, owner, action, 2)],
             "only the materialized action may own WHEN calls"
         );
     }
@@ -199,14 +191,10 @@ enum SelectedScalar {
     Integer(i64),
 }
 
-fn scalar(plan: &PhysicalPlan, fragment: FragmentId, expr: ExprId) -> Option<SelectedScalar> {
+fn scalar(plan: &PhysicalPlan, unit: &BoundExprSet, expr: ExprId) -> Option<SelectedScalar> {
     use arrow::array::Array;
-    let arena = plan.fragments()[&fragment].expressions();
-    let expr = arena.get(expr).unwrap();
+    let expr = unit.definition(expr).unwrap();
     match &expr.kind {
-        ExprKind::Literal(LiteralValue::Null) => Some(SelectedScalar::Null),
-        ExprKind::Literal(LiteralValue::Boolean(value)) => Some(SelectedScalar::Boolean(*value)),
-        ExprKind::Literal(LiteralValue::Int64(value)) => Some(SelectedScalar::Integer(*value)),
         ExprKind::Cast {
             expr: source,
             target,
@@ -215,13 +203,13 @@ fn scalar(plan: &PhysicalPlan, fragment: FragmentId, expr: ExprId) -> Option<Sel
             // CASE can widen a constant's NULL declaration without changing
             // its value, logical domain or carrier. Follow only that exact
             // binding; this reader never executes a value conversion.
-            let input = arena.get(*source).unwrap();
+            let input = unit.definition(*source).unwrap();
             if !input.ty.nullable()
                 && expr.ty.nullable()
                 && input.ty.data_type() == target
                 && input.ty.with_nullable(true).ok().as_ref() == Some(&expr.ty)
             {
-                scalar(plan, fragment, *source)
+                scalar(plan, unit, *source)
             } else {
                 None
             }
@@ -268,9 +256,10 @@ fn literal_when_matrix_retains_truth_only_case_and_exact_action_tags() {
         ] {
             let authored = compile_selected_action(matched, predicate, predicate, true);
             let plan = authored.plan();
-            let (fragment, action) = selected_action_author(plan);
-            let arena = plan.fragments()[&fragment].expressions();
-            if let Some(value) = scalar(plan, fragment, action) {
+            let (fragment, owner, root) = selected_action_author(plan);
+            let unit = plan.fragments()[&fragment].unit(owner).unwrap();
+            let action = unit.root(root).unwrap().definition;
+            if let Some(value) = scalar(plan, unit, action) {
                 assert_eq!(
                     value,
                     SelectedScalar::Integer(0),
@@ -283,28 +272,28 @@ fn literal_when_matrix_retains_truth_only_case_and_exact_action_tags() {
                 operand,
                 when_then,
                 else_expr,
-            } = &arena.get(action).unwrap().kind
+            } = &unit.definition(action).unwrap().kind
             else {
                 panic!(
                     "selected action must be CASE or folded NoAction: {:?}",
-                    arena.get(action)
+                    unit.definition(action)
                 );
             };
             assert!(operand.is_none(), "searched CASE consumes Boolean truth");
             assert_eq!(
-                scalar(plan, fragment, else_expr.unwrap()),
+                scalar(plan, unit, else_expr.unwrap()),
                 Some(SelectedScalar::Integer(0)),
                 "closed ELSE subtree ({matched:?}, {predicate}): {:?}",
-                expression_occurrences(plan, fragment, else_expr.unwrap())
+                expression_occurrences(unit, else_expr.unwrap())
                     .iter()
-                    .map(|id| arena.get(*id))
+                    .map(|id| unit.definition(*id))
                     .collect::<Vec<_>>()
             );
             let mut expected = matched.into_iter().map(i64::from).collect::<Vec<_>>();
             expected.push(3);
             let actual = when_then
                 .iter()
-                .map(|(_, then)| scalar(plan, fragment, *then))
+                .map(|(_, then)| scalar(plan, unit, *then))
                 .collect::<Vec<_>>();
             assert_eq!(
                 actual,
@@ -316,9 +305,11 @@ fn literal_when_matrix_retains_truth_only_case_and_exact_action_tags() {
             if let Some(rejected_guard) = rejected_guard {
                 for (guard, _) in when_then {
                     assert!(
-                        expression_occurrences(plan, fragment, *guard)
-                            .iter()
-                            .any(|id| scalar(plan, fragment, *id) == Some(rejected_guard)),
+                        expression_occurrences(unit, *guard).iter().any(|id| scalar(
+                            plan, unit, *id
+                        ) == Some(
+                            rejected_guard
+                        )),
                         "FALSE/UNKNOWN must remain in each clause guard: {predicate}"
                     );
                 }

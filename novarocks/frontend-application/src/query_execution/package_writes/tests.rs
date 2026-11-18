@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field};
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_physical_plan as p;
 use novarocks_spi::connector::write_stack::{
     ConnectorWriteTargetPlan, ProviderWriteRuntime, WriteRuntimeAdapter,
@@ -42,8 +43,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_sql::compiler::SqlCompileControl;
 use novarocks_type_contract::{
-    CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
+    CompileCheckpoints, CompilePhase, EvaluationDemand, FunctionValueType,
 };
 
 use super::*;
@@ -287,22 +287,27 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
             columns
                 .iter()
                 .map(|(pool, value_type)| {
-                    builder
-                        .add_expression(
-                            source,
+                    let draft = builder.unit(source).unwrap();
+                    let definition = draft
+                        .add(
+                            None,
                             value_type.clone(),
-                            p::ExprKind::Constant(p::ConstantReference {
+                            ExprKind::Constant(p::ConstantReference {
                                 pool: *pool,
                                 ordinal: row,
                             }),
                         )
-                        .expect("constant cell")
+                        .expect("constant cell");
+                    draft
+                        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+                        .unwrap()
                 })
                 .collect::<Box<[_]>>()
         })
         .collect::<Box<[_]>>();
     builder
         .insert_node_unchecked(p::PhysicalNode {
+            expressions: None,
             id: source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -314,6 +319,18 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
             kind: p::NodeKind::Values { rows },
         })
         .expect("values");
+    let control = SqlCompileControl::unbounded();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let ports = builder.node_ports(source).unwrap();
+    let unit = builder
+        .take_unit_builder(source)
+        .unwrap()
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    builder.install_unit(source, Arc::new(unit)).unwrap();
+    work.finish().unwrap();
     let writer = builder.reserve_node_id().expect("writer id");
     let fields = relation_fields(&mut builder, writer, false);
     let projected_target_fields_0: Box<[novarocks_physical_plan::WriterTargetField]> =
@@ -346,6 +363,7 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
             .collect();
     builder
         .insert_node_unchecked(p::PhysicalNode {
+            expressions: None,
             id: writer,
             inputs: Box::from([source]),
             required_inputs: Box::from([property(p::Distribution::Singleton)]),
@@ -408,6 +426,7 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
         .collect::<Box<[_]>>();
     builder
         .insert_node_unchecked(p::PhysicalNode {
+            expressions: None,
             id: exchange,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -426,6 +445,7 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
     let outputs = relation_fields(&mut builder, finish, true);
     builder
         .insert_node_unchecked(p::PhysicalNode {
+            expressions: None,
             id: finish,
             inputs: Box::from([exchange]),
             required_inputs: Box::from([property(p::Distribution::Singleton)]),
@@ -464,7 +484,10 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
         )
         .expect("finish fragment");
 
-    let mut plan = p::PlanBuilder::new(p::PlanVersionId::try_new([4; 16]).expect("version"));
+    let mut plan = p::PlanBuilder::new(
+        p::PlanVersionId::try_new([4; 16]).expect("version"),
+        crate::application::test_constant_policy(),
+    );
     plan.insert_constant_pool(
         ints,
         pool(
@@ -535,45 +558,6 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
     )
 }
 
-/// One complete eager use per constant root site in one root domain.
-fn root_uses(fragment: &p::Fragment) -> p::PhysicalRootUses {
-    let control = SqlCompileControl::unbounded();
-    let roots = p::PhysicalExpressionRoots::try_new(fragment, &control).expect("roots");
-    let mut uses = Vec::new();
-    let bindings = roots
-        .sites()
-        .iter()
-        .enumerate()
-        .map(|(index, (&site, root))| {
-            let id = ExpressionUseId::new(index as u32);
-            uses.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id: id,
-                    domain: EvaluationDomainId::new(0),
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (site, id)
-        })
-        .collect();
-    let flow = ExpressionControlFlow::<p::ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &control,
-    )
-    .expect("flow");
-    p::PhysicalRootUses::try_new(fragment, flow, bindings, &control).expect("root uses")
-}
-
 /// Package admission within the test encode limits; not a production sizing.
 fn admission() -> p::FragmentPackageAdmission {
     p::FragmentPackageAdmission {
@@ -592,17 +576,9 @@ fn extract(
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
 ) -> Result<BTreeMap<p::FragmentId, p::FragmentPackage>, p::FragmentPackageExtractionError> {
     let control = SqlCompileControl::unbounded();
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let root_uses = root_uses(fragment);
-        calls.insert(
-            id,
-            p::FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &control).expect("calls"),
-        );
-        uses.insert(id, root_uses);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             p::FrozenFragmentPruning::try_new(id, vec![], &control).expect("pruning"),
@@ -613,8 +589,6 @@ fn extract(
         plan,
         &BTreeMap::new(),
         writes,
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &control,

@@ -23,6 +23,8 @@ paths = [
     "novarocks/sql/src/analyzer/**",
     "novarocks/sql/src/planner/**",
     "novarocks/execution/src/exec/expr/**",
+    "novarocks/expression-contract/**",
+    "novarocks/expression/**",
     "novarocks/execution/src/exec/operators/hashjoin/**",
     "novarocks/types/src/value/variant*.rs",
     "novarocks/functions/src/native_inlist*.rs",

@@ -22,7 +22,7 @@ use crate::{
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    ArgumentControl, CallProofScope, CompileControlError, EvaluationDemand, EvaluationDomainId,
+    ArgumentControl, CallProofScope, CompileControlError, EvaluationDemand, EvaluationRegionId,
     ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility,
     MAX_UNOBSERVED_COMPILE_WORK, ObservableEffects, SemanticParameterId, SemanticParameterRef,
@@ -130,11 +130,12 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
+            context: (ExpressionEffectContext {
                 use_id: ExpressionUseId::new(u32::MAX),
-                domain: EvaluationDomainId::new(0),
+                region: EvaluationRegionId::new(0),
                 demand: EvaluationDemand::Value,
-            },
+            })
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Scalar,
@@ -416,3 +417,5 @@ fn value_equal_foreign_parameter_table_is_not_the_refined_input_borrow() {
     ));
     assert_eq!(fixture.refinements.load(Ordering::Relaxed), 1);
 }
+
+use novarocks_type_contract::ExpressionEffectContext;

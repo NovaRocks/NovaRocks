@@ -294,7 +294,7 @@ impl Crc32Owner {
         }
         if !input.environment.is_empty()
             || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                && input.proof_scope != input.context.proof_scope()
         {
             return Err(FunctionBindingError::InvalidBinding(
                 "crc32 has no environment dependencies and requires an exact proof scope".into(),
@@ -324,7 +324,7 @@ impl Crc32Owner {
             || input.kind != FunctionKind::Scalar
             || contract.function_id() != input.function_id
             || !std::ptr::eq(contract.selected(), input.selected)
-            || contract.context() != input.context
+            || novarocks_type_contract::CallEffectContext::from(contract.context()) != input.context
             || contract.decimal_overflow_policy() != input.decimal_overflow_policy
             || contract.effects() != &self.call_effects(input.proof_scope)
             || !input.environment.is_empty()
@@ -354,7 +354,7 @@ mod tests {
     };
     use arrow_schema::DataType;
     use novarocks_type_contract::{
-        CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+        CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
         ExpressionEffectContext, ExpressionUseId, SemanticParameterId, SemanticParameterKey,
         SemanticParameterRef, SemanticParameters, ValueLogicalType,
     };
@@ -375,7 +375,7 @@ mod tests {
     fn context() -> ExpressionEffectContext {
         ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         }
     }
@@ -400,7 +400,7 @@ mod tests {
         uses: &'a [Option<ExpressionUseId>],
     ) -> CallEffectInput<'a> {
         CallEffectInput {
-            context: context(),
+            context: (context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
             function_id: owner.declaration.function_id(),
             kind: FunctionKind::Scalar,
@@ -665,7 +665,7 @@ mod tests {
                 1 => wrong.own_row_error = FunctionIntrinsicRowError::MayRaise,
                 2 => wrong.null_behavior = FunctionNullBehavior::CalledOnNull,
                 3 => wrong.instance_state = FunctionInstanceState::ScalarInstance,
-                4 => wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99)),
+                4 => wrong.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99)),
                 5 => wrong.argument_control = ArgumentControl::TypeOnly,
                 _ => wrong.observable_effects.warnings = true,
             }
@@ -705,7 +705,11 @@ mod tests {
         .unwrap();
         let canonical = fresh.prepared().contract().clone();
         let mut wrong = exact;
-        wrong.context.use_id = ExpressionUseId::new(100);
+        wrong.context = novarocks_type_contract::ExpressionEffectContext {
+            use_id: ExpressionUseId::new(100),
+            ..wrong.context.expression().unwrap()
+        }
+        .into();
         assert!(
             owner
                 .prepare_scalar(wrong, canonical.clone(), crate::binding_test_control())
@@ -727,7 +731,7 @@ mod tests {
                 .is_err()
         );
         wrong = exact;
-        wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+        wrong.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
         assert!(matches!(
             owner.validate_and_refine(wrong, crate::binding_test_control()),
             Err(FunctionEffectOwnerError::Owner(
@@ -747,7 +751,7 @@ mod tests {
             ))
         ));
         let mut domain = exact;
-        domain.proof_scope = CallProofScope::Domain(context().domain);
+        domain.proof_scope = CallProofScope::Region(context().region);
         assert_eq!(
             owner
                 .validate_and_refine(domain, crate::binding_test_control())

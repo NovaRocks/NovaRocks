@@ -18,9 +18,7 @@
 use super::*;
 use crate::{FunctionArgument, FunctionBindingRequest, PreparedPureKernel};
 use arrow_schema::DataType;
-use novarocks_type_contract::{
-    CallProofScope, CompileControlError, EvaluationDomainId, ExpressionUseId,
-};
+use novarocks_type_contract::{CallProofScope, CompileControlError, EvaluationRegionId};
 use std::sync::Mutex;
 #[derive(Default)]
 struct Control {
@@ -47,8 +45,8 @@ struct Source {
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
     ty: FunctionValueType,
-    call: ExpressionEffectContext,
-    input: ExpressionEffectContext,
+    call: RelationEffectContext,
+    input: RelationEffectContext,
     parameters: SemanticParameters,
     frozen: CallEffects,
 }
@@ -62,16 +60,10 @@ impl Source {
             value_type: ty.clone(),
             constant: None,
         }];
-        let call = ExpressionEffectContext {
-            use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(17),
-            demand: EvaluationDemand::Value,
-        };
-        let input = ExpressionEffectContext {
-            use_id: ExpressionUseId::new(42),
-            domain: EvaluationDomainId::new(18),
-            demand: EvaluationDemand::Value,
-        };
+        let call = RelationEffectContext::call(novarocks_type_contract::RelationCallId::new(41));
+        let input = RelationEffectContext::materialized_input(
+            novarocks_type_contract::RelationCallId::new(41),
+        );
         let parameters = SemanticParameters::try_new([]).unwrap();
         let request = FunctionBindingRequest {
             arguments: &arguments,
@@ -90,12 +82,15 @@ impl Source {
         let function = resolved.function_id;
         // This is the original FE-like installed author. The BE tests below
         // borrow its actual frozen effects, not a declared/default effect set.
-        let uses = [Some(input.use_id)];
+
         let authored = catalog
             .prepare_fresh_selected(
                 CallEffectInput {
-                    context: call,
-                    argument_uses: CallArgumentUses::SelectedChannels(&uses),
+                    context: (call).into(),
+                    argument_uses: CallArgumentUses::MaterializedInput {
+                        context: input,
+                        input_type: &ty,
+                    },
                     function_id: &function,
                     kind: FunctionKind::Aggregate,
                     selected: &selected,
@@ -103,13 +98,13 @@ impl Source {
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    proof_scope: CallProofScope::Domain(call.domain),
+                    proof_scope: CallProofScope::Relation(call.identity),
                 },
                 selected.clone(),
                 PureCallPreparation::Aggregate {
-                    arguments: ScopedExpressionEffects::primitive(
+                    arguments: ScopedRelationalEffects::primitive(
                         call,
-                        ScopedExpressionEffects::pure_value(input)
+                        ScopedRelationalEffects::pure_value(input)
                             .for_use(input)
                             .unwrap(),
                     ),
@@ -165,7 +160,7 @@ fn frozen_writer_uses_actual_installed_call_and_rejects_context_or_effect_drift(
     let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
         panic!("actual aggregate handle");
     };
-    assert_eq!(handle.contract().call().context(), source.call);
+    assert_eq!(handle.contract().call().context(), source.call.into());
     assert_eq!(handle.contract().call().effects(), &source.frozen);
     assert_eq!(handle.contract().phase(), AggregateKernelPhase::Partial);
     assert_eq!(
@@ -179,7 +174,7 @@ fn frozen_writer_uses_actual_installed_call_and_rejects_context_or_effect_drift(
         Err(FunctionSpecializationFailure::InvalidInput(_))
     ));
     let mut effects = source.frozen.clone();
-    effects.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+    effects.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
     let mut wrong = source.loan();
     wrong.frozen_effects = &effects;
     assert!(prepare_frozen_writer_aggregate(&source.catalog, wrong, &Control::default()).is_err());
@@ -321,7 +316,7 @@ fn frozen_writer_checked_count_borrows_its_original_owner_without_type_requests(
     let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
         panic!("actual checked Count handle");
     };
-    assert_eq!(handle.contract().call().context(), source.call);
+    assert_eq!(handle.contract().call().context(), source.call.into());
     assert_eq!(handle.contract().call().effects(), &source.frozen);
     assert_eq!(handle.contract().phase(), AggregateKernelPhase::Partial);
     assert_eq!(
@@ -406,7 +401,7 @@ fn frozen_writer_checked_preserves_phase_nullability_and_foreign_namespace_refus
         )
     ));
     let mut foreign = source.frozen.clone();
-    foreign.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+    foreign.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
     let mut wrong = source.loan();
     wrong.frozen_effects = &foreign;
     assert!(

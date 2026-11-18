@@ -361,7 +361,10 @@ fn internal_description_with_recovery_and_candidate(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([151; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([151; 16]).unwrap(),
+        crate::application::test_constant_policy(),
+    );
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,

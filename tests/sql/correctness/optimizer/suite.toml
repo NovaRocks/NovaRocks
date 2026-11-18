@@ -29,6 +29,8 @@ paths = [
     "novarocks/functions/src/kernel_input.rs",
     "novarocks/execution/src/exec/expr/compiled_program.rs",
     "novarocks/execution/src/exec/expr/compiled_program/**",
+    "novarocks/expression-contract/**",
+    "novarocks/expression/**",
     "novarocks/functions/src/cast.rs",
     "novarocks/frontend-application/src/query_execution/constant_eval.rs",
     "novarocks/frontend-application/src/query_execution/constant_eval/**",

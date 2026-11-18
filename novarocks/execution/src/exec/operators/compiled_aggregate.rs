@@ -58,8 +58,8 @@ use novarocks_functions::{
     SelectedAggregateMergeInput, SelectedAggregateUpdateInput, Selection,
 };
 use novarocks_local_program::{
-    CompiledAggregateGrouping, LocalProgram, ProgramCallSite, ProgramExpressionRootSite,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, ProgramStateTemplate,
+    CompiledAggregateGrouping, LocalProgram, ProgramCallSite, ProgramNodeId, ProgramNodeKind,
+    ProgramRootRef, ProgramStateTemplate,
 };
 
 use super::compiled_aggregate_topn::{CompiledAggregateTopN, CompiledAggregateTopNFactory};
@@ -215,7 +215,7 @@ pub struct CompiledAggregateProcessorFactory {
     node: ProgramNodeId,
     owns_ordered_endpoint: bool,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     groups: usize,
     calls: Vec<CallPlan>,
     key_types: Vec<FunctionValueType>,
@@ -358,15 +358,7 @@ impl CompiledAggregateProcessorFactory {
                 )
             })?
             .grouping;
-        let mut sites = Vec::new();
-        for group in 0..group_by.len() {
-            let group = novarocks_local_program::checked_program_ordinal(group)
-                .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
-            sites.push(ProgramExpressionRootSite::Node {
-                node,
-                role: ProgramNodeExpressionRole::AggregateGroup { group },
-            });
-        }
+        let mut sites = group_by.to_vec();
         let mut calls = Vec::with_capacity(functions.len());
         for (ordinal, function) in functions.iter().enumerate() {
             let call = novarocks_local_program::checked_program_ordinal(ordinal)
@@ -399,20 +391,7 @@ impl CompiledAggregateProcessorFactory {
                 ));
             }
             let first_root = sites.len();
-            for argument in 0..roots {
-                let argument = u32::try_from(argument).map_err(|_| {
-                    program_binding_failure(
-                        PlanBindingKind::InvalidAssignment,
-                        format!(
-                            "compiled Aggregate call {call} at local node {at} has too many inputs"
-                        ),
-                    )
-                })?;
-                sites.push(ProgramExpressionRootSite::Node {
-                    node,
-                    role: ProgramNodeExpressionRole::AggregateInput { call, argument },
-                });
-            }
+            sites.extend_from_slice(&function.inputs);
             calls.push(CallPlan {
                 handle,
                 contract,
@@ -595,7 +574,8 @@ impl OperatorFactory for CompiledAggregateProcessorFactory {
             direct_intermediate: self.direct_intermediate,
             direct_input: None,
             construction: None,
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.node),
             tracker: None,
             instances: None,
             key_table: None,
@@ -611,7 +591,7 @@ impl OperatorFactory for CompiledAggregateProcessorFactory {
 struct CompiledAggregateProcessor {
     name: String,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     group_roots: usize,
     calls: Vec<CallPlan>,
     key_types: Vec<FunctionValueType>,
@@ -1306,8 +1286,8 @@ mod failure_latch_tests {
     use arrow::array::{Array, Int64Array};
     use novarocks_functions::PureKernelAbi;
     use novarocks_physical_plan::{
-        AggregateCallId, AggregateGrouping, AggregatePhase, FragmentBuilder, FragmentId,
-        FragmentSink, LiteralValue, PlanBuilder, PlanVersionId, ResultField, ResultPort,
+        AggregateCallId, AggregateGrouping, AggregatePhase, FragmentId, FragmentSink,
+        PlanVersionId, ResultField, ResultPort,
     };
 
     fn processor() -> (
@@ -1329,19 +1309,26 @@ mod failure_latch_tests {
         processor_for_key_count(
             distinct,
             int64(false),
-            &[vec![LiteralValue::Int64(1)], vec![LiteralValue::Int64(2)]],
+            &[
+                vec![crate::exec::operators::family_fixture::constant_sources::i64(1)],
+                vec![crate::exec::operators::family_fixture::constant_sources::i64(2)],
+            ],
         )
     }
     fn processor_for_key_count(
         distinct: bool,
         key_type: FunctionValueType,
-        literal_rows: &[Vec<LiteralValue>],
+        literal_rows: &[Vec<novarocks_functions::ConstantValue>],
     ) -> (
         CompiledAggregateProcessor,
         Chunk,
         Arc<RuntimeErrorState>,
         Arc<MemTracker>,
     ) {
+        let fixture_sources =
+            crate::exec::operators::family_fixture::constant_sources::Sources::new();
+        let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
+
         let catalog = if distinct {
             aggregate_catalog(&[("multi_distinct_count", PureKernelAbi::AggregateV1)])
         } else {
@@ -1353,7 +1340,11 @@ mod failure_latch_tests {
             bind(&catalog, "count", &[])
         };
         let fragment = FragmentId::new(1);
-        let mut builder = FragmentBuilder::new(fragment);
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                fragment,
+                &fixture_sources,
+            );
         let source = builder.reserve_node_id().unwrap();
         let keys = values(
             &mut builder,
@@ -1374,9 +1365,20 @@ mod failure_latch_tests {
             }],
             AggregateGrouping::Complete,
         );
-        let definition = finish(builder, node, FragmentSink::Result, 1);
+        let definition = finish(
+            builder,
+            node,
+            FragmentSink::Result,
+            1,
+            &catalog,
+            &parameters,
+        );
         let output = definition.nodes()[&node].output.clone();
-        let mut plan = PlanBuilder::new(PlanVersionId::try_new([101; 16]).unwrap());
+        let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+            PlanVersionId::try_new([101; 16]).unwrap(),
+            &fixture_sources,
+        )
+        .with_semantic_parameters(parameters.clone());
         plan.add_fragment(definition).unwrap();
         plan.set_result_port(ResultPort {
             scalar_schema: None,
@@ -1399,7 +1401,7 @@ mod failure_latch_tests {
         })
         .unwrap();
         let plan = plan.finish_observed(&FixtureControl).unwrap();
-        let package = packages(&plan, &catalog).remove(&fragment).unwrap();
+        let package = packages(&plan).remove(&fragment).unwrap();
         let program = compile(package, &catalog, 1, true);
         let source = program
             .graph()
@@ -1458,8 +1460,13 @@ mod failure_latch_tests {
         use arrow::array::{DictionaryArray, StringArray};
         use arrow::datatypes::Int32Type;
         let ty = FunctionValueType::new(DataType::Utf8, true);
-        let (mut processor, _input, _, _tracker) =
-            processor_for_key_count(false, ty, &[vec![LiteralValue::Utf8("seed".into())]]);
+        let (mut processor, _input, _, _tracker) = processor_for_key_count(
+            false,
+            ty,
+            &[vec![
+                crate::exec::operators::family_fixture::constant_sources::utf8("seed".into()),
+            ]],
+        );
         processor.ensure_state().unwrap();
         let declared = processor.key_types.clone();
         let schema = Arc::clone(processor.prepared_output().unwrap());
@@ -1540,12 +1547,28 @@ mod failure_latch_tests {
         let nan = f64::from_bits(0x7ff8_0000_0000_0042);
         let ty = FunctionValueType::new(DataType::Float64, true);
         let rows = vec![
-            vec![LiteralValue::Float64Bits((-0.0f64).to_bits())],
-            vec![LiteralValue::Float64Bits(0.0f64.to_bits())],
-            vec![LiteralValue::Float64Bits(nan.to_bits())],
-            vec![LiteralValue::Float64Bits(f64::NAN.to_bits())],
-            vec![LiteralValue::Null],
-            vec![LiteralValue::Float64Bits(1.5f64.to_bits())],
+            vec![
+                crate::exec::operators::family_fixture::constant_sources::f64_bits(
+                    (-0.0f64).to_bits(),
+                ),
+            ],
+            vec![
+                crate::exec::operators::family_fixture::constant_sources::f64_bits(
+                    0.0f64.to_bits(),
+                ),
+            ],
+            vec![crate::exec::operators::family_fixture::constant_sources::f64_bits(nan.to_bits())],
+            vec![
+                crate::exec::operators::family_fixture::constant_sources::f64_bits(
+                    f64::NAN.to_bits(),
+                ),
+            ],
+            vec![crate::exec::operators::family_fixture::constant_sources::null()],
+            vec![
+                crate::exec::operators::family_fixture::constant_sources::f64_bits(
+                    1.5f64.to_bits(),
+                ),
+            ],
         ];
         let (mut processor, input, _, _tracker) = processor_for_key_count(false, ty, &rows);
         let state = RuntimeState::default();
@@ -1795,7 +1818,7 @@ mod failure_latch_tests {
         let state = RuntimeState::default();
         processor.apply_for_test(&state, input.clone()).unwrap();
         let row = RequiredExpressionRowError::try_new(
-            processor.sites[0],
+            processor.sites[0].root,
             Selection::all(2),
             novarocks_functions::RowDataError::new(1, "original required row"),
         )
@@ -2003,11 +2026,15 @@ mod schema_prepare_tests {
     use super::*;
     use novarocks_functions::PureKernelAbi;
     use novarocks_physical_plan::{
-        AggregateCallId, AggregateGrouping, AggregatePhase, FragmentBuilder, FragmentId,
-        FragmentSink, PlanBuilder, PlanVersionId, ResultField, ResultPort,
+        AggregateCallId, AggregateGrouping, AggregatePhase, FragmentId, FragmentSink,
+        PlanVersionId, ResultField, ResultPort,
     };
 
     fn program(name: &str, argument: FunctionValueType) -> Arc<LocalProgram> {
+        let fixture_sources =
+            crate::exec::operators::family_fixture::constant_sources::Sources::new();
+        let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
+
         let catalogue = if name == "count" {
             aggregate_fixture::extrema_catalog()
         } else {
@@ -2026,7 +2053,11 @@ mod schema_prepare_tests {
             },
         ));
         let fragment = FragmentId::new(1);
-        let mut builder = FragmentBuilder::new(fragment);
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                fragment,
+                &fixture_sources,
+            );
         let source = builder.reserve_node_id().unwrap();
         let arguments = values(&mut builder, source, &[argument], &[]);
         let (root, _) = add_aggregate(
@@ -2042,10 +2073,22 @@ mod schema_prepare_tests {
             }],
             AggregateGrouping::Complete,
         );
-        let fragment = finish(builder, root, FragmentSink::Result, 2);
+        let fragment = finish(
+            builder,
+            root,
+            FragmentSink::Result,
+            2,
+            &catalogue,
+            &parameters,
+        );
         let output = fragment.nodes()[&root].output.clone();
         let result = bound.result_type();
-        let mut builder = PlanBuilder::new(PlanVersionId::try_new([191; 16]).unwrap());
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+                PlanVersionId::try_new([191; 16]).unwrap(),
+                &fixture_sources,
+            )
+            .with_semantic_parameters(parameters.clone());
         builder.add_fragment(fragment).unwrap();
         builder
             .set_result_port(ResultPort {
@@ -2063,9 +2106,7 @@ mod schema_prepare_tests {
             })
             .unwrap();
         let plan = builder.finish_observed(&FixtureControl).unwrap();
-        let package = packages(&plan, &catalogue)
-            .remove(&FragmentId::new(1))
-            .unwrap();
+        let package = packages(&plan).remove(&FragmentId::new(1)).unwrap();
         compile(package, &catalogue, 2, true)
     }
 

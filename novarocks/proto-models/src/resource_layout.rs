@@ -104,6 +104,9 @@ pub struct ObjectLayout {
     pub size: usize,
     pub alignment: usize,
     pub fields: &'static [FieldLayout],
+    /// Descriptor-owned, message-local reserved field numbers as half-open ranges.
+    /// Oneof storage has no independent protobuf message or reserved namespace.
+    pub reserved: &'static [(u32, u32)],
 }
 
 #[derive(Clone, Copy, Debug)]

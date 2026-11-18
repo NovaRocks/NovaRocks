@@ -379,6 +379,97 @@ fn is_physical_binary(value: &ConstantValue) -> bool {
         )
 }
 
+// SQL interval spelling reads all three components from the checked ordinal.
+// This presentation view does not create a value, key, or semantic conversion.
+#[derive(Clone, Copy)]
+struct SqlIntervalDisplay(Option<(i32, i32, i64)>);
+impl SqlIntervalDisplay {
+    fn len(self) -> usize {
+        fn signed_width(value: i64) -> usize {
+            let magnitude = value.unsigned_abs();
+            usize::from(value < 0)
+                + if magnitude == 0 {
+                    1
+                } else {
+                    magnitude.ilog10() as usize + 1
+                }
+        }
+        match self.0 {
+            None => 4,
+            Some((months, days, nanoseconds)) => {
+                "INTERVAL(months=, days=, nanoseconds=)".len()
+                    + signed_width(i64::from(months))
+                    + signed_width(i64::from(days))
+                    + signed_width(nanoseconds)
+            }
+        }
+    }
+}
+impl std::fmt::Display for SqlIntervalDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some((months, days, nanoseconds)) => write!(
+                f,
+                "INTERVAL(months={months}, days={days}, nanoseconds={nanoseconds})"
+            ),
+            None => f.write_str("NULL"),
+        }
+    }
+}
+fn is_physical_interval(value: &ConstantValue) -> bool {
+    value.value_type().logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+        && value.value_type().data_type()
+            == &DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
+}
+fn write_interval_display(
+    selected: SqlIntervalDisplay,
+    work: &mut CompileCheckpoints<'_>,
+    output: &mut dyn std::fmt::Write,
+) -> Result<std::fmt::Result, crate::compiler::SqlCompileError> {
+    use std::fmt::Write;
+    struct Observed<'output, 'work, 'control> {
+        output: &'output mut dyn Write,
+        work: &'work mut CompileCheckpoints<'control>,
+        primary: Option<novarocks_type_contract::CompileControlError>,
+        refused: bool,
+    }
+    impl Write for Observed<'_, '_, '_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            if self.refused || self.primary.is_some() {
+                return Err(std::fmt::Error);
+            }
+            // Labels and signed i32/i64 decimal components are fixed-width
+            // formatting work, each smaller than the original work quantum.
+            if let Err(cause) = self.work.flush() {
+                self.primary = Some(cause);
+                return Err(std::fmt::Error);
+            }
+            if self.output.write_str(text).is_err() {
+                self.refused = true;
+                return Err(std::fmt::Error);
+            }
+            for _ in text.as_bytes() {
+                if let Err(cause) = self.work.step() {
+                    self.primary = Some(cause);
+                    return Err(std::fmt::Error);
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut writer = Observed {
+        output,
+        work,
+        primary: None,
+        refused: false,
+    };
+    let result = write!(&mut writer, "{selected}");
+    if let Some(cause) = writer.primary {
+        return Err(cause.into());
+    }
+    Ok(result)
+}
+
 // SQL display follows the existing binary literal spelling. This reads only
 // the checked ordinal and does not alter the shared diagnostic formatter.
 fn write_binary_display(
@@ -425,6 +516,21 @@ pub(crate) fn format_constant_observed(
     control: &dyn PureCompileControl,
 ) -> Result<String, crate::compiler::SqlCompileError> {
     use crate::compiler::SqlCompileError;
+    if is_physical_interval(value) {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        work.step()?;
+        let selected = SqlIntervalDisplay(value.try_interval_month_day_nano()?);
+        let capacity = selected.len();
+        work.step()?;
+        work.flush()?;
+        let mut text = String::new();
+        text.try_reserve_exact(capacity)
+            .map_err(|_| SqlCompileError::ResourceExhausted)?;
+        write_interval_display(selected, &mut work, &mut text)?
+            .map_err(|_| SqlCompileError::ResourceExhausted)?;
+        work.finish()?;
+        return Ok(text);
+    }
     if is_physical_binary(value) {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
         let selected = value.try_binary()?;
@@ -497,6 +603,16 @@ pub(crate) fn write_constant_observed(
     control: &dyn PureCompileControl,
     output: &mut dyn std::fmt::Write,
 ) -> Result<std::fmt::Result, crate::compiler::SqlCompileError> {
+    if is_physical_interval(value) {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        work.step()?;
+        let selected = SqlIntervalDisplay(value.try_interval_month_day_nano()?);
+        let result = write_interval_display(selected, &mut work, output)?;
+        if result.is_ok() {
+            work.finish()?;
+        }
+        return Ok(result);
+    }
     if is_physical_binary(value) {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
         let result = write_binary_display(value.try_binary()?, &mut work, output)?;

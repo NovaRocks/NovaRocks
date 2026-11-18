@@ -19,7 +19,7 @@ use super::*;
 use crate::*;
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
-    ArgumentControl, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    ArgumentControl, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionEffects, ExpressionUseId, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
 };
@@ -49,17 +49,15 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn operator() -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(0),
-        domain: EvaluationDomainId::new(u32::MAX),
-        demand: EvaluationDemand::Value,
-    }
+fn operator() -> novarocks_type_contract::RelationEffectContext {
+    novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(0),
+    )
 }
 fn state_context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(u32::MAX),
-        domain: EvaluationDomainId::new(0),
+        region: EvaluationRegionId::new(0),
         demand: EvaluationDemand::Value,
     }
 }
@@ -177,10 +175,10 @@ impl StaticInput {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: operator(),
+            context: (operator()).into(),
             argument_uses: CallArgumentUses::AggregateMerge {
                 phase: AggregateKernelPhase::Final,
-                state_context: state_context(),
+                state_context: (state_context()).into(),
                 state_input_type: &self.state,
             },
             function_id: &self.id,
@@ -194,7 +192,7 @@ impl StaticInput {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            proof_scope: CallProofScope::Domain(operator().domain),
+            proof_scope: CallProofScope::Relation(operator().identity),
         }
     }
 }
@@ -214,10 +212,14 @@ fn merge_static_zero_and_two_channels_have_one_distinct_runtime_state_context() 
             ..ExpressionEffects::PURE_VALUE
         };
         let composed = receipt
-            .compose_for_use(input, ScopedExpressionEffects::primitive(operator(), child))
+            .compose_for_relation(input, ScopedRelationalEffects::primitive(operator(), child))
             .unwrap();
         assert!(composed.for_use(operator()).unwrap().may_raise_row_error);
-        assert!(composed.for_use(state_context()).is_err());
+        assert!(
+            crate::ScopedCallEffects::from(composed)
+                .for_use(state_context())
+                .is_err()
+        );
     }
 }
 
@@ -226,35 +228,47 @@ fn merge_refiner_rejects_phase_kind_context_and_complete_state_domain_before_own
     let data = StaticInput::new(2, ty(true));
     let wrong_domain = FunctionValueType::new(DataType::Utf8, true);
     let narrow = ty(false);
+    // A relation call cannot be consumed as state; a materialized state input
+    // must name this same call. Expression state roots keep their own demand.
     for (phase, context, state) in [
-        (AggregateKernelPhase::Single, state_context(), &data.state),
-        (AggregateKernelPhase::Partial, state_context(), &data.state),
+        (
+            AggregateKernelPhase::Single,
+            state_context().into(),
+            &data.state,
+        ),
+        (
+            AggregateKernelPhase::Partial,
+            state_context().into(),
+            &data.state,
+        ),
         (
             AggregateKernelPhase::Final,
             ExpressionEffectContext {
                 demand: EvaluationDemand::TruthOnly,
                 ..state_context()
-            },
+            }
+            .into(),
             &data.state,
         ),
         (
             AggregateKernelPhase::Final,
-            ExpressionEffectContext {
-                use_id: operator().use_id,
-                ..state_context()
-            },
+            novarocks_type_contract::CallEffectContext::Relation(operator()),
             &data.state,
         ),
         (
             AggregateKernelPhase::Final,
-            ExpressionEffectContext {
-                domain: operator().domain,
-                ..state_context()
-            },
+            novarocks_type_contract::RelationEffectContext::materialized_input(
+                novarocks_type_contract::RelationCallId::new(99),
+            )
+            .into(),
             &data.state,
         ),
-        (AggregateKernelPhase::Final, state_context(), &wrong_domain),
-        (AggregateKernelPhase::Final, state_context(), &narrow),
+        (
+            AggregateKernelPhase::Final,
+            state_context().into(),
+            &wrong_domain,
+        ),
+        (AggregateKernelPhase::Final, state_context().into(), &narrow),
     ] {
         let owner = Refiner::new();
         let mut input = data.input();
@@ -298,20 +312,21 @@ fn merge_receipt_rejects_foreign_equal_state_loan_and_changed_actual_demand() {
     let changes = [
         CallArgumentUses::AggregateMerge {
             phase: AggregateKernelPhase::Final,
-            state_context: state_context(),
+            state_context: (state_context()).into(),
             state_input_type: &foreign,
         },
         CallArgumentUses::AggregateMerge {
             phase: AggregateKernelPhase::Intermediate,
-            state_context: state_context(),
+            state_context: (state_context()).into(),
             state_input_type: &data.state,
         },
         CallArgumentUses::AggregateMerge {
             phase: AggregateKernelPhase::Final,
-            state_context: ExpressionEffectContext {
+            state_context: (ExpressionEffectContext {
                 use_id: ExpressionUseId::new(1),
                 ..state_context()
-            },
+            })
+            .into(),
             state_input_type: &data.state,
         },
         CallArgumentUses::SelectedChannels(&[]),
@@ -423,10 +438,10 @@ impl CountFixture {
     }
     fn input(&self, phase: AggregateKernelPhase) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: operator(),
+            context: (operator()).into(),
             argument_uses: CallArgumentUses::AggregateMerge {
                 phase,
-                state_context: state_context(),
+                state_context: (state_context()).into(),
                 state_input_type: &self.state,
             },
             function_id: &self.id,
@@ -440,12 +455,12 @@ impl CountFixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            proof_scope: CallProofScope::Domain(operator().domain),
+            proof_scope: CallProofScope::Relation(operator().identity),
         }
     }
     fn options(&self, phase: AggregateKernelPhase) -> PureCallPreparation {
         PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::pure_value(operator()),
+            arguments: ScopedRelationalEffects::pure_value(operator()),
             options: AggregatePreparationOptions {
                 state_interpretation: None,
                 phase,
@@ -529,7 +544,7 @@ fn installed_merge_options_cannot_replace_phase_or_full_actual_state_type() {
         ),
     ] {
         let options = PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::pure_value(operator()),
+            arguments: ScopedRelationalEffects::pure_value(operator()),
             options: AggregatePreparationOptions {
                 state_interpretation: None,
                 phase,
@@ -562,7 +577,7 @@ fn installed_merge_options_cannot_replace_phase_or_full_actual_state_type() {
     ];
     for (distinct, order_keys) in invalid_options {
         let options = PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::pure_value(operator()),
+            arguments: ScopedRelationalEffects::pure_value(operator()),
             options: AggregatePreparationOptions {
                 state_interpretation: None,
                 phase: AggregateKernelPhase::Final,
@@ -598,7 +613,7 @@ fn merge_refiner_success_and_ordinary_failure_preserve_every_control_prefix() {
         if ordinary {
             input.argument_uses = CallArgumentUses::AggregateMerge {
                 phase: AggregateKernelPhase::Final,
-                state_context: state_context(),
+                state_context: (state_context()).into(),
                 state_input_type: &wrong,
             };
         }
@@ -750,7 +765,7 @@ fn merge_wide_nested_state_uses_real_type_walk_quantum_and_exact_metadata() {
     let mut input = data.input();
     input.argument_uses = CallArgumentUses::AggregateMerge {
         phase: AggregateKernelPhase::Final,
-        state_context: state_context(),
+        state_context: (state_context()).into(),
         state_input_type: &changed,
     };
     // Provider annotations do not participate in typed execution identity.
@@ -779,7 +794,7 @@ fn merge_wide_nested_state_uses_real_type_walk_quantum_and_exact_metadata() {
     let mut input = data.input();
     input.argument_uses = CallArgumentUses::AggregateMerge {
         phase: AggregateKernelPhase::Final,
-        state_context: state_context(),
+        state_context: (state_context()).into(),
         state_input_type: &changed,
     };
     assert!(refine_call_effects(&Refiner::new(), input, &Control::default()).is_err());

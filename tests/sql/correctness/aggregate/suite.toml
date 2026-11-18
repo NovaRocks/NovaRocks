@@ -45,6 +45,8 @@ paths = [
     "novarocks/functions/src/kernel_input.rs",
     "novarocks/execution/src/exec/expr/compiled_program.rs",
     "novarocks/execution/src/exec/expr/compiled_program/**",
+    "novarocks/expression-contract/**",
+    "novarocks/expression/**",
     "novarocks/functions/src/array_projection.rs",
     "novarocks/functions/src/selected_copy.rs",
     "novarocks/functions/src/selected_copy/guarded_nested.rs",

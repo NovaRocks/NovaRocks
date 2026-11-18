@@ -96,7 +96,9 @@ fn array_state_source_real_ordered_distinct_single_receipt_without_split_capabil
             Some(original)
         );
         let update = run(&single_entry, &Control::default()).unwrap();
-        let PureCallPreparation::Aggregate { options, .. } = update.preparation(effects()) else {
+        let PureCallPreparation::Aggregate { options, .. } =
+            update.preparation(effects(&single_entry))
+        else {
             panic!("Single preparation")
         };
         assert_eq!(options.phase, AggregateKernelPhase::Single);
@@ -120,7 +122,8 @@ fn array_state_source_actual_plain_generic_aggregate_keeps_plain_execution_flags
     assert!(!facts.distinct);
     assert!(facts.order_keys.is_empty());
     let update = run(&partial, &Control::default()).unwrap();
-    let PureCallPreparation::Aggregate { options, .. } = update.preparation(effects()) else {
+    let PureCallPreparation::Aggregate { options, .. } = update.preparation(effects(&partial))
+    else {
         panic!("Partial preparation")
     };
     assert!(!options.distinct);

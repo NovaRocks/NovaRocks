@@ -31,7 +31,7 @@ use arrow_array::{Array, ArrayRef, Date32Array, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
     FunctionNullBehavior, FunctionVolatility, PureCompileControl, SemanticParameters,
     ValueLogicalType,
 };
@@ -198,7 +198,7 @@ fn makedate_actual_owner_fresh_frozen_full_facts_and_raw_preparation_are_exact()
     assert_eq!(selected.result_type, FunctionResultType::Scalar(target()));
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     };
     let uses = [
@@ -207,7 +207,7 @@ fn makedate_actual_owner_fresh_frozen_full_facts_and_raw_preparation_are_exact()
     ];
     let parameters = SemanticParameters::try_new([]).unwrap();
     let input = crate::CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.binding_declaration().function_id(),
         kind: crate::FunctionKind::Scalar,
@@ -216,7 +216,7 @@ fn makedate_actual_owner_fresh_frozen_full_facts_and_raw_preparation_are_exact()
         environment: &[],
         parameters: &parameters,
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context.domain),
+        proof_scope: CallProofScope::Region(context.region),
     };
     let fresh = specialize_scalar(
         &owner,
@@ -231,7 +231,7 @@ fn makedate_actual_owner_fresh_frozen_full_facts_and_raw_preparation_are_exact()
         ..context
     };
     let arguments_effects = ScopedExpressionEffects::pure_value(context)
-        .join_same_domain(ScopedExpressionEffects::primitive(
+        .join_same_region(ScopedExpressionEffects::primitive(
             child_context,
             novarocks_type_contract::ExpressionEffects {
                 may_raise_row_error: true,
@@ -303,7 +303,11 @@ fn makedate_actual_owner_fresh_frozen_full_facts_and_raw_preparation_are_exact()
             .is_err()
     );
     stale = input;
-    stale.context.domain = EvaluationDomainId::new(9);
+    stale.context = novarocks_type_contract::ExpressionEffectContext {
+        region: EvaluationRegionId::new(9),
+        ..stale.context.expression().unwrap()
+    }
+    .into();
     assert!(
         owner
             .prepare_scalar(stale, canonical.clone(), crate::binding_test_control())

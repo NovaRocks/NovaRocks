@@ -60,3 +60,29 @@ pub(crate) fn constant_policy() -> ConstantPolicy {
         max_library_validation_bytes: 16_777_216,
     }
 }
+
+/// Keep each fixture reference with its real immutable backing. Pool IDs are
+/// local to this explicit table; selected-value equality is never inferred.
+pub(crate) fn register_constant(
+    pools: &mut novarocks_physical_plan::ConstantPools,
+    value: &novarocks_functions::ConstantValue,
+) -> novarocks_physical_plan::ConstantReference {
+    use novarocks_physical_plan::ConstantPoolId;
+    let identity = value.pool().backing_identity();
+    let existing = pools
+        .entries()
+        .iter()
+        .find_map(|(id, pool)| (pool.backing_identity() == identity).then_some(*id));
+    let pool = existing.unwrap_or_else(|| {
+        let id = (0..=u32::MAX)
+            .map(ConstantPoolId::new)
+            .find(|id| !pools.entries().contains_key(id))
+            .expect("fixture has an available pool identity");
+        pools.insert(id, value.pool().clone()).unwrap();
+        id
+    });
+    novarocks_physical_plan::ConstantReference {
+        pool,
+        ordinal: value.ordinal(),
+    }
+}

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact branch-local stream projection and one shared Sink expression arena.
+//! Exact branch-local stream projection through compiled input-reading units.
 
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use novarocks_local_program::*;
@@ -24,26 +24,18 @@ use novarocks_physical_plan::{
     OutboundFragmentCut, ValueId,
 };
 use novarocks_type_contract::{
-    BucketLayoutAlgorithm, CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
-    EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
-    FunctionArgumentType, PartitionHashAlgorithm, PureCompileControl,
+    BucketLayoutAlgorithm, CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand,
+    PartitionHashAlgorithm, PureCompileControl,
 };
 use novarocks_types::SlotId;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
 
-pub(crate) struct SinkFlow {
-    pub flow: ProgramControlFlow,
-    pub types: novarocks_type_contract::FunctionArgumentTypes,
-    pub roots: Vec<ProgramRootUseBinding>,
-    pub slots: Vec<ProgramSlotBinding>,
-}
 pub(crate) struct LoweredStreamSink {
     pub sink: StaticSinkProgram,
     pub requirements: Vec<BindingRequirement>,
-    pub flow: SinkFlow,
 }
 pub(crate) fn cut_role(payload: &ExchangePayloadContract) -> ProgramOutputRole {
     match payload {
@@ -86,6 +78,10 @@ enum OutputSelection<'a> {
         aliases: &'a BTreeMap<EdgeId, Arc<[SlotId]>>,
     },
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Sink routes, immutable expression facts and original creator ports retain separate responsibilities"
+)]
 pub(crate) fn lower_stream_sink_with_creation<
     H,
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
@@ -94,6 +90,9 @@ pub(crate) fn lower_stream_sink_with_creation<
     cut: &OutboundFragmentCut,
     root: ProgramNodeId,
     root_layout: &StaticLayout,
+    expressions: &mut crate::expressions::LoweredExpressions,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
+    policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
@@ -104,12 +103,19 @@ pub(crate) fn lower_stream_sink_with_creation<
         OutputSelection::Stream(cut),
         root,
         root_layout,
+        expressions,
+        functions,
+        policy,
         control,
         creation,
         temporary,
         factory,
     )
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Sink routes, immutable expression facts and original creator ports retain separate responsibilities"
+)]
 pub(crate) fn lower_router_sink_with_creation<
     H,
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
@@ -117,6 +123,9 @@ pub(crate) fn lower_router_sink_with_creation<
     package: &FragmentPackage,
     root: ProgramNodeId,
     root_layout: &StaticLayout,
+    expressions: &mut crate::expressions::LoweredExpressions,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
+    policy: novarocks_constant_contract::ConstantPolicy,
     aliases: &BTreeMap<EdgeId, Arc<[SlotId]>>,
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
@@ -128,17 +137,27 @@ pub(crate) fn lower_router_sink_with_creation<
         OutputSelection::Router { aliases },
         root,
         root_layout,
+        expressions,
+        functions,
+        policy,
         control,
         creation,
         temporary,
         factory,
     )
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Sink routes, immutable expression facts and original creator ports retain separate responsibilities"
+)]
 fn lower_selected<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     selection: OutputSelection<'_>,
     root: ProgramNodeId,
     root_layout: &StaticLayout,
+    expressions: &mut crate::expressions::LoweredExpressions,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
+    policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
@@ -150,6 +169,9 @@ fn lower_selected<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         selection,
         root,
         root_layout,
+        expressions,
+        functions,
+        policy,
         &mut work,
         creation,
         crate::creation::borrow_scope(&mut temporary),
@@ -157,16 +179,18 @@ fn lower_selected<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     );
     crate::creation::finish_attempt(result, work)
 }
-struct SinkRead {
-    site: ProgramExpressionRootSite,
-    ordinal: u32,
-    demand: EvaluationDemand,
-}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Sink routes, immutable expression facts and original creator ports retain separate responsibilities"
+)]
 fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     selection: OutputSelection<'_>,
-    root: ProgramNodeId,
+    _root: ProgramNodeId,
     root_layout: &StaticLayout,
+    expressions: &mut crate::expressions::LoweredExpressions,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
+    policy: novarocks_constant_contract::ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
@@ -183,17 +207,6 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         return Err(FragmentCompileError::Invalid("stream root occurrence width differs").into());
     }
     work.flush()?;
-    let mut type_scope = match factory {
-        Some(f) => Some(
-            f.begin_scope()
-                .map_err(crate::FragmentCreationError::Creator)?,
-        ),
-        None => None,
-    };
-    work.flush()?;
-    let mut nodes = Vec::new();
-    let mut types = Vec::new();
-    let mut reads = Vec::new();
     let mut branches = Vec::new();
     let mut requirements = Vec::new();
     let mut router_routes = Vec::new();
@@ -237,7 +250,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     if cuts.len() > MAX_STATIC_SINK_BRANCHES {
         return Err(CompileControlError::ResourceExhausted.into());
     }
-    // The shared Sink arena is bounded before constructing any definition.
+    // Preserve the original combined sink-read bound before creating any unit.
     let mut definitions = 0usize;
     for cut in &cuts {
         let count = match &cut.partitioning.source {
@@ -253,17 +266,43 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             .ok_or(CompileControlError::ResourceExhausted)?;
         work.step()?;
     }
-    if definitions > MAX_STATIC_EXPRESSIONS {
+    if definitions > novarocks_expression::MAX_STATIC_EXPRESSIONS {
         return Err(CompileControlError::ResourceExhausted.into());
     }
-    reserve_vec(&mut nodes, definitions, work)?;
-    reserve_vec(&mut reads, definitions, work)?;
     reserve_vec(&mut router_routes, cuts.len(), work)?;
     reserve_vec(&mut branches, cuts.len(), work)?;
     reserve_vec(&mut requirements, cuts.len(), work)?;
+    let mut source_columns = Vec::new();
+    reserve_vec(&mut source_columns, root_layout.slots().len(), work)?;
+    for value in root_values
+        .iter()
+        .copied()
+        .chain(router.into_iter().flat_map(|(_, routes)| {
+            routes
+                .iter()
+                .flat_map(|route| route.input_mapping.iter().map(|(_, value)| *value))
+        }))
+    {
+        let ty = &fragment
+            .values()
+            .get(&value)
+            .ok_or(FragmentCompileError::Invalid(
+                "missing sink source column type",
+            ))?
+            .ty;
+        source_columns.push((value, ty.clone_observed(|| work.step())?));
+        work.step()?;
+    }
+    if source_columns.len() != root_layout.slots().len() {
+        return Err(FragmentCompileError::Invalid(
+            "sink source columns differ from actual runtime layout",
+        )
+        .into());
+    }
     for (branch_index, cut) in cuts.iter().enumerate() {
         let branch_id =
             u32::try_from(branch_index).map_err(|_| CompileControlError::ResourceExhausted)?;
+        let mut applies = None;
         let (partition_type, keys, routing) = match &cut.partitioning.source {
             Distribution::Singleton | Distribution::Broadcast => (
                 DataStreamPartitionType::Unpartitioned,
@@ -296,7 +335,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             }
             Distribution::ConditionalKey {
                 keys,
-                applies,
+                applies: condition,
                 scheme,
             } => {
                 if scheme.definition.algorithm != PartitionHashAlgorithm::NativeHierarchicalV1 {
@@ -305,27 +344,14 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                     )
                     .into());
                 }
-                let expression = add_read(
-                    SinkReadInput {
-                        fragment,
-                        values: root_values,
-                        layout: root_layout,
-                    },
-                    *applies,
-                    ProgramExpressionRootSite::SinkApplicability { branch: branch_id },
-                    EvaluationDemand::TruthOnly,
-                    &mut nodes,
-                    &mut types,
-                    &mut reads,
-                    &mut type_scope,
-                    work,
-                )?;
+                applies = Some(
+                    first_ordinal(root_values, *condition, work)?
+                        .ok_or(FragmentCompileError::Invalid("sink read is outside root"))?,
+                );
                 (
                     DataStreamPartitionType::HashPartitioned,
                     keys.as_ref(),
-                    StaticStreamRouting::ConditionalKeyV1 {
-                        applies: expression,
-                    },
+                    StaticStreamRouting::Ordinary,
                 )
             }
             Distribution::BucketShuffle { keys, scheme } => {
@@ -353,28 +379,52 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         if partition_type.requires_exprs() && keys.is_empty() {
             return Err(FragmentCompileError::Invalid("keyed stream has no keys").into());
         }
-        let mut partition_exprs = Vec::new();
-        reserve_vec(&mut partition_exprs, keys.len(), work)?;
-        for (key, value) in keys.iter().enumerate() {
-            partition_exprs.push(add_read(
-                SinkReadInput {
-                    fragment,
-                    values: root_values,
-                    layout: root_layout,
-                },
-                *value,
-                ProgramExpressionRootSite::SinkPartition {
-                    branch: branch_id,
-                    key: u32::try_from(key).map_err(|_| CompileControlError::ResourceExhausted)?,
-                },
-                EvaluationDemand::Value,
-                &mut nodes,
-                &mut types,
-                &mut reads,
-                &mut type_scope,
-                work,
-            )?);
+        let mut reads = Vec::new();
+        reserve_vec(
+            &mut reads,
+            keys.len()
+                .checked_add(usize::from(applies.is_some()))
+                .ok_or(CompileControlError::ResourceExhausted)?,
+            work,
+        )?;
+        if let Some(ordinal) = applies {
+            reads.push((ordinal, EvaluationDemand::TruthOnly));
         }
+        for value in keys.iter() {
+            let ordinal = first_ordinal(root_values, *value, work)?
+                .ok_or(FragmentCompileError::Invalid("sink read is outside root"))?;
+            reads.push((ordinal, EvaluationDemand::Value));
+            work.step()?;
+        }
+        let refs = if reads.is_empty() {
+            Vec::new()
+        } else {
+            crate::union_flow::compile_reads(
+                package,
+                expressions,
+                functions,
+                policy,
+                root_layout,
+                &source_columns,
+                &reads,
+                creation,
+                crate::creation::borrow_scope(&mut temporary),
+                factory,
+                work,
+            )?
+        };
+        let (routing, partition_exprs) = match applies {
+            Some(_) => {
+                let (applies, keys) = refs.split_first().ok_or(FragmentCompileError::Invalid(
+                    "conditional sink unit has no applicability root",
+                ))?;
+                (
+                    StaticStreamRouting::ConditionalKeyV1 { applies: *applies },
+                    keys.to_vec(),
+                )
+            }
+            None => (routing, refs),
+        };
         let (columns, layout) = {
             let mut columns = match &selection {
                 OutputSelection::Router { aliases, .. } => aliases
@@ -474,45 +524,14 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         });
         work.step()?;
     }
-    let types = crate::creation::publish_argument_types(
-        types,
-        type_scope
-            .as_mut()
-            .map(|s| s as &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>),
-        work,
-    )
-    .map_err(crate::creation::argument_types_failure)?;
-    let arena = ImmutableExpressions::try_new_for_compile(
-        nodes,
-        false,
-        HashMap::new(),
-        None,
-        work.control(),
-    )
-    .map_err(|error| match error {
-        ExpressionsCompileError::Control(cause) => FragmentCompileError::Control(cause),
-        error => FragmentCompileError::Owner {
-            phase: "sink expressions",
-            error: novarocks_failure_contract::SharedFailureCause::new(error),
-        },
-    })?;
-    let definitions = arena.nodes().len();
-    let arena = Arc::new(arena);
-    let (flow, roots, slots) = read_flow(
-        root,
-        &reads,
-        definitions,
-        work,
-        crate::creation::borrow_scope(&mut temporary),
-        factory,
-    )?;
+    let units = expressions.completed_units(crate::creation::borrow_scope(&mut temporary), work)?;
     let sink = if let Some((effect, _)) = router {
         let ordinal = first_ordinal(root_values, effect, work)?.ok_or(
             FragmentCompileError::Invalid("router effect is outside root"),
         )?;
         StaticSinkProgram::try_change_stream_router(
             branches,
-            arena,
+            &units,
             root_layout.slots()[ordinal],
             router_routes,
         )
@@ -521,164 +540,9 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         let branch = branches
             .pop()
             .ok_or(FragmentCompileError::Invalid("stream branch is absent"))?;
-        StaticSinkProgram::try_data_stream(branch, arena).map_err(sink_error)?
+        StaticSinkProgram::try_data_stream(branch, &units).map_err(sink_error)?
     };
-    Ok(LoweredStreamSink {
-        sink,
-        requirements,
-        flow: SinkFlow {
-            flow,
-            types,
-            roots,
-            slots,
-        },
-    })
-}
-
-struct SinkReadInput<'a> {
-    fragment: &'a novarocks_physical_plan::Fragment,
-    values: &'a [ValueId],
-    layout: &'a StaticLayout,
-}
-
-fn add_read<H>(
-    input: SinkReadInput<'_>,
-    value: ValueId,
-    site: ProgramExpressionRootSite,
-    demand: EvaluationDemand,
-    nodes: &mut Vec<StaticExprNode>,
-    types: &mut Vec<FunctionArgumentType>,
-    reads: &mut Vec<SinkRead>,
-    scope: &mut Option<impl novarocks_type_contract::ValueSchemaCreationScope<H>>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<ProgramExprId, crate::FragmentCreationError<H>> {
-    let ordinal = first_ordinal(input.values, value, work)?
-        .ok_or(FragmentCompileError::Invalid("sink read is outside root"))?;
-    let ty = &input
-        .fragment
-        .values()
-        .get(&value)
-        .ok_or(FragmentCompileError::Invalid("missing sink read type"))?
-        .ty;
-    reserve_vec(nodes, 1, work)?;
-    reserve_vec(reads, 1, work)?;
-    match scope.as_mut() {
-        Some(scope) => crate::creation::reserve_vec(types, 1, Some(scope), work)?,
-        None => reserve_vec(types, 1, work)?,
-    }
-    let id = ProgramExprId::new(nodes.len());
-    nodes.push(StaticExprNode::new_value_typed(
-        StaticExprKind::SlotId(input.layout.slots()[ordinal]),
-        ty.clone_observed(|| work.step())?,
-    ));
-    types.push(FunctionArgumentType::Value(
-        ty.clone_observed(|| work.step())?,
-    ));
-    reads.push(SinkRead {
-        site,
-        ordinal: u32::try_from(ordinal).map_err(|_| CompileControlError::ResourceExhausted)?,
-        demand,
-    });
-    Ok(id)
-}
-fn read_flow<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
-    root: ProgramNodeId,
-    reads: &[SinkRead],
-    definitions: usize,
-    work: &mut CompileCheckpoints<'_>,
-    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
-    factory: Option<&F>,
-) -> Result<
-    (
-        ProgramControlFlow,
-        Vec<ProgramRootUseBinding>,
-        Vec<ProgramSlotBinding>,
-    ),
-    crate::FragmentCreationError<H>,
-> {
-    let mut domains = Vec::new();
-    let mut uses = Vec::new();
-    let mut roots = Vec::new();
-    let mut slots = Vec::new();
-    crate::creation::reserve_vec(
-        &mut domains,
-        reads.len(),
-        crate::creation::borrow_scope(&mut temporary),
-        work,
-    )?;
-    crate::creation::reserve_vec(
-        &mut uses,
-        reads.len(),
-        crate::creation::borrow_scope(&mut temporary),
-        work,
-    )?;
-    crate::creation::reserve_vec(
-        &mut roots,
-        reads.len(),
-        crate::creation::borrow_scope(&mut temporary),
-        work,
-    )?;
-    crate::creation::reserve_vec(
-        &mut slots,
-        reads.len(),
-        crate::creation::borrow_scope(&mut temporary),
-        work,
-    )?;
-    for (definition, read) in reads.iter().enumerate() {
-        let identity =
-            u32::try_from(definition).map_err(|_| CompileControlError::ResourceExhausted)?;
-        let domain = EvaluationDomainId::new(identity);
-        let use_id = ExpressionUseId::new(identity);
-        domains.push(ProgramEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        });
-        uses.push(ProgramExpressionUse {
-            context: ExpressionEffectContext {
-                use_id,
-                domain,
-                demand: read.demand,
-            },
-            definition: ProgramExprId::new(definition),
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        roots.push(ProgramRootUseBinding {
-            site: read.site,
-            use_id,
-        });
-        slots.push(ProgramSlotBinding {
-            occurrence: ProgramUseRef {
-                arena: ProgramExpressionArena::Sink,
-                use_id,
-            },
-            source: ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                node: root,
-                role: ProgramChannelLayoutRole::NodeOutput,
-                ordinal: read.ordinal,
-            }),
-        });
-        work.step()?;
-    }
-    let flow = match factory {
-        Some(factory) => {
-            let mut retained = factory
-                .begin_scope()
-                .map_err(crate::FragmentCreationError::Creator)?;
-            ProgramControlFlow::try_new_with_creator_in(
-                domains,
-                uses,
-                definitions,
-                crate::creation::borrow_scope(&mut temporary)
-                    .expect("strong entry supplies temporary scope"),
-                &mut retained,
-                work.control(),
-            )?
-        }
-        None => ProgramControlFlow::try_new(domains, uses, definitions, work.control())?,
-    };
-    Ok((flow, roots, slots))
+    Ok(LoweredStreamSink { sink, requirements })
 }
 
 fn projected_slots(

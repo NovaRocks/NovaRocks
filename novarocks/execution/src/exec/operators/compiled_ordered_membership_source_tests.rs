@@ -193,13 +193,20 @@ fn compiled_ordered_source_checked_component_membership_keeps_full_ordinal_gate_
         .state
         .clone()
         .with_runtime_filter_session(Some(mixed.clone()));
+    let (ordered_root, membership_root) =
+        match consumer.fixture.program.graph().nodes()[scan.index()].kind() {
+            novarocks_local_program::ProgramNodeKind::Scan {
+                runtime_filters, ..
+            } => (runtime_filters[0].expr_id, runtime_filters[1].expr_id),
+            _ => panic!("the actual mixed consumer belongs to Scan"),
+        };
     // Reindexing this membership root to zero would read the real Utf8 order
     // key. The original FVT guard must reject that mistake, not reinterpret it.
-    let wrong = CompiledRuntimeFilterConsumers::try_new_at_ordinals(
+    let wrong = CompiledRuntimeFilterConsumers::try_new(
         "Scan",
         consumer.fixture.program.clone(),
         scan,
-        vec![(0, membership.clone())],
+        vec![(ordered_root, membership.clone())],
         consumer.state.error_state(),
     )
     .err()
@@ -213,11 +220,11 @@ fn compiled_ordered_source_checked_component_membership_keeps_full_ordinal_gate_
         "{wrong}"
     );
     let members = Arc::new(
-        CompiledRuntimeFilterConsumers::try_new_at_ordinals(
+        CompiledRuntimeFilterConsumers::try_new(
             "Scan",
             consumer.fixture.program.clone(),
             scan,
-            vec![(1, membership.clone())],
+            vec![(membership_root, membership.clone())],
             consumer.state.error_state(),
         )
         .unwrap(),

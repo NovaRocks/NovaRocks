@@ -50,27 +50,19 @@ impl PureCompileControl for DeriveControl {
     }
 }
 pub(super) fn frozen_fixture(fragment: Fragment) -> Fixture {
-    let uses = leaf_roots(&fragment);
-    let calls = uses
-        .flow()
-        .uses()
-        .values()
-        .map(|invocation| FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: PhysicalCallSite::Expression(invocation.context.use_id),
-            context: invocation.context,
-            effects: effects(FunctionKind::Scalar, invocation.context.domain),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        })
-        .collect();
-    Fixture {
-        fragment,
-        uses,
-        calls,
-    }
+    // Both source builders below explicitly install every real scalar unit.
+    // This helper publishes only the genuinely empty relation declarations.
+    let primary = fragment
+        .nodes()
+        .iter()
+        .find_map(|(id, node)| node.expressions.as_ref().map(|_| *id))
+        .unwrap_or(fragment.root());
+    let fragment = fragment
+        .with_call_requests_observed(vec![], &Control::default())
+        .unwrap()
+        .with_calls_observed(vec![], &Control::default())
+        .unwrap();
+    Fixture { fragment, primary }
 }
 pub(super) fn replace_properties(
     fixture: &mut Fixture,
@@ -78,8 +70,7 @@ pub(super) fn replace_properties(
 ) {
     let mut parts = fixture.fragment.clone().into_parts();
     change(&mut parts);
-    fixture.fragment = Fragment::from(parts);
-    fixture.uses = leaf_roots(&fixture.fragment);
+    fixture.fragment = parts.into();
 }
 fn broadcast() -> PhysicalProperties {
     PhysicalProperties {
@@ -95,28 +86,130 @@ fn unconstrained(multiplicity: RowMultiplicity) -> PhysicalProperties {
         ordering: Box::default(),
     }
 }
+// Explicit author for these zero-argument scalar-only source fixtures. Root
+// ordinals, demands and port scopes are supplied by the actual node fields.
+// Sparse use identities remain local to one unit; no fragment call bank exists.
+fn install_scalar_roots(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    types: Vec<ValueType>,
+    root_fields: Vec<(
+        ExprId,
+        EvaluationDemand,
+        novarocks_expression_contract::RootScope,
+    )>,
+) {
+    use novarocks_expression_contract::{BoundExprSet, ExprNode, ExprRoot, UnitParts};
+    let definitions = types
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, ty)| ExprNode {
+            id: ExprId::new(u32::try_from(ordinal).unwrap()),
+            lambda_scope: None,
+            kind: ExprKind::FunctionCall {
+                function: function(FunctionKind::Scalar, ty.clone()),
+                args: Box::default(),
+            },
+            ty,
+        })
+        .collect::<Vec<_>>();
+    let mut roots = Vec::new();
+    let mut root_uses = Vec::new();
+    let mut invocations = Vec::new();
+    let mut claims = BTreeMap::new();
+    for (ordinal, (definition, demand, scope)) in root_fields.into_iter().enumerate() {
+        let id = match ordinal {
+            0 => 0,
+            1 => u32::MAX,
+            n => u32::try_from(n - 1).unwrap(),
+        };
+        let current = context(id, if ordinal % 2 == 0 { 0 } else { u32::MAX }, demand);
+        roots.push(ExprRoot {
+            definition,
+            demand,
+            scope,
+        });
+        root_uses.push(current.use_id);
+        invocations.push(ExpressionInvocation {
+            context: current,
+            definition,
+            control: ControlShape::Eager,
+            arguments: Box::default(),
+        });
+        claims.insert(current.use_id, scalar_claim(current));
+    }
+    let regions = if roots.len() == 1 {
+        vec![domain(0)]
+    } else {
+        vec![domain(0), domain(u32::MAX)]
+    };
+    let control = Control::default();
+    let flow = ExpressionControlFlow::try_new(
+        regions,
+        invocations,
+        &FixtureDefinitions(&definitions),
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let requests = definitions
+        .iter()
+        .map(|definition| (definition.id, zero_argument_request()))
+        .collect();
+    let parts = UnitParts::new(
+        builder.node_ports(node).unwrap().into_boxed_slice(),
+        definitions.into_boxed_slice(),
+        roots.into_boxed_slice(),
+        root_uses.into_boxed_slice(),
+        flow,
+        claims,
+        requests,
+    );
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let unit = BoundExprSet::try_from_parts_in(parts, unit_limits(), &mut work).unwrap();
+    work.finish().unwrap();
+    builder.install_unit(node, Arc::new(unit)).unwrap();
+}
+
 pub(super) fn unsafe_filter() -> Fixture {
+    use novarocks_expression_contract::{RootOrdinal, RootScope};
     let mut builder = FragmentBuilder::new(FragmentId::new(u32::MAX));
     let source = NodeId::new(u32::MAX);
     builder
         .add_values(source, Box::from([Box::default()]), Box::default())
         .unwrap();
     let filter = NodeId::new(0);
-    let request = zero_argument_request();
-    let predicate = builder
-        .add_expression(
-            filter,
-            boolean(),
-            ExprKind::FunctionCall {
-                function: function(FunctionKind::Scalar, boolean()),
-                args: Box::default(),
-            },
-        )
-        .unwrap();
-    // One definition is actually invoked twice, under sparse independent uses.
-    builder
-        .add_filter(filter, source, Box::from([predicate, predicate]))
-        .unwrap();
+    // This source fixture authors the exact node payload before installing
+    // its already-specified sparse immutable unit. The typed add_filter port
+    // requires an existing draft root; this test exercises property authors,
+    // so it must not ask that unrelated construction port to guess the roots.
+    install_node(
+        &mut builder,
+        filter,
+        vec![source],
+        vec![],
+        NodeKind::Filter {
+            predicates: Box::from([RootOrdinal::new(0), RootOrdinal::new(1)]),
+        },
+    );
+    // The same definition is invoked under two independent sparse uses.
+    install_scalar_roots(
+        &mut builder,
+        filter,
+        vec![boolean()],
+        vec![
+            (
+                ExprId::new(0),
+                EvaluationDemand::TruthOnly,
+                RootScope::Port(0),
+            ),
+            (
+                ExprId::new(0),
+                EvaluationDemand::TruthOnly,
+                RootScope::Port(0),
+            ),
+        ],
+    );
     let project = NodeId::new(7);
     builder
         .add_project(project, filter, Box::default(), Box::default())
@@ -139,12 +232,7 @@ pub(super) fn unsafe_filter() -> Fixture {
                 repeat,
                 FragmentSink::Noop,
                 dop(),
-                crate::StagePlacementPolicy::Singleton,
-            )
-            .unwrap()
-            .with_call_requests_observed(
-                vec![(PhysicalCallDefinition::Expression(predicate), request)],
-                &Control::default(),
+                StagePlacementPolicy::Singleton,
             )
             .unwrap(),
     );
@@ -156,15 +244,21 @@ pub(super) fn unsafe_filter() -> Fixture {
             }
         }
     });
-    // Keep old binding metadata immutable: the exact second occurrence refutes it.
-    assert_eq!(fixture.calls.len(), 2);
-    fixture.calls[1].effects.value_stability = FunctionVolatility::Volatile;
+    assert_eq!(fixture.primary, filter);
+    assert_eq!(fixture.claims().len(), 2);
+    fixture.edit_unit(|parts| {
+        parts
+            .claims
+            .get_mut(&ExpressionUseId::new(u32::MAX))
+            .unwrap()
+            .effects
+            .value_stability = FunctionVolatility::Volatile
+    });
     fixture
 }
 fn run(
     fixture: &Fixture,
     cuts: &FragmentCuts,
-    calls: &FrozenFragmentCalls,
     control: &DeriveControl,
 ) -> Result<
     (
@@ -176,8 +270,6 @@ fn run(
     derive_fragment_output_properties_observed(
         &fixture.fragment,
         cuts,
-        &fixture.uses,
-        calls,
         PlanLimits::FROZEN,
         SOURCE,
         PROJECTION,
@@ -222,10 +314,14 @@ fn prefixes(
 #[test]
 fn all_derivation_unsafe_sparse_occurrence_propagates_through_project_repeat_without_mutation() {
     let fixture = unsafe_filter();
-    let calls = fixture.checked().unwrap();
-    assert_eq!(fixture.calls[0].context.use_id, ExpressionUseId::new(0));
     assert_eq!(
-        fixture.calls[1].context.use_id,
+        fixture.claims()[&ExpressionUseId::new(0)].context.use_id,
+        ExpressionUseId::new(0)
+    );
+    assert_eq!(
+        fixture.claims()[&ExpressionUseId::new(u32::MAX)]
+            .context
+            .use_id,
         ExpressionUseId::new(u32::MAX)
     );
     let before = fixture
@@ -237,7 +333,6 @@ fn all_derivation_unsafe_sparse_occurrence_propagates_through_project_repeat_wit
     let (candidate, facts) = run(
         &fixture,
         &FragmentCuts::default(),
-        &calls,
         &DeriveControl::default(),
     )
     .unwrap();
@@ -254,13 +349,13 @@ fn all_derivation_unsafe_sparse_occurrence_propagates_through_project_repeat_wit
         assert_eq!(fixture.fragment.nodes()[&id].output_properties, original);
     }
     assert_eq!(
-        calls.entries()[&fixture.calls[1].site]
+        fixture.claims()[&ExpressionUseId::new(u32::MAX)]
             .effects
             .value_stability,
         FunctionVolatility::Volatile
     );
     prefixes(
-        |control| run(&fixture, &FragmentCuts::default(), &calls, control),
+        |control| run(&fixture, &FragmentCuts::default(), control),
         true,
         true,
     );
@@ -276,12 +371,10 @@ fn all_derivation_required_broadcast_consumer_refuses_candidate_without_old_fall
             .unwrap()
             .required_inputs[0] = broadcast();
     });
-    let calls = fixture.checked().unwrap();
     assert!(matches!(
         run(
             &fixture,
             &FragmentCuts::default(),
-            &calls,
             &DeriveControl::default()
         ),
         Err(FragmentPropertyError::Structure(_))
@@ -291,13 +384,14 @@ fn all_derivation_required_broadcast_consumer_refuses_candidate_without_old_fall
         broadcast()
     );
     prefixes(
-        |control| run(&fixture, &FragmentCuts::default(), &calls, control),
+        |control| run(&fixture, &FragmentCuts::default(), control),
         false,
         true,
     );
 }
 
 pub(super) fn single_copy_dag() -> Fixture {
+    use novarocks_expression_contract::{RootOrdinal, RootScope};
     let mut builder = FragmentBuilder::new(FragmentId::new(41));
     let source = NodeId::new(u32::MAX);
     builder
@@ -323,24 +417,6 @@ pub(super) fn single_copy_dag() -> Fixture {
         )
         .unwrap();
     let join = NodeId::new(2);
-    let mut requests = Vec::new();
-    let mut key = || {
-        let request = zero_argument_request();
-        let expression = builder
-            .add_expression(
-                join,
-                integer(),
-                ExprKind::FunctionCall {
-                    function: function(FunctionKind::Scalar, integer()),
-                    args: Box::default(),
-                },
-            )
-            .unwrap();
-        requests.push((PhysicalCallDefinition::Expression(expression), request));
-        expression
-    };
-    let left = key();
-    let right = key();
     builder
         .add_join(
             join,
@@ -352,8 +428,8 @@ pub(super) fn single_copy_dag() -> Fixture {
                 kind: JoinKind::Inner,
                 condition: crate::HashJoinCondition::Ordinary {
                     keys: Box::from([JoinKey {
-                        left,
-                        right,
+                        left: RootOrdinal::new(0),
+                        right: RootOrdinal::new(1),
                         null_safe: false,
                     }]),
                     residual: None,
@@ -364,21 +440,26 @@ pub(super) fn single_copy_dag() -> Fixture {
             },
         )
         .unwrap();
+    install_scalar_roots(
+        &mut builder,
+        join,
+        vec![integer(), integer()],
+        vec![
+            (ExprId::new(0), EvaluationDemand::Value, RootScope::Port(0)),
+            (ExprId::new(1), EvaluationDemand::Value, RootScope::Port(1)),
+        ],
+    );
     let mut fixture = frozen_fixture(
         builder
             .finish_definition(
                 join,
                 FragmentSink::Noop,
                 dop(),
-                crate::StagePlacementPolicy::Singleton,
+                StagePlacementPolicy::Singleton,
             )
-            .unwrap()
-            .with_call_requests_observed(requests, &Control::default())
             .unwrap(),
     );
     replace_properties(&mut fixture, |parts| {
-        // These are admitted coarse declarations. Derivation must use the stronger
-        // actual child candidate, not these stale output declarations.
         for id in [0, 7] {
             parts
                 .nodes
@@ -396,11 +477,9 @@ pub(super) fn single_copy_dag() -> Fixture {
 #[test]
 fn all_derivation_child_first_shared_union_hash_join_uses_stronger_actual_candidates() {
     let fixture = single_copy_dag();
-    let calls = fixture.checked().unwrap();
     let (candidate, _) = run(
         &fixture,
         &FragmentCuts::default(),
-        &calls,
         &DeriveControl::default(),
     )
     .unwrap();
@@ -413,7 +492,7 @@ fn all_derivation_child_first_shared_union_hash_join_uses_stronger_actual_candid
         unconstrained(RowMultiplicity::SingleCopy)
     );
     prefixes(
-        |control| run(&fixture, &FragmentCuts::default(), &calls, control),
+        |control| run(&fixture, &FragmentCuts::default(), control),
         true,
         true,
     );
@@ -421,30 +500,25 @@ fn all_derivation_child_first_shared_union_hash_join_uses_stronger_actual_candid
 
 #[test]
 fn all_derivation_values_anchor_effect_authority_and_foreign_proof_stay_exact() {
-    let mut fixture = scalar_fixture(2, 53);
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 53, &mut constants);
     replace_properties(&mut fixture, |parts| {
-        parts.nodes.get_mut(&parts.root).unwrap().output_properties = broadcast();
-        let definitions = parts
-            .expressions
-            .iter()
-            .map(|(_, expr)| expr.clone())
-            .collect::<Vec<_>>();
-        for mut expr in definitions {
-            let ExprKind::FunctionCall { function, .. } = &mut expr.kind else {
+        parts.nodes.get_mut(&parts.root).unwrap().output_properties = broadcast()
+    });
+    fixture.edit_unit(|parts| {
+        for definition in &mut parts.definitions {
+            let ExprKind::FunctionCall { function, .. } = &mut definition.kind else {
                 unreachable!()
             };
             function.legacy_metadata.as_mut().unwrap().volatility = FunctionVolatility::Volatile;
-            parts.expressions.insert(expr);
+        }
+        for claim in parts.claims.values_mut() {
+            claim.effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
         }
     });
-    for call in &mut fixture.calls {
-        call.effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
-    }
-    let calls = fixture.checked().unwrap();
     let (candidate, _) = run(
         &fixture,
         &FragmentCuts::default(),
-        &calls,
         &DeriveControl::default(),
     )
     .unwrap();
@@ -453,11 +527,18 @@ fn all_derivation_values_anchor_effect_authority_and_foreign_proof_stay_exact() 
         fixture.fragment.nodes()[&fixture.fragment.root()].output_properties,
         broadcast()
     );
+    assert!(
+        fixture
+            .claims()
+            .values()
+            .all(|claim| claim.effects.own_row_error == FunctionIntrinsicRowError::MayRaise)
+    );
     let control = DeriveControl::default();
-    let proof = calls
+    let proof = fixture
+        .fragment
+        .calls()
         .property_proof(
             &fixture.fragment,
-            &fixture.uses,
             &PlanLimits::FROZEN,
             SOURCE,
             PROJECTION,
@@ -525,8 +606,7 @@ pub(super) fn exchange() -> (Fixture, FragmentCuts) {
 #[test]
 fn all_derivation_exchange_uses_exact_inbound_cut_and_missing_cut_never_falls_back() {
     let (fixture, cuts) = exchange();
-    let calls = fixture.checked().unwrap();
-    let (candidate, _) = run(&fixture, &cuts, &calls, &DeriveControl::default()).unwrap();
+    let (candidate, _) = run(&fixture, &cuts, &DeriveControl::default()).unwrap();
     assert_eq!(
         candidate[&fixture.fragment.root()],
         PhysicalProperties {
@@ -543,14 +623,13 @@ fn all_derivation_exchange_uses_exact_inbound_cut_and_missing_cut_never_falls_ba
         run(
             &fixture,
             &FragmentCuts::default(),
-            &calls,
             &DeriveControl::default()
         ),
         Err(FragmentPropertyError::Structure(_))
     ));
-    prefixes(|control| run(&fixture, &cuts, &calls, control), true, true);
+    prefixes(|control| run(&fixture, &cuts, control), true, true);
     prefixes(
-        |control| run(&fixture, &FragmentCuts::default(), &calls, control),
+        |control| run(&fixture, &FragmentCuts::default(), control),
         false,
         true,
     );
@@ -570,18 +649,16 @@ fn all_derivation_missing_child_cycle_and_unreachable_are_not_partial_candidates
             }
             _ => unreachable!(),
         });
-        let calls = fixture.checked().unwrap();
         assert!(matches!(
             run(
                 &fixture,
                 &FragmentCuts::default(),
-                &calls,
                 &DeriveControl::default()
             ),
             Err(FragmentPropertyError::Structure(_))
         ));
         prefixes(
-            |control| run(&fixture, &FragmentCuts::default(), &calls, control),
+            |control| run(&fixture, &FragmentCuts::default(), control),
             false,
             true,
         );
@@ -620,9 +697,8 @@ fn all_derivation_wide_real_project_graph_quantum_uses_same_immutable_source() {
             }
         }
     });
-    let calls = fixture.checked().unwrap();
     let control = DeriveControl::default();
-    let (candidate, _) = run(&fixture, &FragmentCuts::default(), &calls, &control).unwrap();
+    let (candidate, _) = run(&fixture, &FragmentCuts::default(), &control).unwrap();
     assert_eq!(candidate.len(), 320);
     assert!(
         candidate
@@ -631,7 +707,7 @@ fn all_derivation_wide_real_project_graph_quantum_uses_same_immutable_source() {
     );
     assert!(control.trace.lock().unwrap().contains(&256));
     prefixes(
-        |control| run(&fixture, &FragmentCuts::default(), &calls, control),
+        |control| run(&fixture, &FragmentCuts::default(), control),
         true,
         false,
     );

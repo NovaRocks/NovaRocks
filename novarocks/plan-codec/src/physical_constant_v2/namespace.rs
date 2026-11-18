@@ -70,11 +70,17 @@ pub struct ConstantNamespaceResourceFacts {
 }
 
 trait NamespaceFailure:
-    crate::ipc_flat_stream_v2::ReaderFailure + From<Error> + From<ConstantReferenceError>
+    crate::ipc_flat_stream_v2::ReaderFailure
+    + From<Error>
+    + From<ConstantReferenceError>
+    + From<novarocks_constant_contract::ConstantTableError>
 {
 }
 impl<E> NamespaceFailure for E where
-    E: crate::ipc_flat_stream_v2::ReaderFailure + From<Error> + From<ConstantReferenceError>
+    E: crate::ipc_flat_stream_v2::ReaderFailure
+        + From<Error>
+        + From<ConstantReferenceError>
+        + From<novarocks_constant_contract::ConstantTableError>
 {
 }
 struct NamespaceCreation<'a,'port,E> {
@@ -1412,4 +1418,10 @@ fn prepare_record_reader_observed<'raw, 'table, 'control, E: NamespaceFailure>(
     reader.ok_or_else(|| {
         shape("constant reader was not prepared from its captured original sources").into()
     })
+}
+
+impl From<novarocks_constant_contract::ConstantTableError> for Error {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(ConstantReferenceError::from(error))
+    }
 }

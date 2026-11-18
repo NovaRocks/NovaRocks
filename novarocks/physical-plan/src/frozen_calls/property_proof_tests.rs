@@ -54,7 +54,6 @@ fn safe(
 ) -> Result<bool, FrozenCallError> {
     let proof = calls.property_proof(
         &fixture.fragment,
-        &fixture.uses,
         &PlanLimits::FROZEN,
         SOURCE_INVOICE,
         PROJECTION_LIMITS,
@@ -92,50 +91,73 @@ fn prefixes(run: impl Fn(&ProofControl) -> Result<(), FrozenCallError>, succeeds
 
 #[test]
 fn occurrence_property_proof_preserves_each_shared_use_and_guarded_domain() {
-    let mut fixture = scalar_fixture(2, 0);
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 0, &mut constants);
     assert_eq!(
-        fixture.uses.flow().uses()[&ExpressionUseId::new(0)].definition,
-        fixture.uses.flow().uses()[&ExpressionUseId::new(u32::MAX)].definition
+        fixture.unit().control_flow().uses()[&ExpressionUseId::new(0)].definition,
+        fixture.unit().control_flow().uses()[&ExpressionUseId::new(u32::MAX)].definition
     );
     assert_ne!(
-        fixture.calls[0].context.domain,
-        fixture.calls[1].context.domain
+        fixture.claims()[&ExpressionUseId::new(0)].context.region,
+        fixture.claims()[&ExpressionUseId::new(u32::MAX)]
+            .context
+            .region
     );
     assert!(
         safe(
-            &fixture.checked().unwrap(),
+            fixture.checked().unwrap(),
             &fixture,
             fixture.fragment.root(),
             &ProofControl::default()
         )
         .unwrap()
     );
-    for unsafe_at in 0..2 {
-        fixture.calls[unsafe_at]
-            .effects
-            .observable_effects
-            .rng_sampling = true;
+    for id in [ExpressionUseId::new(0), ExpressionUseId::new(u32::MAX)] {
+        fixture.edit_unit(|parts| {
+            parts
+                .claims
+                .get_mut(&id)
+                .unwrap()
+                .effects
+                .observable_effects
+                .rng_sampling = true
+        });
         assert!(
             !safe(
-                &fixture.checked().unwrap(),
+                fixture.checked().unwrap(),
                 &fixture,
                 fixture.fragment.root(),
                 &ProofControl::default()
             )
             .unwrap()
         );
-        fixture.calls[unsafe_at].effects.observable_effects = ObservableEffects::NONE;
+        fixture.edit_unit(|parts| {
+            parts
+                .claims
+                .get_mut(&id)
+                .unwrap()
+                .effects
+                .observable_effects = ObservableEffects::NONE
+        });
     }
-    let mut guarded = case_fixture();
-    assert!(guarded.calls.iter().any(|call| {
-        guarded.uses.flow().domains()[&call.context.domain]
+    let mut guarded = case_fixture(&mut constants);
+    assert!(guarded.claims().values().any(|call| {
+        guarded.unit().control_flow().regions()[&call.context.region]
             .guard
             .is_some()
     }));
-    guarded.calls[1].effects.observable_effects.warnings = true;
+    guarded.edit_unit(|parts| {
+        parts
+            .claims
+            .get_mut(&ExpressionUseId::new(u32::MAX))
+            .unwrap()
+            .effects
+            .observable_effects
+            .warnings = true
+    });
     assert!(
         !safe(
-            &guarded.checked().unwrap(),
+            guarded.checked().unwrap(),
             &guarded,
             guarded.fragment.root(),
             &ProofControl::default()
@@ -146,61 +168,91 @@ fn occurrence_property_proof_preserves_each_shared_use_and_guarded_domain() {
 
 #[test]
 fn occurrence_property_proof_keeps_row_errors_and_relational_lifecycle() {
-    let mut scalar = scalar_fixture(1, u32::MAX);
-    scalar.calls[0].effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut scalar = scalar_fixture(1, u32::MAX, &mut constants);
+    scalar.edit_unit(|parts| {
+        parts
+            .claims
+            .get_mut(&ExpressionUseId::new(0))
+            .unwrap()
+            .effects
+            .own_row_error = FunctionIntrinsicRowError::MayRaise
+    });
     assert!(
         safe(
-            &scalar.checked().unwrap(),
+            scalar.checked().unwrap(),
             &scalar,
             scalar.fragment.root(),
             &ProofControl::default()
         )
         .unwrap()
     );
-    scalar.calls[0].effects.instance_state = FunctionInstanceState::ScalarInstance;
+    scalar.edit_unit(|parts| {
+        parts
+            .claims
+            .get_mut(&ExpressionUseId::new(0))
+            .unwrap()
+            .effects
+            .instance_state = FunctionInstanceState::ScalarInstance
+    });
     assert!(
         !safe(
-            &scalar.checked().unwrap(),
+            scalar.checked().unwrap(),
             &scalar,
             scalar.fragment.root(),
             &ProofControl::default()
         )
         .unwrap()
     );
-    let mut relational = special_fixture();
-    let calls = relational.checked().unwrap();
+    let mut relational = special_fixture(&mut constants);
     for node in relational.fragment.nodes().keys() {
-        assert!(safe(&calls, &relational, *node, &ProofControl::default()).unwrap());
+        assert!(
+            safe(
+                relational.checked().unwrap(),
+                &relational,
+                *node,
+                &ProofControl::default()
+            )
+            .unwrap()
+        );
     }
-    let table = relational
-        .calls
-        .iter()
-        .position(|call| matches!(call.site, PhysicalCallSite::Table { .. }))
+    let table = *relational
+        .relations()
+        .keys()
+        .find(|site| matches!(site, PhysicalCallSite::Table { .. }))
         .unwrap();
-    let PhysicalCallSite::Table { node } = relational.calls[table].site else {
-        unreachable!()
-    };
-    relational.calls[table].effects.observable_effects.warnings = true;
+    let node = table.node();
+    relational.fragment = relational
+        .candidate_relations(|calls| {
+            calls
+                .iter_mut()
+                .find(|call| call.site == table)
+                .unwrap()
+                .effects
+                .observable_effects
+                .warnings = true;
+        })
+        .unwrap();
     let calls = relational.checked().unwrap();
-    assert!(!safe(&calls, &relational, node, &ProofControl::default()).unwrap());
+    assert!(!safe(calls, &relational, node, &ProofControl::default()).unwrap());
     for other in relational
         .fragment
         .nodes()
         .keys()
         .filter(|other| **other != node)
     {
-        assert!(safe(&calls, &relational, *other, &ProofControl::default()).unwrap());
+        assert!(safe(calls, &relational, *other, &ProofControl::default()).unwrap());
     }
 }
 
 #[test]
 fn occurrence_property_proof_sparse_node_index_refuses_foreign_snapshot_and_missing_node() {
-    let mut fixture = scalar_fixture(1, u32::MAX);
-    // Move the one node and its original definitions, retaining their facts.
-    // Sparse MAX is a map key; it never becomes a vector capacity.
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(1, u32::MAX, &mut constants);
     let mut parts = fixture.fragment.into_parts();
     let old = parts.root;
     let mut node = parts.nodes.remove(&old).unwrap();
+    let unit = node.expressions.as_ref().unwrap().clone();
     node.id = NodeId::new(u32::MAX);
     node.output.node = node.id;
     parts.root = node.id;
@@ -212,30 +264,26 @@ fn occurrence_property_proof_sparse_node_index_refuses_foreign_snapshot_and_miss
             _ => unreachable!(),
         }
     }
-    let definitions = parts
-        .expressions
-        .iter()
-        .map(|(_, definition)| definition.clone())
-        .collect::<Vec<_>>();
-    for mut definition in definitions {
-        definition.owner = node.id;
-        parts.expressions.insert(definition);
-    }
+    // Local definitions have no node owner to relabel. Preserve the exact
+    // unit Arc and the fragment-owned relation table during this node move.
+    assert!(std::sync::Arc::ptr_eq(
+        &unit,
+        node.expressions.as_ref().unwrap()
+    ));
     parts.nodes.insert(node.id, node);
-    fixture.fragment = Fragment::from(parts);
-    fixture.uses = leaf_roots(&fixture.fragment);
+    fixture.fragment = parts.into();
+    fixture.primary = NodeId::new(u32::MAX);
     let calls = fixture.checked().unwrap();
+    let control = ProofControl::default();
     let proof = calls
         .property_proof(
             &fixture.fragment,
-            &fixture.uses,
             &PlanLimits::FROZEN,
             SOURCE_INVOICE,
             PROJECTION_LIMITS,
-            &ProofControl::default(),
+            &control,
         )
         .unwrap();
-    let control = ProofControl::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     assert!(
         proof
@@ -255,7 +303,8 @@ fn occurrence_property_proof_sparse_node_index_refuses_foreign_snapshot_and_miss
 
 #[test]
 fn occurrence_property_proof_bounds_source_before_index_and_rechecks_call_correspondence() {
-    let fixture = scalar_fixture(2, 71);
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 71, &mut constants);
     let calls = fixture.checked().unwrap();
     for limits in [
         PlanLimits {
@@ -276,7 +325,6 @@ fn occurrence_property_proof_bounds_source_before_index_and_rechecks_call_corres
                 calls
                     .property_proof(
                         &fixture.fragment,
-                        &fixture.uses,
                         &limits,
                         SOURCE_INVOICE,
                         PROJECTION_LIMITS,
@@ -289,7 +337,6 @@ fn occurrence_property_proof_bounds_source_before_index_and_rechecks_call_corres
         assert!(matches!(
             calls.property_proof(
                 &fixture.fragment,
-                &fixture.uses,
                 &limits,
                 SOURCE_INVOICE,
                 PROJECTION_LIMITS,
@@ -298,25 +345,33 @@ fn occurrence_property_proof_bounds_source_before_index_and_rechecks_call_corres
             Err(FrozenCallError::TooManyItems)
         ));
     }
-    let mut missing = calls.clone();
-    Arc::make_mut(&mut missing.entries).remove(&fixture.calls[1].site);
+    // A detached but equal table cannot override the immutable fragment's
+    // actual relation source. Correspondence errors below use owned tables.
+    let detached = (*calls).clone();
     assert!(matches!(
-        missing.property_proof(
+        detached.property_proof(
             &fixture.fragment,
-            &fixture.uses,
             &PlanLimits::FROZEN,
             SOURCE_INVOICE,
             PROJECTION_LIMITS,
             &ProofControl::default()
         ),
-        Err(FrozenCallError::MissingSite(_))
+        Err(FrozenCallError::WrongFragment)
     ));
+    let mut missing = special_fixture(&mut constants);
+    let mut parts = missing.fragment.into_parts();
+    let omitted = *parts.calls.entries.keys().next().unwrap();
+    std::sync::Arc::make_mut(&mut parts.calls.entries).remove(&omitted);
+    missing.fragment = parts.into();
+    let calls = missing.fragment.calls();
+    assert!(
+        matches!(calls.property_proof(&missing.fragment, &PlanLimits::FROZEN, SOURCE_INVOICE, PROJECTION_LIMITS, &ProofControl::default()), Err(FrozenCallError::MissingSite(site)) if site == omitted)
+    );
     prefixes(
         |control| {
-            missing
+            calls
                 .property_proof(
-                    &fixture.fragment,
-                    &fixture.uses,
+                    &missing.fragment,
                     &PlanLimits::FROZEN,
                     SOURCE_INVOICE,
                     PROJECTION_LIMITS,
@@ -326,16 +381,18 @@ fn occurrence_property_proof_bounds_source_before_index_and_rechecks_call_corres
         },
         false,
     );
-    let mut changed = calls.clone();
-    Arc::make_mut(&mut changed.entries)
-        .get_mut(&fixture.calls[0].site)
+    let mut changed = special_fixture(&mut constants);
+    let mut parts = changed.fragment.into_parts();
+    std::sync::Arc::make_mut(&mut parts.calls.entries)
+        .values_mut()
+        .next()
         .unwrap()
         .context
-        .domain = EvaluationDomainId::new(99);
+        .demand = EvaluationDemand::TruthOnly;
+    changed.fragment = parts.into();
     assert!(matches!(
-        changed.property_proof(
-            &fixture.fragment,
-            &fixture.uses,
+        changed.fragment.calls().property_proof(
+            &changed.fragment,
             &PlanLimits::FROZEN,
             SOURCE_INVOICE,
             PROJECTION_LIMITS,
@@ -343,14 +400,17 @@ fn occurrence_property_proof_bounds_source_before_index_and_rechecks_call_corres
         ),
         Err(FrozenCallError::WrongContext)
     ));
+    // Invalid scalar claim/context is refused by the real unit constructor;
+    // its unchanged cases are proposed at expression-contract's owner.
 }
 
 #[test]
 fn occurrence_property_proof_actual_quantum_and_every_callback_keep_original_causes() {
-    let fixture = scalar_fixture(320, 17);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(320, 17, &mut fixture_constants);
     let calls = fixture.checked().unwrap();
     let control = ProofControl::default();
-    assert!(safe(&calls, &fixture, fixture.fragment.root(), &control).unwrap());
+    assert!(safe(calls, &fixture, fixture.fragment.root(), &control).unwrap());
     assert!(
         control
             .trace
@@ -360,23 +420,23 @@ fn occurrence_property_proof_actual_quantum_and_every_callback_keep_original_cau
             .any(|(_, units)| *units == 256)
     );
     prefixes(
-        |control| safe(&calls, &fixture, fixture.fragment.root(), control).map(|_| ()),
+        |control| safe(calls, &fixture, fixture.fragment.root(), control).map(|_| ()),
         true,
     );
     prefixes(
-        |control| safe(&calls, &fixture, NodeId::new(u32::MAX), control).map(|_| ()),
+        |control| safe(calls, &fixture, NodeId::new(u32::MAX), control).map(|_| ()),
         false,
     );
 }
 
 #[test]
 fn occurrence_property_proof_exact_projection_envelopes_and_overflow_are_checked() {
-    let fixture = scalar_fixture(320, 17);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(320, 17, &mut fixture_constants);
     let calls = fixture.checked().unwrap();
     let measured = calls
         .property_proof(
             &fixture.fragment,
-            &fixture.uses,
             &PlanLimits::FROZEN,
             SOURCE_INVOICE,
             PROJECTION_LIMITS,
@@ -394,7 +454,6 @@ fn occurrence_property_proof_exact_projection_envelopes_and_overflow_are_checked
             calls
                 .property_proof(
                     &fixture.fragment,
-                    &fixture.uses,
                     &PlanLimits::FROZEN,
                     SOURCE_INVOICE,
                     exact,
@@ -423,7 +482,6 @@ fn occurrence_property_proof_exact_projection_envelopes_and_overflow_are_checked
                 calls
                     .property_proof(
                         &fixture.fragment,
-                        &fixture.uses,
                         &PlanLimits::FROZEN,
                         SOURCE_INVOICE,
                         under,
@@ -436,7 +494,6 @@ fn occurrence_property_proof_exact_projection_envelopes_and_overflow_are_checked
         assert!(matches!(
             calls.property_proof(
                 &fixture.fragment,
-                &fixture.uses,
                 &PlanLimits::FROZEN,
                 SOURCE_INVOICE,
                 under,
@@ -445,14 +502,13 @@ fn occurrence_property_proof_exact_projection_envelopes_and_overflow_are_checked
             Err(FrozenCallError::TooManyItems)
         ));
     }
-    let floor = source_floor(&fixture.fragment, &fixture.uses, &calls).unwrap();
+    let floor = source_floor(&fixture.fragment, calls).unwrap();
     assert!(floor > 0 && floor < SOURCE_INVOICE);
     prefixes(
         |control| {
             calls
                 .property_proof(
                     &fixture.fragment,
-                    &fixture.uses,
                     &PlanLimits::FROZEN,
                     floor - 1,
                     exact,
@@ -477,9 +533,24 @@ fn occurrence_property_proof_exact_projection_envelopes_and_overflow_are_checked
 
 #[test]
 fn occurrence_property_proof_broadcast_error_retains_original_first_site() {
-    let mut fixture = scalar_fixture(2, 73);
-    fixture.calls[0].effects.observable_effects.warnings = true;
-    fixture.calls[1].effects.observable_effects.rng_sampling = true;
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 73, &mut constants);
+    fixture.edit_unit(|parts| {
+        parts
+            .claims
+            .get_mut(&ExpressionUseId::new(0))
+            .unwrap()
+            .effects
+            .observable_effects
+            .warnings = true;
+        parts
+            .claims
+            .get_mut(&ExpressionUseId::new(u32::MAX))
+            .unwrap()
+            .effects
+            .observable_effects
+            .rng_sampling = true;
+    });
     let root = fixture.fragment.root();
     let mut parts = fixture.fragment.into_parts();
     parts
@@ -488,13 +559,12 @@ fn occurrence_property_proof_broadcast_error_retains_original_first_site() {
         .unwrap()
         .output_properties
         .distribution = Distribution::Broadcast;
-    fixture.fragment = Fragment::from(parts);
+    fixture.fragment = parts.into();
     let calls = fixture.checked().unwrap();
     prefixes(
         |control| {
             let proof = calls.property_proof(
                 &fixture.fragment,
-                &fixture.uses,
                 &PlanLimits::FROZEN,
                 SOURCE_INVOICE,
                 PROJECTION_LIMITS,
@@ -510,7 +580,6 @@ fn occurrence_property_proof_broadcast_error_retains_original_first_site() {
     let proof = calls
         .property_proof(
             &fixture.fragment,
-            &fixture.uses,
             &PlanLimits::FROZEN,
             SOURCE_INVOICE,
             PROJECTION_LIMITS,
@@ -521,35 +590,41 @@ fn occurrence_property_proof_broadcast_error_retains_original_first_site() {
     let result = proof.require_declared_broadcast_equivalence(&mut work);
     assert_eq!(
         finish_frozen_calls(work, result),
-        Err(FrozenCallError::ReplicaEquivalence(fixture.calls[0].site))
+        Err(FrozenCallError::ReplicaExpression {
+            node: root,
+            invocation: ExpressionUseId::new(0)
+        })
     );
 }
 
 #[test]
 fn occurrence_property_proof_global_broadcast_fault_follows_visit_order_not_node_order() {
-    let mut fixture = special_fixture();
-    let aggregate_site = fixture.calls[0].site;
-    let window_site = fixture.calls[2].site;
-    fixture.calls[0].effects.observable_effects.warnings = true;
-    fixture.calls[2].effects.observable_effects.warnings = true;
-    let PhysicalCallSite::Aggregate {
-        node: aggregate, ..
-    } = aggregate_site
-    else {
-        panic!("aggregate fixture")
-    };
-    let PhysicalCallSite::Expression(window_use) = window_site else {
-        panic!("window fixture")
-    };
-    let window = fixture
-        .fragment
-        .expressions()
-        .get(fixture.uses.flow().uses()[&window_use].definition)
-        .unwrap()
-        .owner;
-    assert!(aggregate < window);
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = special_fixture(&mut constants);
+    let aggregate_site = *fixture
+        .relations()
+        .keys()
+        .find(|site| matches!(site, PhysicalCallSite::Aggregate { call: 0, .. }))
+        .unwrap();
+    fixture.fragment = fixture
+        .candidate_relations(|calls| {
+            calls
+                .iter_mut()
+                .find(|call| call.site == aggregate_site)
+                .unwrap()
+                .effects
+                .observable_effects
+                .warnings = true;
+        })
+        .unwrap();
+    // Window is now relational, so comparing Aggregate versus Window alone
+    // cannot distinguish scalar-first visitation from node-index sorting.
+    // Add one real scalar Project after the unchanged relation seed instead.
+    let scalar = append_late_scalar(&mut fixture);
+    let aggregate = aggregate_site.node();
+    assert!(aggregate < scalar);
     let mut parts = fixture.fragment.into_parts();
-    for node in [aggregate, window] {
+    for node in [aggregate, scalar] {
         parts
             .nodes
             .get_mut(&node)
@@ -557,21 +632,19 @@ fn occurrence_property_proof_global_broadcast_fault_follows_visit_order_not_node
             .output_properties
             .distribution = Distribution::Broadcast;
     }
-    fixture.fragment = Fragment::from(parts);
+    fixture.fragment = parts.into();
     let calls = fixture.checked().unwrap();
-    let expected = Err(FrozenCallError::ReplicaEquivalence(window_site));
+    let expected = Err(FrozenCallError::ReplicaExpression {
+        node: scalar,
+        invocation: ExpressionUseId::new(0),
+    });
     assert_eq!(
-        calls.validate_replica_equivalence(
-            &fixture.fragment,
-            &fixture.uses,
-            &ProofControl::default()
-        ),
+        calls.validate_replica_equivalence(&fixture.fragment, &ProofControl::default()),
         expected
     );
     let run = |control: &ProofControl| {
         let proof = calls.property_proof(
             &fixture.fragment,
-            &fixture.uses,
             &PlanLimits::FROZEN,
             SOURCE_INVOICE,
             PROJECTION_LIMITS,
@@ -608,7 +681,6 @@ impl PureCompileControl for BorrowedProofControl {
 }
 fn borrowed_proof_run(
     fixture: &Fixture,
-    calls: &FrozenFragmentCalls,
     source: usize,
     complete: bool,
     control: &BorrowedProofControl,
@@ -616,12 +688,11 @@ fn borrowed_proof_run(
         &novarocks_type_contract::ControlOwnedResourceFacts,
     ) -> Result<(), CompileControlError>,
 ) -> Result<PropertyProofProjectionFacts, FragmentPropertyError> {
+    let calls = fixture.fragment.calls();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = if complete {
         crate::validation::validate_fragment_output_properties_in(
             &fixture.fragment,
-            &fixture.uses,
-            calls,
             PlanLimits::FROZEN,
             source,
             PROJECTION_LIMITS,
@@ -632,7 +703,6 @@ fn borrowed_proof_run(
         calls
             .property_proof_in(
                 &fixture.fragment,
-                &fixture.uses,
                 &PlanLimits::FROZEN,
                 source,
                 PROJECTION_LIMITS,
@@ -669,16 +739,123 @@ fn borrowed_gate(
     Ok(())
 }
 
+// The original two Boolean scalar uses remain unit-owned. A real zero-argument
+// relation provides the temporary identity-set allocation whose independent
+// request-count/byte/work ceilings this borrowed admission test exercises.
+fn borrowed_source_with_real_relation(
+    constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
+    let mut fixture = scalar_fixture(2, u32::MAX, constants);
+    assert_eq!(fixture.claims().len(), 2);
+    assert_eq!(
+        fixture.unit().root_use_ids(),
+        &[ExpressionUseId::new(0), ExpressionUseId::new(u32::MAX)]
+    );
+    let original_unit = Arc::clone(
+        fixture.fragment.nodes()[&fixture.primary]
+            .expressions
+            .as_ref()
+            .unwrap(),
+    );
+    let mut parts = fixture.fragment.into_parts();
+    let input = parts.root;
+    assert_eq!(input, fixture.primary);
+    let pass = parts.nodes[&input].output.columns[0];
+    let node = NodeId::new(1);
+    assert!(!parts.nodes.contains_key(&node));
+    let value = ValueId::new(1);
+    assert!(!parts.values.contains_key(&value));
+    parts.values.insert(
+        value,
+        ValueDef {
+            id: value,
+            ty: integer(),
+            origin: ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 1,
+            },
+        },
+    );
+    let selected = function(FunctionKind::Table, integer());
+    let required = parts.nodes[&input].output_properties.clone();
+    parts.nodes.insert(
+        node,
+        PhysicalNode {
+            id: node,
+            expressions: None,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([required]),
+            output_properties: properties(),
+            output: OutputPort {
+                node,
+                columns: Box::from([pass, value]),
+            },
+            kind: NodeKind::TableFunction {
+                function: BoundTableFunction {
+                    function_id: selected.function_id,
+                    overload: selected.overload,
+                    argument_types: selected.argument_types,
+                    result_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::from([integer()]),
+                    ),
+                    legacy_metadata: selected.legacy_metadata,
+                },
+                arguments: Box::default(),
+                outputs: Box::from([
+                    TableFunctionOutput::PassThrough(pass),
+                    TableFunctionOutput::FunctionResult {
+                        result_ordinal: 0,
+                        value,
+                    },
+                ]),
+                left_outer: false,
+            },
+        },
+    );
+    parts.root = node;
+    let fragment = Fragment::from(parts);
+    let site = PhysicalCallSite::Table { node };
+    let fragment = fragment
+        .with_call_requests_observed(vec![(site, zero_argument_request())], &Control::default())
+        .unwrap();
+    let context = novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(17),
+    );
+    fixture.fragment = fragment
+        .with_calls_observed(
+            vec![FrozenPhysicalCall {
+                site,
+                context,
+                materialized_writer_input: None,
+                effects: declared_effects(
+                    FunctionKind::Table,
+                    CallProofScope::Relation(context.identity),
+                ),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            }],
+            &Control::default(),
+        )
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        fixture.fragment.nodes()[&fixture.primary]
+            .expressions
+            .as_ref()
+            .unwrap(),
+        &original_unit
+    ));
+    validate_fragment_definition(&fixture.fragment).unwrap();
+    fixture
+}
+
 #[test]
 fn borrowed_property_source_and_complete_formulas_keep_actual_admission_exact_replay() {
-    let fixture = scalar_fixture(2, u32::MAX);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = borrowed_source_with_real_relation(&mut fixture_constants);
     let calls = fixture.checked().unwrap();
     for complete in [false, true] {
         let plain = if complete {
             crate::validation::validate_fragment_output_properties_observed(
                 &fixture.fragment,
-                &fixture.uses,
-                &calls,
                 PlanLimits::FROZEN,
                 SOURCE_INVOICE,
                 PROJECTION_LIMITS,
@@ -689,7 +866,6 @@ fn borrowed_property_source_and_complete_formulas_keep_actual_admission_exact_re
             calls
                 .property_proof(
                     &fixture.fragment,
-                    &fixture.uses,
                     &PlanLimits::FROZEN,
                     SOURCE_INVOICE,
                     PROJECTION_LIMITS,
@@ -701,21 +877,15 @@ fn borrowed_property_source_and_complete_formulas_keep_actual_admission_exact_re
         let control = BorrowedProofControl::default();
         let mut maximum = [0; 3];
         let mut captures = 0;
-        let result = borrowed_proof_run(
-            &fixture,
-            &calls,
-            SOURCE_INVOICE,
-            complete,
-            &control,
-            &mut |facts| {
+        let result =
+            borrowed_proof_run(&fixture, SOURCE_INVOICE, complete, &control, &mut |facts| {
                 captures += 1;
                 for (index, value) in borrowed_facts_axes(*facts).into_iter().enumerate() {
                     maximum[index] = maximum[index].max(value);
                 }
                 borrowed_gate(facts, [usize::MAX; 3])
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert!(captures > 0);
         assert!(maximum.iter().all(|value| *value > 0));
         assert_eq!(
@@ -735,14 +905,9 @@ fn borrowed_property_source_and_complete_formulas_keep_actual_admission_exact_re
             SOURCE_INVOICE + result.request_bytes
         );
         let control = BorrowedProofControl::default();
-        borrowed_proof_run(
-            &fixture,
-            &calls,
-            SOURCE_INVOICE,
-            complete,
-            &control,
-            &mut |facts| borrowed_gate(facts, maximum),
-        )
+        borrowed_proof_run(&fixture, SOURCE_INVOICE, complete, &control, &mut |facts| {
+            borrowed_gate(facts, maximum)
+        })
         .unwrap();
         for cause in [
             CompileControlError::Cancelled,
@@ -752,7 +917,7 @@ fn borrowed_property_source_and_complete_formulas_keep_actual_admission_exact_re
             let control = BorrowedProofControl::default();
             let mut at_refusal = None;
             assert!(
-                matches!(borrowed_proof_run(&fixture, &calls, SOURCE_INVOICE, complete, &control,
+                matches!(borrowed_proof_run(&fixture, SOURCE_INVOICE, complete, &control,
                 &mut |_| {
                     assert!(at_refusal.is_none(), "admission after first refusal");
                     at_refusal = Some(control.trace.lock().unwrap().clone());
@@ -766,14 +931,9 @@ fn borrowed_property_source_and_complete_formulas_keep_actual_admission_exact_re
             tight[axis] -= 1;
             let control = BorrowedProofControl::default();
             assert!(matches!(
-                borrowed_proof_run(
-                    &fixture,
-                    &calls,
-                    SOURCE_INVOICE,
-                    complete,
-                    &control,
-                    &mut |facts| borrowed_gate(facts, tight)
-                ),
+                borrowed_proof_run(&fixture, SOURCE_INVOICE, complete, &control, &mut |facts| {
+                    borrowed_gate(facts, tight)
+                }),
                 Err(FragmentPropertyError::Control(
                     CompileControlError::ResourceExhausted
                 ))
@@ -784,15 +944,15 @@ fn borrowed_property_source_and_complete_formulas_keep_actual_admission_exact_re
 
 #[test]
 fn borrowed_property_success_and_ordinary_source_error_keep_every_actual_primary_prefix() {
-    let fixture = scalar_fixture(2, 71);
-    let calls = fixture.checked().unwrap();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(2, 71, &mut fixture_constants);
+    fixture.checked().unwrap();
     for complete in [false, true] {
         for source in [SOURCE_INVOICE, 0] {
             let control = BorrowedProofControl::default();
-            let baseline =
-                borrowed_proof_run(&fixture, &calls, source, complete, &control, &mut |facts| {
-                    borrowed_gate(facts, [usize::MAX; 3])
-                });
+            let baseline = borrowed_proof_run(&fixture, source, complete, &control, &mut |facts| {
+                borrowed_gate(facts, [usize::MAX; 3])
+            });
             if source == 0 {
                 assert!(matches!(
                     baseline,
@@ -814,7 +974,7 @@ fn borrowed_property_success_and_ordinary_source_error_keep_every_actual_primary
                         refusal: Some((at, cause.clone())),
                     };
                     assert!(
-                        matches!(borrowed_proof_run(&fixture, &calls, source, complete, &control,
+                        matches!(borrowed_proof_run(&fixture, source, complete, &control,
                         &mut |facts| borrowed_gate(facts, [usize::MAX; 3])), Err(FragmentPropertyError::Control(actual)) if actual==cause)
                     );
                     assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
@@ -827,15 +987,18 @@ fn borrowed_property_success_and_ordinary_source_error_keep_every_actual_primary
 #[test]
 fn borrowed_property_empty_calls_and_foreign_source_still_use_original_owners() {
     // The original empty Values fixture has no values, expressions or calls;
-    // it has no unreachable definition and still uses real root/flow owners.
+    // it has no unreachable definition or synthetic root/flow owners.
     let fixture = empty_fixture();
     let calls = fixture.checked().unwrap();
     assert!(calls.entries().is_empty());
-    assert!(fixture.uses.bindings().is_empty());
+    assert!(fixture.fragment.nodes().values().all(|node| {
+        node.expressions
+            .as_ref()
+            .is_none_or(|unit| unit.roots().is_empty())
+    }));
     for complete in [false, true] {
         borrowed_proof_run(
             &fixture,
-            &calls,
             SOURCE_INVOICE,
             complete,
             &BorrowedProofControl::default(),
@@ -848,7 +1011,6 @@ fn borrowed_property_empty_calls_and_foreign_source_still_use_original_owners() 
     let proof = calls
         .property_proof_in(
             &fixture.fragment,
-            &fixture.uses,
             &PlanLimits::FROZEN,
             SOURCE_INVOICE,
             PROJECTION_LIMITS,
@@ -862,4 +1024,341 @@ fn borrowed_property_empty_calls_and_foreign_source_still_use_original_owners() 
         Err(FrozenCallError::WrongFragment)
     );
     work.finish().unwrap();
+}
+
+fn append_late_scalar(fixture: &mut Fixture) -> NodeId {
+    use novarocks_expression_contract::{
+        BoundExprSetBuilder, DefinitionControl, ExprPort, RootScope,
+    };
+    let mut parts = fixture.fragment.clone().into_parts();
+    let input = parts.root;
+    let node = NodeId::new(u32::MAX);
+    assert!(!parts.nodes.contains_key(&node));
+    let output = ValueId::new(
+        parts
+            .values
+            .keys()
+            .map(|id| id.get())
+            .max()
+            .unwrap()
+            .checked_add(1)
+            .unwrap(),
+    );
+    let input_node = &parts.nodes[&input];
+    let ports = vec![ExprPort {
+        values: input_node
+            .output
+            .columns
+            .iter()
+            .map(|id| (*id, parts.values[id].ty.clone()))
+            .collect(),
+    }];
+    let required = input_node.output_properties.clone();
+    let mut draft = BoundExprSetBuilder::new(unit_limits());
+    let definition = draft
+        .add(
+            None,
+            boolean(),
+            ExprKind::FunctionCall {
+                function: function(FunctionKind::Scalar, boolean()),
+                args: Box::default(),
+            },
+        )
+        .unwrap();
+    draft.request(definition, zero_argument_request()).unwrap();
+    draft
+        .definition_control(
+            definition,
+            DefinitionControl {
+                shape: ControlShape::Eager,
+                temporal_sources: None,
+            },
+        )
+        .unwrap();
+    let root = draft
+        .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let sealed = draft.seal(ports, &mut work).unwrap();
+    let claims = sealed
+        .uses()
+        .iter()
+        .map(|(&id, invocation)| {
+            let mut claim = scalar_claim(invocation.context);
+            claim.effects.observable_effects.warnings = true;
+            (id, claim)
+        })
+        .collect();
+    let unit = sealed.finish(claims, &mut work).unwrap();
+    work.finish().unwrap();
+    parts.values.insert(
+        output,
+        ValueDef {
+            id: output,
+            ty: boolean(),
+            origin: ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 0,
+            },
+        },
+    );
+    parts.nodes.insert(
+        node,
+        PhysicalNode {
+            id: node,
+            expressions: Some(std::sync::Arc::new(unit)),
+            inputs: Box::from([input]),
+            required_inputs: Box::from([required]),
+            output_properties: properties(),
+            output: OutputPort {
+                node,
+                columns: Box::from([output]),
+            },
+            kind: NodeKind::Project {
+                expressions: Box::from([(root, output)]),
+            },
+        },
+    );
+    parts.root = node;
+    fixture.fragment = parts.into();
+    node
+}
+
+// Real node/port sources isolate the newly metered shallow floor. They are
+// created before the tested control starts and contain no invented calls/CVs.
+fn floor_source(nodes: usize, ports: usize) -> Fixture {
+    let mut builder = FragmentBuilder::new(FragmentId::new(991));
+    let source = NodeId::new(u32::MAX);
+    builder
+        .add_values(source, Box::from([Box::default()]), Box::default())
+        .unwrap();
+    let mut root = source;
+    if ports != 0 {
+        assert_eq!(nodes, 2);
+        root = NodeId::new(0);
+        builder
+            .add_row_consuming(
+                root,
+                vec![source; ports].into_boxed_slice(),
+                RequiredInputs::Singleton,
+                Distribution::Singleton,
+                Box::default(),
+                NodeKind::SetOp {
+                    kind: SetOperationKind::UnionAll,
+                    input_mappings: (0..ports).map(|_| Box::default()).collect(),
+                },
+            )
+            .unwrap();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let draft = novarocks_expression_contract::BoundExprSetBuilder::new(unit_limits());
+        let unit = draft
+            .seal(builder.node_ports(root).unwrap(), &mut work)
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        work.finish().unwrap();
+        builder.install_unit(root, Arc::new(unit)).unwrap();
+    } else {
+        for ordinal in 0..nodes - 1 {
+            let node = NodeId::new(u32::try_from(ordinal).unwrap());
+            builder
+                .add_project(node, root, Box::default(), Box::default())
+                .unwrap();
+            root = node;
+        }
+    }
+    let fragment = builder
+        .finish_definition(
+            root,
+            FragmentSink::Noop,
+            dop(),
+            StagePlacementPolicy::Singleton,
+        )
+        .unwrap()
+        .with_call_requests_observed(vec![], &Control::default())
+        .unwrap()
+        .with_calls_observed(vec![], &Control::default())
+        .unwrap();
+    assert_eq!(fragment.nodes().len(), nodes);
+    Fixture {
+        fragment,
+        primary: root,
+    }
+}
+
+#[test]
+fn shallow_source_floor_counts_inline_relation_header_once() {
+    let fixture = empty_fixture();
+    assert!(
+        fixture
+            .fragment
+            .nodes()
+            .values()
+            .all(|node| node.expressions.is_none())
+    );
+    assert!(fixture.fragment.values().is_empty());
+    assert!(fixture.relations().is_empty());
+    let expected = std::mem::size_of_val(&fixture.fragment)
+        + fixture.fragment.nodes().len() * std::mem::size_of::<(NodeId, PhysicalNode)>();
+    assert_eq!(
+        source_floor(&fixture.fragment, fixture.fragment.calls()).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn source_floor_real_many_ports_observe_quantum_before_index_projection() {
+    let fixture = floor_source(2, 320);
+    assert_eq!(fixture.unit().ports().len(), 320);
+    assert!(fixture.unit().definitions().is_empty());
+    assert!(fixture.unit().claims().is_empty());
+    let run = |control: &ProofControl| {
+        fixture
+            .fragment
+            .calls()
+            .property_proof(
+                &fixture.fragment,
+                &PlanLimits::FROZEN,
+                SOURCE_INVOICE,
+                PROJECTION_LIMITS,
+                control,
+            )
+            .map(|_| ())
+    };
+    let control = ProofControl::default();
+    run(&control).unwrap();
+    let trace = control.trace.lock().unwrap().clone();
+    // The complete floor itself reaches this callback before projection/index
+    // admission. The unmetered source implementation flushes only a short tail.
+    assert_eq!(trace[0], (CompilePhase::Validate, 0));
+    assert_eq!(trace[1], (CompilePhase::Validate, 256));
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let control = ProofControl {
+            refusal: Some((1, cause.clone())),
+            ..Default::default()
+        };
+        assert!(matches!(run(&control),Err(FrozenCallError::Control(actual)) if actual==cause));
+        assert_eq!(*control.trace.lock().unwrap(), trace[..=1]);
+    }
+}
+
+#[test]
+fn source_floor_real_unitless_nodes_finish_before_projection_envelope_refusal() {
+    let fixture = floor_source(320, 0);
+    assert!(
+        fixture
+            .fragment
+            .nodes()
+            .values()
+            .all(|node| node.expressions.is_none())
+    );
+    let projection = PropertyProofProjectionLimits {
+        max_request_bytes: 0,
+        ..PROJECTION_LIMITS
+    };
+    let run = |control: &ProofControl| {
+        fixture
+            .fragment
+            .calls()
+            .property_proof(
+                &fixture.fragment,
+                &PlanLimits::FROZEN,
+                SOURCE_INVOICE,
+                projection,
+                control,
+            )
+            .map(|_| ())
+    };
+    let control = ProofControl::default();
+    assert!(matches!(run(&control), Err(FrozenCallError::TooManyItems)));
+    let trace = control.trace.lock().unwrap().clone();
+    // UnitCounts scans 320 nodes, the shallow source floor scans those same
+    // 320 real nodes as separate actual work, then the envelope refuses.
+    assert_eq!(
+        trace,
+        vec![
+            (CompilePhase::Validate, 0),
+            (CompilePhase::Validate, 256),
+            (CompilePhase::Validate, 256),
+            (CompilePhase::Validate, 137)
+        ]
+    );
+    prefixes(run, false);
+}
+
+#[test]
+fn known_header_refusal_precedes_late_control_for_plain_and_borrowed_proof() {
+    struct LateControl {
+        trace: Mutex<Vec<u32>>,
+        cause: CompileControlError,
+    }
+    impl PureCompileControl for LateControl {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert_eq!(phase, CompilePhase::Validate);
+            self.trace.lock().unwrap().push(units);
+            if units == 0 {
+                Ok(())
+            } else {
+                Err(self.cause.clone())
+            }
+        }
+    }
+    let fixture = floor_source(320, 0);
+    for source_missing in [false, true] {
+        let source = if source_missing { 0 } else { SOURCE_INVOICE };
+        let limits = if source_missing {
+            PlanLimits::FROZEN
+        } else {
+            PlanLimits {
+                fragment_nodes: 319,
+                ..PlanLimits::FROZEN
+            }
+        };
+        for borrowed in [false, true] {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = LateControl {
+                    trace: Mutex::new(vec![]),
+                    cause,
+                };
+                let calls = fixture.fragment.calls();
+                let result = if borrowed {
+                    let mut work =
+                        CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+                    let result = calls
+                        .property_proof_in(
+                            &fixture.fragment,
+                            &limits,
+                            source,
+                            PROJECTION_LIMITS,
+                            &mut |_| Ok(()),
+                            &mut work,
+                        )
+                        .map(|_| ());
+                    finish_frozen_calls(work, result)
+                } else {
+                    calls
+                        .property_proof(
+                            &fixture.fragment,
+                            &limits,
+                            source,
+                            PROJECTION_LIMITS,
+                            &control,
+                        )
+                        .map(|_| ())
+                };
+                assert!(matches!(result, Err(FrozenCallError::TooManyItems)));
+                assert_eq!(*control.trace.lock().unwrap(), vec![0, 0]);
+            }
+        }
+    }
 }

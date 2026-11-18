@@ -23,11 +23,12 @@ use novarocks_functions::{
     ConstantPolicy, FunctionArgument, FunctionBindingRequest, FunctionBindingSelection,
     FunctionKind, FunctionResultType, MAX_CALL_EFFECT_ARGUMENTS,
 };
-use novarocks_physical_plan::{
-    BoundFunction, ConstantPools, ExprArena, ExprId, ExprKind, ExprNode,
-};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType,
+};
+use {
+    novarocks_expression_contract::{BoundFunction, ExprKind, ExprNode},
+    novarocks_physical_plan::{ConstantPools, ExprId},
 };
 
 use super::{
@@ -252,7 +253,7 @@ pub(crate) fn author_physical_scalar_request_from_journal_observed<'source>(
 /// preparation; this leaf observes only its work on the original meter.
 pub(crate) fn author_physical_scalar_request_observed<'a>(
     source: &'a ExprNode,
-    expressions: &ExprArena,
+    expressions: super::unit_source::UnitDefinitions<'_>,
     pools: &ConstantPools,
     literal_policy: ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
@@ -282,7 +283,7 @@ pub(crate) fn author_physical_scalar_request_observed<'a>(
         .try_reserve_exact(args.len())
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     for &id in args {
-        let argument = expressions.get(id);
+        let argument = expressions.definition(id);
         work.step()?;
         let argument = argument.ok_or(PhysicalScalarRequestError::MissingArgument(id))?;
         arguments.push(author_physical_argument_observed(

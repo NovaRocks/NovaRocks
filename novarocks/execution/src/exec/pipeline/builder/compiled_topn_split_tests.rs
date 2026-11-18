@@ -39,24 +39,21 @@ use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
 use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
 use novarocks_local_program::{KernelAbiVersion, LocalProgram, ProgramNodeKind};
 use novarocks_physical_plan::{
-    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprKind,
-    Fragment, FragmentBuilder, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, HashDefinition, HashPartitionScheme, NodeId,
-    NullOrdering, PartitionCountDomain, PartitionCountParameter, PartitionCountParameterId,
-    PartitionSpaceId, PhysicalExpressionRoots, PhysicalPlan, PhysicalRootUses, PipelineDopDomain,
-    PlanBuilder, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort,
-    RowMultiplicity, SortDirection, SortExpr, TopNPhase, TopNSequenceId, ValueId, ValueOrigin,
-    extract_fragment_packages,
+    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource,
+    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink, FrozenFragmentPruning,
+    HashDefinition, HashPartitionScheme, NodeId, NullOrdering, PartitionCountDomain,
+    PartitionCountParameter, PartitionCountParameterId, PartitionSpaceId, PhysicalPlan,
+    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField,
+    ResultPort, RowMultiplicity, SortDirection, SortExpr, TopNPhase, TopNSequenceId, ValueId,
+    ValueOrigin, extract_fragment_packages,
 };
-use novarocks_type_contract::{
-    ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-};
+use novarocks_type_contract::EvaluationDemand;
 use novarocks_types::UniqueId;
 
 use super::aggregate_fixture::PreparedUnitRecording;
@@ -219,7 +216,7 @@ fn assert_window(actual: &[Row], input: &[Row], keys: &[Key], limit: usize, offs
 }
 
 fn sort_exprs(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     columns: [ValueId; 2],
     keys: &[Key],
@@ -227,11 +224,20 @@ fn sort_exprs(
     keys.iter()
         .map(|key| SortExpr {
             expr: builder
-                .add_expression(
-                    node,
+                .unit(node)
+                .unwrap()
+                .add(
+                    None,
                     int64(key.column == 0),
                     ExprKind::Value(columns[key.column]),
                 )
+                .and_then(|definition| {
+                    builder.unit(node).unwrap().root(
+                        definition,
+                        EvaluationDemand::Value,
+                        RootScope::Port(0),
+                    )
+                })
                 .unwrap(),
             direction: if key.ascending {
                 SortDirection::Ascending
@@ -276,7 +282,7 @@ fn hash(key: ValueId) -> Distribution {
 
 /// Imports `(a, b)` of `edge` into `builder` as an ExchangeSource at `node`.
 fn receive(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     edge: EdgeId,
     sources: [ValueId; 2],
@@ -341,7 +347,12 @@ fn edge(
 /// `Values(a, b) -> Stream(Hash[b])` | `ExchangeSource -> Partial TopN ->
 /// Stream(Gather)` | `ExchangeSource -> Final TopN -> Result`.
 fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
-    let mut source = FragmentBuilder::new(SOURCE);
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut source = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        SOURCE,
+        &fixture_sources,
+    );
     let values_node = source.reserve_node_id().unwrap();
     let rows = ROWS
         .iter()
@@ -354,6 +365,7 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         &rows,
     );
     let columns = [columns[0], columns[1]];
+    super::family_fixture::seal_no_call_units(&mut source);
     let source = source
         .finish_definition(
             values_node,
@@ -363,7 +375,11 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         )
         .unwrap();
 
-    let mut partial = FragmentBuilder::new(PARTIAL);
+    let mut partial =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            PARTIAL,
+            &fixture_sources,
+        );
     let partial_receiver = partial.reserve_node_id().unwrap();
     let partial_columns = receive(&mut partial, partial_receiver, HASH_EDGE, columns, |c| {
         hash(c[1])
@@ -381,6 +397,7 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
             TopNPhase::Partial { sequence: SEQUENCE },
         )
         .unwrap();
+    super::family_fixture::seal_no_call_units(&mut partial);
     let partial = partial
         .finish_definition(
             partial_topn,
@@ -390,7 +407,10 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         )
         .unwrap();
 
-    let mut last = FragmentBuilder::new(FINAL);
+    let mut last = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        FINAL,
+        &fixture_sources,
+    );
     let final_receiver = last.reserve_node_id().unwrap();
     let final_columns = receive(
         &mut last,
@@ -410,6 +430,7 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         TopNPhase::Final { sequence: SEQUENCE },
     )
     .unwrap();
+    super::family_fixture::seal_no_call_units(&mut last);
     let last = last
         .finish_definition(
             final_topn,
@@ -420,7 +441,10 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         .unwrap();
     let output = last.nodes()[&final_topn].output.clone();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([83; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([83; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(source).unwrap();
     plan.add_fragment(partial).unwrap();
     plan.add_fragment(last).unwrap();
@@ -463,43 +487,8 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         ]),
     })
     .unwrap();
-    plan.finish()
+    plan.finish_observed(&crate::exec::operators::family_fixture::constant_sources::control())
         .unwrap_or_else(|error| panic!("the split TopN plan validates: {error:?}"))
-}
-
-/// Every root is a literal cell or a value read; each gets one eager use.
-fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(0);
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                domain,
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        novarocks_type_contract::CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap()
 }
 
 // Explicit small-fixture admission; these are test inputs, not defaults.
@@ -516,21 +505,6 @@ fn admission() -> FragmentPackageAdmission {
 }
 
 fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
-    let uses = plan
-        .fragments()
-        .iter()
-        .map(|(id, fragment)| (*id, root_uses(fragment)))
-        .collect::<BTreeMap<_, _>>();
-    let calls = plan
-        .fragments()
-        .iter()
-        .map(|(id, fragment)| {
-            (
-                *id,
-                FrozenFragmentCalls::try_new(fragment, &uses[id], vec![], &FixtureControl).unwrap(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     let pruning = plan
         .fragments()
         .keys()
@@ -550,8 +524,6 @@ fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
         plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,

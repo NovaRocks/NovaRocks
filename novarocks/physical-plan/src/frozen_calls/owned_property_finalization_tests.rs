@@ -62,16 +62,15 @@ fn admission() -> FragmentPackageAdmission {
     }
 }
 fn input(fixture: Fixture, cuts: FragmentCuts) -> FragmentPackageInput {
-    let calls = fixture.checked().unwrap();
+    fixture.checked().unwrap();
     let pruning =
         FrozenFragmentPruning::try_new(fixture.fragment.id(), vec![], &Control::default()).unwrap();
     FragmentPackageInput {
         constants: ConstantPools::empty(),
+        statement_constant_policy: policy(),
         version: PlanVersionId::try_new([17; 16]).unwrap(),
         required: RequiredContracts::default(),
         fragment: fixture.fragment,
-        expression_uses: fixture.uses,
-        calls,
         pruning,
         cuts,
         result: None,
@@ -94,8 +93,6 @@ fn derive(input: &FragmentPackageInput) {
     derive_fragment_output_properties_observed(
         &input.fragment,
         &input.cuts,
-        &input.expression_uses,
-        &input.calls,
         PlanLimits::FROZEN,
         SOURCE,
         PROJECTION,
@@ -143,25 +140,34 @@ fn unconstrained(multiplicity: RowMultiplicity) -> PhysicalProperties {
 #[test]
 fn owned_finalization_repairs_filter_project_repeat_keeps_source_calls_dop_and_fresh_proof() {
     let source = input(unsafe_filter(), FragmentCuts::default());
-    assert!(matches!(
-        FragmentPackage::try_new(source.clone(), admission(), &Control::default()),
-        Err(FragmentPackageError::Calls(
-            FrozenCallError::ReplicaEquivalence(_)
-        ))
-    ));
-    let original_calls = source.calls.entries().clone();
-    let original_bindings = source.expression_uses.bindings().clone();
+    assert!(
+        matches!(FragmentPackage::try_new(source.clone(),admission(),&Control::default()),Err(FragmentPackageError::Calls(FrozenCallError::ReplicaExpression{node,invocation})) if node==NodeId::new(0)&&invocation==ExpressionUseId::new(u32::MAX))
+    );
+    let original_calls = source.fragment.calls().entries().clone();
     let original_dop = source.fragment.dop_domain();
-    let original_exprs = source
-        .fragment
-        .expressions()
-        .iter()
-        .map(|(id, expr)| (*id, expr.clone()))
-        .collect::<Vec<_>>();
+    let original_unit = Arc::clone(
+        source.fragment.nodes()[&NodeId::new(0)]
+            .expressions
+            .as_ref()
+            .unwrap(),
+    );
+    let original_roots = original_unit.root_use_ids().to_vec();
+    let original_exprs = original_unit.definitions().to_vec();
+    let original_claims = original_unit.claims().clone();
+    let original_requests = original_unit.requests().clone();
     let package = finish(&source, &FinalControl::default()).unwrap();
     assert_eq!(package.fragment().dop_domain(), original_dop);
     assert_eq!(package.calls().entries(), &original_calls);
-    assert_eq!(package.expression_uses().bindings(), &original_bindings);
+    let current_unit = package.fragment().nodes()[&NodeId::new(0)]
+        .expressions
+        .as_ref()
+        .unwrap();
+    // The transformed property snapshot retains the original immutable unit Arc,
+    // including its actual construction lifetime and recursive type/CV sources.
+    assert!(Arc::ptr_eq(current_unit, &original_unit));
+    assert_eq!(current_unit.root_use_ids(), original_roots.as_slice());
+    assert_eq!(current_unit.claims(), &original_claims);
+    assert_eq!(current_unit.requests(), &original_requests);
     assert_eq!(
         package.fragment().nodes()[&NodeId::new(u32::MAX)].output_properties,
         broadcast()
@@ -176,10 +182,9 @@ fn owned_finalization_repairs_filter_project_repeat_keeps_source_calls_dop_and_f
             broadcast()
         );
     }
-    for (id, original) in original_exprs {
-        let current = package.fragment().expressions().get(id).unwrap();
+    for original in original_exprs {
+        let current = current_unit.definition(original.id).unwrap();
         assert_eq!(current.id, original.id);
-        assert_eq!(current.owner, original.owner);
         assert_eq!(current.ty, original.ty);
         assert_eq!(current.lambda_scope, original.lambda_scope);
         let (
@@ -197,10 +202,10 @@ fn owned_finalization_repairs_filter_project_repeat_keeps_source_calls_dop_and_f
     }
     let control = FinalControl::default();
     let old_proof = source
-        .calls
+        .fragment
+        .calls()
         .property_proof(
             &source.fragment,
-            &source.expression_uses,
             &PlanLimits::FROZEN,
             SOURCE,
             PROJECTION,
@@ -217,7 +222,6 @@ fn owned_finalization_repairs_filter_project_repeat_keeps_source_calls_dop_and_f
         .calls()
         .property_proof(
             package.fragment(),
-            package.expression_uses(),
             &PlanLimits::FROZEN,
             SOURCE,
             PROJECTION,
@@ -257,7 +261,7 @@ fn owned_finalization_shared_sparse_union_hash_join_stronger_candidate_is_fully_
         package.fragment().nodes()[&NodeId::new(1)].inputs.as_ref(),
         &[NodeId::new(0), NodeId::new(7), NodeId::new(0)]
     );
-    assert_eq!(package.calls().entries(), source.calls.entries());
+    assert_eq!(package.calls().entries(), source.fragment.calls().entries());
     prefixes(&source, true, true);
 }
 

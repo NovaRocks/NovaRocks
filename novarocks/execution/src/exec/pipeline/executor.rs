@@ -1227,28 +1227,44 @@ mod tests {
     }
     #[test]
     fn typed_failure_required_root_preserves_original_sparse_row_journal_and_typed_site() {
+        use crate::exec::expr::compiled_program::tests::{SeedMode, program};
         use crate::runtime::task::{ExecutionFailureCause, RequiredExpressionRowError};
         use novarocks_functions::{RowDataError, Selection};
-        use novarocks_local_program::{
-            ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-        };
-        let site = ProgramExpressionRootSite::Node {
-            node: ProgramNodeId::new(41),
-            role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-        };
+        use novarocks_local_program::ProgramNodeKind;
+        let program = program(SeedMode::Input, false);
+        let (node, site) = program
+            .graph()
+            .nodes()
+            .iter()
+            .find_map(|node| {
+                let ProgramNodeKind::Project { exprs, .. } = node.kind() else {
+                    return None;
+                };
+                exprs.first().map(|site| (node.local_id().unwrap(), *site))
+            })
+            .expect("the actual fixture contains a Project root");
         let error = RowDataError::new(1, "required row error is not a successful SQL NULL");
         let selection = Selection::try_sparse(101, &[0, 50, 100]).unwrap();
-        let required = RequiredExpressionRowError::try_new(site, selection, error.clone()).unwrap();
+        let required =
+            RequiredExpressionRowError::try_new(site.root, selection, error.clone()).unwrap();
         assert_eq!(required.batch_row(), 50);
-        assert_eq!(required.root(), site);
+        assert_eq!(required.root(), site.root);
         assert_eq!(required.error(), &error);
-        let failure = run_typed_failure_source(required.clone().into(), false);
+        let failure = run_typed_failure_source(
+            ExecutionFailure::from(required.clone()).at_expression_node(node),
+            false,
+        );
+        assert_eq!(failure.expression_node(), Some(node));
         assert_eq!(
             failure.cause(),
             &ExecutionFailureCause::RequiredRow(required)
         );
         assert!(matches!(
-            RequiredExpressionRowError::try_new(site, selection, RowDataError::new(3, "outside")),
+            RequiredExpressionRowError::try_new(
+                site.root,
+                selection,
+                RowDataError::new(3, "outside")
+            ),
             Err(novarocks_functions::KernelFailure::Internal(_))
         ));
     }

@@ -21,8 +21,8 @@ use super::numeric_unary_owned_transaction_tests::{batch, producer_root, program
 use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, Decimal128Array, Decimal256Array, Float32Array};
 use arrow::datatypes::DataType;
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
-use novarocks_physical_plan::ExprKind;
 use novarocks_query_application::api::QueryExecutionKind;
 use novarocks_query_application::preparation::{CompletedPhysicalPlanCandidate, OutputContract};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -132,15 +132,19 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
     assert_eq!(computed.output, original.original_port().output);
     let mut casts = 0;
     for fragment in source.plan().fragments().values() {
-        for (_, node) in fragment.expressions().iter() {
-            if let ExprKind::Cast { expr, target, .. } = &node.kind {
-                let operand = fragment.expressions().get(*expr).unwrap();
-                if *operand.ty.data_type() == dtype && target == &DataType::Float32 {
-                    casts += 1;
-                    assert!(!operand.ty.nullable());
-                    assert!(node.ty.nullable());
-                    // Cast target is a DataType, not a second root-nullability declaration.
-                    assert_eq!(&node.ty.data_type().clone(), target);
+        for physical in fragment.nodes().values() {
+            let Some(unit) = fragment.unit(physical.id) else {
+                continue;
+            };
+            for node in unit.definitions() {
+                if let ExprKind::Cast { expr, target, .. } = &node.kind {
+                    let operand = unit.definition(*expr).unwrap();
+                    if *operand.ty.data_type() == dtype && target == &DataType::Float32 {
+                        casts += 1;
+                        assert!(!operand.ty.nullable());
+                        assert!(node.ty.nullable());
+                        assert_eq!(&node.ty.data_type().clone(), target);
+                    }
                 }
             }
         }
@@ -165,7 +169,12 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
         vec![Some(0), Some(4), Some(-4), Some(1)],
     );
     let data = batch(&program, root, values.clone());
-    let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
+    let mut frame = CompiledExpressionInstance::try_new(
+        program.unit(root.unit).unwrap().clone(),
+        root.root,
+        &Control,
+    )
+    .unwrap();
     let selected = frame.evaluate(&data, Selection::all(4), &Control).unwrap();
     assert!(selected.errors().is_empty());
     let expected = expected_bits(wide, scale);
@@ -216,9 +225,7 @@ fn decimal_float32_sql_explicit_cast_nonnegative_decimal128_and_decimal256_prese
 fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_preserve_infinity() {
     use arrow::datatypes::Schema;
     use arrow::record_batch::{RecordBatch, RecordBatchOptions};
-    use novarocks_local_program::{
-        ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind,
-    };
+    use novarocks_local_program::ProgramNodeKind;
     use std::sync::Arc;
     // The point makes this a genuine decimal token; >38 digits is authored
     // Decimal256 by the original analyzer, not a retagged scan or guessed CV.
@@ -237,7 +244,12 @@ fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_p
                     novarocks_physical_plan::NodeKind::Scan { .. }
                 ));
             }
-            for (_, expression) in fragment.expressions().iter() {
+            for expression in fragment
+                .nodes()
+                .values()
+                .filter_map(|node| fragment.unit(node.id))
+                .flat_map(|unit| unit.definitions())
+            {
                 if matches!(expression.ty.data_type(), DataType::Decimal256(p, s) if *p > 38 && *s == 1)
                 {
                     actual_wide += 1;
@@ -260,52 +272,30 @@ fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_p
         // documented empty one-row port. No alternate graph is constructed.
         let mut selected = None;
         for program in lowered.values() {
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            for &site in snapshot.bindings().keys() {
-                if matches!(
-                    site,
-                    ProgramExpressionRootSite::Node {
-                        role: ProgramNodeExpressionRole::ProjectOutput { .. },
-                        ..
+            for node in program.graph().nodes() {
+                if let ProgramNodeKind::Project { exprs, .. } = node.kind() {
+                    for &site in exprs {
+                        assert!(selected.is_none());
+                        selected = Some((program.clone(), node.local_id().unwrap(), site));
                     }
-                ) {
-                    assert!(selected.is_none());
-                    selected = Some((program.clone(), site));
                 }
             }
         }
         if selected.is_none() {
             for program in lowered.values() {
-                let snapshot = program
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .resolved_calls()
-                    .snapshot();
-                for &site in snapshot.bindings().keys() {
-                    if matches!(
-                        site,
-                        ProgramExpressionRootSite::Node {
-                            role: ProgramNodeExpressionRole::ValuesCell { .. },
-                            ..
+                for node in program.graph().nodes() {
+                    if let ProgramNodeKind::Values { values } = node.kind() {
+                        for cell in values.dynamic_cells() {
+                            assert!(selected.is_none());
+                            selected =
+                                Some((program.clone(), node.local_id().unwrap(), cell.definition));
                         }
-                    ) {
-                        assert!(selected.is_none());
-                        selected = Some((program.clone(), site));
                     }
                 }
             }
         }
-        let (program, root) =
+        let (program, node, root) =
             selected.expect("actual SQL literal Cast must retain a runtime projection/cell");
-        let ProgramExpressionRootSite::Node { node, role } = root else {
-            unreachable!()
-        };
         let empty_one_row = |schema: Arc<Schema>| {
             assert!(
                 schema.fields().is_empty(),
@@ -318,17 +308,10 @@ fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_p
             )
             .unwrap()
         };
-        let port = match role {
-            ProgramNodeExpressionRole::ProjectOutput { .. } => {
-                let ProgramNodeKind::Project { input, .. } =
-                    program.graph().nodes()[node.index()].kind()
-                else {
-                    unreachable!()
-                };
+        let port = match program.graph().nodes()[node.index()].kind() {
+            ProgramNodeKind::Project { input, .. } => {
                 let parent = &program.graph().nodes()[input.index()];
                 match parent.kind() {
-                    // If the actual optimizer authored a materialized VALUES
-                    // input, consume its original checked batch directly.
                     ProgramNodeKind::Values { values } => match values.batch() {
                         Some(batch) => batch.clone(),
                         None => empty_one_row(parent.output_layout().schema().clone()),
@@ -336,12 +319,23 @@ fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_p
                     _ => empty_one_row(parent.output_layout().schema().clone()),
                 }
             }
-            ProgramNodeExpressionRole::ValuesCell { .. } => {
-                empty_one_row(Arc::new(Schema::empty()))
+            ProgramNodeKind::Values { .. } => {
+                let unit = program.unit(root.unit).unwrap();
+                empty_one_row(
+                    unit.scope(unit.root(root.root).unwrap().scope)
+                        .unwrap()
+                        .schema()
+                        .clone(),
+                )
             }
             _ => unreachable!(),
         };
-        let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(root.unit).unwrap().clone(),
+            root.root,
+            &Control,
+        )
+        .unwrap();
         let output = frame.evaluate(&port, Selection::all(1), &Control).unwrap();
         assert!(output.errors().is_empty());
         let value = output

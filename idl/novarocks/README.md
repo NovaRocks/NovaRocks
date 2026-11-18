@@ -28,25 +28,30 @@ is the NIDL-0 baseline; later NIDL tasks add the staged packages below.
 
 ## Ownership
 
-- This repository-level directory is the long-term, language-neutral source of
-  the NovaRocks-native wire contract. It is not a staging location to be moved
-  into a Rust crate.
-- `novarocks-proto` is the sole Rust owner of generated DTOs and the native
-  descriptor set.
-- Frontend owns semantic encoding from its private plan to these DTOs; Backend
-  owns wire validation and semantic decoding to its private execution domain.
-- Core's `novarocks::proto` facade is transitional transport compatibility.
-  It re-exports protocol DTOs and does not generate a second native DTO tree.
+- 本目录是长期维护的、语言中立的 native wire 契约来源；生成 Rust DTO 与 descriptor
+  的唯一 owner 是 `novarocks/proto-models`。
+- `novarocks/plan-codec` 拥有 frozen package 的类型化投影；FE 编码与 BE preparation
+  消费同一契约。Native Adapter 拥有 RPC/DTO 边界，Worker 拥有 Task 生命周期；
+  wire 消息不授予函数、Provider 或运行能力。
 
 ## Package layout
 
-- `novarocks` (service.proto) — RPC envelope package: the `NovaRocksGrpc`
-  service and its envelope messages only. The package name is fixed: it is the
-  gRPC wire path (`/novarocks.NovaRocksGrpc/*`); renaming it is a wire change.
-- `novarocks.common` (common.proto) — UniqueId, Status, TypeDesc. [NIDL-3]
-- `novarocks.expr` (expr.proto) — recursive Expr. [NIDL-3]
-- `novarocks.plan` (plan.proto) — DistributedPlan/PlanFragment/PlanNode. [NIDL-3]
-- `novarocks.filter` (filter.proto) — runtime filter / lookup. [NIDL-2]
+- `novarocks`（`service.proto`）：native gRPC envelope 与 `NovaRocksGrpc`，RPC 路径保持
+  `/novarocks.NovaRocksGrpc/*`；FrozenFragment 只携带 opaque package。
+- `novarocks.physical_package_v2`（`physical_package_v2.proto`）：唯一静态 package，
+  共享 types、constants、function/aggregate bindings、provider facts 与关系声明。
+- `novarocks.physical_type_v2`、`novarocks.physical_control_v2`、
+  `novarocks.physical_semantics_v2`：完整类型、表达式控制与冻结语义。
+- `novarocks.call_request`（`call_request.proto`）：原始调用请求、常量策略与 pool 引用。
+- `novarocks.plan`（`execution_shared.proto`）：保留的 RF/执行共享消息；该 namespace
+  不表示存在旧计划树 decoder。`expr.proto`、`plan.proto` 已不在本目录。
+- `novarocks.common`、`novarocks.filter` 等其余专属 package 保持各自原事实 owner。
+
+计划修订号 27 在 `PhysicalNode.expressions`（字段 30）承载单元，保存端口、定义、根、
+控制、标量声明与请求。类型、常量与函数绑定表由 package 共享。窗口使用关系调用，
+帧偏移直接引用常量。退役的 fragment 表达式表和 package 控制字段的名称及编号均保留，
+原 codec 边界拒绝退役载荷。原生兼容身份使用修订号 27 与当前描述符摘要，epoch 为 15。详见
+[ADR-0238](../../docs/adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)。
 
 ## Tag discipline
 

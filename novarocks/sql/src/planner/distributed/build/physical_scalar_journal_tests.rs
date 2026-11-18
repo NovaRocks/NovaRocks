@@ -67,10 +67,32 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn source<'a>(owner: &'a SqlAuthoredPhysicalPlan, id: &str) -> (&'a Fragment, &'a ExprNode) {
-    owner.plan().fragments().values().find_map(|fragment| fragment.expressions().iter().find_map(|(_, expression)| {
-        matches!(&expression.kind, ExprKind::FunctionCall { function, .. } if function.function_id.as_str().contains(id)).then_some((fragment, expression))
-    })).expect("actual emitted call")
+fn source<'a>(
+    owner: &'a SqlAuthoredPhysicalPlan,
+    id: &str,
+) -> (
+    &'a Fragment,
+    &'a novarocks_physical_plan::PhysicalNode,
+    &'a ExprNode,
+) {
+    owner
+        .plan()
+        .fragments()
+        .values()
+        .find_map(|fragment| {
+            fragment.nodes().values().find_map(|node| {
+                node.expressions
+                    .as_ref()?
+                    .definitions()
+                    .iter()
+                    .find_map(|expression| {
+                        matches!(&expression.kind, ExprKind::FunctionCall { function, .. }
+                    if function.function_id.as_str().contains(id))
+                        .then_some((fragment, node, expression))
+                    })
+            })
+        })
+        .expect("actual emitted node-local call")
 }
 #[derive(Debug)]
 enum Error {
@@ -102,12 +124,14 @@ impl From<PhysicalScalarRequestError> for Error {
 fn probe<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     fragment: &'a Fragment,
+    node: &'a novarocks_physical_plan::PhysicalNode,
     source: &'a ExprNode,
     control: &dyn PureCompileControl,
 ) -> Result<AuthoredPhysicalScalarRequest<'a>, Error> {
     let mut work = CompileCheckpoints::try_new(control, PHASE)?;
     let result = (|| {
-        let entry = owner.checked_expression_call_source_observed(fragment, source, &mut work)?;
+        let entry =
+            owner.checked_expression_call_source_observed(fragment, node, source, &mut work)?;
         author_physical_scalar_request_from_journal_observed(&entry, &mut work).map_err(Error::from)
     })();
     if matches!(&result, Err(Error::Control(_))) {
@@ -140,12 +164,12 @@ fn emitted_cv(
 #[test]
 fn scalar_journal_borrows_original_request_slice_selection_and_nonzero_cv_backing() {
     let (owner, pool, field) = selected_owner();
-    let (fragment, expression) = source(&owner, "lower");
-    let request = probe(&owner, fragment, expression, &Control::default()).unwrap();
+    let (fragment, node, expression) = source(&owner, "lower");
+    let request = probe(&owner, fragment, node, expression, &Control::default()).unwrap();
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
     let entry = owner
-        .checked_expression_call_source_observed(fragment, expression, &mut work)
+        .checked_expression_call_source_observed(fragment, node, expression, &mut work)
         .unwrap();
     let canonical = entry.canonical_operational().unwrap();
     assert!(std::ptr::eq(
@@ -174,7 +198,7 @@ fn scalar_journal_borrows_original_request_slice_selection_and_nonzero_cv_backin
     );
     work.finish().unwrap();
     let clone = owner.clone();
-    let again = probe(&clone, fragment, expression, &Control::default()).unwrap();
+    let again = probe(&clone, fragment, node, expression, &Control::default()).unwrap();
     assert!(std::ptr::eq(
         request.request().arguments,
         again.request().arguments
@@ -199,13 +223,19 @@ fn scalar_journal_keeps_original_none_for_cast_and_nested_physical_constants() {
         },
     ] {
         let owner = authored(lower(argument, DecimalOverflowPolicy::OutputNull));
-        let (fragment, expression) = source(&owner, "lower");
-        let request = probe(&owner, fragment, expression, &Control::default()).unwrap();
+        let (fragment, node, expression) = source(&owner, "lower");
+        let request = probe(&owner, fragment, node, expression, &Control::default()).unwrap();
         let ExprKind::FunctionCall { args, .. } = &expression.kind else {
             unreachable!()
         };
         assert!(matches!(
-            &fragment.expressions().get(args[0]).unwrap().kind,
+            &node
+                .expressions
+                .as_ref()
+                .unwrap()
+                .definition(args[0])
+                .unwrap()
+                .kind,
             ExprKind::Constant(_)
         ));
         assert!(cv(&request.request().arguments[0]).is_none());
@@ -218,7 +248,7 @@ fn scalar_journal_keeps_original_none_for_cast_and_nested_physical_constants() {
         let mut work = CompileCheckpoints::try_new(&direct_control, PHASE).unwrap();
         let direct = author_physical_scalar_request_observed(
             expression,
-            fragment.expressions(),
+            super::super::unit_source::UnitDefinitions::from_node(node),
             owner.plan().constants(),
             policy(),
             &mut work,
@@ -259,8 +289,8 @@ fn scalar_journal_conversion_retains_original_none_and_true_intermediate_constra
         },
         value_type: FunctionValueType::new(DataType::LargeUtf8, false),
     });
-    let (fragment, expression) = source(&owner, "value_domain_conversion");
-    let request = probe(&owner, fragment, expression, &Control::default()).unwrap();
+    let (fragment, node, expression) = source(&owner, "value_domain_conversion");
+    let request = probe(&owner, fragment, node, expression, &Control::default()).unwrap();
     let FunctionArgument::Value {
         value_type,
         constant,
@@ -281,7 +311,14 @@ fn scalar_journal_conversion_retains_original_none_and_true_intermediate_constra
     let ExprKind::FunctionCall { args, .. } = &expression.kind else {
         unreachable!()
     };
-    let ExprKind::Constant(reference) = fragment.expressions().get(args[0]).unwrap().kind else {
+    let ExprKind::Constant(reference) = node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .definition(args[0])
+        .unwrap()
+        .kind
+    else {
         panic!("conversion physical source CV")
     };
     let emitted = emitted_cv(&owner, reference);
@@ -299,11 +336,11 @@ fn scalar_journal_canonical_null_loans_actual_typed_cv_without_retagging_origina
         },
         DecimalOverflowPolicy::OutputNull,
     ));
-    let (fragment, expression) = source(&owner, "lower");
+    let (fragment, node, expression) = source(&owner, "lower");
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
     let entry = owner
-        .checked_expression_call_source_observed(fragment, expression, &mut work)
+        .checked_expression_call_source_observed(fragment, node, expression, &mut work)
         .unwrap();
     let original = cv(&entry.captured().request().arguments[0]).unwrap();
     let request = author_physical_scalar_request_from_journal_observed(&entry, &mut work).unwrap();
@@ -324,7 +361,14 @@ fn scalar_journal_canonical_null_loans_actual_typed_cv_without_retagging_origina
     let ExprKind::FunctionCall { args, .. } = &expression.kind else {
         unreachable!()
     };
-    let ExprKind::Constant(reference) = fragment.expressions().get(args[0]).unwrap().kind else {
+    let ExprKind::Constant(reference) = node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .definition(args[0])
+        .unwrap()
+        .kind
+    else {
         unreachable!()
     };
     let emitted = emitted_cv(&owner, reference);
@@ -339,11 +383,11 @@ fn scalar_journal_canonical_null_loans_actual_typed_cv_without_retagging_origina
 #[test]
 fn scalar_journal_foreign_source_and_every_actual_callback_preserve_original_causes() {
     let (owner, _, _) = selected_owner();
-    let (fragment, expression) = source(&owner, "lower");
+    let (fragment, node, expression) = source(&owner, "lower");
     let foreign = expression.clone();
     for actual in [expression, &foreign] {
         let baseline = Control::default();
-        let result = probe(&owner, fragment, actual, &baseline);
+        let result = probe(&owner, fragment, node, actual, &baseline);
         if std::ptr::eq(actual, expression) {
             assert!(result.is_ok());
         } else {
@@ -362,7 +406,7 @@ fn scalar_journal_foreign_source_and_every_actual_callback_preserve_original_cau
                     ..Control::default()
                 };
                 assert!(
-                    matches!(probe(&owner, fragment, actual, &control), Err(Error::Control(actual)) if actual == cause)
+                    matches!(probe(&owner, fragment, node, actual, &control), Err(Error::Control(actual)) if actual == cause)
                 );
                 assert_eq!(control.trace(), trace[..=stop]);
             }
@@ -370,7 +414,13 @@ fn scalar_journal_foreign_source_and_every_actual_callback_preserve_original_cau
     }
     let (other_owner, _, _) = selected_owner();
     assert!(matches!(
-        probe(&other_owner, fragment, expression, &Control::default()),
+        probe(
+            &other_owner,
+            fragment,
+            node,
+            expression,
+            &Control::default()
+        ),
         Err(Error::Journal(SqlSourceJournalError::InvalidSource(_)))
     ));
 }
@@ -380,11 +430,11 @@ fn scalar_journal_real_sql_retains_actual_catalogue_and_none_after_cast() {
     let owner = crate::compiler::compile_authored_aggregate_for_test(
         "SELECT LOWER(CAST(order_key AS VARCHAR)) AS lower_key FROM orders",
     );
-    let (fragment, expression) = source(&owner, "lower");
+    let (fragment, node, expression) = source(&owner, "lower");
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
     let entry = owner
-        .checked_expression_call_source_observed(fragment, expression, &mut work)
+        .checked_expression_call_source_observed(fragment, node, expression, &mut work)
         .unwrap();
     assert!(Arc::ptr_eq(
         entry.function_catalog(),

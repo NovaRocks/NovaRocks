@@ -36,11 +36,12 @@ use crate::runtime::{
 };
 use arrow::{array::ArrayRef, record_batch::RecordBatch};
 use novarocks_execution_contract::TaskIdentity;
+use novarocks_expression::evaluator_view::{UnitStateTemplate, state_template};
 use novarocks_functions::{
     AggregateStateAllocator, EvaluatedArgument, InvocationScalarEvaluationInstance,
     ScalarEvaluationInstance, ScalarInvocationActivation, SelectedValues, Selection,
 };
-use novarocks_local_program::{LocalProgram, ProgramExpressionRootSite, ProgramStateTemplate};
+use novarocks_local_program::{LocalProgram, ProgramRootRef};
 use std::sync::Arc;
 
 fn task_state(
@@ -74,7 +75,7 @@ fn control(state: &RuntimeState) -> RuntimeKernelControl {
 /// Executes the original production common helper and its single Frame.
 pub struct RuntimeScalarFrameForTest {
     instance: CompiledExpressionInstance,
-    site: ProgramExpressionRootSite,
+    site: ProgramRootRef,
     control: RuntimeKernelControl,
     _state: Arc<RuntimeState>,
 }
@@ -83,7 +84,7 @@ impl RuntimeScalarFrameForTest {
     /// original Frame caches the same host Arc used for instance birth.
     pub fn try_new_with_allocation_host(
         program: Arc<LocalProgram>,
-        site: ProgramExpressionRootSite,
+        site: ProgramRootRef,
         runtime: Arc<ExecutionRuntime>,
         task: TaskIdentity,
         memory: Option<QueryMemoryBinding>,
@@ -95,9 +96,12 @@ impl RuntimeScalarFrameForTest {
                 .mem_tracker()
                 .ok_or_else(|| fixture_failure("task state has no actual allocation tracker"))?,
         );
+        let unit = program.unit(site.unit).ok_or_else(|| {
+            fixture_failure("frame fixture has no actual compiled expression unit")
+        })?;
         let instance = CompiledExpressionInstance::try_new_with_allocator(
-            program,
-            site,
+            unit.clone(),
+            site.root,
             &control,
             control.allocator(),
         )?;
@@ -110,14 +114,17 @@ impl RuntimeScalarFrameForTest {
     }
     pub fn try_new(
         program: Arc<LocalProgram>,
-        site: ProgramExpressionRootSite,
+        site: ProgramRootRef,
         runtime: Arc<ExecutionRuntime>,
         task: TaskIdentity,
         memory: Option<QueryMemoryBinding>,
     ) -> ExecutionResult<Self> {
         let state = task_state(runtime, task, memory)?;
         let control = control(&state);
-        let instance = CompiledExpressionInstance::try_new(program, site, &control)?;
+        let unit = program.unit(site.unit).ok_or_else(|| {
+            fixture_failure("frame fixture has no actual compiled expression unit")
+        })?;
+        let instance = CompiledExpressionInstance::try_new(unit.clone(), site.root, &control)?;
         Ok(Self {
             instance,
             site,
@@ -150,7 +157,7 @@ pub struct RuntimeInvocationWrapperForTest {
 impl RuntimeInvocationWrapperForTest {
     pub fn try_new(
         program: &LocalProgram,
-        site: ProgramExpressionRootSite,
+        site: ProgramRootRef,
         runtime: Arc<ExecutionRuntime>,
         task: TaskIdentity,
         memory: Option<QueryMemoryBinding>,
@@ -162,17 +169,14 @@ impl RuntimeInvocationWrapperForTest {
                 .mem_tracker()
                 .ok_or_else(|| fixture_failure("task state has no actual allocation tracker"))?,
         );
+        let unit = program
+            .unit(site.unit)
+            .ok_or_else(|| fixture_failure("wrapper fixture has no whole-invocation occurrence"))?;
         let mut selected = None;
-        for call in program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()
-            .values()
-        {
-            if let ProgramStateTemplate::ScalarInvocation { scope, kernel } = call.state_template()
-                && scope.root == site
+        for &occurrence in unit.calls().keys() {
+            if let Some(UnitStateTemplate::ScalarInvocation { scope, kernel }) =
+                state_template(unit, occurrence)
+                && scope.root == site.root
                 && selected.replace(Arc::clone(kernel)).is_some()
             {
                 return Err(fixture_failure(
@@ -250,24 +254,21 @@ pub struct RuntimeScalarWrapperForTest {
 impl RuntimeScalarWrapperForTest {
     pub fn try_new(
         program: &LocalProgram,
-        site: ProgramExpressionRootSite,
+        site: ProgramRootRef,
         runtime: Arc<ExecutionRuntime>,
         task: TaskIdentity,
         memory: Option<QueryMemoryBinding>,
     ) -> ExecutionResult<Self> {
         let state = task_state(runtime, task, memory)?;
         let control = control(&state);
+        let unit = program
+            .unit(site.unit)
+            .ok_or_else(|| fixture_failure("wrapper fixture has no scalar occurrence"))?;
         let mut selected = None;
-        for call in program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()
-            .values()
-        {
-            if let ProgramStateTemplate::Scalar { scope, kernel } = call.state_template()
-                && scope.root == site
+        for &occurrence in unit.calls().keys() {
+            if let Some(UnitStateTemplate::Scalar { scope, kernel }) =
+                state_template(unit, occurrence)
+                && scope.root == site.root
                 && selected.replace(Arc::clone(kernel)).is_some()
             {
                 return Err(fixture_failure(

@@ -18,12 +18,18 @@
 // Full checked compiler fixtures use actual builtin owners. They do not thaw
 // ExprArena or claim Server catalogue, host allocation, or native integration.
 use super::CompiledExpressionInstance;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::{
     array::{Array, BooleanArray, Decimal128Array, Float64Array, Int64Array},
     datatypes::DataType,
     record_batch::RecordBatch,
 };
 use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression::CompiledExprSet;
+use novarocks_expression_contract::{
+    BoundFunction, DefinitionControl, ExprId, ExprKind, ExpressionCallClaim, PhysicalCallRequest,
+    RootScope, SealedUnit,
+};
 use novarocks_functions::{
     CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
     FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
@@ -34,22 +40,16 @@ use novarocks_functions::{
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
-use novarocks_local_program::{
-    KernelAbiVersion, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeId,
-};
+use novarocks_local_program::{KernelAbiVersion, LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_physical_plan::{
-    BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
-    FragmentPackage, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPhysicalCall, LiteralValue, NodeId, PhysicalCallSite,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts,
+    FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageInput, FragmentSink,
+    FrozenFragmentPruning, NodeId, PipelineDopDomain, PlanVersionId, RequiredContracts,
     ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    DomainGuard, EvaluationDemand, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    FunctionValueType, PureCompileControl, SemanticParameters, control_argument_semantics,
+    CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
+    DecimalOverflowPolicy, EvaluationDemand, ExpressionInvocation, FunctionValueType,
+    PureCompileControl, SemanticParameters,
 };
 use std::{
     collections::BTreeMap,
@@ -159,10 +159,15 @@ pub(crate) struct Author {
     arguments: Vec<FunctionArgument>,
     logical_argument_count: usize,
     constant_policy: ConstantPolicy,
+    decimal_policy: DecimalOverflowPolicy,
     expected_result_type: Option<FunctionValueType>,
     pub(crate) shape: ControlShape,
 }
 impl Author {
+    pub(crate) fn with_decimal_policy(mut self, policy: DecimalOverflowPolicy) -> Self {
+        self.decimal_policy = policy;
+        self
+    }
     fn request(&self) -> FunctionBindingRequest<'_> {
         FunctionBindingRequest {
             arguments: &self.arguments,
@@ -179,16 +184,12 @@ impl Author {
 }
 // Transfer the first resolver request; physical child shapes are not request sources.
 fn original_request_sources(
-    fragment: Fragment,
+    builder: &mut FragmentBuilder,
+    author_node: NodeId,
     authors: &BTreeMap<ExprId, Author>,
-) -> (Fragment, novarocks_physical_plan::ConstantPools) {
-    use novarocks_physical_plan::{
-        ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallDefinition,
-        PhysicalCallRequest, StaticFunctionArgument,
-    };
-    let mut pools = ConstantPools::empty();
-    let mut backing_ids = BTreeMap::new();
-    let mut entries = vec![];
+    mut pools: novarocks_physical_plan::ConstantPools,
+) -> novarocks_physical_plan::ConstantPools {
+    use novarocks_physical_plan::StaticFunctionArgument;
     for (&definition, owner) in authors {
         let original = owner.request();
         let arguments = original
@@ -200,17 +201,7 @@ fn original_request_sources(
                     constant,
                 } => {
                     let constant = constant.as_ref().map(|value| {
-                        let identity = value.pool().backing_identity();
-                        let pool = *backing_ids.entry(identity).or_insert_with(|| {
-                            let id =
-                                ConstantPoolId::new(u32::try_from(pools.entries().len()).unwrap());
-                            pools.insert(id, value.pool().clone()).unwrap();
-                            id
-                        });
-                        ConstantReference {
-                            pool,
-                            ordinal: value.ordinal(),
-                        }
+                        crate::exec::expr::test_support::register_constant(&mut pools, value)
                     });
                     StaticFunctionArgument::Value {
                         value_type: value_type.clone(),
@@ -227,22 +218,21 @@ fn original_request_sources(
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        entries.push((
-            PhysicalCallDefinition::Expression(definition),
-            PhysicalCallRequest {
-                arguments,
-                logical_argument_count: original.logical_argument_count,
-                expected_result_type: original.expected_result_type.cloned(),
-                constant_policy: owner.constant_policy,
-            },
-        ));
+        builder
+            .unit(author_node)
+            .unwrap()
+            .request(
+                definition,
+                PhysicalCallRequest {
+                    arguments,
+                    logical_argument_count: original.logical_argument_count,
+                    expected_result_type: original.expected_result_type.cloned(),
+                    constant_policy: owner.constant_policy,
+                },
+            )
+            .unwrap();
     }
-    (
-        fragment
-            .with_call_requests_observed(entries, &Control)
-            .unwrap(),
-        pools,
-    )
+    pools
 }
 fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
     ConstantValue::from_i64(
@@ -323,7 +313,7 @@ fn author_with_target(
         kind: bound.kind,
         argument_types: selected.argument_types.clone(),
         result_type: result.clone(),
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: bound.semantics.volatility,
             argument_evaluation: bound.semantics.argument_evaluation,
             failure_behavior: bound.semantics.failure_behavior,
@@ -337,6 +327,7 @@ fn author_with_target(
         arguments,
         logical_argument_count,
         constant_policy: options().constants,
+        decimal_policy: DecimalOverflowPolicy::ReportError,
         expected_result_type,
         shape,
     }
@@ -348,8 +339,10 @@ pub(crate) fn call(
     args: Vec<ExprId>,
 ) -> ExprId {
     let expr = builder
-        .add_expression(
-            NodeId::new(0),
+        .unit(NodeId::new(0))
+        .unwrap()
+        .add(
+            None,
             owner.result(),
             ExprKind::FunctionCall {
                 function: owner.function.clone(),
@@ -361,146 +354,8 @@ pub(crate) fn call(
     expr
 }
 
-struct FlowAuthor {
-    next_use: u32,
-    next_domain: u32,
-    uses: Vec<ExpressionInvocation<ExprId>>,
-    domains: Vec<ExpressionEvaluationDomain>,
-}
-impl FlowAuthor {
-    fn new() -> Self {
-        Self {
-            next_use: 7,
-            next_domain: 8,
-            uses: vec![],
-            domains: vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(u32::MAX),
-                parent: None,
-                guard: None,
-            }],
-        }
-    }
-    fn visit(
-        &mut self,
-        fragment: &Fragment,
-        authors: &BTreeMap<ExprId, Author>,
-        expr: ExprId,
-        domain: EvaluationDomainId,
-        demand: EvaluationDemand,
-    ) -> ExpressionUseId {
-        let id = ExpressionUseId::new(self.next_use);
-        self.next_use += 17;
-        let definition = fragment.expressions().get(expr).unwrap();
-        let mut case_args = Vec::new();
-        let temporal = if let ExprKind::FunctionCall { args, .. } = &definition.kind {
-            if let ControlShape::TemporalSource(shape) = authors[&expr].shape {
-                let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
-                    &Control,
-                    CompilePhase::FunctionSpecialization,
-                )
-                .unwrap();
-                Some(
-                    novarocks_physical_plan::temporal_source_definitions_observed(
-                        shape.kind(),
-                        fragment.expressions(),
-                        args,
-                        &mut work,
-                    )
-                    .unwrap(),
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let (shape, args) = match &definition.kind {
-            ExprKind::FunctionCall { .. } if authors[&expr].shape == ControlShape::NoArguments => {
-                (ControlShape::NoArguments, &[][..])
-            }
-            ExprKind::FunctionCall { args, .. } => {
-                temporal
-                    .as_ref()
-                    .map_or((authors[&expr].shape, args.as_ref()), |source| {
-                        (
-                            ControlShape::TemporalSource(source.facts.shape()),
-                            source.definitions.as_ref(),
-                        )
-                    })
-            }
-            ExprKind::Value(_) | ExprKind::Literal(_) | ExprKind::Constant(_) => {
-                (ControlShape::Eager, &[][..])
-            }
-            ExprKind::Binary { left, right, .. } => {
-                case_args.extend([*left, *right]);
-                (ControlShape::Eager, case_args.as_slice())
-            }
-            ExprKind::Conjunction { args } => (ControlShape::Conjunction, args.as_ref()),
-            ExprKind::Disjunction { args } => (ControlShape::Disjunction, args.as_ref()),
-            ExprKind::Unary {
-                expr,
-                op: novarocks_physical_plan::UnaryOperator::Not,
-            }
-            | ExprKind::IsNull { expr, .. }
-            | ExprKind::Cast { expr, .. } => (ControlShape::Eager, std::slice::from_ref(expr)),
-            ExprKind::Case {
-                operand,
-                when_then,
-                else_expr,
-            } => {
-                if let Some(operand) = operand {
-                    case_args.push(*operand);
-                }
-                for (when, then) in when_then {
-                    case_args.extend([*when, *then]);
-                }
-                if let Some(otherwise) = else_expr {
-                    case_args.push(*otherwise);
-                }
-                (
-                    ControlShape::Case {
-                        simple: operand.is_some(),
-                        arms: u32::try_from(when_then.len()).unwrap(),
-                        has_else: else_expr.is_some(),
-                    },
-                    case_args.as_slice(),
-                )
-            }
-            other => panic!("fixture lacks exact control author for {other:?}"),
-        };
-        let mut children = vec![];
-        for (ordinal, &child) in args.iter().enumerate() {
-            let (child_demand, guard) =
-                control_argument_semantics(shape, args.len(), ordinal, demand).unwrap();
-            let child_domain = if let Some(kind) = guard {
-                let child_domain = EvaluationDomainId::new(self.next_domain);
-                self.next_domain += 13;
-                self.domains.push(ExpressionEvaluationDomain {
-                    id: child_domain,
-                    parent: Some(domain),
-                    guard: Some(DomainGuard { owner: id, kind }),
-                });
-                child_domain
-            } else {
-                domain
-            };
-            children.push(self.visit(fragment, authors, child, child_domain, child_demand));
-        }
-        self.uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                domain,
-                demand,
-            },
-            definition: expr,
-            control: shape,
-            arguments: children.into_boxed_slice(),
-        });
-        id
-    }
-}
-
 fn program(shape: Shape) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(shape);
     let fragment_id = FragmentId::new(193);
     let source = NodeId::new(u32::MAX);
@@ -532,16 +387,30 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         // Checked typed NULL source definitions establish the actual input
         // layout; evaluation receives the complete matching Arrow input port.
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
+            .unwrap();
+        let root = builder
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .insert_value(ValueDef {
                 id,
                 ty,
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr { node: input, root },
             })
             .unwrap();
-        items.push((expr, id));
+        items.push((root, id));
         output_values.push(id);
     }
     builder
@@ -554,11 +423,15 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         .unwrap();
     let mut authors = BTreeMap::new();
     let flag_expr = builder
-        .add_expression(output, bool_type.clone(), ExprKind::Value(flag))
+        .unit(output)
+        .unwrap()
+        .add(None, bool_type.clone(), ExprKind::Value(flag))
         .unwrap();
     let root = if matches!(shape, Shape::Random) {
         let seed_expr = builder
-            .add_expression(output, integer.clone(), ExprKind::Value(seed))
+            .unit(output)
+            .unwrap()
+            .add(None, integer.clone(), ExprKind::Value(seed))
             .unwrap();
         let from_column = call(
             &mut builder,
@@ -572,10 +445,15 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             vec![seed_expr],
         );
         let null = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 floating.clone(),
-                ExprKind::Literal(LiteralValue::Null),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(floating.clone()), options().constants),
+                ),
             )
             .unwrap();
         let conditional = call(
@@ -594,10 +472,15 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             vec![flag_expr, from_column, null],
         );
         let literal_seed = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 scalar_integer.clone(),
-                ExprKind::Literal(LiteralValue::Int64(42)),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::i64(&(scalar_integer.clone()), 42, options().constants),
+                ),
             )
             .unwrap();
         let from_constant = call(
@@ -624,16 +507,25 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         )
     } else {
         let value = builder
-            .add_expression(output, decimal.clone(), ExprKind::Value(decimal_value))
+            .unit(output)
+            .unwrap()
+            .add(None, decimal.clone(), ExprKind::Value(decimal_value))
             .unwrap();
         let fallback_expr = builder
-            .add_expression(output, decimal.clone(), ExprKind::Value(fallback))
+            .unit(output)
+            .unwrap()
+            .add(None, decimal.clone(), ExprKind::Value(fallback))
             .unwrap();
         let digits = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 scalar_integer.clone(),
-                ExprKind::Literal(LiteralValue::Int64(-1)),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::i64(&(scalar_integer.clone()), -1, options().constants),
+                ),
             )
             .unwrap();
         let rounded = call(
@@ -681,13 +573,15 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         )
     };
     let result_type = authors[&root].result();
+    let root = builder
+        .unit(output)
+        .unwrap()
+        .root(root, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let result_value = builder
         .add_value(
             result_type.clone(),
-            ValueOrigin::Expr {
-                node: output,
-                expr: root,
-            },
+            ValueOrigin::Expr { node: output, root },
         )
         .unwrap();
     builder
@@ -698,9 +592,296 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             Box::from([result_value]),
         )
         .unwrap();
+    let result = ResultPort {
+        scalar_schema: None,
+        fragment: fragment_id,
+        output: builder.construction_node(output).unwrap().output.clone(),
+        fields: Box::from([ResultField {
+            domain: crate::test_result_domain::result_value_domain(&result_type),
+            name: "guarded_result".into(),
+            alias: None,
+            value: result_value,
+            ty: result_type,
+        }]),
+    };
+    compile_checked_fragment(&functions, builder, output, &authors, result, source_pools)
+}
+
+pub(crate) fn finish_fixture_units(
+    functions: &PureEngineFunctionCatalog,
+    builder: &mut FragmentBuilder,
+    author_node: NodeId,
+    authors: &BTreeMap<ExprId, Author>,
+    parameters: &SemanticParameters,
+    source_pools: novarocks_physical_plan::ConstantPools,
+    mut primitive_effects: impl FnMut(
+        &SealedUnit,
+        &ExpressionInvocation<ExprId>,
+        ScopedExpressionEffects,
+    ) -> ScopedExpressionEffects,
+) -> novarocks_physical_plan::ConstantPools {
+    let constants = original_request_sources(builder, author_node, authors, source_pools);
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    for (&definition, owner) in authors {
+        let temporal_sources = if let ControlShape::TemporalSource(shape) = owner.shape {
+            let draft = builder.construction_unit(author_node).unwrap();
+            let ExprKind::FunctionCall { args, .. } = &draft.definition(definition).unwrap().kind
+            else {
+                panic!("original temporal call definition")
+            };
+            Some(
+                novarocks_expression_contract::temporal_source_definitions_from_lookup_observed(
+                    shape.kind(),
+                    |id| draft.definition(id),
+                    args,
+                    &mut work,
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        builder
+            .unit(author_node)
+            .unwrap()
+            .definition_control(
+                definition,
+                DefinitionControl {
+                    shape: owner.shape,
+                    temporal_sources,
+                },
+            )
+            .unwrap();
+    }
+    let nodes = builder
+        .construction_nodes()
+        .map(|(&node, _)| node)
+        .filter(|node| builder.construction_unit(*node).is_some())
+        .collect::<Vec<_>>();
+    for node in nodes {
+        let ports = builder.node_ports(node).unwrap();
+        let sealed = builder
+            .take_unit_builder(node)
+            .unwrap()
+            .seal(ports, &mut work)
+            .unwrap();
+        let flow = sealed.control_flow();
+        let mut summaries = BTreeMap::new();
+        let mut claims = BTreeMap::new();
+        // Consume only the SDK's actual root/argument graph. Use IDs remain
+        // opaque and never determine dependency or preparation order.
+        let mut pending = sealed
+            .root_use_ids()
+            .iter()
+            .rev()
+            .map(|&id| (id, false))
+            .collect::<Vec<_>>();
+        let mut ordered = Vec::new();
+        while let Some((id, complete)) = pending.pop() {
+            if complete {
+                ordered.push(id);
+            } else {
+                pending.push((id, true));
+                for &child in sealed.uses()[&id].arguments.iter().rev() {
+                    pending.push((child, false));
+                }
+            }
+            work.step().unwrap();
+        }
+        for id in ordered {
+            let invocation = &sealed.uses()[&id];
+            let context = invocation.context;
+            let mut children = ScopedExpressionEffects::pure_value(context);
+            for (ordinal, child) in invocation.arguments.iter().enumerate() {
+                children = children
+                    .join_control_argument(summaries[child], flow, ordinal)
+                    .unwrap();
+            }
+            let owner = if node == author_node {
+                authors.get(&invocation.definition)
+            } else {
+                None
+            };
+            let summary = if let Some(owner) = owner {
+                let argument_uses = if owner.shape == ControlShape::NoArguments {
+                    vec![None; owner.logical_argument_count]
+                } else {
+                    invocation
+                        .arguments
+                        .iter()
+                        .map(|id| Some(*id))
+                        .collect::<Vec<_>>()
+                };
+                let preparation = if matches!(
+                    owner.shape,
+                    ControlShape::If | ControlShape::Coalesce | ControlShape::TemporalSource(_)
+                ) {
+                    PureCallPreparation::ControlIntrinsic {
+                        arguments: children,
+                    }
+                } else {
+                    PureCallPreparation::Scalar {
+                        arguments: children,
+                    }
+                };
+                let source_plan = sealed.temporal_source(context.use_id).cloned();
+                let source_channels = source_plan
+                    .as_ref()
+                    .map(|source| {
+                        source
+                            .sources
+                            .iter()
+                            .map(|channel| novarocks_functions::TemporalSourceChannel {
+                                role: channel.role,
+                                context: flow.uses()[&channel.use_id].context,
+                                value_type: &sealed.definition(channel.definition).unwrap().ty,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let definition = sealed.definition(invocation.definition).unwrap();
+                let ExprKind::FunctionCall { args, .. } = &definition.kind else {
+                    panic!("actual authored call")
+                };
+                let regexp_count_pattern_source =
+                    if owner.function.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
+                        Some(
+                            novarocks_expression_contract::regexp_count_pattern_source_observed(
+                                sealed.definitions(),
+                                args,
+                                &mut work,
+                            )
+                            .unwrap(),
+                        )
+                    } else {
+                        None
+                    };
+                let to_base64_byte_source =
+                    if owner.function.function_id.as_str() == "builtin.scalar/to_base64/v1" {
+                        Some(
+                            novarocks_expression_contract::to_base64_byte_source_observed(
+                                sealed.definitions(),
+                                args,
+                                &mut work,
+                            )
+                            .unwrap(),
+                        )
+                    } else {
+                        None
+                    };
+                let token = functions
+                    .prepare_fresh(
+                        CallEffectInput {
+                            context: context.into(),
+                            argument_uses: match &source_plan {
+                                Some(source) => {
+                                    novarocks_functions::CallArgumentUses::TemporalSources {
+                                        facts: &source.facts,
+                                        channels: &source_channels,
+                                    }
+                                }
+                                None => match regexp_count_pattern_source {
+                                    Some(source) => {
+                                        novarocks_functions::CallArgumentUses::RegexpCountPattern {
+                                            source,
+                                            channels: &argument_uses,
+                                        }
+                                    }
+                                    None => match to_base64_byte_source {
+                                        Some(source) => {
+                                            novarocks_functions::CallArgumentUses::ToBase64Bytes {
+                                                source,
+                                                channels: &argument_uses,
+                                            }
+                                        }
+                                        None => {
+                                            novarocks_functions::CallArgumentUses::SelectedChannels(
+                                                &argument_uses,
+                                            )
+                                        }
+                                    },
+                                },
+                            },
+                            function_id: &owner.function.function_id,
+                            kind: FunctionKind::Scalar,
+                            selected: owner.selected.as_ref(),
+                            request: owner.request(),
+                            environment: &[],
+                            parameters,
+                            decimal_overflow_policy: owner.decimal_policy,
+                            proof_scope: CallProofScope::Region(context.region),
+                        },
+                        owner.selected.clone(),
+                        preparation,
+                        &Control,
+                    )
+                    .unwrap();
+                claims.insert(
+                    context.use_id,
+                    ExpressionCallClaim {
+                        context,
+                        effects: token.call_contract().effects().clone(),
+                        decimal_overflow_policy: owner.decimal_policy,
+                        regexp_count_pattern_source,
+                        to_base64_byte_source,
+                        temporal_source: source_plan,
+                    },
+                );
+                ScopedExpressionEffects::primitive(
+                    context,
+                    token.effects().for_use(context).unwrap(),
+                )
+            } else {
+                primitive_effects(&sealed, invocation, children)
+            };
+            summaries.insert(context.use_id, summary);
+        }
+        let unit = sealed.finish(claims, &mut work).unwrap();
+        builder.install_unit(node, Arc::new(unit)).unwrap();
+    }
+    work.finish().unwrap();
+    constants
+}
+fn compile_checked_fragment(
+    functions: &PureEngineFunctionCatalog,
+    builder: FragmentBuilder,
+    root_node: NodeId,
+    authors: &BTreeMap<ExprId, Author>,
+    result: ResultPort,
+    source_pools: novarocks_physical_plan::ConstantPools,
+) -> Arc<LocalProgram> {
+    compile_checked_fragment_with_parameters(
+        functions,
+        builder,
+        root_node,
+        authors,
+        result,
+        SemanticParameters::try_new([]).unwrap(),
+        source_pools,
+    )
+}
+pub(crate) fn compile_checked_fragment_with_parameters(
+    functions: &PureEngineFunctionCatalog,
+    mut builder: FragmentBuilder,
+    root_node: NodeId,
+    authors: &BTreeMap<ExprId, Author>,
+    result: ResultPort,
+    parameters: SemanticParameters,
+    source_pools: novarocks_physical_plan::ConstantPools,
+) -> Arc<LocalProgram> {
+    let fragment_id = builder.id();
+    let constants = finish_fixture_units(
+        functions,
+        &mut builder,
+        root_node,
+        authors,
+        &parameters,
+        source_pools,
+        |_, _, children| children,
+    );
     let fragment = builder
         .finish_definition(
-            output,
+            root_node,
             FragmentSink::Result,
             PipelineDopDomain {
                 min: 1,
@@ -710,270 +891,6 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let result = ResultPort {
-        scalar_schema: None,
-        fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
-        fields: Box::from([ResultField {
-            domain: crate::test_result_domain::result_value_domain(&result_type),
-            name: "guarded_result".into(),
-            alias: None,
-            value: result_value,
-            ty: result_type,
-        }]),
-    };
-    compile_checked_fragment(&functions, fragment, &authors, result)
-}
-
-fn compile_checked_fragment(
-    functions: &PureEngineFunctionCatalog,
-    fragment: Fragment,
-    authors: &BTreeMap<ExprId, Author>,
-    result: ResultPort,
-) -> Arc<LocalProgram> {
-    compile_checked_fragment_with_parameters(
-        functions,
-        fragment,
-        authors,
-        result,
-        SemanticParameters::try_new([]).unwrap(),
-    )
-}
-pub(crate) fn compile_checked_fragment_with_parameters(
-    functions: &PureEngineFunctionCatalog,
-    fragment: Fragment,
-    authors: &BTreeMap<ExprId, Author>,
-    result: ResultPort,
-    parameters: SemanticParameters,
-) -> Arc<LocalProgram> {
-    let (fragment, constants) = original_request_sources(fragment, authors);
-    let fragment_id = fragment.id();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let mut flow_author = FlowAuthor::new();
-    let mut bindings = vec![];
-    for (&site, root) in roots.sites() {
-        let id = flow_author.visit(
-            &fragment,
-            authors,
-            root.expr,
-            EvaluationDomainId::new(u32::MAX),
-            root.demand,
-        );
-        bindings.push((site, id));
-    }
-    let ordered_uses = flow_author.uses;
-    let flow = ExpressionControlFlow::try_new(
-        flow_author.domains,
-        ordered_uses.clone(),
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow.clone(), bindings, &Control).unwrap();
-    let mut summaries = BTreeMap::new();
-    let mut frozen = vec![];
-    for invocation in ordered_uses {
-        let context = invocation.context;
-        let scoped = if let Some(owner) = authors.get(&invocation.definition) {
-            let mut children = ScopedExpressionEffects::pure_value(context);
-            for (ordinal, child) in invocation.arguments.iter().enumerate() {
-                children = if matches!(
-                    owner.shape,
-                    ControlShape::If | ControlShape::Coalesce | ControlShape::TemporalSource(_)
-                ) {
-                    children
-                        .join_control_argument(summaries[child], &flow, ordinal)
-                        .unwrap()
-                } else {
-                    children.join_same_domain(summaries[child]).unwrap()
-                };
-            }
-            let argument_uses = if owner.shape == ControlShape::NoArguments {
-                vec![None; owner.logical_argument_count]
-            } else {
-                invocation
-                    .arguments
-                    .iter()
-                    .map(|id| Some(*id))
-                    .collect::<Vec<_>>()
-            };
-            let preparation = if matches!(
-                owner.shape,
-                ControlShape::If | ControlShape::Coalesce | ControlShape::TemporalSource(_)
-            ) {
-                PureCallPreparation::ControlIntrinsic {
-                    arguments: children,
-                }
-            } else {
-                PureCallPreparation::Scalar {
-                    arguments: children,
-                }
-            };
-            let source_plan = if let ControlShape::TemporalSource(shape) = invocation.control {
-                let source = fragment.expressions().get(invocation.definition).unwrap();
-                let ExprKind::FunctionCall { args, .. } = &source.kind else {
-                    panic!("source call");
-                };
-                let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
-                    &Control,
-                    CompilePhase::FunctionSpecialization,
-                )
-                .unwrap();
-                let projected = novarocks_physical_plan::temporal_source_definitions_observed(
-                    shape.kind(),
-                    fragment.expressions(),
-                    args,
-                    &mut work,
-                )
-                .unwrap();
-                Some(novarocks_type_contract::TemporalSourcePlan {
-                    facts: projected.facts,
-                    sources: projected
-                        .definitions
-                        .iter()
-                        .zip(&invocation.arguments)
-                        .enumerate()
-                        .map(|(ordinal, (&definition, &use_id))| {
-                            novarocks_type_contract::TemporalSourceOccurrence {
-                                role: shape.roles()[ordinal].unwrap(),
-                                definition,
-                                use_id,
-                            }
-                        })
-                        .collect(),
-                })
-            } else {
-                None
-            };
-            let source_channels = source_plan
-                .as_ref()
-                .map(|source| {
-                    source
-                        .sources
-                        .iter()
-                        .map(|channel| novarocks_functions::TemporalSourceChannel {
-                            role: channel.role,
-                            context: flow.uses()[&channel.use_id].context,
-                            value_type: &fragment.expressions().get(channel.definition).unwrap().ty,
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let regexp_count_pattern_source =
-                if owner.function.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
-                    let definition = fragment.expressions().get(invocation.definition).unwrap();
-                    let ExprKind::FunctionCall { args, .. } = &definition.kind else {
-                        panic!("count actual call source")
-                    };
-                    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
-                        &Control,
-                        CompilePhase::FunctionSpecialization,
-                    )
-                    .unwrap();
-                    let source = novarocks_physical_plan::regexp_count_pattern_source_observed(
-                        fragment.expressions(),
-                        args,
-                        &mut work,
-                    )
-                    .unwrap();
-                    work.finish().unwrap();
-                    Some(source)
-                } else {
-                    None
-                };
-            let to_base64_byte_source =
-                if owner.function.function_id.as_str() == "builtin.scalar/to_base64/v1" {
-                    let definition = fragment.expressions().get(invocation.definition).unwrap();
-                    let ExprKind::FunctionCall { args, .. } = &definition.kind else {
-                        panic!("base64 actual call source")
-                    };
-                    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
-                        &Control,
-                        CompilePhase::FunctionSpecialization,
-                    )
-                    .unwrap();
-                    let source = novarocks_physical_plan::to_base64_byte_source_observed(
-                        fragment.expressions(),
-                        args,
-                        &mut work,
-                    )
-                    .unwrap();
-                    work.finish().unwrap();
-                    Some(source)
-                } else {
-                    None
-                };
-            let token = functions
-                .prepare_fresh(
-                    CallEffectInput {
-                        context,
-                        argument_uses: match &source_plan {
-                            Some(source) => {
-                                novarocks_functions::CallArgumentUses::TemporalSources {
-                                    facts: &source.facts,
-                                    channels: &source_channels,
-                                }
-                            }
-                            None => match regexp_count_pattern_source {
-                                Some(source) => {
-                                    novarocks_functions::CallArgumentUses::RegexpCountPattern {
-                                        source,
-                                        channels: &argument_uses,
-                                    }
-                                }
-                                None => match to_base64_byte_source {
-                                    Some(source) => {
-                                        novarocks_functions::CallArgumentUses::ToBase64Bytes {
-                                            source,
-                                            channels: &argument_uses,
-                                        }
-                                    }
-                                    None => {
-                                        novarocks_functions::CallArgumentUses::SelectedChannels(
-                                            &argument_uses,
-                                        )
-                                    }
-                                },
-                            },
-                        },
-                        function_id: &owner.function.function_id,
-                        kind: FunctionKind::Scalar,
-                        selected: owner.selected.as_ref(),
-                        request: owner.request(),
-                        environment: &[],
-                        parameters: &parameters,
-                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(context.domain),
-                    },
-                    owner.selected.clone(),
-                    preparation,
-                    &Control,
-                )
-                .unwrap();
-            frozen.push(FrozenPhysicalCall {
-                materialized_writer_input: None,
-                site: PhysicalCallSite::Expression(context.use_id),
-                context,
-                effects: token.call_contract().effects().clone(),
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                regexp_count_pattern_source,
-                to_base64_byte_source,
-                temporal_source: source_plan,
-            });
-            token.effects()
-        } else {
-            let mut joined = ScopedExpressionEffects::pure_value(context);
-            for (ordinal, child) in invocation.arguments.iter().enumerate() {
-                joined = joined
-                    .join_control_argument(summaries[child], &flow, ordinal)
-                    .unwrap();
-            }
-            joined
-        };
-        summaries.insert(context.use_id, scoped);
-    }
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, frozen, &Control).unwrap();
     let package = Arc::new(
         FragmentPackage::try_new(
             FragmentPackageInput {
@@ -981,8 +898,7 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                 required: RequiredContracts::default(),
                 constants,
                 fragment,
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: options().constants,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters,
@@ -1009,14 +925,25 @@ pub(crate) fn compile_checked_fragment_with_parameters(
         .unwrap(),
     )
 }
-fn root() -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(2),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-    }
+fn root(program: &LocalProgram) -> ProgramRootRef {
+    let ProgramNodeKind::Project { exprs, .. } =
+        program.graph().nodes()[program.graph().root().index()].kind()
+    else {
+        panic!("actual output Project")
+    };
+    exprs[0]
+}
+fn root_unit(program: &LocalProgram) -> &Arc<CompiledExprSet> {
+    program.unit(root(program).unit).unwrap()
 }
 fn instance(program: &Arc<LocalProgram>) -> CompiledExpressionInstance {
-    CompiledExpressionInstance::try_new(program.clone(), root(), &Control).unwrap()
+    let reference = root(program);
+    CompiledExpressionInstance::try_new(
+        program.unit(reference.unit).unwrap().clone(),
+        reference.root,
+        &Control,
+    )
+    .unwrap()
 }
 fn batch(program: &LocalProgram, flags: Vec<Option<bool>>, seeds: Vec<Option<i64>>) -> RecordBatch {
     RecordBatch::try_new(
@@ -1313,14 +1240,19 @@ fn causes() -> [KernelFailure; 7] {
 fn every_guarded_constructor_callback_preserves_all_original_failure_categories() {
     let program = program(Shape::Random);
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-    let _ = CompiledExpressionInstance::try_new(program.clone(), root(), &recorder).unwrap();
+    let _ = CompiledExpressionInstance::try_new(
+        root_unit(&program).clone(),
+        root(&program).root,
+        &recorder,
+    )
+    .unwrap();
     let trace = recorder.trace.lock().unwrap().clone();
     assert!(!trace.is_empty());
     for index in 1..=trace.len() {
         for cause in causes() {
             let control = CallbackControl::new(cause.clone(), index);
             assert!(
-                matches!(CompiledExpressionInstance::try_new(program.clone(), root(), &control), Err(actual) if actual == cause)
+                matches!(CompiledExpressionInstance::try_new(root_unit(&program).clone(), root(&program).root, &control), Err(actual) if actual == cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
         }
@@ -1432,13 +1364,7 @@ fn constant_entry_reuses_actual_prepared_if_coalesce_and_declines_rand() {
         ConstantNode, ConstantNodeOutcome, DeclineReason, evaluate_constant_node,
     };
     let program = program(Shape::Random);
-    let calls = program
-        .expressions()
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .calls();
+    let calls = root_unit(&program).calls();
     for (identity, cases) in [
         (
             "builtin.scalar/if/v1",
@@ -1460,7 +1386,6 @@ fn constant_entry_reuses_actual_prepared_if_coalesce_and_declines_rand() {
             .values()
             .find(|call| call.call_contract().function_id().as_str() == identity)
             .unwrap()
-            .specialization()
             .prepared();
         let selected = prepared.call_contract().selected();
         let FunctionResultType::Scalar(result) = &selected.result_type else {
@@ -1519,7 +1444,6 @@ fn constant_entry_reuses_actual_prepared_if_coalesce_and_declines_rand() {
         .values()
         .find(|call| call.call_contract().function_id().as_str() == "builtin.scalar/rand/v1")
         .unwrap()
-        .specialization()
         .prepared();
     let FunctionResultType::Scalar(result) = &rand.call_contract().selected().result_type else {
         panic!("scalar rand");
@@ -1568,17 +1492,11 @@ fn constant_entry_strict_null_skips_creation_and_opaque_requirement_declines_bef
         }
     }
     let program = program(Shape::Decimal);
-    let actual = program
-        .expressions()
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
+    let actual = root_unit(&program)
         .calls()
         .values()
         .find(|call| call.call_contract().function_id().as_str() == "builtin.scalar/round/v1")
         .unwrap()
-        .specialization()
         .prepared();
     let PreparedPureKernel::Scalar(actual) = actual else {
         panic!("actual scalar ROUND owner")

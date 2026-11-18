@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::contract_lowering::{NodeExpressionEffects, node_effects_with_test_summaries};
 use super::super::{
     expression_occurrences::{AuthoredPhysicalOccurrences, author_physical_occurrences_observed},
     physical_aggregate_requests::{
@@ -28,28 +29,38 @@ use super::super::{
 };
 use super::*;
 use crate::functions::build_builtin_engine_function_catalog;
+use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
 use arrow::{
     array::{Array, Int64Array},
     datatypes::{DataType, Field},
 };
 use novarocks_functions::{
     AggregateKernelPhase, ConstantPolicy, ConstantPool, EngineFunctionCatalog, FunctionArgument,
-    FunctionResultType, PreparedPureKernel, PureCallPreparation,
-};
-use novarocks_physical_plan::{
-    AggregateBinding, AggregateCallId, AggregateGrouping, AggregatePhase, AggregateSequenceId,
-    BinaryOperator, BoundFunction, ConstantPoolId, ConstantPools, ConstantReference, Distribution,
-    ExprId, ExprKind, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, NodeId, NodeKind,
-    NullOrdering, OrderedComparisonAlgorithm, OutputPort, PhysicalProperties, PipelineDopDomain,
-    PlanLimits, RowMultiplicity, SortDirection, SortExpr, TopNPhase, TopNReduction, TopNSequenceId,
-    ValueId, ValueOrigin,
+    FunctionResultType, PreparedPureKernel, PureCallPreparation, ScopedExpressionEffects,
+    ScopedRelationalEffects,
 };
 use novarocks_type_contract::{
-    AggregateStateFormatId, CompilePhase, ExpressionEffectContext, FunctionInstanceState,
-    FunctionIntrinsicRowError, FunctionNullBehavior, FunctionValueType, PureCompileControl,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterValue,
+    AggregateStateFormatId, CompilePhase, EvaluationDemand, ExpressionEffectContext,
+    FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior, FunctionValueType,
+    PureCompileControl, RelationEffectContext, SemanticParameterId, SemanticParameterKey,
+    SemanticParameterValue,
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+use {
+    novarocks_expression_contract::{
+        BinaryOperator, BoundFunction, ExprKind, RootOrdinal, RootScope,
+    },
+    novarocks_physical_plan::{
+        AggregateBinding, AggregateCallId, AggregateGrouping, AggregatePhase, AggregateSequenceId,
+        ConstantPoolId, ConstantPools, ConstantReference, Distribution, ExprId, FragmentId,
+        FragmentSink, NodeId, NodeKind, NullOrdering, OrderedComparisonAlgorithm, OutputPort,
+        PhysicalProperties, PipelineDopDomain, PlanLimits, RowMultiplicity, SortDirection,
+        SortExpr, TopNPhase, TopNReduction, TopNSequenceId, ValueId, ValueOrigin,
+    },
+};
 
 const PHASE: CompilePhase = CompilePhase::FunctionSpecialization;
 const CAUSES: [CompileControlError; 3] = [
@@ -156,7 +167,7 @@ fn binding(
             kind: r.kind,
             argument_types: r.selected.argument_types,
             result_type,
-            legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
                 volatility: r.semantics.volatility,
                 argument_evaluation: r.semantics.argument_evaluation,
                 failure_behavior: r.semantics.failure_behavior,
@@ -183,6 +194,7 @@ struct Fixture {
     pools: ConstantPools,
     catalog: EngineFunctionCatalog,
     owner: NodeId,
+    effects: BTreeMap<NodeId, NodeExpressionEffects>,
 }
 impl Fixture {
     fn new(
@@ -215,23 +227,24 @@ impl Fixture {
         let v = if matches!(source, Source::Star) {
             b.add_values(
                 leaf,
-                Box::from([Box::<[ExprId]>::default()]),
+                Box::from([Box::<[RootOrdinal]>::default()]),
                 Box::default(),
             )
             .unwrap();
             None
         } else {
-            let seed = b
-                .add_expression(
-                    leaf,
-                    t.clone(),
-                    ExprKind::Literal(if t.nullable() {
-                        LiteralValue::Null
-                    } else {
-                        LiteralValue::Int64(11)
-                    }),
-                )
-                .unwrap();
+            let seed = constant(
+                &mut b,
+                &mut pools,
+                leaf,
+                t.clone(),
+                if t.nullable() {
+                    checked::null()
+                } else {
+                    checked::i64(11)
+                },
+            );
+            let seed_root = root(&mut b, leaf, seed, RootScope::AllPorts);
             let v = b
                 .add_value(
                     t.clone(),
@@ -241,7 +254,7 @@ impl Fixture {
                     },
                 )
                 .unwrap();
-            b.add_values(leaf, Box::from([Box::from([seed])]), Box::from([v]))
+            b.add_values(leaf, Box::from([Box::from([seed_root])]), Box::from([v]))
                 .unwrap();
             Some(v)
         };
@@ -249,29 +262,29 @@ impl Fixture {
             Source::Star => None,
             Source::Value => Some(ExprKind::Value(v.unwrap())),
             Source::Literal => Some(if *t.data_type() == DataType::Utf8 {
-                ExprKind::Literal(LiteralValue::Utf8("中国".into()))
+                constant_kind(&mut pools, &t, checked::utf8("中国".into()))
             } else {
-                ExprKind::Literal(LiteralValue::Int64(7))
+                constant_kind(&mut pools, &t, checked::i64(7))
             }),
             Source::Pool => Some(ExprKind::Constant(ConstantReference {
                 pool: ConstantPoolId::new(u32::MAX),
                 ordinal: 1,
             })),
             Source::ChildError => {
-                let a = b
-                    .add_expression(
-                        owner,
-                        ty(DataType::Int64, false),
-                        ExprKind::Literal(LiteralValue::Int64(i64::MAX)),
-                    )
-                    .unwrap();
-                let c = b
-                    .add_expression(
-                        owner,
-                        ty(DataType::Int64, false),
-                        ExprKind::Literal(LiteralValue::Int64(1)),
-                    )
-                    .unwrap();
+                let a = constant(
+                    &mut b,
+                    &mut pools,
+                    owner,
+                    ty(DataType::Int64, false),
+                    checked::i64(i64::MAX),
+                );
+                let c = constant(
+                    &mut b,
+                    &mut pools,
+                    owner,
+                    ty(DataType::Int64, false),
+                    checked::i64(1),
+                );
                 let add = b
                     .add_expression(
                         owner,
@@ -295,12 +308,8 @@ impl Fixture {
                         },
                     )
                     .unwrap();
-                let yes = b
-                    .add_expression(owner, t.clone(), ExprKind::Literal(LiteralValue::Int64(1)))
-                    .unwrap();
-                let no = b
-                    .add_expression(owner, t.clone(), ExprKind::Literal(LiteralValue::Int64(2)))
-                    .unwrap();
+                let yes = constant(&mut b, &mut pools, owner, t.clone(), checked::i64(1));
+                let no = constant(&mut b, &mut pools, owner, t.clone(), checked::i64(2));
                 Some(ExprKind::Case {
                     operand: None,
                     when_then: Box::from([(test, yes)]),
@@ -329,26 +338,6 @@ impl Fixture {
                 );
         }
         alter(&mut binding);
-        let arguments: Box<[ExprId]> = if matches!(source, Source::Star) {
-            Box::default()
-        } else {
-            Box::from([arg.unwrap()])
-        };
-        let keys: Box<[SortExpr]> = (0..order)
-            .map(|i| SortExpr {
-                expr: arg.unwrap(),
-                direction: if i % 2 == 0 {
-                    SortDirection::Descending
-                } else {
-                    SortDirection::Ascending
-                },
-                null_ordering: if i % 2 == 0 {
-                    NullOrdering::First
-                } else {
-                    NullOrdering::Last
-                },
-            })
-            .collect();
         let mut calls = Vec::new();
         let mut output = Vec::new();
         for at in 0..n {
@@ -370,16 +359,36 @@ impl Fixture {
             };
             let out = b.add_value(outtype, origin).unwrap();
             output.push(out);
+            let arguments = arg
+                .into_iter()
+                .map(|id| root(&mut b, owner, id, RootScope::Port(0)))
+                .collect();
+            let keys = (0..order)
+                .map(|i| SortExpr {
+                    expr: root(&mut b, owner, arg.unwrap(), RootScope::Port(0)),
+                    direction: if i % 2 == 0 {
+                        SortDirection::Descending
+                    } else {
+                        SortDirection::Ascending
+                    },
+                    null_ordering: if i % 2 == 0 {
+                        NullOrdering::First
+                    } else {
+                        NullOrdering::Last
+                    },
+                })
+                .collect();
             calls.push(AggregateCall {
                 id,
                 binding: binding.clone(),
-                arguments: arguments.clone(),
+                arguments,
                 distinct: false,
-                order_by: keys.clone(),
+                order_by: keys,
                 output: out,
             });
         }
         b.insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: owner,
             inputs: Box::from([leaf]),
             required_inputs: Box::from([props()]),
@@ -395,11 +404,15 @@ impl Fixture {
             },
         })
         .unwrap();
+        let effects = seal_fixture_units(&mut b, &pools, &catalog);
+        let fragment = finish(b, owner);
+        checked::merge(&mut pools, fragment.constants());
         Self {
-            fragment: finish(b, owner),
+            fragment,
             pools,
             catalog,
             owner,
+            effects,
         }
     }
     fn node(&self) -> &PhysicalNode {
@@ -422,6 +435,104 @@ impl Fixture {
             .unwrap()
     }
 }
+
+fn constant_kind(
+    pools: &mut ConstantPools,
+    ty: &FunctionValueType,
+    source: checked::Source,
+) -> ExprKind {
+    checked::insert(pools, source(ty))
+}
+fn constant(
+    builder: &mut FragmentBuilder,
+    pools: &mut ConstantPools,
+    node: NodeId,
+    ty: FunctionValueType,
+    source: checked::Source,
+) -> ExprId {
+    let kind = constant_kind(pools, &ty, source);
+    builder.add_expression(node, ty, kind).unwrap()
+}
+fn root(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    definition: ExprId,
+    scope: RootScope,
+) -> RootOrdinal {
+    builder
+        .unit(node)
+        .unwrap()
+        .root(definition, EvaluationDemand::Value, scope)
+        .unwrap()
+}
+fn seal_fixture_units(
+    builder: &mut FragmentBuilder,
+    pools: &ConstantPools,
+    catalog: &EngineFunctionCatalog,
+) -> BTreeMap<NodeId, NodeExpressionEffects> {
+    // Fixed structural fixtures retain the original scalar author's summaries
+    // beside exactly the Arc installed in their real node. No SQL journal is
+    // minted and no scalar control/effect derivation is duplicated here.
+    let nodes = builder
+        .construction_nodes()
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    let parameters = SemanticParameters::try_new([(
+        allow_ref().id,
+        SemanticParameterValue::AllowThrowException(false),
+    )])
+    .unwrap();
+    let mut effects = BTreeMap::new();
+    for node in nodes {
+        if builder.construction_unit(node).is_none() {
+            continue;
+        }
+        let ports = builder.node_ports(node).unwrap();
+        let draft = builder.take_unit_builder(node).unwrap();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let sealed = draft.seal(ports, &mut work).unwrap();
+        let authored = author_physical_expression_effects_observed(
+            PhysicalExpressionEffectsInput {
+                owner: crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(node),
+                unit: &sealed,
+                constants: pools,
+                parameters: &parameters,
+                literal_policy: policy(),
+                call_scopes: &BTreeMap::new(),
+            },
+            catalog,
+            &Control::default(),
+        )
+        .unwrap();
+        let unit = Arc::new(sealed.finish(authored.calls, &mut work).unwrap());
+        work.finish().unwrap();
+        effects.insert(
+            node,
+            node_effects_with_test_summaries(unit.clone(), authored.summaries),
+        );
+        builder.install_unit(node, unit).unwrap();
+    }
+    effects
+}
+fn summaries(fixture: &Fixture) -> BTreeMap<NodeId, NodeExpressionEffects> {
+    fixture
+        .effects
+        .iter()
+        .map(|(&node, effects)| {
+            let unit = fixture.fragment.nodes()[&node]
+                .expressions
+                .as_ref()
+                .unwrap()
+                .clone();
+            (
+                node,
+                node_effects_with_test_summaries(unit, effects.summaries().clone()),
+            )
+        })
+        .collect()
+}
+
 fn allow_ref() -> SemanticParameterRef {
     SemanticParameterRef {
         id: SemanticParameterId::new(71),
@@ -464,37 +575,28 @@ fn request<'a>(
         c,
     )
 }
-fn context(o: &AuthoredPhysicalOccurrences, site: PhysicalCallSite) -> ExpressionEffectContext {
+fn context(o: &AuthoredPhysicalOccurrences, site: PhysicalCallSite) -> RelationEffectContext {
     o.relational_contexts
         .iter()
         .find(|(s, _)| *s == site)
         .unwrap()
         .1
 }
-fn child(o: &AuthoredPhysicalOccurrences, f: &Fixture, call: u32, arg: u32) -> ExpressionUseId {
-    o.root_uses.bindings()[&ExpressionRootSite {
-        node: f.owner,
-        role: ExpressionRootRole::AggregateArgument {
-            call,
-            argument: arg,
-        },
-    }]
+fn child(
+    _occurrences: &AuthoredPhysicalOccurrences,
+    fixture: &Fixture,
+    call: u32,
+    arg: u32,
+) -> ExpressionUseId {
+    let unit = fixture.node().expressions.as_ref().unwrap();
+    unit.root_use_ids()[fixture.call(call as usize).arguments[arg as usize].get() as usize]
 }
-fn summaries(
-    o: &AuthoredPhysicalOccurrences,
-) -> BTreeMap<ExpressionUseId, ScopedExpressionEffects> {
-    o.root_uses
-        .flow()
-        .uses()
-        .iter()
-        .map(|(&id, u)| (id, ScopedExpressionEffects::pure_value(u.context)))
-        .collect()
-}
+
 fn input<'a>(
     f: &'a Fixture,
     r: &'a AuthoredPhysicalAggregateUpdateRequest<'a>,
     o: &'a AuthoredPhysicalOccurrences<'a>,
-    e: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    e: &'a BTreeMap<NodeId, NodeExpressionEffects>,
     p: &'a SemanticParameters,
 ) -> PhysicalAggregateOccurrenceInput<'a> {
     PhysicalAggregateOccurrenceInput {
@@ -503,11 +605,11 @@ fn input<'a>(
         source: r.source(),
         request: r,
         occurrences: o,
-        child_effects: e,
+        child_effects: e.get(&f.owner),
         parameters: p,
         environment: &[],
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context(o, r.site()).domain),
+        proof_scope: CallProofScope::Relation(context(o, r.site()).identity),
     }
 }
 fn run(
@@ -605,7 +707,7 @@ fn aggregate_occurrences_installed_count_min_max_single_partial_keep_complete_se
                     |_| {},
                 );
                 let o = f.occurrences();
-                let e = summaries(&o);
+                let e = summaries(&f);
                 let p = SemanticParameters::try_new([]).unwrap();
                 let r = request(&f, 0, &Control::default()).unwrap();
                 let result =
@@ -682,14 +784,9 @@ fn aggregate_occurrences_installed_count_min_max_single_partial_keep_complete_se
         |_| {},
     );
     let o = f.occurrences();
-    assert!(
-        o.root_uses
-            .bindings()
-            .values()
-            .all(|id| o.root_uses.flow().uses().contains_key(id))
-    );
-    assert!(o.root_uses.bindings().is_empty());
-    let e = summaries(&o);
+    assert!(f.node().expressions.is_none());
+    assert!(f.call(0).arguments.is_empty());
+    let e = summaries(&f);
     let p = SemanticParameters::try_new([]).unwrap();
     let r = request(&f, 0, &Control::default()).unwrap();
     assert_eq!(r.request().logical_argument_count, 0);
@@ -771,17 +868,39 @@ fn aggregate_occurrences_repeated_definition_has_independent_child_and_relationa
         0,
         |_| {},
     );
-    assert_eq!(f.call(0).arguments, f.call(1).arguments);
+    assert_ne!(f.call(0).arguments, f.call(1).arguments);
+    let unit = f.node().expressions.as_ref().unwrap();
+    assert_eq!(
+        unit.definition(unit.root(f.call(0).arguments[0]).unwrap().definition)
+            .unwrap()
+            .id,
+        unit.definition(unit.root(f.call(1).arguments[0]).unwrap().definition)
+            .unwrap()
+            .id
+    );
     let o = f.occurrences();
     let a = child(&o, &f, 0, 0);
     let b = child(&o, &f, 1, 0);
     assert_ne!(a, b);
     assert_ne!(
-        o.root_uses.flow().uses()[&a].context.domain,
-        o.root_uses.flow().uses()[&b].context.domain
+        f.node().expressions.as_ref().unwrap().control_flow().uses()[&a]
+            .context
+            .region,
+        f.node().expressions.as_ref().unwrap().control_flow().uses()[&b]
+            .context
+            .region
     );
-    assert_ne!(context(&o, f.site(0)).domain, context(&o, f.site(1)).domain);
-    let e = summaries(&o);
+    assert_ne!(
+        context(&o, f.site(0)).identity,
+        context(&o, f.site(1)).identity
+    );
+    assert_ne!(
+        novarocks_type_contract::CallEffectContext::from(context(&o, f.site(0))),
+        f.node().expressions.as_ref().unwrap().control_flow().uses()[&a]
+            .context
+            .into()
+    );
+    let e = summaries(&f);
     let p = SemanticParameters::try_new([]).unwrap();
     for at in 0..2 {
         let r = request(&f, at, &Control::default()).unwrap();
@@ -804,13 +923,13 @@ fn aggregate_occurrences_order_channels_keep_order_and_are_refused_by_actual_own
         |_| {},
     );
     let o = f.occurrences();
-    let e = summaries(&o);
+    let e = summaries(&f);
     let p = SemanticParameters::try_new([]).unwrap();
     let r = request(&f, 0, &Control::default()).unwrap();
     assert_eq!(r.request().logical_argument_count, 1);
     assert_eq!(r.request().arguments.len(), 3);
     let PureCallPreparation::Aggregate { options, .. } =
-        r.preparation(ScopedExpressionEffects::pure_value(context(&o, f.site(0))))
+        r.preparation(ScopedRelationalEffects::pure_value(context(&o, f.site(0))))
     else {
         panic!("aggregate options")
     };
@@ -825,10 +944,8 @@ fn aggregate_occurrences_order_channels_keep_order_and_are_refused_by_actual_own
     assert!(!options.distinct);
     assert!(options.state_input_type.is_none());
     let arg = child(&o, &f, 0, 0);
-    let order = o.root_uses.bindings()[&ExpressionRootSite {
-        node: f.owner,
-        role: ExpressionRootRole::AggregateOrder { call: 0, key: 0 },
-    }];
+    let order = f.node().expressions.as_ref().unwrap().root_use_ids()
+        [f.call(0).order_by[0].expr.get() as usize];
     assert_ne!(arg, order);
     assert!(run(input(&f, &r, &o, &e, &p), &f.catalog, &Control::default()).is_err());
     prefixes(
@@ -854,34 +971,16 @@ fn aggregate_occurrences_genuine_composed_arithmetic_child_error_survives_lifecy
         SemanticParameterValue::AllowThrowException(false),
     )])
     .unwrap();
-    let e = author_physical_expression_effects_observed(
-        PhysicalExpressionEffectsInput {
-            temporal_sources: None,
-            fragment: &f.fragment,
-            roots: &o.root_uses,
-            constants: &f.pools,
-            parameters: &p,
-            literal_policy: policy(),
-            call_scopes: &BTreeMap::new(),
-        },
-        &f.catalog,
-        &Control::default(),
-    )
-    .unwrap();
+    let e = summaries(&f);
     let id = child(&o, &f, 0, 0);
     assert!(
-        e.summaries[&id]
-            .for_use(o.root_uses.flow().uses()[&id].context)
+        e[&f.owner].summaries()[&id]
+            .for_use(f.node().expressions.as_ref().unwrap().control_flow().uses()[&id].context)
             .unwrap()
             .may_raise_row_error
     );
     let r = request(&f, 0, &Control::default()).unwrap();
-    let actual = run(
-        input(&f, &r, &o, &e.summaries, &p),
-        &f.catalog,
-        &Control::default(),
-    )
-    .unwrap();
+    let actual = run(input(&f, &r, &o, &e, &p), &f.catalog, &Control::default()).unwrap();
     assert_eq!(
         actual.frozen.effects.own_row_error,
         FunctionIntrinsicRowError::NotRowEvaluated
@@ -895,7 +994,7 @@ fn aggregate_occurrences_genuine_composed_arithmetic_child_error_survives_lifecy
             .may_raise_row_error
     );
     prefixes(
-        |c| run(input(&f, &r, &o, &e.summaries, &p), &f.catalog, c),
+        |c| run(input(&f, &r, &o, &e, &p), &f.catalog, c),
         true,
         false,
     );
@@ -913,11 +1012,19 @@ fn aggregate_occurrences_missing_foreign_source_scope_environment_and_proof_keep
     );
     let o = f.occurrences();
     let r = request(&f, 0, &Control::default()).unwrap();
-    let e = summaries(&o);
+    let e = summaries(&f);
     let p = SemanticParameters::try_new([]).unwrap();
     let id = child(&o, &f, 0, 0);
-    let mut missing = e.clone();
-    missing.remove(&id);
+    let mut missing = summaries(&f);
+    let mut missing_children = missing[&f.owner].summaries().clone();
+    missing_children.remove(&id);
+    missing.insert(
+        f.owner,
+        node_effects_with_test_summaries(
+            f.node().expressions.as_ref().unwrap().clone(),
+            missing_children,
+        ),
+    );
     assert!(
         matches!(run(input(&f,&r,&o,&missing,&p),&f.catalog,&Control::default()),Err(PhysicalAggregateOccurrenceError::Relational(PhysicalRelationalEffectsError::MissingChildEffects(actual))) if actual==id)
     );
@@ -926,10 +1033,22 @@ fn aggregate_occurrences_missing_foreign_source_scope_environment_and_proof_keep
         false,
         false,
     );
-    let mut foreign = e.clone();
-    foreign.insert(
+    let mut foreign = summaries(&f);
+    let mut foreign_children = foreign[&f.owner].summaries().clone();
+    let actual = f.node().expressions.as_ref().unwrap().control_flow().uses()[&id].context;
+    foreign_children.insert(
         id,
-        ScopedExpressionEffects::pure_value(context(&o, f.site(0))),
+        ScopedExpressionEffects::pure_value(ExpressionEffectContext {
+            demand: EvaluationDemand::TruthOnly,
+            ..actual
+        }),
+    );
+    foreign.insert(
+        f.owner,
+        node_effects_with_test_summaries(
+            f.node().expressions.as_ref().unwrap().clone(),
+            foreign_children,
+        ),
     );
     prefixes(
         |c| run(input(&f, &r, &o, &foreign, &p), &f.catalog, c),
@@ -964,7 +1083,8 @@ fn aggregate_occurrences_missing_foreign_source_scope_environment_and_proof_keep
         false,
     );
     let mut o3 = o.clone();
-    o3.relational_contexts[0].1 = o.root_uses.flow().uses()[&id].context;
+    o3.relational_contexts[0].1 =
+        RelationEffectContext::materialized_input(context(&o, f.site(0)).identity.call);
     prefixes(
         |c| run(input(&f, &r, &o3, &e, &p), &f.catalog, c),
         false,
@@ -986,8 +1106,8 @@ fn aggregate_occurrences_missing_foreign_source_scope_environment_and_proof_keep
             &f.catalog,
             &Control::default()
         ),
-        Err(PhysicalAggregateOccurrenceError::Relational(
-            PhysicalRelationalEffectsError::InvalidSource(_)
+        Err(PhysicalAggregateOccurrenceError::InvalidSource(
+            "aggregate occurrence and update request have different actual source loans"
         ))
     ));
     prefixes(
@@ -1017,7 +1137,11 @@ fn aggregate_occurrences_missing_foreign_source_scope_environment_and_proof_keep
     prefixes(
         |c| {
             let mut i = input(&f, &r, &o, &e, &p);
-            i.proof_scope = CallProofScope::Domain(o.root_uses.flow().uses()[&id].context.domain);
+            i.proof_scope = CallProofScope::Region(
+                f.node().expressions.as_ref().unwrap().control_flow().uses()[&id]
+                    .context
+                    .region,
+            );
             run(i, &f.catalog, c)
         },
         false,
@@ -1045,7 +1169,7 @@ fn aggregate_occurrences_state_format_drift_and_nominal_utf8_keep_selected_owner
             |_| {},
         );
         let o = f.occurrences();
-        let e = summaries(&o);
+        let e = summaries(&f);
         let p = SemanticParameters::try_new([]).unwrap();
         let r = request(&f, 0, &Control::default()).unwrap();
         let result = run(input(&f, &r, &o, &e, &p), &f.catalog, &Control::default()).unwrap();
@@ -1065,7 +1189,7 @@ fn aggregate_occurrences_state_format_drift_and_nominal_utf8_keep_selected_owner
         |b| b.state_format = AggregateStateFormatId::try_new("foreign/state").unwrap(),
     );
     let o = f.occurrences();
-    let e = summaries(&o);
+    let e = summaries(&f);
     let p = SemanticParameters::try_new([]).unwrap();
     let r = request(&f, 0, &Control::default()).unwrap();
     prefixes(
@@ -1096,7 +1220,7 @@ fn aggregate_occurrences_wide_actual_channels_and_contexts_observe_real_quantum(
         |_| {},
     );
     let o = f.occurrences();
-    let e = summaries(&o);
+    let e = summaries(&f);
     let p = SemanticParameters::try_new([]).unwrap();
     let r = request(&f, 0, &Control::default()).unwrap();
     assert!(
@@ -1133,7 +1257,7 @@ fn aggregate_occurrences_wide_actual_channels_and_contexts_observe_real_quantum(
     );
     let o = many.occurrences();
     assert_eq!(o.relational_contexts.len(), 320);
-    let e = summaries(&o);
+    let e = summaries(&many);
     let r = request(&many, 319, &Control::default()).unwrap();
     prefixes(
         |c| run(input(&many, &r, &o, &e, &p), &many.catalog, c),
@@ -1147,17 +1271,13 @@ fn aggregate_occurrences_wide_actual_channels_and_contexts_observe_real_quantum(
 fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let mut b = FragmentBuilder::new(FragmentId::new(71));
+    let mut pools = ConstantPools::empty();
     let leaf = NodeId::new(7);
     let partial = NodeId::new(17);
     let owner = NodeId::new(901);
     let key_type = ty(DataType::Int64, false);
-    let seed = b
-        .add_expression(
-            leaf,
-            key_type.clone(),
-            ExprKind::Literal(LiteralValue::Int64(3)),
-        )
-        .unwrap();
+    let seed = constant(&mut b, &mut pools, leaf, key_type.clone(), checked::i64(3));
+    let seed_root = root(&mut b, leaf, seed, RootScope::AllPorts);
     let key = b
         .add_value(
             key_type.clone(),
@@ -1167,7 +1287,7 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
             },
         )
         .unwrap();
-    b.add_values(leaf, Box::from([Box::from([seed])]), Box::from([key]))
+    b.add_values(leaf, Box::from([Box::from([seed_root])]), Box::from([key]))
         .unwrap();
     let key_expr = b
         .add_expression(partial, key_type.clone(), ExprKind::Value(key))
@@ -1186,7 +1306,9 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
             },
         )
         .unwrap();
+    let key_root = root(&mut b, partial, key_expr, RootScope::Port(0));
     b.insert_node_unchecked(PhysicalNode {
+        expressions: None,
         id: partial,
         inputs: Box::from([leaf]),
         required_inputs: Box::from([props()]),
@@ -1196,7 +1318,7 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
             columns: Box::from([key, state]),
         },
         kind: NodeKind::Aggregate {
-            group_by: Box::from([(key_expr, key)]),
+            group_by: Box::from([(key_root, key)]),
             calls: Box::from([AggregateCall {
                 id: partial_id,
                 binding: binding.clone(),
@@ -1234,10 +1356,11 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
         )
     };
     let output = b.add_value(out_type, origin).unwrap();
+    let state_root = root(&mut b, owner, state_expr, RootScope::Port(0));
     let call = AggregateCall {
         id: call_id,
         binding,
-        arguments: Box::from([state_expr]),
+        arguments: Box::from([state_root]),
         distinct: false,
         order_by: Box::default(),
         output,
@@ -1246,15 +1369,17 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
         let key_expr = b
             .add_expression(owner, key_type, ExprKind::Value(key))
             .unwrap();
+        let key_root = root(&mut b, owner, key_expr, RootScope::Port(0));
+        let order_root = root(&mut b, owner, key_expr, RootScope::Port(0));
         (
             NodeKind::TopN {
                 reduction: TopNReduction::GroupedStates {
-                    group_by: Box::from([(key_expr, key)]),
+                    group_by: Box::from([(key_root, key)]),
                     calls: Box::from([call]),
                     comparator: OrderedComparisonAlgorithm::NativeScalarOrderV1,
                 },
                 order_by: Box::from([SortExpr {
-                    expr: key_expr,
+                    expr: order_root,
                     direction: SortDirection::Ascending,
                     null_ordering: NullOrdering::Last,
                 }]),
@@ -1277,6 +1402,7 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
         )
     };
     b.insert_node_unchecked(PhysicalNode {
+        expressions: None,
         id: owner,
         inputs: Box::from([partial]),
         required_inputs: Box::from([props()]),
@@ -1288,11 +1414,14 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
         kind,
     })
     .unwrap();
+    let effects = seal_fixture_units(&mut b, &pools, &catalog);
+    let fragment = finish(b, owner);
     Fixture {
-        fragment: finish(b, owner),
-        pools: ConstantPools::empty(),
+        fragment,
+        pools,
         catalog,
         owner,
+        effects,
     }
 }
 
@@ -1329,14 +1458,12 @@ fn aggregate_occurrences_actual_merge_and_grouped_topn_require_missing_logical_s
         node: f.owner,
         call: 0,
     };
-    let o = f.occurrences();
-    assert!(o.root_uses.bindings().contains_key(&ExpressionRootSite {
-        node: f.owner,
-        role: ExpressionRootRole::TopNStateArgument {
-            call: 0,
-            argument: 0
-        }
-    }));
+    let unit = f.node().expressions.as_ref().unwrap();
+    assert!(unit.root(calls[0].arguments[0]).is_some());
+    assert_eq!(
+        unit.root(calls[0].arguments[0]).unwrap().demand,
+        EvaluationDemand::Value
+    );
     assert!(
         matches!(request_at(&calls[0], f.node(), site, &f, &Control::default()), Err(PhysicalAggregateRequestError::MissingLogicalSource(actual)) if actual == phase)
     );
@@ -1364,7 +1491,7 @@ fn fragment_scopes<'a>(
                     source: &f.fragment.nodes()[&node],
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                     environment: &[],
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Relation(context.identity),
                 },
             )
         })
@@ -1390,7 +1517,7 @@ fn fragment_run(
             constants: &f.pools,
             parameters: p,
             literal_policy: policy(),
-            expression_scopes: &BTreeMap::new(),
+            node_effects: &summaries(f),
             relational_scopes: scopes,
         },
         &f.catalog,
@@ -1524,15 +1651,18 @@ fn aggregate_fragment_composer_single_partial_complete_coverage_keeps_real_child
                 );
                 let id = child(&o, &f, ordinal, 0);
                 assert!(
-                    result.summaries[&id]
-                        .for_use(o.root_uses.flow().uses()[&id].context)
+                    f.effects[&f.owner].summaries()[&id]
+                        .for_use(
+                            f.node().expressions.as_ref().unwrap().control_flow().uses()[&id]
+                                .context
+                        )
                         .unwrap()
                         .may_raise_row_error
                 );
             }
             result
                 .calls
-                .validate_fragment(&f.fragment, &o.root_uses, &Control::default())
+                .validate_fragment(&f.fragment, &Control::default())
                 .unwrap();
             fragment_prefixes(|c| fragment_run(&f, &o, &p, &scopes, c), true, false);
         }
@@ -1577,7 +1707,7 @@ fn aggregate_fragment_composer_missing_extra_and_same_shape_foreign_source_scope
             source: f.node(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             environment: &[],
-            proof_scope: CallProofScope::Domain(context(&o, f.site(0)).domain),
+            proof_scope: CallProofScope::Relation(context(&o, f.site(0)).identity),
         },
     );
     assert!(matches!(

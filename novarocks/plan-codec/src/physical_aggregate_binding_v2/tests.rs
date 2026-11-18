@@ -89,7 +89,7 @@ fn function(value: &FunctionValueType) -> BoundFunction {
         ])),
         result_type: value.clone(),
 
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: FunctionVolatility::Immutable,
             argument_evaluation: FunctionArgumentEvaluation::Eager,
             failure_behavior: FunctionFailureBehavior::Propagate,
@@ -237,14 +237,47 @@ fn aggregate_signature_checks_complete_phase_format_function_and_nested_type() {
             sequence: AggregateSequenceId::new(0),
         },
     );
-    let compare = |right: &AggregateBinding| {
+    // Compare the actual emitted definition namespaces. The old standalone
+    // aggregate comparer belonged to the retired scalar Window bank; current
+    // bindings are associated by their actual source, and their full data must
+    // still survive the sole type/function/aggregate codec authors.
+    let project = |binding: &AggregateBinding| {
+        let FunctionArgumentType::Value(argument) = &binding.function.argument_types[0] else {
+            panic!("fixed value argument");
+        };
+        let roots = [
+            (0, argument.clone()),
+            (1, binding.function.result_type.clone()),
+            (2, binding.intermediate_type.clone()),
+        ];
         let control = Control::default();
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
-        let result =
-            verify_aggregate_signature(&left, right, SOURCE, limits().max_work, &mut work).unwrap();
-        work.finish().unwrap();
-        result.matches()
+        let types = encode_type_table_sources(&roots, &[], type_limits(), &control).unwrap();
+        let args = [ArgumentTypeIds::Value(0)];
+        let inputs = [FunctionBindingInput {
+            id: 0,
+            source: BindingSource::Scalar(&binding.function),
+            arguments: &args,
+            result: ResultTypeIds::Scalar(1),
+        }];
+        let functions =
+            encode_function_bindings(&types, &inputs, SOURCE, limits(), &control).unwrap();
+        let inputs = [AggregateBindingInput {
+            id: 0,
+            source: binding,
+            function_binding_id: 0,
+            intermediate_value_type_id: 2,
+        }];
+        let aggregate =
+            encode_aggregate_bindings(&types, &functions, &inputs, SOURCE, limits(), &control)
+                .unwrap();
+        (
+            types.as_wire().clone(),
+            functions.as_wire().to_vec(),
+            aggregate.as_wire().to_vec(),
+        )
     };
+    let expected = project(&left);
+    let compare = |right: &AggregateBinding| project(right) == expected;
     let mut right = left.clone();
     // Legacy occurrence projections are deliberately outside the definition signature.
     right.function.legacy_metadata.as_mut().unwrap().volatility = FunctionVolatility::Volatile;
@@ -502,7 +535,7 @@ fn aggregate_exact_resource_envelopes_and_checked_arithmetic_refuse_underbounds(
         .is_err()
     );
     assert!(add(usize::MAX, 1).is_err());
-    assert!(mul(usize::MAX, 2).is_err());
+    assert!(bytes::<[u8; 2]>(usize::MAX).is_err());
     assert!(bytes::<wire::AggregateBindingDefinition>(usize::MAX).is_err());
 }
 

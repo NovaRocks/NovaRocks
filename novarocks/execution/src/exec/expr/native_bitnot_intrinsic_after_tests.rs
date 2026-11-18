@@ -23,10 +23,9 @@ use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
-use novarocks_local_program::{
-    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind,
-};
+use novarocks_local_program::{ProgramNodeKind, ProgramRootRef, ProgramUnitId};
 
+use novarocks_expression_contract::RootOrdinal;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 struct Control;
@@ -66,29 +65,24 @@ fn producer_root(
         novarocks_physical_plan::FragmentId,
         Arc<novarocks_local_program::LocalProgram>,
     >,
-) -> (
-    Arc<novarocks_local_program::LocalProgram>,
-    ProgramExpressionRootSite,
-) {
+) -> (Arc<novarocks_local_program::LocalProgram>, ProgramRootRef) {
     let mut found = None;
     for program in plans.values() {
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        for (&root, &use_id) in snapshot.bindings() {
-            let occurrence = novarocks_local_program::ProgramUseRef {
-                arena: root.arena(),
-                use_id,
-            };
-            if program.native_bitnot_recipe(occurrence).is_some() {
-                assert!(
-                    found.is_none(),
-                    "this actual SQL source declares exactly one BitwiseNot output root"
-                );
-                found = Some((program.clone(), root));
+        for (unit_ordinal, unit) in program.units().iter().enumerate() {
+            for (root_ordinal, root) in unit.roots().iter().enumerate() {
+                if unit.recipes().native_bitnot(root.use_id).is_some() {
+                    assert!(
+                        found.is_none(),
+                        "this actual SQL source declares exactly one BitwiseNot output root"
+                    );
+                    found = Some((
+                        program.clone(),
+                        ProgramRootRef {
+                            unit: ProgramUnitId::new(unit_ordinal),
+                            root: RootOrdinal::new(u32::try_from(root_ordinal).unwrap()),
+                        },
+                    ));
+                }
             }
         }
     }
@@ -132,7 +126,12 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
         let plans = programs(&source);
         let (program, root) = producer_root(&plans);
         let data = batch(&program, root, input.clone());
-        let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(root.unit).unwrap().clone(),
+            root.root,
+            &Control,
+        )
+        .unwrap();
         let all = frame
             .evaluate(&data, Selection::all(input.len()), &Control)
             .unwrap();
@@ -189,7 +188,12 @@ fn native_bitnot_intrinsic_actual_sql_largeint_cast_uses_exact_logical_recipe() 
         root,
         Arc::new(Int64Array::from(vec![i64::MIN, -1, 0, i64::MAX])),
     );
-    let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
+    let mut frame = CompiledExpressionInstance::try_new(
+        program.unit(root.unit).unwrap().clone(),
+        root.root,
+        &Control,
+    )
+    .unwrap();
     let out = frame.evaluate(&data, Selection::all(4), &Control).unwrap();
     // The SQL cast sign-extends each INT64 to 128 bits. Its complement
     // follows ~x = -x - 1 over signed 128-bit values, without narrowing back.
@@ -219,7 +223,12 @@ fn native_bitnot_intrinsic_actual_sql_nullable_values_current_domain_matches_ori
     let (program, root) = producer_root(&plans);
     let input: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(-2)]));
     let data = batch(&program, root, input.clone());
-    let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
+    let mut frame = CompiledExpressionInstance::try_new(
+        program.unit(root.unit).unwrap().clone(),
+        root.root,
+        &Control,
+    )
+    .unwrap();
     let out = frame.evaluate(&data, Selection::all(3), &Control).unwrap();
     assert!(out.errors().is_empty());
     // Complement keeps NULL and maps 1 -> -2, -2 -> 1.
@@ -253,15 +262,13 @@ fn constant_outputs(sql: &str) -> Vec<ArrayRef> {
             let data = values
                 .batch()
                 .expect("the original table-free input is a constant VALUES batch");
-            for ordinal in 0..exprs.len() {
-                let root = ProgramExpressionRootSite::Node {
-                    node: node.local_id().unwrap(),
-                    role: ProgramNodeExpressionRole::ProjectOutput {
-                        expression: u32::try_from(ordinal).unwrap(),
-                    },
-                };
-                let mut frame =
-                    CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
+            for &root in exprs {
+                let mut frame = CompiledExpressionInstance::try_new(
+                    program.unit(root.unit).unwrap().clone(),
+                    root.root,
+                    &Control,
+                )
+                .unwrap();
                 let out = frame
                     .evaluate(data, Selection::all(data.num_rows()), &Control)
                     .unwrap();
@@ -382,26 +389,44 @@ fn native_bitnot_intrinsic_actual_frame_every_constructor_and_runtime_callback_k
         Arc::new(Int64Array::from(vec![i64::MIN, -1, 0, 1, i64::MAX])),
     );
     let recorder = Refuse::new(usize::MAX, KernelFailure::Cancelled);
-    let _ = CompiledExpressionInstance::try_new(program.clone(), root, &recorder).unwrap();
+    let _ = CompiledExpressionInstance::try_new(
+        program.unit(root.unit).unwrap().clone(),
+        root.root,
+        &recorder,
+    )
+    .unwrap();
     let trace = recorder.trace.lock().unwrap().clone();
     assert!(!trace.is_empty());
     for at in 1..=trace.len() {
         for cause in causes() {
             let control = Refuse::new(at, cause.clone());
-            let result = CompiledExpressionInstance::try_new(program.clone(), root, &control);
+            let result = CompiledExpressionInstance::try_new(
+                program.unit(root.unit).unwrap().clone(),
+                root.root,
+                &control,
+            );
             assert!(matches!(result,Err(actual) if actual==cause));
             assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
         }
     }
-    let mut frame = CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
+    let mut frame = CompiledExpressionInstance::try_new(
+        program.unit(root.unit).unwrap().clone(),
+        root.root,
+        &Control,
+    )
+    .unwrap();
     let recorder = Refuse::new(usize::MAX, KernelFailure::Cancelled);
     frame.evaluate(&data, Selection::all(5), &recorder).unwrap();
     let trace = recorder.trace.lock().unwrap().clone();
     assert!(!trace.is_empty());
     for at in 1..=trace.len() {
         for cause in causes() {
-            let mut frame =
-                CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
+            let mut frame = CompiledExpressionInstance::try_new(
+                program.unit(root.unit).unwrap().clone(),
+                root.root,
+                &Control,
+            )
+            .unwrap();
             let control = Refuse::new(at, cause.clone());
             assert!(
                 matches!(frame.evaluate(&data,Selection::all(5),&control),Err(actual) if actual==cause)
@@ -418,11 +443,11 @@ fn native_bitnot_intrinsic_actual_frame_every_constructor_and_runtime_callback_k
 #[test]
 fn native_bitnot_intrinsic_original_and_exact_utf8_largeint_source_keeps_conversion_and_frame_result()
  {
+    use novarocks_expression_contract::ExprKind;
     use novarocks_functions::builtin::value_conversion::{
         VALUE_CONVERSION_FUNCTION_ID, resolve_value_conversion,
     };
     use novarocks_functions::{FunctionArgumentType, FunctionValueType};
-    use novarocks_physical_plan::ExprKind;
     use novarocks_type_contract::ValueLogicalType;
 
     let sql = "SELECT ~CAST('-170141183460469231731687303715884105728' AS LARGEINT)";
@@ -440,27 +465,33 @@ fn native_bitnot_intrinsic_original_and_exact_utf8_largeint_source_keeps_convers
         );
         let mut conversions = 0;
         for fragment in source.plan().fragments().values() {
-            for (_, expression) in fragment.expressions().iter() {
-                let ExprKind::FunctionCall { function, args } = &expression.kind else {
-                    continue;
-                };
-                if function.function_id.as_str() != VALUE_CONVERSION_FUNCTION_ID {
-                    continue;
+            for unit in fragment
+                .nodes()
+                .values()
+                .filter_map(|node| fragment.unit(node.id))
+            {
+                for expression in unit.definitions() {
+                    let ExprKind::FunctionCall { function, args } = &expression.kind else {
+                        continue;
+                    };
+                    if function.function_id.as_str() != VALUE_CONVERSION_FUNCTION_ID {
+                        continue;
+                    }
+                    conversions += 1;
+                    assert_eq!(
+                        function.overload.as_str(),
+                        "builtin.scalar/value_domain_conversion/utf8_to_largeint_null_invalid/v1"
+                    );
+                    assert_eq!(expression.ty, expected_type);
+                    assert_eq!(args.len(), 1);
+                    let input = &unit.definition(args[0]).unwrap().ty;
+                    assert_eq!(input, &FunctionValueType::new(DataType::Utf8, false));
+                    assert_eq!(
+                        function.argument_types.as_ref(),
+                        &[FunctionArgumentType::Value(input.clone())]
+                    );
+                    assert_eq!(function.result_type, expected_type);
                 }
-                conversions += 1;
-                assert_eq!(
-                    function.overload.as_str(),
-                    "builtin.scalar/value_domain_conversion/utf8_to_largeint_null_invalid/v1"
-                );
-                assert_eq!(expression.ty, expected_type);
-                assert_eq!(args.len(), 1);
-                let input = &fragment.expressions().get(args[0]).unwrap().ty;
-                assert_eq!(input, &FunctionValueType::new(DataType::Utf8, false));
-                assert_eq!(
-                    function.argument_types.as_ref(),
-                    &[FunctionArgumentType::Value(input.clone())]
-                );
-                assert_eq!(function.result_type, expected_type);
             }
         }
         assert_eq!(

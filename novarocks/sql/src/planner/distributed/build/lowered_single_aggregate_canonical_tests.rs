@@ -103,7 +103,24 @@ fn aggregate(
         result.nullable(),
     );
     output.value_type = result.clone();
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    let distinct = false;
+    let state_source = novarocks_type_contract::AggregateStateInterpretation {
+        distinct,
+        order_keys: novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(
+            order
+                .iter()
+                .map(|key| novarocks_type_contract::AggregateStateOrderKey {
+                    ascending: key.asc,
+                    nulls_first: key.nulls_first,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
+    };
+    // Like the Analyzer, retain this actual call's lexical DISTINCT/ORDER
+    // source before moving those same channels into AggregateArgumentSource.
+    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError)
+        .with_aggregate_state_source(state_source);
     PhysicalPlanNode {
         kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
             mode: AggMode::Single,
@@ -111,7 +128,7 @@ fn aggregate(
             aggregates: vec![AggregateCall {
                 name: name.into(),
                 source: AggregateArgumentSource::logical_update(arguments, order, binding),
-                distinct: false,
+                distinct,
                 result_type: output.value_type.clone(),
                 output_column_id: output.column_id,
             }],
@@ -203,6 +220,175 @@ fn repeat(child: PhysicalPlanNode, original: &OutputColumn) -> PhysicalPlanNode 
     }
 }
 
+use super::original_emission_test_observer::{
+    OriginalEmissionObserver, OriginalEmissionView, lower_read_with_original_emission_observer,
+};
+struct MinEmissionObserver<F> {
+    calls: usize,
+    check: F,
+}
+impl<F> OriginalEmissionObserver for MinEmissionObserver<F>
+where
+    F: for<'source, 'control> FnMut(
+        OriginalEmissionView<'source>,
+        &mut CompileCheckpoints<'control>,
+    ) -> Result<(), ContractLoweringError>,
+{
+    fn observe(
+        &mut self,
+        view: OriginalEmissionView<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), ContractLoweringError> {
+        self.calls += 1;
+        (self.check)(view, work)
+    }
+}
+fn observe_original_min(
+    plan: &PhysicalPlanNode,
+    control: &dyn PureCompileControl,
+    check: impl for<'source, 'control> FnMut(
+        OriginalEmissionView<'source>,
+        &mut CompileCheckpoints<'control>,
+    ) -> Result<(), ContractLoweringError>,
+) -> (
+    Result<LoweredSqlPhysicalDraft, ContractLoweringError>,
+    usize,
+) {
+    let mut observer = MinEmissionObserver { calls: 0, check };
+    let result = lower_read_with_original_emission_observer(
+        plan,
+        version(),
+        dop(),
+        None,
+        crate::functions::builtin_sql_function_catalog().snapshot(),
+        false,
+        policy(),
+        control,
+        &mut observer,
+    );
+    (result, observer.calls)
+}
+fn assert_min_carrier_refusal(result: Result<LoweredSqlPhysicalDraft, ContractLoweringError>) {
+    let Err(ContractLoweringError::Semantics(
+        super::super::package_semantics::PackageSemanticsError::Effects(detail),
+    )) = result
+    else {
+        panic!("the actual MIN carrier owner must refuse after original source observation")
+    };
+    assert_eq!(
+        detail,
+        "Aggregate(Function(Function(Kernel(InvalidProgram(KernelDiagnostic(\"MIN/MAX pure owner does not implement this input carrier\"))))))"
+    );
+}
+// Only actual original references; this is not a CheckedAggregate or a plan.
+struct OriginalAggregateEmission<'source> {
+    fragment: FragmentId,
+    node: &'source novarocks_physical_plan::PhysicalNode,
+    source: &'source novarocks_physical_plan::AggregateCall,
+    entry: &'source super::super::lowered_draft::LoweredAggregateSourceEntry,
+    definitions: super::super::unit_source::UnitDefinitions<'source>,
+    site: novarocks_physical_plan::PhysicalCallSite,
+}
+impl<'source> OriginalAggregateEmission<'source> {
+    fn captured(&self) -> &'source crate::binding::CapturedAggregateLogicalRequest {
+        self.entry
+            .logical
+            .captured()
+            .expect("actual original aggregate capture")
+    }
+    fn canonical(
+        &self,
+    ) -> &'source Arc<super::super::lowered_draft::CanonicalAggregateOperationalRequest> {
+        self.entry
+            .canonical
+            .as_ref()
+            .expect("same-emission original canonical request")
+    }
+}
+fn original_aggregate<'source>(
+    view: &OriginalEmissionView<'source>,
+    select: impl Fn(AggregatePhase) -> bool,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<OriginalAggregateEmission<'source>, ContractLoweringError> {
+    for (&fragment, builder) in view.fragments() {
+        for (_, node) in builder.construction_nodes() {
+            work.step()?;
+            let NodeKind::Aggregate { calls, .. } = &node.kind else {
+                continue;
+            };
+            for (ordinal, source) in calls.iter().enumerate() {
+                work.step()?;
+                if !select(source.binding.phase) {
+                    continue;
+                }
+                let site = novarocks_physical_plan::PhysicalCallSite::Aggregate {
+                    node: node.id,
+                    call: u32::try_from(ordinal).unwrap(),
+                };
+                let entry = &view.journal().entries[&(fragment, site)];
+                assert!(std::ptr::eq(
+                    view.actual_node(fragment, node.id).unwrap(),
+                    node
+                ));
+                assert!(std::ptr::eq(&calls[ordinal], source));
+                assert_eq!(
+                    entry.target,
+                    super::super::lowered_draft::AggregateSourceTarget::Aggregate(source.id)
+                );
+                assert_eq!(entry.phase, source.binding.phase);
+                let result = OriginalAggregateEmission {
+                    fragment,
+                    node,
+                    source,
+                    entry,
+                    definitions: super::super::unit_source::UnitDefinitions::from_draft(
+                        builder, node.id,
+                    ),
+                    site,
+                };
+                assert!(result.canonical().belongs_to(result.captured()));
+                assert_eq!(
+                    result.canonical().selected().argument_types,
+                    source.binding.function.argument_types
+                );
+                return Ok(result);
+            }
+        }
+    }
+    panic!("actual aggregate emission must contain the selected phase")
+}
+fn assert_original_min_signature(
+    source: &novarocks_physical_plan::AggregateCall,
+    captured: &crate::binding::CapturedAggregateLogicalRequest,
+    canonical: &super::super::lowered_draft::CanonicalAggregateOperationalRequest,
+    ty: &ValueType,
+) {
+    assert_eq!(value(&canonical.request().arguments[0]).0, ty);
+    assert_eq!(value(&captured.request().arguments[0]).0, ty);
+    let result = ty.with_nullable(true).unwrap();
+    assert_eq!(source.binding.function.result_type, result);
+    assert_eq!(source.binding.intermediate_type, result);
+    assert_eq!(
+        canonical
+            .selected()
+            .aggregate
+            .as_ref()
+            .unwrap()
+            .intermediate_type,
+        result
+    );
+    assert_eq!(
+        canonical
+            .selected()
+            .aggregate
+            .as_ref()
+            .unwrap()
+            .state_format,
+        source.binding.state_format
+    );
+    assert!(canonical.request().expected_result_type.is_none());
+}
+
 #[test]
 fn single_count_star_and_repeat_nullable_channels_publish_actual_selected_request() {
     let star = aggregate("count", vec![], vec![], values(vec![], vec![vec![]]));
@@ -237,8 +423,7 @@ fn single_count_star_and_repeat_nullable_channels_publish_actual_selected_reques
     );
     let actual = entry
         .fragment()
-        .expressions()
-        .get(entry.source().arguments[0])
+        .root_expression(entry.node().id, entry.source().arguments[0])
         .unwrap();
     assert_eq!(&actual.ty, operational.0);
 }
@@ -276,34 +461,32 @@ fn single_min_keeps_nested_field_metadata_and_nominal_json_source_facts() {
             vec![],
             values(vec![input], vec![]),
         );
-        let owner = authored(&plan, &Control::default()).unwrap();
-        let entry = loan(&owner);
-        let canonical = entry.canonical().unwrap();
-        assert_eq!(value(&canonical.request().arguments[0]).0, &ty);
-        assert_eq!(value(&entry.captured().request().arguments[0]).0, &ty);
-        let mut result = ty.clone();
-        result = result.with_nullable(true).unwrap();
-        assert_eq!(entry.source().binding.function.result_type, result);
-        assert_eq!(entry.source().binding.intermediate_type, result);
-        assert_eq!(
-            canonical
-                .selected()
-                .aggregate
-                .as_ref()
-                .unwrap()
-                .intermediate_type,
-            result
-        );
-        assert_eq!(
-            canonical
-                .selected()
-                .aggregate
-                .as_ref()
-                .unwrap()
-                .state_format,
-            entry.source().binding.state_format
-        );
-        assert!(canonical.request().expected_result_type.is_none());
+        if matches!(ty.data_type(), DataType::Struct(_)) {
+            let (result, calls) = observe_original_min(&plan, &Control::default(), |view, work| {
+                let actual =
+                    original_aggregate(&view, |phase| phase == AggregatePhase::Single, work)?;
+                assert_original_min_signature(
+                    actual.source,
+                    actual.captured(),
+                    actual.canonical(),
+                    &ty,
+                );
+                Ok(())
+            });
+            assert_eq!(calls, 1);
+            assert_min_carrier_refusal(result);
+        } else {
+            // Json UTF8 is an actual supported MIN carrier, so keep the full
+            // original completed-owner route and signature assertions.
+            let owner = authored(&plan, &Control::default()).unwrap();
+            let actual = loan(&owner);
+            assert_original_min_signature(
+                actual.source(),
+                actual.captured(),
+                actual.canonical().unwrap(),
+                &ty,
+            );
+        }
     }
 }
 
@@ -343,6 +526,23 @@ fn single_array_agg_original_nonzero_cv_and_order_keep_backing_field_and_policy(
     );
     let owner = authored(&plan, &Control::default()).unwrap();
     let entry = loan(&owner);
+    let state_source = entry
+        .captured()
+        .binding()
+        .aggregate_state_source()
+        .expect("the real lexical aggregate source");
+    assert!(!state_source.distinct);
+    assert_eq!(
+        state_source.order_keys.as_ref(),
+        &[novarocks_type_contract::AggregateStateOrderKey {
+            ascending: false,
+            nulls_first: true,
+        }]
+    );
+    assert_eq!(
+        entry.source().binding.state_interpretation.as_ref(),
+        Some(state_source)
+    );
     let canonical = entry.canonical().unwrap();
     assert_eq!(canonical.request().logical_argument_count, 1);
     assert_eq!(canonical.request().arguments.len(), 2);
@@ -375,8 +575,11 @@ fn single_array_agg_original_nonzero_cv_and_order_keep_backing_field_and_policy(
         } else {
             entry.source().order_by[0].expr
         };
-        let ContractExprKind::Constant(reference) =
-            entry.fragment().expressions().get(expression).unwrap().kind
+        let ContractExprKind::Constant(reference) = entry
+            .fragment()
+            .root_expression(entry.node().id, expression)
+            .unwrap()
+            .kind
         else {
             panic!("actual emitted CV reference");
         };
@@ -425,8 +628,7 @@ fn single_nested_and_elided_cast_constants_remain_original_none_requests() {
         assert!(matches!(
             entry
                 .fragment()
-                .expressions()
-                .get(entry.source().arguments[0])
+                .root_expression(entry.node().id, entry.source().arguments[0])
                 .unwrap()
                 .kind,
             ContractExprKind::Constant(_)
@@ -600,13 +802,18 @@ fn single_wide_nested_metadata_emission_observes_bounded_original_control() {
         vec![],
         values(vec![input], vec![]),
     );
+    let invoke = |control: &Control| {
+        observe_original_min(&plan, control, |view, work| {
+            let actual = original_aggregate(&view, |phase| phase == AggregatePhase::Single, work)?;
+            assert_eq!(value(&actual.canonical().request().arguments[0]).0, &ty);
+            assert_eq!(value(&actual.captured().request().arguments[0]).0, &ty);
+            Ok(())
+        })
+    };
     let baseline = Control::default();
-    let owner = authored(&plan, &baseline).unwrap();
-    let entry = loan(&owner);
-    assert_eq!(
-        value(&entry.canonical().unwrap().request().arguments[0]).0,
-        &ty
-    );
+    let (result, calls) = invoke(&baseline);
+    assert_eq!(calls, 1);
+    assert_min_carrier_refusal(result);
     let expected = baseline.trace.into_inner().unwrap();
     assert!(expected.iter().any(|(_, units)| *units == 256));
     for at in 0..expected.len() {
@@ -619,8 +826,10 @@ fn single_wide_nested_metadata_emission_observes_bounded_original_control() {
                 trace: Default::default(),
                 refusal: Some((at, cause.clone())),
             };
+            let (result, calls) = invoke(&control);
+            assert!(calls <= 1);
             assert!(
-                matches!(authored(&plan, &control), Err(ContractLoweringError::Control(actual)) if actual == cause)
+                matches!(result, Err(ContractLoweringError::Control(actual)) if actual == cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), expected[..=at]);
         }

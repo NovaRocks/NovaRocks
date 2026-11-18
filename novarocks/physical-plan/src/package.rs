@@ -32,9 +32,9 @@ use novarocks_type_contract::{
 
 use crate::{
     AnnotationSubject, Fragment, FragmentCuts, FragmentId, FrozenCallError, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPruningError, NodeId, PhysicalPlan, PhysicalRootUses,
-    PlanAnnotation, PlanVersionId, ProviderReadOccurrenceId, RequiredContracts, ResultPort,
-    RootUseBindingError, ValidationErrors, derive_fragment_cuts,
+    FrozenFragmentPruning, FrozenPruningError, NodeId, PhysicalPlan, PlanAnnotation, PlanVersionId,
+    ProviderReadOccurrenceId, RequiredContracts, ResultPort, ValidationErrors,
+    derive_fragment_cuts,
 };
 
 /// An owned input for the same checked constructor on FE and BE. It contains
@@ -42,15 +42,10 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct FragmentPackageInput {
     pub constants: crate::ConstantPools,
+    pub statement_constant_policy: crate::ConstantPolicy,
     pub version: PlanVersionId,
     pub required: RequiredContracts,
     pub fragment: Fragment,
-    /// Complete invocation control and exact field bindings. Required even
-    /// for a fragment with no expression roots; no eager fallback is inferred.
-    pub expression_uses: PhysicalRootUses,
-    /// Mandatory complete per-occurrence claims. Structural validity does not
-    /// authenticate these facts; the installed exact owner rechecks them.
-    pub calls: FrozenFragmentCalls,
     /// Explicit derived-domain declarations. Structure never grants pruning
     /// authority; the FE still proves semantics and complete consumer coverage.
     pub pruning: FrozenFragmentPruning,
@@ -146,8 +141,6 @@ impl FragmentPackage {
             PackageValidation::Plain(control) => {
                 crate::validate_fragment_output_properties_observed(
                     &input.fragment,
-                    &input.expression_uses,
-                    &input.calls,
                     admission.plan_limits,
                     admission.source_retained_bytes,
                     admission.property_projection_limits,
@@ -161,8 +154,6 @@ impl FragmentPackage {
                 let mut child = novarocks_type_contract::ControlOwnedResourceFacts::default();
                 crate::validate_fragment_output_properties_in(
                     &input.fragment,
-                    &input.expression_uses,
-                    &input.calls,
                     admission.plan_limits,
                     admission.source_retained_bytes,
                     admission.property_projection_limits,
@@ -215,8 +206,10 @@ impl FragmentPackage {
             error => FragmentPackageError::Constant(error),
         })?;
         let call_items = match &mut observation {
-            PackageValidation::Plain(control) => input.calls.dynamic_items_observed(*control),
-            PackageValidation::Caller { work, .. } => input.calls.dynamic_items_in(work),
+            PackageValidation::Plain(control) => {
+                input.fragment.calls().dynamic_items_observed(*control)
+            }
+            PackageValidation::Caller { work, .. } => input.fragment.calls().dynamic_items_in(work),
         }
         .map_err(|error| match error {
             FrozenCallError::Control(cause) => FragmentPackageError::Control(cause),
@@ -229,20 +222,14 @@ impl FragmentPackage {
         .map_err(pruning_error)?;
         let counts = match &mut observation {
             PackageValidation::Plain(control) => {
-                visit_fragment_parameter_references(&input.fragment, &input.calls, *control, |_| {})
+                visit_fragment_parameter_references(&input.fragment, *control, |_| {})
                     .map_err(parameter_error)?
             }
             PackageValidation::Caller { admit, work } => {
-                parameter_walk_resources(&mut resources, &input.fragment, call_items)?;
+                parameter_walk_resources(&mut resources, &input.fragment, call_items, work)?;
                 admit(&resources.facts()).map_err(FragmentPackageError::Control)?;
-                visit_fragment_parameter_references_core(
-                    &input.fragment,
-                    &input.calls,
-                    true,
-                    work,
-                    |_| {},
-                )
-                .map_err(parameter_error)?
+                visit_fragment_parameter_references_core(&input.fragment, true, work, |_| {})
+                    .map_err(parameter_error)?
             }
         };
         let semantic_items = match &observation {
@@ -289,16 +276,15 @@ impl FragmentPackage {
         // package profile, before immutable parameter subset publication.
         let closure = match &mut observation {
             PackageValidation::Plain(control) => {
-                let references =
-                    fragment_parameter_references(&input.fragment, &input.calls, *control)
-                        .map_err(parameter_error)?;
+                let references = fragment_parameter_references(&input.fragment, *control)
+                    .map_err(parameter_error)?;
                 input
                     .parameters
                     .project_observed(references, CompilePhase::Validate, *control)
                     .map_err(parameter_error)?
             }
             PackageValidation::Caller { admit, work } => {
-                parameter_walk_resources(&mut resources, &input.fragment, call_items)?;
+                parameter_walk_resources(&mut resources, &input.fragment, call_items, work)?;
                 resources
                     .buffer::<SemanticParameterRef>(counts.total, 1)
                     .map_err(package_resource_error)?;
@@ -309,7 +295,6 @@ impl FragmentPackage {
                 })?;
                 visit_fragment_parameter_references_core(
                     &input.fragment,
-                    &input.calls,
                     true,
                     work,
                     |reference| references.push(reference),
@@ -370,8 +355,6 @@ impl FragmentPackage {
             let (candidates, _) = crate::derive_fragment_output_properties_observed(
                 &input.fragment,
                 &input.cuts,
-                &input.expression_uses,
-                &input.calls,
                 admission.plan_limits,
                 admission.source_retained_bytes,
                 admission.property_projection_limits,
@@ -394,48 +377,9 @@ impl FragmentPackage {
             input.fragment = Fragment::from(parts);
             work.flush().map_err(FragmentPackageError::Control)?;
 
-            let mut bindings = Vec::new();
-            bindings
-                .try_reserve_exact(input.expression_uses.bindings().len())
-                .map_err(|_| {
-                    FragmentPackageError::Control(CompileControlError::ResourceExhausted)
-                })?;
-            for (site, use_id) in input.expression_uses.bindings() {
-                bindings.push((*site, *use_id));
-                work.step().map_err(FragmentPackageError::Control)?;
-            }
-            // Flow storage is immutable and unchanged by this output-only
-            // transformation. The actual constructor regenerates all physical
-            // roots and checks every current definition/control correspondence.
-            let flow = input.expression_uses.flow().clone();
-            work.step().map_err(FragmentPackageError::Control)?;
-            work.flush().map_err(FragmentPackageError::Control)?;
-            input.expression_uses =
-                PhysicalRootUses::try_new(&input.fragment, flow, bindings, control)
-                    .map_err(root_use_error)?;
-            work.flush().map_err(FragmentPackageError::Control)?;
-
-            let mut calls = Vec::new();
-            calls
-                .try_reserve_exact(input.calls.entries().len())
-                .map_err(|_| {
-                    FragmentPackageError::Control(CompileControlError::ResourceExhausted)
-                })?;
-            for call in input.calls.entries().values() {
-                // Full occurrence effects remain claims for the unchanged
-                // selection, never synthesized from legacy binding flags.
-                calls.push(call.clone());
-                work.step().map_err(FragmentPackageError::Control)?;
-            }
-            work.flush().map_err(FragmentPackageError::Control)?;
-            input.calls = FrozenFragmentCalls::try_new(
-                &input.fragment,
-                &input.expression_uses,
-                calls,
-                control,
-            )
-            .map_err(call_error)?;
-            work.flush().map_err(FragmentPackageError::Control)?;
+            // Units and relation declarations stay with the original Fragment.
+            // Re-admit the new property snapshot; no duplicate root/call table
+            // or regenerated invocation identity exists after this transform.
             Self::try_new(input, admission, control)
         })();
         if matches!(&result, Err(FragmentPackageError::Control(_))) {
@@ -461,12 +405,11 @@ impl FragmentPackage {
         &self.0.fragment
     }
 
-    pub const fn expression_uses(&self) -> &PhysicalRootUses {
-        &self.0.expression_uses
-    }
-
     pub const fn calls(&self) -> &FrozenFragmentCalls {
-        &self.0.calls
+        self.0.fragment.calls()
+    }
+    pub const fn statement_constant_policy(&self) -> crate::ConstantPolicy {
+        self.0.statement_constant_policy
     }
 
     pub const fn pruning(&self) -> &FrozenFragmentPruning {
@@ -515,16 +458,9 @@ fn property_error(error: crate::FragmentPropertyError) -> FragmentPackageError {
         crate::FragmentPropertyError::Structure(cause) => FragmentPackageError::Structure(cause),
     }
 }
-fn root_use_error(error: RootUseBindingError) -> FragmentPackageError {
-    match error {
-        RootUseBindingError::Control(cause) => FragmentPackageError::Control(cause),
-        error => FragmentPackageError::ExpressionUses(error),
-    }
-}
 fn call_error(error: FrozenCallError) -> FragmentPackageError {
     match error {
         FrozenCallError::Control(cause) => FragmentPackageError::Control(cause),
-        FrozenCallError::Roots(cause) => root_use_error(cause),
         error => FragmentPackageError::Calls(error),
     }
 }
@@ -536,7 +472,6 @@ pub enum FragmentPackageError {
     Control(CompileControlError),
     Constant(crate::ConstantReferenceError),
     Structure(ValidationErrors),
-    ExpressionUses(RootUseBindingError),
     Calls(FrozenCallError),
     Pruning(FrozenPruningError),
     Parameter(SemanticParameterError),
@@ -550,7 +485,6 @@ impl fmt::Display for FragmentPackageError {
             Self::Control(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
             Self::Structure(error) => error.fmt(f),
-            Self::ExpressionUses(error) => error.fmt(f),
             Self::Calls(error) => error.fmt(f),
             Self::Pruning(error) => error.fmt(f),
             Self::Parameter(error) => error.fmt(f),
@@ -567,7 +501,6 @@ impl std::error::Error for FragmentPackageError {
             Self::Control(source) => Some(source),
             Self::Constant(source) => Some(source),
             Self::Structure(source) => Some(source),
-            Self::ExpressionUses(source) => Some(source),
             Self::Calls(source) => Some(source),
             Self::Pruning(source) => Some(source),
             Self::Parameter(source) => Some(source),
@@ -607,18 +540,43 @@ pub(crate) fn package_resource_error(
 fn parameter_walk_resources(
     resources: &mut novarocks_type_contract::ControlResourceCounter,
     fragment: &Fragment,
-    call_items: usize,
+    relation_items: usize,
+    work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FragmentPackageError> {
-    // call_items is the original entries + environment references count.
-    // Each actual definition owns one visit and at most one primitive reference.
-    let expressions =
-        novarocks_type_contract::control_resource_mul(fragment.expressions().len(), 2)
+    use novarocks_type_contract::{control_resource_add, control_resource_mul};
+    let mut expressions = 0usize;
+    let mut scalar_items = 0usize;
+    let mut scalar_claims = 0usize;
+    for node in fragment.nodes().values() {
+        let unit = node.expressions.as_ref();
+        work.step().map_err(FragmentPackageError::Control)?;
+        let Some(unit) = unit else { continue };
+        expressions = control_resource_add(expressions, unit.definitions().len())
             .map_err(package_resource_error)?;
+        scalar_claims = control_resource_add(scalar_claims, unit.claims().len())
+            .map_err(package_resource_error)?;
+        scalar_items = control_resource_add(scalar_items, unit.claims().len())
+            .map_err(package_resource_error)?;
+        for claim in unit.claims().values() {
+            scalar_items = control_resource_add(scalar_items, claim.effects.environment.len())
+                .map_err(package_resource_error)?;
+            work.step().map_err(FragmentPackageError::Control)?;
+        }
+    }
+    let expression_work = control_resource_mul(expressions, 2).map_err(package_resource_error)?;
+    let calls =
+        control_resource_add(relation_items, scalar_items).map_err(package_resource_error)?;
+    let source_nodes =
+        control_resource_mul(fragment.nodes().len(), 2).map_err(package_resource_error)?;
+    let total = control_resource_add(
+        control_resource_add(calls, expression_work).map_err(package_resource_error)?,
+        source_nodes,
+    )
+    .map_err(package_resource_error)?;
+    let prepass = control_resource_add(fragment.nodes().len(), scalar_claims)
+        .map_err(package_resource_error)?;
     resources
-        .work(
-            novarocks_type_contract::control_resource_add(call_items, expressions)
-                .map_err(package_resource_error)?,
-        )
+        .work(control_resource_add(total, prepass).map_err(package_resource_error)?)
         .map_err(package_resource_error)
 }
 
@@ -679,6 +637,7 @@ fn parameter_projection_resources(
 #[derive(Clone, Copy, Debug, Default)]
 struct ParameterReferenceCounts {
     total: usize,
+    relation: usize,
     intrinsic: usize,
 }
 
@@ -687,14 +646,12 @@ struct ParameterReferenceCounts {
 // A filtering iterator must not hide an arbitrarily long source walk.
 fn visit_fragment_parameter_references(
     fragment: &Fragment,
-    calls: &FrozenFragmentCalls,
     control: &dyn PureCompileControl,
     visit: impl FnMut(SemanticParameterRef),
 ) -> Result<ParameterReferenceCounts, SemanticParameterProjectionError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
         .map_err(SemanticParameterProjectionError::Control)?;
-    let counts =
-        visit_fragment_parameter_references_core(fragment, calls, false, &mut work, visit)?;
+    let counts = visit_fragment_parameter_references_core(fragment, false, &mut work, visit)?;
     work.finish()
         .map_err(SemanticParameterProjectionError::Control)?;
     Ok(counts)
@@ -702,57 +659,90 @@ fn visit_fragment_parameter_references(
 
 fn visit_fragment_parameter_references_core(
     fragment: &Fragment,
-    calls: &FrozenFragmentCalls,
     checked: bool,
     work: &mut CompileCheckpoints<'_>,
     mut visit: impl FnMut(SemanticParameterRef),
 ) -> Result<ParameterReferenceCounts, SemanticParameterProjectionError> {
     let mut counts = ParameterReferenceCounts::default();
-    for call in calls.entries().values() {
-        for reference in &call.effects.environment {
-            visit(*reference);
-            counts.total = if checked {
-                counts
-                    .total
-                    .checked_add(1)
-                    .ok_or(SemanticParameterProjectionError::Control(
-                        CompileControlError::ResourceExhausted,
-                    ))?
-            } else {
-                counts.total.saturating_add(1)
-            };
+    {
+        let mut environment = |references: &[SemanticParameterRef],
+                               relation: bool,
+                               work: &mut CompileCheckpoints<'_>|
+         -> Result<(), SemanticParameterProjectionError> {
+            for reference in references {
+                visit(*reference);
+                counts.total = if checked {
+                    counts
+                        .total
+                        .checked_add(1)
+                        .ok_or(SemanticParameterProjectionError::Control(
+                            CompileControlError::ResourceExhausted,
+                        ))?
+                } else {
+                    counts.total.saturating_add(1)
+                };
+                if relation {
+                    counts.relation = if checked {
+                        counts.relation.checked_add(1).ok_or(
+                            SemanticParameterProjectionError::Control(
+                                CompileControlError::ResourceExhausted,
+                            ),
+                        )?
+                    } else {
+                        counts.relation.saturating_add(1)
+                    };
+                }
+                work.step()
+                    .map_err(SemanticParameterProjectionError::Control)?;
+            }
+            work.step()
+                .map_err(SemanticParameterProjectionError::Control)
+        };
+        for call in fragment.calls().entries().values() {
+            environment(&call.effects.environment, true, work)?;
+        }
+        for node in fragment.nodes().values() {
+            let unit = node.expressions.as_ref();
             work.step()
                 .map_err(SemanticParameterProjectionError::Control)?;
+            if let Some(unit) = unit {
+                for claim in unit.claims().values() {
+                    environment(&claim.effects.environment, false, work)?;
+                }
+            }
         }
-        work.step()
-            .map_err(SemanticParameterProjectionError::Control)?;
     }
-    for (_, definition) in fragment.expressions().iter() {
-        for reference in definition.kind.intrinsic_parameter_references() {
-            visit(*reference);
-            counts.total = if checked {
-                counts
-                    .total
-                    .checked_add(1)
-                    .ok_or(SemanticParameterProjectionError::Control(
-                        CompileControlError::ResourceExhausted,
-                    ))?
-            } else {
-                counts.total.saturating_add(1)
-            };
-            counts.intrinsic = if checked {
-                counts
-                    .intrinsic
-                    .checked_add(1)
-                    .ok_or(SemanticParameterProjectionError::Control(
-                        CompileControlError::ResourceExhausted,
-                    ))?
-            } else {
-                counts.intrinsic.saturating_add(1)
-            };
-        }
+    for node in fragment.nodes().values() {
+        let unit = node.expressions.as_ref();
         work.step()
             .map_err(SemanticParameterProjectionError::Control)?;
+        if let Some(unit) = unit {
+            for definition in unit.definitions() {
+                for reference in definition.kind.intrinsic_parameter_references() {
+                    visit(*reference);
+                    counts.total = if checked {
+                        counts.total.checked_add(1).ok_or(
+                            SemanticParameterProjectionError::Control(
+                                CompileControlError::ResourceExhausted,
+                            ),
+                        )?
+                    } else {
+                        counts.total.saturating_add(1)
+                    };
+                    counts.intrinsic = if checked {
+                        counts.intrinsic.checked_add(1).ok_or(
+                            SemanticParameterProjectionError::Control(
+                                CompileControlError::ResourceExhausted,
+                            ),
+                        )?
+                    } else {
+                        counts.intrinsic.saturating_add(1)
+                    };
+                }
+                work.step()
+                    .map_err(SemanticParameterProjectionError::Control)?;
+            }
+        }
     }
     Ok(counts)
 }
@@ -761,11 +751,10 @@ fn visit_fragment_parameter_references_core(
 // package resource profile. This second observed walk then copies references.
 fn fragment_parameter_references(
     fragment: &Fragment,
-    calls: &FrozenFragmentCalls,
     control: &dyn PureCompileControl,
 ) -> Result<Vec<SemanticParameterRef>, SemanticParameterProjectionError> {
     let mut references = Vec::new();
-    visit_fragment_parameter_references(fragment, calls, control, |reference| {
+    visit_fragment_parameter_references(fragment, control, |reference| {
         references.push(reference);
     })?;
     Ok(references)
@@ -785,8 +774,6 @@ pub fn extract_fragment_packages(
     plan: &PhysicalPlan,
     scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
-    expression_uses: &BTreeMap<FragmentId, PhysicalRootUses>,
-    calls: &BTreeMap<FragmentId, FrozenFragmentCalls>,
     pruning: &BTreeMap<FragmentId, FrozenFragmentPruning>,
     admissions: &BTreeMap<FragmentId, FragmentPackageAdmission>,
     control: &dyn PureCompileControl,
@@ -877,10 +864,7 @@ pub fn extract_fragment_packages(
             .remove(&fragment.id())
             .unwrap_or_default()
             .into_boxed_slice();
-        let local_calls = calls
-            .get(&fragment.id())
-            .ok_or(FragmentPackageExtractionError::MissingCalls(fragment.id()))?;
-        let counts = visit_fragment_parameter_references(fragment, local_calls, control, |_| {})
+        let counts = visit_fragment_parameter_references(fragment, control, |_| {})
             .map_err(extraction_parameter_error)?;
         // The complete plan has no ownership of the external frozen call
         // table. Admit this necessary subset of the eventual package profile
@@ -888,13 +872,13 @@ pub fn extract_fragment_packages(
         crate::validation::validate_fragment_parameter_resource_usage(
             fragment,
             admission.plan_limits,
-            local_calls.entries().len().saturating_add(counts.total),
+            parameter_preallocation_items(fragment, counts),
         )
         .map_err(|error| {
             FragmentPackageExtractionError::Local(FragmentPackageError::Structure(error))
         })?;
-        let references = fragment_parameter_references(fragment, local_calls, control)
-            .map_err(extraction_parameter_error)?;
+        let references =
+            fragment_parameter_references(fragment, control).map_err(extraction_parameter_error)?;
         let parameters = plan
             .parameters()
             .project_observed(references, CompilePhase::Validate, control)
@@ -910,9 +894,11 @@ pub fn extract_fragment_packages(
             .map_err(FragmentPackageExtractionError::Control)?;
         let mut constant_work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
             .map_err(FragmentPackageExtractionError::Control)?;
-        let projected = plan
-            .constants()
-            .project_fragment_observed(fragment, &mut constant_work);
+        let projected = crate::project_fragment_constants_observed(
+            plan.constants(),
+            fragment,
+            &mut constant_work,
+        );
         let projected = match projected {
             Err(crate::ConstantReferenceError::Control(error)) => {
                 return Err(FragmentPackageExtractionError::Control(error));
@@ -929,19 +915,10 @@ pub fn extract_fragment_packages(
         let package = FragmentPackage::try_new(
             FragmentPackageInput {
                 constants: projected,
+                statement_constant_policy: plan.statement_constant_policy(),
                 version: plan.version(),
                 required: plan.required(),
                 fragment: fragment.clone(),
-                expression_uses: expression_uses
-                    .get(&fragment.id())
-                    .ok_or(FragmentPackageExtractionError::MissingExpressionUses(
-                        fragment.id(),
-                    ))?
-                    .clone(),
-                calls: calls
-                    .get(&fragment.id())
-                    .ok_or(FragmentPackageExtractionError::MissingCalls(fragment.id()))?
-                    .clone(),
                 pruning: pruning
                     .get(&fragment.id())
                     .ok_or(FragmentPackageExtractionError::MissingPruning(
@@ -983,14 +960,6 @@ pub fn extract_fragment_packages(
     if consumed_writes.len() != writes.len() {
         return Err(FragmentPackageExtractionError::UnusedWrite);
     }
-    if expression_uses.len() != outputs.len()
-        || expression_uses.keys().any(|id| !outputs.contains_key(id))
-    {
-        return Err(FragmentPackageExtractionError::UnusedExpressionUses);
-    }
-    if calls.len() != outputs.len() || calls.keys().any(|id| !outputs.contains_key(id)) {
-        return Err(FragmentPackageExtractionError::UnusedCalls);
-    }
     if pruning.len() != outputs.len() || pruning.keys().any(|id| !outputs.contains_key(id)) {
         return Err(FragmentPackageExtractionError::UnusedPruning);
     }
@@ -1007,10 +976,6 @@ pub enum FragmentPackageExtractionError {
     Local(FragmentPackageError),
     Parameter(SemanticParameterError),
     Control(CompileControlError),
-    MissingExpressionUses(FragmentId),
-    UnusedExpressionUses,
-    MissingCalls(FragmentId),
-    UnusedCalls,
     MissingPruning(FragmentId),
     UnusedPruning,
     MissingAdmission(FragmentId),
@@ -1035,16 +1000,6 @@ impl fmt::Display for FragmentPackageExtractionError {
             Self::Local(errors) => errors.fmt(f),
             Self::Parameter(error) => error.fmt(f),
             Self::Control(error) => error.fmt(f),
-            Self::MissingExpressionUses(id) => {
-                write!(f, "expression control is missing for fragment {}", id.get())
-            }
-            Self::UnusedExpressionUses => {
-                f.write_str("expression control names an unused fragment")
-            }
-            Self::MissingCalls(id) => {
-                write!(f, "frozen calls are missing for fragment {}", id.get())
-            }
-            Self::UnusedCalls => f.write_str("frozen calls name an unused fragment"),
             Self::MissingPruning(id) => write!(
                 f,
                 "frozen pruning declarations are missing for fragment {}",
@@ -1076,5 +1031,219 @@ fn extraction_parameter_error(
         SemanticParameterProjectionError::Parameter(error) => {
             FragmentPackageExtractionError::Parameter(error)
         }
+    }
+}
+
+fn parameter_preallocation_items(fragment: &Fragment, counts: ParameterReferenceCounts) -> usize {
+    fragment
+        .calls()
+        .entries()
+        .len()
+        .saturating_add(counts.relation)
+        .saturating_add(counts.intrinsic)
+}
+
+#[cfg(test)]
+mod parameter_preallocation_review_tests {
+    use super::*;
+    use crate::*;
+    use novarocks_expression_contract::{
+        BoundFunction, DefinitionControl, ExprKind, ExpressionCallClaim, RootScope,
+    };
+    use novarocks_type_contract::*;
+    use std::sync::Arc;
+
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn extraction_additional_items_do_not_count_unit_owned_environment_again() {
+        let policy = crate::tests::constant_fixture::policy();
+        let reference = SemanticParameterRef {
+            id: SemanticParameterId::new(0),
+            expected_key: SemanticParameterKey::TimeZone,
+        };
+        let mut builder = FragmentBuilder::new(FragmentId::new(991));
+        let node = builder.reserve_node_id().unwrap();
+        let ty = ValueType::new(arrow_schema::DataType::Int64, false);
+        let draft = builder.unit(node).unwrap();
+        let definition = draft
+            .add(
+                None,
+                ty.clone(),
+                ExprKind::FunctionCall {
+                    function: BoundFunction::from_exact_signature(
+                        FunctionId::try_new("fixture/preallocation/timezone-length").unwrap(),
+                        FunctionOverloadId::try_new("fixture/preallocation/zero-to-i64").unwrap(),
+                        FunctionKind::Scalar,
+                        TypedFactSlice::from_pure_boxed(Box::default()),
+                        ty.clone(),
+                    ),
+                    args: Box::default(),
+                },
+            )
+            .unwrap();
+        draft
+            .definition_control(
+                definition,
+                DefinitionControl {
+                    shape: ControlShape::Eager,
+                    temporal_sources: None,
+                },
+            )
+            .unwrap();
+        draft
+            .request(
+                definition,
+                PhysicalCallRequest {
+                    arguments: Box::default(),
+                    logical_argument_count: 0,
+                    expected_result_type: None,
+                    constant_policy: policy,
+                },
+            )
+            .unwrap();
+        let root = draft
+            .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+            .unwrap();
+        let value = builder
+            .add_value(
+                ty,
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                expressions: None,
+                id: node,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: PhysicalProperties {
+                    distribution: Distribution::Singleton,
+                    row_multiplicity: RowMultiplicity::SingleCopy,
+                    ordering: Box::default(),
+                },
+                output: OutputPort {
+                    node,
+                    columns: Box::from([value]),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([Box::from([root])]),
+                },
+            })
+            .unwrap();
+        let draft = builder.take_unit_builder(node).unwrap();
+        let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+        let sealed = draft.seal(vec![], &mut work).unwrap();
+        let invocation = sealed.uses()[&sealed.root_use_ids()[0]].context;
+        let claims = BTreeMap::from([(
+            invocation.use_id,
+            ExpressionCallClaim {
+                context: invocation,
+                effects: CallEffects {
+                    value_stability: FunctionVolatility::Stable,
+                    own_row_error: FunctionIntrinsicRowError::NoRowError,
+                    failure_behavior: FunctionFailureBehavior::Propagate,
+                    null_behavior: FunctionNullBehavior::CalledOnNull,
+                    argument_control: ArgumentControl::Eager,
+                    instance_state: FunctionInstanceState::None,
+                    observable_effects: ObservableEffects::NONE,
+                    environment: Box::from([reference]),
+                    proof_scope: CallProofScope::Region(invocation.region),
+                },
+                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                temporal_source: None,
+                regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
+            },
+        )]);
+        let unit = sealed.finish(claims, &mut work).unwrap();
+        work.finish().unwrap();
+        builder.install_unit(node, Arc::new(unit)).unwrap();
+        let fragment = builder
+            .finish_definition(
+                node,
+                FragmentSink::Noop,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+                StagePlacementPolicy::Singleton,
+            )
+            .unwrap();
+        let parameters = SemanticParameters::try_new([(
+            reference.id,
+            SemanticParameterValue::TimeZone("UTC".into()),
+        )])
+        .unwrap();
+        let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control).unwrap();
+        let admission = FragmentPackageAdmission {
+            plan_limits: PlanLimits::FROZEN,
+            source_retained_bytes: 64 * 1024 * 1024,
+            property_projection_limits: PropertyProofProjectionLimits {
+                max_request_bytes: 16 * 1024 * 1024,
+                max_coexisting_bytes: 256 * 1024 * 1024,
+                max_projection_work: 16 * 1024 * 1024,
+            },
+        };
+        let package = FragmentPackage::try_new(
+            FragmentPackageInput {
+                constants: ConstantPools::empty(),
+                statement_constant_policy: policy,
+                version: PlanVersionId::try_new([29; 16]).unwrap(),
+                required: RequiredContracts::default(),
+                fragment: fragment.clone(),
+                pruning: pruning.clone(),
+                cuts: FragmentCuts::default(),
+                result: None,
+                parameters: parameters.clone(),
+                scans: BTreeMap::new(),
+                writes: BTreeMap::new(),
+                layouts: BTreeMap::new(),
+                annotations: Box::default(),
+            },
+            admission,
+            &Control,
+        )
+        .unwrap();
+        let mut plan =
+            PlanBuilder::new(package.version(), policy).with_semantic_parameters(parameters);
+        plan.add_fragment(fragment.clone()).unwrap();
+        let plan = plan.finish_observed(&Control).unwrap();
+        let extracted = extract_fragment_packages(
+            &plan,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::from([(fragment.id(), pruning)]),
+            &BTreeMap::from([(fragment.id(), admission)]),
+            &Control,
+        )
+        .unwrap();
+        assert_eq!(extracted[&fragment.id()].fragment(), package.fragment());
+        let counts = visit_fragment_parameter_references(&fragment, &Control, |_| {}).unwrap();
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.intrinsic, 0);
+        assert!(fragment.calls().entries().is_empty());
+        assert_eq!(
+            fragment
+                .unit(node)
+                .unwrap()
+                .claims()
+                .values()
+                .map(|claim| claim.effects.environment.len())
+                .sum::<usize>(),
+            1
+        );
+        // The full source already owns this one scalar environment reference.
+        // No external relation/intrinsic item remains to add to that source.
+        // Red on the extracted current production expression: left=1/right=0.
+        assert_eq!(parameter_preallocation_items(&fragment, counts), 0);
     }
 }

@@ -101,7 +101,8 @@ impl OperatorFactory for CompiledJoinInputSinkFactory {
             declaration: Arc::clone(&self.declaration),
             frame: None,
             slot,
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.declaration.node()),
             error: Arc::clone(&self.error),
             construction: None,
             schema: None,
@@ -145,7 +146,7 @@ struct JoinInputSink {
     writer: Option<InputRunWriter>,
     values: Option<Vec<CompiledExpressionInstance>>,
     scopes: Option<Vec<CompiledExpressionInstance>>,
-    scope_sites: Vec<ProgramExpressionRootSite>,
+    scope_sites: Vec<ProgramRootRef>,
     scope_bindings: Vec<FunctionValueType>,
     conversions: ValueConversionContext,
     producers: Option<NativeRuntimeFilterProducerSet>,
@@ -218,7 +219,6 @@ impl JoinInputSink {
             let binding = self
                 .declaration
                 .program
-                .checked()
                 .channels()
                 .channel_type(ProgramChannelSite::Layout {
                     node: self.declaration.node(),
@@ -365,14 +365,8 @@ impl OperatorLifecycle for JoinInputSink {
             };
             let mut sites = funded_vec(owner.as_ref(), condition.scope_keys().len())?;
             let mut bindings = funded_vec(owner.as_ref(), condition.scope_keys().len())?;
-            for ordinal in 0..condition.scope_keys().len() {
-                let key = u32::try_from(ordinal).map_err(|_| {
-                    build_contract("join scope root ordinal exceeds its frozen u32 representation")
-                })?;
-                let site = ProgramExpressionRootSite::Node {
-                    node: self.declaration.node(),
-                    role: ProgramNodeExpressionRole::NaaScopeBuildKey { key },
-                };
+            for key in condition.scope_keys() {
+                let site = key.build;
                 bindings.push(root_value_type(&self.declaration.program, site)?);
                 sites.push(site);
             }

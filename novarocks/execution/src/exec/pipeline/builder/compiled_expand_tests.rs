@@ -25,13 +25,14 @@ use std::sync::Arc;
 use arrow::array::{Array, Int8Array, Int32Array, Int64Array, ListArray, MapArray, StringArray};
 use arrow::datatypes::{DataType, Field};
 use novarocks_connector_contract::ConnectorRowMutationEffect;
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_functions::ConstantPool;
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
-    ChangeEventSpec, ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder,
-    FragmentId, GroupingOutput, LiteralValue, NodeId, NodeKind, UnpivotConstant, UnpivotSpec,
-    UnpivotValueMapping, ValueId, ValueOrigin,
+    ChangeEventSpec, ConstantPoolId, ConstantPools, ConstantReference, FragmentId, GroupingOutput,
+    NodeId, NodeKind, UnpivotConstant, UnpivotSpec, UnpivotValueMapping, ValueId, ValueOrigin,
 };
+use novarocks_type_contract::EvaluationDemand;
 use novarocks_type_contract::{CompilePhase, FunctionValueType};
 
 use super::family_fixture::{
@@ -45,7 +46,7 @@ use crate::exec::operators::compiled_unpivot::CompiledUnpivotProcessorFactory;
 use crate::runtime::runtime_state::RuntimeErrorState;
 
 fn node_output(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     ordinal: u32,
     ty: FunctionValueType,
@@ -68,7 +69,13 @@ const REPEAT_ROWS: [(i64, i64, i64); 2] = [(1, 10, 100), (2, 20, 200)];
 /// `Values(k1, k2, v) -> Repeat(ROLLUP(k1, k2)) -> Result` with outputs
 /// `(k1', k2', v, GROUPING_ID(k1, k2), GROUPING(k2))`.
 fn repeat_program() -> Arc<LocalProgram> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(61));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(61),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let repeat = NodeId::new(1);
     let rows = REPEAT_ROWS
@@ -418,7 +425,13 @@ fn map_pool() -> ConstantPool {
 /// `Values(id, v1, v2) -> Unpivot -> Result` with outputs
 /// `(id, value, label, codes, attrs)` and a two-row output budget.
 pub(crate) fn unpivot_program() -> Arc<LocalProgram> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(62));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(62),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let unpivot = NodeId::new(1);
     let rows = UNPIVOT_ROWS
@@ -433,12 +446,15 @@ pub(crate) fn unpivot_program() -> Arc<LocalProgram> {
     );
     let utf8 = FunctionValueType::new(DataType::Utf8, false);
     let labels = ["first", "second"].map(|label| {
+        let definition = builder.constant(
+            unpivot,
+            utf8.clone(),
+            crate::exec::operators::family_fixture::constant_sources::utf8(label.into()),
+        );
         builder
-            .add_expression(
-                unpivot,
-                utf8.clone(),
-                ExprKind::Literal(LiteralValue::Utf8(label.into())),
-            )
+            .unit(unpivot)
+            .unwrap()
+            .root(definition, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap()
     });
     let outputs = [
@@ -700,7 +716,13 @@ const CHANGE_ROWS: [(i64, Option<i64>, Option<bool>); 4] = [
 /// `(k', v', effect)`: a Delete event for rows whose `flag` is TRUE that
 /// assigns only `k'`, then an unconditional Insert event assigning both.
 fn change_program() -> Arc<LocalProgram> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(63));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(63),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let expand = NodeId::new(1);
     let rows = CHANGE_ROWS
@@ -709,7 +731,10 @@ fn change_program() -> Arc<LocalProgram> {
             vec![
                 cell(Some(*k)),
                 cell(*v),
-                flag.map_or(LiteralValue::Null, LiteralValue::Boolean),
+                flag.map_or(
+                    crate::exec::operators::family_fixture::constant_sources::null(),
+                    crate::exec::operators::family_fixture::constant_sources::boolean,
+                ),
             ]
         })
         .collect::<Vec<_>>();
@@ -720,16 +745,44 @@ fn change_program() -> Arc<LocalProgram> {
         &rows,
     );
     let flag = builder
-        .add_expression(expand, boolean(true), ExprKind::Value(columns[2]))
+        .unit(expand)
+        .unwrap()
+        .add(None, boolean(true), ExprKind::Value(columns[2]))
+        .unwrap();
+    let flag = builder
+        .unit(expand)
+        .unwrap()
+        .root(flag, EvaluationDemand::TruthOnly, RootScope::Port(0))
         .unwrap();
     let delete_k = builder
-        .add_expression(expand, int64(false), ExprKind::Value(columns[0]))
+        .unit(expand)
+        .unwrap()
+        .add(None, int64(false), ExprKind::Value(columns[0]))
+        .unwrap();
+    let delete_k = builder
+        .unit(expand)
+        .unwrap()
+        .root(delete_k, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let insert_k = builder
-        .add_expression(expand, int64(false), ExprKind::Value(columns[0]))
+        .unit(expand)
+        .unwrap()
+        .add(None, int64(false), ExprKind::Value(columns[0]))
+        .unwrap();
+    let insert_k = builder
+        .unit(expand)
+        .unwrap()
+        .root(insert_k, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let insert_v = builder
-        .add_expression(expand, int64(true), ExprKind::Value(columns[1]))
+        .unit(expand)
+        .unwrap()
+        .add(None, int64(true), ExprKind::Value(columns[1]))
+        .unwrap();
+    let insert_v = builder
+        .unit(expand)
+        .unwrap()
+        .root(insert_v, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let k_out = node_output(&mut builder, expand, 0, int64(true));
     let v_out = node_output(&mut builder, expand, 1, int64(true));
@@ -898,6 +951,8 @@ fn nested_change_program(
     parents: Vec<bool>,
     selected: Vec<bool>,
 ) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     use arrow::{array::StructArray, buffer::NullBuffer};
     assert_eq!(children.len(), parents.len());
     assert_eq!(children.len(), selected.len());
@@ -924,7 +979,11 @@ fn nested_change_program(
     let pool_id = ConstantPoolId::new(903);
     let mut constants = ConstantPools::empty();
     constants.insert(pool_id, pool).unwrap();
-    let mut builder = FragmentBuilder::new(FragmentId::new(65));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(65),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let expand = NodeId::new(1);
     let value = node_output(&mut builder, source, 0, source_ty.clone());
@@ -934,23 +993,39 @@ fn nested_change_program(
         .enumerate()
         .map(|(row, selected)| {
             vec![
-                builder
-                    .add_expression(
-                        source,
-                        source_ty.clone(),
-                        ExprKind::Constant(ConstantReference {
-                            pool: pool_id,
-                            ordinal: u32::try_from(row).unwrap(),
-                        }),
-                    )
-                    .unwrap(),
-                builder
-                    .add_expression(
+                {
+                    let definition = builder
+                        .unit(source)
+                        .unwrap()
+                        .add(
+                            None,
+                            source_ty.clone(),
+                            ExprKind::Constant(ConstantReference {
+                                pool: pool_id,
+                                ordinal: u32::try_from(row).unwrap(),
+                            }),
+                        )
+                        .unwrap();
+                    builder
+                        .unit(source)
+                        .unwrap()
+                        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+                        .unwrap()
+                },
+                {
+                    let definition = builder.constant(
                         source,
                         boolean(false),
-                        ExprKind::Literal(LiteralValue::Boolean(*selected)),
-                    )
-                    .unwrap(),
+                        crate::exec::operators::family_fixture::constant_sources::boolean(
+                            *selected,
+                        ),
+                    );
+                    builder
+                        .unit(source)
+                        .unwrap()
+                        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+                        .unwrap()
+                },
             ]
             .into_boxed_slice()
         })
@@ -959,10 +1034,24 @@ fn nested_change_program(
         .add_values(source, cells.into_boxed_slice(), Box::from([value, flag]))
         .unwrap();
     let predicate = builder
-        .add_expression(expand, boolean(false), ExprKind::Value(flag))
+        .unit(expand)
+        .unwrap()
+        .add(None, boolean(false), ExprKind::Value(flag))
+        .unwrap();
+    let predicate = builder
+        .unit(expand)
+        .unwrap()
+        .root(predicate, EvaluationDemand::TruthOnly, RootScope::Port(0))
         .unwrap();
     let assignment = builder
-        .add_expression(expand, source_ty, ExprKind::Value(value))
+        .unit(expand)
+        .unwrap()
+        .add(None, source_ty, ExprKind::Value(value))
+        .unwrap();
+    let assignment = builder
+        .unit(expand)
+        .unwrap()
+        .root(assignment, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let output = node_output(&mut builder, expand, 0, target_ty);
     let effect = node_output(
@@ -1095,6 +1184,8 @@ fn licensed_change_program(
     selected: Vec<bool>,
     root_required: bool,
 ) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     use arrow::{array::StructArray, buffer::NullBuffer};
     assert_eq!(children.len(), parents.len());
     assert_eq!(children.len(), selected.len());
@@ -1127,7 +1218,11 @@ fn licensed_change_program(
     let pool_id = ConstantPoolId::new(903);
     let mut constants = ConstantPools::empty();
     constants.insert(pool_id, pool).unwrap();
-    let mut builder = FragmentBuilder::new(FragmentId::new(65));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(65),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let expand = NodeId::new(1);
     let value = node_output(&mut builder, source, 0, source_ty.clone());
@@ -1137,23 +1232,39 @@ fn licensed_change_program(
         .enumerate()
         .map(|(row, selected)| {
             vec![
-                builder
-                    .add_expression(
-                        source,
-                        source_ty.clone(),
-                        ExprKind::Constant(ConstantReference {
-                            pool: pool_id,
-                            ordinal: u32::try_from(row).unwrap(),
-                        }),
-                    )
-                    .unwrap(),
-                builder
-                    .add_expression(
+                {
+                    let definition = builder
+                        .unit(source)
+                        .unwrap()
+                        .add(
+                            None,
+                            source_ty.clone(),
+                            ExprKind::Constant(ConstantReference {
+                                pool: pool_id,
+                                ordinal: u32::try_from(row).unwrap(),
+                            }),
+                        )
+                        .unwrap();
+                    builder
+                        .unit(source)
+                        .unwrap()
+                        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+                        .unwrap()
+                },
+                {
+                    let definition = builder.constant(
                         source,
                         boolean(false),
-                        ExprKind::Literal(LiteralValue::Boolean(*selected)),
-                    )
-                    .unwrap(),
+                        crate::exec::operators::family_fixture::constant_sources::boolean(
+                            *selected,
+                        ),
+                    );
+                    builder
+                        .unit(source)
+                        .unwrap()
+                        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+                        .unwrap()
+                },
             ]
             .into_boxed_slice()
         })
@@ -1162,10 +1273,24 @@ fn licensed_change_program(
         .add_values(source, cells.into_boxed_slice(), Box::from([value, flag]))
         .unwrap();
     let predicate = builder
-        .add_expression(expand, boolean(false), ExprKind::Value(flag))
+        .unit(expand)
+        .unwrap()
+        .add(None, boolean(false), ExprKind::Value(flag))
+        .unwrap();
+    let predicate = builder
+        .unit(expand)
+        .unwrap()
+        .root(predicate, EvaluationDemand::TruthOnly, RootScope::Port(0))
         .unwrap();
     let assignment = builder
-        .add_expression(expand, source_ty, ExprKind::Value(value))
+        .unit(expand)
+        .unwrap()
+        .add(None, source_ty, ExprKind::Value(value))
+        .unwrap();
+    let assignment = builder
+        .unit(expand)
+        .unwrap()
+        .root(assignment, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let input = FunctionValueType::new(target_ty.data_type().clone(), !root_required);
     let storage = FunctionValueType::new(

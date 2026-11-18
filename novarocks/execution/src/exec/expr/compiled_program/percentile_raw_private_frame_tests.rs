@@ -29,8 +29,8 @@ fn percentile_raw_private_frame_original_values_full_rowdata_sparse_and_host_dro
     let tracker = MemTracker::new_root("percentile-raw-private-frame");
     tracker.install_limit_once(4 * 1024 * 1024).unwrap();
     let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-        program,
-        root(),
+        root_unit(&program).clone(),
+        root(&program).root,
         &Control,
         Some(host(tracker.clone())),
     )
@@ -82,8 +82,12 @@ fn percentile_raw_private_frame_original_values_full_rowdata_sparse_and_host_dro
 fn percentile_raw_private_frame_missing_host_and_true_budget_failure_latch() {
     let program = fixture::program();
     let batch = fixture::source_batch(&program);
-    let mut no_host =
-        CompiledExpressionInstance::try_new(program.clone(), root(), &Control).unwrap();
+    let mut no_host = CompiledExpressionInstance::try_new(
+        root_unit(&program).clone(),
+        root(&program).root,
+        &Control,
+    )
+    .unwrap();
     assert!(matches!(
         no_host.evaluate(&batch, Selection::all(3), &Control),
         Err(KernelFailure::InvalidProgram(_))
@@ -91,8 +95,8 @@ fn percentile_raw_private_frame_missing_host_and_true_budget_failure_latch() {
     let tracker = MemTracker::new_root("percentile-raw-refusal");
     tracker.install_limit_once(1).unwrap();
     let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-        program,
-        root(),
+        root_unit(&program).clone(),
+        root(&program).root,
         &Control,
         Some(host(tracker.clone())),
     )
@@ -191,8 +195,8 @@ fn percentile_raw_private_frame_constructor_host_seven_causes_have_no_footer() {
                 refused: std::sync::atomic::AtomicBool::new(false),
             });
             let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-                p,
-                root(),
+                root_unit(&p).clone(),
+                root(&p).root,
                 &Control,
                 Some(authority.clone()),
             )

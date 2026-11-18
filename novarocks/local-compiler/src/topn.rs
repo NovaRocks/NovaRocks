@@ -37,18 +37,15 @@
 //! uses its own local state-reduction node and exact prepared call sites.
 
 use crate::{lowering::FragmentCompileError, sort::lower_sort_keys};
-use novarocks_local_program::{
-    LocalSortMode, ProgramExprId, ProgramNodeId, ProgramNodeKind, StaticLayout,
-};
-use novarocks_physical_plan::{ExprId, NodeKind, PhysicalNode, TopNPhase, TopNReduction};
+use novarocks_local_program::{LocalSortMode, ProgramNodeId, ProgramNodeKind, StaticLayout};
+use novarocks_physical_plan::{NodeKind, PhysicalNode, TopNPhase, TopNReduction};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
-use std::collections::BTreeMap;
 
 pub(crate) fn lower_topn(
     node: &PhysicalNode,
     input: ProgramNodeId,
     layout: &StaticLayout,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     control: &dyn PureCompileControl,
 ) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
@@ -63,7 +60,7 @@ fn lower_core(
     node: &PhysicalNode,
     input: ProgramNodeId,
     layout: &StaticLayout,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
     let NodeKind::TopN {
@@ -147,7 +144,7 @@ pub(crate) fn lower_grouped_topn_with_creation<H>(
     package: &novarocks_physical_plan::FragmentPackage,
     node: &PhysicalNode,
     input: ProgramNodeId,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     slots: &[novarocks_types::SlotId],
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
@@ -197,15 +194,12 @@ pub(crate) fn lower_grouped_topn_with_creation<H>(
                 .into());
             }
         }
-        let definitions = package.fragment().expressions();
         let mut groups = Vec::new();
         crate::assert_rows::reserve_vec(&mut groups, group_by.len(), &mut work)?;
         for (id, value) in group_by {
-            let definition = definitions
-                .get(*id)
-                .ok_or(FragmentCompileError::Invalid("missing GroupedTopN key"))?;
+            let definition = crate::expressions::bound_root(package, node.id, *id)?;
             work.step()?;
-            if !matches!(definition.kind, novarocks_physical_plan::ExprKind::Value(source) if source == *value)
+            if !matches!(definition.kind, novarocks_expression_contract::ExprKind::Value(source) if source == *value)
                 || !novarocks_physical_plan::grouped_state_topn_key_supported(
                     *comparator,
                     &definition.ty,
@@ -223,10 +217,8 @@ pub(crate) fn lower_grouped_topn_with_creation<H>(
         let mut permutation = Vec::new();
         crate::assert_rows::reserve_vec(&mut permutation, order_by.len(), &mut work)?;
         for key in order_by {
-            let definition = definitions
-                .get(key.expr)
-                .ok_or(FragmentCompileError::Invalid("missing GroupedTopN rank"))?;
-            let novarocks_physical_plan::ExprKind::Value(value) = definition.kind else {
+            let definition = crate::expressions::bound_root(package, node.id, key.expr)?;
+            let novarocks_expression_contract::ExprKind::Value(value) = definition.kind else {
                 return Err((FragmentCompileError::Invalid(
                     "GroupedTopN rank is not a direct value",
                 ))

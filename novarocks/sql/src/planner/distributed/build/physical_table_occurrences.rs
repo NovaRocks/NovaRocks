@@ -17,15 +17,14 @@
 
 //! Fresh exact-owner table facts from independent actual argument roots.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use novarocks_functions::{
     CallEffectInput, PureCallPreparation, PureCallSpecialization, PureKernelAbi,
-    ScopedExpressionEffects,
+    ScopedRelationalEffects,
 };
 use novarocks_physical_plan::{
-    ExpressionRootRole, ExpressionRootSite, Fragment, FrozenPhysicalCall, NodeKind,
-    PhysicalCallSite, PhysicalNode,
+    Fragment, FrozenPhysicalCall, NodeKind, PhysicalCallSite, PhysicalNode,
 };
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileCheckpoints, CompileControlError,
@@ -96,7 +95,7 @@ pub(crate) struct PhysicalTableOccurrenceInput<'a> {
     pub source: &'a PhysicalNode,
     pub request: &'a AuthoredPhysicalTableRequest<'a>,
     pub occurrences: &'a AuthoredPhysicalOccurrences<'a>,
-    pub child_effects: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    pub child_effects: Option<&'a super::contract_lowering::NodeExpressionEffects>,
     pub parameters: &'a SemanticParameters,
     pub environment: &'a [SemanticParameterRef],
     pub decimal_overflow_policy: DecimalOverflowPolicy,
@@ -131,7 +130,7 @@ pub(crate) fn prepare_physical_table_occurrence_observed(
     work.step()?;
     let same_source = actual.is_some_and(|node| std::ptr::eq(node, input.source))
         && std::ptr::eq(input.source, input.request.source())
-        && input.occurrences.root_uses.roots().fragment() == input.fragment.id();
+        && std::ptr::eq(input.occurrences.fragment(), input.fragment);
     work.step()?;
     if !same_source {
         return Err(PhysicalTableOccurrenceError::InvalidSource(
@@ -189,25 +188,20 @@ pub(crate) fn prepare_physical_table_occurrence_observed(
         .try_reserve_exact(arguments.len())
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     work.flush()?;
-    let roots = &input.occurrences.root_uses;
+    let unit = input.source.expressions.as_deref();
     let mut children = ExpressionEffects::PURE_VALUE;
-    for (ordinal, &definition) in arguments.iter().enumerate() {
-        let ordinal = u32::try_from(ordinal);
-        work.step()?;
-        let ordinal = ordinal.map_err(|_| {
-            PhysicalTableOccurrenceError::InvalidSource(
-                "table argument ordinal is not representable",
-            )
-        })?;
-        let root_site = ExpressionRootSite {
-            node: input.source.id,
-            role: ExpressionRootRole::TableFunctionArgument { argument: ordinal },
-        };
+    for &root in arguments {
+        let unit = unit.ok_or(PhysicalTableOccurrenceError::InvalidSource(
+            "table parameter has no actual node unit",
+        ))?;
         let (use_id, actual_effects) = relational_root_effects_observed(
-            roots,
-            root_site,
-            definition,
-            input.child_effects,
+            unit,
+            root,
+            input
+                .child_effects
+                .ok_or(PhysicalTableOccurrenceError::InvalidSource(
+                    "parameter has no original unit summaries",
+                ))?,
             work,
         )?;
         children = children.join(actual_effects);
@@ -215,7 +209,7 @@ pub(crate) fn prepare_physical_table_occurrence_observed(
         work.step()?;
     }
     let call = CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
         function_id: &function.function_id,
         kind: FunctionKind::Table,
@@ -232,7 +226,7 @@ pub(crate) fn prepare_physical_table_occurrence_observed(
             call,
             Arc::clone(input.request.selected()),
             PureCallPreparation::Table {
-                arguments: ScopedExpressionEffects::primitive(context, children),
+                arguments: ScopedRelationalEffects::primitive(context, children),
             },
             work.control(),
         )
@@ -240,9 +234,6 @@ pub(crate) fn prepare_physical_table_occurrence_observed(
     work.flush()?;
     let frozen = FrozenPhysicalCall {
         materialized_writer_input: None,
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
-        temporal_source: None,
         site,
         context,
         effects: preparation.call_contract().effects().clone(),

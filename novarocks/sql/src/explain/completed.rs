@@ -23,10 +23,11 @@ use std::{
     fmt::{self, Write},
 };
 
+use novarocks_expression_contract::{ExprId, RootOrdinal};
 use novarocks_physical_plan::{
-    AnnotationSubject, Edge, ExprId, Fragment, FragmentCuts, FragmentId, FragmentSink, NodeId,
-    NodeKind, PhysicalNode, PhysicalPlan, PlanAnnotation, PlanVersionId, SortExpr, ValueId,
-    WindowExpression, WriteTargetOrdinal, WriterGroupedUnpivotSpec,
+    AnnotationSubject, Edge, Fragment, FragmentCuts, FragmentId, FragmentSink, NodeId, NodeKind,
+    PhysicalNode, PhysicalPlan, PlanAnnotation, PlanVersionId, SortExpr, ValueId,
+    WriteTargetOrdinal, WriterGroupedUnpivotSpec,
 };
 use sha2::{Digest, Sha256};
 
@@ -576,8 +577,8 @@ impl<'a> RenderDiagnostic<'a> {
                 .constants()
                 .resolve_observed(reference, expected, &mut work)
                 .map_err(|error| match error {
-                    novarocks_physical_plan::ConstantReferenceError::Control(error) => error.into(),
-                    novarocks_physical_plan::ConstantReferenceError::Constant(error) => {
+                    novarocks_constant_contract::ConstantTableError::Control(error) => error.into(),
+                    novarocks_constant_contract::ConstantTableError::Constant(error) => {
                         error.into()
                     }
                     other => SqlCompileError::InvalidRequest(other.to_string()),
@@ -865,7 +866,6 @@ pub fn render_completed_plan(
             render_fragment_profile(observation, &mut lines)?;
         }
         render_value_definitions(&context, *fragment_id, fragment, &mut lines)?;
-        render_expression_definitions(&context, *fragment_id, fragment, &mut lines)?;
         render_nodes_iterative(&context, *fragment_id, fragment, &mut lines)?;
     }
     lines.finish_observed()
@@ -1316,22 +1316,53 @@ fn render_sink(
     Ok(())
 }
 
-fn render_expression_definitions(
+fn render_expression_unit(
     context: &RenderContext<'_>,
     fragment_id: FragmentId,
-    fragment: &Fragment,
+    node: &PhysicalNode,
+    pad: &str,
     lines: &mut ExplainRenderOutput,
 ) -> Result<(), SqlCompileError> {
-    if fragment.expressions().is_empty() {
+    let Some(unit) = &node.expressions else {
         return Ok(());
-    }
-    lines.push(format_args!("  EXPRESSION DEFINITIONS"))?;
-    for (id, expression) in fragment.expressions().iter() {
+    };
+    lines.push(format_args!(
+        "{pad}  EXPRESSION UNIT node=n{}",
+        node.id.get()
+    ))?;
+    for (ordinal, port) in unit.ports().iter().enumerate() {
         lines.push(format_args!(
-            "    e{} = {} : {}",
-            id.get(),
-            format_expr_definition(context, fragment_id, expression),
+            "{pad}    PORT {ordinal} [{}]",
+            joined(
+                &port.values,
+                ", ",
+                |(value, ty): &(ValueId, novarocks_physical_plan::ValueType),
+                 out: &mut fmt::Formatter<'_>| write!(
+                    out,
+                    "{}: {}",
+                    context.value_name(fragment_id, *value),
+                    format_value_type(ty)
+                )
+            )
+        ))?;
+    }
+    lines.push(format_args!("{pad}    EXPRESSION DEFINITIONS"))?;
+    for expression in unit.definitions() {
+        lines.push(format_args!(
+            "{pad}      {} = {} : {}",
+            DefinitionRef(node.id, expression.id),
+            format_expr_definition(context, fragment_id, node.id, expression),
             format_value_type(&expression.ty)
+        ))?;
+    }
+    lines.push(format_args!("{pad}    ROOTS"))?;
+    for (ordinal, root) in unit.roots().iter().enumerate() {
+        lines.push(format_args!(
+            "{pad}      {} = {} demand={:?} scope={:?}",
+            RootRef(node.id, RootOrdinal::new(ordinal as u32)),
+            DefinitionRef(node.id, root.definition),
+            root.demand,
+            root.scope
         ))?;
     }
     Ok(())
@@ -1384,12 +1415,12 @@ impl fmt::Display for ValueOriginDisplay<'_> {
                     digest_bytes(payload.payload())
                 )
             }
-            ValueOrigin::Expr { node, expr } => {
+            ValueOrigin::Expr { node, root } => {
                 write!(
                     formatter,
-                    "expr(node=n{}, expr=e{})",
+                    "expr(node=n{}, root=r{})",
                     node.get(),
-                    expr.get()
+                    root.get()
                 )
             }
             ValueOrigin::NullExtended { node, of } => write!(
@@ -1724,13 +1755,14 @@ fn digest_bytes(bytes: &[u8]) -> DigestBytes {
 struct ExprDefinitionDisplay<'a> {
     context: &'a RenderContext<'a>,
     fragment: FragmentId,
-    expression: &'a novarocks_physical_plan::ExprNode,
+    node: NodeId,
+    expression: &'a novarocks_expression_contract::ExprNode,
 }
 
 impl fmt::Display for ExprDefinitionDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use novarocks_physical_plan::ExprKind;
-        let expr = |id: ExprId| id.get();
+        use novarocks_expression_contract::ExprKind;
+        let expr = |id: ExprId| DefinitionRef(self.node, id);
         match &self.expression.kind {
             ExprKind::Value(value) => self
                 .context
@@ -1739,11 +1771,10 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
             ExprKind::LambdaParameter { lambda, ordinal } => {
                 write!(
                     formatter,
-                    "lambda-parameter(lambda=e{}, ordinal={ordinal})",
+                    "lambda-parameter(lambda={}, ordinal={ordinal})",
                     expr(*lambda)
                 )
             }
-            ExprKind::Literal(value) => format_literal(value).fmt(formatter),
             ExprKind::Constant(reference) => write!(
                 formatter,
                 "constant-reference(pool={}, ordinal={})",
@@ -1752,36 +1783,38 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
             ),
             ExprKind::Unary { op, expr: inner } => write!(
                 formatter,
-                "({}e{})",
+                "({}{})",
                 match op {
-                    novarocks_physical_plan::UnaryOperator::Plus => "+",
-                    novarocks_physical_plan::UnaryOperator::Minus => "-",
-                    novarocks_physical_plan::UnaryOperator::Not => "NOT ",
-                    novarocks_physical_plan::UnaryOperator::BitwiseNot => "~",
+                    novarocks_expression_contract::UnaryOperator::Plus => "+",
+                    novarocks_expression_contract::UnaryOperator::Minus => "-",
+                    novarocks_expression_contract::UnaryOperator::Not => "NOT ",
+                    novarocks_expression_contract::UnaryOperator::BitwiseNot => "~",
                 },
                 expr(*inner)
             ),
             ExprKind::Conjunction { args } => write!(
                 formatter,
                 "({})",
-                args.iter()
-                    .map(|arg| format!("e{}", expr(*arg)))
-                    .collect::<Vec<_>>()
-                    .join(" AND ")
+                joined(
+                    args,
+                    " AND ",
+                    |arg: &ExprId, out: &mut fmt::Formatter<'_>| expr(*arg).fmt(out)
+                )
             ),
             ExprKind::Disjunction { args } => write!(
                 formatter,
                 "({})",
-                args.iter()
-                    .map(|arg| format!("e{}", expr(*arg)))
-                    .collect::<Vec<_>>()
-                    .join(" OR ")
+                joined(
+                    args,
+                    " OR ",
+                    |arg: &ExprId, out: &mut fmt::Formatter<'_>| expr(*arg).fmt(out)
+                )
             ),
             ExprKind::Binary {
                 left, op, right, ..
             } => write!(
                 formatter,
-                "(e{} {} e{})",
+                "({} {} {})",
                 expr(*left),
                 binary_operator(*op),
                 expr(*right)
@@ -1796,8 +1829,8 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                     ", ",
                     |argument: &ExprId, output: &mut fmt::Formatter<'_>| write!(
                         output,
-                        "e{}",
-                        argument.get()
+                        "{}",
+                        expr(*argument)
                     )
                 )
             ),
@@ -1806,7 +1839,7 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 body,
             } => write!(
                 formatter,
-                "lambda<{}> -> e{}",
+                "lambda<{}> -> {}",
                 joined(
                     parameter_types,
                     ",",
@@ -1821,14 +1854,14 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 target,
                 ..
             } => {
-                write!(formatter, "CAST(e{} AS {target})", expr(*inner))
+                write!(formatter, "CAST({} AS {target})", expr(*inner))
             }
             ExprKind::IsNull {
                 expr: inner,
                 negated,
             } => write!(
                 formatter,
-                "(e{} IS {}NULL)",
+                "({} IS {}NULL)",
                 expr(*inner),
                 if *negated { "NOT " } else { "" }
             ),
@@ -1838,7 +1871,7 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 negated,
             } => write!(
                 formatter,
-                "(e{} {}IN ({}))",
+                "({} {}IN ({}))",
                 expr(*inner),
                 if *negated { "NOT " } else { "" },
                 joined(
@@ -1846,8 +1879,8 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                     ", ",
                     |item: &ExprId, output: &mut fmt::Formatter<'_>| write!(
                         output,
-                        "e{}",
-                        item.get()
+                        "{}",
+                        expr(*item)
                     )
                 )
             ),
@@ -1858,7 +1891,7 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 negated,
             } => write!(
                 formatter,
-                "(e{} {}BETWEEN e{} AND e{})",
+                "({} {}BETWEEN {} AND {})",
                 expr(*inner),
                 if *negated { "NOT " } else { "" },
                 expr(*low),
@@ -1870,7 +1903,7 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 negated,
             } => write!(
                 formatter,
-                "(e{} {}LIKE e{})",
+                "({} {}LIKE {})",
                 expr(*inner),
                 if *negated { "NOT " } else { "" },
                 expr(*pattern)
@@ -1882,13 +1915,13 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
             } => {
                 formatter.write_str("CASE")?;
                 if let Some(operand) = operand {
-                    write!(formatter, " e{}", expr(*operand))?;
+                    write!(formatter, " {}", expr(*operand))?;
                 }
                 for (when, then) in when_then {
-                    write!(formatter, " WHEN e{} THEN e{}", expr(*when), expr(*then))?;
+                    write!(formatter, " WHEN {} THEN {}", expr(*when), expr(*then))?;
                 }
                 if let Some(otherwise) = else_expr {
-                    write!(formatter, " ELSE e{}", expr(*otherwise))?;
+                    write!(formatter, " ELSE {}", expr(*otherwise))?;
                 }
                 formatter.write_str(" END")
             }
@@ -1898,53 +1931,11 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 negated,
             } => write!(
                 formatter,
-                "(e{} IS {}{})",
+                "({} IS {}{})",
                 expr(*inner),
                 if *negated { "NOT " } else { "" },
                 if *value { "TRUE" } else { "FALSE" }
             ),
-            ExprKind::WindowCall {
-                function,
-                distinct,
-                args,
-                function_order_by,
-                frame,
-                ignore_nulls,
-                aggregate_binding,
-            } => {
-                write!(
-                    formatter,
-                    "{}@{}({}{}) order-by=[{}] frame=",
-                    function.function_id.as_str(),
-                    function.overload.as_str(),
-                    if *distinct { "DISTINCT " } else { "" },
-                    joined(
-                        args,
-                        ", ",
-                        |argument: &ExprId, output: &mut fmt::Formatter<'_>| write!(
-                            output,
-                            "e{}",
-                            argument.get()
-                        )
-                    ),
-                    format_sort_expr_refs(function_order_by)
-                )?;
-                match frame {
-                    Some(frame) => write!(formatter, "{}", format_window_frame(frame))?,
-                    None => formatter.write_str("none")?,
-                }
-                write!(formatter, " ignore-nulls={ignore_nulls} aggregate-binding=")?;
-                match aggregate_binding {
-                    Some(binding) => write!(
-                        formatter,
-                        "{}@{}:{}",
-                        binding.function.function_id.as_str(),
-                        binding.function.overload.as_str(),
-                        aggregate_phase(binding.phase)
-                    ),
-                    None => formatter.write_str("none"),
-                }
-            }
         }
     }
 }
@@ -1952,37 +1943,74 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
 fn format_expr_definition<'a>(
     context: &'a RenderContext<'a>,
     fragment_id: FragmentId,
-    expression: &'a novarocks_physical_plan::ExprNode,
+    node: NodeId,
+    expression: &'a novarocks_expression_contract::ExprNode,
 ) -> ExprDefinitionDisplay<'a> {
     ExprDefinitionDisplay {
         context,
         fragment: fragment_id,
+        node,
         expression,
     }
 }
 
-fn binary_operator(operator: novarocks_physical_plan::BinaryOperator) -> &'static str {
+fn binary_operator(operator: novarocks_expression_contract::BinaryOperator) -> &'static str {
     match operator {
-        novarocks_physical_plan::BinaryOperator::Add => "+",
-        novarocks_physical_plan::BinaryOperator::Subtract => "-",
-        novarocks_physical_plan::BinaryOperator::Multiply => "*",
-        novarocks_physical_plan::BinaryOperator::Divide => "/",
-        novarocks_physical_plan::BinaryOperator::Modulo => "%",
-        novarocks_physical_plan::BinaryOperator::Eq => "=",
-        novarocks_physical_plan::BinaryOperator::EqForNull => "<=>",
-        novarocks_physical_plan::BinaryOperator::NotEq => "!=",
-        novarocks_physical_plan::BinaryOperator::Lt => "<",
-        novarocks_physical_plan::BinaryOperator::LtEq => "<=",
-        novarocks_physical_plan::BinaryOperator::Gt => ">",
-        novarocks_physical_plan::BinaryOperator::GtEq => ">=",
-        novarocks_physical_plan::BinaryOperator::BitAnd => "&",
-        novarocks_physical_plan::BinaryOperator::BitOr => "|",
-        novarocks_physical_plan::BinaryOperator::BitXor => "^",
+        novarocks_expression_contract::BinaryOperator::Add => "+",
+        novarocks_expression_contract::BinaryOperator::Subtract => "-",
+        novarocks_expression_contract::BinaryOperator::Multiply => "*",
+        novarocks_expression_contract::BinaryOperator::Divide => "/",
+        novarocks_expression_contract::BinaryOperator::Modulo => "%",
+        novarocks_expression_contract::BinaryOperator::Eq => "=",
+        novarocks_expression_contract::BinaryOperator::EqForNull => "<=>",
+        novarocks_expression_contract::BinaryOperator::NotEq => "!=",
+        novarocks_expression_contract::BinaryOperator::Lt => "<",
+        novarocks_expression_contract::BinaryOperator::LtEq => "<=",
+        novarocks_expression_contract::BinaryOperator::Gt => ">",
+        novarocks_expression_contract::BinaryOperator::GtEq => ">=",
+        novarocks_expression_contract::BinaryOperator::BitAnd => "&",
+        novarocks_expression_contract::BinaryOperator::BitOr => "|",
+        novarocks_expression_contract::BinaryOperator::BitXor => "^",
     }
 }
 
-fn format_sort_expr_refs(expressions: &[SortExpr]) -> SortExprsDisplay<'_> {
-    SortExprsDisplay(expressions)
+struct WindowCallDisplay<'a> {
+    node: NodeId,
+    call: &'a novarocks_physical_plan::WindowCallSpec,
+}
+impl fmt::Display for WindowCallDisplay<'_> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let call = self.call;
+        write!(
+            out,
+            "{}@{}({}{}) order-by=[{}] frame=",
+            call.binding.function_id.as_str(),
+            call.binding.overload.as_str(),
+            if call.distinct { "DISTINCT " } else { "" },
+            format_root_refs(self.node, &call.arguments),
+            SortExprsDisplay(self.node, &call.order_by)
+        )?;
+        match &call.frame {
+            Some(frame) => format_window_frame(frame).fmt(out)?,
+            None => out.write_str("none")?,
+        }
+        write!(
+            out,
+            " ignore-nulls={} aggregate-binding=",
+            call.ignore_nulls
+        )?;
+        match &call.aggregate_binding {
+            Some(binding) => write!(
+                out,
+                "{}@{}:{}",
+                binding.function.function_id.as_str(),
+                binding.function.overload.as_str(),
+                aggregate_phase(binding.phase)
+            )?,
+            None => out.write_str("none")?,
+        }
+        write!(out, " ->v{}", call.output.get())
+    }
 }
 
 fn format_window_frame(frame: &novarocks_physical_plan::WindowFrame) -> String {
@@ -2010,11 +2038,19 @@ fn format_window_bound(bound: &novarocks_physical_plan::WindowBound) -> String {
             "UNBOUNDED PRECEDING".to_string()
         }
         novarocks_physical_plan::WindowBound::Preceding(expression) => {
-            format!("e{} PRECEDING", expression.get())
+            format!(
+                "constant-reference(pool={}, ordinal={}) PRECEDING",
+                expression.pool.get(),
+                expression.ordinal
+            )
         }
         novarocks_physical_plan::WindowBound::CurrentRow => "CURRENT ROW".to_string(),
         novarocks_physical_plan::WindowBound::Following(expression) => {
-            format!("e{} FOLLOWING", expression.get())
+            format!(
+                "constant-reference(pool={}, ordinal={}) FOLLOWING",
+                expression.pool.get(),
+                expression.ordinal
+            )
         }
         novarocks_physical_plan::WindowBound::UnboundedFollowing => {
             "UNBOUNDED FOLLOWING".to_string()
@@ -2741,6 +2777,7 @@ fn render_nodes_iterative(
         let mut contract = NodeContractLines::new(lines);
         render_node_contract(context, fragment_id, fragment, node, &pad, &mut contract);
         contract.finish()?;
+        render_expression_unit(context, fragment_id, node, &pad, lines)?;
         if is_detailed(context.level) {
             render_annotations(
                 context,
@@ -2958,13 +2995,13 @@ fn render_node_contract(
             }
             for guarantee in relation.predicate_guarantees() {
                 lines.push(format_args!(
-                    "{pad}  provider-guarantee expr=e{} kind={}",
-                    guarantee.predicate.get(),
+                    "{pad}  provider-guarantee root={} kind={}",
+                    RootRef(node.id, guarantee.predicate),
                     predicate_guarantee_kind(guarantee.kind)
                 ));
             }
             for residual in residuals {
-                lines.push(format_args!("{pad}  residual expr=e{}", residual.get()));
+                lines.push(format_args!("{pad}  residual root={}", RootRef(node.id, *residual)));
             }
             if !derived_values.is_empty() {
                 lines.push(format_args!(
@@ -2987,8 +3024,8 @@ fn render_node_contract(
             lines.push(format_args!(
                 "{pad}  provider-outputs=[{}], guarantees=[{}], residuals=[{}], derived-values=[{}]",
                 joined(provider_outputs, ", ", |(_, value): &(novarocks_physical_plan::ProviderColumnReference, ValueId), output: &mut fmt::Formatter<'_>| write!(output, "v{}", value.get())),
-                joined(relation.predicate_guarantees(), ", ", |guarantee: &novarocks_physical_plan::PredicateGuarantee, output: &mut fmt::Formatter<'_>| write!(output, "e{}:{}", guarantee.predicate.get(), predicate_guarantee_kind(guarantee.kind))),
-                format_expr_ids(residuals),
+                joined(relation.predicate_guarantees(), ", ", |guarantee: &novarocks_physical_plan::PredicateGuarantee, output: &mut fmt::Formatter<'_>| write!(output, "{}:{}", RootRef(node.id, guarantee.predicate), predicate_guarantee_kind(guarantee.kind))),
+                format_root_refs(node.id, residuals),
                 format_value_ids(derived_values)
             ));
         }
@@ -2996,26 +3033,26 @@ fn render_node_contract(
             for (ordinal, predicate) in predicates.iter().enumerate() {
                 lines.push(format_args!(
                     "{pad}  predicates[{ordinal}]: {}",
-                    format_expr(plan, fragment_id, fragment, *predicate)
+                    format_root(plan, fragment_id, fragment, node.id, *predicate)
                 ));
             }
         }
         NodeKind::Project { expressions } => lines.push(format_args!(
             "{pad}  expressions=[{}]",
-            joined(expressions, ", ", |(expression, output): &(ExprId, ValueId), formatter: &mut fmt::Formatter<'_>| write!(
+            joined(expressions, ", ", |(expression, output): &(RootOrdinal, ValueId), formatter: &mut fmt::Formatter<'_>| write!(
                     formatter,
                     "{} AS {}",
-                    format_expr(plan, fragment_id, fragment, *expression),
+                    format_root(plan, fragment_id, fragment, node.id, *expression),
                     context.value_name(fragment_id, *output)
                 ))
         )),
         NodeKind::Aggregate { group_by, calls, .. } => {
             lines.push(format_args!(
                 "{pad}  group-by=[{}]",
-                joined(group_by, ", ", |(expression, output): &(ExprId, ValueId), formatter: &mut fmt::Formatter<'_>| write!(
+                joined(group_by, ", ", |(expression, output): &(RootOrdinal, ValueId), formatter: &mut fmt::Formatter<'_>| write!(
                             formatter,
                             "{} AS {}",
-                            format_expr(plan, fragment_id, fragment, *expression),
+                            format_root(plan, fragment_id, fragment, node.id, *expression),
                             context.value_name(fragment_id, *output)
                         ))
             ));
@@ -3028,9 +3065,9 @@ fn render_node_contract(
                         call.binding.function.function_id.as_str(),
                         call.binding.function.overload.as_str(),
                         aggregate_phase(call.binding.phase),
-                        joined(&call.arguments, ", ", |expression: &ExprId, output: &mut fmt::Formatter<'_>| format_expr(plan, fragment_id, fragment, *expression).fmt(output)),
+                        joined(&call.arguments, ", ", |expression: &RootOrdinal, output: &mut fmt::Formatter<'_>| format_root(plan, fragment_id, fragment, node.id, *expression).fmt(output)),
                         call.distinct,
-                        format_sort_exprs(plan, fragment_id, fragment, &call.order_by),
+                        format_sort_exprs(plan, fragment_id, fragment, node.id, &call.order_by),
                         context.value_name(fragment_id, call.output)
                     ))
             ));
@@ -3058,11 +3095,11 @@ condition,
                 joined(keys, ", ", |key: &novarocks_physical_plan::JoinKey, formatter: &mut fmt::Formatter<'_>| write!(
                         formatter,
                         "{} {} {}",
-                        format_expr(plan, fragment_id, fragment, key.left),
+                        format_root(plan, fragment_id, fragment, node.id, key.left),
                         if key.null_safe { "<=>" } else { "=" },
-                        format_expr(plan, fragment_id, fragment, key.right)
+                        format_root(plan, fragment_id, fragment, node.id, key.right)
                     )),
-                format_optional_readable_expr(plan, fragment_id, fragment, *residual),
+                format_optional_root(plan, fragment_id, fragment, node.id, *residual),
                 format_value_ids(null_extended)
             ));
             if let Some(scope) = condition.scope_keys() {
@@ -3070,9 +3107,9 @@ condition,
                     "{pad}  scope-keys=[{}]",
                     joined(scope, ", ", |key: &novarocks_physical_plan::JoinKey, formatter: &mut fmt::Formatter<'_>| write!(
                         formatter, "{} {} {}",
-                        format_expr(plan, fragment_id, fragment, key.left),
+                        format_root(plan, fragment_id, fragment, node.id, key.left),
                         if key.null_safe { "<=>" } else { "=" },
-                        format_expr(plan, fragment_id, fragment, key.right)
+                        format_root(plan, fragment_id, fragment, node.id, key.right)
                     ))
                 ));
             }
@@ -3088,19 +3125,19 @@ condition,
                 "{pad}  kind={}, distribution={}, on: {}, null-extended=[{}]",
                 join_kind_label(*kind),
                 nest_loop_distribution(*distribution),
-                format_optional_readable_expr(plan, fragment_id, fragment, *predicate),
+                format_optional_root(plan, fragment_id, fragment, node.id, *predicate),
                 format_value_ids(null_extended)
             ));
         }
         NodeKind::Sort { order_by, mode } => match mode {
                 novarocks_physical_plan::SortMode::Global => lines.push(format_args!(
                     "{pad}  mode=global, order-by=[{}]",
-                    format_sort_exprs(plan, fragment_id, fragment, order_by)
+                    format_sort_exprs(plan, fragment_id, fragment, node.id, order_by)
                 )),
                 novarocks_physical_plan::SortMode::Analytic { partition_by } => lines.push(format_args!(
                     "{pad}  mode=analytic partition-by=[{}], order-by=[{}]",
-                    format_sort_exprs(plan, fragment_id, fragment, partition_by),
-                    format_sort_exprs(plan, fragment_id, fragment, order_by)
+                    format_sort_exprs(plan, fragment_id, fragment, node.id, partition_by),
+                    format_sort_exprs(plan, fragment_id, fragment, node.id, order_by)
                 )),
                 novarocks_physical_plan::SortMode::PartitionTopN {
                     partition_by,
@@ -3109,8 +3146,8 @@ condition,
                 } => lines.push(format_args!(
                     "{pad}  mode=analytic, partition_limit={limit} topn_type={} partition-by=[{}], order-by=[{}]",
                     partition_topn_label(*kind),
-                    format_sort_exprs(plan, fragment_id, fragment, partition_by),
-                    format_sort_exprs(plan, fragment_id, fragment, order_by)
+                    format_sort_exprs(plan, fragment_id, fragment, node.id, partition_by),
+                    format_sort_exprs(plan, fragment_id, fragment, node.id, order_by)
                 )),
             },
         NodeKind::TopN {
@@ -3123,7 +3160,7 @@ condition,
             lines.push(format_args!(
                 "{pad}  phase={}, limit={limit}, offset={offset}, order-by=[{}]",
                 topn_phase(*phase),
-                format_sort_exprs(plan, fragment_id, fragment, order_by)
+                format_sort_exprs(plan, fragment_id, fragment, node.id, order_by)
             ));
             if let novarocks_physical_plan::TopNReduction::GroupedStates { group_by, calls, comparator } = reduction {
                 lines.push(format_args!("{pad}  unit=group-key, keys={}, merged-states={}, comparator={}", group_by.len(), calls.len(), comparator.stable_name()));
@@ -3133,17 +3170,14 @@ condition,
             Some(limit) => lines.push(format_args!("{pad}  limit={limit}, offset={offset}")),
             None => lines.push(format_args!("{pad}  limit=none, offset={offset}")),
         },
-        NodeKind::Window(spec) => lines.push(format_args!(
-            "{pad}  partition-by=[{}], order-by=[{}], expressions=[{}]",
-            format_sort_exprs(plan, fragment_id, fragment, &spec.partition_by),
-            format_sort_exprs(plan, fragment_id, fragment, &spec.order_by),
-            joined(&spec.expressions, ", ", |expression: &WindowExpression, formatter: &mut fmt::Formatter<'_>| write!(
-                    formatter,
-                    "{}->{}",
-                    format_expr(plan, fragment_id, fragment, expression.expression),
-                    context.value_name(fragment_id, expression.output)
-                ))
-        )),
+        NodeKind::Window(spec) => {
+            lines.push(format_args!("{pad}  partition-by=[{}], order-by=[{}]",
+                format_sort_exprs(plan, fragment_id, fragment, node.id, &spec.partition_by),
+                format_sort_exprs(plan, fragment_id, fragment, node.id, &spec.order_by)));
+            for (ordinal, call) in spec.calls.iter().enumerate() {
+                lines.push(format_args!("{pad}  WINDOW CALL {ordinal}: {}", WindowCallDisplay { node: node.id, call }));
+            }
+        }
         NodeKind::SetOp {
             kind,
             input_mappings,
@@ -3166,7 +3200,7 @@ condition,
         }
         NodeKind::Values { rows } => lines.push(format_args!(
             "{pad}  rows=[{}]",
-            ValuesRowsDisplay { plan, fragment_id, fragment, rows }
+            ValuesRowsDisplay { plan, fragment_id, fragment, node: node.id, rows }
         )),
         NodeKind::Repeat {
             grouping_sets,
@@ -3193,16 +3227,16 @@ condition,
                     formatter,
                     "v{}:[{}]",
                     mapping.input.get(),
-                    format_unpivot_constants(plan, fragment_id, fragment, &mapping.constants)
+                    format_unpivot_constants(plan, fragment_id, fragment, node.id, &mapping.constants)
                 )),
             spec.max_output_rows,
             spec.max_output_bytes
         )),
         NodeKind::GenerateSeries { start, stop, step } => lines.push(format_args!(
             "{pad}  start={}, stop={}, step={}",
-            format_expr(plan, fragment_id, fragment, *start),
-            format_expr(plan, fragment_id, fragment, *stop),
-            format_optional_readable_expr(plan, fragment_id, fragment, *step)
+            format_root(plan, fragment_id, fragment, node.id, *start),
+            format_root(plan, fragment_id, fragment, node.id, *stop),
+            format_optional_root(plan, fragment_id, fragment, node.id, *step)
         )),
         NodeKind::TableFunction {
             function,
@@ -3213,7 +3247,7 @@ condition,
             "{pad}  function={}@{}, arguments=[{}], outputs=[{}], left-outer={left_outer}",
             function.function_id.as_str(),
             function.overload.as_str(),
-            joined(arguments, ", ", |argument: &ExprId, formatter: &mut fmt::Formatter<'_>| format_expr(plan, fragment_id, fragment, *argument).fmt(formatter)),
+            joined(arguments, ", ", |argument: &RootOrdinal, formatter: &mut fmt::Formatter<'_>| format_root(plan, fragment_id, fragment, node.id, *argument).fmt(formatter)),
             format_table_function_outputs(outputs)
         )),
         NodeKind::AssertOneRow(assertion) => {
@@ -3232,15 +3266,16 @@ condition,
                     formatter,
                     "effect={} predicate={} assignments=[{}]",
                     connector_row_mutation_effect(event.effect),
-                    format_optional_readable_expr(plan, fragment_id, fragment, event.predicate),
+                    format_optional_root(plan, fragment_id, fragment, node.id, event.predicate),
                     joined(&event.assignments, ", ", |assignment: &novarocks_physical_plan::ChangeAssignment, output: &mut fmt::Formatter<'_>| write!(
                             output,
                             "v{}->{}",
                             assignment.output.get(),
-                            format_optional_readable_expr(
+                            format_optional_root(
                                 plan,
                                 fragment_id,
                                 fragment,
+                                node.id,
                                 assignment.expression
                             )
                         ))
@@ -3282,28 +3317,38 @@ condition,
             format_writer_schema(&spec.input_schema),
             format_writer_schema(&spec.output_schema),
             format_writer_aggregates(&spec.final_aggregates),
-            GroupedUnpivotDisplay { plan, fragment_id, fragment, value: spec.grouped_unpivot.as_ref() }
+            GroupedUnpivotDisplay { plan, fragment_id, fragment, node: node.id, value: spec.grouped_unpivot.as_ref() }
         )),
     }
 }
 
-struct ExprIdsDisplay<'a>(&'a [ExprId]);
-
-impl fmt::Display for ExprIdsDisplay<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        joined(
-            self.0,
-            ", ",
-            |expression: &ExprId, output: &mut fmt::Formatter<'_>| {
-                write!(output, "e{}", expression.get())
-            },
-        )
-        .fmt(formatter)
+#[derive(Clone, Copy)]
+struct DefinitionRef(NodeId, ExprId);
+impl fmt::Display for DefinitionRef {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(out, "n{}:e{}", self.0.get(), self.1.get())
     }
 }
-
-fn format_expr_ids(expressions: &[ExprId]) -> ExprIdsDisplay<'_> {
-    ExprIdsDisplay(expressions)
+#[derive(Clone, Copy)]
+struct RootRef(NodeId, RootOrdinal);
+impl fmt::Display for RootRef {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(out, "n{}:r{}", self.0.get(), self.1.get())
+    }
+}
+struct RootRefsDisplay<'a>(NodeId, &'a [RootOrdinal]);
+impl fmt::Display for RootRefsDisplay<'_> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        joined(
+            self.1,
+            ", ",
+            |root: &RootOrdinal, out: &mut fmt::Formatter<'_>| RootRef(self.0, *root).fmt(out),
+        )
+        .fmt(out)
+    }
+}
+fn format_root_refs(node: NodeId, roots: &[RootOrdinal]) -> RootRefsDisplay<'_> {
+    RootRefsDisplay(node, roots)
 }
 
 struct SetOpMappingsDisplay<'a>(&'a [Box<[ValueId]>]);
@@ -3338,7 +3383,8 @@ struct ValuesRowsDisplay<'a> {
     plan: &'a PhysicalPlan,
     fragment_id: FragmentId,
     fragment: &'a Fragment,
-    rows: &'a [Box<[ExprId]>],
+    node: NodeId,
+    rows: &'a [Box<[RootOrdinal]>],
 }
 
 impl fmt::Display for ValuesRowsDisplay<'_> {
@@ -3352,8 +3398,14 @@ impl fmt::Display for ValuesRowsDisplay<'_> {
                 if column_index != 0 {
                     formatter.write_str(", ")?;
                 }
-                format_expr(self.plan, self.fragment_id, self.fragment, *expression)
-                    .fmt(formatter)?;
+                format_root(
+                    self.plan,
+                    self.fragment_id,
+                    self.fragment,
+                    self.node,
+                    *expression,
+                )
+                .fmt(formatter)?;
             }
             formatter.write_str("]")?;
         }
@@ -3361,68 +3413,28 @@ impl fmt::Display for ValuesRowsDisplay<'_> {
     }
 }
 
-fn format_optional_readable_expr(
+fn format_optional_root(
     _plan: &PhysicalPlan,
     _fragment_id: FragmentId,
     _fragment: &Fragment,
-    expression: Option<ExprId>,
+    node: NodeId,
+    expression: Option<RootOrdinal>,
 ) -> String {
-    expression.map_or_else(|| "none".to_string(), format_expr_id)
+    expression.map_or_else(|| "none".to_string(), |root| format_root_ref(node, root))
 }
 
-fn format_expr(
+fn format_root(
     _plan: &PhysicalPlan,
     _fragment_id: FragmentId,
     _fragment: &Fragment,
-    expression: ExprId,
+    node: NodeId,
+    expression: RootOrdinal,
 ) -> String {
-    format_expr_id(expression)
+    format_root_ref(node, expression)
 }
 
-fn format_expr_id(expression: ExprId) -> String {
-    format!("e{}", expression.get())
-}
-
-struct LiteralDisplay<'a>(&'a novarocks_physical_plan::LiteralValue);
-
-impl fmt::Display for LiteralDisplay<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            novarocks_physical_plan::LiteralValue::Null => formatter.write_str("NULL"),
-            novarocks_physical_plan::LiteralValue::Boolean(value) => value.fmt(formatter),
-            novarocks_physical_plan::LiteralValue::Int64(value) => value.fmt(formatter),
-            novarocks_physical_plan::LiteralValue::UInt64(value) => value.fmt(formatter),
-            novarocks_physical_plan::LiteralValue::Float64Bits(value) => {
-                write!(formatter, "{}[bits=0x{value:016x}]", f64::from_bits(*value))
-            }
-            novarocks_physical_plan::LiteralValue::LargeInt(value)
-            | novarocks_physical_plan::LiteralValue::Decimal128(value) => value.fmt(formatter),
-            novarocks_physical_plan::LiteralValue::IntervalMonthDayNano {
-                months,
-                days,
-                nanoseconds,
-            } => {
-                write!(
-                    formatter,
-                    "INTERVAL(months={months}, days={days}, nanoseconds={nanoseconds})"
-                )
-            }
-            novarocks_physical_plan::LiteralValue::Decimal256(value) => {
-                arrow::datatypes::i256::from_be_bytes(*value).fmt(formatter)
-            }
-            novarocks_physical_plan::LiteralValue::Utf8(value) => quote_text(value).fmt(formatter),
-            novarocks_physical_plan::LiteralValue::Binary(value) => {
-                write!(formatter, "X'{}'", format_hex(value))
-            }
-            novarocks_physical_plan::LiteralValue::Date32(value) => value.fmt(formatter),
-            novarocks_physical_plan::LiteralValue::Time64(value)
-            | novarocks_physical_plan::LiteralValue::Timestamp(value) => value.fmt(formatter),
-        }
-    }
-}
-
-fn format_literal(value: &novarocks_physical_plan::LiteralValue) -> LiteralDisplay<'_> {
-    LiteralDisplay(value)
+fn format_root_ref(node: NodeId, expression: RootOrdinal) -> String {
+    format!("{}", RootRef(node, expression))
 }
 
 fn function_display_name(identity: &novarocks_physical_plan::FunctionId) -> &str {
@@ -3451,18 +3463,18 @@ fn format_value_ids(values: &[ValueId]) -> ValueIdsDisplay<'_> {
     ValueIdsDisplay(values)
 }
 
-struct SortExprsDisplay<'a>(&'a [SortExpr]);
+struct SortExprsDisplay<'a>(NodeId, &'a [SortExpr]);
 
 impl fmt::Display for SortExprsDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         joined(
-            self.0,
+            self.1,
             ", ",
             |expression: &SortExpr, output: &mut fmt::Formatter<'_>| {
                 write!(
                     output,
-                    "e{} {} NULLS {}",
-                    expression.expr.get(),
+                    "{} {} NULLS {}",
+                    RootRef(self.0, expression.expr),
                     sort_direction(expression.direction),
                     null_ordering(expression.null_ordering)
                 )
@@ -3476,9 +3488,10 @@ fn format_sort_exprs<'a>(
     _plan: &PhysicalPlan,
     _fragment_id: FragmentId,
     _fragment: &Fragment,
+    node: NodeId,
     expressions: &'a [SortExpr],
 ) -> SortExprsDisplay<'a> {
-    SortExprsDisplay(expressions)
+    SortExprsDisplay(node, expressions)
 }
 
 fn format_distribution<'a>(
@@ -3602,6 +3615,7 @@ struct UnpivotConstantsDisplay<'a> {
     plan: &'a PhysicalPlan,
     fragment_id: FragmentId,
     fragment: &'a Fragment,
+    node: NodeId,
     constants: &'a [novarocks_physical_plan::UnpivotConstant],
 }
 
@@ -3613,10 +3627,14 @@ impl fmt::Display for UnpivotConstantsDisplay<'_> {
             |constant: &novarocks_physical_plan::UnpivotConstant,
              output: &mut fmt::Formatter<'_>| {
                 match constant {
-                    novarocks_physical_plan::UnpivotConstant::Scalar(expression) => {
-                        format_expr(self.plan, self.fragment_id, self.fragment, *expression)
-                            .fmt(output)
-                    }
+                    novarocks_physical_plan::UnpivotConstant::Scalar(expression) => format_root(
+                        self.plan,
+                        self.fragment_id,
+                        self.fragment,
+                        self.node,
+                        *expression,
+                    )
+                    .fmt(output),
                     novarocks_physical_plan::UnpivotConstant::Int32List(reference) => write!(
                         output,
                         "int32-constant-reference(pool={}, ordinal={})",
@@ -3640,12 +3658,14 @@ fn format_unpivot_constants<'a>(
     plan: &'a PhysicalPlan,
     fragment_id: FragmentId,
     fragment: &'a Fragment,
+    node: NodeId,
     constants: &'a [novarocks_physical_plan::UnpivotConstant],
 ) -> UnpivotConstantsDisplay<'a> {
     UnpivotConstantsDisplay {
         plan,
         fragment_id,
         fragment,
+        node,
         constants,
     }
 }
@@ -3654,6 +3674,7 @@ struct GroupedUnpivotDisplay<'a> {
     plan: &'a PhysicalPlan,
     fragment_id: FragmentId,
     fragment: &'a Fragment,
+    node: NodeId,
     value: Option<&'a WriterGroupedUnpivotSpec>,
 }
 
@@ -3690,6 +3711,7 @@ impl fmt::Display for GroupedUnpivotDisplay<'_> {
                         self.plan,
                         self.fragment_id,
                         self.fragment,
+                        self.node,
                         &mapping.constants
                     )
                 )
@@ -3900,15 +3922,76 @@ fn node_header<'a>(
 mod tests {
     #[test]
     fn explicit_interval_literal_display_preserves_all_three_components() {
-        let literal = novarocks_physical_plan::LiteralValue::IntervalMonthDayNano {
-            months: -7,
-            days: 23,
-            nanoseconds: i64::MIN,
-        };
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let ty = novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+            false,
+        );
+        let value = novarocks_constant_contract::ConstantValue::from_interval_month_day_nano(
+            std::sync::Arc::new(ty.try_to_field("interval original").unwrap()),
+            ty,
+            (-7, 23, i64::MIN),
+            crate::constant::test_constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
         assert_eq!(
-            super::format_literal(&literal).to_string(),
+            value.try_interval_month_day_nano().unwrap(),
+            Some((-7, 23, i64::MIN))
+        );
+        let diagnostic = super::RenderDiagnostic::new(&control);
+        let mut rendered = String::new();
+        diagnostic.constant(&value, &mut rendered).unwrap();
+        assert!(diagnostic.take_error().is_none());
+        assert_eq!(
+            rendered,
             "INTERVAL(months=-7, days=23, nanoseconds=-9223372036854775808)"
         );
+        assert_eq!(
+            crate::constant::format_constant_observed(&value, &control).unwrap(),
+            rendered
+        );
+        use arrow::array::Array as _;
+        let array = arrow::array::IntervalMonthDayNanoArray::from(vec![
+            Some(arrow::datatypes::IntervalMonthDayNano::new(99, 99, 99)),
+            Some(arrow::datatypes::IntervalMonthDayNano::new(
+                i32::MIN,
+                i32::MAX,
+                i64::MAX,
+            )),
+            Some(arrow::datatypes::IntervalMonthDayNano::new(0, 0, 0)),
+            None,
+        ]);
+        let ty = novarocks_type_contract::FunctionValueType::new(array.data_type().clone(), true);
+        let pool = novarocks_constant_contract::ConstantPool::try_new(
+            std::sync::Arc::new(ty.try_to_field("original interval pool").unwrap()),
+            ty,
+            array.to_data(),
+            crate::constant::test_constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        for (ordinal, expected) in [
+            (
+                1,
+                "INTERVAL(months=-2147483648, days=2147483647, nanoseconds=9223372036854775807)",
+            ),
+            (2, "INTERVAL(months=0, days=0, nanoseconds=0)"),
+            (3, "NULL"),
+        ] {
+            let value = pool.value(ordinal).unwrap();
+            assert_eq!(value.ordinal(), ordinal);
+            let mut rendered = String::new();
+            diagnostic.constant(&value, &mut rendered).unwrap();
+            assert!(diagnostic.take_error().is_none());
+            assert_eq!(rendered, expected);
+            assert_eq!(
+                crate::constant::format_constant_observed(&value, &control).unwrap(),
+                expected
+            );
+        }
     }
 
     use arrow::datatypes::DataType;
@@ -4106,7 +4189,14 @@ mod tests {
             let expressions = physical
                 .fragments()
                 .values()
-                .map(|fragment| fragment.expressions().len())
+                .map(|fragment| {
+                    fragment
+                        .nodes()
+                        .values()
+                        .filter_map(|node| node.expressions.as_ref())
+                        .map(|unit| unit.definitions().len())
+                        .sum::<usize>()
+                })
                 .max()
                 .unwrap_or(0);
             let values = physical
@@ -4565,10 +4655,47 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("EXPRESSION DEFINITIONS"), "{rendered}");
-        assert!(rendered.contains("predicates[0]: e"), "{rendered}");
+        let (filter, predicate) = completed
+            .plan()
+            .fragments()
+            .values()
+            .flat_map(|fragment| fragment.nodes().values())
+            .find_map(|node| match &node.kind {
+                novarocks_physical_plan::NodeKind::Filter { predicates } => {
+                    Some((node.id, predicates[0]))
+                }
+                _ => None,
+            })
+            .expect("actual Filter root");
+        assert!(
+            rendered.contains(&format!(
+                "predicates[0]: n{}:r{}",
+                filter.get(),
+                predicate.get()
+            )),
+            "{rendered}"
+        );
         assert!(rendered.contains("HASH AGGREGATE"), "{rendered}");
         assert!(rendered.contains("builtin.aggregate/sum/v1"), "{rendered}");
-        assert!(rendered.contains("order-by=[e"), "{rendered}");
+        let (sort, key) = completed
+            .plan()
+            .fragments()
+            .values()
+            .flat_map(|fragment| fragment.nodes().values())
+            .find_map(|node| match &node.kind {
+                novarocks_physical_plan::NodeKind::Sort { order_by, .. }
+                | novarocks_physical_plan::NodeKind::TopN { order_by, .. }
+                    if !order_by.is_empty() =>
+                {
+                    Some((node.id, order_by[0].expr))
+                }
+                _ => None,
+            })
+            .expect("actual ordering root");
+        assert!(
+            rendered.contains(&format!("order-by=[n{}:r{}", sort.get(), key.get())),
+            "{rendered}"
+        );
         assert!(rendered.contains("limit=1"), "{rendered}");
     }
 
@@ -4747,42 +4874,88 @@ mod tests {
             .plan()
             .fragments()
             .values()
-            .map(|fragment| fragment.expressions().len())
+            .map(|fragment| {
+                fragment
+                    .nodes()
+                    .values()
+                    .filter_map(|node| node.expressions.as_ref())
+                    .map(|unit| unit.definitions().len())
+                    .sum::<usize>()
+            })
             .sum::<usize>();
         let definition_count = rendered
             .lines()
             .filter(|line| {
                 let line = line.trim_start();
-                line.starts_with('e') && line.contains(" = ") && line.contains(" : ")
+                line.starts_with('n')
+                    && line.contains(":e")
+                    && line.contains(" = ")
+                    && line.contains(" : ")
             })
             .count();
         assert_eq!(definition_count, expression_count, "{rendered}");
+        // Local definition zero in two real node units must remain distinct
+        // in the contract listing; the DAG itself is never flattened.
+        let (first, second) = completed
+            .plan()
+            .fragments()
+            .values()
+            .find_map(|fragment| {
+                let mut owners = fragment
+                    .nodes()
+                    .values()
+                    .filter(|node| {
+                        node.expressions.as_ref().is_some_and(|unit| {
+                            unit.definitions()
+                                .first()
+                                .is_some_and(|definition| definition.id == ExprId::new(0))
+                        })
+                    })
+                    .map(|node| node.id);
+                Some((owners.next()?, owners.next()?))
+            })
+            .expect("VALUES and its Project retain separate expression units");
+        for owner in [first, second] {
+            let label = format!("{} = ", DefinitionRef(owner, ExprId::new(0)));
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&label)),
+                "{rendered}"
+            );
+        }
 
         let multiply = completed
             .plan()
             .fragments()
             .values()
             .find_map(|fragment| {
-                fragment.expressions().iter().find_map(|(id, expression)| {
-                    let novarocks_physical_plan::ExprKind::Binary {
-                        left,
-                        op: novarocks_physical_plan::BinaryOperator::Multiply,
-                        right,
-                        ..
-                    } = expression.kind
-                    else {
-                        return None;
-                    };
-                    Some((*id, left, right))
+                fragment.nodes().values().find_map(|node| {
+                    node.expressions
+                        .as_ref()?
+                        .definitions()
+                        .iter()
+                        .find_map(|expression| {
+                            let novarocks_expression_contract::ExprKind::Binary {
+                                left,
+                                op: novarocks_expression_contract::BinaryOperator::Multiply,
+                                right,
+                                ..
+                            } = expression.kind
+                            else {
+                                return None;
+                            };
+                            Some((node.id, expression.id, left, right))
+                        })
                 })
             })
             .expect("multiply expression");
         assert!(
             rendered.contains(&format!(
-                "e{} = (e{} * e{})",
-                multiply.0.get(),
-                multiply.1.get(),
-                multiply.2.get()
+                "{} = ({} * {})",
+                DefinitionRef(multiply.0, multiply.1),
+                DefinitionRef(multiply.0, multiply.2),
+                DefinitionRef(multiply.0, multiply.3)
             )),
             "{rendered}"
         );
@@ -4955,15 +5128,23 @@ mod tests {
         let mut builder = novarocks_physical_plan::FragmentBuilder::new(fragment_id);
         let root = builder.reserve_node_id().expect("values node id");
         let ty = novarocks_physical_plan::ValueType::new(DataType::Int64, false);
+        let mut constants = novarocks_physical_plan::ConstantPools::empty();
+        let kind =
+            crate::test_constants::insert(&mut constants, crate::test_constants::i64(1)(&ty));
         let expression = builder
-            .add_expression(
-                root,
-                ty.clone(),
-                novarocks_physical_plan::ExprKind::Literal(
-                    novarocks_physical_plan::LiteralValue::Int64(1),
-                ),
+            .unit(root)
+            .unwrap()
+            .add(None, ty.clone(), kind)
+            .expect("constant expression");
+        let expression = builder
+            .unit(root)
+            .unwrap()
+            .root(
+                expression,
+                novarocks_type_contract::EvaluationDemand::Value,
+                novarocks_expression_contract::RootScope::AllPorts,
             )
-            .expect("literal expression");
+            .unwrap();
         let value = builder
             .add_value(
                 ty.clone(),
@@ -4980,6 +5161,7 @@ mod tests {
         };
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: root,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -4993,6 +5175,23 @@ mod tests {
                 },
             })
             .expect("values node");
+        let ports = builder.node_ports(root).unwrap();
+        let draft = builder.take_unit_builder(root).unwrap();
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            &control,
+            novarocks_type_contract::CompilePhase::Validate,
+        )
+        .unwrap();
+        let unit = draft
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        work.finish().unwrap();
+        builder
+            .install_unit(root, std::sync::Arc::new(unit))
+            .unwrap();
         let mut root = root;
         let mut output = novarocks_physical_plan::OutputPort {
             node: root,
@@ -5002,6 +5201,7 @@ mod tests {
             let node = builder.reserve_node_id().expect("deep node id");
             builder
                 .insert_node_unchecked(PhysicalNode {
+                    expressions: None,
                     id: node,
                     inputs: Box::from([root]),
                     required_inputs: Box::from([properties.clone()]),
@@ -5031,8 +5231,12 @@ mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .expect("deep fragment");
-        let mut plan = novarocks_physical_plan::PlanBuilder::new(seed.plan().version())
-            .with_required_contracts(seed.plan().required());
+        let mut plan = novarocks_physical_plan::PlanBuilder::new(
+            seed.plan().version(),
+            crate::test_constants::policy(),
+        )
+        .with_constant_pools(constants)
+        .with_required_contracts(seed.plan().required());
         plan.add_fragment(deep_fragment)
             .expect("deep fragment in plan");
         plan.set_result_port(novarocks_physical_plan::ResultPort {
@@ -5048,7 +5252,9 @@ mod tests {
             }]),
         })
         .expect("deep result port");
-        let deep = plan.finish().expect("deep complete plan");
+        let deep = plan
+            .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
+            .expect("deep complete plan");
         let rendered = render_plan(
             &seed,
             &deep,
@@ -5176,10 +5382,10 @@ mod tests {
             .join("\n");
 
         assert_ne!(exact, pruning);
-        assert!(exact.contains("provider-guarantee expr=e"), "{exact}");
+        assert!(exact.contains("provider-guarantee root=n"), "{exact}");
         assert!(exact.contains("kind=exact"), "{exact}");
         assert!(pruning.contains("kind=pruning-only"), "{pruning}");
-        assert!(pruning.contains("residual expr=e"), "{pruning}");
+        assert!(pruning.contains("residual root=n"), "{pruning}");
         assert!(pruning.contains("relation-field[0] column="), "{pruning}");
         assert!(pruning.contains("provider-output[0] column="), "{pruning}");
         assert!(

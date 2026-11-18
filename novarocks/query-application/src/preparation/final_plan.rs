@@ -105,36 +105,6 @@ impl CompletedPhysicalPlanCandidate {
         })
     }
 
-    /// Author every fragment's package semantics from SQL's original source
-    /// journal. A structural program has no SQL journal; it is refused rather
-    /// than given fabricated call scopes.
-    pub fn author_package_semantics(
-        &self,
-        statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<
-        std::collections::BTreeMap<
-            novarocks_physical_plan::FragmentId,
-            novarocks_sql::compiler::FragmentPackageSemantics,
-        >,
-        novarocks_sql::compiler::PackageSemanticsError,
-    > {
-        match &self.source {
-            CompletedPlanSource::Sql(source) => {
-                novarocks_sql::compiler::author_fragment_package_semantics(
-                    source,
-                    statement_constant_policy,
-                    control,
-                )
-            }
-            CompletedPlanSource::Program(_) => Err(
-                novarocks_sql::compiler::PackageSemanticsError::InvalidSource(
-                    "a structural program has no SQL call source journal",
-                ),
-            ),
-        }
-    }
-
     /// Same immutable source's publication-proved public output obligation.
     /// No caller can replace it with another plan or supplied result schema.
     pub fn original_public_result_port(&self) -> Option<&novarocks_physical_plan::ResultPort> {
@@ -1020,10 +990,12 @@ mod tests {
         assert!(
             plan.fragments()
                 .values()
-                .flat_map(|fragment| fragment.expressions().iter())
-                .any(|(_, expression)| matches!(
+                .flat_map(|fragment| fragment.nodes().values())
+                .filter_map(|node| node.expressions.as_deref())
+                .flat_map(|unit| unit.definitions())
+                .any(|expression| matches!(
                     expression.kind,
-                    novarocks_physical_plan::ExprKind::Constant(_)
+                    novarocks_expression_contract::ExprKind::Constant(_)
                 ))
         );
         let baseline = Control {

@@ -25,11 +25,11 @@ use arrow::{
     datatypes::DataType,
     record_batch::RecordBatch,
 };
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::ExprKind;
+use novarocks_expression_contract::RootOrdinal;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
-use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeKind, StaticExprKind,
-};
-use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition};
+use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef, ProgramUnitId};
 
 use novarocks_type_contract::{ControlShape, FunctionVolatility};
 use std::{
@@ -63,25 +63,28 @@ fn authored(sql: &str, expected: usize) -> Vec<Arc<LocalProgram>> {
     let source = approx_sql_source(sql);
     let mut count = 0;
     for fragment in source.plan().fragments().values() {
-        for (id, expr) in fragment.expressions().iter() {
-            let ExprKind::FunctionCall { function, args } = &expr.kind else {
+        for node in fragment.nodes().values() {
+            let Some(unit) = fragment.unit(node.id) else {
                 continue;
             };
-            if function.function_id.as_str() != "builtin.scalar/percentile_hash/v1" {
-                continue;
+            for expr in unit.definitions() {
+                let ExprKind::FunctionCall { function, args } = &expr.kind else {
+                    continue;
+                };
+                if function.function_id.as_str() != "builtin.scalar/percentile_hash/v1" {
+                    continue;
+                }
+                assert_eq!(args.len(), expected);
+                assert_eq!(function.argument_types.len(), expected);
+                let request = &unit.requests()[&expr.id];
+                assert_eq!(request.logical_argument_count, expected);
+                assert_eq!(request.arguments.len(), expected);
+                eprintln!(
+                    "HASH actual authored complete signature/source: {:?} {function:?} {request:?}",
+                    expr.id
+                );
+                count += 1;
             }
-            assert_eq!(args.len(), expected);
-            assert_eq!(function.argument_types.len(), expected);
-            let request = fragment
-                .call_requests()
-                .get(PhysicalCallDefinition::Expression(*id))
-                .unwrap();
-            assert_eq!(request.logical_argument_count, expected);
-            assert_eq!(request.arguments.len(), expected);
-            eprintln!(
-                "HASH actual authored complete signature/source: {id:?} {function:?} {request:?}"
-            );
-            count += 1;
         }
     }
     assert_eq!(count, 1);
@@ -90,67 +93,54 @@ fn authored(sql: &str, expected: usize) -> Vec<Arc<LocalProgram>> {
         .map(|program| Arc::new(program.expect("complete actual HASH source must compile")))
         .collect()
 }
-fn root(
-    programs: &[Arc<LocalProgram>],
-    expected: usize,
-) -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
+fn root(programs: &[Arc<LocalProgram>], expected: usize) -> (Arc<LocalProgram>, ProgramRootRef) {
     let mut found = None;
     for p in programs {
-        let snapshot = p
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        for (site, use_id) in snapshot.bindings() {
-            let flow = &snapshot.flows()[&site.arena()];
-            let invocation = &flow.uses()[use_id];
-            let arena = &snapshot.roots().arenas()[&site.arena()];
-            let node = arena.node(invocation.definition).unwrap();
-            let StaticExprKind::BoundCall { args, .. } = node.kind() else {
-                continue;
-            };
-            let resolved = p.checked().channels().expressions().resolved_calls();
-            let Some(call) =
-                resolved
-                    .calls()
-                    .get(&novarocks_local_program::ProgramCallSite::Expression(
-                        novarocks_local_program::ProgramUseRef {
-                            arena: site.arena(),
-                            use_id: *use_id,
-                        },
-                    ))
-            else {
-                continue;
-            };
-            if call.call_contract().function_id().as_str() != "builtin.scalar/percentile_hash/v1" {
-                continue;
+        for (unit_ordinal, unit) in p.units().iter().enumerate() {
+            for (root_ordinal, root) in unit.roots().iter().enumerate() {
+                let flow = unit.control_flow();
+                let invocation = &flow.uses()[&root.use_id];
+                let node = unit.definitions().node(root.definition).unwrap();
+                let StaticExprKind::BoundCall { args, .. } = node.kind() else {
+                    continue;
+                };
+                let Some(call) = unit.calls().get(&root.use_id) else {
+                    continue;
+                };
+                if call.call_contract().function_id().as_str()
+                    != "builtin.scalar/percentile_hash/v1"
+                {
+                    continue;
+                }
+                assert_eq!(invocation.control, ControlShape::Eager);
+                assert_eq!(args.len(), 1);
+                assert_eq!(invocation.arguments.len(), 1);
+                assert_eq!(flow.uses()[&invocation.arguments[0]].definition, args[0]);
+                assert_eq!(
+                    call.call_contract().selected().argument_types.len(),
+                    expected
+                );
+                assert_eq!(call.call_contract().logical_argument_count(), expected);
+                assert_eq!(
+                    call.call_contract().effects().value_stability,
+                    FunctionVolatility::Immutable
+                );
+                assert!(found.is_none());
+                found = Some((
+                    p.clone(),
+                    ProgramRootRef {
+                        unit: ProgramUnitId::new(unit_ordinal),
+                        root: RootOrdinal::new(u32::try_from(root_ordinal).unwrap()),
+                    },
+                ));
             }
-            assert_eq!(invocation.control, ControlShape::Eager);
-            assert_eq!(args.len(), 1);
-            assert_eq!(invocation.arguments.len(), 1);
-            assert_eq!(flow.uses()[&invocation.arguments[0]].definition, args[0]);
-            assert_eq!(
-                call.call_contract().selected().argument_types.len(),
-                expected
-            );
-            assert_eq!(call.call_contract().logical_argument_count(), expected);
-            assert_eq!(
-                call.call_contract().effects().value_stability,
-                FunctionVolatility::Immutable
-            );
-            assert!(found.is_none());
-            found = Some((p.clone(), *site));
         }
     }
     found.expect("actual source must retain exactly one HASH producer root")
 }
-fn input(program: &LocalProgram, root: ProgramExpressionRootSite, n: usize) -> RecordBatch {
-    let ProgramExpressionRootSite::Node { node, .. } = root else {
-        panic!("actual project root")
-    };
-    let ProgramNodeKind::Project { input, .. } = program.graph().nodes()[node.index()].kind()
-    else {
+fn input(program: &LocalProgram, root: ProgramRootRef, n: usize) -> RecordBatch {
+    let node = program.graph().nodes().iter().find(|node| matches!(node.kind(), ProgramNodeKind::Project { exprs, .. } if exprs.contains(&root))).expect("actual project root");
+    let ProgramNodeKind::Project { input, .. } = node.kind() else {
         panic!("actual project")
     };
     let schema = program.graph().nodes()[input.index()]
@@ -201,9 +191,13 @@ fn hash_native_n1_actual_sql_source_and_frame_original_n1() {
         let batch = input(&p, site, 3);
         let (tracker, host) = allocation_host();
         let control = Control::default();
-        let mut frame =
-            CompiledExpressionInstance::try_new_with_allocator(p, site, &control, Some(host))
-                .unwrap();
+        let mut frame = CompiledExpressionInstance::try_new_with_allocator(
+            p.unit(site.unit).unwrap().clone(),
+            site.root,
+            &control,
+            Some(host),
+        )
+        .unwrap();
         let out = frame.evaluate(&batch, Selection::all(3), &control).unwrap();
         assert!(out.errors().is_empty());
         let actual = out.values().as_any().downcast_ref::<BinaryArray>().unwrap();
@@ -254,8 +248,8 @@ fn hash_native_n1_actual_frame_seven_causes_exact_prefix_and_failed_group_latch(
     let control = Control::default();
     let (tracker, host) = allocation_host();
     let mut frame = CompiledExpressionInstance::try_new_with_allocator(
-        p.clone(),
-        site,
+        p.unit(site.unit).unwrap().clone(),
+        site.root,
         &Control::default(),
         Some(host),
     )
@@ -276,8 +270,8 @@ fn hash_native_n1_actual_frame_seven_causes_exact_prefix_and_failed_group_latch(
             };
             let (tracker, host) = allocation_host();
             let mut frame = CompiledExpressionInstance::try_new_with_allocator(
-                p.clone(),
-                site,
+                p.unit(site.unit).unwrap().clone(),
+                site.root,
                 &Control::default(),
                 Some(host),
             )

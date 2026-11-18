@@ -189,9 +189,7 @@ fn map_agg_sql_source_with_semantics(
 const SQL: &str = "SELECT g, ELEMENT_AT(MAP_AGG(k, v), 'a') AS v_a, ELEMENT_AT(MAP_AGG(k, v), 'b') AS v_b, CARDINALITY(MAP_AGG(k, v)) AS map_size FROM fixture.t_agg_map_agg_extract GROUP BY g ORDER BY g";
 #[test]
 fn map_agg_actual_original_required_sql_full_signature_source() {
-    use novarocks_physical_plan::{
-        NodeKind, PhysicalCallDefinition, PhysicalCallSite, StaticFunctionArgument,
-    };
+    use novarocks_physical_plan::{NodeKind, PhysicalCallSite, StaticFunctionArgument};
     let source = map_agg_sql_source(SQL);
     let mut calls_seen = 0;
     for fragment in source.plan().fragments().values() {
@@ -205,12 +203,10 @@ fn map_agg_actual_original_required_sql_full_signature_source() {
                 }
                 let request = fragment
                     .call_requests()
-                    .get(PhysicalCallDefinition::Relational(
-                        PhysicalCallSite::Aggregate {
-                            node: *node_id,
-                            call: ordinal as u32,
-                        },
-                    ))
+                    .get(PhysicalCallSite::Aggregate {
+                        node: *node_id,
+                        call: ordinal as u32,
+                    })
                     .unwrap();
                 assert_eq!(
                     call.binding.function.overload.as_str(),

@@ -19,7 +19,7 @@ use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::ArrayRef;
 use arrow_schema::Field;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -123,7 +123,7 @@ fn at(recipe: &PreparedCastRecipe, input: &ArrayRef, row: usize) -> CastRowResul
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(7),
-        domain: EvaluationDomainId::new(11),
+        region: EvaluationRegionId::new(11),
         demand: EvaluationDemand::Value,
     }
 }

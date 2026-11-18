@@ -270,10 +270,9 @@ fn typed_pool_references_preserve_sharing_order_and_zero_ordinals() {
         .into_iter()
         .map(|id| v2::ExpressionDefinition {
             id,
-            owner_node_id: Some(0),
             lambda_scope_expr_id: None,
             value_type_id: Some(0),
-            kind: Some(v2::expression_definition::Kind::Literal(reference)),
+            kind: Some(v2::expression_definition::Kind::Constant(reference)),
         })
         .collect::<Vec<_>>();
     let package = v2::FragmentPackage {
@@ -304,16 +303,39 @@ fn typed_pool_references_preserve_sharing_order_and_zero_ordinals() {
         fragment: Some(v2::Fragment {
             id: 0,
             root_node_id: Some(u32::MAX),
-            expressions: definitions.clone(),
+            nodes: vec![v2::PhysicalNode {
+                id: u32::MAX,
+                expressions: Some(v2::ExpressionUnit {
+                    definitions: definitions.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
             ..Default::default()
         }),
         ..Default::default()
     };
+    let descriptor = self::pool()
+        .get_message_by_name("novarocks.physical_package_v2.ExpressionDefinition")
+        .unwrap();
+    assert_eq!(
+        descriptor.get_field_by_name("constant").unwrap().number(),
+        7
+    );
+    assert!(descriptor.get_field_by_name("literal").is_none());
+    assert!(descriptor.reserved_names().any(|name| name == "literal"));
     let bytes = package.encode_to_vec();
     let decoded = v2::FragmentPackage::decode(bytes.as_slice()).unwrap();
     assert_eq!(decoded, package);
     assert_eq!(decoded.constants, [pool]);
-    assert_eq!(decoded.fragment.unwrap().expressions, definitions);
+    assert_eq!(
+        decoded.fragment.unwrap().nodes[0]
+            .expressions
+            .as_ref()
+            .unwrap()
+            .definitions,
+        definitions
+    );
     assert_ne!(
         reference.encode_to_vec(),
         v2::ConstantReference::default().encode_to_vec()
@@ -472,14 +494,27 @@ fn intrinsic_scoped_refs_and_false_true_parameters_survive_one_package_carrier()
     };
     let package = v2::FragmentPackage {
         fragment: Some(v2::Fragment {
-            expressions: expressions.clone(),
+            nodes: vec![v2::PhysicalNode {
+                expressions: Some(v2::ExpressionUnit {
+                    definitions: expressions.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
             ..Default::default()
         }),
         parameters: Some(parameters.clone()),
         ..Default::default()
     };
     let decoded = v2::FragmentPackage::decode(package.encode_to_vec().as_slice()).unwrap();
-    assert_eq!(decoded.fragment.unwrap().expressions, expressions);
+    assert_eq!(
+        decoded.fragment.unwrap().nodes[0]
+            .expressions
+            .as_ref()
+            .unwrap()
+            .definitions,
+        expressions
+    );
     assert_eq!(decoded.parameters, Some(parameters));
     // Deliberately carrier-only: no fake full FragmentPackage validation claim.
 }
@@ -493,6 +528,16 @@ fn original_requests_keep_missing_distinct_from_explicit_empty_and_present_zero(
     assert!(missing.call_requests.is_none());
     assert!(empty.call_requests.as_ref().unwrap().entries.is_empty());
     assert_eq!(empty.encode_to_vec(), [0x4a, 0x00]);
+    // The sender's statement policy has independent presence at package tag27;
+    // an empty policy is not silently supplied from receiving defaults.
+    let missing_policy = v2::FragmentPackage::decode([].as_slice()).unwrap();
+    let explicit_policy = v2::FragmentPackage::decode([0xda, 0x01, 0x00].as_slice()).unwrap();
+    assert!(missing_policy.source_constant_policy.is_none());
+    assert_eq!(
+        explicit_policy.source_constant_policy,
+        Some(v2::SourceConstantPolicy::default())
+    );
+    assert_eq!(explicit_policy.encode_to_vec(), [0xda, 0x01, 0x00]);
     // Ten explicit zero fields are original source policy data. Omission is
     // retained by Prost and is rejected by the separate typed receiving owner.
     let bytes = [
@@ -521,27 +566,36 @@ fn original_requests_keep_missing_distinct_from_explicit_empty_and_present_zero(
 
 #[test]
 fn original_request_definition_does_not_alias_expression_occurrence_namespace() {
-    use novarocks_proto_models::{physical_package_v2 as v2, physical_semantics_v2 as sem};
-    // Both contain numeric zero, but their outer oneof alternatives differ.
-    // The relational ExpressionUseId is represented faithfully here; only
-    // the typed request decoder has authority to refuse that alternative.
-    let definition = v2::CallRequestDefinition::decode([0x08, 0].as_slice()).unwrap();
-    let occurrence = v2::CallRequestDefinition::decode([0x12, 2, 0x08, 0].as_slice()).unwrap();
-    assert_eq!(
-        definition.kind,
-        Some(v2::call_request_definition::Kind::ExpressionDefinitionId(0))
-    );
+    use novarocks_proto_models::{
+        call_request, physical_package_v2 as v2, physical_semantics_v2 as sem,
+    };
+    // Independent bytes: a unit-local definition key and an actual relation
+    // node key both preserve explicit zero in their distinct message grammar.
+    let definition = call_request::UnitCallRequest::decode([0x08, 0].as_slice()).unwrap();
+    let occurrence = v2::CallRequestDefinition::decode([0x12, 2, 0x30, 0].as_slice()).unwrap();
+    assert_eq!(definition.definition_id, Some(0));
     assert_eq!(
         occurrence.kind,
         Some(v2::call_request_definition::Kind::Relational(
             sem::CallSite {
-                kind: Some(sem::call_site::Kind::ExpressionUseId(0)),
+                kind: Some(sem::call_site::Kind::TableNodeId(0))
             }
         ))
     );
-    assert_ne!(definition, occurrence);
+    assert_ne!(
+        definition.encode_to_vec(),
+        call_request::UnitCallRequest::default().encode_to_vec()
+    );
     assert_eq!(definition.encode_to_vec(), [0x08, 0]);
-    assert_eq!(occurrence.encode_to_vec(), [0x12, 2, 0x08, 0]);
+    assert_eq!(occurrence.encode_to_vec(), [0x12, 2, 0x30, 0]);
+    // A retired expression-definition key is not reinterpreted as a relation.
+    let retired = v2::CallRequestDefinition::decode([0x08, 0].as_slice()).unwrap();
+    assert!(retired.kind.is_none());
+    let descriptor = pool()
+        .get_message_by_name("novarocks.call_request.CallRequestDefinition")
+        .unwrap();
+    assert!(descriptor.reserved_ranges().any(|range| range.contains(&1)));
+    // DTO retention/omission is not the preflight's retired-field rejection.
 }
 
 #[test]
@@ -562,4 +616,129 @@ fn original_call_requests_retire_the_request_identity_field() {
     ] {
         assert_eq!(request.get_field_by_name(name).unwrap().number(), number);
     }
+}
+
+#[test]
+fn node_unit_roots_ports_claims_and_requests_preserve_actual_optional_references() {
+    use novarocks_proto_models::{
+        call_request, physical_control_v2 as control, physical_package_v2 as v2,
+        physical_semantics_v2 as sem,
+    };
+    for id in [0, u32::MAX] {
+        let root = v2::ExpressionRoot {
+            definition_id: Some(id),
+            use_id: Some(id),
+            demand: control::EvaluationDemand::Value as i32,
+            scope: Some(v2::RootScope {
+                kind: Some(v2::root_scope::Kind::Port(0)),
+            }),
+        };
+        for absent in [
+            v2::ExpressionRoot {
+                definition_id: None,
+                ..root
+            },
+            v2::ExpressionRoot {
+                use_id: None,
+                ..root
+            },
+            v2::ExpressionRoot {
+                scope: None,
+                ..root
+            },
+        ] {
+            assert_ne!(root.encode_to_vec(), absent.encode_to_vec());
+            assert_eq!(
+                v2::ExpressionRoot::decode(absent.encode_to_vec().as_slice()).unwrap(),
+                absent
+            );
+        }
+        let input = v2::ExpressionInput {
+            value_id: Some(id),
+            value_type_id: Some(id),
+        };
+        for absent in [
+            v2::ExpressionInput {
+                value_id: None,
+                ..input
+            },
+            v2::ExpressionInput {
+                value_type_id: None,
+                ..input
+            },
+        ] {
+            assert_ne!(input.encode_to_vec(), absent.encode_to_vec());
+        }
+        let unit = v2::ExpressionUnit {
+            ports: vec![v2::ExpressionPort {
+                values: vec![input, input],
+            }],
+            roots: vec![
+                root,
+                v2::ExpressionRoot {
+                    scope: Some(v2::RootScope {
+                        kind: Some(v2::root_scope::Kind::AllPorts(control::Empty {})),
+                    }),
+                    ..root
+                },
+            ],
+            control: Some(control::ExpressionControl {
+                regions: vec![control::EvaluationRegion {
+                    id,
+                    parent_region_id: Some(0),
+                    guard: None,
+                }],
+                uses: vec![control::ExpressionUse {
+                    id,
+                    definition_id: Some(id),
+                    region_id: Some(id),
+                    argument_use_ids: vec![0, id, 0],
+                    ..Default::default()
+                }],
+            }),
+            claims: Some(sem::ExpressionClaims {
+                entries: vec![sem::ExpressionCallClaim {
+                    use_id: Some(id),
+                    context: Some(sem::ExpressionEffectContext {
+                        use_id: Some(id),
+                        region_id: Some(id),
+                        demand: control::EvaluationDemand::TruthOnly as i32,
+                    }),
+                    ..Default::default()
+                }],
+            }),
+            requests: vec![call_request::UnitCallRequest {
+                definition_id: Some(id),
+                logical_argument_count: Some(0),
+                expected_result_value_type_id: Some(id),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let node = v2::PhysicalNode {
+            id,
+            expressions: Some(unit.clone()),
+            ..Default::default()
+        };
+        let decoded = v2::PhysicalNode::decode(node.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, node);
+        assert_eq!(decoded.expressions.unwrap(), unit);
+        // Carrier fidelity permits arbitrary numeric references. The unit's
+        // structural, ownership and mandatory-claim checks belong to its decoder.
+    }
+    let descriptor = pool()
+        .get_message_by_name("novarocks.physical_package_v2.PhysicalNode")
+        .unwrap();
+    assert_eq!(
+        descriptor
+            .get_field_by_name("expressions")
+            .unwrap()
+            .number(),
+        30
+    );
+    let fragment = pool()
+        .get_message_by_name("novarocks.physical_package_v2.Fragment")
+        .unwrap();
+    assert!(fragment.get_field_by_name("expressions").is_none());
+    assert!(fragment.reserved_ranges().any(|range| range.contains(&4)));
 }

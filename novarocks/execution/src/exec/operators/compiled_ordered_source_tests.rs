@@ -28,9 +28,11 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::shape::StepOperator;
 use crate::runtime::task::ExecutionResult;
 use futures::{Stream, future::BoxFuture};
+use novarocks_expression_contract::{RootOrdinal, RootScope};
 use novarocks_spi::connector::read_stack::{
     BudgetConsume, ConnectorPollBudget, ConnectorSourceOperations,
 };
+use novarocks_type_contract::EvaluationDemand;
 use std::future::Future;
 use std::{
     pin::Pin,
@@ -216,12 +218,7 @@ impl SourceCase {
         let residual = residuals.first().map(|&node| {
             crate::exec::operators::compiled_expression::CompiledFilterProcessorFactory::try_new(
                 consumer.fixture.program.clone(),
-                novarocks_local_program::ProgramExpressionRootSite::Node {
-                    node,
-                    role: novarocks_local_program::ProgramNodeExpressionRole::ScanResidual {
-                        predicate: 0,
-                    },
-                },
+                node,
                 consumer.state.error_state(),
             )
             .unwrap()
@@ -665,34 +662,45 @@ fn compiled_ordered_source_bind_refusal_never_claims_a_stream_and_refunds_its_pr
 
 #[test]
 fn compiled_ordered_source_actual_residual_finishes_before_live_key_evaluation() {
-    fn residual(builder: &mut FragmentBuilder, scan: NodeId, values: &[ValueId]) -> Box<[ExprId]> {
+    fn residual(
+        builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+        scan: NodeId,
+        values: &[ValueId],
+    ) -> Box<[RootOrdinal]> {
         let input = builder
-            .add_expression(
-                scan,
+            .unit(scan)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Int64, true),
                 ExprKind::Value(values[1]),
             )
             .unwrap();
-        let seven = builder
-            .add_expression(
-                scan,
-                FunctionValueType::new(DataType::Int64, false),
-                ExprKind::Literal(LiteralValue::Int64(7)),
-            )
-            .unwrap();
-        Box::from([builder
-            .add_expression(
-                scan,
+        let seven = builder.constant(
+            scan,
+            FunctionValueType::new(DataType::Int64, false),
+            crate::exec::operators::family_fixture::constant_sources::i64(7),
+        );
+        let definition = builder
+            .unit(scan)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Boolean, true),
                 ExprKind::Binary {
                     left: input,
-                    op: novarocks_physical_plan::BinaryOperator::Gt,
+                    op: novarocks_expression_contract::BinaryOperator::Gt,
                     right: seven,
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     allow_throw_exception: None,
                 },
             )
+            .unwrap();
+        Box::from([builder
+            .unit(scan)
+            .unwrap()
+            .root(definition, EvaluationDemand::TruthOnly, RootScope::Port(0))
             .unwrap()])
     }
     let consumer = Consumer::with_fixture(
@@ -742,13 +750,20 @@ fn compiled_ordered_source_actual_residual_finishes_before_live_key_evaluation()
 
 #[test]
 fn compiled_ordered_source_empty_actual_residual_never_polls_an_invalid_live_snapshot() {
-    fn residual(builder: &mut FragmentBuilder, scan: NodeId, _: &[ValueId]) -> Box<[ExprId]> {
+    fn residual(
+        builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+        scan: NodeId,
+        _: &[ValueId],
+    ) -> Box<[RootOrdinal]> {
+        let definition = builder.constant(
+            scan,
+            FunctionValueType::new(DataType::Boolean, false),
+            crate::exec::operators::family_fixture::constant_sources::boolean(false),
+        );
         Box::from([builder
-            .add_expression(
-                scan,
-                FunctionValueType::new(DataType::Boolean, false),
-                ExprKind::Literal(LiteralValue::Boolean(false)),
-            )
+            .unit(scan)
+            .unwrap()
+            .root(definition, EvaluationDemand::TruthOnly, RootScope::Port(0))
             .unwrap()])
     }
     let consumer = Consumer::with_fixture(
@@ -804,28 +819,34 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
             expected_key: SemanticParameterKey::AllowThrowException,
         }
     }
-    fn residual(builder: &mut FragmentBuilder, scan: NodeId, values: &[ValueId]) -> Box<[ExprId]> {
+    fn residual(
+        builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+        scan: NodeId,
+        values: &[ValueId],
+    ) -> Box<[RootOrdinal]> {
         let input = builder
-            .add_expression(
-                scan,
+            .unit(scan)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Int64, true),
                 ExprKind::Value(values[1]),
             )
             .unwrap();
-        let zero = builder
-            .add_expression(
-                scan,
-                FunctionValueType::new(DataType::Int64, false),
-                ExprKind::Literal(LiteralValue::Int64(0)),
-            )
-            .unwrap();
+        let zero = builder.constant(
+            scan,
+            FunctionValueType::new(DataType::Int64, false),
+            crate::exec::operators::family_fixture::constant_sources::i64(0),
+        );
         let modulo = builder
-            .add_expression(
-                scan,
+            .unit(scan)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Int64, true),
                 ExprKind::Binary {
                     left: input,
-                    op: novarocks_physical_plan::BinaryOperator::Modulo,
+                    op: novarocks_expression_contract::BinaryOperator::Modulo,
                     right: zero,
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -833,19 +854,26 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
                 },
             )
             .unwrap();
-        Box::from([builder
-            .add_expression(
-                scan,
+        let definition = builder
+            .unit(scan)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Boolean, true),
                 ExprKind::Binary {
                     left: modulo,
-                    op: novarocks_physical_plan::BinaryOperator::Gt,
+                    op: novarocks_expression_contract::BinaryOperator::Gt,
                     right: zero,
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     allow_throw_exception: None,
                 },
             )
+            .unwrap();
+        Box::from([builder
+            .unit(scan)
+            .unwrap()
+            .root(definition, EvaluationDemand::TruthOnly, RootScope::Port(0))
             .unwrap()])
     }
     let fixture = super::super::ordered_fixture_with_parameters(
@@ -894,13 +922,13 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
         })
         .collect::<Vec<_>>();
     assert_eq!(scans.len(), 1);
-    assert_eq!(
-        required.root(),
-        novarocks_local_program::ProgramExpressionRootSite::Node {
-            node: scans[0],
-            role: novarocks_local_program::ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
-        }
-    );
+    let program = &source.consumer.fixture.program;
+    let ProgramNodeKind::Scan { residuals, .. } = program.graph().nodes()[scans[0].index()].kind()
+    else {
+        unreachable!();
+    };
+    assert_eq!(required.root(), residuals[0].root);
+    assert_eq!(error.expression_node(), Some(scans[0]));
     assert_eq!(required.batch_row(), 0);
     assert_eq!(required.error().selected_ordinal(), 0);
     // Signed modulo by zero retains its exact Data reason before any snapshot I/O.

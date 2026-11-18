@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{
     ArrayRef, FixedSizeBinaryArray, Float32Array, Int8Array, Int16Array, Int32Array,
     LargeBinaryArray, NullArray, StringArray, StructArray,
@@ -118,8 +119,8 @@ fn largeint_type() -> FunctionValueType {
     nominal(DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt)
 }
 
-// Only source-layout construction is local. The original shared flow author,
-// FrozenPhysicalCalls, package validator and compiler author every invocation.
+// Only source-layout construction is local. The shared SDK seal, fresh-call
+// author, package validator and compiler author every invocation.
 fn conversion_program(
     columns: &[FunctionValueType],
     build: impl FnOnce(
@@ -127,8 +128,10 @@ fn conversion_program(
         &mut FragmentBuilder,
         &mut BTreeMap<ExprId, Author>,
         &[ExprId],
+        &mut novarocks_physical_plan::ConstantPools,
     ) -> ExprId,
 ) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = conversion_catalogue();
     let id = FragmentId::new(229);
     let source = NodeId::new(u32::MAX);
@@ -143,17 +146,38 @@ fn conversion_program(
     for (ordinal, ty) in columns.iter().enumerate() {
         assert!(ty.nullable());
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
+            .unwrap();
+        let input_root = builder
+            .unit(input)
+            .unwrap()
+            .root(
+                expr,
+                EvaluationDemand::Value,
+                novarocks_expression_contract::RootScope::Port(0),
+            )
             .unwrap();
         let value = ValueId::new(901 + u32::try_from(ordinal).unwrap() * 71);
         builder
             .insert_value(ValueDef {
                 id: value,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr {
+                    node: input,
+                    root: input_root,
+                },
             })
             .unwrap();
-        items.push((expr, value));
+        items.push((input_root, value));
         values.push(value);
     }
     builder
@@ -169,19 +193,42 @@ fn conversion_program(
         .zip(values)
         .map(|(ty, value)| {
             builder
-                .add_expression(output, ty.clone(), ExprKind::Value(value))
+                .unit(output)
+                .unwrap()
+                .add(None, ty.clone(), ExprKind::Value(value))
                 .unwrap()
         })
         .collect::<Vec<_>>();
     let mut authors = BTreeMap::new();
-    let expression = build(&functions, &mut builder, &mut authors, &leaves);
-    let result_type = builder.expressions().get(expression).unwrap().ty.clone();
+    let expression = build(
+        &functions,
+        &mut builder,
+        &mut authors,
+        &leaves,
+        &mut source_pools,
+    );
+    let result_type = builder
+        .construction_unit(output)
+        .unwrap()
+        .definition(expression)
+        .unwrap()
+        .ty
+        .clone();
+    let output_root = builder
+        .unit(output)
+        .unwrap()
+        .root(
+            expression,
+            EvaluationDemand::Value,
+            novarocks_expression_contract::RootScope::Port(0),
+        )
+        .unwrap();
     let value = builder
         .add_value(
             result_type.clone(),
             ValueOrigin::Expr {
                 node: output,
-                expr: expression,
+                root: output_root,
             },
         )
         .unwrap();
@@ -189,26 +236,14 @@ fn conversion_program(
         .add_project(
             output,
             input,
-            Box::from([(expression, value)]),
+            Box::from([(output_root, value)]),
             Box::from([value]),
-        )
-        .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: id,
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "conversion_result".into(),
@@ -217,7 +252,7 @@ fn conversion_program(
             ty: result_type,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, builder, output, &authors, result, source_pools)
 }
 
 fn converted(
@@ -244,7 +279,7 @@ fn converted(
 fn direct_program(source: FunctionValueType, target: FunctionValueType) -> Arc<LocalProgram> {
     conversion_program(
         std::slice::from_ref(&source),
-        |functions, builder, authors, leaves| {
+        |functions, builder, authors, leaves, _source_pools| {
             converted(
                 functions,
                 builder,
@@ -402,7 +437,7 @@ fn actual_compiled_value_conversion_signed_overflow_is_success_null_consumed_by_
                 } else {
                     vec![largeint_type(), target.clone()]
                 },
-                |functions, builder, authors, leaves| {
+                |functions, builder, authors, leaves, _source_pools| {
                     let narrowed = converted(
                         functions,
                         builder,
@@ -414,8 +449,10 @@ fn actual_compiled_value_conversion_signed_overflow_is_success_null_consumed_by_
                     if null_test {
                         // IS NULL observes success NULL from range overflow, not row errors.
                         builder
-                            .add_expression(
-                                NodeId::new(0),
+                            .unit(NodeId::new(0))
+                            .unwrap()
+                            .add(
+                                None,
                                 FunctionValueType::new(DataType::Boolean, false),
                                 ExprKind::IsNull {
                                     expr: narrowed,
@@ -737,13 +774,18 @@ fn actual_compiled_value_conversion_round_child_error_is_terminal_not_success_nu
     let decimal = FunctionValueType::new(DataType::Decimal128(38, 0), true);
     let program = conversion_program(
         &[integer.clone(), decimal.clone()],
-        |functions, builder, authors, leaves| {
+        |functions, builder, authors, leaves, source_pools| {
             let scalar_integer = FunctionValueType::new(DataType::Int64, false);
             let digits = builder
-                .add_expression(
-                    NodeId::new(0),
+                .unit(NodeId::new(0))
+                .unwrap()
+                .add(
+                    None,
                     scalar_integer.clone(),
-                    ExprKind::Literal(LiteralValue::Int64(-1)),
+                    checked_constants::kind(
+                        source_pools,
+                        checked_constants::i64(&(scalar_integer.clone()), -1, options().constants),
+                    ),
                 )
                 .unwrap();
             let rounded = call(
@@ -761,8 +803,10 @@ fn actual_compiled_value_conversion_round_child_error_is_terminal_not_success_nu
                 vec![leaves[1], digits],
             );
             let null_test = builder
-                .add_expression(
-                    NodeId::new(0),
+                .unit(NodeId::new(0))
+                .unwrap()
+                .add(
+                    None,
                     FunctionValueType::new(DataType::Boolean, false),
                     ExprKind::IsNull {
                         expr: rounded,

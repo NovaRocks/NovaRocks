@@ -121,7 +121,7 @@ pub(super) trait FrameFailure: From<KernelFailure> {
         work: &mut super::Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, Self>;
     fn required(
-        root: novarocks_local_program::ProgramExpressionRootSite,
+        root: novarocks_expression_contract::RootOrdinal,
         selection: Selection<'_>,
         error: novarocks_functions::RowDataError,
     ) -> Self;
@@ -155,7 +155,7 @@ impl FrameFailure for KernelFailure {
         unreachable!("Kernel-only root entry rejects every invocation lifecycle before Frame")
     }
     fn required(
-        _root: novarocks_local_program::ProgramExpressionRootSite,
+        _root: novarocks_expression_contract::RootOrdinal,
         _selection: Selection<'_>,
         _error: novarocks_functions::RowDataError,
     ) -> Self {
@@ -229,7 +229,7 @@ impl FrameFailure for crate::runtime::task::ExecutionFailure {
         }
     }
     fn required(
-        root: novarocks_local_program::ProgramExpressionRootSite,
+        root: novarocks_expression_contract::RootOrdinal,
         selection: Selection<'_>,
         error: novarocks_functions::RowDataError,
     ) -> Self {

@@ -404,8 +404,7 @@ fn state_sources_count_star_stream_loans_exact_actual_partial_and_final_own_requ
     assert_eq!(graph.root().node, entry.node().inputs[0]);
     let ContractExprKind::Value(state) = entry
         .fragment()
-        .expressions()
-        .get(entry.source().arguments[0])
+        .root_expression(entry.node().id, entry.source().arguments[0])
         .unwrap()
         .kind
     else {

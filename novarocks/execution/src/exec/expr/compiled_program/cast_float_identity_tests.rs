@@ -150,19 +150,10 @@ fn root_recipe(
     &novarocks_functions::PreparedCastRecipe,
     ExpressionEffectContext,
 ) {
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let occurrence = ProgramUseRef {
-        arena: root().arena(),
-        use_id: snapshot.bindings()[&root()],
-    };
+    let occurrence = cast_root_use(program);
     (
-        program.cast_recipe(occurrence).unwrap(),
-        snapshot.flows()[&occurrence.arena].uses()[&occurrence.use_id].context,
+        root_unit(program).recipes().cast(occurrence).unwrap(),
+        root_unit(program).control_flow().uses()[&occurrence].context,
     )
 }
 
@@ -369,10 +360,7 @@ fn float_identity_pure_own_effect_keeps_real_round_child_errors_and_compact_jour
                     .may_raise_row_error
             );
             let mut evaluator = instance(&program);
-            let occurrence = ProgramUseRef {
-                arena: root().arena(),
-                use_id: context.use_id,
-            };
+            let occurrence = context.use_id;
             let summary = evaluator.effects[&occurrence];
             assert!(summary.for_use(context).unwrap().may_raise_row_error);
             let raw = 10_i128.pow(38) - 1;

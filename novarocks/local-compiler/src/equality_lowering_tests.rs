@@ -15,30 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::{
+    BinaryOperator, BoundFunction, DefinitionControl, ExprId, ExprKind, ExpressionCallClaim,
+    PhysicalCallRequest, RootScope, UnitError,
+};
+
 use super::*;
+use crate::test_units::PureUnitFixture;
 use arrow_schema::DataType;
+use novarocks_expression::ComparisonSite as ProgramComparisonSite;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
-    FunctionResultType, InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
+    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionBindingRequest,
+    FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
+    InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
 };
-use novarocks_local_program::{
-    KernelAbiVersion, ProgramComparisonSite, ProgramExpressionArena, ProgramExpressionRootSite,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramUseRef, StaticExprKind,
-};
+use novarocks_local_program::KernelAbiVersion;
+use novarocks_local_program::ProgramNodeKind;
 use novarocks_physical_plan::{
-    BinaryOperator, BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts,
-    FragmentId, FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning,
-    FrozenPhysicalCall, LiteralValue, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
-    PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort, ValidationErrors,
-    ValueOrigin,
+    Fragment, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackageInput, FragmentSink,
+    FrozenFragmentPruning, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField,
+    ResultPort, ValidationErrors, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CallProofScope, ControlShape, DecimalOverflowPolicy, DomainGuard, EvaluationDemand,
-    EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, FunctionValueType, FunctionVolatility,
-    SemanticParameters, ValueLogicalType, control_argument_semantics,
+    CallProofScope, ControlShape, DecimalOverflowPolicy, EvaluationDemand, ExpressionUseId,
+    FunctionValueType, FunctionVolatility, SemanticParameters, ValueLogicalType,
 };
 use std::{num::NonZeroUsize, sync::Mutex};
 
@@ -121,7 +123,155 @@ enum OutputClaim {
     NonBoolean,
     Narrow,
 }
+#[derive(Debug)]
+enum FixtureError {
+    Unit(UnitError),
+    Physical(ValidationErrors),
+}
+impl FixtureError {
+    fn is_producer_defect(&self) -> bool {
+        match self {
+            Self::Unit(UnitError::Invalid { .. }) => true,
+            Self::Physical(e) => e.is_producer_defect(),
+            _ => false,
+        }
+    }
+}
+impl From<UnitError> for FixtureError {
+    fn from(e: UnitError) -> Self {
+        Self::Unit(e)
+    }
+}
+impl From<ValidationErrors> for FixtureError {
+    fn from(e: ValidationErrors) -> Self {
+        Self::Physical(e)
+    }
+}
+fn seal_units(
+    builder: &mut FragmentBuilder,
+    functions: &PureEngineFunctionCatalog,
+    selected: Option<&Arc<FunctionBindingSelection>>,
+    request: Option<FunctionBindingRequest<'_>>,
+    rand_definitions: &[ExprId],
+    policy: ConstantPolicy,
+) -> Result<(), FixtureError> {
+    if let Some(selected) = selected {
+        let declaration = functions
+            .metadata()
+            .definition("rand", FunctionKind::Scalar)
+            .unwrap();
+        assert!(
+            declaration
+                .binding_declaration()
+                .unwrap()
+                .effect_declaration(&selected.overload)
+                .unwrap()
+                .argument_control
+                .matches_scalar_shape(ControlShape::Eager)
+        );
+        let draft = builder.unit(NodeId::new(0)).unwrap();
+        for &definition in rand_definitions {
+            let original = request.unwrap();
+            assert!(
+                original.arguments.is_empty(),
+                "this actual RAND overload is zero-argument"
+            );
+            draft.request(
+                definition,
+                PhysicalCallRequest {
+                    arguments: Box::default(),
+                    logical_argument_count: original.logical_argument_count,
+                    expected_result_type: original.expected_result_type.cloned(),
+                    constant_policy: policy,
+                },
+            )?;
+            draft.definition_control(
+                definition,
+                DefinitionControl {
+                    shape: ControlShape::Eager,
+                    temporal_sources: None,
+                },
+            )?;
+        }
+    }
+    let nodes = builder
+        .construction_nodes()
+        .filter_map(|(&id, _)| builder.construction_unit(id).is_some().then_some(id))
+        .collect::<Vec<_>>();
+    let parameters = SemanticParameters::default();
+    for node in nodes {
+        let ports = builder.node_ports(node).unwrap();
+        let draft = builder.take_unit_builder(node).unwrap();
+        let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate)
+            .map_err(UnitError::from)?;
+        let sealed = draft.seal(ports, &mut work)?;
+        let mut claims = BTreeMap::new();
+        for (&use_id, invocation) in sealed.uses() {
+            let ExprKind::FunctionCall { function, .. } =
+                &sealed.definition(invocation.definition).unwrap().kind
+            else {
+                continue;
+            };
+            let selected = selected.unwrap();
+            let token = functions
+                .prepare_fresh(
+                    CallEffectInput {
+                        context: invocation.context.into(),
+                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&[]),
+                        function_id: &function.function_id,
+                        kind: function.kind,
+                        selected: selected.as_ref(),
+                        request: request.unwrap(),
+                        environment: &[],
+                        parameters: &parameters,
+                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                        proof_scope: CallProofScope::Region(invocation.context.region),
+                    },
+                    selected.clone(),
+                    PureCallPreparation::Scalar {
+                        arguments: ScopedExpressionEffects::pure_value(invocation.context),
+                    },
+                    &Control,
+                )
+                .unwrap();
+            claims.insert(
+                use_id,
+                ExpressionCallClaim {
+                    context: invocation.context,
+                    effects: token.call_contract().effects().clone(),
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    temporal_source: None,
+                    regexp_count_pattern_source: None,
+                    to_base64_byte_source: None,
+                },
+            );
+        }
+        let unit = sealed.finish(claims, &mut work)?;
+        work.finish().map_err(UnitError::from)?;
+        builder.install_unit(node, Arc::new(unit)).unwrap();
+    }
+    Ok(())
+}
+fn unit(program: &novarocks_local_program::LocalProgram) -> &novarocks_expression::CompiledExprSet {
+    let root = &program.graph().nodes()[program.graph().root().index()];
+    let reference = match root.kind() {
+        ProgramNodeKind::Project { exprs, .. } => exprs[0],
+        ProgramNodeKind::Filter { predicates, .. } => predicates[0],
+        _ => panic!("actual consumer root"),
+    };
+    program.unit(reference.unit).unwrap()
+}
+fn source_unit(source: &FragmentPackage) -> &novarocks_expression_contract::BoundExprSet {
+    source.fragment().nodes()[&NodeId::new(0)]
+        .expressions
+        .as_ref()
+        .unwrap()
+}
+fn occurrence(program: &novarocks_local_program::LocalProgram) -> ExpressionUseId {
+    unit(program).roots()[0].use_id
+}
 struct Fixture {
+    constants: novarocks_physical_plan::ConstantPools,
     fragment: Fragment,
     expression: ExprId,
     ordered: Vec<ExprId>,
@@ -131,15 +281,24 @@ struct Fixture {
     constant_policy: ConstantPolicy,
     carrier_cast: bool,
 }
-fn input_literal(ty: &FunctionValueType, floating_bits: Option<u64>) -> LiteralValue {
+fn input_constant(
+    pools: &mut novarocks_physical_plan::ConstantPools,
+    ty: &FunctionValueType,
+    floating_bits: Option<u64>,
+) -> ExprKind {
     if ty.nullable() {
-        return LiteralValue::Null;
+        return crate::test_constants::null(pools, ty, options().constants);
     }
     match ty.data_type() {
-        DataType::Boolean => LiteralValue::Boolean(true),
-        DataType::Int64 => LiteralValue::Int64(7),
-        DataType::Float64 => LiteralValue::Float64Bits(floating_bits.unwrap_or(1f64.to_bits())),
-        _ => panic!("a nonnullable fixture requires an exact supported literal"),
+        DataType::Boolean => crate::test_constants::boolean(pools, ty, true, options().constants),
+        DataType::Int64 => crate::test_constants::i64(pools, ty, 7, options().constants),
+        DataType::Float64 => crate::test_constants::f64_bits(
+            pools,
+            ty,
+            floating_bits.unwrap_or(1f64.to_bits()),
+            options().constants,
+        ),
+        _ => panic!("a nonnullable fixture requires an exact checked constant factory"),
     }
 }
 fn fixture(
@@ -150,7 +309,8 @@ fn fixture(
     right: FunctionValueType,
     output: OutputClaim,
     bits: Option<[u64; 2]>,
-) -> Result<Fixture, ValidationErrors> {
+) -> Result<Fixture, FixtureError> {
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(FragmentId::new(101));
     builder
         .add_values(
@@ -162,10 +322,10 @@ fn fixture(
     let mut inputs = vec![];
     for (ordinal, ty) in [&left, &right].into_iter().enumerate() {
         let literal = builder
-            .add_expression(
+            .fixture_value_root(
                 NodeId::new(44),
                 ty.clone(),
-                ExprKind::Literal(input_literal(ty, bits.map(|bits| bits[ordinal]))),
+                input_constant(&mut constants, ty, bits.map(|bits| bits[ordinal])),
             )
             .unwrap();
         let value = builder
@@ -173,7 +333,7 @@ fn fixture(
                 ty.clone(),
                 ValueOrigin::Expr {
                     node: NodeId::new(44),
-                    expr: literal,
+                    root: literal,
                 },
             )
             .unwrap();
@@ -192,13 +352,13 @@ fn fixture(
         )
         .unwrap();
     let a = builder
-        .add_expression(NodeId::new(0), left.clone(), ExprKind::Value(inputs[0].1))
+        .fixture_definition(NodeId::new(0), left.clone(), ExprKind::Value(inputs[0].1))
         .unwrap();
     let b = if matches!(shape, Shape::CarrierCast) {
         a
     } else {
         builder
-            .add_expression(NodeId::new(0), right.clone(), ExprKind::Value(inputs[1].1))
+            .fixture_definition(NodeId::new(0), right.clone(), ExprKind::Value(inputs[1].1))
             .unwrap()
     };
     let mut rand_selected = None;
@@ -263,7 +423,7 @@ fn fixture(
                 kind: rand.kind,
                 argument_types: selected.argument_types.clone(),
                 result_type: result.clone(),
-                legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+                legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
                     volatility: rand.semantics.volatility,
                     argument_evaluation: rand.semantics.argument_evaluation,
                     failure_behavior: rand.semantics.failure_behavior,
@@ -272,7 +432,7 @@ fn fixture(
                 }),
             };
             let first = builder
-                .add_expression(
+                .fixture_definition(
                     NodeId::new(0),
                     result.clone(),
                     ExprKind::FunctionCall {
@@ -282,7 +442,7 @@ fn fixture(
                 )
                 .unwrap();
             let second = builder
-                .add_expression(
+                .fixture_definition(
                     NodeId::new(0),
                     result.clone(),
                     ExprKind::FunctionCall {
@@ -293,10 +453,15 @@ fn fixture(
                 .unwrap();
             rand_definitions.extend([first, second]);
             let otherwise = builder
-                .add_expression(
+                .fixture_definition(
                     NodeId::new(0),
                     result.clone(),
-                    ExprKind::Literal(LiteralValue::Float64Bits(0f64.to_bits())),
+                    crate::test_constants::f64_bits(
+                        &mut constants,
+                        &result,
+                        0f64.to_bits(),
+                        options().constants,
+                    ),
                 )
                 .unwrap();
             (
@@ -311,7 +476,19 @@ fn fixture(
         }
     };
     let expression = builder
-        .add_expression(NodeId::new(0), result.clone(), kind)
+        .fixture_definition(NodeId::new(0), result.clone(), kind)
+        .unwrap();
+    let ordinal = builder
+        .fixture_occurrence(
+            NodeId::new(0),
+            expression,
+            if matches!(mode, Mode::Filter) {
+                EvaluationDemand::TruthOnly
+            } else {
+                EvaluationDemand::Value
+            },
+            RootScope::Port(0),
+        )
         .unwrap();
     match mode {
         Mode::Project => {
@@ -320,7 +497,7 @@ fn fixture(
                     result,
                     ValueOrigin::Expr {
                         node: NodeId::new(0),
-                        expr: expression,
+                        root: ordinal,
                     },
                 )
                 .unwrap();
@@ -328,17 +505,25 @@ fn fixture(
                 .add_project(
                     NodeId::new(0),
                     NodeId::new(44),
-                    Box::from([(expression, value)]),
+                    Box::from([(ordinal, value)]),
                     Box::from([value]),
                 )
                 .unwrap();
         }
         Mode::Filter => {
             builder
-                .add_filter(NodeId::new(0), NodeId::new(44), Box::from([expression]))
+                .add_filter(NodeId::new(0), NodeId::new(44), Box::from([ordinal]))
                 .unwrap();
         }
     }
+    seal_units(
+        &mut builder,
+        functions,
+        rand_selected.as_ref(),
+        rand_request,
+        &rand_definitions,
+        options().constants,
+    )?;
     let fragment = builder.finish_definition(
         NodeId::new(0),
         FragmentSink::Result,
@@ -350,6 +535,7 @@ fn fixture(
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     Ok(Fixture {
+        constants,
         fragment,
         expression,
         ordered,
@@ -360,182 +546,8 @@ fn fixture(
         carrier_cast: matches!(shape, Shape::CarrierCast),
     })
 }
-fn uses(fixture: &Fixture) -> PhysicalRootUses {
-    struct Author {
-        next_use: u32,
-        next_domain: u32,
-        uses: Vec<ExpressionInvocation<ExprId>>,
-        domains: Vec<ExpressionEvaluationDomain>,
-    }
-    impl Author {
-        fn visit(
-            &mut self,
-            fixture: &Fixture,
-            expr: ExprId,
-            domain: EvaluationDomainId,
-            demand: EvaluationDemand,
-        ) -> ExpressionUseId {
-            let id = ExpressionUseId::new(self.next_use);
-            self.next_use += 17;
-            let (shape, args) = match &fixture.fragment.expressions().get(expr).unwrap().kind {
-                ExprKind::Binary { left, right, .. } => (ControlShape::Eager, vec![*left, *right]),
-                ExprKind::Cast { expr, .. } => (ControlShape::Eager, vec![*expr]),
-                ExprKind::Case {
-                    operand,
-                    when_then,
-                    else_expr,
-                } => {
-                    let mut args = Vec::new();
-                    args.extend(*operand);
-                    args.extend(when_then.iter().flat_map(|(when, then)| [*when, *then]));
-                    args.extend(*else_expr);
-                    (
-                        ControlShape::Case {
-                            simple: true,
-                            arms: 2,
-                            has_else: true,
-                        },
-                        args,
-                    )
-                }
-                ExprKind::Literal(_) | ExprKind::Value(_) | ExprKind::FunctionCall { .. } => {
-                    (ControlShape::Eager, vec![])
-                }
-                _ => panic!("the complete fixture has only declared intrinsic/call kinds"),
-            };
-            let children = args
-                .iter()
-                .enumerate()
-                .map(|(ordinal, &child)| {
-                    let (child_demand, guard) =
-                        control_argument_semantics(shape, args.len(), ordinal, demand).unwrap();
-                    let child_domain = if let Some(kind) = guard {
-                        let child_domain = EvaluationDomainId::new(self.next_domain);
-                        self.next_domain += 13;
-                        self.domains.push(ExpressionEvaluationDomain {
-                            id: child_domain,
-                            parent: Some(domain),
-                            guard: Some(DomainGuard { owner: id, kind }),
-                        });
-                        child_domain
-                    } else {
-                        domain
-                    };
-                    self.visit(fixture, child, child_domain, child_demand)
-                })
-                .collect::<Vec<_>>();
-            self.uses.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id: id,
-                    domain,
-                    demand,
-                },
-                definition: expr,
-                control: shape,
-                arguments: children.into_boxed_slice(),
-            });
-            id
-        }
-    }
-    let domain = EvaluationDomainId::new(u32::MAX);
-    let mut author = Author {
-        next_use: 7,
-        next_domain: 8,
-        uses: vec![],
-        domains: vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-    };
-    let roots = PhysicalExpressionRoots::try_new(&fixture.fragment, &Control).unwrap();
-    let bindings = roots
-        .sites()
-        .iter()
-        .map(|(&site, root)| (site, author.visit(fixture, root.expr, domain, root.demand)))
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        author.domains,
-        author.uses,
-        fixture.fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(&fixture.fragment, flow, bindings, &Control).unwrap()
-}
 fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<FragmentPackage> {
-    use novarocks_physical_plan::{
-        PhysicalCallDefinition, PhysicalCallRequest, StaticFunctionArgument,
-    };
-    let Fixture {
-        fragment,
-        expression,
-        ordered,
-        rand_selected,
-        rand_request,
-        rand_definitions,
-        constant_policy,
-        carrier_cast,
-    } = fixture;
-    // Both emitted RAND definitions use the same genuine initial zero-argument request.
-    let entries = rand_definitions
-        .iter()
-        .map(|&definition| {
-            let original = rand_request.as_ref().unwrap();
-            let arguments = original
-                .arguments
-                .iter()
-                .map(|argument| match argument {
-                    FunctionArgument::Value {
-                        value_type,
-                        constant,
-                    } => {
-                        assert!(
-                            constant.is_none(),
-                            "RAND fixture has no original CV arguments"
-                        );
-                        StaticFunctionArgument::Value {
-                            value_type: value_type.clone(),
-                            constant: None,
-                        }
-                    }
-                    FunctionArgument::Lambda {
-                        parameter_types,
-                        result_type,
-                    } => StaticFunctionArgument::Lambda {
-                        parameter_types: parameter_types.clone(),
-                        result_type: result_type.clone(),
-                    },
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            (
-                PhysicalCallDefinition::Expression(definition),
-                PhysicalCallRequest {
-                    arguments,
-                    logical_argument_count: original.logical_argument_count,
-                    expected_result_type: original.expected_result_type.cloned(),
-                    constant_policy,
-                },
-            )
-        })
-        .collect();
-    let fragment = fragment
-        .with_call_requests_observed(entries, &Control)
-        .unwrap();
-    let fixture = Fixture {
-        fragment,
-        expression,
-        ordered,
-        rand_selected,
-        rand_request,
-        rand_definitions,
-        constant_policy,
-        carrier_cast,
-    };
-    let expression_uses = uses(&fixture);
-    let parameters = SemanticParameters::try_new(if carrier_cast {
+    let parameters = SemanticParameters::try_new(if fixture.carrier_cast {
         vec![(
             novarocks_type_contract::SemanticParameterId::new(7),
             novarocks_type_contract::SemanticParameterValue::AllowThrowException(true),
@@ -544,53 +556,13 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
         vec![]
     })
     .unwrap();
-    let mut frozen = vec![];
-    for invocation in expression_uses.flow().uses().values() {
-        let ExprKind::FunctionCall { function, .. } = &fixture
-            .fragment
-            .expressions()
-            .get(invocation.definition)
-            .unwrap()
-            .kind
-        else {
-            continue;
-        };
-        let request = fixture.rand_request.unwrap();
-        let selected = fixture.rand_selected.as_ref().unwrap().clone();
-        let token = functions
-            .prepare_fresh(
-                CallEffectInput {
-                    context: invocation.context,
-                    argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&[]),
-                    function_id: &function.function_id,
-                    kind: function.kind,
-                    selected: selected.as_ref(),
-                    request,
-                    environment: &[],
-                    parameters: &parameters,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    proof_scope: CallProofScope::Domain(invocation.context.domain),
-                },
-                selected.clone(),
-                PureCallPreparation::Scalar {
-                    arguments: ScopedExpressionEffects::pure_value(invocation.context),
-                },
-                &Control,
-            )
-            .unwrap();
-        frozen.push(FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: PhysicalCallSite::Expression(invocation.context.use_id),
-            context: invocation.context,
-            effects: token.call_contract().effects().clone(),
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        });
-    }
-    let calls = FrozenFragmentCalls::try_new(&fixture.fragment, &expression_uses, frozen, &Control)
-        .unwrap();
+    let constants = fixture.constants.clone();
+    let _ = (
+        functions,
+        &fixture.rand_selected,
+        &fixture.rand_request,
+        &fixture.rand_definitions,
+    );
     let root = &fixture.fragment.nodes()[&fixture.fragment.root()];
     let result = ResultPort {
         scalar_schema: None,
@@ -617,10 +589,9 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
             FragmentPackageInput {
                 version: PlanVersionId::try_new([101; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 fragment: fixture.fragment,
-                expression_uses,
-                calls,
+                statement_constant_policy: fixture.constant_policy,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters,
@@ -635,15 +606,6 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
         )
         .unwrap(),
     )
-}
-fn root(mode: Mode) -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(2),
-        role: match mode {
-            Mode::Project => ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-            Mode::Filter => ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
-        },
-    }
 }
 fn compile(
     source: Arc<FragmentPackage>,
@@ -715,11 +677,11 @@ fn binary_eq_and_not_eq_have_mandatory_recipes_for_exact_ordered_child_uses() {
                     let physical_root = fixture.expression;
                     let source = package(&functions, fixture);
                     let program = compile(source.clone(), &functions, &Control).unwrap();
-                    let calls = program.checked().channels().expressions().resolved_calls();
-                    let snapshot = calls.snapshot();
-                    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-                    let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-                    let use_id = snapshot.bindings()[&root(mode)];
+                    let compiled = unit(&program);
+                    let calls = compiled;
+                    let flow = compiled.control_flow();
+                    let arena = compiled.definitions();
+                    let use_id = occurrence(&program);
                     let invocation = &flow.uses()[&use_id];
                     assert_eq!(invocation.control, ControlShape::Eager);
                     assert_eq!(invocation.arguments.len(), 2);
@@ -732,7 +694,7 @@ fn binary_eq_and_not_eq_have_mandatory_recipes_for_exact_ordered_child_uses() {
                         }
                     );
                     assert_eq!(
-                        source.expression_uses().flow().uses()[&use_id].definition,
+                        source_unit(&source).control_flow().uses()[&use_id].definition,
                         physical_root
                     );
                     let (a, b) = match (op, arena.node(invocation.definition).unwrap().kind()) {
@@ -744,38 +706,34 @@ fn binary_eq_and_not_eq_have_mandatory_recipes_for_exact_ordered_child_uses() {
                         let child = &flow.uses()[&invocation.arguments[ordinal]];
                         assert_eq!(child.definition, definition);
                         assert_eq!(child.context.demand, EvaluationDemand::Value);
-                        assert_eq!(child.context.domain, invocation.context.domain);
+                        assert_eq!(child.context.region, invocation.context.region);
                         assert_eq!(
-                            source.expression_uses().flow().uses()[&child.context.use_id]
+                            source_unit(&source).control_flow().uses()[&child.context.use_id]
                                 .definition,
                             ordered[ordinal]
                         );
                         assert!(matches!(
                             arena.node(definition).unwrap().kind(),
-                            StaticExprKind::SlotId(_)
+                            StaticExprKind::Input
                         ));
                     }
                     assert_ne!(invocation.arguments[0], invocation.arguments[1]);
-                    let occurrence = ProgramUseRef {
-                        arena: ProgramExpressionArena::Main,
-                        use_id,
-                    };
-                    let recipe = program
-                        .comparison_recipe(ProgramComparisonSite::Binary(occurrence))
+                    let occurrence = use_id;
+                    let recipe = unit(&program)
+                        .recipes()
+                        .comparison(ProgramComparisonSite::Binary(occurrence))
                         .unwrap();
                     assert_eq!(recipe.left_type(), &left);
                     assert_eq!(recipe.right_type(), &right);
                     assert_eq!(recipe.nullable_result(), left_null || right_null);
                     assert!(
-                        program
-                            .comparison_recipe(ProgramComparisonSite::CaseWhen {
-                                occurrence,
-                                arm: 0
-                            })
+                        unit(&program)
+                            .recipes()
+                            .comparison(ProgramComparisonSite::CaseWhen { occurrence, arm: 0 })
                             .is_none()
                     );
                     assert!(calls.calls().is_empty());
-                    assert!(source.calls().entries().is_empty());
+                    assert!(source_unit(&source).claims().is_empty());
                 }
             }
         }
@@ -806,16 +764,10 @@ fn floating_comparison_recipe_preserves_exact_source_types_and_literal_bit_patte
             .unwrap(),
         );
         let program = compile(source, &functions, &Control).unwrap();
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-        let constants = arena
-            .nodes()
+        let constants = program
+            .units()
             .iter()
+            .flat_map(|unit| unit.definitions().nodes().iter())
             .filter_map(|node| {
                 if let StaticExprKind::Constant(value) = node.kind() {
                     Some(value.try_f64_bits().unwrap().unwrap())
@@ -825,12 +777,10 @@ fn floating_comparison_recipe_preserves_exact_source_types_and_literal_bit_patte
             })
             .collect::<Vec<_>>();
         assert_eq!(constants, bits);
-        let occurrence = ProgramUseRef {
-            arena: ProgramExpressionArena::Main,
-            use_id: snapshot.bindings()[&root(Mode::Project)],
-        };
-        let recipe = program
-            .comparison_recipe(ProgramComparisonSite::Binary(occurrence))
+        let occurrence = occurrence(&program);
+        let recipe = unit(&program)
+            .recipes()
+            .comparison(ProgramComparisonSite::Binary(occurrence))
             .unwrap();
         assert_eq!(recipe.left_type(), &ty);
         assert_eq!(recipe.right_type(), &ty);
@@ -856,11 +806,11 @@ fn simple_case_has_one_exact_recipe_per_ordered_when_and_keeps_actual_rand_effec
     let ordered = fixture.ordered.clone();
     let source = package(&functions, fixture);
     let program = compile(source.clone(), &functions, &Control).unwrap();
-    let calls = program.checked().channels().expressions().resolved_calls();
-    let snapshot = calls.snapshot();
-    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-    let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-    let use_id = snapshot.bindings()[&root(Mode::Project)];
+    let compiled = unit(&program);
+    let calls = compiled;
+    let flow = compiled.control_flow();
+    let arena = compiled.definitions();
+    let use_id = occurrence(&program);
     let invocation = &flow.uses()[&use_id];
     assert_eq!(
         invocation.control,
@@ -883,56 +833,49 @@ fn simple_case_has_one_exact_recipe_per_ordered_when_and_keeps_actual_rand_effec
         let child = &flow.uses()[child_use];
         assert_eq!(child.definition, children[ordinal]);
         assert_eq!(
-            source.expression_uses().flow().uses()[child_use].definition,
+            source_unit(&source).control_flow().uses()[child_use].definition,
             ordered[ordinal]
         );
         assert_eq!(child.context.demand, EvaluationDemand::Value);
     }
     assert_eq!(children[0], children[3]);
     assert_ne!(invocation.arguments[0], invocation.arguments[3]);
-    let occurrence = ProgramUseRef {
-        arena: ProgramExpressionArena::Main,
-        use_id,
-    };
+    let occurrence = use_id;
     for (arm, rhs) in [(0, &right), (1, &left)] {
-        let recipe = program
-            .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm })
+        let recipe = unit(&program)
+            .recipes()
+            .comparison(ProgramComparisonSite::CaseWhen { occurrence, arm })
             .unwrap();
         assert_eq!(recipe.left_type(), &left);
         assert_eq!(recipe.right_type(), rhs);
         assert!(recipe.nullable_result());
     }
     assert!(
-        program
-            .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm: 2 })
+        unit(&program)
+            .recipes()
+            .comparison(ProgramComparisonSite::CaseWhen { occurrence, arm: 2 })
             .is_none()
     );
     assert!(
-        program
-            .comparison_recipe(ProgramComparisonSite::Binary(occurrence))
+        unit(&program)
+            .recipes()
+            .comparison(ProgramComparisonSite::Binary(occurrence))
             .is_none()
     );
     assert!(
-        program
-            .comparison_recipe(ProgramComparisonSite::CaseWhen {
-                occurrence: ProgramUseRef {
-                    arena: ProgramExpressionArena::Main,
-                    use_id: invocation.arguments[1],
-                },
+        unit(&program)
+            .recipes()
+            .comparison(ProgramComparisonSite::CaseWhen {
+                occurrence: invocation.arguments[1],
                 arm: 0
             })
             .is_none()
     );
     assert_eq!(calls.calls().len(), 2);
-    assert_eq!(source.calls().entries().len(), 2);
-    assert!(
-        !source
-            .calls()
-            .entries()
-            .contains_key(&PhysicalCallSite::Expression(use_id))
-    );
+    assert_eq!(source_unit(&source).claims().len(), 2);
+    assert!(!source_unit(&source).claims().contains_key(&use_id));
     for call in calls.calls().values() {
-        let context = call.call_contract().context();
+        let context = call.call_contract().context().expression().unwrap();
         assert_eq!(
             call.call_contract().function_id().as_str(),
             "builtin.scalar/rand/v1"
@@ -941,7 +884,7 @@ fn simple_case_has_one_exact_recipe_per_ordered_when_and_keeps_actual_rand_effec
         assert_eq!(summary.value_stability, FunctionVolatility::Volatile);
         assert!(summary.has_instance_state);
         assert!(summary.observable_effects.rng_sampling);
-        let frozen = &source.calls().entries()[&PhysicalCallSite::Expression(context.use_id)];
+        let frozen = &source_unit(&source).claims()[&context.use_id];
         assert_eq!(call.call_contract().effects(), &frozen.effects);
         assert_eq!(frozen.context, context);
     }
@@ -1062,16 +1005,8 @@ fn nullable_null_domain_keeps_a_checked_recipe_instead_of_a_nonnullable_boolean_
             .unwrap(),
         );
         let program = compile(source, &functions, &Control).unwrap();
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        let occurrence = ProgramUseRef {
-            arena: ProgramExpressionArena::Main,
-            use_id: snapshot.bindings()[&root(Mode::Project)],
-        };
+        let _compiled = unit(&program);
+        let occurrence = occurrence(&program);
         let sites = match shape {
             Shape::Binary(_) => vec![ProgramComparisonSite::Binary(occurrence)],
             Shape::CarrierCast => unreachable!("this matrix only contains comparison nodes"),
@@ -1081,7 +1016,7 @@ fn nullable_null_domain_keeps_a_checked_recipe_instead_of_a_nonnullable_boolean_
             ],
         };
         for site in sites {
-            let recipe = program.comparison_recipe(site).unwrap();
+            let recipe = unit(&program).recipes().comparison(site).unwrap();
             assert_eq!(recipe.left_type(), &ty);
             assert_eq!(recipe.right_type(), &ty);
             assert!(recipe.nullable_result());
@@ -1149,8 +1084,10 @@ fn actual_fragment_compilation_preserves_primitive_capability_refusals() {
         };
         assert!(matches!(
             error.downcast_ref::<crate::expressions::ExpressionLoweringError>(),
-            Some(crate::expressions::ExpressionLoweringError::Comparison(
-                novarocks_functions::ComparisonPrepareError::Unsupported
+            Some(crate::expressions::ExpressionLoweringError::Unit(
+                novarocks_expression::ExprCompileError::Comparison(
+                    novarocks_functions::ComparisonPrepareError::Unsupported
+                )
             ))
         ));
     }
@@ -1181,18 +1118,20 @@ fn actual_fragment_compilation_preserves_primitive_capability_refusals() {
     };
     assert!(matches!(
         error.downcast_ref::<crate::expressions::ExpressionLoweringError>(),
-        Some(crate::expressions::ExpressionLoweringError::Cast(
-            novarocks_functions::CastPrepareError::Unsupported
+        Some(crate::expressions::ExpressionLoweringError::Unit(
+            novarocks_expression::ExprCompileError::Cast(
+                novarocks_functions::CastPrepareError::Unsupported
+            )
         ))
     ));
 }
 
 #[test]
 fn final_program_primitive_errors_preserve_only_typed_unsupported() {
+    use novarocks_expression::PrimitiveError as P;
     use novarocks_functions::{
         ArithmeticPrepareError as A, CastPrepareError as C, ComparisonPrepareError as B,
     };
-    use novarocks_local_program::ProgramPrimitiveError as P;
     for (primitive, expected) in [
         (P::Arithmetic(A::Unsupported), true),
         (P::Cast(C::Unsupported), true),
@@ -1204,9 +1143,15 @@ fn final_program_primitive_errors_preserve_only_typed_unsupported() {
         (P::Control(CompileControlError::Cancelled), false),
     ] {
         let error = FragmentCompileError::Owner {
-            phase: "local program",
+            phase: "expressions",
             error: novarocks_failure_contract::SharedFailureCause::new(
-                novarocks_local_program::LocalProgramCompileError::Primitive(primitive),
+                crate::expressions::ExpressionLoweringError::Unit(match primitive {
+                    P::Arithmetic(e) => novarocks_expression::ExprCompileError::Arithmetic(e),
+                    P::Cast(e) => novarocks_expression::ExprCompileError::Cast(e),
+                    P::Comparison(e) => novarocks_expression::ExprCompileError::Comparison(e),
+                    P::Control(e) => novarocks_expression::ExprCompileError::Control(e),
+                    P::Invalid(e) => novarocks_expression::ExprCompileError::Invalid(e),
+                }),
             ),
         };
         assert_eq!(error.is_unsupported(), expected);

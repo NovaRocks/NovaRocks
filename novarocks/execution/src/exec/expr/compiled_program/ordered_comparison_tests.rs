@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{
     ArrayRef, BinaryArray, FixedSizeBinaryBuilder, LargeBinaryArray, LargeStringArray, StringArray,
 };
@@ -69,6 +70,7 @@ fn ordered_value_program(
     source_kind: Source,
     truth_only: bool,
 ) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let mut builder = FragmentBuilder::new(FragmentId::new(211));
     let source = NodeId::new(u32::MAX);
@@ -86,16 +88,30 @@ fn ordered_value_program(
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
+            .unwrap();
+        let root = builder
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *id,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr { node: input, root },
             })
             .unwrap();
-        items.push((expr, *id));
+        items.push((root, *id));
     }
     builder
         .add_project(
@@ -112,10 +128,17 @@ fn ordered_value_program(
     let mut authors = BTreeMap::new();
     let (left, right) = if matches!(source_kind, Source::Random) {
         let condition = builder
-            .add_expression(output, flag.clone(), ExprKind::Value(columns[2].0))
+            .unit(output)
+            .unwrap()
+            .add(None, flag.clone(), ExprKind::Value(columns[2].0))
             .unwrap();
-        let left_rand = random(&mut builder, &mut authors, &functions);
-        let null = literal(&mut builder, scalar.clone(), LiteralValue::Null);
+        let left_rand = random(&mut builder, &mut authors, &functions, &mut source_pools);
+        let null = literal(
+            &mut builder,
+            scalar.clone(),
+            checked_constants::null(&(scalar.clone()), options().constants),
+            &mut source_pools,
+        );
         let left = call(
             &mut builder,
             &mut authors,
@@ -131,18 +154,37 @@ fn ordered_value_program(
             ),
             vec![condition, left_rand, null],
         );
-        (left, random(&mut builder, &mut authors, &functions))
+        (
+            left,
+            random(&mut builder, &mut authors, &functions, &mut source_pools),
+        )
     } else {
         let left = builder
-            .add_expression(output, scalar.clone(), ExprKind::Value(columns[0].0))
+            .unit(output)
+            .unwrap()
+            .add(None, scalar.clone(), ExprKind::Value(columns[0].0))
             .unwrap();
         let right = builder
-            .add_expression(output, scalar.clone(), ExprKind::Value(columns[1].0))
+            .unit(output)
+            .unwrap()
+            .add(None, scalar.clone(), ExprKind::Value(columns[1].0))
             .unwrap();
         if matches!(source_kind, Source::Rounded) {
             (
-                round_value(&mut builder, &mut authors, &functions, left),
-                round_value(&mut builder, &mut authors, &functions, right),
+                round_value(
+                    &mut builder,
+                    &mut authors,
+                    &functions,
+                    left,
+                    &mut source_pools,
+                ),
+                round_value(
+                    &mut builder,
+                    &mut authors,
+                    &functions,
+                    right,
+                    &mut source_pools,
+                ),
             )
         } else {
             (left, right)
@@ -150,8 +192,10 @@ fn ordered_value_program(
     };
     let result_type = FunctionValueType::new(DataType::Boolean, true);
     let expr = builder
-        .add_expression(
-            output,
+        .unit(output)
+        .unwrap()
+        .add(
+            None,
             result_type.clone(),
             ExprKind::Binary {
                 op,
@@ -160,6 +204,19 @@ fn ordered_value_program(
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                 allow_throw_exception: None,
             },
+        )
+        .unwrap();
+    let expr = builder
+        .unit(output)
+        .unwrap()
+        .root(
+            expr,
+            if truth_only {
+                EvaluationDemand::TruthOnly
+            } else {
+                EvaluationDemand::Value
+            },
+            RootScope::Port(0),
         )
         .unwrap();
     let mut fields = vec![];
@@ -178,7 +235,10 @@ fn ordered_value_program(
         let value = builder
             .add_value(
                 result_type.clone(),
-                ValueOrigin::Expr { node: output, expr },
+                ValueOrigin::Expr {
+                    node: output,
+                    root: expr,
+                },
             )
             .unwrap();
         builder
@@ -197,38 +257,34 @@ fn ordered_value_program(
             ty: result_type,
         });
     }
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: FragmentId::new(211),
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: fields.into_boxed_slice(),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, builder, output, &authors, result, source_pools)
 }
-fn ordered_root(truth: bool) -> ProgramExpressionRootSite {
+fn ordered_root(program: &LocalProgram, truth: bool) -> ProgramRootRef {
     if truth {
-        ProgramExpressionRootSite::Node {
-            node: ProgramNodeId::new(2),
-            role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
-        }
+        let ProgramNodeKind::Filter { predicates, .. } =
+            program.graph().nodes()[program.graph().root().index()].kind()
+        else {
+            panic!("actual ordered comparison Filter")
+        };
+        predicates[0]
     } else {
-        root()
+        root(program)
     }
 }
 fn ordered_instance(program: &Arc<LocalProgram>, truth: bool) -> CompiledExpressionInstance {
-    CompiledExpressionInstance::try_new(program.clone(), ordered_root(truth), &Control).unwrap()
+    let reference = ordered_root(program, truth);
+    CompiledExpressionInstance::try_new(
+        program.unit(reference.unit).unwrap().clone(),
+        reference.root,
+        &Control,
+    )
+    .unwrap()
 }
 fn ordered_batch(
     program: &LocalProgram,
@@ -252,25 +308,18 @@ fn result(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<bool>>
         .collect()
 }
 fn assert_recipe(program: &LocalProgram, truth: bool, op: ComparisonOperator, ty: DataType) {
-    let site = ordered_root(truth);
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let occurrence = ProgramUseRef {
-        arena: site.arena(),
-        use_id: snapshot.bindings()[&site],
-    };
-    let recipe = program
-        .comparison_recipe(ProgramComparisonSite::Binary(occurrence))
+    let site = ordered_root(program, truth);
+    let unit = program.unit(site.unit).unwrap();
+    let occurrence = unit.root(site.root).unwrap().use_id;
+    let recipe = unit
+        .recipes()
+        .comparison(ComparisonSite::Binary(occurrence))
         .unwrap();
     assert_eq!(recipe.operator(), op);
     assert_eq!(recipe.left_type().data_type().clone(), ty);
     assert_eq!(recipe.right_type().data_type().clone(), ty);
-    let flow = &snapshot.flows()[&site.arena()];
-    let invocation = &flow.uses()[&occurrence.use_id];
+    let flow = unit.control_flow();
+    let invocation = &flow.uses()[&occurrence];
     assert_eq!(
         invocation.context.demand,
         if truth {
@@ -660,8 +709,9 @@ fn ordered_largeint_is_signed_i128_while_same_fixed16_physical_and_uuid_keep_byt
     for domain in domains {
         for (physical, frozen) in operators() {
             let program = ordered_value_program(physical, domain.clone(), Source::Columns, false);
-            let recipe = program
-                .comparison_recipe(ProgramComparisonSite::Binary(root_use(&program)))
+            let recipe = root_unit(&program)
+                .recipes()
+                .comparison(ComparisonSite::Binary(root_use(&program)))
                 .unwrap();
             assert_eq!(recipe.left_type(), &domain);
             assert_eq!(recipe.right_type(), &domain);

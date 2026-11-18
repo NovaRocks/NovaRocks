@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use arrow_array::{Array, Int64Array, new_null_array};
 use arrow_schema::{DataType, Field};
 use novarocks_constant_contract::ConstantPolicy;
@@ -110,16 +112,20 @@ fn request_fragment(
     use crate::{ExprKind, FragmentBuilder, FragmentId, NodeId};
     let owner = NodeId::new(8);
     let mut builder = FragmentBuilder::new(FragmentId::new(id));
+    let source_value = builder
+        .add_value(
+            ty.clone(),
+            crate::ValueOrigin::NodeOutput {
+                node: NodeId::new(99),
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
     builder
-        .add_values(NodeId::new(99), Box::from([Box::default()]), Box::default())
+        .add_values(NodeId::new(99), Box::default(), Box::from([source_value]))
         .unwrap();
-    let argument_kind = match &ty.data_type() {
-        DataType::Int64 => ExprKind::Literal(crate::LiteralValue::Int64(42)),
-        _ => ExprKind::Literal(crate::LiteralValue::Null),
-    };
-    let input = builder
-        .add_expression(owner, ty.clone(), argument_kind)
-        .unwrap();
+    let argument_kind = ExprKind::Value(source_value);
+    let input = builder.define(owner, ty.clone(), argument_kind).unwrap();
     let result = FunctionValueType::new(DataType::Int64, true);
     let function = crate::BoundFunction {
         function_id: FunctionId::try_new("test/request-source").unwrap(),
@@ -141,7 +147,7 @@ fn request_fragment(
         }),
     };
     let call = builder
-        .add_expression(
+        .define(
             owner,
             result.clone(),
             ExprKind::FunctionCall {
@@ -150,27 +156,39 @@ fn request_fragment(
             },
         )
         .unwrap();
+    let call_root = builder.root_definition(
+        owner,
+        call,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let output = builder
         .add_value(
             result,
             crate::ValueOrigin::Expr {
                 node: owner,
-                expr: call,
+                root: call_root,
             },
         )
         .unwrap();
-    let mut assignments = vec![(call, output)];
+    let mut assignments = vec![(call_root, output)];
     let mut outputs = vec![output];
     if let Some(reference) = shared_expression {
         let expression = builder
-            .add_expression(owner, ty.clone(), ExprKind::Constant(reference))
+            .define(owner, ty.clone(), ExprKind::Constant(reference))
             .unwrap();
+        let expression = builder.root_definition(
+            owner,
+            expression,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
         let value = builder
             .add_value(
                 ty.clone(),
                 crate::ValueOrigin::Expr {
                     node: owner,
-                    expr: expression,
+                    root: expression,
                 },
             )
             .unwrap();
@@ -185,8 +203,69 @@ fn request_fragment(
             outputs.into_boxed_slice(),
         )
         .unwrap();
+    // The fixture explicitly authors an eager scalar call and its original
+    // selected constant arguments before publishing this node's checked unit.
+    let original = crate::PhysicalCallRequest {
+        arguments: refs
+            .iter()
+            .map(|reference| FunctionArgument::Value {
+                value_type: ty.clone(),
+                constant: *reference,
+            })
+            .collect(),
+        logical_argument_count: refs.len(),
+        expected_result_type: None,
+        constant_policy: policy(),
+    };
+    let unit = builder.unit(owner).unwrap();
+    unit.request(call, original).unwrap();
+    unit.definition_control(
+        call,
+        novarocks_expression_contract::DefinitionControl {
+            shape: novarocks_type_contract::ControlShape::Eager,
+            temporal_sources: None,
+        },
+    )
+    .unwrap();
+    let ports = builder.node_ports(owner).unwrap();
+    let draft = builder.take_unit_builder(owner).unwrap();
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
+    let sealed = draft.seal(ports, &mut work).unwrap();
+    let claims = sealed
+        .uses()
+        .iter()
+        .filter(|(_, invocation)| invocation.definition == call)
+        .map(|(&id, invocation)| {
+            use novarocks_type_contract::*;
+            (
+                id,
+                novarocks_expression_contract::ExpressionCallClaim {
+                    context: invocation.context,
+                    effects: CallEffects {
+                        value_stability: FunctionVolatility::Immutable,
+                        own_row_error: FunctionIntrinsicRowError::NoRowError,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        null_behavior: FunctionNullBehavior::CalledOnNull,
+                        argument_control: ArgumentControl::Eager,
+                        instance_state: FunctionInstanceState::None,
+                        observable_effects: ObservableEffects::NONE,
+                        environment: Box::default(),
+                        proof_scope: CallProofScope::Region(invocation.context.region),
+                    },
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    temporal_source: None,
+                    regexp_count_pattern_source: None,
+                    to_base64_byte_source: None,
+                },
+            )
+        })
+        .collect();
+    let unit = sealed.finish(claims, &mut work).unwrap();
+    work.finish().unwrap();
+    builder.install_unit(owner, Arc::new(unit)).unwrap();
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             owner,
             crate::FragmentSink::Noop,
             crate::PipelineDopDomain {
@@ -197,33 +276,15 @@ fn request_fragment(
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap()
-        .with_call_requests_observed(
-            vec![(
-                crate::PhysicalCallDefinition::Expression(call),
-                crate::PhysicalCallRequest {
-                    arguments: refs
-                        .iter()
-                        .map(|reference| FunctionArgument::Value {
-                            value_type: ty.clone(),
-                            constant: *reference,
-                        })
-                        .collect(),
-                    logical_argument_count: refs.len(),
-                    expected_result_type: None,
-                    constant_policy: policy(),
-                },
-            )],
-            &Control::default(),
-        )
-        .unwrap()
 }
+
 fn project(
     fragment: &crate::Fragment,
     pools: &ConstantPools,
     control: &dyn PureCompileControl,
 ) -> Result<ConstantPools, ConstantReferenceError> {
     let mut work = CompileCheckpoints::try_new(control, PHASE)?;
-    let result = pools.project_fragment_observed(fragment, &mut work);
+    let result = crate::project_fragment_constants_observed(pools, fragment, &mut work);
     if matches!(result, Err(ConstantReferenceError::Control(_))) {
         return result;
     }
@@ -238,8 +299,11 @@ fn closed(
     validate_fragment_constants_observed(fragment, pools, true, crate::PlanLimits::FROZEN, control)
 }
 fn plan(fragment: &crate::Fragment, pools: ConstantPools) -> crate::PhysicalPlan {
-    let mut builder = crate::PlanBuilder::new(crate::PlanVersionId::try_new([81; 16]).unwrap())
-        .with_constant_pools(pools);
+    let mut builder = crate::PlanBuilder::new(
+        crate::PlanVersionId::try_new([81; 16]).unwrap(),
+        crate::tests::constant_fixture::policy(),
+    )
+    .with_constant_pools(pools);
     builder.add_fragment(fragment.clone()).unwrap();
     builder.finish_observed(&Control::default()).unwrap()
 }
@@ -278,9 +342,11 @@ fn request_only_selected_constant_projects_original_source_and_closes_local_and_
     );
     assert!(
         !fragment
-            .expressions()
-            .iter()
-            .any(|(_, node)| matches!(node.kind, crate::ExprKind::Constant(_)))
+            .nodes()
+            .values()
+            .filter_map(|node| node.expressions.as_ref())
+            .flat_map(|unit| unit.definitions())
+            .any(|node| matches!(node.kind, crate::ExprKind::Constant(_)))
     );
     let pools = table(&[0, u32::MAX], &pool);
     let projected = project(&fragment, &pools, &Control::default()).unwrap();
@@ -356,7 +422,11 @@ fn request_reference_missing_pool_out_of_bounds_and_full_type_refuse_without_rea
     for (address, expected) in [
         (
             reference(7, 1),
-            ConstantReferenceError::MissingPool(ConstantPoolId::new(7)),
+            ConstantReferenceError::Table(
+                novarocks_constant_contract::ConstantTableError::MissingPool(ConstantPoolId::new(
+                    7,
+                )),
+            ),
         ),
         (
             reference(0, 3),
@@ -379,11 +449,15 @@ fn request_reference_missing_pool_out_of_bounds_and_full_type_refuse_without_rea
     );
     assert_eq!(
         project(&wrong, &pools, &Control::default()).unwrap_err(),
-        ConstantReferenceError::SourceTypeMismatch(reference(0, 1))
+        ConstantReferenceError::Table(
+            novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(reference(0, 1))
+        )
     );
     assert_eq!(
         closed(&wrong, &pools, &Control::default()).unwrap_err(),
-        ConstantReferenceError::SourceTypeMismatch(reference(0, 1))
+        ConstantReferenceError::Table(
+            novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(reference(0, 1))
+        )
     );
 }
 
@@ -415,7 +489,9 @@ fn request_nested_named_semantics_are_checked_against_the_real_admitted_pool() {
     let wrong = request_fragment(13, wrong_type, &[Some(reference(0, 1))], None);
     assert_eq!(
         project(&wrong, &pools, &Control::default()).unwrap_err(),
-        ConstantReferenceError::SourceTypeMismatch(reference(0, 1))
+        ConstantReferenceError::Table(
+            novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(reference(0, 1))
+        )
     );
 }
 
@@ -445,7 +521,9 @@ fn request_reference_projection_and_validation_preserve_every_actual_small_contr
         &[Some(reference(9, 1))],
         None,
     );
-    let expected = Err(ConstantReferenceError::MissingPool(ConstantPoolId::new(9)));
+    let expected = Err(ConstantReferenceError::Table(
+        novarocks_constant_contract::ConstantTableError::MissingPool(ConstantPoolId::new(9)),
+    ));
     let trace = every_prefix(
         |control| project(&bad, &pools, control).map(|_| ()),
         expected.clone(),

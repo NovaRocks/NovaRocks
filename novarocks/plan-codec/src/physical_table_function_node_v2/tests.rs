@@ -27,8 +27,8 @@ use crate::{
         ConnectorPayloadProjectionLimits, decode_connector_payloads, encode_connector_payloads,
     },
     physical_expression_v2::{
-        ExpressionProjectionLimits, ExpressionTypeIds, decode_expression_definitions,
-        encode_expression_definitions,
+        ExpressionDefinitionSource, ExpressionProjectionLimits, ExpressionTypeIds,
+        decode_expression_definitions, encode_expression_definitions,
     },
     physical_properties_v2::PhysicalPropertyProjectionLimits,
     physical_type_v2::{TypeProjectionLimits, decode_type_table, encode_type_table_sources},
@@ -36,6 +36,7 @@ use crate::{
     physical_value_v2::{ValueProjectionLimits, ValueSource, decode_values, encode_values},
 };
 use arrow::datatypes::{DataType, Field};
+use novarocks_expression_contract::{ExprId, RootOrdinal};
 use novarocks_type_contract::{
     CompileControlError, FunctionArgumentType, FunctionId, FunctionKind, FunctionOverloadId,
     FunctionValueType, PureCompileControl, SemanticParameters, ValueLogicalType,
@@ -173,11 +174,47 @@ fn property() -> p::PhysicalProperties {
         ordering: Box::default(),
     }
 }
+fn unit_from_sources(
+    nodes: impl IntoIterator<Item = novarocks_expression_contract::ExprNode>,
+    values: &[p::ValueDef],
+    control: &dyn PureCompileControl,
+) -> novarocks_expression_contract::BoundExprSet {
+    use novarocks_expression_contract::{BoundExprSetBuilder, ExprPort, RootScope, UnitLimits};
+    use novarocks_type_contract::{CompileCheckpoints, EvaluationDemand};
+    let mut builder = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: p::PlanLimits::FROZEN.expression_semantic_depth,
+    });
+    for node in nodes {
+        let demand = if *node.ty.data_type() == DataType::Boolean {
+            EvaluationDemand::TruthOnly
+        } else {
+            EvaluationDemand::Value
+        };
+        let id = builder.add(node.lambda_scope, node.ty, node.kind).unwrap();
+        assert_eq!(id, node.id);
+        builder.root(id, demand, RootScope::Port(0)).unwrap();
+    }
+    let ports = vec![ExprPort {
+        values: values
+            .iter()
+            .map(|value| (value.id, value.ty.clone()))
+            .collect(),
+    }];
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+    let unit = builder
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(std::collections::BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    unit
+}
+
 struct Fixture {
     node: p::PhysicalNode,
     roots: Vec<(u32, FunctionValueType)>,
     values: Vec<p::ValueDef>,
-    arena: p::ExprArena,
+    unit: novarocks_expression_contract::BoundExprSet,
     parameters: SemanticParameters,
     pools: p::ConstantPools,
     arguments: Vec<ArgumentTypeIds<'static>>,
@@ -232,6 +269,7 @@ impl Fixture {
             novarocks_type_contract::TypedFactSlice::from_pure_boxed(results),
         );
         let node = p::PhysicalNode {
+            expressions: None,
             id: p::NodeId::new(u32::MAX),
             inputs: Box::from([p::NodeId::new(0)]),
             required_inputs: Box::from([property()]),
@@ -246,7 +284,7 @@ impl Fixture {
             },
             kind: p::NodeKind::TableFunction {
                 function,
-                arguments: vec![p::ExprId::new(7); arguments.len()].into_boxed_slice(),
+                arguments: vec![RootOrdinal::new(1); arguments.len()].into_boxed_slice(),
                 outputs: Box::from([
                     p::TableFunctionOutput::PassThrough(p::ValueId::new(7)),
                     p::TableFunctionOutput::FunctionResult {
@@ -261,7 +299,7 @@ impl Fixture {
                 left_outer: true,
             },
         };
-        let values = [0, 7, u32::MAX]
+        let values: Vec<p::ValueDef> = [0, 7, u32::MAX]
             .into_iter()
             .map(|id| p::ValueDef {
                 id: p::ValueId::new(id),
@@ -272,23 +310,23 @@ impl Fixture {
                 },
             })
             .collect();
-        let arena = p::ExprArena::try_from_definitions_observed(
-            [0, 7, u32::MAX].into_iter().map(|id| p::ExprNode {
-                id: p::ExprId::new(id),
-                owner: p::NodeId::new(u32::MAX),
-                lambda_scope: None,
-                ty: value.clone(),
-                kind: p::ExprKind::Value(p::ValueId::new(0)),
-            }),
-            &p::PlanLimits::FROZEN,
+        let unit = unit_from_sources(
+            [0, 1, 2]
+                .into_iter()
+                .map(|id| novarocks_expression_contract::ExprNode {
+                    id: ExprId::new(id),
+                    lambda_scope: None,
+                    ty: value.clone(),
+                    kind: novarocks_expression_contract::ExprKind::Value(p::ValueId::new(0)),
+                }),
+            &values,
             &Control::default(),
-        )
-        .unwrap();
+        );
         Self {
             node,
             roots,
             values,
-            arena,
+            unit,
             arguments,
             parameters: SemanticParameters::try_new([]).unwrap(),
             pools: p::ConstantPools::empty(),
@@ -333,7 +371,7 @@ impl Fixture {
         } else {
             vec![0]
         };
-        let scalar = p::BoundFunction::from_exact_signature(
+        let scalar = novarocks_expression_contract::BoundFunction::from_exact_signature(
             FunctionId::try_new("test/scalar").unwrap(),
             FunctionOverloadId::try_new("test/scalar/profile").unwrap(),
             FunctionKind::Scalar,
@@ -399,18 +437,18 @@ impl Fixture {
         )
         .unwrap();
         let ids = self
-            .arena
+            .unit
+            .definitions()
             .iter()
-            .map(|(id, _)| ExpressionTypeIds {
-                expr: *id,
+            .map(|node| ExpressionTypeIds {
+                expr: node.id,
                 value_type_id: 0,
                 lambda_parameter_type_ids: &[],
                 function_binding_id: None,
-                aggregate_binding_id: None,
             })
             .collect::<Vec<_>>();
         let expressions = encode_expression_definitions(
-            &self.arena,
+            Some(ExpressionDefinitionSource::from_unit(&self.unit)),
             &ids,
             &types,
             &functions,
@@ -422,8 +460,10 @@ impl Fixture {
             control,
         )
         .unwrap();
+        let wire_roots = crate::test_constants::wire_roots(&self.unit);
         let read = decode_expression_definitions(
             expressions.as_wire(),
+            &wire_roots,
             &read_values,
             &headers,
             &aggregates_read,
@@ -483,7 +523,7 @@ fn complete_table_node_has_independent_sparse_ordered_wire_oracle() {
         assert_eq!(wire.output.as_ref().unwrap().value_ids, [7, 0, u32::MAX]);
         let body = raw(&wire).unwrap();
         assert_eq!(body.function_binding_id, Some(0));
-        assert_eq!(body.argument_expr_ids, [7]);
+        assert_eq!(body.argument_roots, [1]);
         assert!(body.left_outer);
         assert_eq!(
             body.outputs,
@@ -554,7 +594,7 @@ fn zero_arguments_and_both_output_variants_are_preserved_without_defaults() {
     let control = Control::default();
     f.with_tokens(&control, |values, expressions, read, functions| {
         let (wire, _) = encode(&f.node, values, expressions, node_limits()).unwrap();
-        assert!(raw(&wire).unwrap().argument_expr_ids.is_empty());
+        assert!(raw(&wire).unwrap().argument_roots.is_empty());
         let (actual, _) = decode(&wire, read, functions, node_limits()).unwrap();
         assert_node(&actual, &f.node);
     });
@@ -577,7 +617,7 @@ fn missing_unknown_wrong_kind_and_foreign_equal_source_are_ordinary_refusals() {
                 1 => bad.output_properties = None,
                 2 => raw_mut(&mut bad).function_binding_id = None,
                 3 => raw_mut(&mut bad).function_binding_id = Some(7),
-                4 => raw_mut(&mut bad).argument_expr_ids[0] = 8,
+                4 => raw_mut(&mut bad).argument_roots[0] = 8,
                 5 => raw_mut(&mut bad).outputs[0].kind = None,
                 6 => {
                     raw_mut(&mut bad).outputs[1].kind =
@@ -638,7 +678,7 @@ fn independent_request_layout_golden_and_every_node_axis_exact_or_one_under() {
             * (Layout::array::<p::NodeId>(1).unwrap().size()
                 + Layout::array::<p::PhysicalProperties>(1).unwrap().size()
                 + Layout::array::<p::ValueId>(3).unwrap().size()
-                + Layout::array::<p::ExprId>(1).unwrap().size()
+                + Layout::array::<RootOrdinal>(1).unwrap().size()
                 + Layout::array::<p::TableFunctionOutput>(3).unwrap().size());
         assert_eq!(received.allocation_requests_upper_bound, 10);
         assert_eq!(
@@ -686,9 +726,9 @@ fn actual_source_floors_include_wire_capacity_and_foreign_receiving_headers_refu
     let control = Control::default();
     f.with_tokens(&control, |values, expressions, read, functions| {
         let (mut wire, _) = encode(&f.node, values, expressions, node_limits()).unwrap();
-        raw_mut(&mut wire).argument_expr_ids.reserve(1024);
+        raw_mut(&mut wire).argument_roots.reserve(1024);
         let known = wire_header_floor(&wire, wire.output.as_ref().unwrap()).unwrap()
-            + bytes::<u32>(raw(&wire).unwrap().argument_expr_ids.capacity()).unwrap()
+            + bytes::<u32>(raw(&wire).unwrap().argument_roots.capacity()).unwrap()
             + bytes::<wire::TableFunctionOutput>(raw(&wire).unwrap().outputs.capacity()).unwrap();
         assert!(matches!(
             prepare_table_function_node_decode(&wire, read, functions, known - 1, node_limits()),
@@ -748,7 +788,7 @@ fn every_actual_small_callback_preserves_three_causes_and_ordinary_footer() {
             true,
         );
         let mut bad = wire.clone();
-        raw_mut(&mut bad).argument_expr_ids[0] = 8;
+        raw_mut(&mut bad).argument_roots[0] = 8;
         control.arm(None);
         assert!(decode(&bad, read, functions, node_limits()).is_err());
         assert!(control.trace().last().unwrap().1 > 0);
@@ -865,7 +905,7 @@ fn table_caller_owned_full_lambda_dictionary_relation_seals_prefixes_and_replays
         let (wire,sf)=caller_table_encode(&f.node,values,expressions,node_limits(),&control,&mut |f|{sent.push(*f);Ok(())}).unwrap();
         let body=raw(&wire).unwrap();
         assert_eq!(body.function_binding_id,Some(0));
-        assert_eq!(body.argument_expr_ids,[7,7]);
+        assert_eq!(body.argument_roots,[1,1]);
         assert!(body.left_outer);
         assert_eq!(body.outputs.len(),3);
         let mut received=Vec::new();
@@ -992,7 +1032,7 @@ fn table_caller_owned_known_root_requests_win_at_pending255_and_wide_is_actual()
         .unwrap();
         let sent = control.trace();
         assert!(sent.iter().any(|(_, u)| *u == 256));
-        assert_eq!(raw(&wire).unwrap().argument_expr_ids, vec![7; 320]);
+        assert_eq!(raw(&wire).unwrap().argument_roots, vec![1; 320]);
         control.arm(None);
         let (owned, _) =
             caller_table_decode(&wire, read, functions, node_limits(), &control, &mut |_| {

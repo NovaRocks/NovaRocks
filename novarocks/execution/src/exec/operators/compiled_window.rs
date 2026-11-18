@@ -61,9 +61,8 @@ use novarocks_functions::{
     WindowRowRange,
 };
 use novarocks_local_program::{
-    AnalyticOutputColumn, LocalProgram, ProgramCallSite, ProgramExpressionRootSite,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, ProgramStateTemplate, WindowFrame,
-    WindowFunctionKind,
+    AnalyticOutputColumn, LocalProgram, ProgramCallSite, ProgramNodeId, ProgramNodeKind,
+    ProgramRootRef, ProgramStateTemplate, WindowFrame, WindowFunctionKind,
 };
 
 #[path = "compiled_window_invocation_input.rs"]
@@ -153,7 +152,7 @@ enum OutputSource {
 pub struct CompiledWindowProcessorFactory {
     name: String,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     partition_keys: usize,
     order_keys: usize,
     calls: Vec<CallPlan>,
@@ -190,29 +189,8 @@ impl CompiledWindowProcessorFactory {
                 format!("compiled local node {at} is not an Analytic"),
             ));
         };
-        let key = |count: usize, role: fn(u32) -> ProgramNodeExpressionRole| {
-            (0..count)
-                .map(|key| {
-                    u32::try_from(key)
-                        .map(|key| ProgramExpressionRootSite::Node {
-                            node,
-                            role: role(key),
-                        })
-                        .map_err(|_| {
-                            program_binding_failure(
-                                PlanBindingKind::InvalidAssignment,
-                                format!("compiled Analytic at local node {at} has too many keys"),
-                            )
-                        })
-                })
-                .collect::<ExecutionResult<Vec<_>>>()
-        };
-        let mut sites = key(partition_exprs.len(), |key| {
-            ProgramNodeExpressionRole::WindowPartition { key }
-        })?;
-        sites.extend(key(order_by_exprs.len(), |key| {
-            ProgramNodeExpressionRole::WindowOrder { key }
-        })?);
+        let mut sites = partition_exprs.to_vec();
+        sites.extend_from_slice(order_by_exprs);
         let mut calls = Vec::with_capacity(functions.len());
         for (ordinal, function) in functions.iter().enumerate() {
             let call = novarocks_local_program::checked_program_ordinal(ordinal)
@@ -265,20 +243,7 @@ impl CompiledWindowProcessorFactory {
                 ));
             }
             let first_root = sites.len();
-            for argument in 0..roots {
-                let argument = u32::try_from(argument).map_err(|_| {
-                    program_binding_failure(
-                        PlanBindingKind::InvalidAssignment,
-                        format!(
-                            "compiled Analytic call {call} at local node {at} has too many inputs"
-                        ),
-                    )
-                })?;
-                sites.push(ProgramExpressionRootSite::Node {
-                    node,
-                    role: ProgramNodeExpressionRole::WindowInput { call, argument },
-                });
-            }
+            sites.extend_from_slice(&function.args);
             calls.push(CallPlan {
                 kernel,
                 frame,
@@ -371,7 +336,8 @@ impl CompiledWindowProcessorFactory {
             output_node: self.output_node,
             output: None,
             construction: None,
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.output_node),
             instances: None,
             partition_key_types: None,
             order_key_types: None,
@@ -409,7 +375,7 @@ struct Piece {
 struct CompiledWindowProcessor {
     name: String,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     partition_keys: usize,
     order_keys: usize,
     calls: Vec<CallPlan>,

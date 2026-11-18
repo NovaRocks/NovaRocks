@@ -16,10 +16,10 @@
 // under the License.
 use super::fixtures::assert_original_same_owner;
 use arrow::datatypes::DataType;
+use novarocks_expression_contract::{ExprKind, UnaryOperator};
 use novarocks_functions::{KernelEvaluationControl, KernelFailure};
-use novarocks_physical_plan::{ExprKind, UnaryOperator};
-use novarocks_sql::compiler::author_fragment_package_semantics;
-use novarocks_sql_testkit::{sql_fixture_constant_policy as policy, sql_source};
+use novarocks_sql::compiler::check_pure_call_definitions_observed;
+use novarocks_sql_testkit::sql_source;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::time::Duration;
 struct Control;
@@ -57,7 +57,12 @@ fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnul
         assert!(!port.fields[0].ty.nullable());
         let mut actual_minus = 0;
         for fragment in source.plan().fragments().values() {
-            for (_, expr) in fragment.expressions().iter() {
+            for (unit, expr) in fragment
+                .nodes()
+                .values()
+                .filter_map(|node| node.expressions.as_deref())
+                .flat_map(|unit| unit.definitions().iter().map(move |expr| (unit, expr)))
+            {
                 if matches!(
                     expr.kind,
                     ExprKind::Unary {
@@ -71,7 +76,7 @@ fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnul
                     let ExprKind::Unary { expr: input, .. } = &expr.kind else {
                         unreachable!();
                     };
-                    let input = fragment.expressions().get(*input).unwrap();
+                    let input = unit.definition(*input).unwrap();
                     assert_eq!(input.ty.data_type(), &dtype);
                     assert!(!input.ty.nullable());
                 }
@@ -124,10 +129,21 @@ fn numeric_unary_owned_transaction_actual_aggregate_window_and_table_sources_pub
                 .unwrap()
                 .is_some()
         );
-        let semantics = author_fragment_package_semantics(&source, policy(), &Control).unwrap();
-        assert_eq!(semantics.len(), source.plan().fragments().len());
+        source
+            .require_statement_constant_policy(source.plan().statement_constant_policy())
+            .unwrap();
+        check_pure_call_definitions_observed(&source, &Control).unwrap();
         for fragment in source.plan().fragments().values() {
-            for (_, expr) in fragment.expressions().iter() {
+            fragment
+                .calls()
+                .validate_fragment(fragment, &Control)
+                .unwrap();
+            for expr in fragment
+                .nodes()
+                .values()
+                .filter_map(|node| node.expressions.as_deref())
+                .flat_map(|unit| unit.definitions())
+            {
                 if let ExprKind::Unary {
                     op: UnaryOperator::Minus,
                     ..

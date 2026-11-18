@@ -206,7 +206,7 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     use novarocks_physical_plan as p;
-    use novarocks_type_contract::{CompilePhase, ExpressionControlFlow};
+    use novarocks_type_contract::CompilePhase;
     let (candidate, reads) = paired.into_parts();
     let plan = candidate.plan();
     control.checkpoint(CompilePhase::Encode, 0)?;
@@ -250,7 +250,10 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
             .result_port()
             .is_none_or(|port| port.fragment != destination.id())
         || plan.fragments().values().any(|fragment| {
-            !fragment.expressions().is_empty()
+            fragment
+                .nodes()
+                .values()
+                .any(|node| node.expressions.is_some())
                 || !fragment.summaries().is_empty()
                 || !fragment.runtime_filters().is_empty()
         })
@@ -263,40 +266,9 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
     if !encodings.is_empty() || !capabilities.is_empty() {
         return Err("empty two-core fixture retained unexpected Provider access".into());
     }
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let flow = ExpressionControlFlow::try_new(
-            Vec::new(),
-            Vec::new(),
-            fragment.expressions(),
-            CompilePhase::Validate,
-            control,
-        )
-        .map_err(|error| match error {
-            novarocks_type_contract::ExpressionControlFlowError::Control(cause) => {
-                novarocks_plan_codec::PhysicalEncodeError::Control(cause)
-            }
-            other => format!("empty fixture expression flow: {other:?}").into(),
-        })?;
-        let roots =
-            p::PhysicalRootUses::try_new(fragment, flow, Vec::new(), control).map_err(|error| {
-                match error {
-                    p::RootUseBindingError::Control(cause) => {
-                        novarocks_plan_codec::PhysicalEncodeError::Control(cause)
-                    }
-                    other => format!("empty fixture root uses: {other:?}").into(),
-                }
-            })?;
-        let frozen_calls = p::FrozenFragmentCalls::try_new(fragment, &roots, Vec::new(), control)
-            .map_err(|error| match error {
-            p::FrozenCallError::Control(cause) => {
-                novarocks_plan_codec::PhysicalEncodeError::Control(cause)
-            }
-            other => format!("empty fixture calls: {other:?}").into(),
-        })?;
+    for &id in plan.fragments().keys() {
         let frozen_pruning = p::FrozenFragmentPruning::try_new(id, Vec::new(), control).map_err(
             |error| match error {
                 p::FrozenPruningError::Control(cause) => {
@@ -305,8 +277,6 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
                 other => format!("empty fixture pruning: {other:?}").into(),
             },
         )?;
-        uses.insert(id, roots);
-        calls.insert(id, frozen_calls);
         pruning.insert(id, frozen_pruning);
         admissions.insert(id, *carrier.admission());
     }
@@ -314,8 +284,6 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
         plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         control,
@@ -1383,7 +1351,8 @@ mod tests {
     /// including required COUNT state roots. Local slot IDs and labels differ.
     #[test]
     fn count_shuffle_frozen_peers_share_exact_partial_state_declarations() {
-        use novarocks_physical_plan::{AggregatePhase, Distribution, ExprKind, NodeKind};
+        use novarocks_expression_contract::ExprKind;
+        use novarocks_physical_plan::{AggregatePhase, Distribution, NodeKind};
         use novarocks_plan_codec::physical_package_v2::decode_fragment_package;
         use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
@@ -1478,7 +1447,7 @@ mod tests {
                                         && matches!(call.binding.phase, AggregatePhase::Final { .. })
                                         && call.binding.phase.sequence() == partial.binding.phase.sequence()
                                         && call.arguments.len() == 1
-                                        && matches!(receiver.fragment().expressions().get(call.arguments[0]).map(|expr| &expr.kind), Some(ExprKind::Value(value)) if *value == imported.destination)
+                                        && matches!(receiver.fragment().root_expression(node.id, call.arguments[0]).map(|expr| &expr.kind), Some(ExprKind::Value(value)) if *value == imported.destination)
                                 })
                             });
                             assert!(
@@ -1539,12 +1508,14 @@ mod tests {
             });
             canonical |= package
                 .fragment()
-                .expressions()
-                .iter()
-                .any(|(_, expression)| {
+                .nodes()
+                .values()
+                .filter_map(|node| node.expressions.as_deref())
+                .flat_map(|unit| unit.definitions())
+                .any(|expression| {
                     matches!(
                         &expression.kind,
-                        novarocks_physical_plan::ExprKind::FunctionCall { function, .. }
+                        novarocks_expression_contract::ExprKind::FunctionCall { function, .. }
                             if function.function_id.as_str()
                                 == "builtin.scalar/__json_canonical_key/v1"
                     )
@@ -3122,7 +3093,10 @@ mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .expect("scan fragment");
-        let mut builder = PlanBuilder::new(PlanVersionId::try_new([11; 16]).expect("version"));
+        let mut builder = PlanBuilder::new(
+            PlanVersionId::try_new([11; 16]).expect("version"),
+            crate::application::test_constant_policy(),
+        );
         builder.add_fragment(fragment).expect("one fragment");
         builder.finish().expect("validated scan plan")
     }

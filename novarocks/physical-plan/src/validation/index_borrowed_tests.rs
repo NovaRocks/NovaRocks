@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::*;
 use arrow_schema::DataType;
 use novarocks_connector_contract::{
@@ -75,7 +77,7 @@ fn empty() -> Fragment {
         .add_values(NodeId::new(0), Box::from([Box::default()]), Box::default())
         .unwrap();
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             NodeId::new(0),
             FragmentSink::Noop,
             dop(),
@@ -85,6 +87,7 @@ fn empty() -> Fragment {
 }
 fn node(id: u32, inputs: &[u32], outputs: &[u32]) -> PhysicalNode {
     PhysicalNode {
+        expressions: None,
         id: NodeId::new(id),
         inputs: inputs.iter().copied().map(NodeId::new).collect(),
         required_inputs: vec![singleton(); inputs.len()].into_boxed_slice(),
@@ -401,8 +404,14 @@ fn genuine_wide_project_fanout_keeps_one_source_port_with_full_original_occurren
     for value in values.iter().take(256) {
         let project = builder.reserve_node_id().unwrap();
         let expression = builder
-            .add_expression(project, ty.clone(), ExprKind::Value(*value))
+            .define(project, ty.clone(), ExprKind::Value(*value))
             .unwrap();
+        let expression = builder.root_definition(
+            project,
+            expression,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
         let mut item = node(project.get(), &[source.get()], &[value.get()]);
         item.kind = NodeKind::Project {
             expressions: Box::from([(expression, *value)]),
@@ -432,7 +441,7 @@ fn genuine_wide_project_fanout_keeps_one_source_port_with_full_original_occurren
     };
     builder.insert_node_unchecked(item).unwrap();
     let fragment = builder
-        .finish_definition(
+        .finish_fixture_definition(
             union,
             FragmentSink::Noop,
             dop(),

@@ -23,13 +23,12 @@
 use crate::lowering::FragmentCompileError;
 use novarocks_connector_contract::{ConnectorReadProgramRecipe, ConnectorReadRelationKind};
 use novarocks_local_program::{
-    BindingRequirement, CompiledScanInput, ProgramExprId, ProgramNodeId, ProgramNodeKind,
-    ProgramScanSource, ScanSourceKind, StaticLayout,
+    BindingRequirement, CompiledScanInput, ProgramNodeId, ProgramNodeKind, ProgramScanSource,
+    ScanSourceKind, StaticLayout,
 };
-use novarocks_physical_plan::{ExprId, NodeKind, PhysicalNode, PredicateGuaranteeKind, Relation};
+use novarocks_physical_plan::{NodeKind, PhysicalNode, PredicateGuaranteeKind, Relation};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use novarocks_types::SlotId;
-use std::collections::BTreeMap;
 
 pub(crate) struct LoweredScan {
     pub kind: ProgramNodeKind,
@@ -138,7 +137,7 @@ pub(crate) fn lower_scan_with_creation<H>(
     recipe: ConnectorReadProgramRecipe,
     runtime_filters: novarocks_local_program::ScanFilterConsumers,
     slots: &[SlotId],
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<LoweredScan, crate::FragmentCreationError<H>> {
@@ -162,7 +161,7 @@ fn lower_core_with_creation<H>(
     recipe: ConnectorReadProgramRecipe,
     runtime_filters: novarocks_local_program::ScanFilterConsumers,
     slots: &[SlotId],
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<LoweredScan, crate::FragmentCreationError<H>> {

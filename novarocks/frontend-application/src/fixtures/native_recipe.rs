@@ -398,9 +398,6 @@ impl RecipeRoot {
     ) -> Result<Self, crate::query_execution::package_freeze::PackageFreezeError> {
         use crate::query_execution::package_freeze::PackageFreezeError;
         use novarocks_physical_plan as p;
-        use novarocks_type_contract::{
-            CompilePhase, EvaluationDomainId, ExpressionControlFlow, ExpressionEvaluationDomain,
-        };
         fn refused(error: &(dyn std::error::Error + 'static)) -> PackageFreezeError {
             // Preserve the same typed cancellation/deadline/control cause
             // through the validators' original error/source chain.
@@ -439,7 +436,10 @@ impl RecipeRoot {
             );
         if !one_empty_values
             || !fragment.values().is_empty()
-            || !fragment.expressions().is_empty()
+            || fragment
+                .nodes()
+                .values()
+                .any(|node| node.expressions.is_some())
             || !result.fields.is_empty()
             || !result.output.columns.is_empty()
         {
@@ -468,29 +468,6 @@ impl RecipeRoot {
             ));
         }
         let id = fragment.id();
-        let roots = p::PhysicalExpressionRoots::try_new(fragment, control)
-            .map_err(|error| refused(&error))?;
-        if !roots.sites().is_empty() {
-            return Err(PackageFreezeError::Facts(
-                "pure component cannot author a SQL expression or call scope".into(),
-            ));
-        }
-        let flow = ExpressionControlFlow::try_new(
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
-                parent: None,
-                guard: None,
-            }],
-            Vec::new(),
-            fragment.expressions(),
-            CompilePhase::Validate,
-            control,
-        )
-        .map_err(|error| refused(&error))?;
-        let uses = p::PhysicalRootUses::try_new(fragment, flow, Vec::new(), control)
-            .map_err(|error| refused(&error))?;
-        let calls = p::FrozenFragmentCalls::try_new(fragment, &uses, Vec::new(), control)
-            .map_err(|error| refused(&error))?;
         let pruning = p::FrozenFragmentPruning::try_new(id, Vec::new(), control)
             .map_err(|error| refused(&error))?;
         // Full-plan extraction proves exact fragment coverage and preserves
@@ -499,8 +476,6 @@ impl RecipeRoot {
             plan,
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &[(id, uses)].into(),
-            &[(id, calls)].into(),
             &[(id, pruning)].into(),
             &[(id, *carrier.admission())].into(),
             control,
@@ -1352,7 +1327,7 @@ pub(crate) fn count_description() -> (
         )
         .unwrap();
     let version = PlanVersionId::try_new([9; 16]).unwrap();
-    let mut plan = PlanBuilder::new(version);
+    let mut plan = PlanBuilder::new(version, crate::application::test_constant_policy());
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,

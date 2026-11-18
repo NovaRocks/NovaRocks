@@ -27,44 +27,48 @@ fn shape(message: &'static str) -> ExpressionCodecError {
 }
 
 /// Constant-size closed projections. The caller owns observation and scope.
-pub(super) fn decode_unary(op: i32) -> Result<p::UnaryOperator, ExpressionCodecError> {
+pub(super) fn decode_unary(
+    op: i32,
+) -> Result<novarocks_expression_contract::UnaryOperator, ExpressionCodecError> {
     use wire::UnaryOperator as W;
     Ok(match W::try_from(op) {
-        Ok(W::Plus) => p::UnaryOperator::Plus,
-        Ok(W::Minus) => p::UnaryOperator::Minus,
-        Ok(W::Not) => p::UnaryOperator::Not,
-        Ok(W::BitwiseNot) => p::UnaryOperator::BitwiseNot,
+        Ok(W::Plus) => novarocks_expression_contract::UnaryOperator::Plus,
+        Ok(W::Minus) => novarocks_expression_contract::UnaryOperator::Minus,
+        Ok(W::Not) => novarocks_expression_contract::UnaryOperator::Not,
+        Ok(W::BitwiseNot) => novarocks_expression_contract::UnaryOperator::BitwiseNot,
         Ok(W::Unspecified) | Err(_) => {
             return Err(shape("unary operator is unknown or unspecified"));
         }
     })
 }
 
-pub(super) fn decode_binary(op: i32) -> Result<p::BinaryOperator, ExpressionCodecError> {
+pub(super) fn decode_binary(
+    op: i32,
+) -> Result<novarocks_expression_contract::BinaryOperator, ExpressionCodecError> {
     use wire::BinaryOperator as W;
     Ok(
         match W::try_from(op).map_err(|_| shape("binary operator is unknown"))? {
             W::Unspecified => return Err(shape("binary operator is unspecified")),
-            W::Add => p::BinaryOperator::Add,
-            W::Subtract => p::BinaryOperator::Subtract,
-            W::Multiply => p::BinaryOperator::Multiply,
-            W::Divide => p::BinaryOperator::Divide,
-            W::Modulo => p::BinaryOperator::Modulo,
-            W::Eq => p::BinaryOperator::Eq,
-            W::EqForNull => p::BinaryOperator::EqForNull,
-            W::NotEq => p::BinaryOperator::NotEq,
-            W::Lt => p::BinaryOperator::Lt,
-            W::LtEq => p::BinaryOperator::LtEq,
-            W::Gt => p::BinaryOperator::Gt,
-            W::GtEq => p::BinaryOperator::GtEq,
-            W::BitAnd => p::BinaryOperator::BitAnd,
-            W::BitOr => p::BinaryOperator::BitOr,
-            W::BitXor => p::BinaryOperator::BitXor,
+            W::Add => novarocks_expression_contract::BinaryOperator::Add,
+            W::Subtract => novarocks_expression_contract::BinaryOperator::Subtract,
+            W::Multiply => novarocks_expression_contract::BinaryOperator::Multiply,
+            W::Divide => novarocks_expression_contract::BinaryOperator::Divide,
+            W::Modulo => novarocks_expression_contract::BinaryOperator::Modulo,
+            W::Eq => novarocks_expression_contract::BinaryOperator::Eq,
+            W::EqForNull => novarocks_expression_contract::BinaryOperator::EqForNull,
+            W::NotEq => novarocks_expression_contract::BinaryOperator::NotEq,
+            W::Lt => novarocks_expression_contract::BinaryOperator::Lt,
+            W::LtEq => novarocks_expression_contract::BinaryOperator::LtEq,
+            W::Gt => novarocks_expression_contract::BinaryOperator::Gt,
+            W::GtEq => novarocks_expression_contract::BinaryOperator::GtEq,
+            W::BitAnd => novarocks_expression_contract::BinaryOperator::BitAnd,
+            W::BitOr => novarocks_expression_contract::BinaryOperator::BitOr,
+            W::BitXor => novarocks_expression_contract::BinaryOperator::BitXor,
         },
     )
 }
 
-pub(super) fn decode_window_units(units: i32) -> Result<p::WindowFrameUnits, ExpressionCodecError> {
+pub(crate) fn decode_window_units(units: i32) -> Result<p::WindowFrameUnits, ExpressionCodecError> {
     use wire::WindowFrameUnits as W;
     Ok(match W::try_from(units) {
         Ok(W::Rows) => p::WindowFrameUnits::Rows,
@@ -78,7 +82,7 @@ pub(super) fn decode_window_units(units: i32) -> Result<p::WindowFrameUnits, Exp
     })
 }
 
-pub(super) fn decode_window_exclusion(
+pub(crate) fn decode_window_exclusion(
     exclusion: i32,
 ) -> Result<p::WindowFrameExclusion, ExpressionCodecError> {
     use wire::WindowFrameExclusion as W;
@@ -95,7 +99,19 @@ pub(super) fn decode_window_exclusion(
     })
 }
 
-pub(super) fn decode_window_bound(
+fn decode_constant(
+    value: &wire::ConstantReference,
+) -> Result<p::ConstantReference, ExpressionCodecError> {
+    Ok(p::ConstantReference {
+        pool: p::ConstantPoolId::new(
+            value
+                .pool_id
+                .ok_or_else(|| shape("window constant pool is absent"))?,
+        ),
+        ordinal: value.row_ordinal,
+    })
+}
+pub(crate) fn decode_window_bound(
     bound: &wire::WindowBound,
 ) -> Result<p::WindowBound, ExpressionCodecError> {
     use wire::window_bound::Kind as K;
@@ -106,15 +122,15 @@ pub(super) fn decode_window_bound(
             .ok_or_else(|| shape("window bound kind is absent"))?
         {
             K::UnboundedPreceding(_) => p::WindowBound::UnboundedPreceding,
-            K::PrecedingExprId(id) => p::WindowBound::Preceding(p::ExprId::new(*id)),
+            K::Preceding(value) => p::WindowBound::Preceding(decode_constant(value)?),
             K::CurrentRow(_) => p::WindowBound::CurrentRow,
-            K::FollowingExprId(id) => p::WindowBound::Following(p::ExprId::new(*id)),
+            K::Following(value) => p::WindowBound::Following(decode_constant(value)?),
             K::UnboundedFollowing(_) => p::WindowBound::UnboundedFollowing,
         },
     )
 }
 
-pub(super) fn decode_window_frame(
+pub(crate) fn decode_window_frame(
     frame: &wire::WindowFrame,
 ) -> Result<p::WindowFrame, ExpressionCodecError> {
     // The original receiving reference pass checks ordered start/end presence
@@ -156,7 +172,7 @@ mod tests {
 
     #[test]
     fn receiving_operators_cover_every_closed_variant_and_original_error_categories() {
-        use p::{BinaryOperator as B, UnaryOperator as P};
+        use novarocks_expression_contract::{BinaryOperator as B, UnaryOperator as P};
         use wire::{BinaryOperator as V, UnaryOperator as W};
         for (wire, expected) in [
             (W::Plus, P::Plus),
@@ -233,21 +249,45 @@ mod tests {
                 p::WindowBound::UnboundedPreceding,
             ),
             (
-                K::PrecedingExprId(0),
-                p::WindowBound::Preceding(p::ExprId::new(0)),
+                K::Preceding(wire::ConstantReference {
+                    pool_id: Some(0),
+                    row_ordinal: 0,
+                }),
+                p::WindowBound::Preceding(p::ConstantReference {
+                    pool: p::ConstantPoolId::new(0),
+                    ordinal: 0,
+                }),
             ),
             (
-                K::PrecedingExprId(u32::MAX),
-                p::WindowBound::Preceding(p::ExprId::new(u32::MAX)),
+                K::Preceding(wire::ConstantReference {
+                    pool_id: Some(u32::MAX),
+                    row_ordinal: u32::MAX,
+                }),
+                p::WindowBound::Preceding(p::ConstantReference {
+                    pool: p::ConstantPoolId::new(u32::MAX),
+                    ordinal: u32::MAX,
+                }),
             ),
             (K::CurrentRow(Empty {}), p::WindowBound::CurrentRow),
             (
-                K::FollowingExprId(0),
-                p::WindowBound::Following(p::ExprId::new(0)),
+                K::Following(wire::ConstantReference {
+                    pool_id: Some(0),
+                    row_ordinal: 0,
+                }),
+                p::WindowBound::Following(p::ConstantReference {
+                    pool: p::ConstantPoolId::new(0),
+                    ordinal: 0,
+                }),
             ),
             (
-                K::FollowingExprId(u32::MAX),
-                p::WindowBound::Following(p::ExprId::new(u32::MAX)),
+                K::Following(wire::ConstantReference {
+                    pool_id: Some(u32::MAX),
+                    row_ordinal: u32::MAX,
+                }),
+                p::WindowBound::Following(p::ConstantReference {
+                    pool: p::ConstantPoolId::new(u32::MAX),
+                    ordinal: u32::MAX,
+                }),
             ),
             (
                 K::UnboundedFollowing(Empty {}),
@@ -259,16 +299,28 @@ mod tests {
         let raw = wire::WindowFrame {
             units: wire::WindowFrameUnits::Groups as i32,
             exclusion: wire::WindowFrameExclusion::Ties as i32,
-            start: Some(bound(K::FollowingExprId(u32::MAX))),
-            end: Some(bound(K::PrecedingExprId(0))),
+            start: Some(bound(K::Following(wire::ConstantReference {
+                pool_id: Some(u32::MAX),
+                row_ordinal: u32::MAX,
+            }))),
+            end: Some(bound(K::Preceding(wire::ConstantReference {
+                pool_id: Some(0),
+                row_ordinal: 0,
+            }))),
         };
         assert_eq!(
             decode_window_frame(&raw).unwrap(),
             p::WindowFrame {
                 units: p::WindowFrameUnits::Groups,
                 exclusion: p::WindowFrameExclusion::Ties,
-                start: p::WindowBound::Following(p::ExprId::new(u32::MAX)),
-                end: p::WindowBound::Preceding(p::ExprId::new(0))
+                start: p::WindowBound::Following(p::ConstantReference {
+                    pool: p::ConstantPoolId::new(u32::MAX),
+                    ordinal: u32::MAX
+                }),
+                end: p::WindowBound::Preceding(p::ConstantReference {
+                    pool: p::ConstantPoolId::new(0),
+                    ordinal: 0
+                })
             }
         );
         // This projection deliberately preserves bounds the semantic owner may
@@ -291,6 +343,13 @@ mod tests {
         error(
             decode_window_bound(&wire::WindowBound { kind: None }),
             "window bound kind is absent",
+        );
+        error(
+            decode_window_bound(&bound(K::Preceding(wire::ConstantReference {
+                pool_id: None,
+                row_ordinal: 0,
+            }))),
+            "window constant pool is absent",
         );
         let mut frame = wire::WindowFrame {
             units: 0,

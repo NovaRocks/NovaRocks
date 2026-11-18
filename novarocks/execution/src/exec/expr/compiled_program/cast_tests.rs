@@ -17,138 +17,79 @@
 
 // Complete Physical packages using the production owners from the parent fixture.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::Float32Array;
 use novarocks_functions::CastOperation;
 use novarocks_local_compiler::FragmentCompileError;
+use novarocks_type_contract::{ExpressionEffectContext, ExpressionUseId};
 
 fn package(
     functions: &PureEngineFunctionCatalog,
-    fragment: Fragment,
+    mut builder: FragmentBuilder,
+    root_node: NodeId,
     authors: &BTreeMap<ExprId, Author>,
     result: ResultPort,
     allow: bool,
+    source_pools: novarocks_physical_plan::ConstantPools,
 ) -> Arc<FragmentPackage> {
-    let (fragment, constants) = original_request_sources(fragment, authors);
-    let fragment_id = fragment.id();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let mut author = FlowAuthor::new();
-    let mut bindings = Vec::new();
-    for (&site, root) in roots.sites() {
-        bindings.push((
-            site,
-            author.visit(
-                &fragment,
-                authors,
-                root.expr,
-                EvaluationDomainId::new(u32::MAX),
-                root.demand,
-            ),
-        ));
-    }
-    let ordered = author.uses;
-    let flow = ExpressionControlFlow::try_new(
-        author.domains,
-        ordered.clone(),
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow.clone(), bindings, &Control).unwrap();
+    let fragment_id = builder.id();
     let parameters = SemanticParameters::try_new([(
         allow_ref().id,
         SemanticParameterValue::AllowThrowException(allow),
     )])
     .unwrap();
-    let mut summaries = BTreeMap::new();
-    let mut frozen = Vec::new();
-    for invocation in ordered {
-        let context = invocation.context;
-        let definition = fragment.expressions().get(invocation.definition).unwrap();
-        let mut children = ScopedExpressionEffects::pure_value(context);
-        for (ordinal, child) in invocation.arguments.iter().enumerate() {
-            children = children
-                .join_control_argument(summaries[child], &flow, ordinal)
-                .unwrap();
-        }
-        let summary = if let Some(owner) = authors.get(&invocation.definition) {
-            let argument_uses = invocation
-                .arguments
-                .iter()
-                .map(|id| Some(*id))
-                .collect::<Vec<_>>();
-            let token = functions
-                .prepare_fresh(
-                    CallEffectInput {
-                        context,
-                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
-                            &argument_uses,
-                        ),
-                        function_id: &owner.function.function_id,
-                        kind: FunctionKind::Scalar,
-                        selected: owner.selected.as_ref(),
-                        request: owner.request(),
-                        environment: &[],
-                        parameters: &parameters,
-                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(context.domain),
-                    },
-                    owner.selected.clone(),
-                    if matches!(owner.shape, ControlShape::If | ControlShape::Coalesce) {
-                        PureCallPreparation::ControlIntrinsic {
-                            arguments: children,
-                        }
-                    } else {
-                        PureCallPreparation::Scalar {
-                            arguments: children,
-                        }
-                    },
+    let constants = finish_fixture_units(
+        functions,
+        &mut builder,
+        root_node,
+        authors,
+        &parameters,
+        source_pools,
+        |unit, invocation, children| {
+            let definition = unit.definition(invocation.definition).unwrap();
+            if let ExprKind::Binary {
+                op,
+                left,
+                right,
+                decimal_overflow_policy,
+                allow_throw_exception: Some(reference),
+            } = &definition.kind
+            {
+                let value = parameters.require(*reference).unwrap();
+                let SemanticParameterValue::AllowThrowException(allow) = value else {
+                    panic!("exact intrinsic parameter key")
+                };
+                let recipe = PreparedArithmeticRecipe::try_new(
+                    operation(*op),
+                    &unit.definition(*left).unwrap().ty,
+                    &unit.definition(*right).unwrap().ty,
+                    &definition.ty,
+                    *decimal_overflow_policy,
+                    *allow,
                     &Control,
                 )
                 .unwrap();
-            frozen.push(FrozenPhysicalCall {
-                materialized_writer_input: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                site: PhysicalCallSite::Expression(context.use_id),
-                context,
-                effects: token.call_contract().effects().clone(),
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            });
-            token.effects()
-        } else if let ExprKind::Binary {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-            allow_throw_exception: Some(reference),
-        } = &definition.kind
-        {
-            let value = parameters.require(*reference).unwrap();
-            let SemanticParameterValue::AllowThrowException(allow) = value else {
-                panic!("exact intrinsic parameter key")
-            };
-            let recipe = PreparedArithmeticRecipe::try_new(
-                operation(*op),
-                &fragment.expressions().get(*left).unwrap().ty,
-                &fragment.expressions().get(*right).unwrap().ty,
-                &definition.ty,
-                *decimal_overflow_policy,
-                *allow,
-                &Control,
-            )
-            .unwrap();
-            recipe
-                .own_effects(context)
-                .join_same_domain(children)
-                .unwrap()
-        } else {
-            children
-        };
-        summaries.insert(context.use_id, summary);
-    }
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, frozen, &Control).unwrap();
+                recipe
+                    .own_effects(invocation.context)
+                    .join_same_region(children)
+                    .unwrap()
+            } else {
+                children
+            }
+        },
+    );
+    let fragment = builder
+        .finish_definition(
+            root_node,
+            FragmentSink::Result,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
     Arc::new(
         FragmentPackage::try_new(
             FragmentPackageInput {
@@ -156,8 +97,7 @@ fn package(
                 required: RequiredContracts::default(),
                 constants,
                 fragment,
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: options().constants,
                 pruning: FrozenFragmentPruning::try_new(fragment_id, Vec::new(), &Control).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
@@ -174,6 +114,11 @@ fn package(
     )
 }
 
+fn cast_root_use(program: &LocalProgram) -> ExpressionUseId {
+    let reference = root(program);
+    root_unit(program).root(reference.root).unwrap().use_id
+}
+
 #[derive(Clone, Copy)]
 enum Source {
     Column,
@@ -186,18 +131,36 @@ fn result_literal(
     builder: &mut FragmentBuilder,
     result: &FunctionValueType,
     policy: DecimalOverflowPolicy,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> ExprId {
     if matches!(result.data_type(), DataType::Timestamp(_, None)) {
-        return literal(builder, result, LiteralValue::Timestamp(71));
+        return literal(
+            builder,
+            result,
+            checked_constants::timestamp(result, 71, options().constants),
+            source_pools,
+        );
     }
     if *result.data_type() == DataType::Int64 {
-        return literal(builder, result, LiteralValue::Int64(71));
+        return literal(
+            builder,
+            result,
+            checked_constants::i64(result, 71, options().constants),
+            source_pools,
+        );
     }
     let source = FunctionValueType::new(DataType::Int64, false);
-    let value = literal(builder, &source, LiteralValue::Int64(71));
+    let value = literal(
+        builder,
+        &source,
+        checked_constants::i64(&source, 71, options().constants),
+        source_pools,
+    );
     builder
-        .add_expression(
-            NodeId::new(0),
+        .unit(NodeId::new(0))
+        .unwrap()
+        .add(
+            None,
             result.clone(),
             ExprKind::Cast {
                 expr: value,
@@ -217,6 +180,7 @@ fn fixture(
     policy: DecimalOverflowPolicy,
     allow: bool,
 ) -> (PureEngineFunctionCatalog, Arc<FragmentPackage>) {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let fid = FragmentId::new(213);
     let start = NodeId::new(u32::MAX);
@@ -237,15 +201,26 @@ fn fixture(
     for (id, ty) in &columns {
         let definition = if !ty.nullable() && *ty.data_type() == DataType::Float32 {
             let exact = builder
-                .add_expression(
-                    input_node,
-                    FunctionValueType::new(DataType::Float64, false),
-                    ExprKind::Literal(LiteralValue::Float64Bits(0.0_f64.to_bits())),
+                .unit(input_node)
+                .unwrap()
+                .add(
+                    None,
+                    (FunctionValueType::new(DataType::Float64, false)).clone(),
+                    checked_constants::kind(
+                        &mut source_pools,
+                        checked_constants::f64_bits(
+                            &(FunctionValueType::new(DataType::Float64, false)),
+                            0.0_f64.to_bits(),
+                            options().constants,
+                        ),
+                    ),
                 )
                 .unwrap();
             builder
-                .add_expression(
-                    input_node,
+                .unit(input_node)
+                .unwrap()
+                .add(
+                    None,
                     ty.clone(),
                     ExprKind::Cast {
                         expr: exact,
@@ -257,44 +232,65 @@ fn fixture(
                 .unwrap()
         } else {
             let value = if ty.nullable() {
-                LiteralValue::Null
+                checked_constants::null(ty, options().constants)
             } else {
                 match ty.data_type() {
-                    DataType::Binary => {
-                        LiteralValue::Binary(b"native producer".to_vec().into_boxed_slice())
+                    DataType::Binary => checked_constants::binary(
+                        ty,
+                        &(b"native producer".to_vec().into_boxed_slice()),
+                        options().constants,
+                    ),
+                    DataType::Decimal128(..) => {
+                        checked_constants::decimal128(ty, 0, options().constants)
                     }
-                    DataType::Decimal128(..) => LiteralValue::Decimal128(0),
-                    DataType::Decimal256(..) => {
-                        LiteralValue::Decimal256(arrow_buffer::i256::ZERO.to_be_bytes())
-                    }
-                    DataType::Boolean => LiteralValue::Boolean(false),
-                    DataType::Date32 => LiteralValue::Date32(0),
+                    DataType::Decimal256(..) => checked_constants::decimal256(
+                        ty,
+                        arrow_buffer::i256::ZERO.to_be_bytes(),
+                        options().constants,
+                    ),
+                    DataType::Boolean => checked_constants::boolean(ty, false, options().constants),
+                    DataType::Date32 => checked_constants::date32(ty, 0, options().constants),
                     DataType::FixedSizeBinary(16)
                         if ty.logical_type()
                             == novarocks_type_contract::ValueLogicalType::LargeInt =>
                     {
-                        LiteralValue::LargeInt(0)
+                        checked_constants::largeint(ty, 0, options().constants)
                     }
-                    DataType::Int64 => LiteralValue::Int64(0),
-                    DataType::UInt64 => LiteralValue::UInt64(0),
-                    DataType::Timestamp(_, None) => LiteralValue::Timestamp(0),
-                    DataType::Float64 => LiteralValue::Float64Bits(0.0_f64.to_bits()),
+                    DataType::Int64 => checked_constants::i64(ty, 0, options().constants),
+                    DataType::UInt64 => checked_constants::u64(ty, 0, options().constants),
+                    DataType::Timestamp(_, None) => {
+                        checked_constants::timestamp(ty, 0, options().constants)
+                    }
+                    DataType::Float64 => {
+                        checked_constants::f64_bits(ty, 0.0_f64.to_bits(), options().constants)
+                    }
                     _ => {
                         panic!("nonnullable fixture requires an implemented exact numeric literal")
                     }
                 }
             };
             builder
-                .add_expression(input_node, ty.clone(), ExprKind::Literal(value))
+                .unit(input_node)
+                .unwrap()
+                .add(
+                    None,
+                    ty.clone(),
+                    checked_constants::kind(&mut source_pools, value),
+                )
                 .unwrap()
         };
+        let definition = builder
+            .unit(input_node)
+            .unwrap()
+            .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *id,
                 ty: ty.clone(),
                 origin: ValueOrigin::Expr {
                     node: input_node,
-                    expr: definition,
+                    root: definition,
                 },
             })
             .unwrap();
@@ -314,11 +310,18 @@ fn fixture(
             let exact = literal(
                 &mut builder,
                 &FunctionValueType::new(DataType::Float64, false),
-                LiteralValue::Float64Bits((-0.0_f64).to_bits()),
+                checked_constants::f64_bits(
+                    &FunctionValueType::new(DataType::Float64, false),
+                    (-0.0_f64).to_bits(),
+                    options().constants,
+                ),
+                &mut source_pools,
             );
             builder
-                .add_expression(
-                    output_node,
+                .unit(output_node)
+                .unwrap()
+                .add(
+                    None,
                     source_type.clone(),
                     ExprKind::Cast {
                         expr: exact,
@@ -330,40 +333,61 @@ fn fixture(
                 .unwrap()
         } else {
             let value = match source_type.data_type() {
-                DataType::Binary => {
-                    LiteralValue::Binary(b"native\0producer".to_vec().into_boxed_slice())
+                DataType::Binary => checked_constants::binary(
+                    &source_type,
+                    &(b"native\0producer".to_vec().into_boxed_slice()),
+                    options().constants,
+                ),
+                DataType::Decimal128(..) => {
+                    checked_constants::decimal128(&source_type, 1, options().constants)
                 }
-                DataType::Decimal128(..) => LiteralValue::Decimal128(1),
-                DataType::Decimal256(..) => {
-                    LiteralValue::Decimal256(arrow_buffer::i256::from_i128(1).to_be_bytes())
+                DataType::Decimal256(..) => checked_constants::decimal256(
+                    &source_type,
+                    arrow_buffer::i256::from_i128(1).to_be_bytes(),
+                    options().constants,
+                ),
+                DataType::Boolean => {
+                    checked_constants::boolean(&source_type, true, options().constants)
                 }
-                DataType::Boolean => LiteralValue::Boolean(true),
-                DataType::Date32 => LiteralValue::Date32(71),
+                DataType::Date32 => {
+                    checked_constants::date32(&source_type, 71, options().constants)
+                }
                 DataType::FixedSizeBinary(16)
                     if source_type.logical_type()
                         == novarocks_type_contract::ValueLogicalType::LargeInt =>
                 {
-                    LiteralValue::LargeInt(i128::MIN)
+                    checked_constants::largeint(&source_type, i128::MIN, options().constants)
                 }
-                DataType::Int64 => LiteralValue::Int64(71),
-                DataType::UInt64 => LiteralValue::UInt64(u64::MAX),
-                DataType::Timestamp(_, None) => LiteralValue::Timestamp(71),
-                DataType::Float64 => LiteralValue::Float64Bits((-0.0_f64).to_bits()),
+                DataType::Int64 => checked_constants::i64(&source_type, 71, options().constants),
+                DataType::UInt64 => {
+                    checked_constants::u64(&source_type, u64::MAX, options().constants)
+                }
+                DataType::Timestamp(_, None) => {
+                    checked_constants::timestamp(&source_type, 71, options().constants)
+                }
+                DataType::Float64 => checked_constants::f64_bits(
+                    &source_type,
+                    (-0.0_f64).to_bits(),
+                    options().constants,
+                ),
                 _ => panic!("constant fixture requires an implemented exact numeric literal"),
             };
-            literal(&mut builder, &source_type, value)
+            literal(&mut builder, &source_type, value, &mut source_pools)
         }
     } else {
         builder
-            .add_expression(
-                output_node,
-                source_type.clone(),
-                ExprKind::Value(columns[0].0),
-            )
+            .unit(output_node)
+            .unwrap()
+            .add(None, source_type.clone(), ExprKind::Value(columns[0].0))
             .unwrap()
     };
     if matches!(source, Source::Add) {
-        let rhs = literal(&mut builder, &source_type, LiteralValue::Int64(1));
+        let rhs = literal(
+            &mut builder,
+            &source_type,
+            checked_constants::i64(&source_type, 1, options().constants),
+            &mut source_pools,
+        );
         child = arithmetic(&mut builder, BinaryOperator::Add, child, rhs, &source_type);
     }
     if matches!(source, Source::Round) {
@@ -381,8 +405,10 @@ fn fixture(
         assert_eq!(authors[&child].result(), source_type);
     }
     let cast = builder
-        .add_expression(
-            output_node,
+        .unit(output_node)
+        .unwrap()
+        .add(
+            None,
             result_type.clone(),
             ExprKind::Cast {
                 expr: child,
@@ -396,7 +422,7 @@ fn fixture(
     let expression = match wrap {
         Wrap::Bare | Wrap::ConstantRight => cast,
         Wrap::Coalesce | Wrap::If => {
-            let fallback = result_literal(&mut builder, &result_type, policy);
+            let fallback = result_literal(&mut builder, &result_type, policy, &mut source_pools);
             if matches!(wrap, Wrap::Coalesce) {
                 call(
                     &mut builder,
@@ -415,11 +441,9 @@ fn fixture(
             } else {
                 let flag = if matches!(source, Source::RandCondition) {
                     let seed = builder
-                        .add_expression(
-                            output_node,
-                            seed_type.clone(),
-                            ExprKind::Value(columns[1].0),
-                        )
+                        .unit(output_node)
+                        .unwrap()
+                        .add(None, seed_type.clone(), ExprKind::Value(columns[1].0))
                         .unwrap();
                     let random = call(
                         &mut builder,
@@ -433,8 +457,10 @@ fn fixture(
                         vec![seed],
                     );
                     builder
-                        .add_expression(
-                            output_node,
+                        .unit(output_node)
+                        .unwrap()
+                        .add(
+                            None,
                             FunctionValueType::new(DataType::Boolean, false),
                             ExprKind::IsNull {
                                 expr: random,
@@ -444,7 +470,9 @@ fn fixture(
                         .unwrap()
                 } else {
                     builder
-                        .add_expression(output_node, boolean.clone(), ExprKind::Value(columns[2].0))
+                        .unit(output_node)
+                        .unwrap()
+                        .add(None, boolean.clone(), ExprKind::Value(columns[2].0))
                         .unwrap()
                 };
                 let flag_type = if matches!(source, Source::RandCondition) {
@@ -472,8 +500,10 @@ fn fixture(
         Wrap::IsNull | Wrap::And | Wrap::Or => {
             root_type = FunctionValueType::new(DataType::Boolean, false);
             let is_null = builder
-                .add_expression(
-                    output_node,
+                .unit(output_node)
+                .unwrap()
+                .add(
+                    None,
                     root_type.clone(),
                     ExprKind::IsNull {
                         expr: cast,
@@ -487,11 +517,18 @@ fn fixture(
                 let decide = literal(
                     &mut builder,
                     &root_type,
-                    LiteralValue::Boolean(matches!(wrap, Wrap::Or)),
+                    checked_constants::boolean(
+                        &root_type,
+                        matches!(wrap, Wrap::Or),
+                        options().constants,
+                    ),
+                    &mut source_pools,
                 );
                 builder
-                    .add_expression(
-                        output_node,
+                    .unit(output_node)
+                    .unwrap()
+                    .add(
+                        None,
                         root_type.clone(),
                         if matches!(wrap, Wrap::Or) {
                             ExprKind::Disjunction {
@@ -508,12 +545,17 @@ fn fixture(
         }
         Wrap::NullParent => panic!("this fixture has no null arithmetic parent"),
     };
+    let expression = builder
+        .unit(output_node)
+        .unwrap()
+        .root(expression, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let value = builder
         .add_value(
             root_type.clone(),
             ValueOrigin::Expr {
                 node: output_node,
-                expr: expression,
+                root: expression,
             },
         )
         .unwrap();
@@ -525,22 +567,14 @@ fn fixture(
             Box::from([value]),
         )
         .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output_node,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fid,
-        output: fragment.nodes()[&output_node].output.clone(),
+        output: builder
+            .construction_node(output_node)
+            .unwrap()
+            .output
+            .clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&root_type),
             name: "cast_result".into(),
@@ -549,7 +583,15 @@ fn fixture(
             ty: root_type,
         }]),
     };
-    let package = package(&functions, fragment, &authors, result, allow);
+    let package = package(
+        &functions,
+        builder,
+        output_node,
+        &authors,
+        result,
+        allow,
+        source_pools,
+    );
     (functions, package)
 }
 fn compile(
@@ -572,25 +614,12 @@ fn compiled(
 ) -> Arc<LocalProgram> {
     let (functions, package) = fixture(source.clone(), result.clone(), mode, wrap, policy, allow);
     let program = compile(&functions, package, &Control).unwrap();
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
     let mut count = 0;
-    for (arena, flow) in snapshot.flows() {
-        for (id, invocation) in flow.uses() {
-            let definition = snapshot.roots().arenas()[arena]
-                .node(invocation.definition)
-                .unwrap();
+    for unit in program.units() {
+        for (&id, invocation) in unit.control_flow().uses() {
+            let definition = unit.definitions().node(invocation.definition).unwrap();
             if matches!(definition.kind(), StaticExprKind::PreparedCast { .. }) {
-                let recipe = program
-                    .cast_recipe(ProgramUseRef {
-                        arena: *arena,
-                        use_id: *id,
-                    })
-                    .unwrap();
+                let recipe = unit.recipes().cast(id).unwrap();
                 assert_eq!(recipe.operation(), CastOperation::Carrier);
                 // A narrowed ELSE is itself an authored I64 -> target Cast.
                 // Identify the primary occurrence by both complete source facts.
@@ -929,12 +958,7 @@ fn cast_literal_broadcast_empty_selection_and_real_round_rand_owners_keep_exact_
             DecimalOverflowPolicy::ReportError,
             true,
         );
-        let calls = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls();
+        let calls = root_unit(&program).calls();
         assert!(
             calls
                 .values()
@@ -987,13 +1011,18 @@ fn cast_runtime_all_original_failure_categories_stop_at_exact_callback_and_latch
         .collect::<Vec<_>>();
     let batch = sliced_batch(&program, &source);
     let constructor = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-    CompiledExpressionInstance::try_new(program.clone(), root(), &constructor).unwrap();
+    CompiledExpressionInstance::try_new(
+        root_unit(&program).clone(),
+        root(&program).root,
+        &constructor,
+    )
+    .unwrap();
     let constructor_trace = constructor.trace.lock().unwrap().clone();
     for stop_at in 1..=constructor_trace.len() {
         for cause in causes() {
             let control = CallbackControl::new(cause.clone(), stop_at);
             assert!(
-                matches!(CompiledExpressionInstance::try_new(program.clone(), root(), &control), Err(actual) if actual == cause)
+                matches!(CompiledExpressionInstance::try_new(root_unit(&program).clone(), root(&program).root, &control), Err(actual) if actual == cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), constructor_trace[..stop_at]);
         }
@@ -1189,19 +1218,11 @@ fn identity_cast_keeps_a_required_child_binding_and_permissive_source_carrier() 
         DecimalOverflowPolicy::OutputNull,
         false,
     );
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let occurrence = snapshot.bindings()[&root()];
+    let occurrence = cast_root_use(&program);
     assert!(
-        program
-            .cast_recipe(novarocks_local_program::ProgramUseRef {
-                arena: root().arena(),
-                use_id: occurrence,
-            })
+        root_unit(&program)
+            .recipes()
+            .cast(occurrence)
             .unwrap()
             .is_identity()
     );
@@ -1289,8 +1310,8 @@ fn identity_cast_keeps_a_required_child_binding_and_permissive_source_carrier() 
             MemTracker::new_root("permissive identity Cast result"),
         );
         let mut evaluator = CompiledExpressionInstance::try_new_with_allocator(
-            program.clone(),
-            root(),
+            root_unit(&program).clone(),
+            root(&program).root,
             &Control,
             Some(host),
         )

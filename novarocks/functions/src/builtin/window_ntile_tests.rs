@@ -23,17 +23,16 @@ use crate::{
     FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
     FunctionResultType, FunctionSpecializationFailure, InstalledPureKernel, KernelDiagnostic,
     PreparedPureKernel, PureCallPreparation, PureImplementationDeclaration, PureImplementationId,
-    PureKernelAbi, PurePreparationSource, ScopedExpressionEffects, WindowCallOptions,
+    PureKernelAbi, PurePreparationSource, ScopedRelationalEffects, WindowCallOptions,
     WindowEvaluationPartition, WindowRowRange,
 };
 use arrow_array::{Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
-    FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior, FunctionValueType,
-    PureCompileControl, SemanticParameters, WindowBound, WindowFrame, WindowFrameExclusion,
-    WindowFrameUnits,
+    ExpressionUseId, FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior,
+    FunctionValueType, PureCompileControl, SemanticParameters, WindowBound, WindowFrame,
+    WindowFrameExclusion, WindowFrameUnits,
 };
 use std::{sync::Mutex, time::Duration};
 const ARGUMENT_USES: [Option<ExpressionUseId>; 1] = [Some(ExpressionUseId::new(11))];
@@ -91,12 +90,10 @@ fn causes() -> [KernelFailure; 7] {
         KernelFailure::InstanceFailed,
     ]
 }
-fn context() -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
-        demand: EvaluationDemand::Value,
-    }
+fn context() -> novarocks_type_contract::RelationEffectContext {
+    novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(41),
+    )
 }
 
 fn policy() -> ConstantPolicy {
@@ -177,7 +174,7 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: context(),
+            context: (context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&ARGUMENT_USES),
             function_id: &self.id,
             kind: FunctionKind::Window,
@@ -190,7 +187,7 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Domain(context().domain),
+            proof_scope: CallProofScope::Relation(context().identity),
         }
     }
     fn prepare(
@@ -202,7 +199,7 @@ impl Fixture {
             self.input(),
             self.selected.clone(),
             PureCallPreparation::Window {
-                arguments: ScopedExpressionEffects::pure_value(context()),
+                arguments: ScopedRelationalEffects::pure_value(context()),
                 options,
             },
             control,
@@ -372,7 +369,7 @@ fn ntile_frozen_subset_keeps_actual_installed_attachment_and_selected_arc() {
             f.selected.clone(),
             fresh.contract().call().effects(),
             PureCallPreparation::Window {
-                arguments: ScopedExpressionEffects::pure_value(context()),
+                arguments: ScopedRelationalEffects::pure_value(context()),
                 options: opts,
             },
             &CompileControl::default(),
@@ -607,7 +604,7 @@ fn ntile_null_dynamic_nonpositive_and_uncast_sources_are_explicit_prepare_refusa
                 input,
                 selected.clone(),
                 PureCallPreparation::Window {
-                    arguments: ScopedExpressionEffects::pure_value(context()),
+                    arguments: ScopedRelationalEffects::pure_value(context()),
                     options: options(None, false)
                 },
                 &CompileControl::default()
@@ -627,7 +624,7 @@ fn ntile_null_dynamic_nonpositive_and_uncast_sources_are_explicit_prepare_refusa
                 input,
                 f.selected.clone(),
                 PureCallPreparation::Window {
-                    arguments: ScopedExpressionEffects::pure_value(context()),
+                    arguments: ScopedRelationalEffects::pure_value(context()),
                     options: options(None, false)
                 },
                 &CompileControl::default()

@@ -19,7 +19,7 @@
 use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, KernelDiagnostic, SelectedValues, Selection};
 use arrow_array::{ArrayRef, BinaryArray};
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -85,7 +85,7 @@ fn binary_text_recipe_exact_type_root_null_obligation_and_refuses_other_routes()
                 .unwrap();
                 let context = ExpressionEffectContext {
                     use_id: ExpressionUseId::new(1),
-                    domain: EvaluationDomainId::new(2),
+                    region: EvaluationRegionId::new(2),
                     demand: EvaluationDemand::Value,
                 };
                 assert!(

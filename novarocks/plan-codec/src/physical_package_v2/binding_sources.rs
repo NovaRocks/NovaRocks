@@ -77,7 +77,6 @@ enum ResultRow {
 }
 pub(crate) struct AggregateRow<'source> {
     pub id: u32,
-    pub occurrence: BindingOccurrence,
     pub source: &'source p::AggregateBinding,
     pub function_id: u32,
     pub intermediate_id: u32,
@@ -98,7 +97,7 @@ pub(crate) struct BindingSources<'source> {
 
 #[derive(Clone, Copy)]
 enum Loan<'source> {
-    Function(&'source p::BoundFunction),
+    Function(&'source novarocks_expression_contract::BoundFunction),
     Table(&'source p::BoundTableFunction),
     Aggregate(&'source p::AggregateBinding),
 }
@@ -153,70 +152,41 @@ fn visit_bindings<'source>(
     visitor: &mut impl BindingVisitor<'source>,
 ) -> Result<(), TypeViewError> {
     let fragment = package.fragment();
-    budget.before_steps(twice(add(
-        fragment.expressions().len(),
-        fragment.nodes().len(),
-    )?)?)?;
-    for (expression, node) in fragment.expressions().iter() {
-        match &node.kind {
-            p::ExprKind::FunctionCall { function, .. } => {
-                visitor.header(
-                    Header {
-                        loop_work: 0,
-                        functions: 1,
-                        aggregates: 0,
-                        arguments: function.argument_types.len(),
-                        results: 0,
-                    },
-                    budget,
-                    work,
-                )?;
-                visitor.capture(
-                    BindingOccurrence::Scalar(*expression),
-                    Loan::Function(function),
-                    budget,
-                    work,
-                )?;
-            }
-            p::ExprKind::WindowCall {
-                function,
-                aggregate_binding,
-                ..
-            } => {
-                let aggregate_arguments = aggregate_binding
-                    .as_ref()
-                    .map_or(0, |binding| binding.function.argument_types.len());
-                let aggregates = usize::from(aggregate_binding.is_some());
-                visitor.header(
-                    Header {
-                        loop_work: 0,
-                        functions: add(1, aggregates)?,
-                        aggregates,
-                        arguments: add(function.argument_types.len(), aggregate_arguments)?,
-                        results: 0,
-                    },
-                    budget,
-                    work,
-                )?;
-                visitor.capture(
-                    BindingOccurrence::Window(*expression),
-                    Loan::Function(function),
-                    budget,
-                    work,
-                )?;
-                if let Some(binding) = aggregate_binding {
+    budget.before_steps(twice(fragment.nodes().len())?)?;
+    for (node_id, node) in fragment.nodes() {
+        if let Some(unit) = &node.expressions {
+            budget.before_steps(twice(unit.definitions().len())?)?;
+            for expression in unit.definitions() {
+                if let novarocks_expression_contract::ExprKind::FunctionCall { function, .. } =
+                    &expression.kind
+                {
+                    visitor.header(
+                        Header {
+                            loop_work: 0,
+                            functions: 1,
+                            aggregates: 0,
+                            arguments: function.argument_types.len(),
+                            results: 0,
+                        },
+                        budget,
+                        work,
+                    )?;
                     visitor.capture(
-                        BindingOccurrence::WindowAggregate(*expression),
-                        Loan::Aggregate(binding),
+                        BindingOccurrence::Scalar {
+                            node: *node_id,
+                            definition: expression.id,
+                        },
+                        Loan::Function(function),
                         budget,
                         work,
                     )?;
                 }
+                work.step()?;
             }
-            _ => {}
         }
         work.step()?;
     }
+    budget.before_steps(twice(fragment.nodes().len())?)?;
     for (node_id, node) in fragment.nodes() {
         if let Some((_, calls)) = node.kind.aggregate_contract() {
             visitor.header(
@@ -256,6 +226,58 @@ fn visit_bindings<'source>(
             }
         }
         match &node.kind {
+            p::NodeKind::Window(spec) => {
+                visitor.header(
+                    Header {
+                        loop_work: twice(spec.calls.len())?,
+                        functions: 0,
+                        aggregates: 0,
+                        arguments: 0,
+                        results: 0,
+                    },
+                    budget,
+                    work,
+                )?;
+                for (ordinal, call) in spec.calls.iter().enumerate() {
+                    let aggregates = usize::from(call.aggregate_binding.is_some());
+                    let aggregate_arguments = call
+                        .aggregate_binding
+                        .as_ref()
+                        .map_or(0, |binding| binding.function.argument_types.len());
+                    visitor.header(
+                        Header {
+                            loop_work: 0,
+                            functions: add(1, aggregates)?,
+                            aggregates,
+                            arguments: add(call.binding.argument_types.len(), aggregate_arguments)?,
+                            results: 0,
+                        },
+                        budget,
+                        work,
+                    )?;
+                    visitor.capture(
+                        BindingOccurrence::Window {
+                            node: *node_id,
+                            ordinal,
+                        },
+                        Loan::Function(&call.binding),
+                        budget,
+                        work,
+                    )?;
+                    if let Some(binding) = &call.aggregate_binding {
+                        visitor.capture(
+                            BindingOccurrence::WindowAggregate {
+                                node: *node_id,
+                                ordinal,
+                            },
+                            Loan::Aggregate(binding),
+                            budget,
+                            work,
+                        )?;
+                    }
+                    work.step()?;
+                }
+            }
             p::NodeKind::TableFunction { function, .. } => {
                 visitor.header(
                     Header {
@@ -564,9 +586,6 @@ impl<'source> BindingSources<'source> {
     pub(crate) fn functions(&self) -> &[FunctionRow<'source>] {
         &self.functions
     }
-    pub(crate) fn aggregates(&self) -> &[AggregateRow<'source>] {
-        &self.aggregates
-    }
     /// Later definition inputs borrow this exact package and retained
     /// contribution before reading any binding occurrence or source loan.
     pub(crate) fn check_package_in(
@@ -699,7 +718,6 @@ impl<'source> BindingSources<'source> {
             )?;
             self.aggregates.push(AggregateRow {
                 id: id(self.aggregates.len())?,
-                occurrence,
                 source: binding,
                 function_id,
                 intermediate_id,

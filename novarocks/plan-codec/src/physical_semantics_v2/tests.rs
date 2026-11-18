@@ -21,7 +21,7 @@ use novarocks_physical_plan::{
     FragmentPackageInput, FragmentSink, NodeId, NodeKind, OutputPort, PhysicalNode,
     PhysicalProperties, PipelineDopDomain, PlanVersionId, RequiredContracts, RowMultiplicity,
 };
-use novarocks_type_contract::{ExpressionControlFlow, SemanticParameterId, SemanticParameterValue};
+use novarocks_type_contract::{SemanticParameterId, SemanticParameterValue};
 use std::{collections::BTreeMap, sync::Mutex};
 
 #[derive(Default)]
@@ -60,6 +60,7 @@ fn input() -> FragmentPackageInput {
                 row_multiplicity: RowMultiplicity::SingleCopy,
                 ordering: Box::default(),
             },
+            expressions: None,
             kind: NodeKind::Values {
                 rows: Box::from([Box::default()]),
             },
@@ -77,24 +78,17 @@ fn input() -> FragmentPackageInput {
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let flow = ExpressionControlFlow::try_new(
-        vec![],
-        vec![],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &control,
-    )
-    .unwrap();
-    let expression_uses = PhysicalRootUses::try_new(&fragment, flow, vec![], &control).unwrap();
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &control).unwrap();
+    let fragment = fragment
+        .with_call_requests_observed(vec![], &control)
+        .unwrap()
+        .with_calls_observed(vec![], &control)
+        .unwrap();
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &control).unwrap();
     FragmentPackageInput {
+        statement_constant_policy: crate::test_constants::policy(),
         version: PlanVersionId::try_new([1; 16]).unwrap(),
         required: RequiredContracts::default(),
         fragment,
-        expression_uses,
-        calls,
         pruning,
         cuts: FragmentCuts::default(),
         result: None,
@@ -117,18 +111,21 @@ fn public_semantics_projection_preserves_explicit_empty_components_and_same_pack
     assert!(encoded.parameters.entries.is_empty());
     assert!(encoded.calls.entries.is_empty());
     assert!(encoded.pruning.witnesses.is_empty());
-    let decoded = decode_fragment_semantics(
-        package.fragment(),
-        package.expression_uses(),
-        &encoded,
-        &Control::default(),
-    )
-    .unwrap();
+    let decoded =
+        decode_fragment_semantics(package.fragment(), &encoded, &Control::default()).unwrap();
     let (parameters, calls, pruning) = decoded.into_parts();
+    let fragment = original
+        .fragment
+        .clone()
+        .with_calls_observed(
+            calls.entries().values().cloned().collect(),
+            &Control::default(),
+        )
+        .unwrap();
     let reconstructed = FragmentPackage::try_new(
         FragmentPackageInput {
             parameters,
-            calls,
+            fragment,
             pruning,
             ..original
         },
@@ -139,7 +136,6 @@ fn public_semantics_projection_preserves_explicit_empty_components_and_same_pack
     assert_eq!(reconstructed.version(), package.version());
     assert_eq!(reconstructed.required(), package.required());
     assert_eq!(reconstructed.fragment(), package.fragment());
-    assert_eq!(reconstructed.expression_uses(), package.expression_uses());
     assert_eq!(reconstructed.parameters(), package.parameters());
     assert_eq!(reconstructed.cuts(), package.cuts());
     assert_eq!(reconstructed.result(), package.result());
@@ -162,14 +158,18 @@ fn decoded_semantic_parts_require_actual_package_parameter_closure() {
         id: u32::MAX,
         value: Some(wire::semantic_parameter::Value::AllowThrowException(false)),
     });
-    let (parameters, calls, pruning) = decode_fragment_semantics(
-        package.fragment(),
-        package.expression_uses(),
-        &encoded,
-        &Control::default(),
-    )
-    .unwrap()
-    .into_parts();
+    let (parameters, calls, pruning) =
+        decode_fragment_semantics(package.fragment(), &encoded, &Control::default())
+            .unwrap()
+            .into_parts();
+    let fragment = original
+        .fragment
+        .clone()
+        .with_calls_observed(
+            calls.entries().values().cloned().collect(),
+            &Control::default(),
+        )
+        .unwrap();
     assert_eq!(
         parameters.get(SemanticParameterId::new(u32::MAX)),
         Some(&SemanticParameterValue::AllowThrowException(false))
@@ -178,7 +178,7 @@ fn decoded_semantic_parts_require_actual_package_parameter_closure() {
         FragmentPackage::try_new(
             FragmentPackageInput {
                 parameters,
-                calls,
+                fragment,
                 pruning,
                 ..original
             },
@@ -208,13 +208,7 @@ fn public_semantics_control_refusal_precedes_result_publication_in_both_directio
                 let result = if phase == CompilePhase::Encode {
                     encode_fragment_semantics(&package, &control).map(|_| ())
                 } else {
-                    decode_fragment_semantics(
-                        package.fragment(),
-                        package.expression_uses(),
-                        &encoded,
-                        &control,
-                    )
-                    .map(|_| ())
+                    decode_fragment_semantics(package.fragment(), &encoded, &control).map(|_| ())
                 };
                 assert_eq!(result, Err(SemanticsCodecError::Control(error.clone())));
                 assert_eq!(
@@ -260,12 +254,7 @@ fn ordinary_decode_failure_observes_completed_tail_and_preserves_control_categor
             });
         }
         assert!(matches!(
-            decode_fragment_semantics(
-                package.fragment(),
-                package.expression_uses(),
-                &bad,
-                &Control::default()
-            ),
+            decode_fragment_semantics(package.fragment(), &bad, &Control::default()),
             Err(SemanticsCodecError::InvalidShape(_))
         ));
         for error in [
@@ -275,7 +264,6 @@ fn ordinary_decode_failure_observes_completed_tail_and_preserves_control_categor
         ] {
             let result = decode_fragment_semantics(
                 package.fragment(),
-                package.expression_uses(),
                 &bad,
                 &PositiveRefusal(error.clone()),
             )
@@ -292,10 +280,11 @@ fn nested_owner_control_failures_keep_the_original_semantics_codec_category() {
         CompileControlError::DeadlineExceeded,
         CompileControlError::ResourceExhausted,
     ] {
-        let root = RootUseBindingError::Roots(ExpressionRootError::Control(error.clone()));
         for projected in [
-            SemanticsCodecError::from(FrozenCallError::Roots(root.clone())),
-            SemanticsCodecError::from(ControlCodecError::Roots(root)),
+            SemanticsCodecError::from(FrozenCallError::Control(error.clone())),
+            SemanticsCodecError::from(ControlCodecError::Flow(
+                novarocks_type_contract::ExpressionControlFlowError::Control(error.clone()),
+            )),
             SemanticsCodecError::from(FrozenPruningError::Structure(
                 PruningStructureError::Source(PredicateSourceError::Control(error.clone())),
             )),

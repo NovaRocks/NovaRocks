@@ -525,7 +525,7 @@ fn inlist_recipe_created_callbacks_keep_original_control_and_no_request_tail() {
 fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefix() {
     use crate::PreparedNativeInListRecipe;
     use novarocks_type_contract::{
-        CompileControlError, CompilePhase, EvaluationDemand, EvaluationDomainId,
+        CompileControlError, CompilePhase, EvaluationDemand, EvaluationRegionId,
         ExpressionEffectContext, ExpressionUseId, FunctionValueType, PureCompileControl,
     };
     struct Compile {
@@ -548,7 +548,7 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
     }
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(601),
-        domain: EvaluationDomainId::new(41),
+        region: EvaluationRegionId::new(41),
         demand: EvaluationDemand::Value,
     };
     let source = FunctionValueType::new(DataType::Int64, true);
@@ -576,6 +576,19 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
     assert_eq!(effects, prepared.own_effects(context));
     let trace = original.trace.into_inner().unwrap();
     assert_eq!(*borrowed.trace.lock().unwrap(), trace);
+    let static_profile = Compile {
+        trace: Mutex::new(Vec::new()),
+        refusal: None,
+    };
+    PreparedNativeInListRecipe::validate_borrowed_profile(
+        &source,
+        candidates.iter().copied(),
+        &target,
+        &static_profile,
+    )
+    .unwrap();
+    assert_eq!(*static_profile.trace.lock().unwrap(), trace);
+
     assert!(trace.iter().all(|(_, units)| *units <= 256));
     assert!(
         trace
@@ -604,6 +617,19 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
             .unwrap_err();
             assert_eq!(error.control_error(), Some(cause.clone()));
             assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
+            let static_control = Compile {
+                trace: Mutex::new(Vec::new()),
+                refusal: Some((stop, cause.clone())),
+            };
+            let error = PreparedNativeInListRecipe::validate_borrowed_profile(
+                &source,
+                candidates.iter().copied(),
+                &target,
+                &static_control,
+            )
+            .unwrap_err();
+            assert_eq!(error.control_error(), Some(cause.clone()));
+            assert_eq!(*static_control.trace.lock().unwrap(), trace[..=stop]);
         }
     }
     let required_target = FunctionValueType::new(DataType::Boolean, false);
@@ -634,6 +660,23 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
         )
         .unwrap_err();
         assert_eq!(error, borrowed_error);
+        let static_control = Compile {
+            trace: Mutex::new(Vec::new()),
+            refusal: None,
+        };
+        let static_error = PreparedNativeInListRecipe::validate_borrowed_profile(
+            input,
+            std::iter::once(candidate),
+            output,
+            &static_control,
+        )
+        .unwrap_err();
+        assert_eq!(error, static_error);
+        assert_eq!(
+            *original.trace.lock().unwrap(),
+            *static_control.trace.lock().unwrap()
+        );
+
         assert_eq!(
             *original.trace.lock().unwrap(),
             *borrowed.trace.lock().unwrap()
@@ -727,12 +770,12 @@ fn inlist_json_profile_preserves_nominal_evidence_and_rejects_plain_text_mixing(
 #[test]
 fn json_inlist_required_data_effects_are_shared_by_owned_and_borrowed_profiles() {
     use novarocks_type_contract::{
-        EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
+        EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, ExpressionUseId,
         FunctionValueType, ValueLogicalType,
     };
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(760),
-        domain: EvaluationDomainId::new(14),
+        region: EvaluationRegionId::new(14),
         demand: EvaluationDemand::Value,
     };
     let result = FunctionValueType::new(DataType::Boolean, true);

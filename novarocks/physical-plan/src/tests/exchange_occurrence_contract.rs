@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 
 #[test]
 fn exchange_source_rejects_reordered_output_occurrences() {
@@ -44,6 +46,7 @@ fn exchange_source_rejects_reordered_output_occurrences() {
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -60,7 +63,7 @@ fn exchange_source_rejects_reordered_output_occurrences() {
         .unwrap();
 
     let errors = builder
-        .finish_definition(
+        .finish_fixture_definition(
             node,
             FragmentSink::Noop,
             dop(),

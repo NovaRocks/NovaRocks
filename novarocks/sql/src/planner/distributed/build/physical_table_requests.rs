@@ -53,6 +53,7 @@ pub(crate) enum PhysicalTableRequestError {
     Type(ValueTypeError),
     InvalidSource(&'static str),
     MissingArgument(ExprId),
+    MissingRoot(novarocks_expression_contract::RootOrdinal),
 }
 impl From<ValueTypeError> for PhysicalTableRequestError {
     fn from(error: ValueTypeError) -> Self {
@@ -209,9 +210,9 @@ pub(crate) fn author_physical_table_request_observed<'a>(
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     work.flush()?;
     for &id in ids {
-        let argument = fragment.expressions().get(id);
+        let argument = super::unit_source::UnitDefinitions::from_node(source).root_definition(id);
         work.step()?;
-        let argument = argument.ok_or(PhysicalTableRequestError::MissingArgument(id))?;
+        let argument = argument.ok_or(PhysicalTableRequestError::MissingRoot(id))?;
         arguments.push(author_physical_argument_observed(
             argument,
             pools,
@@ -318,7 +319,10 @@ pub(crate) fn author_physical_table_request_from_journal_observed<'source>(
         ));
     }
     for (&actual, &original) in ids.iter().zip(entry.arguments()) {
-        let matching = actual == original;
+        let definitions = super::unit_source::UnitDefinitions::from_node(entry.source());
+        let matching = definitions
+            .root(actual)
+            .is_some_and(|root| root.definition == original);
         work.step()?;
         if !matching {
             return Err(PhysicalTableRequestError::InvalidSource(
@@ -326,11 +330,11 @@ pub(crate) fn author_physical_table_request_from_journal_observed<'source>(
             ));
         }
         work.flush()?;
-        let expression = entry.fragment().expressions().get(actual);
+        let expression = definitions.definition(original);
         work.step()?;
         work.flush()?;
         if expression.is_none() {
-            return Err(PhysicalTableRequestError::MissingArgument(actual));
+            return Err(PhysicalTableRequestError::MissingArgument(original));
         }
     }
     for (expected, actual) in selected.argument_types.iter().zip(&function.argument_types) {

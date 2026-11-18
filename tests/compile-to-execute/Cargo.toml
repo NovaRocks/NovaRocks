@@ -26,6 +26,8 @@ env-inputs = []
 
 [dev-dependencies]
 novarocks-execution.workspace = true
+novarocks-expression.workspace = true
+novarocks-expression-contract.workspace = true
 novarocks-sql-testkit.workspace = true
 novarocks-plan-codec.workspace = true
 prost.workspace = true

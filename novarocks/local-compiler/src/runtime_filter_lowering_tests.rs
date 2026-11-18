@@ -20,34 +20,108 @@
 //! binding numbering) and pure provider validation, then compiled into the
 //! final LocalProgram owner.
 
+use novarocks_expression::StaticExprKind;
+
 use super::scan_lowering_tests::{
     FixtureControl, Trace, binding, functions, int64, options, package_admission, payload,
-    providers, public_schema, root_uses,
+    providers, public_schema,
 };
 use super::*;
+use crate::test_units::PureUnitFixture;
 use arrow_schema::DataType;
 use novarocks_connector_contract::*;
+use novarocks_expression_contract::{
+    BoundFunction, ExprKind, LegacyBindingMetadata, PhysicalCallRequest, RootOrdinal, RootScope,
+};
 use novarocks_functions::{
     AggregateBindingSelection, AggregateKernelPhase, AggregatePreparationOptions,
     AggregateStateFormatIdentity, CallArgumentUses, CallEffectInput, EngineFunctionCatalogBuilder,
     FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
     FunctionResultType, InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
+    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedRelationalEffects,
 };
 use novarocks_local_program::{
     BindingRequirement, FilterConsumerActivation, FilterNullSemantics, FilterProducerKind,
-    FilterReduction, LocalProgram, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramExpressionArena, ProgramExpressionRootSite, ProgramLexicalSource,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, ProgramUseRef, StaticExprKind,
-    StaticFilterContract,
+    FilterReduction, LocalProgram, ProgramNodeId, ProgramNodeKind, StaticFilterContract,
 };
 use novarocks_physical_plan::*;
 use novarocks_type_contract::{
-    CallProofScope, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, SemanticParameters, ValueLogicalType,
+    CallProofScope, DecimalOverflowPolicy, EvaluationDemand, ExpressionEffects, RelationCallId,
+    RelationEffectContext, SemanticParameters, ValueLogicalType,
 };
 use std::num::NonZeroU64;
+
+fn zero_port_root(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    ty: ValueType,
+    kind: ExprKind,
+) -> RootOrdinal {
+    let definition = builder.fixture_definition(node, ty, kind).unwrap();
+    builder
+        .fixture_occurrence(
+            node,
+            definition,
+            EvaluationDemand::Value,
+            RootScope::AllPorts,
+        )
+        .unwrap()
+}
+fn seal_fixture_units(builder: &mut FragmentBuilder) {
+    let nodes = builder
+        .construction_nodes()
+        .filter_map(|(&id, _)| builder.construction_unit(id).is_some().then_some(id))
+        .collect::<Vec<_>>();
+    for node in nodes {
+        builder.finish_fixture_unit(node, &FixtureControl).unwrap();
+    }
+}
+trait FixtureFinish {
+    fn finish_fixture_definition(
+        self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop: PipelineDopDomain,
+        placement: StagePlacementPolicy,
+    ) -> Result<Fragment, ValidationErrors>;
+    fn finish_fixture_structure(
+        self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop: PipelineDopDomain,
+        placement: StagePlacementPolicy,
+    ) -> Fragment;
+}
+impl FixtureFinish for FragmentBuilder {
+    fn finish_fixture_definition(
+        mut self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop: PipelineDopDomain,
+        placement: StagePlacementPolicy,
+    ) -> Result<Fragment, ValidationErrors> {
+        seal_fixture_units(&mut self);
+        self.finish_definition(root, sink, dop, placement)
+    }
+    fn finish_fixture_structure(
+        mut self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop: PipelineDopDomain,
+        placement: StagePlacementPolicy,
+    ) -> Fragment {
+        seal_fixture_units(&mut self);
+        self.finish_structure(
+            root,
+            sink,
+            dop,
+            PlanLimits::FROZEN,
+            &FixtureControl,
+            placement,
+        )
+        .unwrap()
+    }
+}
 
 /// The scan fragment of every shape; it also hosts the join when the join
 /// is not partitioned.
@@ -317,7 +391,8 @@ fn frozen_read_declared_typed(
 }
 
 /// `VALUES (7), (8), (20)` as the one-column build source of `edge`.
-fn build_fragment(edge: EdgeId, nullable: bool) -> (Fragment, ValueId) {
+fn build_fragment(edge: EdgeId, nullable: bool) -> (Fragment, ValueId, ConstantPools) {
+    let mut constants = ConstantPools::empty();
     let mut build = FragmentBuilder::new(BUILD);
     let column = build
         .add_value(
@@ -330,26 +405,30 @@ fn build_fragment(edge: EdgeId, nullable: bool) -> (Fragment, ValueId) {
         .unwrap();
     let rows = [7, 8, 20]
         .map(|value| {
-            Box::from([build
-                .add_expression(
-                    VALUES,
-                    nullable_int64(nullable),
-                    ExprKind::Literal(LiteralValue::Int64(value)),
-                )
-                .unwrap()])
+            Box::from([zero_port_root(
+                &mut build,
+                VALUES,
+                nullable_int64(nullable),
+                crate::test_constants::i64(
+                    &mut constants,
+                    &nullable_int64(nullable),
+                    value,
+                    options(None).constants,
+                ),
+            )])
         })
         .into_iter()
         .collect();
     build.add_values(VALUES, rows, Box::from([column])).unwrap();
     let fragment = build
-        .finish_definition(
+        .finish_fixture_definition(
             VALUES,
             FragmentSink::Stream { edge },
             dop(),
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    (fragment, column)
+    (fragment, column, constants)
 }
 
 fn receive(
@@ -440,11 +519,21 @@ fn add_join(
     let right_type = key_type(builder, build.1);
     let key = JoinKey {
         left: builder
-            .add_expression(JOIN, left_type, ExprKind::Value(probe.1[0]))
+            .fixture_value_root(JOIN, left_type, ExprKind::Value(probe.1[0]))
             .unwrap(),
-        right: builder
-            .add_expression(JOIN, right_type, ExprKind::Value(build.1))
-            .unwrap(),
+        right: {
+            let definition = builder
+                .fixture_definition(JOIN, right_type, ExprKind::Value(build.1))
+                .unwrap();
+            builder
+                .fixture_occurrence(
+                    JOIN,
+                    definition,
+                    EvaluationDemand::Value,
+                    RootScope::Port(1),
+                )
+                .unwrap()
+        },
         null_safe,
     };
     let probe_properties = builder.node_output_properties(probe.0).unwrap().clone();
@@ -709,17 +798,9 @@ fn packages_with_reads(
     plan: &PhysicalPlan,
     scans: BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
 ) -> BTreeMap<FragmentId, Arc<FragmentPackage>> {
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let root_uses = root_uses(fragment);
-        calls.insert(
-            id,
-            FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &FixtureControl).unwrap(),
-        );
-        uses.insert(id, root_uses);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
@@ -730,8 +811,6 @@ fn packages_with_reads(
         plan,
         &scans,
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,
@@ -752,7 +831,7 @@ fn dynamic_filter() -> StaticScanDynamicFilter {
 pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
     let mut builder = FragmentBuilder::new(PROBE);
     let scan = add_scan(&mut builder, Distribution::Unconstrained);
-    let (build, build_column) = build_fragment(BUILD_EDGE, rf.null_safe);
+    let (build, build_column, constants) = build_fragment(BUILD_EDGE, rf.null_safe);
     let imported = receive(
         &mut builder,
         BUILD_RECEIVER,
@@ -771,7 +850,7 @@ pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
     );
     builder.attach_runtime_filter(FILTER).unwrap();
     let probe = builder
-        .finish_definition(
+        .finish_fixture_definition(
             JOIN,
             FragmentSink::Stream { edge: EDGE },
             dop(),
@@ -790,7 +869,7 @@ pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
         RowMultiplicity::SingleCopy,
     );
     let gather = gather
-        .finish_definition(
+        .finish_fixture_definition(
             RECEIVER,
             FragmentSink::Result,
             dop(),
@@ -798,7 +877,13 @@ pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        options(None).constants,
+    );
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(probe).unwrap();
     plan.add_fragment(gather).unwrap();
     plan.add_fragment(build).unwrap();
@@ -835,7 +920,7 @@ pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
     ))
     .unwrap();
     let plan = plan
-        .finish()
+        .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the broadcast runtime-filter plan validates: {error:?}"));
     let dynamic = if rf.scan_consumer() {
         vec![dynamic_filter()]
@@ -878,14 +963,14 @@ fn partitioned() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
     let scan = add_scan(&mut builder, Distribution::Unconstrained);
     builder.attach_runtime_filter(FILTER).unwrap();
     let probe = builder
-        .finish_definition(
+        .finish_fixture_definition(
             SCAN,
             FragmentSink::Stream { edge: PROBE_EDGE },
             dop(),
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let (build, build_column) = build_fragment(BUILD_EDGE, false);
+    let (build, build_column, constants) = build_fragment(BUILD_EDGE, false);
 
     let mut joiner = FragmentBuilder::new(JOINER);
     let probe_columns = receive(
@@ -915,7 +1000,7 @@ fn partitioned() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
     );
     joiner.attach_runtime_filter(FILTER).unwrap();
     let joiner = joiner
-        .finish_definition(
+        .finish_fixture_definition(
             JOIN,
             FragmentSink::Result,
             dop(),
@@ -923,7 +1008,13 @@ fn partitioned() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        options(None).constants,
+    );
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(probe).unwrap();
     plan.add_fragment(build).unwrap();
     plan.add_fragment(joiner).unwrap();
@@ -963,7 +1054,7 @@ fn partitioned() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
     ))
     .unwrap();
     let plan = plan
-        .finish()
+        .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the partitioned runtime-filter plan validates: {error:?}"));
     let mut packages = packages(&plan, Some(frozen_read(false, vec![dynamic_filter()])));
     (
@@ -1066,27 +1157,14 @@ fn assert_producer(program: &LocalProgram, binding: u32, null_semantics: FilterN
     assert_eq!(producer.producer.kind(), FilterProducerKind::Membership);
     assert_eq!(producer.producer.reduction(), FilterReduction::SetUnion);
     assert_eq!(producer.producer.contract(), &membership(null_semantics));
-    // The key's existing JoinBuildKey root is the producer key; no other
-    // root names the join's runtime filter.
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let build_root = snapshot.roots().sites()[&ProgramExpressionRootSite::Node {
-        node: join,
-        role: ProgramNodeExpressionRole::JoinBuildKey { key: 0 },
-    }]
-        .definition;
-    assert_eq!(build_root, producer.expr_id);
-    assert!(!snapshot.bindings().keys().any(|site| matches!(
-        site,
-        ProgramExpressionRootSite::Node {
-            node,
-            role: ProgramNodeExpressionRole::RuntimeFilter { .. },
-        } if *node == join
-    )));
+    // The producer borrows the actual build-key root, with no extra scalar occurrence.
+    let (unit, root) = crate::test_units::compiled_root(program, producer.expr_id);
+    assert_eq!(producer.expr_id, condition.keys()[0].build);
+    assert_eq!(
+        unit.control_flow().uses()[&root.use_id].definition,
+        root.definition
+    );
+    assert_eq!(unit.roots().len(), 2);
 }
 
 /// The scan's one blocking membership consumer: binding `binding`, channel
@@ -1134,36 +1212,21 @@ fn assert_consumer_activation(
     assert_eq!(dynamic.len(), 1);
     assert_eq!(dynamic[0].filter_id(), consumer.consumer.channel_id());
     assert_eq!(dynamic[0].variable(), "v0");
-    // The key is a compiler-authored slot read of the scan's output 0 ...
-    let checked = program.checked();
-    let snapshot = checked.channels().expressions().resolved_calls().snapshot();
-    let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-    let key = arena.node(consumer.expr_id).unwrap();
+    // The compiler-authored read retains its actual output position and complete type.
+    let (unit, root) = crate::test_units::compiled_root(program, consumer.expr_id);
     assert!(matches!(
-        key.kind(),
-        StaticExprKind::SlotId(slot) if *slot == node.output_layout().slots()[0]
+        unit.definitions().node(root.definition).unwrap().kind(),
+        StaticExprKind::Input
     ));
-    // ... rooted at the scan's RuntimeFilter { binding: 0 } as one Value use
-    // whose lexical source is that exact output occurrence.
-    let site = ProgramExpressionRootSite::Node {
-        node: scan,
-        role: ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
-    };
-    let use_id = snapshot.bindings()[&site];
-    let root = &snapshot.flows()[&ProgramExpressionArena::Main].uses()[&use_id];
-    assert_eq!(root.definition, consumer.expr_id);
-    assert_eq!(root.context.demand, EvaluationDemand::Value);
-    assert!(root.arguments.is_empty());
+    let invocation = &unit.control_flow().uses()[&root.use_id];
+    assert_eq!(invocation.definition, root.definition);
+    assert_eq!(invocation.context.demand, EvaluationDemand::Value);
+    assert!(invocation.arguments.is_empty());
+    let input = unit.input(root.use_id).unwrap();
+    assert_eq!(input.ordinal, 0);
     assert_eq!(
-        checked.slots()[&ProgramUseRef {
-            arena: ProgramExpressionArena::Main,
-            use_id,
-        }],
-        ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-            node: scan,
-            role: ProgramChannelLayoutRole::NodeOutput,
-            ordinal: 0,
-        })
+        unit.scope(input.scope).unwrap().schema().as_ref(),
+        node.output_layout().schema().as_ref()
     );
 }
 
@@ -1349,36 +1412,21 @@ fn runtime_filter_shapes_outside_m1_are_refused_by_name() {
     let mut required = filter_requirements(&program);
     required.sort_unstable();
     assert_eq!(required, vec![1, 2]);
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let consumer_site = ProgramExpressionRootSite::Node {
-        node: join,
-        role: ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
-    };
-    let probe_site = ProgramExpressionRootSite::Node {
-        node: join,
-        role: ProgramNodeExpressionRole::JoinProbeKey { key: 0 },
-    };
-    let use_id = snapshot.bindings()[&consumer_site];
-    assert_ne!(use_id, snapshot.bindings()[&probe_site]);
-    let invocation = &snapshot.flows()[&ProgramExpressionArena::Main].uses()[&use_id];
-    assert_eq!(invocation.definition, consumer.expr_id);
+    // The consumer borrows this exact probe root, never another node's use bank.
+    let (unit, root) = crate::test_units::compiled_root(&program, consumer.expr_id);
+    assert_eq!(consumer.expr_id, condition.keys()[0].probe);
+    let invocation = &unit.control_flow().uses()[&root.use_id];
+    assert_eq!(invocation.definition, root.definition);
     assert_eq!(invocation.context.demand, EvaluationDemand::Value);
     assert!(invocation.arguments.is_empty());
+    assert_eq!(unit.input(root.use_id).unwrap().ordinal, 0);
+    let ProgramNodeKind::Join { left_layout, .. } = program.graph().nodes()[join.index()].kind()
+    else {
+        unreachable!()
+    };
     assert_eq!(
-        program.checked().slots()[&ProgramUseRef {
-            arena: ProgramExpressionArena::Main,
-            use_id,
-        }],
-        ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-            node: join,
-            role: ProgramChannelLayoutRole::JoinLeft,
-            ordinal: 0,
-        })
+        unit.scope(root.scope).unwrap().schema().as_ref(),
+        left_layout.schema().as_ref()
     );
     assert!(
         !program
@@ -1524,7 +1572,7 @@ fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage
     // The group key republishes the scan value itself.
     let grouped = scan[0];
     let group_key = builder
-        .add_expression(AGGREGATE, ty.clone(), ExprKind::Value(grouped))
+        .fixture_value_root(AGGREGATE, ty.clone(), ExprKind::Value(grouped))
         .unwrap();
     builder
         .add_row_consuming(
@@ -1541,7 +1589,7 @@ fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage
         )
         .unwrap();
     let order_key = builder
-        .add_expression(TOPN, ty.clone(), ExprKind::Value(grouped))
+        .fixture_value_root(TOPN, ty.clone(), ExprKind::Value(grouped))
         .unwrap();
     builder
         .add_top_n(
@@ -1559,7 +1607,7 @@ fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage
         .unwrap();
     builder.attach_runtime_filter(FILTER).unwrap();
     let fragment = builder
-        .finish_definition(
+        .finish_fixture_definition(
             TOPN,
             FragmentSink::Result,
             dop(),
@@ -1568,7 +1616,10 @@ fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage
         .unwrap();
     let mut result = result_port(PROBE, TOPN, &[grouped]);
     result.fields[0].ty = ty.clone();
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        options(None).constants,
+    );
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(result).unwrap();
     plan.add_runtime_filter(ordered_filter(
@@ -1585,7 +1636,7 @@ fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage
     ))
     .unwrap();
     let plan = plan
-        .finish()
+        .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the aggregate TopN filter plan validates: {error:?}"));
     let read = frozen_read_declared_typed(
         true,
@@ -1683,7 +1734,7 @@ impl CountStar {
         &self,
         id: u32,
         phase: AggregatePhase,
-        arguments: Box<[ExprId]>,
+        arguments: Box<[RootOrdinal]>,
         output: ValueId,
     ) -> AggregateCall {
         let mut function = BoundFunction::from_exact_signature(
@@ -1747,7 +1798,7 @@ fn add_count(
         .map(|state| {
             let ty = builder.value(state).unwrap().ty.clone();
             Box::from([builder
-                .add_expression(node, ty, ExprKind::Value(state))
+                .fixture_value_root(node, ty, ExprKind::Value(state))
                 .unwrap()])
         })
         .unwrap_or_default();
@@ -1758,6 +1809,7 @@ fn add_count(
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([input_properties]),
@@ -1777,15 +1829,18 @@ fn add_count(
 }
 
 /// Finish a fragment with one original request per relational call.
-fn finish_with_requests(builder: FragmentBuilder, root: NodeId, sink: FragmentSink) -> Fragment {
-    let fragment = builder
-        .finish_definition(
-            root,
-            sink,
-            dop(),
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
+fn finish_with_requests(
+    builder: FragmentBuilder,
+    root: NodeId,
+    sink: FragmentSink,
+    catalog: &PureEngineFunctionCatalog,
+) -> Fragment {
+    let fragment = builder.finish_fixture_structure(
+        root,
+        sink,
+        dop(),
+        novarocks_physical_plan::StagePlacementPolicy::Singleton,
+    );
     let mut entries = fragment
         .call_requests()
         .entries()
@@ -1795,7 +1850,7 @@ fn finish_with_requests(builder: FragmentBuilder, root: NodeId, sink: FragmentSi
     let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
     visit_relational_calls_observed::<FrozenCallError>(&fragment, &mut work, |site, _, _| {
         entries.push((
-            PhysicalCallDefinition::Relational(site),
+            site,
             PhysicalCallRequest {
                 arguments: Box::default(),
                 logical_argument_count: 0,
@@ -1807,42 +1862,20 @@ fn finish_with_requests(builder: FragmentBuilder, root: NodeId, sink: FragmentSi
     })
     .unwrap();
     work.finish().unwrap();
-    fragment
+    let fragment = fragment
         .with_call_requests_observed(entries, &FixtureControl)
+        .unwrap();
+    let calls = freeze_counts(&fragment, catalog);
+    fragment
+        .with_calls_observed(calls, &FixtureControl)
         .unwrap()
 }
 
-/// Root uses and frozen calls of one fragment. Every expression root is a
-/// leaf with one eager use in domain 0; aggregate call `k` owns domain
-/// `k + 1` and the relational use right after the expression uses, the
-/// smallest identity the FE can give it.
+/// Freeze actual COUNT relations independently of the scalar units' local use identities.
 fn freeze_counts(
     fragment: &Fragment,
     catalog: &PureEngineFunctionCatalog,
-) -> (PhysicalRootUses, FrozenFragmentCalls) {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                domain: EvaluationDomainId::new(0),
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, id));
-    }
-    let base = u32::try_from(uses.len()).unwrap();
-    let mut domains = vec![ExpressionEvaluationDomain {
-        id: EvaluationDomainId::new(0),
-        parent: None,
-        guard: None,
-    }];
+) -> Vec<FrozenPhysicalCall> {
     let mut sites = Vec::new();
     for node in fragment.nodes().values() {
         let (calls, topn) = match &node.kind {
@@ -1854,18 +1887,7 @@ fn freeze_counts(
             _ => continue,
         };
         for ordinal in 0..calls.len() {
-            let k = u32::try_from(sites.len()).unwrap();
-            let context = ExpressionEffectContext {
-                use_id: ExpressionUseId::new(base + k),
-                domain: EvaluationDomainId::new(k + 1),
-                demand: EvaluationDemand::Value,
-            };
-            domains.push(ExpressionEvaluationDomain {
-                id: context.domain,
-                parent: None,
-                guard: None,
-            });
-            let call = u32::try_from(ordinal).unwrap();
+            let call = ordinal as u32;
             let site = if topn {
                 PhysicalCallSite::TopNState {
                     node: node.id,
@@ -1877,18 +1899,10 @@ fn freeze_counts(
                     call,
                 }
             };
+            let context = RelationEffectContext::call(RelationCallId::new(sites.len() as u32));
             sites.push((node.id, call, context, site));
         }
     }
-    let flow = ExpressionControlFlow::try_new(
-        domains,
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let root_uses = PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap();
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut frozen = Vec::new();
     for (node, ordinal, context, site) in sites {
@@ -1925,41 +1939,29 @@ fn freeze_counts(
                 AggregatePreparationOptions {
                     state_interpretation: None,
                     phase,
-                    distinct: false,
+                    distinct: call.distinct,
                     order_keys: Arc::from([]),
                     state_input_type: None,
                 },
             )
         } else {
-            let state_use = root_uses.bindings()[&ExpressionRootSite {
-                node,
-                role: match site {
-                    PhysicalCallSite::TopNState { .. } => ExpressionRootRole::TopNStateArgument {
-                        call: ordinal,
-                        argument: 0,
-                    },
-                    _ => ExpressionRootRole::AggregateArgument {
-                        call: ordinal,
-                        argument: 0,
-                    },
-                },
-            }];
-            state_type = fragment
-                .expressions()
-                .get(call.arguments[0])
-                .unwrap()
-                .ty
-                .clone();
+            let unit = fragment.nodes()[&node]
+                .expressions
+                .as_ref()
+                .expect("actual state-input unit");
+            let state_root = &unit.roots()[call.arguments[0].get() as usize];
+            let state_use = unit.root_use(call.arguments[0]).unwrap();
+            state_type = unit.definition(state_root.definition).unwrap().ty.clone();
             (
                 CallArgumentUses::AggregateMerge {
                     phase,
-                    state_context: root_uses.flow().uses()[&state_use].context,
+                    state_context: unit.control_flow().uses()[&state_use].context.into(),
                     state_input_type: &state_type,
                 },
                 AggregatePreparationOptions {
                     state_interpretation: None,
                     phase,
-                    distinct: false,
+                    distinct: call.distinct,
                     order_keys: Arc::from([]),
                     state_input_type: Some(state_type.clone()),
                 },
@@ -1968,7 +1970,7 @@ fn freeze_counts(
         let token = catalog
             .prepare_fresh(
                 CallEffectInput {
-                    context,
+                    context: context.into(),
                     argument_uses,
                     function_id: &binding.function.function_id,
                     kind: FunctionKind::Aggregate,
@@ -1981,11 +1983,11 @@ fn freeze_counts(
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Relation(context.identity),
                 },
                 Arc::clone(&selection),
                 PureCallPreparation::Aggregate {
-                    arguments: ScopedExpressionEffects::primitive(
+                    arguments: ScopedRelationalEffects::primitive(
                         context,
                         ExpressionEffects::PURE_VALUE,
                     ),
@@ -1996,18 +1998,13 @@ fn freeze_counts(
             .unwrap_or_else(|error| panic!("COUNT(*) prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
             materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
             site,
             context,
             effects: token.call_contract().effects().clone(),
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
         });
     }
-    let calls = FrozenFragmentCalls::try_new(fragment, &root_uses, frozen, &FixtureControl)
-        .unwrap_or_else(|error| panic!("frozen COUNT(*) calls validate: {error}"));
-    (root_uses, calls)
+    frozen
 }
 
 /// `SELECT count(*) FROM t a JOIN broadcast(VALUES (7), (8), (20)) b ON
@@ -2020,7 +2017,7 @@ fn count_star_join() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
     let count = CountStar::bind(&catalog);
     let mut builder = FragmentBuilder::new(PROBE);
     let scan = add_scan_columns(&mut builder, Distribution::Unconstrained, 1);
-    let (build, build_column) = build_fragment(BUILD_EDGE, false);
+    let (build, build_column, constants) = build_fragment(BUILD_EDGE, false);
     let imported = receive(
         &mut builder,
         BUILD_RECEIVER,
@@ -2052,7 +2049,12 @@ fn count_star_join() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
         AggregateGrouping::Partial,
     );
     builder.attach_runtime_filter(FILTER).unwrap();
-    let probe = finish_with_requests(builder, AGGREGATE, FragmentSink::Stream { edge: EDGE });
+    let probe = finish_with_requests(
+        builder,
+        AGGREGATE,
+        FragmentSink::Stream { edge: EDGE },
+        &catalog,
+    );
 
     let mut gather = FragmentBuilder::new(GATHER);
     let received = receive(
@@ -2075,9 +2077,15 @@ fn count_star_join() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
         Some(received[0]),
         AggregateGrouping::Complete,
     );
-    let gather = finish_with_requests(gather, FINAL, FragmentSink::Result);
+    let gather = finish_with_requests(gather, FINAL, FragmentSink::Result, &catalog);
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        options(None).constants,
+    );
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(probe).unwrap();
     plan.add_fragment(gather).unwrap();
     plan.add_fragment(build).unwrap();
@@ -2131,14 +2139,9 @@ fn count_star_join() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
         .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the COUNT(*) runtime-filter plan validates: {error:?}"));
 
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let (root_uses, frozen) = freeze_counts(fragment, &catalog);
-        calls.insert(id, frozen);
-        uses.insert(id, root_uses);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
@@ -2152,8 +2155,6 @@ fn count_star_join() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
             frozen_read_columns(false, 1, vec![dynamic_filter()]),
         )]),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,
@@ -2162,26 +2163,22 @@ fn count_star_join() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
     (Arc::new(packages.remove(&PROBE).unwrap()), catalog)
 }
 
-// The FE numbers a relational call's context right after the expression
-// uses, which is the first identity a fresh occurrence could take. The scan's
-// runtime-filter key root never takes it, so the relational COUNT(*) call and
-// the derived key root each keep their own occurrence.
+// Relation contexts and scalar root uses have independent owners and identity types.
 #[test]
 fn a_runtime_filter_key_root_never_reuses_a_relational_call_use() {
     let (package, catalog) = count_star_join();
     let relational = package
+        .fragment()
         .calls()
         .entries()
         .iter()
         .find_map(|(site, call)| {
-            matches!(site, PhysicalCallSite::Aggregate { .. }).then_some(call.context.use_id)
+            matches!(site, PhysicalCallSite::Aggregate { .. }).then_some(call.context)
         })
-        .expect("the probe fragment freezes its COUNT(*)");
-    let flow_uses = package.expression_uses().flow().uses().len();
+        .expect("the probe fragment freezes its actual COUNT relation");
     assert_eq!(
-        relational.get() as usize,
-        flow_uses,
-        "the relational use is the first identity after the flow's uses"
+        relational.identity.role,
+        novarocks_type_contract::RelationEffectRole::Call
     );
     let validated =
         validate_fragment_providers(Arc::clone(&package), &providers(), &FixtureControl).unwrap();
@@ -2191,22 +2188,33 @@ fn a_runtime_filter_key_root_never_reuses_a_relational_call_use() {
     let scan = node_of(&program, |kind| {
         matches!(kind, ProgramNodeKind::Scan { .. })
     });
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
+    let ProgramNodeKind::Scan {
+        runtime_filters, ..
+    } = program.graph().nodes()[scan.index()].kind()
+    else {
+        unreachable!()
+    };
+    let key = runtime_filters[0].expr_id;
+    let (unit, root) = crate::test_units::compiled_root(&program, key);
+    assert_eq!(
+        unit.control_flow().uses()[&root.use_id].definition,
+        root.definition
+    );
+    let aggregate = node_of(&program, |kind| {
+        matches!(kind, ProgramNodeKind::Aggregate { .. })
+    });
+    let prepared = program
         .resolved_calls()
-        .snapshot();
-    let key = snapshot.bindings()[&ProgramExpressionRootSite::Node {
-        node: scan,
-        role: ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
-    }];
-    assert_ne!(key, relational, "the key root has its own occurrence");
+        .calls()
+        .get(&novarocks_local_program::ProgramCallSite::Aggregate {
+            node: aggregate,
+            call: 0,
+        })
+        .expect("actual prepared relation");
+    assert_eq!(prepared.call_contract().context(), relational.into());
     assert!(
-        !snapshot.flows()[&ProgramExpressionArena::Main]
-            .uses()
-            .contains_key(&relational),
-        "no Main occurrence takes the relational call's identity"
+        unit.calls().is_empty(),
+        "the pure key unit contains no scalar invocation of COUNT"
     );
 }
 
@@ -2244,6 +2252,7 @@ fn complete_once_downgraded_scan_and_probe_keep_their_original_sites() {
             let ProgramNodeKind::Join {
                 condition,
                 runtime_filter_consumers,
+                left_layout,
                 ..
             } = program.graph().nodes()[join.index()].kind()
             else {
@@ -2262,23 +2271,14 @@ fn complete_once_downgraded_scan_and_probe_keep_their_original_sites() {
             );
             assert_eq!(site.key_ordinal, 0);
             assert_eq!(site.expr_id, condition.keys()[0].probe);
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            let rf = ProgramExpressionRootSite::Node {
-                node: join,
-                role: ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
-            };
-            let probe = ProgramExpressionRootSite::Node {
-                node: join,
-                role: ProgramNodeExpressionRole::JoinProbeKey { key: 0 },
-            };
-            assert_ne!(snapshot.bindings()[&rf], snapshot.bindings()[&probe]);
-            assert!(
-                matches!(program.checked().slots()[&ProgramUseRef { arena: ProgramExpressionArena::Main, use_id: snapshot.bindings()[&rf] }], ProgramLexicalSource::Input(ProgramChannelSite::Layout { node, role: ProgramChannelLayoutRole::JoinLeft, ordinal: 0 }) if node == join)
+            // The consumer reuses the admitted probe occurrence and its exact input scope.
+            let (unit, root) = crate::test_units::compiled_root(&program, site.expr_id);
+            let binding = unit.input(root.use_id).expect("direct probe input");
+            assert_eq!(binding.ordinal, 0);
+            assert_eq!(binding.scope, root.scope);
+            assert_eq!(
+                unit.scope(binding.scope).unwrap().schema().as_ref(),
+                left_layout.schema().as_ref()
             );
         }
         let mut requirements = filter_requirements(&program);

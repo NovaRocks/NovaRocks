@@ -16,7 +16,9 @@
 // under the License.
 
 use super::*;
-use novarocks_local_program::StaticExprKind;
+use crate::exec::expr::compiled_program::checked_constants;
+use novarocks_expression::StaticExprKind;
+use novarocks_type_contract::RegionGuard;
 
 #[derive(Clone, Copy)]
 enum CaseKind {
@@ -26,12 +28,25 @@ enum CaseKind {
     DeferredRandom,
     ErrorThen,
 }
-fn literal_i64(builder: &mut FragmentBuilder, value: i64) -> ExprId {
+fn literal_i64(
+    builder: &mut FragmentBuilder,
+    value: i64,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
+) -> ExprId {
     builder
-        .add_expression(
-            NodeId::new(0),
-            FunctionValueType::new(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Int64(value)),
+        .unit(NodeId::new(0))
+        .unwrap()
+        .add(
+            None,
+            (FunctionValueType::new(DataType::Int64, false)).clone(),
+            checked_constants::kind(
+                source_pools,
+                checked_constants::i64(
+                    &(FunctionValueType::new(DataType::Int64, false)),
+                    value,
+                    options().constants,
+                ),
+            ),
         )
         .unwrap()
 }
@@ -39,9 +54,10 @@ fn constant_rand(
     builder: &mut FragmentBuilder,
     authors: &mut BTreeMap<ExprId, Author>,
     functions: &PureEngineFunctionCatalog,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> ExprId {
     let ty = FunctionValueType::new(DataType::Int64, false);
-    let seed = literal_i64(builder, 42);
+    let seed = literal_i64(builder, 42, source_pools);
     call(
         builder,
         authors,
@@ -59,8 +75,9 @@ fn rounded(
     authors: &mut BTreeMap<ExprId, Author>,
     functions: &PureEngineFunctionCatalog,
     value: ExprId,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> ExprId {
-    let digits = literal_i64(builder, -1);
+    let digits = literal_i64(builder, -1, source_pools);
     call(
         builder,
         authors,
@@ -80,6 +97,7 @@ fn rounded(
     )
 }
 fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let fragment_id = FragmentId::new(199);
     let source = NodeId::new(u32::MAX);
@@ -104,16 +122,30 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
+            .unwrap();
+        let root = builder
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *id,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr { node: input, root },
             })
             .unwrap();
-        items.push((expr, *id));
+        items.push((root, *id));
     }
     builder
         .add_project(
@@ -128,18 +160,22 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
         )
         .unwrap();
     let when_first = builder
-        .add_expression(output, boolean.clone(), ExprKind::Value(first))
+        .unit(output)
+        .unwrap()
+        .add(None, boolean.clone(), ExprKind::Value(first))
         .unwrap();
     let mut authors = BTreeMap::new();
     let (when_second, then_first, then_second, otherwise, result_type) = match kind {
         CaseKind::Priority | CaseKind::NoElse => {
             let when_second = builder
-                .add_expression(output, boolean, ExprKind::Value(second))
+                .unit(output)
+                .unwrap()
+                .add(None, boolean, ExprKind::Value(second))
                 .unwrap();
-            let first = literal_i64(&mut builder, 11);
-            let second = literal_i64(&mut builder, 22);
+            let first = literal_i64(&mut builder, 11, &mut source_pools);
+            let second = literal_i64(&mut builder, 22, &mut source_pools);
             let otherwise = if matches!(kind, CaseKind::Priority) {
-                Some(literal_i64(&mut builder, 33))
+                Some(literal_i64(&mut builder, 33, &mut source_pools))
             } else {
                 None
             };
@@ -154,12 +190,22 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
         CaseKind::Random | CaseKind::DeferredRandom => {
             let when_second = if matches!(kind, CaseKind::DeferredRandom) {
                 let value = builder
-                    .add_expression(output, decimal.clone(), ExprKind::Value(decimal_value))
+                    .unit(output)
+                    .unwrap()
+                    .add(None, decimal.clone(), ExprKind::Value(decimal_value))
                     .unwrap();
-                let round = rounded(&mut builder, &mut authors, &functions, value);
+                let round = rounded(
+                    &mut builder,
+                    &mut authors,
+                    &functions,
+                    value,
+                    &mut source_pools,
+                );
                 builder
-                    .add_expression(
-                        output,
+                    .unit(output)
+                    .unwrap()
+                    .add(
+                        None,
                         FunctionValueType::new(DataType::Boolean, false),
                         ExprKind::IsNull {
                             expr: round,
@@ -169,12 +215,15 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
                     .unwrap()
             } else {
                 builder
-                    .add_expression(output, boolean, ExprKind::Value(second))
+                    .unit(output)
+                    .unwrap()
+                    .add(None, boolean, ExprKind::Value(second))
                     .unwrap()
             };
-            let first = constant_rand(&mut builder, &mut authors, &functions);
-            let second = constant_rand(&mut builder, &mut authors, &functions);
-            let otherwise = constant_rand(&mut builder, &mut authors, &functions);
+            let first = constant_rand(&mut builder, &mut authors, &functions, &mut source_pools);
+            let second = constant_rand(&mut builder, &mut authors, &functions, &mut source_pools);
+            let otherwise =
+                constant_rand(&mut builder, &mut authors, &functions, &mut source_pools);
             (
                 when_second,
                 first,
@@ -185,14 +234,26 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
         }
         CaseKind::ErrorThen => {
             let when_second = builder
-                .add_expression(output, boolean, ExprKind::Value(second))
+                .unit(output)
+                .unwrap()
+                .add(None, boolean, ExprKind::Value(second))
                 .unwrap();
             let value = builder
-                .add_expression(output, decimal.clone(), ExprKind::Value(decimal_value))
+                .unit(output)
+                .unwrap()
+                .add(None, decimal.clone(), ExprKind::Value(decimal_value))
                 .unwrap();
-            let first = rounded(&mut builder, &mut authors, &functions, value);
+            let first = rounded(
+                &mut builder,
+                &mut authors,
+                &functions,
+                value,
+                &mut source_pools,
+            );
             let fallback = builder
-                .add_expression(output, decimal.clone(), ExprKind::Value(fallback))
+                .unit(output)
+                .unwrap()
+                .add(None, decimal.clone(), ExprKind::Value(fallback))
                 .unwrap();
             // Repeated definition is allowed, but the THEN and ELSE occurrences
             // must have distinct required-domain uses and independent mappings.
@@ -200,8 +261,10 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
         }
     };
     let case = builder
-        .add_expression(
-            output,
+        .unit(output)
+        .unwrap()
+        .add(
+            None,
             result_type.clone(),
             ExprKind::Case {
                 operand: None,
@@ -210,12 +273,17 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
             },
         )
         .unwrap();
+    let case = builder
+        .unit(output)
+        .unwrap()
+        .root(case, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let result_value = builder
         .add_value(
             result_type.clone(),
             ValueOrigin::Expr {
                 node: output,
-                expr: case,
+                root: case,
             },
         )
         .unwrap();
@@ -227,22 +295,10 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
             Box::from([result_value]),
         )
         .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "searched_case_result".into(),
@@ -251,7 +307,7 @@ fn case_program(kind: CaseKind) -> Arc<LocalProgram> {
             ty: result_type,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, builder, output, &authors, result, source_pools)
 }
 fn case_batch(
     program: &LocalProgram,
@@ -290,10 +346,10 @@ fn rand_bits(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<u64
         .collect()
 }
 fn assert_case_domains(program: &LocalProgram, has_else: bool) {
-    let resolved = program.checked().channels().expressions().resolved_calls();
-    let snapshot = resolved.snapshot();
-    let flow = &snapshot.flows()[&root().arena()];
-    let invocation = &flow.uses()[&snapshot.bindings()[&root()]];
+    let reference = root(program);
+    let unit = program.unit(reference.unit).unwrap();
+    let flow = unit.control_flow();
+    let invocation = &flow.uses()[&unit.root(reference.root).unwrap().use_id];
     assert_eq!(
         invocation.control,
         ControlShape::Case {
@@ -302,7 +358,7 @@ fn assert_case_domains(program: &LocalProgram, has_else: bool) {
             has_else
         }
     );
-    let definitions = &snapshot.roots().arenas()[&root().arena()];
+    let definitions = unit.definitions();
     assert!(
         matches!(definitions.node(invocation.definition).unwrap().kind(),StaticExprKind::Case {has_case_expr:false,has_else_expr,children} if *has_else_expr==has_else && children.len()==4+usize::from(has_else))
     );
@@ -316,7 +372,7 @@ fn assert_case_domains(program: &LocalProgram, has_else: bool) {
                 EvaluationDemand::Value
             }
         );
-        assert_ne!(actual.context.domain, invocation.context.domain);
+        assert_ne!(actual.context.region, invocation.context.region);
         let expected = if ordinal == 4 {
             novarocks_type_contract::GuardKind::CaseElse
         } else if ordinal % 2 == 0 {
@@ -329,8 +385,8 @@ fn assert_case_domains(program: &LocalProgram, has_else: bool) {
             }
         };
         assert_eq!(
-            flow.domains()[&actual.context.domain].guard,
-            Some(DomainGuard {
+            flow.regions()[&actual.context.region].guard,
+            Some(RegionGuard {
                 owner: invocation.context.use_id,
                 kind: expected
             })

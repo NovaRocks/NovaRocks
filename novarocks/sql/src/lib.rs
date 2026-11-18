@@ -52,6 +52,8 @@ pub(crate) mod explain;
 pub(crate) mod planner;
 
 #[cfg(test)]
+pub(crate) mod test_constants;
+#[cfg(test)]
 pub(crate) mod test_value_types;
 
 #[cfg(test)]

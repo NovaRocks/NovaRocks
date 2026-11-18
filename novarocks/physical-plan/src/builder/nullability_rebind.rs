@@ -22,8 +22,8 @@
 
 use super::FragmentBuilder;
 use crate::{
-    AggregateBinding, BoundFunction, BoundTableFunction, ExprId, ExprKind, ExprNode, NodeId,
-    NodeKind, PhysicalCallSite, PhysicalNode, TopNReduction, ValueDef, ValueId, ValueType,
+    AggregateBinding, BoundFunction, BoundTableFunction, NodeId, NodeKind, PhysicalCallSite,
+    PhysicalNode, TopNReduction, ValueDef, ValueId, ValueType,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, ValueTypeError,
@@ -58,6 +58,11 @@ impl FragmentBuilder {
     }
     pub fn construction_values(&self) -> impl ExactSizeIterator<Item = (&ValueId, &ValueDef)> {
         self.values.iter()
+    }
+    /// Read the original node-private definitions during unpublished source
+    /// and nullability journaling. Absence never creates a replacement draft.
+    pub fn construction_unit(&self, node: NodeId) -> Option<&crate::BoundExprSetBuilder> {
+        self.unit_builders.get(&node)
     }
     pub fn construction_node(&self, id: NodeId) -> Option<&PhysicalNode> {
         self.nodes.get(&id)
@@ -130,9 +135,6 @@ impl UnpublishedNullabilityEditor<'_> {
         schema.fields[ordinal].ty = revised;
         Ok(())
     }
-    pub fn expression(&self, id: ExprId) -> Option<&ExprNode> {
-        self.builder.expressions.get(id)
-    }
     pub fn value(&self, id: ValueId) -> Option<&ValueDef> {
         self.builder.values.get(&id)
     }
@@ -164,120 +166,42 @@ impl UnpublishedNullabilityEditor<'_> {
         Ok(())
     }
 
-    pub fn expression_type(
-        &mut self,
-        id: ExprId,
-        expected: &ValueType,
-        revised: ValueType,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), NullabilityRebindError> {
-        let actual =
-            self.builder
-                .expressions
-                .get(id)
-                .ok_or(NullabilityRebindError::Association(
-                    "expression edit names an absent definition",
-                ))?;
-        exact_type(&actual.ty, expected, work)?;
-        root_admission(expected, &revised, work)?;
-        if matches!(
-            actual.kind,
-            ExprKind::FunctionCall { .. } | ExprKind::WindowCall { .. }
-        ) {
-            return Err(NullabilityRebindError::Association(
-                "call type requires its accompanying canonical signature",
-            ));
-        }
-        self.builder
-            .expressions
-            .get_mut_for_construction(id)
-            .expect("checked above")
-            .ty = revised;
-        Ok(())
-    }
-
-    /// Scalar signature and output type change together. SQL must separately
-    /// retain the exact fresh operational request that selected this binding.
-    /// Arguments, use order, identity, lexical scope and intrinsic parameters
-    /// remain in the original node and cannot be replaced through this API.
-    pub fn scalar_signature(
-        &mut self,
-        id: ExprId,
-        expected: &BoundFunction,
-        revised: BoundFunction,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), NullabilityRebindError> {
-        let actual =
-            self.builder
-                .expressions
-                .get(id)
-                .ok_or(NullabilityRebindError::Association(
-                    "scalar edit names an absent definition",
-                ))?;
-        let ExprKind::FunctionCall { function, .. } = &actual.kind else {
-            return Err(NullabilityRebindError::Association(
-                "scalar edit names a different lifecycle",
-            ));
-        };
-        work.step()?;
-        if !binding_equal(function, expected, work)? {
-            return Err(NullabilityRebindError::Association(
-                "scalar earlier binding does not match its actual definition",
-            ));
-        }
-        signature_identity(expected, &revised, work)?;
-        exact_type(&actual.ty, &expected.result_type, work)?;
-        root_admission(&expected.result_type, &revised.result_type, work)?;
-        let actual = self
-            .builder
-            .expressions
-            .get_mut_for_construction(id)
-            .expect("checked above");
-        // Move the one actual selected result and binding. No graph or original
-        // ResultPort is cloned to obtain a second declaration.
-        actual.ty = revised.result_type.clone();
-        let ExprKind::FunctionCall { function, .. } = &mut actual.kind else {
-            unreachable!("checked above")
-        };
-        *function = revised;
-        Ok(())
-    }
     /// Window ordering, frame, distinct/NULL treatment and all argument
     /// occurrences remain in the same node. Only the two actual signatures
     /// are moved after their earlier complete fields have been checked.
     pub fn window_signature(
         &mut self,
-        id: ExprId,
+        site: PhysicalCallSite,
         expected: &BoundFunction,
         expected_aggregate: Option<&AggregateBinding>,
         revised: BoundFunction,
         revised_aggregate: Option<Box<AggregateBinding>>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), NullabilityRebindError> {
-        let actual =
-            self.builder
-                .expressions
-                .get(id)
-                .ok_or(NullabilityRebindError::Association(
-                    "window edit names an absent definition",
-                ))?;
-        let ExprKind::WindowCall {
-            function,
-            aggregate_binding,
-            ..
-        } = &actual.kind
-        else {
+        let PhysicalCallSite::Window { node, call } = site else {
             return Err(NullabilityRebindError::Association(
                 "window edit names a different lifecycle",
             ));
         };
+        let Some(PhysicalNode {
+            kind: NodeKind::Window(spec),
+            ..
+        }) = self.builder.nodes.get(&node)
+        else {
+            return Err(NullabilityRebindError::Association("window node is absent"));
+        };
+        let actual = spec
+            .calls
+            .get(call as usize)
+            .ok_or(NullabilityRebindError::Association("window call is absent"))?;
+        let function = &actual.binding;
+        let aggregate_binding = &actual.aggregate_binding;
         if !binding_equal(function, expected, work)? {
             return Err(NullabilityRebindError::Association(
                 "window earlier binding differs from its actual definition",
             ));
         }
         signature_identity(expected, &revised, work)?;
-        exact_type(&actual.ty, &expected.result_type, work)?;
         root_admission(&expected.result_type, &revised.result_type, work)?;
         match (
             aggregate_binding.as_deref(),
@@ -300,22 +224,18 @@ impl UnpublishedNullabilityEditor<'_> {
                 ));
             }
         }
-        let actual = self
+        let NodeKind::Window(spec) = &mut self
             .builder
-            .expressions
-            .get_mut_for_construction(id)
-            .expect("checked above");
-        actual.ty = revised.result_type.clone();
-        let ExprKind::WindowCall {
-            function,
-            aggregate_binding,
-            ..
-        } = &mut actual.kind
+            .nodes
+            .get_mut(&node)
+            .expect("checked above")
+            .kind
         else {
             unreachable!("checked above")
         };
-        *function = revised;
-        *aggregate_binding = revised_aggregate;
+        let actual = &mut spec.calls[call as usize];
+        actual.binding = revised;
+        actual.aggregate_binding = revised_aggregate;
         Ok(())
     }
 
@@ -573,7 +493,7 @@ fn aggregate_site(site: PhysicalCallSite) -> Result<(NodeId, usize), Nullability
                 NullabilityRebindError::Association("aggregate ordinal is not representable")
             })?,
         )),
-        PhysicalCallSite::Expression(_) | PhysicalCallSite::Table { .. } => Err(
+        PhysicalCallSite::Window { .. } | PhysicalCallSite::Table { .. } => Err(
             NullabilityRebindError::Association("aggregate edit names a non-aggregate site"),
         ),
     }

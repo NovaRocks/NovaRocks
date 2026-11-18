@@ -19,19 +19,40 @@
 use super::*;
 use crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance;
 fn list_fixture(width: usize) -> Fixture {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let fragment_id = FragmentId::new(91);
     let source = NodeId::new(u32::MAX);
     let input = NodeId::new(41);
     let root = NodeId::new(0);
     let mut builder = FragmentBuilder::new(fragment_id);
-    let operands = source_columns(&mut builder, source, input, root);
+    let operands = source_columns(&mut builder, source, input, root, &mut source_pools);
     let order = [operands[2], operands[0], operands[1]];
     let predicates = (0..width)
-        .map(|ordinal| order[ordinal % 3])
+        .map(|ordinal| {
+            builder
+                .unit(root)
+                .unwrap()
+                .root(
+                    order[ordinal % 3],
+                    EvaluationDemand::TruthOnly,
+                    RootScope::Port(0),
+                )
+                .unwrap()
+        })
         .collect::<Vec<_>>()
         .into_boxed_slice();
     builder.add_filter(root, input, predicates).unwrap();
+    let source_pools = super::super::guarded_tests::finish_fixture_units(
+        &functions(),
+        &mut builder,
+        root,
+        &BTreeMap::new(),
+        &SemanticParameters::try_new([]).unwrap(),
+        source_pools,
+        |_, _, children| children,
+    );
     Fixture {
+        constants: source_pools,
         fragment: builder
             .finish_definition(
                 root,
@@ -64,25 +85,20 @@ fn list_program(width: usize) -> Arc<LocalProgram> {
 fn filter_conjunction_actual_repeated_definition_distinct_use_order_and_wide_roots() {
     for width in [3, 4, 320] {
         let program = list_program(width);
-        let node = ProgramNodeId::new(2);
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
+        let ProgramNodeKind::Filter { predicates, .. } =
+            program.graph().nodes()[program.graph().root().index()].kind()
+        else {
+            panic!("actual Filter")
+        };
+        let unit = program.unit(predicates[0].unit).unwrap();
         let mut distinct = BTreeMap::new();
         let mut definitions = vec![];
         for ordinal in 0..width {
-            let site = ProgramExpressionRootSite::Node {
-                node,
-                role: ProgramNodeExpressionRole::FilterPredicate {
-                    predicate: u32::try_from(ordinal).unwrap(),
-                },
-            };
-            let use_id = snapshot.bindings()[&site];
+            let reference = predicates[ordinal];
+            assert_eq!(reference.unit, predicates[0].unit);
+            let use_id = unit.root(reference.root).unwrap().use_id;
             assert!(distinct.insert(use_id, ordinal).is_none());
-            let invocation = &snapshot.flows()[&site.arena()].uses()[&use_id];
+            let invocation = &unit.control_flow().uses()[&use_id];
             assert_eq!(invocation.context.demand, EvaluationDemand::TruthOnly);
             definitions.push(invocation.definition);
         }
@@ -97,9 +113,11 @@ fn filter_conjunction_actual_repeated_definition_distinct_use_order_and_wide_roo
                 vec![Some(true), Some(false), None],
             ],
         );
-        let mut instance =
-            CompiledFilterConjunctionInstance::try_new(Arc::clone(&program), node, &Control)
-                .unwrap();
+        let roots = predicates
+            .iter()
+            .map(|reference| (unit.clone(), reference.root))
+            .collect::<Vec<_>>();
+        let mut instance = CompiledFilterConjunctionInstance::try_new(&roots, &Control).unwrap();
         let actual = instance
             .evaluate_required(&input, Selection::all(3), &Control)
             .unwrap();

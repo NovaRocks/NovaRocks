@@ -20,10 +20,6 @@ use arrow::datatypes::TimeUnit;
 use novarocks_connector_contract as c;
 use novarocks_physical_plan as p;
 use novarocks_proto_models::plan;
-use novarocks_type_contract::{
-    ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Mutex,
@@ -923,13 +919,16 @@ fn change_stream_source(
 ) -> (p::Fragment, p::ValueId, p::SummaryOutput) {
     let mut builder = p::FragmentBuilder::new(p::FragmentId::new(3));
     let input = builder.reserve_node_id().unwrap();
-    let expression = builder
-        .add_expression(
-            input,
-            FunctionValueType::new(DataType::Int64, false),
-            p::ExprKind::Constant(p::ConstantReference { pool, ordinal: 0 }),
-        )
-        .unwrap();
+    let expression = crate::test_constants::pure_root(
+        &mut builder,
+        input,
+        FunctionValueType::new(DataType::Int64, false),
+        novarocks_expression_contract::ExprKind::Constant(p::ConstantReference {
+            pool,
+            ordinal: 0,
+        }),
+        novarocks_expression_contract::RootScope::AllPorts,
+    );
     let value = builder
         .add_value(
             FunctionValueType::new(DataType::Int64, false),
@@ -947,13 +946,13 @@ fn change_stream_source(
         )
         .unwrap();
     let expand = builder.reserve_node_id().unwrap();
-    let assignment = builder
-        .add_expression(
-            expand,
-            FunctionValueType::new(DataType::Int64, false),
-            p::ExprKind::Value(value),
-        )
-        .unwrap();
+    let assignment = crate::test_constants::pure_root(
+        &mut builder,
+        expand,
+        FunctionValueType::new(DataType::Int64, false),
+        novarocks_expression_contract::ExprKind::Value(value),
+        novarocks_expression_contract::RootScope::Port(0),
+    );
     let effect = builder
         .add_value(
             FunctionValueType::new(DataType::Int8, false),
@@ -974,6 +973,7 @@ fn change_stream_source(
         .unwrap();
     builder
         .insert_node_unchecked(p::PhysicalNode {
+            expressions: None,
             id: expand,
             inputs: Box::from([input]),
             required_inputs: Box::from([property(p::Distribution::Unconstrained)]),
@@ -1013,6 +1013,7 @@ fn change_stream_source(
         author: p::SummaryAuthor::RouterSink,
     };
     builder.set_summaries(Box::new([summary]));
+    crate::test_constants::seal_pure_units(&mut builder);
     let fragment = builder
         .finish_definition(
             expand,
@@ -1066,6 +1067,7 @@ fn checked_writer_plan_packages_inner(
     // A real producer/stream/finisher plan, with original cut derivation and
     // full Package publication. There are no aggregate or function calls.
     let pool = p::ConstantPoolId::new(5);
+    let mut literal_sources = p::ConstantPools::empty();
     let ordinal = c::WriteTargetOrdinal::try_new(0).unwrap();
     let edge = p::EdgeId::new(7);
     let route_edge = p::EdgeId::new(8);
@@ -1105,17 +1107,23 @@ fn checked_writer_plan_packages_inner(
         (source, values)
     } else {
         let source = builder.reserve_node_id().unwrap();
-        let expression = builder
-            .add_expression(
-                source,
-                FunctionValueType::new(DataType::Int64, false),
-                if constant_row {
-                    p::ExprKind::Constant(p::ConstantReference { pool, ordinal: 0 })
-                } else {
-                    p::ExprKind::Literal(p::LiteralValue::Int64(42))
-                },
-            )
-            .unwrap();
+        let expression = crate::test_constants::pure_root(
+            &mut builder,
+            source,
+            FunctionValueType::new(DataType::Int64, false),
+            if constant_row {
+                novarocks_expression_contract::ExprKind::Constant(p::ConstantReference {
+                    pool,
+                    ordinal: 0,
+                })
+            } else {
+                crate::test_constants::insert(
+                    &mut literal_sources,
+                    crate::test_constants::i64(42)(&FunctionValueType::new(DataType::Int64, false)),
+                )
+            },
+            novarocks_expression_contract::RootScope::AllPorts,
+        );
         let value = builder
             .add_value(
                 FunctionValueType::new(DataType::Int64, false),
@@ -1127,6 +1135,7 @@ fn checked_writer_plan_packages_inner(
             .unwrap();
         builder
             .insert_node_unchecked(p::PhysicalNode {
+                expressions: None,
                 id: source,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -1168,6 +1177,7 @@ fn checked_writer_plan_packages_inner(
         .collect();
     builder
         .insert_node_unchecked(p::PhysicalNode {
+            expressions: None,
             id: writer,
             inputs: Box::from([source]),
             required_inputs: Box::from([property(p::Distribution::Singleton)]),
@@ -1192,6 +1202,7 @@ fn checked_writer_plan_packages_inner(
             },
         })
         .unwrap();
+    crate::test_constants::seal_pure_units(&mut builder);
     let producer = builder
         .finish_definition(
             writer,
@@ -1224,6 +1235,7 @@ fn checked_writer_plan_packages_inner(
         .collect::<Box<[_]>>();
     builder
         .insert_node_unchecked(p::PhysicalNode {
+            expressions: None,
             id: exchange,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1281,6 +1293,7 @@ fn checked_writer_plan_packages_inner(
     let outputs = relation_fields(&mut builder, finish, true);
     builder
         .insert_node_unchecked(p::PhysicalNode {
+            expressions: None,
             id: finish,
             inputs: std::iter::once(exchange)
                 .chain(summary_input.map(|(node, _)| node))
@@ -1334,7 +1347,13 @@ fn checked_writer_plan_packages_inner(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = p::PlanBuilder::new(p::PlanVersionId::try_new([1; 16]).unwrap());
+    let mut plan = p::PlanBuilder::new(
+        p::PlanVersionId::try_new([1; 16]).unwrap(),
+        crate::test_constants::policy(),
+    );
+    for (&id, pool) in literal_sources.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     if constant_row {
         plan.insert_constant_pool(
             pool,
@@ -1454,62 +1473,9 @@ fn checked_writer_plan_packages_inner(
     })
     .unwrap();
     let plan = plan.finish_observed(&Setup).unwrap();
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (id, fragment) in plan.fragments() {
-        let roots = p::PhysicalExpressionRoots::try_new(fragment, &Setup).unwrap();
-        let bindings = roots
-            .sites()
-            .iter()
-            .enumerate()
-            .map(|(ordinal, (site, _))| (*site, ExpressionUseId::new(ordinal as u32)))
-            .collect::<Vec<_>>();
-        let invocations = roots
-            .sites()
-            .iter()
-            .enumerate()
-            .map(|(ordinal, (_, root))| {
-                assert!(matches!(
-                    fragment.expressions().get(root.expr).unwrap().kind,
-                    p::ExprKind::Literal(_) | p::ExprKind::Constant(_) | p::ExprKind::Value(_)
-                ));
-                ExpressionInvocation {
-                    context: ExpressionEffectContext {
-                        use_id: ExpressionUseId::new(ordinal as u32),
-                        domain: EvaluationDomainId::new(0),
-                        demand: root.demand,
-                    },
-                    definition: root.expr,
-                    control: ControlShape::Eager,
-                    arguments: Box::default(),
-                }
-            })
-            .collect::<Vec<_>>();
-        let domains = if invocations.is_empty() {
-            vec![]
-        } else {
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
-                parent: None,
-                guard: None,
-            }]
-        };
-        let flow = ExpressionControlFlow::try_new(
-            domains,
-            invocations,
-            fragment.expressions(),
-            CompilePhase::Validate,
-            &Setup,
-        )
-        .unwrap();
-        let actual = p::PhysicalRootUses::try_new(fragment, flow, bindings, &Setup).unwrap();
-        calls.insert(
-            *id,
-            p::FrozenFragmentCalls::try_new(fragment, &actual, vec![], &Setup).unwrap(),
-        );
-        uses.insert(*id, actual);
+    for id in plan.fragments().keys() {
         pruning.insert(
             *id,
             p::FrozenFragmentPruning::try_new(*id, vec![], &Setup).unwrap(),
@@ -1531,8 +1497,6 @@ fn checked_writer_plan_packages_inner(
         &plan,
         &BTreeMap::new(),
         &BTreeMap::from([(ordinal, recipe)]),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &Setup,

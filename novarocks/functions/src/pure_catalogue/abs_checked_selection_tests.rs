@@ -20,7 +20,7 @@ use arrow_array::{Array, ArrayRef, Int32Array, Int64Array};
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, SemanticParameterId,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameters, ValueSchemaCreationScope,
     ValueTypeStorageHold, ValueTypeStorageLifetime,
 };
@@ -198,13 +198,13 @@ impl Fixture {
     fn context(&self) -> ExpressionEffectContext {
         ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         }
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: self.context(),
+            context: (self.context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Scalar,
@@ -217,7 +217,7 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(self.context().domain),
+            proof_scope: CallProofScope::Region(self.context().region),
         }
     }
     fn options(&self) -> PureCallPreparation {
@@ -314,7 +314,7 @@ fn abs_checked_registered_adapter_preserves_actual_fresh_frozen_values_and_exact
     assert_eq!(sealed.source(), PurePreparationSource::Frozen);
     assert_original_abs_values(&sealed);
     let mut inaccurate = frozen;
-    inaccurate.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(8));
+    inaccurate.proof_scope = CallProofScope::Region(EvaluationRegionId::new(8));
     assert!(matches!(
         fixture.catalog.prepare_frozen_selected(
             fixture.input(),
@@ -419,8 +419,20 @@ fn abs_checked_loan_keeps_exact_original_input_catalogue_registered_owner_and_po
     for fault in 0..13 {
         let mut input = fixture.input();
         match fault {
-            0 => input.context.use_id = ExpressionUseId::new(43),
-            1 => input.context.domain = EvaluationDomainId::new(8),
+            0 => {
+                input.context = novarocks_type_contract::ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(43),
+                    ..input.context.expression().unwrap()
+                }
+                .into()
+            }
+            1 => {
+                input.context = novarocks_type_contract::ExpressionEffectContext {
+                    region: EvaluationRegionId::new(8),
+                    ..input.context.expression().unwrap()
+                }
+                .into()
+            }
             2 => input.argument_uses = crate::CallArgumentUses::SelectedChannels(&copied_uses),
             3 => input.function_id = &copied_function,
             4 => input.kind = FunctionKind::Window,
@@ -449,7 +461,7 @@ fn abs_checked_loan_keeps_exact_original_input_catalogue_registered_owner_and_po
     // The loan does not certify refinement: legitimate original ABS proof/env
     // guards still execute after successful full signature admission.
     let mut invalid = fixture.input();
-    invalid.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(8));
+    invalid.proof_scope = CallProofScope::Region(EvaluationRegionId::new(8));
     assert!(
         fixture
             .catalog

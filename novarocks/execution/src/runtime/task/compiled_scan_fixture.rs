@@ -38,6 +38,7 @@ use bytes::Bytes;
 use futures::Stream;
 use futures::future::BoxFuture;
 use novarocks_connector_contract::*;
+use novarocks_expression_contract::{BinaryOperator, ExprKind, RootOrdinal, RootScope};
 use novarocks_functions::ConstantPolicy;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
@@ -46,10 +47,8 @@ use novarocks_local_program::{KernelAbiVersion, LocalProgram};
 use novarocks_physical_plan::*;
 use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, PureCompileControl,
-    control_argument_semantics,
+    CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
+    PureCompileControl,
 };
 
 use crate::exec::chunk::Chunk;
@@ -247,7 +246,7 @@ fn typed_frozen_read_with_distribution(
 
 /// A real physical Scan under exactly the same frozen fixture provider facts.
 pub(crate) fn add_typed_scan(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     types: &[ValueType],
     dynamic_filters: Vec<StaticScanDynamicFilter>,
@@ -256,11 +255,14 @@ pub(crate) fn add_typed_scan(
 }
 
 pub(crate) fn add_typed_scan_with_residual(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     types: &[ValueType],
     dynamic_filters: Vec<StaticScanDynamicFilter>,
-    residual: impl FnOnce(&mut FragmentBuilder, &[ValueId]) -> Box<[ExprId]>,
+    residual: impl FnOnce(
+        &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+        &[ValueId],
+    ) -> Box<[RootOrdinal]>,
 ) -> (Vec<ValueId>, FrozenConnectorRead) {
     // This scripted source declares one physical stream, as the original
     // ordered Scan compiler fixture does. Partial driver DOP stays explicit.
@@ -335,6 +337,8 @@ pub(crate) fn add_typed_scan_with_residual(
 /// Compile the fixture fragment for `dop` drivers, with or without the
 /// `v0 > 7` residual.
 pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let binding = binding();
     let relation_payload = ConnectorReadRelationPayload::new(
         ConnectorReadRelationKind::Table,
@@ -344,7 +348,11 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
     let columns = [b"c0" as &'static [u8], b"c1"].map(|bytes| ProviderColumnReference {
         column_payload: payload(&binding, ConnectorCodecCategory::ReadColumn, bytes),
     });
-    let mut builder = FragmentBuilder::new(FRAGMENT);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FRAGMENT,
+            &fixture_sources,
+        );
     let provider = columns
         .iter()
         .map(|column| {
@@ -362,24 +370,35 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
     let mut residuals = Vec::new();
     if residual {
         let column = builder
-            .add_expression(SCAN, int64(), ExprKind::Value(provider[0]))
+            .unit(SCAN)
+            .unwrap()
+            .add(None, int64(), ExprKind::Value(provider[0]))
             .unwrap();
-        let literal = builder
-            .add_expression(SCAN, int64(), ExprKind::Literal(LiteralValue::Int64(7)))
+        let literal = builder.constant(
+            SCAN,
+            int64(),
+            crate::exec::operators::family_fixture::constant_sources::i64(7),
+        );
+        let predicate = builder
+            .unit(SCAN)
+            .unwrap()
+            .add(
+                None,
+                boolean(),
+                ExprKind::Binary {
+                    left: column,
+                    op: BinaryOperator::Gt,
+                    right: literal,
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    allow_throw_exception: None,
+                },
+            )
             .unwrap();
         residuals.push(
             builder
-                .add_expression(
-                    SCAN,
-                    boolean(),
-                    ExprKind::Binary {
-                        left: column,
-                        op: BinaryOperator::Gt,
-                        right: literal,
-                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                        allow_throw_exception: None,
-                    },
-                )
+                .unit(SCAN)
+                .unwrap()
+                .root(predicate, EvaluationDemand::TruthOnly, RootScope::Port(0))
                 .unwrap(),
         );
     }
@@ -442,14 +461,21 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
     let mut projected = Vec::new();
     for &input in [provider[1], provider[0]].iter() {
         let expr = builder
-            .add_expression(PROJECT, int64(), ExprKind::Value(input))
+            .unit(PROJECT)
+            .unwrap()
+            .add(None, int64(), ExprKind::Value(input))
+            .unwrap();
+        let expr = builder
+            .unit(PROJECT)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         let output = builder
             .add_value(
                 int64(),
                 ValueOrigin::Expr {
                     node: PROJECT,
-                    expr,
+                    root: expr,
                 },
             )
             .unwrap();
@@ -464,6 +490,21 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
             projected.clone().into_boxed_slice(),
         )
         .unwrap();
+    crate::exec::operators::family_fixture::seal_no_call_units(&mut builder);
+    if residual {
+        let unit = builder
+            .construction_node(SCAN)
+            .unwrap()
+            .expressions
+            .as_ref()
+            .unwrap();
+        assert!(
+            unit.control_flow()
+                .regions()
+                .values()
+                .all(|region| region.guard.is_none())
+        );
+    }
     let fragment = builder
         .finish_definition(
             PROJECT,
@@ -477,7 +518,10 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        &fixture_sources,
+    );
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
@@ -499,24 +543,18 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
             .collect(),
     })
     .unwrap();
-    let plan = plan.finish().unwrap();
+    let plan = plan
+        .finish_observed(&crate::exec::operators::family_fixture::constant_sources::control())
+        .unwrap();
 
     let scans = BTreeMap::from([(
         ProviderReadOccurrenceId::new(0),
         typed_frozen_read(&[int64(), int64()], vec![]),
     )]);
 
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let root_uses = root_uses(fragment);
-        calls.insert(
-            id,
-            FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &FixtureControl).unwrap(),
-        );
-        uses.insert(id, root_uses);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
@@ -527,8 +565,6 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
         &plan,
         &scans,
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,
@@ -541,78 +577,6 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
         compile_fragment(validated, &functions, options(dop), &FixtureControl)
             .unwrap_or_else(|error| panic!("the scan fixture compiles: {error}")),
     )
-}
-
-/// One complete eager use tree per physical root site in one root domain.
-pub(crate) fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
-    struct Author<'a> {
-        fragment: &'a Fragment,
-        next: u32,
-        uses: Vec<ExpressionInvocation<ExprId>>,
-    }
-    impl Author<'_> {
-        fn visit(&mut self, expr: ExprId, demand: EvaluationDemand) -> ExpressionUseId {
-            let id = ExpressionUseId::new(self.next);
-            self.next += 1;
-            let args = match &self.fragment.expressions().get(expr).unwrap().kind {
-                ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Literal(_) | ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
-                _ => panic!(
-                    "the scan fixture has only binary expressions, values, literals and constants"
-                ),
-            };
-            let arguments = args
-                .iter()
-                .enumerate()
-                .map(|(ordinal, &child)| {
-                    let (child_demand, guard) = control_argument_semantics(
-                        ControlShape::Eager,
-                        args.len(),
-                        ordinal,
-                        demand,
-                    )
-                    .unwrap();
-                    assert!(guard.is_none());
-                    self.visit(child, child_demand)
-                })
-                .collect::<Box<[_]>>();
-            self.uses.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id: id,
-                    domain: EvaluationDomainId::new(0),
-                    demand,
-                },
-                definition: expr,
-                control: ControlShape::Eager,
-                arguments,
-            });
-            id
-        }
-    }
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let mut author = Author {
-        fragment,
-        next: 0,
-        uses: vec![],
-    };
-    let bindings = roots
-        .sites()
-        .iter()
-        .map(|(&site, root)| (site, author.visit(root.expr, root.demand)))
-        .collect();
-    let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        author.uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap()
 }
 
 // Conservative retained-source invoice and independent projection ceilings for

@@ -159,7 +159,6 @@ fn definition(
 ) -> wire::ExpressionDefinition {
     wire::ExpressionDefinition {
         id,
-        owner_node_id: Some(u32::MAX),
         lambda_scope_expr_id: None,
         value_type_id: Some(ty),
         kind: Some(kind),
@@ -346,6 +345,7 @@ impl Fixture {
         .unwrap();
         let expressions = super::super::decode_expression_definitions(
             defs,
+            &[],
             &values,
             &fh,
             &ah,
@@ -368,20 +368,20 @@ impl Fixture {
             }),
         );
         parameter.lambda_scope_expr_id = Some(13);
-        vec![
+        let mut definitions = vec![
             definition(
                 6,
                 1,
                 K::FunctionCall(wire::FunctionCall {
                     function_binding_id: Some(u32::MAX),
-                    argument_expr_ids: vec![u32::MAX, 13],
+                    argument_expr_ids: vec![16, 13],
                 }),
             ),
-            definition(u32::MAX, 0, K::ValueId(0)),
+            definition(16, 0, K::ValueId(0)),
             definition(
                 0,
                 1,
-                K::Literal(wire::ConstantReference {
+                K::Constant(wire::ConstantReference {
                     pool_id: Some(u32::MAX),
                     row_ordinal: 1,
                 }),
@@ -399,7 +399,7 @@ impl Fixture {
                 1,
                 K::Binary(wire::BinaryExpression {
                     left_expr_id: Some(0),
-                    right_expr_id: Some(u32::MAX),
+                    right_expr_id: Some(16),
                     op: wire::BinaryOperator::Add as i32,
                     decimal_overflow_policy: semantics::DecimalOverflowPolicy::OutputNull as i32,
                     allow_throw_exception: Some(allow()),
@@ -432,7 +432,7 @@ impl Fixture {
                 8,
                 1,
                 K::Cast(wire::CastExpression {
-                    expr_id: Some(u32::MAX),
+                    expr_id: Some(16),
                     target_carrier_type_id: Some(self.carrier_i64),
                     decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
                     allow_throw_exception: Some(allow()),
@@ -442,8 +442,8 @@ impl Fixture {
                 9,
                 3,
                 K::InList(wire::InListExpression {
-                    expr_id: Some(u32::MAX),
-                    list_expr_ids: vec![0, u32::MAX, 0],
+                    expr_id: Some(16),
+                    list_expr_ids: vec![0, 16, 0],
                     negated: true,
                 }),
             ),
@@ -453,7 +453,7 @@ impl Fixture {
                 K::Between(wire::BetweenExpression {
                     expr_id: Some(0),
                     low_expr_id: Some(0),
-                    high_expr_id: Some(u32::MAX),
+                    high_expr_id: Some(16),
                     negated: false,
                 }),
             ),
@@ -461,8 +461,8 @@ impl Fixture {
                 11,
                 3,
                 K::Like(wire::LikeExpression {
-                    expr_id: Some(19),
-                    pattern_expr_id: Some(19),
+                    expr_id: Some(15),
+                    pattern_expr_id: Some(15),
                     negated: true,
                 }),
             ),
@@ -475,7 +475,7 @@ impl Fixture {
                         when_expr_id: Some(4),
                         then_expr_id: Some(0),
                     }],
-                    else_expr_id: Some(u32::MAX),
+                    else_expr_id: Some(16),
                 }),
             ),
             definition(
@@ -495,44 +495,10 @@ impl Fixture {
                     negated: false,
                 }),
             ),
-            definition(
-                15,
-                1,
-                K::WindowCall(wire::WindowCall {
-                    function_binding_id: Some(0),
-                    argument_expr_ids: vec![u32::MAX],
-                    frame: None,
-                    ..Default::default()
-                }),
-            ),
-            definition(
-                16,
-                1,
-                K::WindowCall(wire::WindowCall {
-                    function_binding_id: Some(9),
-                    argument_expr_ids: vec![u32::MAX, 0],
-                    function_order_by: vec![wire::SortExpression {
-                        expr_id: Some(0),
-                        direction: wire::SortDirection::Descending as i32,
-                        null_ordering: wire::NullOrdering::Last as i32,
-                    }],
-                    frame: Some(wire::WindowFrame {
-                        units: wire::WindowFrameUnits::Groups as i32,
-                        exclusion: wire::WindowFrameExclusion::Ties as i32,
-                        start: Some(wire::WindowBound {
-                            kind: Some(wire::window_bound::Kind::PrecedingExprId(0)),
-                        }),
-                        end: Some(wire::WindowBound {
-                            kind: Some(wire::window_bound::Kind::FollowingExprId(u32::MAX)),
-                        }),
-                    }),
-                    ignore_nulls: true,
-                    aggregate_binding_id: Some(u32::MAX),
-                    ..Default::default()
-                }),
-            ),
-            definition(19, 6, K::ValueId(1)),
-        ]
+            definition(15, 6, K::ValueId(1)),
+        ];
+        definitions.sort_by_key(|definition| definition.id);
+        definitions
     }
 }
 fn small() -> Vec<wire::ExpressionDefinition> {
@@ -542,10 +508,10 @@ fn small() -> Vec<wire::ExpressionDefinition> {
             0,
             wire::expression_definition::Kind::Unary(wire::UnaryExpression {
                 op: wire::UnaryOperator::Plus as i32,
-                expr_id: Some(u32::MAX),
+                expr_id: Some(1),
             }),
         ),
-        definition(u32::MAX, 0, wire::expression_definition::Kind::ValueId(0)),
+        definition(1, 0, wire::expression_definition::Kind::ValueId(0)),
     ]
 }
 fn golden() -> Vec<wire::ExpressionDefinition> {
@@ -554,21 +520,21 @@ fn golden() -> Vec<wire::ExpressionDefinition> {
         definition(
             0,
             1,
-            K::Literal(wire::ConstantReference {
+            K::Constant(wire::ConstantReference {
                 pool_id: Some(u32::MAX),
                 row_ordinal: 1,
             }),
         ),
-        definition(u32::MAX, 0, K::ValueId(0)),
+        definition(1, 0, K::ValueId(0)),
         definition(
-            3,
+            2,
             3,
             K::Conjunction(wire::ExpressionIds {
-                expr_ids: vec![0, u32::MAX],
+                expr_ids: vec![0, 1],
             }),
         ),
         definition(
-            13,
+            3,
             1,
             K::Lambda(wire::LambdaExpression {
                 parameter_value_type_ids: vec![5, 4],
@@ -577,7 +543,10 @@ fn golden() -> Vec<wire::ExpressionDefinition> {
         ),
     ]
 }
-fn owned(f: &Fixture, defs: &[wire::ExpressionDefinition]) -> p::ExprArena {
+fn owned(
+    f: &Fixture,
+    defs: &[wire::ExpressionDefinition],
+) -> Box<[novarocks_expression_contract::ExprNode]> {
     let control = Control::default();
     f.with_tokens(defs, &control, |e, fs, ags| {
         materialize_expressions(
@@ -592,79 +561,82 @@ fn owned(f: &Fixture, defs: &[wire::ExpressionDefinition]) -> p::ExprArena {
             .unwrap(),
         )
         .unwrap()
-        .into_arena()
+        .into_definitions()
     })
 }
 
 #[test]
-fn owned_expressions_materialize_all_seventeen_kinds_with_independent_payload_oracles() {
+fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_payload_oracles() {
     let control = Control::default();
     let f = Fixture::new(&control);
     let defs = f.all();
     let arena = owned(&f, &defs);
-    assert_eq!(arena.len(), 19);
+    assert_eq!(arena.len(), 17);
     let id = p::ExprId::new;
-    let get = |i| &arena.get(id(i)).unwrap().kind;
+    let get = |i: u32| &arena[i as usize].kind;
     let allow = novarocks_type_contract::SemanticParameterRef {
         id: SemanticParameterId::new(0),
         expected_key: SemanticParameterKey::AllowThrowException,
     };
     for (i, expected) in [
-        (u32::MAX, p::ExprKind::Value(p::ValueId::new(0))),
+        (
+            16,
+            novarocks_expression_contract::ExprKind::Value(p::ValueId::new(0)),
+        ),
         (
             0,
-            p::ExprKind::Constant(p::ConstantReference {
+            novarocks_expression_contract::ExprKind::Constant(p::ConstantReference {
                 pool: p::ConstantPoolId::new(u32::MAX),
                 ordinal: 1,
             }),
         ),
         (
             1,
-            p::ExprKind::Unary {
-                op: p::UnaryOperator::Plus,
+            novarocks_expression_contract::ExprKind::Unary {
+                op: novarocks_expression_contract::UnaryOperator::Plus,
                 expr: id(0),
             },
         ),
         (
             2,
-            p::ExprKind::Binary {
+            novarocks_expression_contract::ExprKind::Binary {
                 left: id(0),
-                op: p::BinaryOperator::Add,
-                right: id(u32::MAX),
+                op: novarocks_expression_contract::BinaryOperator::Add,
+                right: id(16),
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                 allow_throw_exception: Some(allow),
             },
         ),
         (
             3,
-            p::ExprKind::Conjunction {
+            novarocks_expression_contract::ExprKind::Conjunction {
                 args: Box::from([id(4), id(4)]),
             },
         ),
         (
             4,
-            p::ExprKind::IsNull {
+            novarocks_expression_contract::ExprKind::IsNull {
                 expr: id(0),
                 negated: false,
             },
         ),
         (
             5,
-            p::ExprKind::Disjunction {
+            novarocks_expression_contract::ExprKind::Disjunction {
                 args: Box::from([id(4), id(4)]),
             },
         ),
         (
             7,
-            p::ExprKind::LambdaParameter {
+            novarocks_expression_contract::ExprKind::LambdaParameter {
                 lambda: id(13),
                 ordinal: 0,
             },
         ),
         (
             8,
-            p::ExprKind::Cast {
-                expr: id(u32::MAX),
+            novarocks_expression_contract::ExprKind::Cast {
+                expr: id(16),
                 target: DataType::Int64,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                 allow_throw_exception: allow,
@@ -672,47 +644,47 @@ fn owned_expressions_materialize_all_seventeen_kinds_with_independent_payload_or
         ),
         (
             9,
-            p::ExprKind::InList {
-                expr: id(u32::MAX),
-                list: Box::from([id(0), id(u32::MAX), id(0)]),
+            novarocks_expression_contract::ExprKind::InList {
+                expr: id(16),
+                list: Box::from([id(0), id(16), id(0)]),
                 negated: true,
             },
         ),
         (
             10,
-            p::ExprKind::Between {
+            novarocks_expression_contract::ExprKind::Between {
                 expr: id(0),
                 low: id(0),
-                high: id(u32::MAX),
+                high: id(16),
                 negated: false,
             },
         ),
         (
             11,
-            p::ExprKind::Like {
-                expr: id(19),
-                pattern: id(19),
+            novarocks_expression_contract::ExprKind::Like {
+                expr: id(15),
+                pattern: id(15),
                 negated: true,
             },
         ),
         (
             12,
-            p::ExprKind::Case {
+            novarocks_expression_contract::ExprKind::Case {
                 operand: None,
                 when_then: Box::from([(id(4), id(0))]),
-                else_expr: Some(id(u32::MAX)),
+                else_expr: Some(id(16)),
             },
         ),
         (
             13,
-            p::ExprKind::Lambda {
+            novarocks_expression_contract::ExprKind::Lambda {
                 parameter_types: Box::from([FunctionValueType::new(DataType::Int64, true)]),
                 body: id(7),
             },
         ),
         (
             14,
-            p::ExprKind::IsTruthValue {
+            novarocks_expression_contract::ExprKind::IsTruthValue {
                 expr: id(4),
                 value: true,
                 negated: false,
@@ -721,10 +693,10 @@ fn owned_expressions_materialize_all_seventeen_kinds_with_independent_payload_or
     ] {
         assert_eq!(*get(i), expected);
     }
-    let p::ExprKind::FunctionCall { function, args } = get(6) else {
+    let novarocks_expression_contract::ExprKind::FunctionCall { function, args } = get(6) else {
         panic!("FunctionCall")
     };
-    assert_eq!(&**args, &[id(u32::MAX), id(13)]);
+    assert_eq!(&**args, &[id(16), id(13)]);
     assert_eq!(function.function_id.as_str(), "original/function");
     assert!(function.legacy_metadata.is_none());
     assert_eq!(
@@ -743,71 +715,15 @@ fn owned_expressions_materialize_all_seventeen_kinds_with_independent_payload_or
         &[FunctionValueType::new(DataType::Int64, true)]
     );
     assert_eq!(*result_type, FunctionValueType::new(DataType::Int64, true));
-    let p::ExprKind::WindowCall {
-        frame,
-        aggregate_binding,
-        ignore_nulls,
-        ..
-    } = get(15)
-    else {
-        panic!("Window")
-    };
-    assert!(frame.is_none());
-    assert!(aggregate_binding.is_none());
-    assert!(!ignore_nulls);
-    let p::ExprKind::WindowCall {
-        function,
-        args,
-        function_order_by,
-        frame,
-        aggregate_binding,
-        ignore_nulls,
-        distinct,
-    } = get(16)
-    else {
-        panic!("Aggregate Window")
-    };
-    assert!(function.legacy_metadata.is_none());
-    assert!(!distinct);
-    assert!(ignore_nulls);
-    assert_eq!(&**args, &[id(u32::MAX), id(0)]);
-    assert_eq!(
-        &**function_order_by,
-        &[p::SortExpr {
-            expr: id(0),
-            direction: p::SortDirection::Descending,
-            null_ordering: p::NullOrdering::Last
-        }]
-    );
-    assert_eq!(
-        *frame,
-        Some(p::WindowFrame {
-            units: p::WindowFrameUnits::Groups,
-            exclusion: p::WindowFrameExclusion::Ties,
-            start: p::WindowBound::Preceding(id(0)),
-            end: p::WindowBound::Following(id(u32::MAX))
-        })
-    );
-    let a = aggregate_binding.as_ref().unwrap();
-    assert_eq!(a.phase, p::AggregatePhase::Single);
-    assert_eq!(a.state_format.as_str(), "original-state/v1");
-    assert_eq!(a.logical_argument_count, 1);
-    assert_eq!(
-        a.state_argument_contract,
-        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature
-    );
-    assert!(a.function.legacy_metadata.is_none());
-    assert_eq!(a.intermediate_type, *f.types.value_type(5).unwrap());
     for raw in &defs {
-        let node = arena.get(id(raw.id)).unwrap();
-        assert_eq!(node.owner, p::NodeId::new(u32::MAX));
+        let node = arena.get(raw.id as usize).unwrap();
         assert_eq!(node.lambda_scope, raw.lambda_scope_expr_id.map(id));
         assert_eq!(
             node.ty,
             *f.types.value_type(raw.value_type_id.unwrap()).unwrap()
         );
     }
-    assert_eq!(arena.get(id(7)).unwrap().lambda_scope, Some(id(13)));
+    assert_eq!(arena.get(7).unwrap().lambda_scope, Some(id(13)));
     let pool = f
         .pools
         .entries()
@@ -816,24 +732,8 @@ fn owned_expressions_materialize_all_seventeen_kinds_with_independent_payload_or
     assert_eq!(pool.field().name(), "original-pool");
 }
 
-fn independent_tree_layout() -> Layout {
-    let key = Layout::new::<p::ExprId>();
-    let value = Layout::new::<p::ExprNode>();
-    let ptr = Layout::new::<usize>();
-    let align = key.align().max(value.align()).max(ptr.align());
-    // Locked source five leaf fields plus the internal edge-array padding.
-    let bytes = ptr.size()
-        + 4
-        + 11 * (key.size() + value.size())
-        + 5 * (align - 1)
-        + 12 * ptr.size()
-        + (align - 1);
-    Layout::from_size_align(bytes, align)
-        .unwrap()
-        .pad_to_align()
-}
 #[test]
-fn owned_expression_requests_have_independent_stage_tree_dictionary_and_list_layout_oracle() {
+fn owned_expression_requests_have_independent_dense_slice_dictionary_and_list_layout_oracle() {
     let control = Control::default();
     let f = Fixture::new(&control);
     let defs = golden();
@@ -848,15 +748,15 @@ fn owned_expression_requests_have_independent_stage_tree_dictionary_and_list_lay
         )
         .unwrap();
         let facts = *prepared.facts();
-        let node = independent_tree_layout();
-        let bytes = Layout::array::<p::ExprNode>(4).unwrap().size()
-            + 4 * node.size()
+        let bytes = 2 * Layout::array::<novarocks_expression_contract::ExprNode>(4)
+            .unwrap()
+            .size()
             + 2 * Layout::array::<p::ExprId>(2).unwrap().size()
             + 2 * Layout::array::<FunctionValueType>(2).unwrap().size();
         assert_eq!(facts.definition_count, 4);
         assert_eq!(facts.type_reference_count, 6);
         assert_eq!(facts.expression_reference_count, 3);
-        assert_eq!(facts.new_allocation_requests_upper_bound, 9);
+        assert_eq!(facts.new_allocation_requests_upper_bound, 6);
         assert_eq!(facts.new_allocation_request_bytes_upper_bound, bytes);
         assert_eq!(
             facts.coexisting_source_and_request_bytes_upper_bound,
@@ -870,12 +770,12 @@ fn owned_expression_requests_have_independent_stage_tree_dictionary_and_list_lay
             + Layout::array::<FunctionValueType>(2).unwrap().size();
         assert_eq!(
             out.retained_bytes,
-            4 * (size_of::<p::ExprId>() + size_of::<p::ExprNode>()) + payload
+            4 * size_of::<novarocks_expression_contract::ExprNode>() + payload
         );
         assert!(out.retained_bytes < bytes);
-        let p::ExprKind::Lambda {
+        let novarocks_expression_contract::ExprKind::Lambda {
             parameter_types, ..
-        } = &out.arena().get(p::ExprId::new(13)).unwrap().kind
+        } = &out.definitions().get(3).unwrap().kind
         else {
             panic!("Lambda")
         };
@@ -927,7 +827,13 @@ fn owned_expression_seven_exact_and_under_axes_keep_known_numeric_primary() {
         let prepared =
             prepare_expression_materialization(e, fs, ags, &p::PlanLimits::FROZEN, SOURCE, tight)
                 .unwrap();
-        assert_eq!(materialize_expressions(prepared).unwrap().arena().len(), 4);
+        assert_eq!(
+            materialize_expressions(prepared)
+                .unwrap()
+                .definitions()
+                .len(),
+            4
+        );
         for axis in 0..7 {
             let mut under = tight;
             match axis {
@@ -1011,8 +917,13 @@ fn owned_expression_foreign_equal_namespaces_and_source_floor_remain_ordinary() 
                 &mut CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap(),
             )
             .unwrap()
-            + fs.retained_output_floor().unwrap()
-            + ags.retained_output_floor().unwrap();
+            .max(fs.retained_invoice_floor().unwrap())
+            .max(ags.retained_invoice_floor().unwrap())
+            .max(
+                e.retained_output_floor().unwrap()
+                    + fs.retained_output_floor().unwrap()
+                    + ags.retained_output_floor().unwrap(),
+            );
         assert!(matches!(
             prepare_expression_materialization(
                 e,
@@ -1067,40 +978,91 @@ fn owned_expression_actual_prepare_emit_and_ordinary_tails_keep_all_small_contro
 }
 
 #[test]
-fn owned_expression_wide_actual_source_loops_and_arena_preserve_quantum_prefixes() {
+fn owned_expression_wide_actual_source_loops_and_dense_slice_preserve_quantum_prefixes() {
     let control = Control::default();
     let f = Fixture::new(&control);
     let defs = (0..320)
-        .map(|i| {
-            definition(
-                if i == 319 { u32::MAX } else { i },
-                0,
-                wire::expression_definition::Kind::ValueId(0),
-            )
-        })
+        .map(|i| definition(i, 0, wire::expression_definition::Kind::ValueId(0)))
         .collect::<Vec<_>>();
     f.with_tokens(&defs,&control,|e,fs,ags|{
         control.arm(None);let prepared=prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,limits()).unwrap();let trace=control.trace();control.disarm();assert!(trace.contains(&256));
         for at in [0,trace.iter().position(|n|*n==256).unwrap(),trace.len()-1]{for cause in CAUSES{control.arm(Some((at,cause.clone())));assert!(matches!(prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,limits()),Err(Error::Control(actual)) if actual==cause));assert_eq!(control.trace(),trace[..=at]);control.disarm();}}
-        control.arm(None);let out=materialize_expressions(prepared).unwrap();assert_eq!(out.arena().len(),320);assert_eq!(out.arena().get(p::ExprId::new(u32::MAX)).unwrap().ty,FunctionValueType::new(DataType::Int64,false));let trace=control.trace();control.disarm();
+        control.arm(None);let out=materialize_expressions(prepared).unwrap();assert_eq!(out.definitions().len(),320);assert_eq!(out.definitions().get(319).unwrap().ty,FunctionValueType::new(DataType::Int64,false));let trace=control.trace();control.disarm();
         for at in [0,trace.len()/2,trace.len()-1]{for cause in CAUSES{let prepared=prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,limits()).unwrap();control.arm(Some((at,cause.clone())));assert!(matches!(materialize_expressions(prepared),Err(Error::Control(actual)) if actual==cause));assert_eq!(control.trace(),trace[..=at]);control.disarm();}}
         for late in CAUSES{let mut under=limits();under.max_type_references=255;control.arm(Some((1,late)));assert!(matches!(prepare_expression_materialization(e,fs,ags,&p::PlanLimits::FROZEN,SOURCE,under),Err(Error::Control(CompileControlError::ResourceExhausted))));assert_eq!(control.trace(),[0]);control.disarm();}
     });
 }
 
 #[test]
-fn owned_expression_arena_enters_actual_sparse_fragment_construction() {
+fn owned_expression_unit_enters_actual_sparse_fragment_construction() {
     let control = Control::default();
     let f = Fixture::new(&control);
     let defs = vec![definition(
         0,
         1,
-        wire::expression_definition::Kind::Literal(wire::ConstantReference {
+        wire::expression_definition::Kind::Constant(wire::ConstantReference {
             pool_id: Some(u32::MAX),
             row_ordinal: 1,
         }),
     )];
-    let arena = owned(&f, &defs);
+    let definitions = owned(&f, &defs);
+    struct Membership<'a>(&'a [novarocks_expression_contract::ExprNode]);
+    impl novarocks_type_contract::ExpressionDefinitionMembership<p::ExprId> for Membership<'_> {
+        fn definition_count(&self) -> usize {
+            self.0.len()
+        }
+        fn contains_definition(&self, id: p::ExprId) -> bool {
+            self.0
+                .get(id.get() as usize)
+                .is_some_and(|definition| definition.id == id)
+        }
+    }
+    let use_id = novarocks_type_contract::ExpressionUseId::new(0);
+    let region = novarocks_type_contract::EvaluationRegionId::new(0);
+    let flow = novarocks_type_contract::ExpressionControlFlow::try_new(
+        vec![novarocks_type_contract::ExpressionEvaluationRegion {
+            id: region,
+            parent: None,
+            guard: None,
+        }],
+        vec![novarocks_type_contract::ExpressionInvocation {
+            definition: p::ExprId::new(0),
+            context: novarocks_type_contract::ExpressionEffectContext {
+                use_id,
+                region,
+                demand: novarocks_type_contract::EvaluationDemand::Value,
+            },
+            control: novarocks_type_contract::ControlShape::Eager,
+            arguments: Box::default(),
+        }],
+        &Membership(&definitions),
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let parts = novarocks_expression_contract::UnitParts::new(
+        Box::default(),
+        definitions,
+        Box::from([novarocks_expression_contract::ExprRoot {
+            definition: p::ExprId::new(0),
+            demand: novarocks_type_contract::EvaluationDemand::Value,
+            scope: novarocks_expression_contract::RootScope::AllPorts,
+        }]),
+        Box::from([use_id]),
+        flow,
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let unit = novarocks_expression_contract::BoundExprSet::try_from_parts_in(
+        parts,
+        novarocks_expression_contract::UnitLimits {
+            expression_semantic_depth: p::PlanLimits::FROZEN.expression_semantic_depth,
+        },
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
     let node = p::NodeId::new(u32::MAX);
     let value = p::ValueId::new(u32::MAX);
     let properties = p::PhysicalProperties {
@@ -1109,6 +1071,7 @@ fn owned_expression_arena_enters_actual_sparse_fragment_construction() {
         ordering: Box::new([]),
     };
     let physical = p::PhysicalNode {
+        expressions: Some(Arc::new(unit)),
         id: node,
         inputs: Box::new([]),
         required_inputs: Box::new([]),
@@ -1118,7 +1081,9 @@ fn owned_expression_arena_enters_actual_sparse_fragment_construction() {
             columns: Box::from([value]),
         },
         kind: p::NodeKind::Values {
-            rows: Box::from([Box::from([p::ExprId::new(0)])]),
+            rows: Box::from([Box::from([
+                novarocks_expression_contract::RootOrdinal::new(0),
+            ])]),
         },
     };
     let input = p::FragmentStructureInput {
@@ -1137,7 +1102,6 @@ fn owned_expression_arena_enters_actual_sparse_fragment_construction() {
                 },
             },
         )]),
-        expressions: arena,
         nodes: BTreeMap::from([(node, physical)]),
         sink: p::FragmentSink::Noop,
         dop_domain: p::PipelineDopDomain {
@@ -1151,8 +1115,13 @@ fn owned_expression_arena_enters_actual_sparse_fragment_construction() {
         p::Fragment::try_from_structure_observed(input, p::PlanLimits::FROZEN, &control).unwrap();
     assert_eq!(fragment.root(), node);
     assert_eq!(
-        fragment.expressions().get(p::ExprId::new(0)).unwrap().kind,
-        p::ExprKind::Constant(p::ConstantReference {
+        fragment
+            .unit(node)
+            .unwrap()
+            .definition(p::ExprId::new(0))
+            .unwrap()
+            .kind,
+        novarocks_expression_contract::ExprKind::Constant(p::ConstantReference {
             pool: p::ConstantPoolId::new(u32::MAX),
             ordinal: 1
         })

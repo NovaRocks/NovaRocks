@@ -16,6 +16,7 @@
 // under the License.
 //! Actual prepared owners, frozen source edges and the sole compiled evaluator.
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::{ArrayRef, Date32Array, StringArray, TimestampMicrosecondArray};
 use novarocks_type_contract::{TemporalSourceKind as Kind, TemporalSourceShape as Source};
 
@@ -70,6 +71,7 @@ fn catalogue() -> PureEngineFunctionCatalog {
     builder.seal_pure(manifest).unwrap()
 }
 fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue();
     let source = NodeId::new(u32::MAX);
     let input = NodeId::new(41);
@@ -93,16 +95,33 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
         (flag, boolean.clone()),
     ] {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
+            .unwrap();
+        let input_root = builder
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .insert_value(ValueDef {
                 id,
                 ty,
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr {
+                    node: input,
+                    root: input_root,
+                },
             })
             .unwrap();
-        items.push((expr, id));
+        items.push((input_root, id));
         outputs.push(id);
     }
     builder
@@ -114,12 +133,16 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
         )
         .unwrap();
     let source_expr = builder
-        .add_expression(output, ty.clone(), ExprKind::Value(value))
+        .unit(output)
+        .unwrap()
+        .add(None, ty.clone(), ExprKind::Value(value))
         .unwrap();
     let format_expr = if matches!(fixture, Fixture::PlainFormat | Fixture::FormatOverride) {
         Some(
             builder
-                .add_expression(output, string.clone(), ExprKind::Value(format_value))
+                .unit(output)
+                .unwrap()
+                .add(None, string.clone(), ExprKind::Value(format_value))
                 .unwrap(),
         )
     } else {
@@ -138,8 +161,10 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
             // Date32-to-timestamp cast can panic before this source phase.
             normal_type = ty.clone();
             normal = builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     normal_type.clone(),
                     ExprKind::Cast {
                         expr: source_expr,
@@ -161,8 +186,10 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
                 true,
             );
             normal = builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     normal_type.clone(),
                     ExprKind::Cast {
                         expr: source_expr,
@@ -189,8 +216,10 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
             );
             // The unsupported transformed TIME child must stay undemanded.
             normal = builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     FunctionValueType::new(
                         DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
                         true,
@@ -235,14 +264,21 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
     );
     if matches!(fixture, Fixture::SparseIf | Fixture::SparseCastOther) {
         let flag_expr = builder
-            .add_expression(output, boolean.clone(), ExprKind::Value(flag))
+            .unit(output)
+            .unwrap()
+            .add(None, boolean.clone(), ExprKind::Value(flag))
             .unwrap();
         let integer = FunctionValueType::new(DataType::Int64, true);
         let null = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 integer.clone(),
-                ExprKind::Literal(LiteralValue::Null),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(integer.clone()), options().constants),
+                ),
             )
             .unwrap();
         root_expr = call(
@@ -262,12 +298,17 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
         );
     }
     let result_type = authors[&root_expr].result();
+    let output_root = builder
+        .unit(output)
+        .unwrap()
+        .root(root_expr, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let result_value = builder
         .add_value(
             result_type.clone(),
             ValueOrigin::Expr {
                 node: output,
-                expr: root_expr,
+                root: output_root,
             },
         )
         .unwrap();
@@ -275,26 +316,14 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
         .add_project(
             output,
             input,
-            Box::from([(root_expr, result_value)]),
+            Box::from([(output_root, result_value)]),
             Box::from([result_value]),
-        )
-        .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "temporal_result".into(),
@@ -305,7 +334,8 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
     };
     compile_checked_fragment_with_parameters(
         &functions,
-        fragment,
+        builder,
+        output,
         &authors,
         result,
         if matches!(
@@ -320,6 +350,7 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
             )])
             .unwrap()
         },
+        source_pools,
     )
 }
 fn batch(
@@ -412,7 +443,7 @@ fn actual_each_registered_profile_uses_explicit_source_receipt_and_original_math
 #[test]
 fn utf8_override_preserves_raw_clock_result_and_two_distinct_source_occurrences() {
     let program = program(Fixture::FormatOverride, DataType::Utf8);
-    let calls = program.checked().channels().expressions().resolved_calls();
+    let calls = root_unit(&program);
     let source = calls
         .calls()
         .values()
@@ -531,13 +562,18 @@ fn every_actual_temporal_constructor_and_evaluation_callback_preserves_seven_cau
             vec![Some(true); rows],
         );
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-        CompiledExpressionInstance::try_new(program.clone(), root(), &recorder).unwrap();
+        CompiledExpressionInstance::try_new(
+            root_unit(&program).clone(),
+            root(&program).root,
+            &recorder,
+        )
+        .unwrap();
         let constructor = recorder.trace.lock().unwrap().clone();
         for index in 1..=constructor.len() {
             for cause in causes() {
                 let control = CallbackControl::new(cause.clone(), index);
                 assert!(
-                    matches!(CompiledExpressionInstance::try_new(program.clone(),root(),&control),Err(actual) if actual==cause)
+                    matches!(CompiledExpressionInstance::try_new(root_unit(&program).clone(),root(&program).root,&control),Err(actual) if actual==cause)
                 );
                 assert_eq!(*control.trace.lock().unwrap(), constructor[..index]);
             }

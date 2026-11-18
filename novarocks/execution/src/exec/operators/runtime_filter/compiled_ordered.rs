@@ -36,8 +36,7 @@ use novarocks_functions::{
 };
 use novarocks_local_program::{
     FilterConsumerActivation, FilterLateApplyGranularity, FilterReduction, LocalProgram,
-    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind,
-    StaticFilterContract,
+    ProgramNodeId, ProgramNodeKind, ProgramRootRef, StaticFilterContract,
 };
 use std::sync::Arc;
 
@@ -53,7 +52,7 @@ fn contract_failure(detail: impl Into<Arc<str>>) -> ExecutionFailure {
 }
 
 struct OrderedSpecification {
-    site: ProgramExpressionRootSite,
+    site: ProgramRootRef,
     contract: execution::RuntimeFilterConsumerContract,
 }
 struct OrderedSpecifications {
@@ -145,7 +144,7 @@ impl CompiledOrderedScanFactory {
             .map_err(|_| KernelFailure::ResourceExhausted)?;
         // The ordinal belongs to the full Scan list. Membership bindings may
         // precede or interleave these sites; no filtered subset is renumbered.
-        for (ordinal, binding) in runtime_filters.iter().enumerate() {
+        for binding in runtime_filters {
             control.checkpoint(1)?;
             if !matches!(
                 binding.consumer.contract(),
@@ -153,14 +152,7 @@ impl CompiledOrderedScanFactory {
             ) {
                 continue;
             }
-            let binding_ordinal =
-                u32::try_from(ordinal).map_err(|_| KernelFailure::ResourceExhausted)?;
-            let site = ProgramExpressionRootSite::Node {
-                node,
-                role: ProgramNodeExpressionRole::RuntimeFilter {
-                    binding: binding_ordinal,
-                },
-            };
+            let site = binding.expr_id;
             let order = host.shared_order_contract(binding.consumer.contract(), control)?;
             let key = root_value_type(&program, site)?;
             let domain_matches = match order.keys() {
@@ -191,7 +183,7 @@ impl CompiledOrderedScanFactory {
             specifications,
             session,
             host: host.clone(),
-            control: control.clone(),
+            control: control.clone().at_expression_node(node),
         })
     }
 
@@ -439,8 +431,13 @@ impl CompiledOrderedScanEvaluator {
             };
             if binding.instance.is_none() {
                 binding.instance = Some(CompiledExpressionInstance::try_new_with_allocator(
-                    Arc::clone(&self.factory.program),
-                    specification.site,
+                    Arc::clone(
+                        self.factory
+                            .program
+                            .unit(specification.site.unit)
+                            .ok_or_else(|| invalid("ordered Scan root unit is absent"))?,
+                    ),
+                    specification.site.root,
                     &self.control,
                     self.control.allocator(),
                 )?);

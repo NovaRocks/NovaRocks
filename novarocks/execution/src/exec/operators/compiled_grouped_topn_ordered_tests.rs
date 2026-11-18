@@ -135,8 +135,12 @@ fn ordered_fixture_with_parameters(
     residual: Option<ScanResidualAuthor>,
     parameters: novarocks_type_contract::SemanticParameters,
 ) -> Fixture {
-    let key =
-        |value: Option<&str>| value.map_or(LiteralValue::Null, |v| LiteralValue::Utf8(v.into()));
+    let key = |value: Option<&str>| {
+        value.map_or(
+            crate::exec::operators::family_fixture::constant_sources::null(),
+            |v| crate::exec::operators::family_fixture::constant_sources::utf8(v.into()),
+        )
+    };
     let rows = [
         (Some("c"), 30),
         (Some("a"), 10),
@@ -148,7 +152,12 @@ fn ordered_fixture_with_parameters(
         (Some("a"), 1),
     ]
     .into_iter()
-    .map(|(k, v)| vec![key(k), LiteralValue::Int64(v)])
+    .map(|(k, v)| {
+        vec![
+            key(k),
+            crate::exec::operators::family_fixture::constant_sources::i64(v),
+        ]
+    })
     .collect::<Vec<_>>();
     fixture_with_source_parameters(
         &[FunctionValueType::new(DataType::Utf8, true)],

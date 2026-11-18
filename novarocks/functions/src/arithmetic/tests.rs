@@ -19,7 +19,7 @@ use super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::{ArrayRef, Float64Array};
 use novarocks_type_contract::arithmetic_result_value_type_with_op;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -140,7 +140,7 @@ fn eval(
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(31),
-        domain: EvaluationDomainId::new(9),
+        region: EvaluationRegionId::new(9),
         demand: EvaluationDemand::Value,
     }
 }

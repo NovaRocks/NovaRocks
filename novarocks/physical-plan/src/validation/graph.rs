@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1837,7 +1839,7 @@ mod scalar_binding_tests {
                 .add_values(root, Box::default(), Box::from([value]))
                 .unwrap();
             let fragment = builder
-                .finish_definition(
+                .finish_fixture_definition(
                     root,
                     FragmentSink::Result,
                     PipelineDopDomain {

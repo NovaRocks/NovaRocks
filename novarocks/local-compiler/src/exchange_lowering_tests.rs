@@ -19,6 +19,10 @@
 //! package extraction: a Values producer streaming over one edge and an
 //! ExchangeSource consumer. Both sides compile independently.
 
+use crate::test_units::PureUnitFixture;
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
+
 use crate::{
     FragmentCompileError, LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
@@ -31,23 +35,19 @@ use novarocks_functions::{
 };
 use novarocks_local_program::{
     BindingRequirement, DataStreamPartitionType, KernelAbiVersion, LocalProgram,
-    ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId, ProgramExpressionArena,
-    ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeId, ProgramNodeKind, ProgramUseRef,
-    StaticExprKind, StaticSinkProgram,
+    ProgramChannelLayoutRole, ProgramNodeId, ProgramNodeKind, StaticSinkProgram,
 };
 use novarocks_physical_plan::{
-    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId,
-    ExprKind, Fragment, FragmentBuilder, FragmentId, FragmentPackage, FragmentPackageAdmission,
-    FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, HashDefinition, HashPartitionScheme,
-    LiteralValue, NodeId, OutputPort, PartitionCountDomain, PartitionCountParameter,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanBuilder, PlanLimits,
+    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource,
+    FragmentBuilder, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
+    FrozenFragmentPruning, HashDefinition, HashPartitionScheme, NodeId, OutputPort,
+    PartitionCountDomain, PartitionCountParameter, PipelineDopDomain, PlanBuilder, PlanLimits,
     PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort, RowMultiplicity,
     ValueOrigin, ValueType, extract_fragment_packages,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    PartitionCountParameterId, PartitionSpaceId, PureCompileControl,
+    CompileControlError, CompilePhase, EvaluationDemand, PartitionCountParameterId,
+    PartitionSpaceId, PureCompileControl,
 };
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
@@ -130,17 +130,23 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     } else {
         b_type.clone()
     };
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut producer = FragmentBuilder::new(PRODUCER);
     let mut outputs = Vec::new();
     let mut cells = Vec::new();
     for (ordinal, literal) in [11, 22].into_iter().enumerate() {
         let field_type = if ordinal == 1 { &b_type } else { &ty };
         let literal = if conditional && ordinal == 1 {
-            LiteralValue::Null
+            crate::test_constants::null(&mut constants, field_type, options(None).constants)
         } else if widened && ordinal == 1 {
-            LiteralValue::Boolean(true)
+            crate::test_constants::boolean(
+                &mut constants,
+                field_type,
+                true,
+                options(None).constants,
+            )
         } else {
-            LiteralValue::Int64(literal)
+            crate::test_constants::i64(&mut constants, field_type, literal, options(None).constants)
         };
         outputs.push(
             producer
@@ -153,11 +159,12 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
                 )
                 .unwrap(),
         );
-        cells.push(
-            producer
-                .add_expression(VALUES, field_type.clone(), ExprKind::Literal(literal))
-                .unwrap(),
-        );
+        cells.push(constant_root(
+            &mut producer,
+            VALUES,
+            field_type.clone(),
+            literal,
+        ));
     }
     let (a, b) = (outputs[0], outputs[1]);
     producer
@@ -170,16 +177,17 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     let root = if repeated {
         let project = NodeId::new(11);
         let read_a = producer
-            .add_expression(project, ty.clone(), ExprKind::Value(a))
+            .fixture_value_root(project, ty.clone(), ExprKind::Value(a))
             .unwrap();
         let read_b = producer
-            .add_expression(project, b_type.clone(), ExprKind::Value(b))
+            .fixture_value_root(project, b_type.clone(), ExprKind::Value(b))
             .unwrap();
+        let repeated_b = producer.fixture_repeated_root(project, read_b).unwrap();
         producer
             .add_project(
                 project,
                 VALUES,
-                Box::from([(read_b, b), (read_a, a), (read_b, b)]),
+                Box::from([(read_b, b), (read_a, a), (repeated_b, b)]),
                 Box::from([b, a, b]),
             )
             .unwrap();
@@ -195,6 +203,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     } else {
         FragmentSink::Stream { edge: EDGE }
     };
+    finish_units(&mut producer);
     let producer = producer
         .finish_definition(
             root,
@@ -312,7 +321,13 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        options(None).constants,
+    );
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
@@ -380,19 +395,11 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         })
         .unwrap();
     }
-    let plan = plan.finish().unwrap();
+    let plan = plan.finish_observed(&FixtureControl).unwrap();
 
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let root_uses = root_uses(fragment);
-        calls.insert(
-            id,
-            FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &FixtureControl).unwrap(),
-        );
-        uses.insert(id, root_uses);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
@@ -403,8 +410,6 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         &plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,
@@ -412,43 +417,30 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     .unwrap()
 }
 
-/// One eager root occurrence per physical root site in one root domain.
-fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(0);
-    let mut invocations = Vec::new();
-    let bindings = roots
-        .sites()
-        .iter()
-        .enumerate()
-        .map(|(ordinal, (&site, root))| {
-            let use_id = ExpressionUseId::new(ordinal as u32);
-            invocations.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    domain,
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (site, use_id)
-        })
-        .collect();
-    let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap()
+fn constant_root(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    ty: ValueType,
+    kind: ExprKind,
+) -> RootOrdinal {
+    let definition = builder.fixture_definition(node, ty, kind).unwrap();
+    builder
+        .fixture_occurrence(
+            node,
+            definition,
+            EvaluationDemand::Value,
+            RootScope::AllPorts,
+        )
+        .unwrap()
+}
+fn finish_units(builder: &mut FragmentBuilder) {
+    let nodes = builder
+        .construction_nodes()
+        .filter_map(|(&node, _)| builder.construction_unit(node).is_some().then_some(node))
+        .collect::<Vec<_>>();
+    for node in nodes {
+        builder.finish_fixture_unit(node, &FixtureControl).unwrap();
+    }
 }
 
 // Conservative retained-source invoice and independent projection ceilings for
@@ -617,7 +609,7 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
     assert!(producer.result().is_none());
     let producer = compile(producer, None).unwrap();
     let root_slots = producer.graph().nodes()[0].output_layout().slots().to_vec();
-    let Some(StaticSinkProgram::DataStream { branch, arena }) = producer.graph().sink() else {
+    let Some(StaticSinkProgram::DataStream { branch }) = producer.graph().sink() else {
         panic!("stream sink");
     };
     assert_eq!(branch.dest_node_id(), RECEIVER.get() as i32);
@@ -629,7 +621,10 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
     // The reversed cut projection `[b, a]` names root slots in that order.
     assert_eq!(branch.output_columns(), &[root_slots[1], root_slots[0]]);
     assert!(branch.limit().is_none());
-    assert!(arena.nodes().is_empty());
+    assert_eq!(
+        branch.contract().routing,
+        novarocks_local_program::StaticStreamRouting::Ordinary
+    );
     let requirements = producer.graph().requirements().entries();
     assert_eq!(requirements.len(), 1);
     assert!(matches!(
@@ -637,18 +632,8 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
         BindingRequirement::ExchangeOutput { branch: 0, layout , ..}
             if layout.slots() == [root_slots[1], root_slots[0]]
     ));
-    // The empty Sink arena still owns its (empty) flow.
-    let snapshot = producer
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    assert!(
-        snapshot.flows()[&ProgramExpressionArena::Sink]
-            .uses()
-            .is_empty()
-    );
+    // Gather owns no expression root in the sink; physical source units remain independent.
+    assert_eq!(producer.units().len(), 1);
     assert!(producer.exchange_inputs().is_empty());
 
     let consumer = compile(packages.remove(&CONSUMER).unwrap(), Some(1)).unwrap();
@@ -710,59 +695,45 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
 fn hash_producer_authors_one_sink_partition_root_per_key() {
     let producer = compile(packages(Shape::Hash).remove(&PRODUCER).unwrap(), None).unwrap();
     let root_slots = producer.graph().nodes()[0].output_layout().slots().to_vec();
-    let Some(StaticSinkProgram::DataStream { branch, arena }) = producer.graph().sink() else {
+    let Some(StaticSinkProgram::DataStream { branch }) = producer.graph().sink() else {
         panic!("stream sink");
     };
     assert_eq!(
         branch.partition_type(),
         DataStreamPartitionType::HashPartitioned
     );
-    assert_eq!(
-        branch.partition_exprs(),
-        &[ProgramExprId::new(0), ProgramExprId::new(1)]
-    );
-    // Keys `[b, a]` read the root occurrences 1 and 0 in a separate arena.
+    let keys = branch.partition_exprs();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].unit, keys[1].unit);
+    assert_eq!([keys[0].root.get(), keys[1].root.get()], [0, 1]);
+    let unit = producer.unit(keys[0].unit).unwrap();
+    assert_eq!(unit.definitions().nodes().len(), 2);
+    assert_eq!(unit.roots().len(), 2);
+    assert_eq!(unit.control_flow().uses().len(), 2);
+    // Keys [b, a] read the complete root schema at actual ordinals 1 and 0.
     for (key, ordinal) in [(0, 1u32), (1, 0u32)] {
+        let root = unit.root(keys[key].root).unwrap();
         assert!(matches!(
-            arena.nodes()[key].kind(),
-            StaticExprKind::SlotId(slot) if *slot == root_slots[ordinal as usize]
+            unit.definitions().node(root.definition).unwrap().kind(),
+            StaticExprKind::Input
         ));
-    }
-    assert!(!Arc::ptr_eq(arena, producer.graph().expressions()));
-    let checked = producer.checked();
-    let snapshot = checked.channels().expressions().resolved_calls().snapshot();
-    let sites = snapshot
-        .bindings()
-        .iter()
-        .filter(|(site, _)| matches!(site, ProgramExpressionRootSite::SinkPartition { .. }))
-        .map(|(site, use_id)| (*site, *use_id))
-        .collect::<Vec<_>>();
-    assert_eq!(sites.len(), 2);
-    assert_eq!(
-        snapshot.flows()[&ProgramExpressionArena::Sink].uses().len(),
-        2
-    );
-    for (key, (site, use_id)) in sites.into_iter().enumerate() {
+        assert_eq!(unit.input(root.use_id).unwrap().ordinal, ordinal);
+        let scope = unit.scope(root.scope).unwrap();
+        assert_eq!(scope.schema().fields().len(), root_slots.len());
         assert_eq!(
-            site,
-            ProgramExpressionRootSite::SinkPartition {
-                branch: 0,
-                key: key as u32,
-            }
-        );
-        let expected = ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-            node: ProgramNodeId::new(0),
-            role: ProgramChannelLayoutRole::NodeOutput,
-            ordinal: if key == 0 { 1 } else { 0 },
-        });
-        assert_eq!(
-            checked.slots()[&ProgramUseRef {
-                arena: ProgramExpressionArena::Sink,
-                use_id,
-            }],
-            expected
+            producer
+                .channels()
+                .channel_layout(
+                    producer.graph(),
+                    ProgramNodeId::new(0),
+                    ProgramChannelLayoutRole::NodeOutput
+                )
+                .unwrap()
+                .slots()[ordinal as usize],
+            root_slots[ordinal as usize]
         );
     }
+    assert!(!Arc::ptr_eq(unit, &producer.units()[0]));
 }
 
 #[test]
@@ -832,7 +803,7 @@ fn hierarchical_conditional_and_round_robin_keep_their_exact_sender_and_receiver
         let mut packages = packages(shape);
         let producer = compile(packages.remove(&PRODUCER).unwrap(), None)
             .expect("the exact sender contract compiles");
-        let Some(StaticSinkProgram::DataStream { branch, arena }) = producer.graph().sink() else {
+        let Some(StaticSinkProgram::DataStream { branch }) = producer.graph().sink() else {
             panic!("stream")
         };
         let consumer = compile(packages.remove(&CONSUMER).unwrap(), Some(1))
@@ -858,7 +829,15 @@ fn hierarchical_conditional_and_round_robin_keep_their_exact_sender_and_receiver
                 else {
                     panic!("conditional routing must not become ordinary Hash")
                 };
-                assert_eq!(arena.node(applies).unwrap().data_type(), &DataType::Boolean);
+                let unit = producer.unit(applies.unit).unwrap();
+                let root = unit.root(applies.root).unwrap();
+                assert_eq!(
+                    unit.definitions()
+                        .node(root.definition)
+                        .unwrap()
+                        .data_type(),
+                    &DataType::Boolean
+                );
                 assert_eq!(
                     facts.routing,
                     CompiledExchangeRouting::ConditionalKey {
@@ -867,24 +846,12 @@ fn hierarchical_conditional_and_round_robin_keep_their_exact_sender_and_receiver
                     }
                 );
                 assert_eq!(facts.hash_partition_slots.as_ref(), &slots[1..]);
-                let snapshot = producer
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .resolved_calls()
-                    .snapshot();
-                let id = snapshot.bindings()
-                    [&ProgramExpressionRootSite::SinkApplicability { branch: 0 }];
+                assert_eq!(root.demand, EvaluationDemand::TruthOnly);
                 assert_eq!(
-                    snapshot.flows()[&ProgramExpressionArena::Sink].uses()[&id]
-                        .context
-                        .demand,
+                    unit.control_flow().uses()[&root.use_id].context.demand,
                     EvaluationDemand::TruthOnly
                 );
-                assert_eq!(
-                    snapshot.flows()[&ProgramExpressionArena::Sink].uses().len(),
-                    2
-                );
+                assert_eq!(unit.control_flow().uses().len(), 2);
             }
             Shape::RoundRobin => {
                 assert_eq!(branch.partition_type(), DataStreamPartitionType::Random);
@@ -908,7 +875,7 @@ fn repeated_conditional_imports_use_the_same_first_mask_and_hash_key_occurrence(
     let mut packages = packages(Shape::RepeatedConditional);
     let producer = compile(packages.remove(&PRODUCER).unwrap(), None).unwrap();
     let root = &producer.graph().nodes()[producer.graph().root().index()];
-    let Some(StaticSinkProgram::DataStream { branch, arena }) = producer.graph().sink() else {
+    let Some(StaticSinkProgram::DataStream { branch }) = producer.graph().sink() else {
         panic!("stream sink");
     };
     let StaticStreamRouting::ConditionalKeyV1 { applies } = branch.contract().routing else {
@@ -917,11 +884,17 @@ fn repeated_conditional_imports_use_the_same_first_mask_and_hash_key_occurrence(
     let slots = root.output_layout().slots();
     assert_eq!(slots.len(), 3);
     assert_ne!(slots[0], slots[2]);
-    assert!(
-        matches!(arena.node(applies).unwrap().kind(), StaticExprKind::SlotId(slot) if *slot == slots[0])
+    assert_eq!(crate::test_units::input_ordinal(&producer, applies), 0);
+    assert_eq!(
+        crate::test_units::input_ordinal(&producer, branch.partition_exprs()[0]),
+        0
     );
-    assert!(
-        matches!(arena.node(branch.partition_exprs()[0]).unwrap().kind(), StaticExprKind::SlotId(slot) if *slot == slots[0])
+    let unit = producer.unit(applies.unit).unwrap();
+    let root = unit.root(applies.root).unwrap();
+    assert_eq!(unit.scope(root.scope).unwrap().schema().fields().len(), 3);
+    assert_eq!(
+        unit.control_flow().uses()[&root.use_id].context.demand,
+        EvaluationDemand::TruthOnly
     );
     assert_eq!(branch.output_columns(), slots);
 
@@ -959,8 +932,12 @@ fn full_outer_exchange_input_packages(
     let ty = ValueType::new(DataType::Int64, false);
     let nullable = ValueType::new(DataType::Int64, true);
     let join = NodeId::new(30);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut consumer = FragmentBuilder::new(CONSUMER);
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([73; 16]).unwrap(),
+        options(None).constants,
+    );
     let mut edges = Vec::new();
     let mut inputs = Vec::new();
     let mut imported = Vec::new();
@@ -984,15 +961,12 @@ fn full_outer_exchange_input_packages(
                     )
                     .unwrap(),
             );
-            cells.push(
-                producer
-                    .add_expression(
-                        VALUES,
-                        ty.clone(),
-                        ExprKind::Literal(LiteralValue::Int64(literal)),
-                    )
-                    .unwrap(),
-            );
+            cells.push(constant_root(
+                &mut producer,
+                VALUES,
+                ty.clone(),
+                crate::test_constants::i64(&mut constants, &ty, literal, options(None).constants),
+            ));
         }
         producer
             .add_values(
@@ -1001,6 +975,7 @@ fn full_outer_exchange_input_packages(
                 outputs.clone().into_boxed_slice(),
             )
             .unwrap();
+        finish_units(&mut producer);
         plan.add_fragment(
             producer
                 .finish_definition(
@@ -1076,12 +1051,32 @@ fn full_outer_exchange_input_packages(
     }
     let keys = (0..2)
         .map(|ordinal| JoinKey {
-            left: consumer
-                .add_expression(join, ty.clone(), ExprKind::Value(imported[0][ordinal]))
-                .unwrap(),
-            right: consumer
-                .add_expression(join, ty.clone(), ExprKind::Value(imported[1][ordinal]))
-                .unwrap(),
+            left: {
+                let definition = consumer
+                    .fixture_definition(join, ty.clone(), ExprKind::Value(imported[0][ordinal]))
+                    .unwrap();
+                consumer
+                    .fixture_occurrence(
+                        join,
+                        definition,
+                        EvaluationDemand::Value,
+                        RootScope::Port(0),
+                    )
+                    .unwrap()
+            },
+            right: {
+                let definition = consumer
+                    .fixture_definition(join, ty.clone(), ExprKind::Value(imported[1][ordinal]))
+                    .unwrap();
+                consumer
+                    .fixture_occurrence(
+                        join,
+                        definition,
+                        EvaluationDemand::Value,
+                        RootScope::Port(1),
+                    )
+                    .unwrap()
+            },
             null_safe: false,
         })
         .collect::<Vec<_>>();
@@ -1119,6 +1114,7 @@ fn full_outer_exchange_input_packages(
             },
         )
         .unwrap();
+    finish_units(&mut consumer);
     plan.add_fragment(
         consumer
             .finish_definition(
@@ -1154,18 +1150,13 @@ fn full_outer_exchange_input_packages(
             .into_boxed_slice(),
     })
     .unwrap();
-    let plan = plan.finish().unwrap();
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
+    let plan = plan.finish_observed(&FixtureControl).unwrap();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let roots = root_uses(fragment);
-        calls.insert(
-            id,
-            FrozenFragmentCalls::try_new(fragment, &roots, vec![], &FixtureControl).unwrap(),
-        );
-        uses.insert(id, roots);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
@@ -1176,8 +1167,6 @@ fn full_outer_exchange_input_packages(
         &plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,

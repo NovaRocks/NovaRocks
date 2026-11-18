@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::{CallRequestError, PhysicalCallDefinition, PhysicalCallRequest};
+use crate::{CallRequestError, PhysicalCallRequest, PhysicalCallSite};
 use novarocks_constant_contract::ConstantPolicy;
 use novarocks_function_contract::FunctionArgument;
 use novarocks_type_contract::{CompilePhase, PureCompileControl};
@@ -106,7 +106,7 @@ fn finish(
     result
 }
 fn source(
-    requests: &[(PhysicalCallDefinition, PhysicalCallRequest)],
+    requests: &[(PhysicalCallSite, PhysicalCallRequest)],
     capacity: usize,
     control: &dyn PureCompileControl,
 ) -> Result<(), CallRequestError> {
@@ -116,72 +116,91 @@ fn source(
     )
 }
 fn checked_empty_requests(count: usize) -> crate::Fragment {
-    use novarocks_type_contract::{
-        FunctionArgumentEvaluation, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,
-        FunctionKind, FunctionOverloadId, FunctionVolatility,
-    };
+    use novarocks_type_contract::*;
     let mut builder = crate::FragmentBuilder::new(crate::FragmentId::new(9));
-    let source = crate::NodeId::new(99);
-    let owner = crate::NodeId::new(0);
+    let input = crate::NodeId::new(99);
     builder
-        .add_values(source, Box::from([Box::default()]), Box::default())
+        .add_values(input, Box::from([Box::default()]), Box::default())
         .unwrap();
-    let mut requests = Vec::with_capacity(count);
-    let mut assignments = Vec::with_capacity(count);
-    let mut outputs = Vec::with_capacity(count);
-    for _ in 0..count {
-        let expression = builder
-            .add_expression(
-                owner,
-                integer(),
-                ExprKind::FunctionCall {
-                    function: BoundFunction {
-                        function_id: FunctionId::try_new("test/resource-request").unwrap(),
-                        overload: FunctionOverloadId::try_new("test/resource-request/exact")
-                            .unwrap(),
-                        kind: FunctionKind::Scalar,
-                        argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
-                            Box::default(),
-                        ),
-                        result_type: integer(),
-                        legacy_metadata: Some(crate::LegacyBindingMetadata {
-                            volatility: FunctionVolatility::Immutable,
-                            argument_evaluation: FunctionArgumentEvaluation::Eager,
-                            failure_behavior: FunctionFailureBehavior::Propagate,
-                            intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-                            semantic_parameters: Box::default(),
-                        }),
-                    },
-                    args: Box::default(),
-                },
-            )
-            .unwrap();
+    let owner = crate::NodeId::new(0);
+    let binding = crate::BoundFunction::from_exact_signature(
+        FunctionId::try_new("fixture/resource-request/window").unwrap(),
+        FunctionOverloadId::try_new("fixture/resource-request/window-zero").unwrap(),
+        FunctionKind::Window,
+        TypedFactSlice::from_pure_boxed(Box::default()),
+        integer(),
+    );
+    let mut calls = Vec::new();
+    let mut outputs = Vec::new();
+    let mut requests = Vec::new();
+    let mut claims = Vec::new();
+    for ordinal in 0..count {
+        let ordinal = u32::try_from(ordinal).unwrap();
         let output = builder
             .add_value(
                 integer(),
-                crate::ValueOrigin::Expr {
+                crate::ValueOrigin::NodeOutput {
                     node: owner,
-                    expr: expression,
+                    output_ordinal: ordinal,
                 },
             )
             .unwrap();
-        assignments.push((expression, output));
         outputs.push(output);
-        requests.push((
-            PhysicalCallDefinition::Expression(expression),
-            request(Vec::new()),
-        ));
+        calls.push(crate::WindowCallSpec {
+            binding: binding.clone(),
+            distinct: false,
+            arguments: Box::default(),
+            order_by: Box::default(),
+            frame: None,
+            ignore_nulls: false,
+            aggregate_binding: None,
+            output,
+        });
+        let site = crate::PhysicalCallSite::Window {
+            node: owner,
+            call: ordinal,
+        };
+        requests.push((site, request(Vec::new())));
+        let context = RelationEffectContext::call(RelationCallId::new(ordinal));
+        claims.push(crate::FrozenPhysicalCall {
+            site,
+            context,
+            materialized_writer_input: None,
+            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+            effects: CallEffects {
+                value_stability: FunctionVolatility::Immutable,
+                own_row_error: FunctionIntrinsicRowError::NotRowEvaluated,
+                failure_behavior: FunctionFailureBehavior::Propagate,
+                null_behavior: FunctionNullBehavior::CalledOnNull,
+                argument_control: ArgumentControl::Window,
+                instance_state: FunctionInstanceState::WindowPartition,
+                observable_effects: ObservableEffects::NONE,
+                environment: Box::default(),
+                proof_scope: CallProofScope::Relation(context.identity),
+            },
+        });
     }
+    let properties = builder.node_output_properties(input).unwrap().clone();
     builder
-        .add_project(
-            owner,
-            source,
-            assignments.into_boxed_slice(),
-            outputs.into_boxed_slice(),
-        )
+        .insert_node_unchecked(crate::PhysicalNode {
+            id: owner,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([properties.clone()]),
+            output_properties: properties,
+            output: crate::OutputPort {
+                node: owner,
+                columns: outputs.into_boxed_slice(),
+            },
+            expressions: None,
+            kind: crate::NodeKind::Window(crate::WindowSpec {
+                partition_by: Box::default(),
+                order_by: Box::default(),
+                calls: calls.into_boxed_slice(),
+            }),
+        })
         .unwrap();
     builder
-        .finish_definition(
+        .finish_structure(
             owner,
             crate::FragmentSink::Noop,
             crate::PipelineDopDomain {
@@ -189,12 +208,17 @@ fn checked_empty_requests(count: usize) -> crate::Fragment {
                 max: 1,
                 requires_power_of_two: false,
             },
+            crate::PlanLimits::FROZEN,
+            &Control::default(),
             crate::StagePlacementPolicy::Singleton,
         )
+        .unwrap()
+        .with_calls_observed(claims, &Control::default())
         .unwrap()
         .with_call_requests_observed(requests, &Control::default())
         .unwrap()
 }
+
 fn prefixes(
     operation: impl Fn(&dyn PureCompileControl) -> Result<(), CallRequestError>,
     expected: Result<(), CallRequestError>,
@@ -259,7 +283,9 @@ fn request_owned_arguments_and_lambda_types_preserve_the_sole_resource_numerics(
 #[test]
 fn request_source_capacity_and_owned_extents_refuse_before_the_unadmitted_walk() {
     let requests = vec![(
-        PhysicalCallDefinition::Expression(crate::ExprId::new(0)),
+        PhysicalCallSite::Table {
+            node: crate::NodeId::new(0),
+        },
         mixed_request(),
     )];
     let control = Control::default();
@@ -288,7 +314,9 @@ fn request_source_capacity_and_owned_extents_refuse_before_the_unadmitted_walk()
 #[test]
 fn request_resource_success_preserves_control_prefix_and_type_author_refuses_invalid_requests() {
     let requests = vec![(
-        PhysicalCallDefinition::Expression(crate::ExprId::new(u32::MAX)),
+        PhysicalCallSite::Table {
+            node: crate::NodeId::new(u32::MAX),
+        },
         mixed_request(),
     )];
     prefixes(
@@ -355,6 +383,6 @@ fn request_table_and_source_wide_owned_loops_have_real_quantum_without_a_type_in
     assert_eq!(usage.items, 320);
     assert_eq!(
         usage.bytes,
-        320 * std::mem::size_of::<(PhysicalCallDefinition, PhysicalCallRequest)>()
+        320 * std::mem::size_of::<(PhysicalCallSite, PhysicalCallRequest)>()
     );
 }

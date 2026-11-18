@@ -16,12 +16,20 @@
 // under the License.
 
 use super::CompiledExpressionInstance;
+use crate::exec::expr::compiled_program::checked_constants;
 use arrow::{
     array::{Array, Decimal128Array, Float64Array, Int64Array},
     datatypes::DataType,
     record_batch::RecordBatch,
 };
-use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression::{
+    CompiledExprSet, EvaluationEnvironment, ScopeColumn, ScopeLayout, ScopeLayouts,
+    compile_expr_set_pure,
+};
+use novarocks_expression_contract::{
+    BoundExprSetBuilder, BoundFunction, DefinitionControl, ExprId, ExprKind, ExprPort,
+    ExpressionCallClaim, PhysicalCallRequest, RootOrdinal, RootScope, UnitLimits, ValueId,
+};
 use novarocks_functions::{
     CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
     FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
@@ -29,27 +37,13 @@ use novarocks_functions::{
     PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi, ScopedExpressionEffects, Selection,
 };
-use novarocks_local_compiler::{
-    LocalCompileOptions, compile_fragment, validate_fragment_providers,
-};
-use novarocks_local_program::{
-    KernelAbiVersion, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeId,
-};
-use novarocks_physical_plan::{
-    BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
-    FragmentPackage, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPhysicalCall, LiteralValue, NodeId, PhysicalCallSite,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts,
-    ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
-};
+use novarocks_physical_plan::StaticFunctionArgument;
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
-    PureCompileControl, SemanticParameters,
+    ArgumentControl, CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase,
+    ControlShape, DecimalOverflowPolicy, EvaluationDemand, ExpressionUseId, FunctionValueType,
+    MAX_CONTROL_DEPTH, PureCompileControl, SemanticParameters, ValueTypeStorageLifetime,
 };
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 struct Control;
 impl PureCompileControl for Control {
@@ -117,6 +111,7 @@ struct Author {
     arguments: Vec<FunctionArgument>,
     logical_argument_count: usize,
     constant_policy: ConstantPolicy,
+    control: ControlShape,
 }
 impl Author {
     fn request(&self) -> FunctionBindingRequest<'_> {
@@ -152,26 +147,33 @@ fn author(
     let FunctionResultType::Scalar(result) = &selected.result_type else {
         panic!("scalar owner")
     };
-    let function = BoundFunction {
-        function_id: bound.function_id,
-        overload: selected.overload.clone(),
-        kind: bound.kind,
-        argument_types: selected.argument_types.clone(),
-        result_type: result.clone(),
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
-            volatility: bound.semantics.volatility,
-            argument_evaluation: bound.semantics.argument_evaluation,
-            failure_behavior: bound.semantics.failure_behavior,
-            intrinsic_row_error: bound.semantics.intrinsic_row_error,
-            semantic_parameters: Box::default(),
-        }),
+    let declaration = functions
+        .metadata()
+        .pure_overload_declaration_observed(
+            &bound.function_id,
+            bound.kind,
+            &selected.overload,
+            &Control,
+        )
+        .unwrap();
+    let control = match declaration.effects().argument_control {
+        ArgumentControl::Eager => ControlShape::Eager,
+        _ => panic!("the actual ROUND/RAND owners must declare eager control"),
     };
+    let function = BoundFunction::from_exact_signature(
+        bound.function_id,
+        selected.overload.clone(),
+        bound.kind,
+        selected.argument_types.clone(),
+        result.clone(),
+    );
     Author {
         function,
         selected,
         arguments,
         logical_argument_count,
         constant_policy: constant_policy(),
+        control,
     }
 }
 fn constant_policy() -> ConstantPolicy {
@@ -188,18 +190,12 @@ fn constant_policy() -> ConstantPolicy {
         max_library_validation_bytes: 1 << 20,
     }
 }
-// Transfer the first resolver request; physical child shapes are not request sources.
+// Transfer the first resolver request; child shapes never reconstruct it.
 fn original_request_sources(
-    fragment: Fragment,
+    builder: &mut BoundExprSetBuilder,
     authors: &BTreeMap<ExprId, Author>,
-) -> (Fragment, novarocks_physical_plan::ConstantPools) {
-    use novarocks_physical_plan::{
-        ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallDefinition,
-        PhysicalCallRequest, StaticFunctionArgument,
-    };
-    let mut pools = ConstantPools::empty();
-    let mut backing_ids = BTreeMap::new();
-    let mut entries = vec![];
+    pools: &mut novarocks_physical_plan::ConstantPools,
+) {
     for (&definition, owner) in authors {
         let original = owner.request();
         let arguments = original
@@ -211,17 +207,7 @@ fn original_request_sources(
                     constant,
                 } => {
                     let constant = constant.as_ref().map(|value| {
-                        let identity = value.pool().backing_identity();
-                        let pool = *backing_ids.entry(identity).or_insert_with(|| {
-                            let id =
-                                ConstantPoolId::new(u32::try_from(pools.entries().len()).unwrap());
-                            pools.insert(id, value.pool().clone()).unwrap();
-                            id
-                        });
-                        ConstantReference {
-                            pool,
-                            ordinal: value.ordinal(),
-                        }
+                        crate::exec::expr::test_support::register_constant(pools, value)
                     });
                     StaticFunctionArgument::Value {
                         value_type: value_type.clone(),
@@ -238,22 +224,27 @@ fn original_request_sources(
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        entries.push((
-            PhysicalCallDefinition::Expression(definition),
-            PhysicalCallRequest {
-                arguments,
-                logical_argument_count: original.logical_argument_count,
-                expected_result_type: original.expected_result_type.cloned(),
-                constant_policy: owner.constant_policy,
-            },
-        ));
+        builder
+            .request(
+                definition,
+                PhysicalCallRequest {
+                    arguments,
+                    logical_argument_count: original.logical_argument_count,
+                    expected_result_type: original.expected_result_type.cloned(),
+                    constant_policy: owner.constant_policy,
+                },
+            )
+            .unwrap();
+        builder
+            .definition_control(
+                definition,
+                DefinitionControl {
+                    shape: owner.control,
+                    temporal_sources: None,
+                },
+            )
+            .unwrap();
     }
-    (
-        fragment
-            .with_call_requests_observed(entries, &Control)
-            .unwrap(),
-        pools,
-    )
 }
 fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
     ConstantValue::from_i64(
@@ -277,15 +268,14 @@ fn argument(ty: FunctionValueType, constant: Option<ConstantValue>) -> FunctionA
     }
 }
 fn call(
-    builder: &mut FragmentBuilder,
-    owner: NodeId,
+    builder: &mut BoundExprSetBuilder,
     authors: &mut BTreeMap<ExprId, Author>,
     author: Author,
     args: Vec<ExprId>,
 ) -> ExprId {
     let id = builder
-        .add_expression(
-            owner,
+        .add(
+            None,
             author.result(),
             ExprKind::FunctionCall {
                 function: author.function.clone(),
@@ -296,35 +286,6 @@ fn call(
     authors.insert(id, author);
     id
 }
-fn invocation(
-    fragment: &Fragment,
-    expr: ExprId,
-    demand: EvaluationDemand,
-    next: &mut u32,
-    out: &mut Vec<ExpressionInvocation<ExprId>>,
-) -> ExpressionUseId {
-    let id = ExpressionUseId::new(*next);
-    *next += 13;
-    let args = match &fragment.expressions().get(expr).unwrap().kind {
-        ExprKind::FunctionCall { args, .. } => args
-            .iter()
-            .map(|child| invocation(fragment, *child, EvaluationDemand::Value, next, out))
-            .collect::<Vec<_>>(),
-        ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
-        _ => panic!("unsupported fixture shape"),
-    };
-    out.push(ExpressionInvocation {
-        context: ExpressionEffectContext {
-            use_id: id,
-            domain: EvaluationDomainId::new(91),
-            demand,
-        },
-        definition: expr,
-        control: ControlShape::Eager,
-        arguments: args.into_boxed_slice(),
-    });
-    id
-}
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -333,64 +294,44 @@ enum Shape {
     ObservableSibling,
 }
 
-fn program(shape: Shape) -> Arc<LocalProgram> {
+struct Program {
+    unit: Arc<CompiledExprSet>,
+    roots: Vec<RootOrdinal>,
+}
+
+fn program(shape: Shape) -> Program {
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue();
-    let fragment_id = FragmentId::new(93);
-    let source = NodeId::new(100);
-    let input = NodeId::new(17);
-    let output = NodeId::new(2);
     let value = ValueId::new(333);
     let digits_value = ValueId::new(901);
-    let result = ValueId::new(77);
-    let reference = ValueId::new(78);
     let decimal = FunctionValueType::new(DataType::Decimal128(38, 0), true);
     let integer = FunctionValueType::new(DataType::Int64, true);
-    let mut builder = FragmentBuilder::new(fragment_id);
-    builder
-        .add_values(source, Box::from([Box::default()]), Box::default())
-        .unwrap();
-    let mut input_items = vec![];
-    for (id, ty) in [(value, decimal.clone()), (digits_value, integer.clone())] {
-        let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
-            .unwrap();
-        builder
-            .insert_value(ValueDef {
-                id,
-                ty,
-                origin: ValueOrigin::Expr { node: input, expr },
-            })
-            .unwrap();
-        input_items.push((expr, id));
-    }
-    builder
-        .add_project(
-            input,
-            source,
-            input_items.into_boxed_slice(),
-            Box::from([value, digits_value]),
-        )
-        .unwrap();
+    let port_values = vec![(value, decimal.clone()), (digits_value, integer.clone())];
+    let mut builder = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: MAX_CONTROL_DEPTH,
+    });
     let mut authors = BTreeMap::new();
     let first = if matches!(shape, Shape::ObservableSibling) {
         let ty = FunctionValueType::new(DataType::Int64, false);
         let seed = builder
-            .add_expression(
-                output,
+            .add(
+                None,
                 ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(42)),
+                checked_constants::kind(
+                    &mut constants,
+                    checked_constants::i64(&ty, 42, constant_policy()),
+                ),
             )
             .unwrap();
         call(
             &mut builder,
-            output,
             &mut authors,
             author(&functions, "rand", vec![integer_argument(ty, 42)]),
             vec![seed],
         )
     } else {
         builder
-            .add_expression(output, decimal.clone(), ExprKind::Value(value))
+            .add(None, decimal.clone(), ExprKind::Value(value))
             .unwrap()
     };
     let source_type = if matches!(shape, Shape::ObservableSibling) {
@@ -399,19 +340,21 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         decimal.clone()
     };
     let digit = builder
-        .add_expression(
-            output,
+        .add(
+            None,
             integer.clone(),
             if matches!(shape, Shape::ObservableSibling) {
                 ExprKind::Value(digits_value)
             } else {
-                ExprKind::Literal(LiteralValue::Int64(-1))
+                checked_constants::kind(
+                    &mut constants,
+                    checked_constants::i64(&integer, -1, constant_policy()),
+                )
             },
         )
         .unwrap();
     let first_round = call(
         &mut builder,
-        output,
         &mut authors,
         author(
             &functions,
@@ -433,15 +376,17 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
     let root = if matches!(shape, Shape::Nested) {
         let ty = authors[&first_round].result();
         let zero = builder
-            .add_expression(
-                output,
+            .add(
+                None,
                 integer.clone(),
-                ExprKind::Literal(LiteralValue::Int64(0)),
+                checked_constants::kind(
+                    &mut constants,
+                    checked_constants::i64(&integer, 0, constant_policy()),
+                ),
             )
             .unwrap();
         call(
             &mut builder,
-            output,
             &mut authors,
             author(
                 &functions,
@@ -453,203 +398,152 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
     } else {
         first_round
     };
-    let mut outputs = vec![(root, result)];
-    if matches!(shape, Shape::ObservableSibling) {
-        outputs.push((first, reference));
-    }
-    let mut fields = vec![];
-    for &(expr, id) in &outputs {
-        let ty = authors[&expr].result();
+    let mut roots = vec![
         builder
-            .insert_value(ValueDef {
-                id,
-                ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: output, expr },
-            })
-            .unwrap();
-        fields.push(ResultField {
-            domain: crate::test_result_domain::result_value_domain(&ty),
-            name: format!("result_{}", fields.len()).into(),
-            alias: None,
-            value: id,
-            ty,
-        });
+            .root(root, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap(),
+    ];
+    if matches!(shape, Shape::ObservableSibling) {
+        roots.push(
+            builder
+                .root(first, EvaluationDemand::Value, RootScope::Port(0))
+                .unwrap(),
+        );
     }
-    let output_ids = outputs
-        .iter()
-        .map(|(_, id)| *id)
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    builder
-        .add_project(output, input, outputs.into_boxed_slice(), output_ids)
-        .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+    original_request_sources(&mut builder, &authors, &mut constants);
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    let sealed = builder
+        .seal(
+            vec![ExprPort {
+                values: port_values.clone().into_boxed_slice(),
+            }],
+            &mut work,
         )
         .unwrap();
-    let (fragment, constants) = original_request_sources(fragment, &authors);
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let mut next = 1000;
-    let mut ordered_uses = vec![];
-    let bindings = roots
-        .sites()
-        .iter()
-        .map(|(site, root)| {
-            (
-                *site,
-                invocation(
-                    &fragment,
-                    root.expr,
-                    root.demand,
-                    &mut next,
-                    &mut ordered_uses,
-                ),
-            )
-        })
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(91),
-            parent: None,
-            guard: None,
-        }],
-        ordered_uses.clone(),
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
+    let mut effects = BTreeMap::<ExpressionUseId, ScopedExpressionEffects>::new();
+    let mut claims = BTreeMap::new();
+    // These fixed definitions were authored after their actual children. Check
+    // that fixture premise instead of interpreting use numbers as a schedule.
+    for definition in sealed.definitions() {
+        for (&use_id, invocation) in sealed
+            .uses()
+            .iter()
+            .filter(|(_, item)| item.definition == definition.id)
+        {
+            let context = invocation.context;
+            let mut children = ScopedExpressionEffects::pure_value(context);
+            for (ordinal, child) in invocation.arguments.iter().enumerate() {
+                assert!(sealed.uses()[child].definition.get() < definition.id.get());
+                children = children
+                    .join_control_argument(effects[child], sealed.control_flow(), ordinal)
+                    .unwrap();
+            }
+            let summary = if let Some(owner) = authors.get(&definition.id) {
+                let argument_uses = invocation
+                    .arguments
+                    .iter()
+                    .map(|id| Some(*id))
+                    .collect::<Vec<_>>();
+                let token = functions
+                    .prepare_fresh(
+                        CallEffectInput {
+                            context: context.into(),
+                            argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
+                                &argument_uses,
+                            ),
+                            function_id: &owner.function.function_id,
+                            kind: FunctionKind::Scalar,
+                            selected: owner.selected.as_ref(),
+                            request: owner.request(),
+                            environment: &[],
+                            parameters: &parameters,
+                            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                            proof_scope: CallProofScope::Region(context.region),
+                        },
+                        owner.selected.clone(),
+                        PureCallPreparation::Scalar {
+                            arguments: children,
+                        },
+                        &Control,
+                    )
+                    .unwrap();
+                claims.insert(
+                    use_id,
+                    ExpressionCallClaim {
+                        context,
+                        effects: token.call_contract().effects().clone(),
+                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                        temporal_source: None,
+                        regexp_count_pattern_source: None,
+                        to_base64_byte_source: None,
+                    },
+                );
+                ScopedExpressionEffects::primitive(
+                    context,
+                    token.effects().for_use(context).unwrap(),
+                )
+            } else {
+                children
+            };
+            effects.insert(use_id, summary);
+        }
+    }
+    let unit = sealed.finish(claims, &mut work).unwrap();
+    work.finish().unwrap();
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::LowerProgram).unwrap();
+    let schema = Arc::new(arrow::datatypes::Schema::new(
+        port_values
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (_, ty))| ty.try_to_field(format!("input_{ordinal}")).unwrap())
+            .collect::<Vec<_>>(),
+    ));
+    let scope = ScopeLayout::try_new(
+        schema,
+        port_values.iter().map(|(_, ty)| ty.clone()).collect(),
+        port_values
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (value, ty))| ScopeColumn {
+                value: *value,
+                ordinal: u32::try_from(ordinal).unwrap(),
+                ty: ty.clone(),
+            })
+            .collect(),
+        ValueTypeStorageLifetime::pure(),
+        &mut work,
     )
     .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
-    let parameters = SemanticParameters::try_new([]).unwrap();
-    let mut effects = BTreeMap::new();
-    let mut frozen = vec![];
-    // This is actual postorder: parent facts compose its real children, including
-    // the MayRaise nested ROUND and the instance-observable seeded RAND.
-    for invocation in ordered_uses {
-        let context = invocation.context;
-        let scoped = if let Some(author) = authors.get(&invocation.definition) {
-            let mut children = ScopedExpressionEffects::pure_value(context);
-            for child in &invocation.arguments {
-                children = children.join_same_domain(effects[child]).unwrap();
-            }
-            let argument_uses = invocation
-                .arguments
-                .iter()
-                .map(|id| Some(*id))
-                .collect::<Vec<_>>();
-            let token = functions
-                .prepare_fresh(
-                    CallEffectInput {
-                        context,
-                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
-                            &argument_uses,
-                        ),
-                        function_id: &author.function.function_id,
-                        kind: FunctionKind::Scalar,
-                        selected: author.selected.as_ref(),
-                        request: author.request(),
-                        environment: &[],
-                        parameters: &parameters,
-                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(context.domain),
-                    },
-                    author.selected.clone(),
-                    PureCallPreparation::Scalar {
-                        arguments: children,
-                    },
-                    &Control,
-                )
-                .unwrap();
-            frozen.push(FrozenPhysicalCall {
-                materialized_writer_input: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                site: PhysicalCallSite::Expression(context.use_id),
-                context,
-                effects: token.call_contract().effects().clone(),
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            });
-            token.effects()
-        } else {
-            ScopedExpressionEffects::pure_value(context)
-        };
-        effects.insert(context.use_id, scoped);
-    }
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, frozen, &Control).unwrap();
-    let result = ResultPort {
-        scalar_schema: None,
-        fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
-        fields: fields.into_boxed_slice(),
-    };
-    let package = Arc::new(
-        FragmentPackage::try_new(
-            FragmentPackageInput {
-                version: PlanVersionId::try_new([93; 16]).unwrap(),
-                required: RequiredContracts::default(),
-                constants,
-                pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &Control).unwrap(),
-                fragment,
-                expression_uses: uses,
-                calls,
-                cuts: FragmentCuts::default(),
-                result: Some(result),
-                parameters,
-                scans: BTreeMap::new(),
-                writes: BTreeMap::new(),
-                annotations: Box::default(),
-                layouts: Default::default(),
-            },
-            package_admission(),
-            &Control,
-        )
-        .unwrap(),
-    );
-    let providers =
-        PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Control).unwrap();
-    let validated = validate_fragment_providers(package, &providers, &Control).unwrap();
-    Arc::new(
-        compile_fragment(
-            validated,
-            &functions,
-            LocalCompileOptions {
-                pipeline_dop: NonZeroUsize::new(1).unwrap(),
-                root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
-                kernel_abi: KernelAbiVersion::CURRENT,
-                constants: constant_policy(),
-            },
-            &Control,
-        )
-        .unwrap(),
-    )
-}
-fn instance(program: &Arc<LocalProgram>, expression: u32) -> CompiledExpressionInstance {
-    CompiledExpressionInstance::try_new(
-        program.clone(),
-        ProgramExpressionRootSite::Node {
-            node: ProgramNodeId::new(2),
-            role: ProgramNodeExpressionRole::ProjectOutput { expression },
+    let compiled = compile_expr_set_pure(
+        &unit,
+        EvaluationEnvironment {
+            constants: &constants,
+            parameters: &parameters,
         },
-        &Control,
+        ScopeLayouts {
+            ports: &[scope],
+            all_ports: None,
+        },
+        constant_policy(),
+        &functions,
+        &mut work,
     )
-    .unwrap()
+    .unwrap();
+    work.finish().unwrap();
+    Program {
+        unit: compiled,
+        roots,
+    }
 }
-fn batch(
-    program: &LocalProgram,
-    values: Vec<Option<i128>>,
-    digits: Vec<Option<i64>>,
-) -> RecordBatch {
+fn instance(program: &Program, expression: usize) -> CompiledExpressionInstance {
+    CompiledExpressionInstance::try_new(program.unit.clone(), program.roots[expression], &Control)
+        .unwrap()
+}
+fn batch(program: &Program, values: Vec<Option<i128>>, digits: Vec<Option<i64>>) -> RecordBatch {
+    let root = program.unit.root(program.roots[0]).unwrap();
     RecordBatch::try_new(
-        program.graph().nodes()[1].output_layout().schema().clone(),
+        program.unit.scope(root.scope).unwrap().schema().clone(),
         vec![
             Arc::new(
                 Decimal128Array::from(values)
@@ -658,6 +552,147 @@ fn batch(
             ),
             Arc::new(Int64Array::from(digits)),
         ],
+    )
+    .unwrap()
+}
+
+// This operator caller owns a real Values -> Project graph and publishes the
+// same actual unit table through LocalProgram's original final author.
+fn operator_program(source: &Program) -> novarocks_local_program::LocalProgram {
+    use novarocks_local_program::*;
+    use novarocks_type_contract::FunctionArgumentType;
+    use std::{collections::BTreeSet, num::NonZeroUsize};
+    let root = source.unit.root(source.roots[0]).unwrap();
+    let scope = source.unit.scope(root.scope).unwrap();
+    let input = StaticLayout::try_new_typed_for_compile(
+        scope.schema().clone(),
+        Arc::from([
+            novarocks_types::SlotId::new(333),
+            novarocks_types::SlotId::new(901),
+        ]),
+        scope
+            .ordinal_types()
+            .iter()
+            .map(|ty| (ty.typed_binding().clone(), None))
+            .collect(),
+        ValueTypeStorageLifetime::pure(),
+        |_| Ok(()),
+        &Control,
+    )
+    .unwrap();
+    let values = StaticValues::try_new(
+        RecordBatch::try_new(
+            input.schema().clone(),
+            scope
+                .ordinal_types()
+                .iter()
+                .map(|ty| arrow::array::new_null_array(ty.data_type(), 0))
+                .collect(),
+        )
+        .unwrap(),
+        input.clone(),
+    )
+    .unwrap();
+    let FunctionArgumentType::Value(output_type) = &source.unit.types()[root.definition.index()]
+    else {
+        panic!("the actual Project root is scalar")
+    };
+    let output = StaticLayout::try_new_typed_for_compile(
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            output_type.try_to_field("result").unwrap(),
+        ])),
+        Arc::from([novarocks_types::SlotId::new(77)]),
+        vec![(output_type.typed_binding().clone(), None)],
+        ValueTypeStorageLifetime::pure(),
+        |_| Ok(()),
+        &Control,
+    )
+    .unwrap();
+    let site = ProgramRootRef {
+        unit: ProgramUnitId::new(0),
+        root: source.roots[0],
+    };
+    let nodes = vec![
+        ProgramNode::new_local(
+            ProgramNodeId::new(0),
+            vec![DiagnosticSourceNodeId::new(17)],
+            ProgramNodeKind::Values { values },
+            input,
+        ),
+        ProgramNode::new_local(
+            ProgramNodeId::new(1),
+            vec![DiagnosticSourceNodeId::new(2)],
+            ProgramNodeKind::Project {
+                input: ProgramNodeId::new(0),
+                is_subordinate: false,
+                validate_final_result_input: false,
+                exprs: vec![site],
+                expr_slot_ids: vec![novarocks_types::SlotId::new(77)],
+                expr_slot_schemas: None,
+                output_indices: None,
+            },
+            output.clone(),
+        ),
+    ];
+    let graph = LocalProgramGraph::try_new_with_sink(
+        nodes,
+        ProgramNodeId::new(1),
+        std::slice::from_ref(&source.unit),
+        CompileProfile::new(
+            NonZeroUsize::new(1).unwrap(),
+            None,
+            output.identity().unwrap(),
+            KernelAbiVersion::CURRENT,
+        ),
+        BindingRequirements::try_new(vec![BindingRequirement::ResultSink { layout: output }])
+            .unwrap(),
+        Some(StaticSinkProgram::Result),
+    )
+    .unwrap();
+    let channels = [
+        (0, 0, scope.ordinal_types()[0].clone()),
+        (0, 1, scope.ordinal_types()[1].clone()),
+        (1, 0, output_type.clone()),
+    ]
+    .into_iter()
+    .map(|(node, ordinal, ty)| {
+        (
+            ProgramChannelSite::Layout {
+                node: ProgramNodeId::new(node),
+                role: ProgramChannelLayoutRole::NodeOutput,
+                ordinal,
+            },
+            ty,
+        )
+    })
+    .collect();
+    let operators = [(0, 17), (1, 2)]
+        .into_iter()
+        .map(|(index, source)| LocalOperatorProvenance {
+            id: LocalOperatorId::new(index),
+            lowered_nodes: Box::from([ProgramNodeId::new(index as usize)]),
+            sources: Box::from([DiagnosticSourceNodeId::new(source)]),
+            origin: LocalOperatorOrigin::Direct,
+            cost_owner: LocalOperatorId::new(index),
+            metrics: OperatorMetricAggregation {
+                cpu_time: MetricAggregation::Sum,
+                wall_time: MetricAggregation::Maximum,
+                peak_retained_bytes: MetricAggregation::Maximum,
+            },
+        })
+        .collect();
+    LocalProgram::try_new(
+        graph,
+        vec![source.unit.clone()],
+        vec![],
+        channels,
+        operators,
+        &BTreeSet::from([
+            DiagnosticSourceNodeId::new(17),
+            DiagnosticSourceNodeId::new(2),
+        ]),
+        CompiledProgramFacts::default(),
+        &Control,
     )
     .unwrap()
 }
@@ -774,19 +809,51 @@ fn operator_selected_evaluation_skips_unselected_row_errors_and_reports_batch_ro
         vec![Some(15), Some(max38), Some(25)],
         vec![None; 3],
     );
-    let site = ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(2),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+    let local = operator_program(&program);
+    let node = &local.graph().nodes()[local.graph().root().index()];
+    let novarocks_local_program::ProgramNodeKind::Project { exprs, .. } = node.kind() else {
+        panic!("the actual caller is a Project")
     };
-    let mut evaluator = instance(&program, 0);
+    let site = exprs[0];
+    let actual_node = node.local_id().unwrap();
+    let unit = local.unit(site.unit).unwrap();
+    assert!(Arc::ptr_eq(unit, &program.unit));
+    assert_eq!(site.root, program.roots[0]);
+    let mut evaluator =
+        CompiledExpressionInstance::try_new(unit.clone(), site.root, &Control).unwrap();
     let control =
         crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::default());
-    let values = evaluate_selected(&mut evaluator, site, &input, &[0, 2], &control).unwrap();
+    let values = evaluate_selected(&mut evaluator, site, &input, &[0, 2], &control)
+        .map_err(|cause| cause.at_expression_node(actual_node))
+        .unwrap();
     let values = values.as_any().downcast_ref::<Decimal128Array>().unwrap();
     assert_eq!(values.len(), 2);
     assert_eq!((values.value(0), values.value(1)), (20, 30));
-    let error = evaluate_selected(&mut instance(&program, 0), site, &input, &[1, 2], &control)
+    let original = evaluate_selected(&mut instance(&program, 0), site, &input, &[1, 2], &control)
         .expect_err("the selected overflow row is required");
+    let error = original.clone().at_expression_node(actual_node);
+    assert!(error.same_occurrence(&original));
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&error),
+        novarocks_failure_contract::FailureProjection::failure_fact(&original),
+    );
+    assert_eq!(error.expression_node(), Some(actual_node));
+    let crate::runtime::task::execution_failure::ExecutionFailureCause::RequiredRow(required) =
+        error.cause()
+    else {
+        panic!("the selected ROUND overflow must retain its typed row error")
+    };
+    assert_eq!(required.root(), site.root);
+    assert_eq!(required.batch_row(), 1);
+    assert_eq!(required.error().selected_ordinal(), 0);
+    assert!(required.error().message().contains("overflow"));
+    assert!(std::ptr::eq(
+        std::error::Error::source(required)
+            .unwrap()
+            .downcast_ref::<novarocks_functions::RowDataError>()
+            .unwrap(),
+        required.error(),
+    ));
     let message = error.to_string();
     assert!(
         message.contains("failed at batch row 1 (selected ordinal 0)"),
@@ -794,20 +861,8 @@ fn operator_selected_evaluation_skips_unselected_row_errors_and_reports_batch_ro
     );
     assert!(message.contains("overflow"), "{message}");
     let unordered = evaluate_selected(&mut instance(&program, 0), site, &input, &[2, 0], &control)
+        .map_err(|cause| cause.at_expression_node(actual_node))
         .expect_err("rows must be strictly increasing");
+    assert_eq!(unordered.expression_node(), None);
     assert!(unordered.to_string().contains("not ordered"), "{unordered}");
-}
-
-// Conservative retained-source invoice and independent projection ceilings for
-// these small fixtures only; this is not a production default or a MEM grant.
-fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
-    novarocks_physical_plan::FragmentPackageAdmission {
-        plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
-        source_retained_bytes: 64 * 1024 * 1024,
-        property_projection_limits: novarocks_physical_plan::PropertyProofProjectionLimits {
-            max_request_bytes: 16 * 1024 * 1024,
-            max_coexisting_bytes: 256 * 1024 * 1024,
-            max_projection_work: 16 * 1024 * 1024,
-        },
-    }
 }

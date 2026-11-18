@@ -50,7 +50,8 @@ message FragmentPackage {
   repeated ConnectorPayloadDefinition provider_payloads = 10;
   repeated ProviderReadReferenceDefinition read_references = 11;
   repeated RelationDefinition relations = 12;
-  novarocks.physical_control_v2.ExpressionControl expression_control = 13;
+  reserved 13;
+  reserved "expression_control";
   novarocks.physical_semantics_v2.FrozenCalls calls = 14;
   novarocks.physical_semantics_v2.FrozenPruning pruning = 15;
   novarocks.physical_semantics_v2.SemanticParameters parameters = 16;
@@ -67,13 +68,15 @@ message FragmentPackage {
   novarocks.physical_type_v2.SourceFieldTable source_fields = 24;
   repeated SystemRelationUnits system_relation_units = 25;
   repeated FrozenWriteLayoutRecipe layouts = 26;
+  novarocks.call_request.SourceConstantPolicy source_constant_policy = 27;
 }
 message RequiredContracts { uint32 plan_contract_revision = 1; }
 message Fragment {
   uint32 id = 1;
   optional uint32 root_node_id = 2;
   repeated ValueDefinition values = 3;
-  repeated ExpressionDefinition expressions = 4;
+  reserved 4;
+  reserved "expressions";
   repeated PhysicalNode nodes = 5;
   FragmentSink sink = 6;
   PipelineDopDomain dop_domain = 7;
@@ -232,7 +235,9 @@ message RelationField {
   optional uint32 value_type_id = 2;
 }
 message PredicateGuarantee {
-  optional uint32 predicate_expr_id = 1;
+  reserved 1;
+  reserved "predicate_expr_id";
+  optional uint32 predicate_root = 3;
   PredicateGuaranteeKind kind = 2;
 }
 enum PredicateGuaranteeKind {
@@ -309,7 +314,9 @@ message ProviderFieldOrigin {
 }
 message ExpressionOrigin {
   optional uint32 node_id = 1;
-  optional uint32 expr_id = 2;
+  reserved 2;
+  reserved "expr_id";
+  optional uint32 root_ordinal = 3;
 }
 message NullExtendedOrigin {
   optional uint32 node_id = 1;
@@ -349,13 +356,14 @@ enum WriterDerivedKind {
 }
 message ExpressionDefinition {
   uint32 id = 1;
-  optional uint32 owner_node_id = 2;
+  reserved 2, 21;
+  reserved "owner_node_id", "window_call", "literal";
   optional uint32 lambda_scope_expr_id = 3;
   optional uint32 value_type_id = 4;
   oneof kind {
     uint32 value_id = 5;
     LambdaParameter lambda_parameter = 6;
-    novarocks.call_request.ConstantReference literal = 7;
+    novarocks.call_request.ConstantReference constant = 7;
     UnaryExpression unary = 8;
     BinaryExpression binary = 9;
     ExpressionIds conjunction = 10;
@@ -369,7 +377,7 @@ message ExpressionDefinition {
     LikeExpression like = 18;
     CaseExpression case_expression = 19;
     TruthValueExpression is_truth_value = 20;
-    WindowCall window_call = 21;
+
   }
 }
 message ExpressionIds { repeated uint32 expr_ids = 1; }
@@ -470,14 +478,19 @@ message TruthValueExpression {
 message WindowCall {
   optional uint32 function_binding_id = 1;
   bool distinct = 2;
-  repeated uint32 argument_expr_ids = 3;
-  repeated SortExpression function_order_by = 4;
+  reserved 3, 4;
+  reserved "argument_expr_ids", "function_order_by";
+  repeated uint32 argument_roots = 8;
+  repeated SortExpression order_by = 9;
+  optional uint32 output_value_id = 10;
   WindowFrame frame = 5;
   bool ignore_nulls = 6;
   optional uint32 aggregate_binding_id = 7;
 }
 message SortExpression {
-  optional uint32 expr_id = 1;
+  reserved 1;
+  reserved "expr_id";
+  optional uint32 root_ordinal = 4;
   SortDirection direction = 2;
   NullOrdering null_ordering = 3;
 }
@@ -498,11 +511,13 @@ message WindowFrame {
   WindowFrameExclusion exclusion = 4;
 }
 message WindowBound {
+  reserved 2, 4;
+  reserved "preceding_expr_id", "following_expr_id";
   oneof kind {
     novarocks.physical_control_v2.Empty unbounded_preceding = 1;
-    uint32 preceding_expr_id = 2;
+    novarocks.call_request.ConstantReference preceding = 6;
     novarocks.physical_control_v2.Empty current_row = 3;
-    uint32 following_expr_id = 4;
+    novarocks.call_request.ConstantReference following = 7;
     novarocks.physical_control_v2.Empty unbounded_following = 5;
   }
 }
@@ -601,8 +616,39 @@ enum OrderedComparisonAlgorithm {
   ORDERED_COMPARISON_ALGORITHM_NATIVE_SCALAR_ORDER_V1 = 1;
 }
 
+
+// All identities in this component are local to this one node. Complete
+// function/type/constant facts remain in the package's sole shared tables.
+message ExpressionUnit {
+  repeated ExpressionPort ports = 1;
+  repeated ExpressionDefinition definitions = 2;
+  repeated ExpressionRoot roots = 3;
+  novarocks.physical_control_v2.ExpressionControl control = 4;
+  novarocks.physical_semantics_v2.ExpressionClaims claims = 5;
+  repeated novarocks.call_request.UnitCallRequest requests = 6;
+}
+message ExpressionPort { repeated ExpressionInput values = 1; }
+message ExpressionInput {
+  optional uint32 value_id = 1;
+  optional uint32 value_type_id = 2;
+}
+message ExpressionRoot {
+  optional uint32 definition_id = 1;
+  novarocks.physical_control_v2.EvaluationDemand demand = 2;
+  RootScope scope = 3;
+  optional uint32 use_id = 4;
+}
+message RootScope {
+  oneof kind {
+    uint32 port = 1;
+    novarocks.physical_control_v2.Empty all_ports = 2;
+  }
+}
+message RootOrdinals { repeated uint32 ordinals = 1; }
+
 message PhysicalNode {
   uint32 id = 1;
+  ExpressionUnit expressions = 30;
   repeated uint32 input_node_ids = 2;
   repeated PhysicalProperties required_inputs = 3;
   PhysicalProperties output_properties = 4;
@@ -644,7 +690,9 @@ message ScanNode {
   optional uint32 relation_id = 2;
   ScanReadBudget read_budget = 3;
   repeated ProviderOutput provider_outputs = 4;
-  repeated uint32 residual_expr_ids = 5;
+  reserved 5;
+  reserved "residual_expr_ids";
+  repeated uint32 residual_roots = 7;
   repeated uint32 derived_value_ids = 6;
 }
 message ScanReadBudget {
@@ -655,9 +703,11 @@ message ProviderOutput {
   optional uint32 column_payload_id = 1;
   optional uint32 value_id = 2;
 }
-message FilterNode { repeated uint32 predicate_expr_ids = 1; }
+message FilterNode { reserved 1; reserved "predicate_expr_ids"; repeated uint32 predicate_roots = 2; }
 message ExpressionOutput {
-  optional uint32 expr_id = 1;
+  reserved 1;
+  reserved "expr_id";
+  optional uint32 root_ordinal = 3;
   optional uint32 value_id = 2;
 }
 message ProjectNode { repeated ExpressionOutput expressions = 1; }
@@ -675,24 +725,32 @@ enum AggregateGrouping {
 message AggregateCall {
   uint32 id = 1;
   optional uint32 aggregate_binding_id = 2;
-  repeated uint32 argument_expr_ids = 3;
+  reserved 3;
+  reserved "argument_expr_ids";
+  repeated uint32 argument_roots = 7;
   bool distinct = 4;
   repeated SortExpression order_by = 5;
   optional uint32 output_value_id = 6;
 }
 message JoinKey {
-  optional uint32 left_expr_id = 1;
-  optional uint32 right_expr_id = 2;
+  reserved 1, 2;
+  reserved "left_expr_id", "right_expr_id";
+  optional uint32 left_root = 4;
+  optional uint32 right_root = 5;
   bool null_safe = 3;
 }
 message OrdinaryHashJoinCondition {
   repeated JoinKey keys = 1;
-  optional uint32 residual_expr_id = 2;
+  reserved 2;
+  reserved "residual_expr_id";
+  optional uint32 residual_root = 3;
 }
 message NullAwareEqualHashJoinCondition {
   repeated JoinKey value_equal_keys = 1;
   repeated JoinKey scope_keys = 2;
-  optional uint32 eligibility_expr_id = 3;
+  reserved 3;
+  reserved "eligibility_expr_id";
+  optional uint32 eligibility_root = 4;
 }
 message HashJoinNode {
   JoinKind kind = 1;
@@ -709,7 +767,9 @@ message HashJoinNode {
 message NestLoopJoinNode {
   JoinKind kind = 1;
   NestLoopJoinDistribution distribution = 2;
-  optional uint32 predicate_expr_id = 3;
+  reserved 3;
+  reserved "predicate_expr_id";
+  optional uint32 predicate_root = 5;
   repeated uint32 null_extended_value_ids = 4;
 }
 enum JoinKind {
@@ -791,7 +851,9 @@ message LimitNode {
 message WindowNode {
   repeated SortExpression partition_by = 1;
   repeated SortExpression order_by = 2;
-  repeated ExpressionOutput expressions = 3;
+  reserved 3;
+  reserved "expressions";
+  repeated WindowCall calls = 4;
 }
 message SetOperationNode {
   SetOperationKind kind = 1;
@@ -803,7 +865,7 @@ enum SetOperationKind {
   SET_OPERATION_KIND_INTERSECT = 2;
   SET_OPERATION_KIND_EXCEPT = 3;
 }
-message ValuesNode { repeated ExpressionIds rows = 1; }
+message ValuesNode { reserved 1; reserved "rows"; repeated RootOrdinals root_rows = 2; }
 message SystemRelationNode { uint64 batches = 1; uint64 rows = 2; }
 message SystemRelationUnits {
   optional uint32 node_id = 1;
@@ -827,8 +889,10 @@ message GroupingOutput {
 // Real existing constant variants. Special list/map constants use the same
 // typed IPC pool without inventing a scalar ExprId or losing their exact kind.
 message UnpivotConstant {
+  reserved 1;
+  reserved "scalar_expr_id";
   oneof kind {
-    uint32 scalar_expr_id = 1;
+    uint32 scalar_root = 4;
     novarocks.call_request.ConstantReference int32_list = 2;
     novarocks.call_request.ConstantReference utf8_map = 3;
   }
@@ -846,13 +910,17 @@ message UnpivotNode {
   uint64 max_output_bytes = 6;
 }
 message GenerateSeriesNode {
-  optional uint32 start_expr_id = 1;
-  optional uint32 stop_expr_id = 2;
-  optional uint32 step_expr_id = 3;
+  reserved 1, 2, 3;
+  reserved "start_expr_id", "stop_expr_id", "step_expr_id";
+  optional uint32 start_root = 4;
+  optional uint32 stop_root = 5;
+  optional uint32 step_root = 6;
 }
 message TableFunctionNode {
   optional uint32 function_binding_id = 1;
-  repeated uint32 argument_expr_ids = 2;
+  reserved 2;
+  reserved "argument_expr_ids";
+  repeated uint32 argument_roots = 5;
   repeated TableFunctionOutput outputs = 3;
   bool left_outer = 4;
 }
@@ -905,13 +973,17 @@ message ChangeEventExpandNode {
   optional uint32 effect_output_value_id = 2;
 }
 message ChangeEvent {
-  optional uint32 predicate_expr_id = 1;
+  reserved 1;
+  reserved "predicate_expr_id";
+  optional uint32 predicate_root = 5;
   RowMutationEffect effect = 2;
   repeated ChangeAssignment assignments = 3;
 }
 message ChangeAssignment {
   optional uint32 value_id = 1;
-  optional uint32 expr_id = 2;
+  reserved 2;
+  reserved "expr_id";
+  optional uint32 root_ordinal = 5;
   optional uint32 write_input_value_type_id = 3;
   optional uint32 storage_value_type_id = 4;
 }

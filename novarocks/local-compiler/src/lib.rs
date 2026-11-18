@@ -282,3 +282,9 @@ mod union_lowering_tests;
 
 #[cfg(test)]
 mod table_function_lowering_tests;
+
+#[cfg(test)]
+mod test_constants;
+
+#[cfg(test)]
+mod test_units;

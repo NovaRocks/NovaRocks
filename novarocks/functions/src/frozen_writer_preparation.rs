@@ -23,11 +23,11 @@ use crate::{
     AggregateKernelPhase, AggregatePreparationOptions, CallArgumentUses, CallEffectInput,
     EngineFunctionCatalog, FunctionArgumentType, FunctionBindingRequest, FunctionBindingSelection,
     FunctionId, FunctionKind, FunctionSpecializationFailure, PureCallPreparation,
-    PureCallSpecialization, ScopedExpressionEffects,
+    PureCallSpecialization, ScopedRelationalEffects,
 };
 use novarocks_type_contract::{
     CallEffects, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    ExpressionEffectContext, FunctionValueType, PureCompileControl, SemanticParameters,
+    FunctionValueType, PureCompileControl, RelationEffectContext, SemanticParameters,
 };
 use std::sync::Arc;
 
@@ -35,8 +35,8 @@ pub struct FrozenWriterAggregatePreparation<'a> {
     pub function_id: &'a FunctionId,
     pub selected: &'a Arc<FunctionBindingSelection>,
     pub original_request: FunctionBindingRequest<'a>,
-    pub call_context: ExpressionEffectContext,
-    pub materialized_input_context: ExpressionEffectContext,
+    pub call_context: RelationEffectContext,
+    pub materialized_input_context: RelationEffectContext,
     pub frozen_effects: &'a CallEffects,
     pub decimal_overflow_policy: DecimalOverflowPolicy,
     pub parameters: &'a SemanticParameters,
@@ -151,8 +151,7 @@ fn prepare_frozen_writer_aggregate_core<H>(
             AggregateKernelPhase::Partial | AggregateKernelPhase::Final
         ) || source.call_context.demand != EvaluationDemand::Value
             || input.demand != EvaluationDemand::Value
-            || input.use_id == source.call_context.use_id
-            || input.domain == source.call_context.domain
+            || !input.is_materialized_input_of(source.call_context)
             || source.original_request.logical_argument_count != 1
             || source.original_request.arguments.len() != 1
             || source.selected.argument_types.len() != 1
@@ -188,14 +187,16 @@ fn prepare_frozen_writer_aggregate_core<H>(
                 .into());
             }
         }
-        let children = ScopedExpressionEffects::pure_value(input)
+        let children = ScopedRelationalEffects::pure_value(input)
             .for_use(input)
             .map_err(FunctionSpecializationFailure::Effects)?;
-        let argument_uses = [Some(input.use_id)];
         let order_keys = order_keys.unwrap_or_else(|| Arc::from([]));
         let (argument_uses, options) = if source.phase.consumes_logical_arguments() {
             (
-                CallArgumentUses::SelectedChannels(&argument_uses),
+                CallArgumentUses::MaterializedInput {
+                    context: input,
+                    input_type: source.actual_input_type,
+                },
                 AggregatePreparationOptions {
                     state_interpretation: None,
                     phase: source.phase,
@@ -208,7 +209,7 @@ fn prepare_frozen_writer_aggregate_core<H>(
             (
                 CallArgumentUses::AggregateMerge {
                     phase: source.phase,
-                    state_context: input,
+                    state_context: input.into(),
                     state_input_type: source.actual_input_type,
                 },
                 AggregatePreparationOptions {
@@ -222,7 +223,7 @@ fn prepare_frozen_writer_aggregate_core<H>(
         };
         work.flush()?;
         let effect_input = CallEffectInput {
-            context: source.call_context,
+            context: source.call_context.into(),
             argument_uses,
             function_id: source.function_id,
             kind: FunctionKind::Aggregate,
@@ -235,7 +236,7 @@ fn prepare_frozen_writer_aggregate_core<H>(
         };
         let selected = Arc::clone(source.selected);
         let preparation = PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::primitive(source.call_context, children),
+            arguments: ScopedRelationalEffects::primitive(source.call_context, children),
             options,
         };
         let token = match creation {

@@ -30,7 +30,7 @@ use novarocks_type_contract::ExpressionEffectContext;
 use novarocks_type_contract::FunctionValueType;
 use novarocks_type_contract::PureCompileControl;
 use novarocks_type_contract::ValueLogicalType;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -118,7 +118,7 @@ fn date_float_exact_profiles_nullability_effects_and_nominal_admission() {
                         assert_eq!(r.allow_throw_exception(), allow);
                         let context = ExpressionEffectContext {
                             use_id: ExpressionUseId::new(1),
-                            domain: EvaluationDomainId::new(2),
+                            region: EvaluationRegionId::new(2),
                             demand: EvaluationDemand::Value,
                         };
                         assert!(

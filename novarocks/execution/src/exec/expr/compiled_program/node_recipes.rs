@@ -16,10 +16,9 @@
 // under the License.
 
 //! Borrowed recipes for one expression node, independent of program traversal.
+use novarocks_expression::{ComparisonSite, CompiledExprSet};
 use novarocks_functions::*;
-use novarocks_local_program::{
-    ExpressionProgram, ProgramCallSite, ProgramComparisonSite, ProgramUseRef,
-};
+use novarocks_type_contract::ExpressionUseId;
 
 #[derive(Clone, Copy)]
 pub(super) enum ComparisonPosition {
@@ -41,56 +40,48 @@ pub(super) trait NodeRecipes {
     fn prepared_call(&self) -> Option<&PreparedPureKernel>;
 }
 
-pub(super) struct ProgramNodeRecipes<'a> {
-    pub program: &'a ExpressionProgram,
-    pub occurrence: ProgramUseRef,
+pub(super) struct UnitNodeRecipes<'a> {
+    pub unit: &'a CompiledExprSet,
+    pub occurrence: ExpressionUseId,
 }
-impl NodeRecipes for ProgramNodeRecipes<'_> {
+impl NodeRecipes for UnitNodeRecipes<'_> {
     fn comparison_recipe(&self, position: ComparisonPosition) -> Option<&PreparedComparisonRecipe> {
         let site = match position {
-            ComparisonPosition::Binary => ProgramComparisonSite::Binary(self.occurrence),
-            ComparisonPosition::BetweenLower => {
-                ProgramComparisonSite::BetweenLower(self.occurrence)
-            }
-            ComparisonPosition::BetweenUpper => {
-                ProgramComparisonSite::BetweenUpper(self.occurrence)
-            }
-            ComparisonPosition::CaseWhen(arm) => ProgramComparisonSite::CaseWhen {
+            ComparisonPosition::Binary => ComparisonSite::Binary(self.occurrence),
+            ComparisonPosition::BetweenLower => ComparisonSite::BetweenLower(self.occurrence),
+            ComparisonPosition::BetweenUpper => ComparisonSite::BetweenUpper(self.occurrence),
+            ComparisonPosition::CaseWhen(arm) => ComparisonSite::CaseWhen {
                 occurrence: self.occurrence,
                 arm,
             },
         };
-        self.program.comparison_recipe(site)
+        self.unit.recipes().comparison(site)
     }
     fn null_safe_comparison_recipe(&self) -> Option<&PreparedNullSafeComparisonRecipe> {
-        self.program.null_safe_comparison_recipe(self.occurrence)
+        self.unit.recipes().null_safe_comparison(self.occurrence)
     }
     fn native_like_recipe(&self) -> Option<&PreparedNativeLikeRecipe> {
-        self.program.native_like_recipe(self.occurrence)
+        self.unit.recipes().native_like(self.occurrence)
     }
     fn native_inlist_recipe(&self) -> Option<&PreparedNativeInListRecipe> {
-        self.program.native_inlist_recipe(self.occurrence)
+        self.unit.recipes().native_inlist(self.occurrence)
     }
     fn native_negate_recipe(&self) -> Option<&PreparedNativeNegateRecipe> {
-        self.program.native_negate_recipe(self.occurrence)
+        self.unit.recipes().native_negate(self.occurrence)
     }
     fn native_bitnot_recipe(&self) -> Option<&PreparedNativeBitNotRecipe> {
-        self.program.native_bitnot_recipe(self.occurrence)
+        self.unit.recipes().native_bitnot(self.occurrence)
     }
     fn arithmetic_recipe(&self) -> Option<&PreparedArithmeticRecipe> {
-        self.program.arithmetic_recipe(self.occurrence)
+        self.unit.recipes().arithmetic(self.occurrence)
     }
     fn cast_recipe(&self) -> Option<&PreparedCastRecipe> {
-        self.program.cast_recipe(self.occurrence)
+        self.unit.recipes().cast(self.occurrence)
     }
     fn prepared_call(&self) -> Option<&PreparedPureKernel> {
-        self.program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
+        self.unit
             .calls()
-            .get(&ProgramCallSite::Expression(self.occurrence))
-            .map(|call| call.specialization().prepared())
+            .get(&self.occurrence)
+            .map(|call| call.prepared())
     }
 }

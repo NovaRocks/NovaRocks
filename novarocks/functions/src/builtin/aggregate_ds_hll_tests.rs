@@ -22,7 +22,7 @@ use arrow_array::StringArray;
 use arrow_schema::Field;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     SemanticParameters,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
@@ -173,14 +173,12 @@ fn kernel(name: &str, values: &[FunctionValueType], phase: AggregateKernelPhase)
         .resolve_bound_user(name, FunctionKind::Aggregate, request, &Compile)
         .unwrap();
     let selected = Arc::new(bound.selected);
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(431),
-        domain: EvaluationDomainId::new(29),
-        demand: EvaluationDemand::Value,
-    };
+    let context = novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(431),
+    );
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(434),
-        domain: EvaluationDomainId::new(30),
+        region: EvaluationRegionId::new(30),
         demand: EvaluationDemand::Value,
     };
     let state_type =
@@ -193,7 +191,7 @@ fn kernel(name: &str, values: &[FunctionValueType], phase: AggregateKernelPhase)
     } else {
         CallArgumentUses::AggregateMerge {
             phase,
-            state_context,
+            state_context: state_context.into(),
             state_input_type: &state_type,
         }
     };
@@ -206,15 +204,15 @@ fn kernel(name: &str, values: &[FunctionValueType], phase: AggregateKernelPhase)
                 selected: &selected,
                 request,
                 argument_uses,
-                context,
+                context: context.into(),
                 parameters: &parameters,
                 environment: &[],
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Relation(context.identity),
             },
             selected.clone(),
             PureCallPreparation::Aggregate {
-                arguments: ScopedExpressionEffects::pure_value(context),
+                arguments: ScopedRelationalEffects::pure_value(context),
                 options: AggregatePreparationOptions {
                     state_interpretation: None,
                     phase,

@@ -58,7 +58,7 @@ fn sql_fold_dependency_ds_scalar_actual_literal_three_arity_exact_source() {
         // port has no allocation host and preserves the call for execution.
         // Independent byte/arity values remain in Functions' real-host tests.
         assert!(matches!(receipt.outcome, Some(Outcome::Declined)));
-        let retained = source.plan().fragments().values().flat_map(|fragment| fragment.expressions().iter()).filter(|(_, expression)| {
+        let retained = expression_sources(&source).filter(|(_, _, expression)| {
             matches!(&expression.kind, ExprKind::FunctionCall { function, args }
                 if function.function_id.as_str() == "builtin.scalar/ds_hll_count_distinct_state/v1" && args.len() == count)
         }).count();

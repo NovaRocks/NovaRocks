@@ -16,8 +16,10 @@
 // under the License.
 
 use super::*;
-use novarocks_local_program::{ProgramComparisonSite, ProgramUseRef};
-use novarocks_physical_plan::BinaryOperator;
+use crate::exec::expr::compiled_program::checked_constants;
+use novarocks_expression::ComparisonSite;
+use novarocks_expression_contract::BinaryOperator;
+use novarocks_type_contract::ExpressionUseId;
 
 #[derive(Clone, Copy)]
 enum EqualityCase {
@@ -29,18 +31,31 @@ enum EqualityCase {
     ErrorOperand,
     ErrorLabel,
 }
-fn literal(builder: &mut FragmentBuilder, ty: FunctionValueType, value: LiteralValue) -> ExprId {
+fn literal(
+    builder: &mut FragmentBuilder,
+    ty: FunctionValueType,
+    value: novarocks_functions::ConstantValue,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
+) -> ExprId {
     builder
-        .add_expression(NodeId::new(0), ty, ExprKind::Literal(value))
+        .unit(NodeId::new(0))
+        .unwrap()
+        .add(None, ty, checked_constants::kind(source_pools, value))
         .unwrap()
 }
 fn random(
     builder: &mut FragmentBuilder,
     authors: &mut BTreeMap<ExprId, Author>,
     functions: &PureEngineFunctionCatalog,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> ExprId {
     let integer = FunctionValueType::new(DataType::Int64, false);
-    let seed = literal(builder, integer.clone(), LiteralValue::Int64(42));
+    let seed = literal(
+        builder,
+        integer.clone(),
+        checked_constants::i64(&(integer.clone()), 42, options().constants),
+        source_pools,
+    );
     call(
         builder,
         authors,
@@ -58,9 +73,15 @@ fn round_value(
     authors: &mut BTreeMap<ExprId, Author>,
     functions: &PureEngineFunctionCatalog,
     value: ExprId,
+    source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> ExprId {
     let integer = FunctionValueType::new(DataType::Int64, false);
-    let digits = literal(builder, integer.clone(), LiteralValue::Int64(-1));
+    let digits = literal(
+        builder,
+        integer.clone(),
+        checked_constants::i64(&(integer.clone()), -1, options().constants),
+        source_pools,
+    );
     call(
         builder,
         authors,
@@ -80,6 +101,7 @@ fn round_value(
     )
 }
 fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let mut builder = FragmentBuilder::new(FragmentId::new(203));
     let source = NodeId::new(u32::MAX);
@@ -100,16 +122,30 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
+                ty.clone(),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
+            )
+            .unwrap();
+        let root = builder
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *id,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr { node: input, root },
             })
             .unwrap();
-        items.push((expr, *id));
+        items.push((root, *id));
     }
     builder
         .add_project(
@@ -125,8 +161,10 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
         .unwrap();
     let value = |builder: &mut FragmentBuilder, index: usize| {
         builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 columns[index].1.clone(),
                 ExprKind::Value(columns[index].0),
             )
@@ -142,8 +180,10 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
         let left = value(&mut builder, 0);
         let right = value(&mut builder, 1);
         builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 result_type.clone(),
                 ExprKind::Binary {
                     op: if matches!(kind, EqualityCase::Eq) {
@@ -166,49 +206,89 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
                 value(&mut builder, 2),
             ),
             EqualityCase::RandomOperand => {
-                let operand = random(&mut builder, &mut authors, &functions);
+                let operand = random(&mut builder, &mut authors, &functions, &mut source_pools);
                 let first = literal(
                     &mut builder,
                     floating.clone(),
-                    LiteralValue::Float64Bits(SEED_42[0]),
+                    checked_constants::f64_bits(
+                        &(floating.clone()),
+                        SEED_42[0],
+                        options().constants,
+                    ),
+                    &mut source_pools,
                 );
                 let second = literal(
                     &mut builder,
-                    floating,
-                    LiteralValue::Float64Bits(SEED_42[1]),
+                    (floating).clone(),
+                    checked_constants::f64_bits(&(floating), SEED_42[1], options().constants),
+                    &mut source_pools,
                 );
                 (operand, first, second)
             }
             EqualityCase::RandomLabels => (
                 value(&mut builder, 0),
-                random(&mut builder, &mut authors, &functions),
-                random(&mut builder, &mut authors, &functions),
+                random(&mut builder, &mut authors, &functions, &mut source_pools),
+                random(&mut builder, &mut authors, &functions, &mut source_pools),
             ),
             EqualityCase::ErrorOperand => {
                 let source = value(&mut builder, 3);
-                let operand = round_value(&mut builder, &mut authors, &functions, source);
+                let operand = round_value(
+                    &mut builder,
+                    &mut authors,
+                    &functions,
+                    source,
+                    &mut source_pools,
+                );
                 (
                     operand,
                     value(&mut builder, 4),
-                    literal(&mut builder, decimal.clone(), LiteralValue::Null),
+                    literal(
+                        &mut builder,
+                        decimal.clone(),
+                        checked_constants::null(&(decimal.clone()), options().constants),
+                        &mut source_pools,
+                    ),
                 )
             }
             EqualityCase::ErrorLabel => {
                 let operand = value(&mut builder, 3);
                 let source = value(&mut builder, 4);
-                let first = round_value(&mut builder, &mut authors, &functions, source);
+                let first = round_value(
+                    &mut builder,
+                    &mut authors,
+                    &functions,
+                    source,
+                    &mut source_pools,
+                );
                 // The later label is a separate occurrence of the original
                 // operand definition; no failed first label may reach it.
                 (operand, first, operand)
             }
             EqualityCase::Eq | EqualityCase::NotEq => unreachable!(),
         };
-        let then_first = literal(&mut builder, result_type.clone(), LiteralValue::Int64(10));
-        let then_second = literal(&mut builder, result_type.clone(), LiteralValue::Int64(20));
-        let otherwise = literal(&mut builder, result_type.clone(), LiteralValue::Int64(30));
+        let then_first = literal(
+            &mut builder,
+            result_type.clone(),
+            checked_constants::i64(&(result_type.clone()), 10, options().constants),
+            &mut source_pools,
+        );
+        let then_second = literal(
+            &mut builder,
+            result_type.clone(),
+            checked_constants::i64(&(result_type.clone()), 20, options().constants),
+            &mut source_pools,
+        );
+        let otherwise = literal(
+            &mut builder,
+            result_type.clone(),
+            checked_constants::i64(&(result_type.clone()), 30, options().constants),
+            &mut source_pools,
+        );
         builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 result_type.clone(),
                 ExprKind::Case {
                     operand: Some(operand),
@@ -218,10 +298,18 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
             )
             .unwrap()
     };
+    let expr = builder
+        .unit(output)
+        .unwrap()
+        .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let result_value = builder
         .add_value(
             result_type.clone(),
-            ValueOrigin::Expr { node: output, expr },
+            ValueOrigin::Expr {
+                node: output,
+                root: expr,
+            },
         )
         .unwrap();
     builder
@@ -232,22 +320,10 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
             Box::from([result_value]),
         )
         .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: FragmentId::new(203),
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "equality_result".into(),
@@ -256,7 +332,7 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
             ty: result_type,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result)
+    compile_checked_fragment(&functions, builder, output, &authors, result, source_pools)
 }
 fn batch(
     program: &LocalProgram,
@@ -311,30 +387,29 @@ fn integers(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<i64>
         .iter()
         .collect()
 }
-fn root_use(program: &LocalProgram) -> ProgramUseRef {
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    ProgramUseRef {
-        arena: root().arena(),
-        use_id: snapshot.bindings()[&root()],
-    }
+fn root_use(program: &LocalProgram) -> ExpressionUseId {
+    let reference = root(program);
+    program
+        .unit(reference.unit)
+        .unwrap()
+        .root(reference.root)
+        .unwrap()
+        .use_id
 }
 fn assert_case_recipes(program: &LocalProgram, ty: DataType) {
     let occurrence = root_use(program);
     for arm in 0..2 {
-        let recipe = program
-            .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm })
+        let recipe = root_unit(program)
+            .recipes()
+            .comparison(ComparisonSite::CaseWhen { occurrence, arm })
             .unwrap();
         assert_eq!(recipe.left_type().data_type().clone(), ty);
         assert_eq!(recipe.right_type().data_type().clone(), ty);
     }
     assert!(
-        program
-            .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm: 2 })
+        root_unit(program)
+            .recipes()
+            .comparison(ComparisonSite::CaseWhen { occurrence, arm: 2 })
             .is_none()
     );
 }
@@ -372,8 +447,9 @@ fn ordinary_eq_and_not_eq_preserve_frozen_float_bits_and_nulls_in_sparse_rows() 
     let rows = [1, 2, 3, 4, 5, 6, 7, 8, 9];
     for kind in [EqualityCase::Eq, EqualityCase::NotEq] {
         let program = equality_program(kind);
-        let recipe = program
-            .comparison_recipe(ProgramComparisonSite::Binary(root_use(&program)))
+        let recipe = root_unit(&program)
+            .recipes()
+            .comparison(ComparisonSite::Binary(root_use(&program)))
             .unwrap();
         assert_eq!(
             recipe.left_type(),

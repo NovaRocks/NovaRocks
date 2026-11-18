@@ -17,11 +17,8 @@
 
 //! Real SQL -> frozen package -> LocalCompiler partition ranking contract.
 use arrow::datatypes::DataType;
-use novarocks_local_program::{
-    LocalSortMode, PartitionRank, ProgramChannelLayoutRole, ProgramExpressionRootSite,
-    ProgramNodeExpressionRole, ProgramNodeKind, ProgramRootInput, StaticExprKind,
-    root_input_layout,
-};
+use novarocks_expression::StaticExprKind;
+use novarocks_local_program::{LocalSortMode, PartitionRank, ProgramNodeKind};
 use novarocks_sql_testkit::{installed_builtin_owner_catalogue, sql_source};
 use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
@@ -68,55 +65,25 @@ fn partition_topn_preserves_actual_sql_rank_limit_and_key_roots() {
                 assert!(!order_by[0].asc);
                 assert!(!order_by[0].nulls_first);
 
-                let node_id = node.local_id().expect("compiled Sort has a local identity");
-                let snapshot = program
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .resolved_calls()
-                    .snapshot();
-                for (role, expression) in [
-                    (
-                        ProgramNodeExpressionRole::SortPartition { key: 0 },
-                        partition_by[0].expr,
-                    ),
-                    (
-                        ProgramNodeExpressionRole::SortOrder { key: 0 },
-                        order_by[0].expr,
-                    ),
-                ] {
-                    let site = ProgramExpressionRootSite::Node {
-                        node: node_id,
-                        role,
-                    };
-                    let root = snapshot
-                        .roots()
-                        .sites()
-                        .get(&site)
-                        .expect("the actual Sort field has its declared root role");
-                    assert_eq!(root.definition, expression);
-                    assert!(snapshot.bindings().contains_key(&site));
-                    let ProgramRootInput::Layout {
-                        node: input_node,
-                        role: input_role,
-                    } = root_input_layout(program.graph(), site).unwrap()
-                    else {
-                        panic!("a source key reads the actual Sort input");
-                    };
-                    assert_eq!(input_node, *input);
-                    assert_eq!(input_role, ProgramChannelLayoutRole::NodeOutput);
-                    let layout = program
-                        .checked()
-                        .channels()
-                        .channel_layout(input_node, input_role)
-                        .unwrap();
-                    assert_eq!(layout.schema().fields().len(), 1);
-                    assert_eq!(layout.schema().field(0).data_type(), &DataType::Int64);
-                    let definition = program.graph().expressions().node(expression).unwrap();
-                    let StaticExprKind::SlotId(slot) = definition.kind() else {
-                        panic!("SQL k remains the declared source slot");
-                    };
-                    assert_eq!(*slot, layout.slots()[0]);
+                let layout = program.graph().nodes()[input.index()].output_layout();
+                assert_eq!(layout.schema().fields().len(), 1);
+                assert_eq!(layout.schema().field(0).data_type(), &DataType::Int64);
+                assert_eq!(partition_by[0].expr.unit, order_by[0].expr.unit);
+                assert_ne!(partition_by[0].expr.root, order_by[0].expr.root);
+                for expression in [partition_by[0].expr, order_by[0].expr] {
+                    let unit = program.unit(expression.unit).unwrap();
+                    let root = unit.root(expression.root).unwrap();
+                    let definition = unit.definitions().node(root.definition).unwrap();
+                    assert!(matches!(definition.kind(), StaticExprKind::Input));
+                    let binding = unit
+                        .input(root.use_id)
+                        .expect("SQL k remains the declared source input");
+                    assert_eq!(binding.ordinal, 0);
+                    assert_eq!(binding.scope, root.scope);
+                    assert_eq!(
+                        unit.scope(binding.scope).unwrap().schema().as_ref(),
+                        layout.schema().as_ref()
+                    );
                     assert_eq!(
                         definition.value_type().unwrap().data_type(),
                         &DataType::Int64

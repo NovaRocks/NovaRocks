@@ -25,12 +25,9 @@ use super::sql_test_source::{
 use arrow::array::{Array, ArrayRef, BooleanArray, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
-use novarocks_local_program::{
-    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind, ProgramRootInput,
-    root_input_layout,
-};
-use novarocks_physical_plan::ExprKind;
+use novarocks_local_program::ProgramNodeKind;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{sync::Arc, time::Duration};
@@ -53,7 +50,9 @@ impl KernelEvaluationControl for Control {
 fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
     let mut n = 0;
     for (&id, fragment) in source.plan().fragments() {
-        for (definition, node) in fragment.expressions().iter() {
+        for (_source_node, unit, definition, node) in
+            super::sql_test_source::unit_definitions(fragment)
+        {
             if let ExprKind::Like {
                 expr,
                 pattern,
@@ -61,8 +60,8 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
             } = &node.kind
             {
                 n += 1;
-                let input = fragment.expressions().get(*expr).unwrap();
-                let pattern = fragment.expressions().get(*pattern).unwrap();
+                let input = unit.definition(*expr).unwrap();
+                let pattern = unit.definition(*pattern).unwrap();
                 println!(
                     "actual original LIKE fragment={id:?} definition={definition:?} operand={:?} pattern={:?} result={:?} negated={negated}",
                     input.ty, pattern.ty, node.ty
@@ -119,40 +118,24 @@ fn evaluate(
                         && node.output_layout().schema().field(0).data_type()
                             == &DataType::Boolean =>
                 {
-                    vec![ProgramExpressionRootSite::Node {
-                        node: node.local_id().unwrap(),
-                        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-                    }]
+                    vec![exprs[0]]
                 }
-                ProgramNodeKind::Filter { .. } if truth => vec![ProgramExpressionRootSite::Node {
-                    node: node.local_id().unwrap(),
-                    role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
-                }],
+                ProgramNodeKind::Filter { predicates, .. } if truth => predicates.to_vec(),
                 ProgramNodeKind::Scan { residuals, .. } if truth => {
                     // The original installed Scan author owns these ordered
                     // roots. Enumerate its exact residual ordinals; no assumed
                     // root zero or synthesized Filter predicate supplies one.
-                    residuals
-                        .iter()
-                        .enumerate()
-                        .map(|(ordinal, _)| ProgramExpressionRootSite::Node {
-                            node: node.local_id().unwrap(),
-                            role: ProgramNodeExpressionRole::ScanResidual {
-                                predicate: u32::try_from(ordinal).unwrap(),
-                            },
-                        })
-                        .collect()
+                    residuals.to_vec()
                 }
                 _ => Vec::new(),
             };
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
+
             for site in sites {
-                if snapshot.bindings().contains_key(&site) {
+                if program
+                    .unit(site.unit)
+                    .and_then(|unit| unit.root(site.root))
+                    .is_some()
+                {
                     assert!(found.is_none(), "fixture has one actual LIKE root");
                     found = Some((program.clone(), site));
                 }
@@ -160,14 +143,9 @@ fn evaluate(
         }
     }
     let (program, site) = found.expect("actual original LIKE root");
-    let ProgramRootInput::Layout { node, role } = root_input_layout(program.graph(), site).unwrap()
-    else {
-        panic!("actual source owns a scan input")
-    };
-    let schema = program
-        .checked()
-        .channels()
-        .channel_layout(node, role)
+    let unit = program.unit(site.unit).unwrap();
+    let schema = unit
+        .scope(unit.root(site.root).unwrap().scope)
         .unwrap()
         .schema()
         .clone();
@@ -184,8 +162,12 @@ fn evaluate(
         Vec::new(),
     ] {
         let selection = Selection::try_sparse(input.len(), &rows).unwrap();
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &Control,
+        )
+        .unwrap();
         let out = frame.evaluate(&data, selection, &Control).unwrap();
         assert!(out.errors().is_empty());
         assert_eq!(out.selection(), selection);

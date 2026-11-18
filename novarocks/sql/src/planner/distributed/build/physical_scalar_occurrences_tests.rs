@@ -16,29 +16,34 @@
 // under the License.
 
 use super::super::{
-    expression_occurrences::author_physical_occurrences_observed,
+    expression_component_test_fixture::{FixtureBuilder, UnitFixture},
+    physical_expression_effects::{
+        PhysicalCallSourceScope, PhysicalExpressionEffectsInput,
+        author_physical_expression_effects_observed,
+    },
     physical_scalar_requests::author_physical_scalar_request_observed,
+    unit_source::UnitDefinitions,
 };
 use super::*;
 use crate::functions::build_builtin_engine_function_catalog;
+use crate::test_constants as checked;
 use arrow::datatypes::{DataType, Field};
 use novarocks_functions::{
     ConstantPolicy, EngineFunctionCatalog, FunctionArgument, FunctionResolutionError,
     FunctionResultType, FunctionSpecializationFailure, ResolvedAggregateSignature,
 };
-use novarocks_physical_plan::{
-    BoundFunction, ChangeEventSpec, ConstantPools, ExprArena, ExpressionRootRole,
-    ExpressionRootSite, Fragment, FragmentBuilder, FragmentId, FragmentSink, FrozenFragmentCalls,
-    LiteralValue, NodeId, NodeKind, PhysicalRootUses, PipelineDopDomain, PlanLimits, ValueOrigin,
-};
 use novarocks_type_contract::{
-    CompilePhase, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionEffects,
-    ExpressionEvaluationDomain, ExpressionInvocation, FunctionArgumentEvaluation,
+    CompilePhase, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, ExpressionEffects,
+    ExpressionEvaluationRegion, ExpressionInvocation, FunctionArgumentEvaluation,
     FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError, FunctionValueType,
     FunctionVolatility, GuardKind, PureCompileControl, SemanticParameterId, SemanticParameterKey,
     SemanticParameterValue,
 };
 use std::sync::Mutex;
+use {
+    novarocks_expression_contract::{BoundExprSet, BoundFunction, RootOrdinal},
+    novarocks_physical_plan::{ConstantPools, NodeId},
+};
 
 const PHASE: CompilePhase = CompilePhase::FunctionSpecialization;
 const CAUSES: [CompileControlError; 3] = [
@@ -112,7 +117,7 @@ fn binding(
         kind: resolved.kind,
         argument_types: resolved.selected.argument_types,
         result_type,
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: resolved.semantics.volatility,
             argument_evaluation: resolved.semantics.argument_evaluation,
             failure_behavior: resolved.semantics.failure_behavior,
@@ -121,91 +126,55 @@ fn binding(
         }),
     }
 }
-fn empty() -> (FragmentBuilder, NodeId, NodeId) {
-    let mut builder = FragmentBuilder::new(FragmentId::new(71));
-    let input = NodeId::new(7);
-    let owner = NodeId::new(901);
-    builder
-        .add_values(
-            input,
-            Box::from([Box::<[ExprId]>::default()]),
-            Box::default(),
-        )
-        .unwrap();
-    (builder, input, owner)
+// Generic malformed-flow tests borrow only real definition membership. This
+// supplies no control shape, SQL provenance, installed capability or new graph.
+struct Membership<'a>(UnitDefinitions<'a>);
+impl novarocks_type_contract::ExpressionDefinitionMembership<ExprId> for Membership<'_> {
+    fn definition_count(&self) -> usize {
+        self.0.len()
+    }
+    fn contains_definition(&self, id: ExprId) -> bool {
+        self.0.definition(id).is_some()
+    }
 }
 fn literal(
-    builder: &mut FragmentBuilder,
+    builder: &mut FixtureBuilder,
     owner: NodeId,
     ty: FunctionValueType,
-    value: LiteralValue,
+    value: checked::Source,
 ) -> ExprId {
-    builder
-        .add_expression(owner, ty, ExprKind::Literal(value))
-        .unwrap()
+    assert_eq!(owner, builder.node);
+    let kind = checked::insert(&mut builder.constants, value(&ty));
+    builder.add(ty, kind)
 }
 fn call(
-    builder: &mut FragmentBuilder,
+    builder: &mut FixtureBuilder,
     owner: NodeId,
     function: BoundFunction,
     args: &[ExprId],
 ) -> ExprId {
-    builder
-        .add_expression(
-            owner,
-            function.result_type.clone(),
-            ExprKind::FunctionCall {
-                function,
-                args: args.into(),
-            },
-        )
-        .unwrap()
+    assert_eq!(owner, builder.node);
+    builder.add(
+        function.result_type.clone(),
+        ExprKind::FunctionCall {
+            function,
+            args: args.into(),
+        },
+    )
 }
-fn finish(builder: FragmentBuilder, root: NodeId) -> Fragment {
-    builder
-        .finish_structure(
-            root,
-            FragmentSink::Noop,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            PlanLimits::FROZEN,
-            &Control::default(),
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap()
-}
-fn project(builder: &mut FragmentBuilder, input: NodeId, owner: NodeId, roots: &[ExprId]) {
-    let mut pairs = Vec::new();
-    let mut outputs = Vec::new();
-    for &expr in roots {
-        let value = builder
-            .add_value(
-                builder.expressions().get(expr).unwrap().ty.clone(),
-                ValueOrigin::Expr { node: owner, expr },
-            )
-            .unwrap();
-        pairs.push((expr, value));
-        outputs.push(value);
+fn value_roots(builder: &mut FixtureBuilder, definitions: &[ExprId]) {
+    for &definition in definitions {
+        builder.root(definition, EvaluationDemand::Value);
     }
-    builder
-        .add_project(
-            owner,
-            input,
-            pairs.into_boxed_slice(),
-            outputs.into_boxed_slice(),
-        )
-        .unwrap();
 }
-fn lower(catalog: &EngineFunctionCatalog) -> (Fragment, ExprId) {
-    let (mut builder, input, owner) = empty();
+fn lower(catalog: &EngineFunctionCatalog) -> (UnitFixture, ExprId) {
+    let mut builder = FixtureBuilder::new();
+    let owner = builder.node;
     let arg = literal(
         &mut builder,
         owner,
         ty(DataType::Utf8, false),
-        LiteralValue::Utf8("Straße".into()),
+        checked::utf8("Straße".into()),
     );
     let root = call(
         &mut builder,
@@ -213,124 +182,52 @@ fn lower(catalog: &EngineFunctionCatalog) -> (Fragment, ExprId) {
         binding(catalog, "lower", &[ty(DataType::Utf8, false)]),
         &[arg],
     );
-    project(&mut builder, input, owner, &[root]);
-    (finish(builder, owner), root)
+    value_roots(&mut builder, &[root]);
+    (builder.seal(catalog, policy()), root)
 }
-fn shared_if(catalog: &EngineFunctionCatalog) -> (Fragment, ExprId) {
-    let (mut builder, input, owner) = empty();
+fn shared_if(catalog: &EngineFunctionCatalog) -> (UnitFixture, ExprId, [RootOrdinal; 2]) {
+    let mut builder = FixtureBuilder::new();
+    let owner = builder.node;
     let boolean = ty(DataType::Boolean, false);
-    let a = literal(
-        &mut builder,
-        owner,
-        boolean.clone(),
-        LiteralValue::Boolean(true),
-    );
+    let a = literal(&mut builder, owner, boolean.clone(), checked::boolean(true));
     let b = literal(
         &mut builder,
         owner,
         boolean.clone(),
-        LiteralValue::Boolean(false),
+        checked::boolean(false),
     );
-    let mut function = binding(
-        catalog,
-        "if",
-        &[boolean.clone(), boolean.clone(), boolean.clone()],
-    );
-    // These contradictory legacy fields are not authority for the new owner.
-    function
+    let mut function = binding(catalog, "if", &[boolean.clone(), boolean.clone(), boolean]);
+    // These contradictory legacy fields are not authority for the real owner.
+    let legacy = function
         .legacy_metadata
         .as_mut()
-        .expect("actual legacy fixture")
-        .argument_evaluation = FunctionArgumentEvaluation::Eager;
-    function
-        .legacy_metadata
-        .as_mut()
-        .expect("actual legacy fixture")
-        .volatility = FunctionVolatility::Volatile;
-    function
-        .legacy_metadata
-        .as_mut()
-        .expect("actual legacy fixture")
-        .intrinsic_row_error = FunctionIntrinsicRowError::MayRaise;
-    function
-        .legacy_metadata
-        .as_mut()
-        .expect("actual legacy fixture")
-        .failure_behavior = FunctionFailureBehavior::ReturnsNull;
-    let root = ExprId::new(u32::MAX - 1);
-    builder
-        .insert_expression(ExprNode {
-            id: root,
-            owner,
-            lambda_scope: None,
-            ty: function.result_type.clone(),
-            kind: ExprKind::FunctionCall {
-                function,
-                args: Box::from([a, b, a]),
-            },
-        })
-        .unwrap();
-    let value = builder
-        .add_value(
-            boolean,
-            ValueOrigin::NodeOutput {
-                node: owner,
-                output_ordinal: 0,
-            },
-        )
-        .unwrap();
-    let effect = builder
-        .add_value(
-            ty(DataType::Int8, false),
-            ValueOrigin::NodeOutput {
-                node: owner,
-                output_ordinal: 1,
-            },
-        )
-        .unwrap();
-    builder
-        .add_row_rewriting(
-            owner,
-            input,
-            Some(&BTreeMap::new()),
-            Box::from([value, effect]),
-            NodeKind::ChangeEventExpand {
-                events: Box::from([ChangeEventSpec {
-                    predicate: Some(root),
-                    effect: novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
-                    assignments: Box::from([novarocks_physical_plan::ChangeAssignment::exact(
-                        value,
-                        Some(root),
-                    )]),
-                }]),
-                effect_output: effect,
-            },
-        )
-        .unwrap();
-    (finish(builder, owner), root)
+        .expect("actual legacy fixture");
+    legacy.argument_evaluation = FunctionArgumentEvaluation::Eager;
+    legacy.volatility = FunctionVolatility::Volatile;
+    legacy.intrinsic_row_error = FunctionIntrinsicRowError::MayRaise;
+    legacy.failure_behavior = FunctionFailureBehavior::ReturnsNull;
+    let root = call(&mut builder, owner, function, &[a, b, a]);
+    let truth = builder.root(root, EvaluationDemand::TruthOnly);
+    let value = builder.root(root, EvaluationDemand::Value);
+    (builder.seal(catalog, policy()), root, [truth, value])
 }
-fn uses(fragment: &Fragment, catalog: &EngineFunctionCatalog) -> PhysicalRootUses {
-    author_physical_occurrences_observed(fragment, catalog, &Control::default())
-        .unwrap()
-        .root_uses
+fn request<'a>(source: &'a ExprNode, fixture: &UnitFixture) -> AuthoredPhysicalScalarRequest<'a> {
+    request_from(source, fixture.definitions(), &fixture.constants)
 }
-fn request<'a>(source: &'a ExprNode, fragment: &Fragment) -> AuthoredPhysicalScalarRequest<'a> {
-    request_from(source, fragment.expressions())
-}
-fn request_from<'a>(source: &'a ExprNode, arena: &ExprArena) -> AuthoredPhysicalScalarRequest<'a> {
+fn request_from<'a>(
+    source: &'a ExprNode,
+    definitions: UnitDefinitions<'_>,
+    pools: &ConstantPools,
+) -> AuthoredPhysicalScalarRequest<'a> {
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
-    let result = author_physical_scalar_request_observed(
-        source,
-        arena,
-        &ConstantPools::empty(),
-        policy(),
-        &mut work,
-    )
-    .unwrap();
+    let result =
+        author_physical_scalar_request_observed(source, definitions, pools, policy(), &mut work)
+            .unwrap();
     work.finish().unwrap();
     result
 }
+
 fn leaves(
     flow: &ExpressionControlFlow<ExprId>,
 ) -> BTreeMap<ExpressionUseId, ScopedExpressionEffects> {
@@ -360,7 +257,7 @@ fn input<'a>(
         parameters,
         environment: &[],
         decimal_overflow_policy: policy,
-        proof_scope: CallProofScope::Domain(flow.uses()[&id].context.domain),
+        proof_scope: CallProofScope::Region(flow.uses()[&id].context.region),
     }
 }
 fn run(
@@ -417,70 +314,102 @@ fn root_use(flow: &ExpressionControlFlow<ExprId>, definition: ExprId) -> Express
         .0
 }
 fn prepare_all(
-    fragment: &Fragment,
-    roots: &PhysicalRootUses,
+    fixture: &UnitFixture,
     catalog: &EngineFunctionCatalog,
-    policy: DecimalOverflowPolicy,
+    decimal_policy: DecimalOverflowPolicy,
 ) -> (
     BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
-    FrozenFragmentCalls,
+    BoundExprSet,
 ) {
     let params = SemanticParameters::try_new([]).unwrap();
-    let mut summaries = BTreeMap::new();
-    let mut frozen = Vec::new();
-    // The author assigns each parent before its ordered descendants. Each
-    // invocation is prepared independently, including shared definitions.
-    for (&id, item) in roots.flow().uses().iter().rev() {
-        let source = fragment.expressions().get(item.definition).unwrap();
-        if matches!(source.kind, ExprKind::FunctionCall { .. }) {
-            let req = request(source, fragment);
-            let result = run(
-                input(source, &req, roots.flow(), id, &summaries, &params, policy),
-                catalog,
-                &Control::default(),
-            )
-            .unwrap();
-            assert!(Arc::ptr_eq(
-                req.selected(),
-                result.preparation.call_contract().selected_owner()
-            ));
-            assert_eq!(result.frozen.context, item.context);
-            summaries.insert(id, result.preparation.effects());
-            frozen.push(result.frozen);
-        } else {
-            summaries.insert(id, ScopedExpressionEffects::pure_value(item.context));
+    let scopes = fixture
+        .flow()
+        .uses()
+        .iter()
+        .filter_map(|(&id, item)| {
+            let source = fixture.definition(item.definition);
+            matches!(source.kind, ExprKind::FunctionCall { .. }).then_some((
+                id,
+                PhysicalCallSourceScope {
+                    source,
+                    decimal_overflow_policy: decimal_policy,
+                    environment: &[],
+                    proof_scope: CallProofScope::Region(item.context.region),
+                },
+            ))
+        })
+        .collect();
+    // Reuse the existing direct-component composer, whose original owner walks
+    // actual child edges. Numeric use order has no dependency meaning.
+    let authored = author_physical_expression_effects_observed(
+        PhysicalExpressionEffectsInput {
+            owner: crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(
+                fixture.node,
+            ),
+            unit: &fixture.sealed,
+            constants: &fixture.constants,
+            parameters: &params,
+            literal_policy: policy(),
+            call_scopes: &scopes,
+        },
+        catalog,
+        &Control::default(),
+    )
+    .unwrap();
+    let mut summaries = authored.summaries.clone();
+    let mut claims = BTreeMap::new();
+    // The real composer's verified summaries supply every child. Re-enter the
+    // original occurrence leaf independently per use to preserve the exact
+    // selected Arc assertion without duplicating dependency traversal.
+    for (&id, item) in fixture.flow().uses() {
+        let source = fixture.definition(item.definition);
+        if !matches!(source.kind, ExprKind::FunctionCall { .. }) {
+            continue;
         }
-    }
-    let calls = FrozenFragmentCalls::try_new(fragment, roots, frozen, &Control::default()).unwrap();
-    calls
-        .validate_fragment(fragment, roots, &Control::default())
+        let req = request(source, fixture);
+        let fresh = run(
+            input(
+                source,
+                &req,
+                fixture.flow(),
+                id,
+                &authored.summaries,
+                &params,
+                decimal_policy,
+            ),
+            catalog,
+            &Control::default(),
+        )
         .unwrap();
-    (summaries, calls)
+        assert!(Arc::ptr_eq(
+            req.selected(),
+            fresh.preparation.call_contract().selected_owner()
+        ));
+        assert_eq!(fresh.claim.context, item.context);
+        assert_eq!(fresh.claim, authored.calls[&id]);
+        let effects = fresh.preparation.effects().for_use(item.context).unwrap();
+        let summary = ScopedExpressionEffects::primitive(item.context, effects);
+        assert_eq!(summary, authored.summaries[&id]);
+        summaries.insert(id, summary);
+        assert!(claims.insert(id, fresh.claim).is_none());
+    }
+    assert_eq!(claims.len(), authored.calls.len());
+    let unit = fixture.validate_claims(claims);
+    (summaries, unit)
 }
 
 #[test]
 fn scalar_occurrences_shared_if_keeps_two_demands_guards_policies_and_same_selected_owner() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
-    let (fragment, root) = shared_if(&catalog);
-    let roots = uses(&fragment, &catalog);
-    let source = fragment.expressions().get(root).unwrap();
+    let (fragment, root, roots) = shared_if(&catalog);
+    let source = fragment.definition(root);
     let req = request(source, &fragment);
-    let children = leaves(roots.flow());
+    let children = leaves(fragment.flow());
     let params = SemanticParameters::try_new([]).unwrap();
-    let owner = NodeId::new(901);
-    let truth = roots.bindings()[&ExpressionRootSite {
-        node: owner,
-        role: ExpressionRootRole::ChangePredicate { event: 0 },
-    }];
-    let value = roots.bindings()[&ExpressionRootSite {
-        node: owner,
-        role: ExpressionRootRole::ChangeAssignment {
-            event: 0,
-            assignment: 0,
-        },
-    }];
+    let truth = fragment.root_use(roots[0]);
+    let value = fragment.root_use(roots[1]);
     assert_ne!(truth, value);
-    let mut calls = Vec::new();
+    let mut calls = BTreeMap::new();
     for (id, demand, policy) in [
         (
             truth,
@@ -493,20 +422,28 @@ fn scalar_occurrences_shared_if_keeps_two_demands_guards_policies_and_same_selec
             DecimalOverflowPolicy::OutputNull,
         ),
     ] {
-        let invocation = &roots.flow().uses()[&id];
+        let invocation = &fragment.flow().uses()[&id];
         assert_eq!(invocation.definition, root);
         assert_eq!(invocation.control, ControlShape::If);
         assert_eq!(invocation.context.demand, demand);
         for (ordinal, kind) in [(1, GuardKind::IfThen), (2, GuardKind::IfElse)] {
-            let child = &roots.flow().uses()[&invocation.arguments[ordinal]];
-            let domain = roots.flow().domains()[&child.context.domain];
-            assert_eq!(domain.parent, Some(invocation.context.domain));
+            let child = &fragment.flow().uses()[&invocation.arguments[ordinal]];
+            let domain = fragment.flow().regions()[&child.context.region];
+            assert_eq!(domain.parent, Some(invocation.context.region));
             assert_eq!(domain.guard.unwrap().owner, id);
             assert_eq!(domain.guard.unwrap().kind, kind);
             assert_eq!(child.context.demand, demand);
         }
         let result = run(
-            input(source, &req, roots.flow(), id, &children, &params, policy),
+            input(
+                source,
+                &req,
+                fragment.flow(),
+                id,
+                &children,
+                &params,
+                policy,
+            ),
             &catalog,
             &Control::default(),
         )
@@ -523,35 +460,32 @@ fn scalar_occurrences_shared_if_keeps_two_demands_guards_policies_and_same_selec
                 .unwrap(),
             ExpressionEffects::PURE_VALUE
         );
-        assert_eq!(result.frozen.decimal_overflow_policy, policy);
+        assert_eq!(result.claim.decimal_overflow_policy, policy);
         assert_eq!(
-            result.frozen.effects.value_stability,
+            result.claim.effects.value_stability,
             FunctionVolatility::Immutable
         );
         assert_eq!(
-            result.frozen.effects.own_row_error,
+            result.claim.effects.own_row_error,
             FunctionIntrinsicRowError::NoRowError
         );
         assert_eq!(
-            result.frozen.effects.proof_scope,
-            CallProofScope::Domain(invocation.context.domain)
+            result.claim.effects.proof_scope,
+            CallProofScope::Region(invocation.context.region)
         );
-        calls.push(result.frozen);
+        assert!(calls.insert(id, result.claim).is_none());
     }
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &roots, calls, &Control::default()).unwrap();
-    assert_eq!(calls.entries().len(), 2);
-    calls
-        .validate_fragment(&fragment, &roots, &Control::default())
-        .unwrap();
+    let calls = fragment.validate_claims(calls);
+    assert_eq!(calls.claims().len(), 2);
 }
 
 #[test]
 fn scalar_occurrences_actual_coalesce_preserves_rng_instance_and_decimal_row_error_children() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
-    let (mut builder, leaf, owner) = empty();
+    let mut builder = FixtureBuilder::new();
+    let owner = builder.node;
     let rand = call(&mut builder, owner, binding(&catalog, "rand", &[]), &[]);
-    let rand_ty = builder.expressions().get(rand).unwrap().ty.clone();
+    let rand_ty = builder.definition(rand).ty.clone();
     let coalesce_rand = call(
         &mut builder,
         owner,
@@ -563,7 +497,7 @@ fn scalar_occurrences_actual_coalesce_preserves_rng_instance_and_decimal_row_err
         &mut builder,
         owner,
         decimal.clone(),
-        LiteralValue::Decimal128(12345),
+        checked::decimal128(12345),
     );
     let round = call(
         &mut builder,
@@ -571,31 +505,30 @@ fn scalar_occurrences_actual_coalesce_preserves_rng_instance_and_decimal_row_err
         binding(&catalog, "round", &[decimal]),
         &[arg],
     );
-    let round_ty = builder.expressions().get(round).unwrap().ty.clone();
+    let round_ty = builder.definition(round).ty.clone();
     let coalesce_round = call(
         &mut builder,
         owner,
         binding(&catalog, "coalesce", &[round_ty.clone(), round_ty]),
         &[round, round],
     );
-    project(&mut builder, leaf, owner, &[coalesce_rand, coalesce_round]);
-    let fragment = finish(builder, owner);
-    let roots = uses(&fragment, &catalog);
+    value_roots(&mut builder, &[coalesce_rand, coalesce_round]);
+    let fragment = builder.seal(&catalog, policy());
     for policy in [
         DecimalOverflowPolicy::ReportError,
         DecimalOverflowPolicy::OutputNull,
     ] {
-        let (summaries, calls) = prepare_all(&fragment, &roots, &catalog, policy);
-        let rand_use = root_use(roots.flow(), coalesce_rand);
-        let round_use = root_use(roots.flow(), coalesce_round);
+        let (summaries, calls) = prepare_all(&fragment, &catalog, policy);
+        let rand_use = root_use(fragment.flow(), coalesce_rand);
+        let round_use = root_use(fragment.flow(), coalesce_round);
         let rng = summaries[&rand_use]
-            .for_use(roots.flow().uses()[&rand_use].context)
+            .for_use(fragment.flow().uses()[&rand_use].context)
             .unwrap();
         assert_eq!(rng.value_stability, FunctionVolatility::Volatile);
         assert!(rng.has_instance_state);
         assert!(rng.observable_effects.rng_sampling);
         let decimal = summaries[&round_use]
-            .for_use(roots.flow().uses()[&round_use].context)
+            .for_use(fragment.flow().uses()[&round_use].context)
             .unwrap();
         assert_eq!(
             decimal.may_raise_row_error,
@@ -604,12 +537,10 @@ fn scalar_occurrences_actual_coalesce_preserves_rng_instance_and_decimal_row_err
         // Own COALESCE facts do not absorb the child's mutable instance; the
         // composed scoped summary above retains it for the next parent.
         assert_eq!(
-            calls.entries()[&PhysicalCallSite::Expression(rand_use)]
-                .effects
-                .own_row_error,
+            calls.claims()[&rand_use].effects.own_row_error,
             FunctionIntrinsicRowError::NoRowError
         );
-        assert_eq!(calls.entries().len(), 6);
+        assert_eq!(calls.claims().len(), 6);
     }
 }
 
@@ -617,10 +548,9 @@ fn scalar_occurrences_actual_coalesce_preserves_rng_instance_and_decimal_row_err
 fn scalar_occurrences_reject_foreign_static_source_missing_use_and_wrong_definition() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let (fragment, root) = lower(&catalog);
-    let roots = uses(&fragment, &catalog);
-    let flow = roots.flow();
+    let flow = fragment.flow();
     let id = root_use(flow, root);
-    let source = fragment.expressions().get(root).unwrap();
+    let source = fragment.definition(root);
     let req = request(source, &fragment);
     let cloned = source.clone();
     let foreign = request(&cloned, &fragment);
@@ -703,9 +633,9 @@ fn scalar_occurrences_reject_foreign_static_source_missing_use_and_wrong_definit
         .unwrap()
         .definition = root;
     let wrong = ExpressionControlFlow::try_new(
-        flow.domains().values().copied().collect(),
+        flow.regions().values().copied().collect(),
         invocations,
-        fragment.expressions(),
+        &Membership(fragment.definitions()),
         PHASE,
         &Control::default(),
     )
@@ -753,11 +683,10 @@ fn scalar_occurrences_reject_foreign_static_source_missing_use_and_wrong_definit
 #[test]
 fn scalar_occurrences_missing_or_foreign_guarded_child_summary_is_not_erased() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
-    let (fragment, root) = shared_if(&catalog);
-    let roots = uses(&fragment, &catalog);
-    let flow = roots.flow();
+    let (fragment, root, _) = shared_if(&catalog);
+    let flow = fragment.flow();
     let id = root_use(flow, root);
-    let source = fragment.expressions().get(root).unwrap();
+    let source = fragment.definition(root);
     let req = request(source, &fragment);
     let params = SemanticParameters::try_new([]).unwrap();
     let child = flow.uses()[&id].arguments[1];
@@ -832,10 +761,9 @@ fn scalar_occurrences_missing_or_foreign_guarded_child_summary_is_not_erased() {
 fn scalar_occurrences_exact_environment_parameters_and_domain_proof_are_explicit() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let (fragment, root) = lower(&catalog);
-    let roots = uses(&fragment, &catalog);
-    let flow = roots.flow();
+    let flow = fragment.flow();
     let id = root_use(flow, root);
-    let source = fragment.expressions().get(root).unwrap();
+    let source = fragment.definition(root);
     let req = request(source, &fragment);
     let children = leaves(flow);
     let empty = SemanticParameters::try_new([]).unwrap();
@@ -896,7 +824,7 @@ fn scalar_occurrences_exact_environment_parameters_and_domain_proof_are_explicit
         &empty,
         DecimalOverflowPolicy::ReportError,
     );
-    call.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(u32::MAX));
+    call.proof_scope = CallProofScope::Region(EvaluationRegionId::new(u32::MAX));
     assert!(matches!(
         run(call, &catalog, &Control::default()),
         Err(PhysicalScalarOccurrenceError::Occurrence(
@@ -917,9 +845,9 @@ fn scalar_occurrences_exact_environment_parameters_and_domain_proof_are_explicit
         &Control::default(),
     )
     .unwrap();
-    assert!(result.frozen.effects.environment.is_empty());
+    assert!(result.claim.effects.environment.is_empty());
     assert_eq!(
-        result.frozen.decimal_overflow_policy,
+        result.claim.decimal_overflow_policy,
         DecimalOverflowPolicy::OutputNull
     );
 }
@@ -928,10 +856,9 @@ fn scalar_occurrences_exact_environment_parameters_and_domain_proof_are_explicit
 fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owner_facts() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let (fragment, root) = lower(&catalog);
-    let roots = uses(&fragment, &catalog);
-    let flow = roots.flow();
+    let flow = fragment.flow();
     let id = root_use(flow, root);
-    let source = fragment.expressions().get(root).unwrap();
+    let source = fragment.definition(root);
     let children = leaves(flow);
     let params = SemanticParameters::try_new([]).unwrap();
     // A metadata-only SQL snapshot has no installation authority, even though
@@ -1076,7 +1003,7 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
         kind: resolved.kind,
         argument_types: resolved.selected.argument_types,
         result_type: result.clone(),
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: resolved.semantics.volatility,
             argument_evaluation: resolved.semantics.argument_evaluation,
             failure_behavior: resolved.semantics.failure_behavior,
@@ -1084,68 +1011,37 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
             semantic_parameters: Box::default(),
         }),
     };
-    let owner = NodeId::new(901);
-    let nodes = vec![
-        ExprNode {
-            id: ExprId::new(1),
-            owner,
-            lambda_scope: None,
-            ty: integer.clone(),
-            kind: ExprKind::Literal(LiteralValue::Int64(7)),
+    let mut draft = FixtureBuilder::new();
+    let constant_kind = checked::insert(&mut draft.constants, checked::i64(7)(&integer));
+    let body = draft.add(integer.clone(), constant_kind);
+    let lambda = draft.add(
+        integer.clone(),
+        ExprKind::Lambda {
+            parameter_types: Box::from([integer]),
+            body,
         },
-        ExprNode {
-            id: ExprId::new(2),
-            owner,
-            lambda_scope: None,
-            ty: integer.clone(),
-            kind: ExprKind::Lambda {
-                parameter_types: Box::from([integer]),
-                body: ExprId::new(1),
-            },
-        },
-        ExprNode {
-            id: ExprId::new(3),
-            owner,
-            lambda_scope: None,
-            ty: list,
-            kind: ExprKind::Value(novarocks_physical_plan::ValueId::new(3)),
-        },
-    ];
-    let arena = ExprArena::try_from_definitions_observed(
-        nodes.into_iter(),
-        &PlanLimits::FROZEN,
-        &Control::default(),
-    )
-    .unwrap();
-    let source = ExprNode {
-        id: ExprId::new(17),
-        owner,
-        lambda_scope: None,
-        ty: result,
-        kind: ExprKind::FunctionCall {
+    );
+    let value = draft.add(
+        list,
+        ExprKind::Value(novarocks_physical_plan::ValueId::new(3)),
+    );
+    let source_id = draft.add(
+        result,
+        ExprKind::FunctionCall {
             function,
-            args: Box::from([ExprId::new(2), ExprId::new(3)]),
+            args: Box::from([lambda, value]),
         },
-    };
-    // Membership includes the root without manufacturing an installed owner.
-    let mut nodes: Vec<_> = arena.iter().map(|(_, node)| node.clone()).collect();
-    nodes.push(source.clone());
-    let arena = ExprArena::try_from_definitions_observed(
-        nodes.into_iter(),
-        &PlanLimits::FROZEN,
-        &Control::default(),
-    )
-    .unwrap();
-    let source = arena.get(ExprId::new(17)).unwrap();
-    let req = request_from(source, &arena);
-    let domain = EvaluationDomainId::new(0);
+    );
+    let source = draft.definition(source_id);
+    let req = request_from(source, draft.definitions(), &draft.constants);
+    let domain = EvaluationRegionId::new(0);
     let context = |id| ExpressionEffectContext {
         use_id: ExpressionUseId::new(id),
-        domain,
+        region: domain,
         demand: EvaluationDemand::Value,
     };
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
+        vec![ExpressionEvaluationRegion {
             id: domain,
             parent: None,
             guard: None,
@@ -1159,18 +1055,18 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
             },
             ExpressionInvocation {
                 context: context(1),
-                definition: ExprId::new(2),
+                definition: lambda,
                 control: ControlShape::Eager,
                 arguments: Box::default(),
             },
             ExpressionInvocation {
                 context: context(2),
-                definition: ExprId::new(3),
+                definition: value,
                 control: ControlShape::Eager,
                 arguments: Box::default(),
             },
         ],
-        &arena,
+        &Membership(draft.definitions()),
         PHASE,
         &Control::default(),
     )
@@ -1182,7 +1078,7 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
                 source,
                 &req,
                 &flow,
-                ExpressionUseId::new(0),
+                flow.root_use_ids()[0],
                 &children,
                 &params,
                 DecimalOverflowPolicy::ReportError
@@ -1203,7 +1099,7 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
                     source,
                     &req,
                     &flow,
-                    ExpressionUseId::new(0),
+                    flow.root_use_ids()[0],
                     &children,
                     &params,
                     DecimalOverflowPolicy::ReportError,
@@ -1221,10 +1117,10 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
 fn scalar_occurrences_every_actual_small_success_callback_preserves_three_first_causes_and_caller_tail()
  {
     let catalog = build_builtin_engine_function_catalog().unwrap();
-    for (fragment, root) in [lower(&catalog), shared_if(&catalog)] {
-        let roots = uses(&fragment, &catalog);
-        let flow = roots.flow();
-        let source = fragment.expressions().get(root).unwrap();
+    let (shared, shared_root, _) = shared_if(&catalog);
+    for (fragment, root) in [lower(&catalog), (shared, shared_root)] {
+        let flow = fragment.flow();
+        let source = fragment.definition(root);
         let req = request(source, &fragment);
         let children = leaves(flow);
         let params = SemanticParameters::try_new([]).unwrap();
@@ -1281,7 +1177,8 @@ fn scalar_occurrences_every_actual_small_success_callback_preserves_three_first_
 #[test]
 fn scalar_occurrences_wide_coalesce_preserves_actual_order_and_samples_only_real_callbacks() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
-    let (mut builder, leaf, owner) = empty();
+    let mut builder = FixtureBuilder::new();
+    let owner = builder.node;
     let nullable = ty(DataType::Utf8, true);
     let mut args = Vec::new();
     for at in 0..320 {
@@ -1290,9 +1187,9 @@ fn scalar_occurrences_wide_coalesce_preserves_actual_order_and_samples_only_real
             owner,
             nullable.clone(),
             if at == 319 {
-                LiteralValue::Utf8("last".into())
+                checked::utf8("last".into())
             } else {
-                LiteralValue::Null
+                checked::null()
             },
         ));
     }
@@ -1302,12 +1199,11 @@ fn scalar_occurrences_wide_coalesce_preserves_actual_order_and_samples_only_real
         binding(&catalog, "coalesce", &vec![nullable; 320]),
         &args,
     );
-    project(&mut builder, leaf, owner, &[root]);
-    let fragment = finish(builder, owner);
-    let roots = uses(&fragment, &catalog);
-    let flow = roots.flow();
+    value_roots(&mut builder, &[root]);
+    let fragment = builder.seal(&catalog, policy());
+    let flow = fragment.flow();
     let id = root_use(flow, root);
-    let source = fragment.expressions().get(root).unwrap();
+    let source = fragment.definition(root);
     let req = request(source, &fragment);
     let children = leaves(flow);
     let params = SemanticParameters::try_new([]).unwrap();
@@ -1338,11 +1234,6 @@ fn scalar_occurrences_wide_coalesce_preserves_actual_order_and_samples_only_real
     // This is the actual occurrence edge/summary loop, not a claim about opaque
     // builtin preparation internals. Wide cancellation samples three callbacks.
     assert!(trace.contains(&(PHASE, 256)));
-    let (_, calls) = prepare_all(
-        &fragment,
-        &roots,
-        &catalog,
-        DecimalOverflowPolicy::ReportError,
-    );
-    assert_eq!(calls.entries().len(), 1);
+    let (_, calls) = prepare_all(&fragment, &catalog, DecimalOverflowPolicy::ReportError);
+    assert_eq!(calls.claims().len(), 1);
 }

@@ -138,13 +138,7 @@ fn validate_package_core(
         }
         error => crate::FragmentPackageError::Constant(error),
     })?;
-    // Count the immutable control representation in the same package dynamic
-    // item bound. These counts are not a decoded-allocation or peak-byte model.
-    let control = &input.expression_uses;
-    usage.add_items(control.flow().domains().len());
-    usage.add_items(control.flow().use_reference_count());
-    usage.add_items(control.bindings().len());
-    usage.add_items(control.roots().sites().len());
+    // Unit-owned control representation is counted by add_fragment above.
     usage.add_items(semantic_items);
     usage.add_items(input.scans.len());
     for scan in input.scans.values() {

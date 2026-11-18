@@ -19,7 +19,7 @@
 use super::super::*;
 use crate::{KernelDiagnostic, SelectedValues, Selection};
 use arrow_array::ArrayRef;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -224,7 +224,7 @@ fn decimal128_rescale_recipe_distinct_metadata_rounding_scale_errors_addresses_a
 fn decimal128_rescale_recipe_exact_nullable_effects_policy_and_foreign_address_guards() {
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(31),
-        domain: EvaluationDomainId::new(4),
+        region: EvaluationRegionId::new(4),
         demand: EvaluationDemand::Value,
     };
     for (policy, allow) in modes() {

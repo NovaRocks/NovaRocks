@@ -25,12 +25,9 @@ use super::sql_test_source::{
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
-use novarocks_local_program::{
-    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind, ProgramRootInput,
-    root_input_layout,
-};
-use novarocks_physical_plan::ExprKind;
+use novarocks_local_program::ProgramNodeKind;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{sync::Arc, time::Duration};
@@ -53,7 +50,7 @@ impl KernelEvaluationControl for Control {
 fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
     let mut n = 0;
     for (&id, fragment) in source.plan().fragments() {
-        for (_, node) in fragment.expressions().iter() {
+        for (_source_node, unit, _, node) in super::sql_test_source::unit_definitions(fragment) {
             if let ExprKind::InList {
                 expr,
                 list,
@@ -62,7 +59,7 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
             {
                 n += 1;
                 assert_eq!(node.ty.data_type().clone(), DataType::Boolean);
-                let input = fragment.expressions().get(*expr).unwrap();
+                let input = unit.definition(*expr).unwrap();
                 println!(
                     "actual original IN source fragment={id:?} input={:?} result={:?} negated={negated} candidates={}",
                     input.ty,
@@ -72,7 +69,7 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
                 for value in list.iter() {
                     println!(
                         "actual original IN candidate {:?}",
-                        fragment.expressions().get(*value).unwrap().ty
+                        unit.definition(*value).unwrap().ty
                     );
                 }
             }
@@ -125,44 +122,29 @@ fn evaluate(sql: &str, field: Field, input: ArrayRef, expected: &[Option<bool>],
                         && node.output_layout().schema().field(0).data_type()
                             == &DataType::Boolean =>
                 {
-                    ProgramExpressionRootSite::Node {
-                        node: node.local_id().unwrap(),
-                        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-                    }
+                    exprs[0]
                 }
-                ProgramNodeKind::Filter { .. } if truth => ProgramExpressionRootSite::Node {
-                    node: node.local_id().unwrap(),
-                    role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
-                },
+                ProgramNodeKind::Filter { predicates, .. } if truth => predicates[0],
                 ProgramNodeKind::Scan { residuals, .. } if truth && residuals.len() == 1 => {
-                    ProgramExpressionRootSite::Node {
-                        node: node.local_id().unwrap(),
-                        role: ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
-                    }
+                    residuals[0]
                 }
                 _ => continue,
             };
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            if snapshot.bindings().contains_key(&site) {
+
+            if program
+                .unit(site.unit)
+                .and_then(|unit| unit.root(site.root))
+                .is_some()
+            {
                 assert!(found.is_none(), "fixture has one actual membership root");
                 found = Some((program.clone(), site));
             }
         }
     }
     let (program, site) = found.expect("actual original membership root");
-    let ProgramRootInput::Layout { node, role } = root_input_layout(program.graph(), site).unwrap()
-    else {
-        panic!("actual source owns a scan input")
-    };
-    let schema = program
-        .checked()
-        .channels()
-        .channel_layout(node, role)
+    let unit = program.unit(site.unit).unwrap();
+    let schema = unit
+        .scope(unit.root(site.root).unwrap().scope)
         .unwrap()
         .schema()
         .clone();
@@ -176,8 +158,12 @@ fn evaluate(sql: &str, field: Field, input: ArrayRef, expected: &[Option<bool>],
         Vec::new(),
     ] {
         let selection = Selection::try_sparse(input.len(), &rows).unwrap();
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &Control,
+        )
+        .unwrap();
         let out = frame.evaluate(&data, selection, &Control).unwrap();
         assert!(out.errors().is_empty());
         assert_eq!(out.selection(), selection);

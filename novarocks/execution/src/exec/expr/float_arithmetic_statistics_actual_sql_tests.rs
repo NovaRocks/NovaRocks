@@ -20,7 +20,7 @@ use super::filter_conjunction_actual_sql_compiler_tests::compiler_results;
 use super::ndv_filter_actual_sql_source_tests::sql_source_with_columns;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
 use arrow::datatypes::DataType;
-use novarocks_physical_plan::ExprKind;
+use novarocks_expression_contract::ExprKind;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{ValueLogicalType, arithmetic_result_value_type_with_op};
 fn statement(text: &str, query: u32) -> String {
@@ -66,7 +66,8 @@ fn authored() {
     for (case, source) in sources().into_iter().enumerate() {
         let mut float = 0;
         for fragment in source.plan().fragments().values() {
-            for (id, expr) in fragment.expressions().iter() {
+            for (_source_node, unit, id, expr) in super::sql_test_source::unit_definitions(fragment)
+            {
                 let ExprKind::Binary {
                     op,
                     left,
@@ -80,8 +81,8 @@ fn authored() {
                 let Some(operator) = op.arithmetic_operator() else {
                     continue;
                 };
-                let left = &fragment.expressions().get(*left).unwrap().ty;
-                let right = &fragment.expressions().get(*right).unwrap().ty;
+                let left = &unit.definition(*left).unwrap().ty;
+                let right = &unit.definition(*right).unwrap().ty;
                 eprintln!(
                     "statistics original arithmetic case={case} mode=compiled fragment={:?} definition={id:?} operator={operator:?} left={left:?} right={right:?} result={:?} policy={decimal_overflow_policy:?} allow_source={allow_throw_exception:?}",
                     fragment.id(),

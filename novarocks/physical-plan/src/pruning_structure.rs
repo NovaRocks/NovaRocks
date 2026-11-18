@@ -227,7 +227,6 @@ impl<'package, 'witness> PruningDomainStructure<'package, 'witness> {
             let checked = if work.is_borrowed() {
                 PredicateConjunctSource::try_new_in(
                     fragment,
-                    package.expression_uses(),
                     source.responsibility.site,
                     conjunct_path,
                     work.observed_mut(),
@@ -235,7 +234,6 @@ impl<'package, 'witness> PruningDomainStructure<'package, 'witness> {
             } else {
                 PredicateConjunctSource::try_new(
                     fragment,
-                    package.expression_uses(),
                     source.responsibility.site,
                     conjunct_path,
                     control,
@@ -515,7 +513,7 @@ fn actual_transport(
     if let NodeKind::Project { expressions } = &parent.kind {
         for (expression, value) in expressions {
             work.step()?;
-            if *value == output && fragment.expressions().get(*expression)
+            if *value == output && fragment.root_expression(parent.id,*expression)
                 .is_some_and(|expression| matches!(expression.kind, ExprKind::Value(value) if value == input))
             { return Ok(true); }
         }

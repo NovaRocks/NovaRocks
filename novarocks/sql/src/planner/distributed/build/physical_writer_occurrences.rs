@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use novarocks_functions::{
     CallArgumentUses, CallEffectInput, PureCallSpecialization, PureKernelAbi,
-    ScopedExpressionEffects,
+    ScopedRelationalEffects,
 };
 use novarocks_physical_plan::{
     Fragment, FrozenPhysicalCall, PhysicalCallSite, PhysicalNode, WriterAggregateCall,
@@ -246,15 +246,17 @@ fn prepare_writer_occurrence_in(
             "installed writer owner has different aggregate argument control",
         ));
     }
-    let argument_uses = [Some(value_context.use_id)];
     let call = CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: if phase.consumes_logical_arguments() {
-            CallArgumentUses::SelectedChannels(&argument_uses)
+            CallArgumentUses::MaterializedInput {
+                context: value_context,
+                input_type: &input.request.input().ty,
+            }
         } else {
             CallArgumentUses::AggregateMerge {
                 phase,
-                state_context: value_context,
+                state_context: value_context.into(),
                 state_input_type: &input.request.input().ty,
             }
         },
@@ -270,7 +272,7 @@ fn prepare_writer_occurrence_in(
     work.flush()?;
     let options = input
         .request
-        .preparation(ScopedExpressionEffects::primitive(context, children));
+        .preparation(ScopedRelationalEffects::primitive(context, children));
     work.flush()?;
     let preparation = functions
         .prepare_fresh_selected(
@@ -282,9 +284,6 @@ fn prepare_writer_occurrence_in(
         .map_err(ExpressionOccurrenceError::function)?;
     work.flush()?;
     let frozen = FrozenPhysicalCall {
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
-        temporal_source: None,
         site,
         context,
         materialized_writer_input: Some(value_context),

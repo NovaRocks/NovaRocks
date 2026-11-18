@@ -24,7 +24,7 @@ use arrow_array::{ArrayRef, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, SemanticParameters, WindowBound,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, SemanticParameters, WindowBound,
     WindowFrame, WindowFrameExclusion, WindowFrameUnits,
 };
 use std::{
@@ -344,10 +344,11 @@ impl<'owner> Call<'owner> {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
-                use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(1),
-                demand: EvaluationDemand::Value,
+            context: match self.owner.declaration.kind() {
+                FunctionKind::Scalar => Self::scalar_context().into(),
+                FunctionKind::Aggregate | FunctionKind::Window | FunctionKind::Table => {
+                    Self::relation_context().into()
+                }
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: self.owner.declaration.function_id(),
@@ -364,8 +365,20 @@ impl<'owner> Call<'owner> {
             proof_scope: CallProofScope::Unconditional,
         }
     }
-    fn children(&self) -> ScopedExpressionEffects {
-        ScopedExpressionEffects::pure_value(self.input().context)
+    fn scalar_context() -> ExpressionEffectContext {
+        ExpressionEffectContext {
+            use_id: ExpressionUseId::new(0),
+            region: EvaluationRegionId::new(1),
+            demand: EvaluationDemand::Value,
+        }
+    }
+    fn relation_context() -> novarocks_type_contract::RelationEffectContext {
+        novarocks_type_contract::RelationEffectContext::call(
+            novarocks_type_contract::RelationCallId::new(0),
+        )
+    }
+    fn relation_children(&self) -> ScopedRelationalEffects {
+        ScopedRelationalEffects::pure_value(Self::relation_context())
     }
 }
 fn aggregate_options(phase: AggregateKernelPhase) -> AggregatePreparationOptions {
@@ -392,13 +405,13 @@ fn window_options() -> WindowCallOptions {
 }
 fn aggregate_prepare(call: &Call<'_>, phase: AggregateKernelPhase) -> PureCallPreparation {
     PureCallPreparation::Aggregate {
-        arguments: call.children(),
+        arguments: call.relation_children(),
         options: aggregate_options(phase),
     }
 }
 fn over_prepare(call: &Call<'_>) -> PureCallPreparation {
     PureCallPreparation::AggregateWindow {
-        arguments: call.children(),
+        arguments: call.relation_children(),
         options: AggregateWindowPreparationOptions {
             aggregate: aggregate_options(AggregateKernelPhase::Single),
             window: window_options(),
@@ -1096,7 +1109,7 @@ fn pure_window_fresh_and_frozen_prepare_real_partition() {
     let call = Call::new(&owner, 0);
     for frozen in [false, true] {
         let options = PureCallPreparation::Window {
-            arguments: call.children(),
+            arguments: call.relation_children(),
             options: window_options(),
         };
         let specialization = if frozen {
@@ -1151,7 +1164,7 @@ fn pure_table_fresh_and_frozen_prepare_selected_cursor() {
     let call = Call::new(&owner, 0);
     for frozen in [false, true] {
         let options = PureCallPreparation::Table {
-            arguments: call.children(),
+            arguments: call.relation_children(),
         };
         let specialization = if frozen {
             catalog.prepare_frozen(
@@ -1406,7 +1419,7 @@ fn c02_p1_preparation_registered_and_direct_hooks_are_once_per_use_point() {
                                 call.input(),
                                 call.selected.clone(),
                                 &owner.frozen(&call.selected),
-                                call.children(),
+                                call.relation_children(),
                                 options,
                                 &COMPILE,
                             )
@@ -1415,7 +1428,7 @@ fn c02_p1_preparation_registered_and_direct_hooks_are_once_per_use_point() {
                                 owner.as_ref(),
                                 call.input(),
                                 call.selected.clone(),
-                                call.children(),
+                                call.relation_children(),
                                 options,
                                 &COMPILE,
                             )
@@ -1432,7 +1445,7 @@ fn c02_p1_preparation_registered_and_direct_hooks_are_once_per_use_point() {
                                 call.input(),
                                 call.selected.clone(),
                                 &owner.frozen(&call.selected),
-                                call.children(),
+                                call.relation_children(),
                                 aggregate_options(AggregateKernelPhase::Single),
                                 &COMPILE,
                             )
@@ -1441,7 +1454,7 @@ fn c02_p1_preparation_registered_and_direct_hooks_are_once_per_use_point() {
                                 owner.as_ref(),
                                 call.input(),
                                 call.selected.clone(),
-                                call.children(),
+                                call.relation_children(),
                                 aggregate_options(AggregateKernelPhase::Single),
                                 &COMPILE,
                             )
@@ -1575,11 +1588,9 @@ fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
                     .unwrap()
                     .effect_declaration(&selected.overload)
                     .unwrap();
-                let context = ExpressionEffectContext {
-                    use_id: ExpressionUseId::new(7),
-                    domain: EvaluationDomainId::new(11),
-                    demand: EvaluationDemand::Value,
-                };
+                let context = novarocks_type_contract::RelationEffectContext::call(
+                    novarocks_type_contract::RelationCallId::new(7),
+                );
                 let parameters = SemanticParameters::default();
                 let uses = [Some(ExpressionUseId::new(8)), Some(ExpressionUseId::new(9))];
                 let input = CallEffectInput {
@@ -1588,11 +1599,11 @@ fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
                     selected: &selected,
                     request,
                     argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
-                    context,
+                    context: context.into(),
                     parameters: &parameters,
                     environment: &[],
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Relation(context.identity),
                 };
                 let effects = CallEffects {
                     value_stability: declaration.value_stability,
@@ -1608,7 +1619,7 @@ fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
                 for window in [window_first, !window_first] {
                     let preparation = if window {
                         PureCallPreparation::AggregateWindow {
-                            arguments: ScopedExpressionEffects::pure_value(context),
+                            arguments: ScopedRelationalEffects::pure_value(context),
                             options: AggregateWindowPreparationOptions {
                                 aggregate: aggregate_options(AggregateKernelPhase::Single),
                                 window: window_options(),
@@ -1616,7 +1627,7 @@ fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
                         }
                     } else {
                         PureCallPreparation::Aggregate {
-                            arguments: ScopedExpressionEffects::pure_value(context),
+                            arguments: ScopedRelationalEffects::pure_value(context),
                             options: aggregate_options(AggregateKernelPhase::Single),
                         }
                     };

@@ -33,10 +33,6 @@ enum SinkMaterializationFailure {
         required: usize,
         source: TryFromIntError,
     },
-    KeyIdentity {
-        required: usize,
-        source: TryFromIntError,
-    },
 }
 impl fmt::Display for SinkMaterializationFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -45,16 +41,13 @@ impl fmt::Display for SinkMaterializationFailure {
             Self::RootIdentity { required, .. } => {
                 write!(f, "compiled program root index {required} exceeds i32")
             }
-            Self::KeyIdentity { required, .. } => {
-                write!(f, "compiled partition key index {required} exceeds u32")
-            }
         }
     }
 }
 impl std::error::Error for SinkMaterializationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::RootIdentity { source, .. } | Self::KeyIdentity { source, .. } => Some(source),
+            Self::RootIdentity { source, .. } => Some(source),
             Self::Contract(_) => None,
         }
     }
@@ -73,12 +66,6 @@ impl FailureProjection for SinkMaterializationFailure {
                 *required,
                 42,
                 i32::MAX as u64,
-            ),
-            Self::KeyIdentity { required, .. } => (
-                ExecutionReason::SinkKeyIdentityExtent,
-                *required,
-                43,
-                u32::MAX as u64,
             ),
         };
         FailureFact::new(FailureClass::Representation, reason.reason()).with_representation(
@@ -105,11 +92,6 @@ pub(super) fn root_identity(required: usize) -> Result<i32, ExecutionFailure> {
         ExecutionFailure::from_domain(SinkMaterializationFailure::RootIdentity { required, source })
     })
 }
-pub(super) fn key_identity(required: usize) -> Result<u32, ExecutionFailure> {
-    u32::try_from(required).map_err(|source| {
-        ExecutionFailure::from_domain(SinkMaterializationFailure::KeyIdentity { required, source })
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -132,17 +114,5 @@ mod tests {
             .downcast_ref::<SinkMaterializationFailure>()
             .unwrap();
         assert!(source.source().unwrap().is::<TryFromIntError>());
-        assert_eq!(key_identity(u32::MAX as usize).unwrap(), u32::MAX);
-        if let Some(required) = (u32::MAX as usize).checked_add(1) {
-            let failure = key_identity(required).unwrap_err();
-            assert_eq!(
-                failure
-                    .failure_fact()
-                    .representation()
-                    .unwrap()
-                    .extent_limit,
-                Some(u32::MAX as u64)
-            );
-        }
     }
 }

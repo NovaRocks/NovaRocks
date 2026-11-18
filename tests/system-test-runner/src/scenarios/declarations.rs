@@ -715,6 +715,20 @@ pub(super) fn for_module(
             "tests/system-test-runner/src/scenarios/trino_protocol.rs".into(),
         ]);
     }
+    if paths.iter().any(|path| {
+        matches!(
+            path.as_str(),
+            "novarocks/local-program/**"
+                | "novarocks/local-compiler/**"
+                | "novarocks/physical-plan/**"
+                | "novarocks/plan-codec/**"
+        )
+    }) {
+        paths.extend([
+            "novarocks/expression-contract/**".into(),
+            "novarocks/expression/**".into(),
+        ]);
+    }
     let mut declaration = ScenarioDeclaration {
         reference_inputs: Vec::new(),
         impact: ScenarioImpact { paths },

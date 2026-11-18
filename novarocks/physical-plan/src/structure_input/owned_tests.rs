@@ -33,7 +33,8 @@ fn borrowed(
 
 #[test]
 fn borrowed_original_sparse_structure_preserves_all_fields_and_only_caller_phase() {
-    let source = input(2);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let source = input(2, &mut fixture_constants);
     let expected = source.clone();
     let plain = Control::default();
     let original = construct(source.clone(), PlanLimits::FROZEN, &plain).unwrap();
@@ -43,7 +44,10 @@ fn borrowed_original_sparse_structure_preserves_all_fields_and_only_caller_phase
     assert_eq!(decoded.root(), NodeId::new(u32::MAX));
     assert_eq!(decoded.values(), &expected.values);
     assert_eq!(decoded.nodes(), &expected.nodes);
-    assert_eq!(decoded.expressions(), &expected.expressions);
+    assert_eq!(
+        decoded.unit(NodeId::new(0)),
+        expected.nodes[&NodeId::new(0)].expressions.as_deref()
+    );
     assert_eq!(decoded.sink(), &expected.sink);
     assert_eq!(decoded.dop_domain(), expected.dop_domain);
     assert_eq!(decoded.runtime_filters(), &*expected.runtime_filters);
@@ -61,8 +65,9 @@ fn borrowed_original_sparse_structure_preserves_all_fields_and_only_caller_phase
 
 #[test]
 fn borrowed_structure_actual_success_and_original_rejections_preserve_every_control_prefix() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for case in 0..5 {
-        let mut source = input(if case == 4 { 320 } else { 2 });
+        let mut source = input(if case == 4 { 320 } else { 2 }, &mut fixture_constants);
         let mut limits = PlanLimits::FROZEN;
         match case {
             1 => source.values.get_mut(&ValueId::new(0)).unwrap().id = ValueId::new(9),

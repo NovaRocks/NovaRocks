@@ -173,7 +173,6 @@ fn expression(
 ) -> wire::ExpressionDefinition {
     wire::ExpressionDefinition {
         id,
-        owner_node_id: Some(u32::MAX),
         lambda_scope_expr_id: None,
         value_type_id: Some(ty),
         kind: Some(kind),
@@ -419,14 +418,14 @@ impl Fixture {
                 1,
                 K::FunctionCall(wire::FunctionCall {
                     function_binding_id: Some(u32::MAX),
-                    argument_expr_ids: vec![u32::MAX, 13],
+                    argument_expr_ids: vec![17, 13],
                 }),
             ),
-            expression(u32::MAX, 0, K::ValueId(0)),
+            expression(17, 0, K::ValueId(0)),
             expression(
                 0,
                 1,
-                K::Literal(wire::ConstantReference {
+                K::Constant(wire::ConstantReference {
                     pool_id: Some(u32::MAX),
                     row_ordinal: 1,
                 }),
@@ -444,7 +443,7 @@ impl Fixture {
                 1,
                 K::Binary(wire::BinaryExpression {
                     left_expr_id: Some(0),
-                    right_expr_id: Some(u32::MAX),
+                    right_expr_id: Some(17),
                     op: wire::BinaryOperator::Add as i32,
                     decimal_overflow_policy: semantics::DecimalOverflowPolicy::OutputNull as i32,
                     allow_throw_exception: Some(allow()),
@@ -477,7 +476,7 @@ impl Fixture {
                 8,
                 1,
                 K::Cast(wire::CastExpression {
-                    expr_id: Some(u32::MAX),
+                    expr_id: Some(17),
                     target_carrier_type_id: Some(self.carrier_i64),
                     decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
                     allow_throw_exception: Some(allow()),
@@ -487,8 +486,8 @@ impl Fixture {
                 9,
                 3,
                 K::InList(wire::InListExpression {
-                    expr_id: Some(u32::MAX),
-                    list_expr_ids: vec![0, u32::MAX, 0],
+                    expr_id: Some(17),
+                    list_expr_ids: vec![0, 17, 0],
                     negated: true,
                 }),
             ),
@@ -498,7 +497,7 @@ impl Fixture {
                 K::Between(wire::BetweenExpression {
                     expr_id: Some(0),
                     low_expr_id: Some(0),
-                    high_expr_id: Some(u32::MAX),
+                    high_expr_id: Some(17),
                     negated: false,
                 }),
             ),
@@ -506,8 +505,8 @@ impl Fixture {
                 11,
                 3,
                 K::Like(wire::LikeExpression {
-                    expr_id: Some(19),
-                    pattern_expr_id: Some(19),
+                    expr_id: Some(16),
+                    pattern_expr_id: Some(16),
                     negated: false,
                 }),
             ),
@@ -520,7 +519,7 @@ impl Fixture {
                         when_expr_id: Some(4),
                         then_expr_id: Some(0),
                     }],
-                    else_expr_id: Some(u32::MAX),
+                    else_expr_id: Some(17),
                 }),
             ),
             expression(
@@ -542,51 +541,16 @@ impl Fixture {
             ),
             expression(
                 15,
-                1,
-                K::WindowCall(wire::WindowCall {
-                    function_binding_id: Some(0),
-                    argument_expr_ids: vec![u32::MAX],
-                    frame: None,
-                    ..Default::default()
-                }),
-            ),
-            expression(
-                16,
-                1,
-                K::WindowCall(wire::WindowCall {
-                    function_binding_id: Some(9),
-                    argument_expr_ids: vec![u32::MAX, 0],
-                    function_order_by: vec![wire::SortExpression {
-                        expr_id: Some(0),
-                        direction: wire::SortDirection::Ascending as i32,
-                        null_ordering: wire::NullOrdering::First as i32,
-                    }],
-                    frame: Some(wire::WindowFrame {
-                        units: wire::WindowFrameUnits::Rows as i32,
-                        exclusion: wire::WindowFrameExclusion::NoOthers as i32,
-                        start: Some(wire::WindowBound {
-                            kind: Some(wire::window_bound::Kind::PrecedingExprId(0)),
-                        }),
-                        end: Some(wire::WindowBound {
-                            kind: Some(wire::window_bound::Kind::CurrentRow(Empty {})),
-                        }),
-                    }),
-                    aggregate_binding_id: Some(u32::MAX),
-                    ..Default::default()
-                }),
-            ),
-            expression(
-                17,
                 7,
-                K::Literal(wire::ConstantReference {
+                K::Constant(wire::ConstantReference {
                     pool_id: Some(7),
                     row_ordinal: 1,
                 }),
             ),
-            expression(19, 10, K::ValueId(2)),
+            expression(16, 10, K::ValueId(2)),
         ];
-        // Inputs deliberately retain author order; IDs never drive capacity.
-        defs.reverse();
+        // This node-local wire table uses its explicit dense definition order.
+        defs.sort_by_key(|definition| definition.id);
         defs
     }
 }
@@ -597,10 +561,10 @@ fn small() -> Vec<wire::ExpressionDefinition> {
             0,
             wire::expression_definition::Kind::Unary(wire::UnaryExpression {
                 op: wire::UnaryOperator::Plus as i32,
-                expr_id: Some(u32::MAX),
+                expr_id: Some(1),
             }),
         ),
-        expression(u32::MAX, 0, wire::expression_definition::Kind::ValueId(0)),
+        expression(1, 0, wire::expression_definition::Kind::ValueId(0)),
     ]
 }
 fn run(
@@ -614,6 +578,7 @@ fn run(
         control.activate();
         decode_expression_definitions(
             defs,
+            &[],
             values,
             functions,
             aggregates,
@@ -660,7 +625,7 @@ fn prefixes(
 }
 
 #[test]
-fn receiving_expressions_cover_all_seventeen_kinds_and_original_sparse_correspondence() {
+fn receiving_expressions_cover_all_sixteen_scalar_kinds_and_original_dense_correspondence() {
     use wire::expression_definition::Kind as K;
     let fixture = Fixture::new();
     let definitions = fixture.all_kinds();
@@ -669,6 +634,7 @@ fn receiving_expressions_cover_all_seventeen_kinds_and_original_sparse_correspon
         control.activate();
         let token = decode_expression_definitions(
             &definitions,
+            &[],
             values,
             functions,
             aggregates,
@@ -714,10 +680,10 @@ fn receiving_expressions_cover_all_seventeen_kinds_and_original_sparse_correspon
                 kinds.push(kind);
             }
         }
-        assert_eq!(kinds.len(), 17);
+        assert_eq!(kinds.len(), 16);
         assert!(token.definition(123456).unwrap().is_none());
         let zero = token.definition(0).unwrap().unwrap();
-        let Some(K::Literal(reference)) = zero.kind.as_ref() else {
+        let Some(K::Constant(reference)) = zero.kind.as_ref() else {
             panic!("actual selected constant");
         };
         assert_eq!(reference.pool_id, Some(u32::MAX));
@@ -737,12 +703,7 @@ fn receiving_expressions_cover_all_seventeen_kinds_and_original_sparse_correspon
         let Some(K::InList(list)) = token.definition(9).unwrap().unwrap().kind.as_ref() else {
             panic!("actual in-list");
         };
-        assert_eq!(list.list_expr_ids, [0, u32::MAX, 0]);
-        let Some(K::WindowCall(window)) = token.definition(15).unwrap().unwrap().kind.as_ref()
-        else {
-            panic!("actual window");
-        };
-        assert!(window.frame.is_none());
+        assert_eq!(list.list_expr_ids, [0, 17, 0]);
         // Frozen expected nullable=true accepts this actual nonnullable Value
         // shape. Domain/fits proof remains with the original Fragment author.
         assert_eq!(functions.as_wire()[0].arguments[0], arg(1));
@@ -767,9 +728,6 @@ fn receiving_expressions_reject_missing_closed_payloads_and_forward_reference_fa
     let mut cases = Vec::new();
     let mut bad = valid.clone();
     bad[0].kind = None;
-    cases.push(bad);
-    let mut bad = valid.clone();
-    bad[0].owner_node_id = None;
     cases.push(bad);
     let mut bad = valid.clone();
     bad[0].value_type_id = None;
@@ -797,7 +755,7 @@ fn receiving_expressions_reject_missing_closed_payloads_and_forward_reference_fa
     bad[0].kind = Some(K::CaseExpression(wire::CaseExpression {
         arms: vec![wire::WhenThen {
             when_expr_id: None,
-            then_expr_id: Some(u32::MAX),
+            then_expr_id: Some(1),
         }],
         ..Default::default()
     }));
@@ -808,7 +766,7 @@ fn receiving_expressions_reject_missing_closed_payloads_and_forward_reference_fa
     let mut forward = valid;
     forward[0].kind = Some(K::Unary(wire::UnaryExpression {
         op: wire::UnaryOperator::Minus as i32,
-        expr_id: Some(u32::MAX),
+        expr_id: Some(1),
     }));
     assert!(run(&fixture, &forward, SOURCE, limits(), &Control::default()).is_ok());
 }
@@ -820,7 +778,7 @@ fn receiving_constants_preserve_selected_ordinal_and_require_exact_nested_source
     let source = expression(
         0,
         7,
-        K::Literal(wire::ConstantReference {
+        K::Constant(wire::ConstantReference {
             pool_id: Some(7),
             row_ordinal: 1,
         }),
@@ -848,7 +806,7 @@ fn receiving_constants_preserve_selected_ordinal_and_require_exact_nested_source
     assert!(std::ptr::eq(selected.field(), original.field()));
     for (pool_id, row_ordinal) in [(None, 1), (Some(404), 1), (Some(7), 3)] {
         let mut bad = source.clone();
-        bad.kind = Some(K::Literal(wire::ConstantReference {
+        bad.kind = Some(K::Constant(wire::ConstantReference {
             pool_id,
             row_ordinal,
         }));
@@ -892,8 +850,8 @@ fn receiving_constants_preserve_selected_ordinal_and_require_exact_nested_source
     bad.value_type_id = Some(42);
     assert!(matches!(
         run(&changed, &[bad], SOURCE, limits(), &Control::default()),
-        Err(Error::Constant(ConstantReferenceError::SourceTypeMismatch(
-            _
+        Err(Error::Constant(ConstantReferenceError::Table(
+            novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(_)
         )))
     ));
     let value = expression(0, 1, K::ValueId(0));
@@ -904,7 +862,7 @@ fn receiving_constants_preserve_selected_ordinal_and_require_exact_nested_source
     let mut bad = expression(
         0,
         0,
-        K::Literal(wire::ConstantReference {
+        K::Constant(wire::ConstantReference {
             pool_id: Some(u32::MAX),
             row_ordinal: 1,
         }),
@@ -917,8 +875,8 @@ fn receiving_constants_preserve_selected_ordinal_and_require_exact_nested_source
             limits(),
             &Control::default()
         ),
-        Err(Error::Constant(ConstantReferenceError::SourceTypeMismatch(
-            _
+        Err(Error::Constant(ConstantReferenceError::Table(
+            novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(_)
         )))
     ));
     bad.value_type_id = Some(4);
@@ -926,7 +884,7 @@ fn receiving_constants_preserve_selected_ordinal_and_require_exact_nested_source
 }
 
 #[test]
-fn receiving_calls_lambdas_and_window_payloads_use_exact_original_namespaces() {
+fn receiving_calls_and_lambdas_use_exact_original_namespaces() {
     use wire::expression_definition::Kind as K;
     let fixture = Fixture::new();
     let valid = fixture.all_kinds();
@@ -936,11 +894,11 @@ fn receiving_calls_lambdas_and_window_payloads_use_exact_original_namespaces() {
         let call = bad.iter_mut().find(|def| def.id == 6).unwrap();
         call.kind = Some(K::FunctionCall(wire::FunctionCall {
             function_binding_id: Some(id),
-            argument_expr_ids: vec![u32::MAX, 13],
+            argument_expr_ids: vec![17, 13],
         }));
         cases.push(bad);
     }
-    for args in [vec![u32::MAX], vec![u32::MAX, 0], vec![13, 13]] {
+    for args in [vec![17], vec![17, 0], vec![13, 13]] {
         let mut bad = valid.clone();
         let call = bad.iter_mut().find(|def| def.id == 6).unwrap();
         call.kind = Some(K::FunctionCall(wire::FunctionCall {
@@ -979,66 +937,6 @@ fn receiving_calls_lambdas_and_window_payloads_use_exact_original_namespaces() {
     };
     parameter.ordinal = 1;
     cases.push(bad);
-    let mut bad = valid.clone();
-    let Some(K::WindowCall(window)) = bad
-        .iter_mut()
-        .find(|def| def.id == 15)
-        .unwrap()
-        .kind
-        .as_mut()
-    else {
-        unreachable!()
-    };
-    window.distinct = true;
-    cases.push(bad);
-    let mut bad = valid.clone();
-    let Some(K::WindowCall(window)) = bad
-        .iter_mut()
-        .find(|def| def.id == 16)
-        .unwrap()
-        .kind
-        .as_mut()
-    else {
-        unreachable!()
-    };
-    window.aggregate_binding_id = None;
-    cases.push(bad);
-    let mut bad = valid.clone();
-    let Some(K::WindowCall(window)) = bad
-        .iter_mut()
-        .find(|def| def.id == 16)
-        .unwrap()
-        .kind
-        .as_mut()
-    else {
-        unreachable!()
-    };
-    window.function_order_by[0].direction = 0;
-    cases.push(bad);
-    let mut bad = valid.clone();
-    let Some(K::WindowCall(window)) = bad
-        .iter_mut()
-        .find(|def| def.id == 16)
-        .unwrap()
-        .kind
-        .as_mut()
-    else {
-        unreachable!()
-    };
-    window.frame.as_mut().unwrap().end = None;
-    cases.push(bad);
-    let mut bad = valid.clone();
-    let Some(K::WindowCall(window)) = bad
-        .iter_mut()
-        .find(|def| def.id == 16)
-        .unwrap()
-        .kind
-        .as_mut()
-    else {
-        unreachable!()
-    };
-    window.frame.as_mut().unwrap().units = 0;
-    cases.push(bad);
     for case in cases {
         assert!(run(&fixture, &case, SOURCE, limits(), &Control::default()).is_err());
     }
@@ -1056,6 +954,7 @@ fn receiving_calls_lambdas_and_window_payloads_use_exact_original_namespaces() {
         assert!(matches!(
             decode_expression_definitions(
                 &valid,
+                &[],
                 values,
                 &foreign,
                 aggregates,
@@ -1090,6 +989,7 @@ fn receiving_calls_lambdas_and_window_payloads_use_exact_original_namespaces() {
         assert!(matches!(
             decode_expression_definitions(
                 &valid,
+                &[],
                 values,
                 &foreign,
                 &aggregate,
@@ -1118,8 +1018,8 @@ fn receiving_cast_and_all_arithmetic_parameter_references_are_not_defaults() {
             let mut defs = small();
             defs[0].value_type_id = Some(1);
             defs[0].kind = Some(K::Binary(wire::BinaryExpression {
-                left_expr_id: Some(u32::MAX),
-                right_expr_id: Some(u32::MAX),
+                left_expr_id: Some(1),
+                right_expr_id: Some(1),
                 op: op as i32,
                 decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
                 allow_throw_exception: Some(semantics::SemanticParameterRef {
@@ -1139,7 +1039,7 @@ fn receiving_cast_and_all_arithmetic_parameter_references_are_not_defaults() {
         0,
         1,
         K::Cast(wire::CastExpression {
-            expr_id: Some(u32::MAX),
+            expr_id: Some(1),
             target_carrier_type_id: Some(fixture.carrier_i64),
             decimal_overflow_policy: semantics::DecimalOverflowPolicy::OutputNull as i32,
             allow_throw_exception: Some(allow()),
@@ -1194,8 +1094,8 @@ fn receiving_cast_and_all_arithmetic_parameter_references_are_not_defaults() {
     assert!(run(&fixture, &defs, SOURCE, limits(), &Control::default()).is_err());
     let mut binary = small();
     binary[0].kind = Some(K::Binary(wire::BinaryExpression {
-        left_expr_id: Some(u32::MAX),
-        right_expr_id: Some(u32::MAX),
+        left_expr_id: Some(1),
+        right_expr_id: Some(1),
         op: wire::BinaryOperator::Eq as i32,
         decimal_overflow_policy: semantics::DecimalOverflowPolicy::OutputNull as i32,
         allow_throw_exception: Some(allow()),
@@ -1271,7 +1171,7 @@ fn receiving_expression_success_ordinary_tails_and_real_quantum_preserve_all_con
     let mut literal = expression(
         0,
         7,
-        wire::expression_definition::Kind::Literal(wire::ConstantReference {
+        wire::expression_definition::Kind::Constant(wire::ConstantReference {
             pool_id: Some(7),
             row_ordinal: 1,
         }),
@@ -1284,7 +1184,7 @@ fn receiving_expression_success_ordinary_tails_and_real_quantum_preserve_all_con
         true,
         true,
     );
-    literal.kind = Some(wire::expression_definition::Kind::Literal(
+    literal.kind = Some(wire::expression_definition::Kind::Constant(
         wire::ConstantReference {
             pool_id: Some(7),
             row_ordinal: 3,
@@ -1335,22 +1235,21 @@ fn receiving_expression_success_ordinary_tails_and_real_quantum_preserve_all_con
                 0,
                 wire::expression_definition::Kind::Unary(wire::UnaryExpression {
                     op: wire::UnaryOperator::Plus as i32,
-                    expr_id: Some(u32::MAX),
+                    expr_id: Some(320),
                 }),
             )
         })
         .collect::<Vec<_>>();
     wide.push(expression(
-        u32::MAX,
+        320,
         0,
         wire::expression_definition::Kind::ValueId(0),
     ));
-    wide.reverse();
     let good = Control::default();
     assert!(run(&fixture, &wide, SOURCE, limits(), &good).is_ok());
     assert!(good.trace().iter().any(|(_, units)| *units == 256));
     prefixes(&fixture, &wide, SOURCE, limits(), true, false);
     let mut ordinary = wide;
-    ordinary[159].owner_node_id = None;
+    ordinary[159].value_type_id = None;
     prefixes(&fixture, &ordinary, SOURCE, limits(), false, false);
 }

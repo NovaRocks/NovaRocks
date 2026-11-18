@@ -33,7 +33,7 @@ fn invoke(
         let mut observed = ExpressionNamespaceWriteFacts::default();
         let result = (|| {
             let token = prepare_expression_definitions_in(
-                &f.arena,
+                Some(ExpressionDefinitionSource::new(&f.definitions, &[])),
                 inputs,
                 types,
                 functions,
@@ -62,13 +62,13 @@ fn invoke(
     })
 }
 #[test]
-fn caller_owned_sender_preserves_all_original_seventeen_payloads_and_facts() {
+fn caller_owned_sender_preserves_all_original_sixteen_scalar_payloads_and_facts() {
     let f = all_kinds();
     let legacy = f.run(&Control::default(), SOURCE, limits(), true).unwrap();
     let actual = invoke(&f, &Control::default(), limits()).unwrap();
     assert_eq!(actual, legacy);
-    assert_eq!(actual.1.len(), 17);
-    assert_eq!(actual.1.last().unwrap().id, u32::MAX);
+    assert_eq!(actual.1.len(), 16);
+    assert_eq!(actual.1.last().unwrap().id, 15);
 }
 #[test]
 fn caller_owned_sender_seven_exact_axes_and_one_under_replay_actual_source() {
@@ -125,7 +125,7 @@ fn caller_owned_sender_known_root_request_refuses_before_pending_quantum_and_emi
             let mut l = limits();
             l.max_new_allocation_request_bytes = 0;
             let result = prepare_expression_definitions_in(
-                &f.arena,
+                Some(ExpressionDefinitionSource::new(&f.definitions, &[])),
                 inputs,
                 types,
                 functions,
@@ -146,7 +146,7 @@ fn caller_owned_sender_known_root_request_refuses_before_pending_quantum_and_emi
         let c = Control::default();
         let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();
         let token = prepare_expression_definitions_in(
-            &f.arena,
+            Some(ExpressionDefinitionSource::new(&f.definitions, &[])),
             inputs,
             types,
             functions,
@@ -208,7 +208,7 @@ fn caller_owned_literal_captured_comparer_preserves_original_facts_and_primary_r
         .entries()
         .get(&ConstantPoolId::new(u32::MAX))
         .unwrap();
-    let node = good.arena.get(ExprId::new(0)).unwrap();
+    let node = good.definitions.first().unwrap();
     for cause in CAUSES {
         let c = Control {
             trace: Mutex::new(vec![]),

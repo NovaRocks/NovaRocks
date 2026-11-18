@@ -822,7 +822,7 @@ impl<'source> PackageTypeSourceSink<'source, TypeViewError> for Capture<'source,
                 };
                 if previous.occurrence.owner != occurrence.owner
                     || previous.occurrence.channel != PackageTypeChannel::Value
-                    || !matches!(occurrence.owner, PackageTypeOwner::Expression(_))
+                    || !matches!(occurrence.owner, PackageTypeOwner::Expression { .. })
                     || occurrence.channel != PackageTypeChannel::CastTarget
                 {
                     return Err(TypeViewError::InvalidSource(
@@ -1487,7 +1487,7 @@ mod tests {
                 views.fields().len(),
                 writers.len()
             ),
-            (25, 25, 0, 1)
+            (27, 26, 0, 1)
         );
         assert_eq!(
             (
@@ -1495,7 +1495,7 @@ mod tests {
                 budget.facts().value_root_count,
                 budget.facts().field_root_count
             ),
-            (25, 25, 1)
+            (27, 26, 2)
         );
         let encoded = encode_borrowed_type_namespaces_sources_in(
             views.values(),
@@ -1521,7 +1521,7 @@ mod tests {
                 encoded.as_wire().value_types.len(),
                 encoded.as_wire().fields.len()
             ),
-            (25, 0)
+            (26, 0)
         );
         for row in views.occurrences() {
             match (row.root, row.source) {
@@ -1529,6 +1529,23 @@ mod tests {
                     assert!(std::ptr::eq(
                         encoded.value_type_observed(id, &mut work).unwrap().unwrap(),
                         original
+                    ));
+                }
+                (TypeRootReference::SourceField(id), PackageTypeSource::SourceField(field)) => {
+                    let PackageTypeOwner::Constant(pool_id) = row.occurrence.owner else {
+                        panic!("original constant Field owner");
+                    };
+                    assert_eq!(row.occurrence.channel, PackageTypeChannel::ConstantField);
+                    assert!(std::ptr::eq(
+                        field,
+                        package.constants().entries()[&pool_id].field_ref()
+                    ));
+                    assert!(std::ptr::eq(
+                        encoded
+                            .source_field_source_observed(id, &mut work)
+                            .unwrap()
+                            .unwrap(),
+                        field.as_ref()
                     ));
                 }
                 (
@@ -1565,8 +1582,12 @@ mod tests {
         let source_wire = encoded
             .as_source_wire()
             .expect("independent writer Source facts");
+        assert_eq!(source_wire.field_facts.len(), 2);
+        assert_eq!(source_wire.field_facts[0].field_id, Some(0));
+        assert!(source_wire.field_facts[0].metadata.is_empty());
+        assert_eq!(source_wire.field_facts[1].field_id, Some(1));
         assert_eq!(
-            source_wire.field_facts[0].metadata[1].value.len(),
+            source_wire.field_facts[1].metadata[1].value.len(),
             20 * 1024
         );
         work.finish().unwrap();

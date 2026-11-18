@@ -24,10 +24,24 @@
 
 #![allow(dead_code)]
 
+mod constant_emission;
 mod grouped_topn;
 mod neutral_requests;
 mod nullable_transaction;
+mod scalar_emission;
+mod standalone_scalar;
+pub(crate) use standalone_scalar::{StandaloneScalarEmission, lower_required_constant_unit};
+mod scalar_nullability;
+mod unit_authorship;
 
+#[cfg(test)]
+pub(super) mod original_emission_test_observer;
+
+#[cfg(test)]
+pub(super) use neutral_requests::transfer_component_request_for_test;
+
+use novarocks_expression_contract::{RootOrdinal, RootScope};
+use novarocks_type_contract::EvaluationDemand;
 use std::sync::Arc;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,40 +49,8 @@ use std::fmt;
 
 use arrow::datatypes::DataType;
 use novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft;
-use novarocks_physical_plan::{
-    AggregateBinding, AggregateCall as ContractAggregateCall, AggregateCallId, AggregateGrouping,
-    AggregatePhase, AggregateSequenceId, BinaryOperator, BoundFunction, BoundTableFunction,
-    BucketOrdinalDomainProof, BuildError, ChangeEventSpec,
-    ChangeStreamRoute as ContractChangeStreamRoute, DataRelation, Distribution, Edge,
-    EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId,
-    ExprKind as ContractExprKind, Fragment, FragmentBuilder, FragmentId, FragmentSink,
-    FunctionArgumentType, GroupingOutput, HashDefinition, HashPartitionScheme,
-    JoinDistribution as ContractJoinDistribution, JoinKey, JoinKind as ContractJoinKind,
-    JoinSide as ContractJoinSide, MetadataRelation, MetadataRelationKind, NestLoopJoinDistribution,
-    NodeId, NodeKind, NullOrdering, OrderingKey, OutputPort, PartitionCountDomain,
-    PartitionCountParameter, PartitionTopNType, PhysicalProperties, PipelineDopDomain,
-    PlanAnnotation, PlanBuilder, PlanVersionId, PositionShardAggregation, PositionShardInput,
-    PositionShardOutput, PredicateGuarantee, PredicateGuaranteeKind, ProviderReadReference,
-    ROOT_WRITE_RESULT_SCHEMA_REVISION, Relation, RelationField, RequiredInputs, ResultField,
-    ResultPort, RowCountAssertion, RowCountAssertionSpec, RowMultiplicity, RuntimeFilter,
-    RuntimeFilterArtifactCapability, RuntimeFilterCompletion, RuntimeFilterConsumer,
-    RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget, RuntimeFilterContributionKind,
-    RuntimeFilterCoverage, RuntimeFilterCoverageNode, RuntimeFilterDomain, RuntimeFilterEndpoint,
-    RuntimeFilterEqualityWitness, RuntimeFilterEqualityWitnessId, RuntimeFilterId,
-    RuntimeFilterKind, RuntimeFilterLifecycle, RuntimeFilterLineageStep,
-    RuntimeFilterNullSemantics, RuntimeFilterOrderKey, RuntimeFilterPolicy, RuntimeFilterProducer,
-    RuntimeFilterProducerProgress, RuntimeFilterProducerTarget, RuntimeFilterReduction,
-    RuntimeFilterWitnessId, SetOperationKind, SortDirection, SortExpr, SortMode,
-    TableFunctionOutput, TopNPhase as ContractTopNPhase, TopNSequenceId, UnaryOperator,
-    UnpivotConstant as ContractUnpivotConstant, UnpivotSpec, UnpivotValueMapping, ValidationErrors,
-    ValueId, ValueOrigin, ValueType, WRITER_MULTIPLEX_SCHEMA_REVISION,
-    WindowBound as ContractWindowBound, WindowExpression, WindowFrame as ContractWindowFrame,
-    WindowFrameExclusion, WindowFrameUnits, WindowSpec, WriterAggregateCall, WriterDerivedKind,
-    WriterFinishSpec, WriterGroupedUnpivotMapping, WriterGroupedUnpivotSpec, WriterRelationField,
-    WriterRelationFieldRole, WriterRelationSchema, WriterTarget, WriterTargetField,
-};
 #[cfg(test)]
-use novarocks_physical_plan::{LiteralValue as ContractLiteralValue, ProviderReadOccurrenceId};
+use novarocks_physical_plan::ProviderReadOccurrenceId;
 use novarocks_spi::connector::read_stack::ConnectorReadRelationKind;
 use novarocks_spi::connector::write_stack::{
     ConnectorWriteLayoutPreference, RootWriteResultSchema, WriteTargetOrdinal,
@@ -79,14 +61,52 @@ use novarocks_type_contract::{
     SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
 };
 use sha2::{Digest, Sha256};
+use {
+    novarocks_expression_contract::{
+        BinaryOperator, BoundFunction, ExprKind as ContractExprKind, UnaryOperator,
+    },
+    novarocks_physical_plan::{
+        AggregateBinding, AggregateCall as ContractAggregateCall, AggregateCallId,
+        AggregateGrouping, AggregatePhase, AggregateSequenceId, BoundTableFunction,
+        BucketOrdinalDomainProof, BuildError, ChangeEventSpec,
+        ChangeStreamRoute as ContractChangeStreamRoute, DataRelation, Distribution, Edge,
+        EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId, Fragment,
+        FragmentBuilder, FragmentId, FragmentSink, FunctionArgumentType, GroupingOutput,
+        HashDefinition, HashPartitionScheme, JoinDistribution as ContractJoinDistribution, JoinKey,
+        JoinKind as ContractJoinKind, JoinSide as ContractJoinSide, MetadataRelation,
+        MetadataRelationKind, NestLoopJoinDistribution, NodeId, NodeKind, NullOrdering,
+        OrderingKey, OutputPort, PartitionCountDomain, PartitionCountParameter, PartitionTopNType,
+        PhysicalProperties, PipelineDopDomain, PlanAnnotation, PlanBuilder, PlanVersionId,
+        PositionShardAggregation, PositionShardInput, PositionShardOutput, PredicateGuarantee,
+        PredicateGuaranteeKind, ProviderReadReference, ROOT_WRITE_RESULT_SCHEMA_REVISION, Relation,
+        RelationField, RequiredInputs, ResultField, ResultPort, RowCountAssertion,
+        RowCountAssertionSpec, RowMultiplicity, RuntimeFilter, RuntimeFilterArtifactCapability,
+        RuntimeFilterCompletion, RuntimeFilterConsumer, RuntimeFilterConsumerActivation,
+        RuntimeFilterConsumerTarget, RuntimeFilterContributionKind, RuntimeFilterCoverage,
+        RuntimeFilterCoverageNode, RuntimeFilterDomain, RuntimeFilterEndpoint,
+        RuntimeFilterEqualityWitness, RuntimeFilterEqualityWitnessId, RuntimeFilterId,
+        RuntimeFilterKind, RuntimeFilterLifecycle, RuntimeFilterLineageStep,
+        RuntimeFilterNullSemantics, RuntimeFilterOrderKey, RuntimeFilterPolicy,
+        RuntimeFilterProducer, RuntimeFilterProducerProgress, RuntimeFilterProducerTarget,
+        RuntimeFilterReduction, RuntimeFilterWitnessId, SetOperationKind, SortDirection, SortExpr,
+        SortMode, TableFunctionOutput, TopNPhase as ContractTopNPhase, TopNSequenceId,
+        UnpivotConstant as ContractUnpivotConstant, UnpivotSpec, UnpivotValueMapping,
+        ValidationErrors, ValueId, ValueOrigin, ValueType, WRITER_MULTIPLEX_SCHEMA_REVISION,
+        WindowBound as ContractWindowBound, WindowCallSpec, WindowFrame as ContractWindowFrame,
+        WindowFrameExclusion, WindowFrameUnits, WindowSpec, WriterAggregateCall, WriterDerivedKind,
+        WriterFinishSpec, WriterGroupedUnpivotMapping, WriterGroupedUnpivotSpec,
+        WriterRelationField, WriterRelationFieldRole, WriterRelationSchema, WriterTarget,
+        WriterTargetField,
+    },
+};
 
 use super::lowered_draft::{
     AggregateRuntimeDemand, AggregateSourceTarget, AggregateStateEndpoint, AggregateStateLink,
-    AggregateStateSources, AggregateStateTransport, CanonicalAggregateOperationalRequest,
-    CanonicalCallOperationalRequest, CapturedOperationalSource, EmittedOperationalCall,
-    LoweredAggregateLogicalSource, LoweredAggregateSourceEntry, LoweredExpressionLogicalSource,
-    LoweredExpressionSourceEntry, LoweredOperationalChannel, LoweredSqlPhysicalDraft,
-    LoweredTableSourceEntry, SqlExpressionCallKind, SqlLogicalSourceJournal,
+    AggregateStateTransport, CanonicalAggregateOperationalRequest, CanonicalCallOperationalRequest,
+    CapturedOperationalSource, EmittedOperationalCall, LoweredAggregateLogicalSource,
+    LoweredAggregateSourceEntry, LoweredExpressionLogicalSource, LoweredExpressionSourceEntry,
+    LoweredOperationalChannel, LoweredSqlPhysicalDraft, LoweredTableSourceEntry,
+    LoweredWindowSourceEntry, SqlExpressionCallKind, SqlLogicalSourceJournal,
     SqlOperationalChannelRole, SqlOperationalProjectionError,
     project_emitted_call_arguments_observed, project_emitted_writer_value_observed,
     validate_expression_source_entry_observed, validate_table_source_entry_observed,
@@ -193,14 +213,9 @@ pub(crate) fn lower_final_physical_write_plan(
         write,
         write_target_ordinal,
         auxiliary,
-        mut targets,
-    } = input;
-    if write.position_materialization.is_some() {
-        return Err(invalid_write(
-            "position materialization requires a change-stream router".into(),
-        ));
-    }
-    let mut visitor = ContractLoweringVisitor::new(
+        targets,
+    } = require_ordinary_write_input(input)?;
+    let visitor = ContractLoweringVisitor::new(
         version,
         dop_domain,
         reads,
@@ -209,6 +224,35 @@ pub(crate) fn lower_final_physical_write_plan(
         constant_policy,
         control,
     )?;
+    drive_ordinary_write_emission(
+        visitor,
+        plan,
+        write,
+        write_target_ordinal,
+        auxiliary,
+        targets,
+    )
+}
+
+fn require_ordinary_write_input(
+    input: FinalWriteLowering<'_>,
+) -> Result<FinalWriteLowering<'_>, ContractLoweringError> {
+    if input.write.position_materialization.is_some() {
+        return Err(invalid_write(
+            "position materialization requires a change-stream router".into(),
+        ));
+    }
+    Ok(input)
+}
+
+fn drive_ordinary_write_emission(
+    mut visitor: ContractLoweringVisitor<'_>,
+    plan: &PhysicalPlanNode,
+    write: SqlWritePlanInput,
+    write_target_ordinal: WriteTargetOrdinal,
+    auxiliary: &WriterAuxiliaryPlan,
+    mut targets: FinalizedWriteTargetSet,
+) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     // A write states the runtime filters it can name, for the same reason a
     // read does: a filter whose probe is not one value of one type is a filter
     // the plan cannot say anything exact about.
@@ -358,7 +402,7 @@ fn lower_final_physical_plan_inner_with_domains(
         .map(|facts| facts.domains(&plan.output_columns))
         .transpose()
         .map_err(invalid_write)?;
-    let mut visitor = ContractLoweringVisitor::new(
+    let visitor = ContractLoweringVisitor::new(
         version,
         dop_domain,
         reads,
@@ -367,6 +411,15 @@ fn lower_final_physical_plan_inner_with_domains(
         constant_policy,
         control,
     )?;
+    drive_read_emission(visitor, plan, semantics, domains)
+}
+
+fn drive_read_emission(
+    mut visitor: ContractLoweringVisitor<'_>,
+    plan: &PhysicalPlanNode,
+    semantics: Option<crate::compiler::root_output::RootOutputSemantics>,
+    domains: Option<Vec<novarocks_physical_plan::ResultValueDomain>>,
+) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan, &mut visitor.work)?;
     let root = visitor.lower_node(plan)?;
 
@@ -424,6 +477,9 @@ fn lower_final_physical_plan_inner_with_domains(
 }
 
 struct ContractLoweringVisitor<'a> {
+    #[cfg(test)]
+    original_emission_observer:
+        Option<&'a mut dyn original_emission_test_observer::OriginalEmissionObserver>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     root_allow_throw_exception_used: bool,
@@ -433,11 +489,7 @@ struct ContractLoweringVisitor<'a> {
     work: CompileCheckpoints<'a>,
     current_fragment: FragmentId,
     next_fragment: u32,
-    next_constant_pool: Option<u32>,
-    constant_sources: BTreeMap<
-        novarocks_constant_contract::ConstantBackingIdentity,
-        novarocks_physical_plan::ConstantPoolId,
-    >,
+    constant_emission: constant_emission::SqlConstantEmission,
     /// The one hash partition space each destination fragment receives in.
     exchange_hash_schemes: BTreeMap<FragmentId, HashPartitionScheme>,
     write_stage_placements: BTreeMap<FragmentId, novarocks_physical_plan::StagePlacementPolicy>,
@@ -463,6 +515,9 @@ struct ContractLoweringVisitor<'a> {
     /// The lambdas open at this point, outermost first.
     lambda_scope: Vec<LoweringLambdaScope>,
     fragments: BTreeMap<FragmentId, FragmentBuilder>,
+    // Construction order preserves the original per-fragment nullable pass;
+    // addresses remain node-local and never form another expression arena.
+    definition_order: BTreeMap<FragmentId, NullableConstructionOrder>,
     completions: BTreeMap<FragmentId, (NodeId, FragmentSink)>,
     plan_version: PlanVersionId,
     plan_builder: PlanBuilder,
@@ -477,6 +532,107 @@ struct ContractLoweringVisitor<'a> {
     runtime_filter_builds: BTreeMap<i32, PendingRuntimeFilterBuild>,
     runtime_filter_probes: BTreeMap<i32, Vec<PendingRuntimeFilterProbe>>,
     edges: BTreeMap<EdgeId, Edge>,
+}
+
+use super::unit_source::{ScalarDefinitionAddress, ScalarSourceSite, ScalarUnitOwner};
+
+/// Only the original lowering module constructs this same-emission loan.
+/// It borrows its exact draft/sealed unit, journal and catalogue; it owns no
+/// expression namespace, result plan, resource capacity or fallback path.
+pub(super) struct SqlUnitSourceLoan<'a> {
+    site: ScalarSourceSite,
+    definitions: super::unit_source::UnitDefinitions<'a>,
+    constants: &'a novarocks_physical_plan::ConstantPools,
+    parameters: &'a SemanticParameters,
+    journal: &'a SqlLogicalSourceJournal,
+    functions: &'a Arc<dyn crate::compiler::SqlFunctionCatalog>,
+}
+impl<'a> SqlUnitSourceLoan<'a> {
+    pub(super) fn site(&self) -> ScalarSourceSite {
+        self.site.clone()
+    }
+    pub(super) fn owner(&self) -> ScalarUnitOwner {
+        self.site.owner()
+    }
+    pub(super) fn definitions(&self) -> super::unit_source::UnitDefinitions<'a> {
+        self.definitions.clone()
+    }
+    pub(super) const fn constants(&self) -> &'a novarocks_physical_plan::ConstantPools {
+        self.constants
+    }
+    pub(super) const fn parameters(&self) -> &'a SemanticParameters {
+        self.parameters
+    }
+    pub(super) const fn journal(&self) -> &'a SqlLogicalSourceJournal {
+        self.journal
+    }
+    pub(super) const fn functions(&self) -> &'a Arc<dyn crate::compiler::SqlFunctionCatalog> {
+        self.functions
+    }
+    pub(super) fn checked_expression_source_observed(
+        &self,
+        source: &'a novarocks_expression_contract::ExprNode,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<
+        super::lowered_draft::CheckedExpressionLogicalSourceEntry<'a>,
+        super::lowered_draft::SqlSourceJournalError,
+    > {
+        super::lowered_draft::check_original_unit_source_observed(self, source, work)
+    }
+}
+
+/// The original unit and its child-first summaries stay paired through relation
+/// preparation. Equal local use/region numbers from another unit do not match.
+pub(super) struct NodeExpressionEffects {
+    unit: Arc<novarocks_expression_contract::BoundExprSet>,
+    summaries: BTreeMap<
+        novarocks_type_contract::ExpressionUseId,
+        novarocks_functions::ScopedExpressionEffects,
+    >,
+}
+impl NodeExpressionEffects {
+    pub(super) fn unit(&self) -> &novarocks_expression_contract::BoundExprSet {
+        &self.unit
+    }
+    pub(super) fn summaries(
+        &self,
+    ) -> &BTreeMap<
+        novarocks_type_contract::ExpressionUseId,
+        novarocks_functions::ScopedExpressionEffects,
+    > {
+        &self.summaries
+    }
+}
+
+/// This module alone issues the original immutable graph loan while the final
+/// call/property publication gate is pending. It is not a completed SQL plan.
+pub(super) struct SqlRelationSourceLoan<'a> {
+    fragments: &'a BTreeMap<FragmentId, Fragment>,
+    edges: &'a BTreeMap<EdgeId, Edge>,
+    constants: &'a novarocks_physical_plan::ConstantPools,
+    parameters: &'a SemanticParameters,
+    journal: &'a SqlLogicalSourceJournal,
+    functions: &'a Arc<dyn crate::compiler::SqlFunctionCatalog>,
+}
+impl<'a> SqlRelationSourceLoan<'a> {
+    pub(super) const fn fragments(&self) -> &'a BTreeMap<FragmentId, Fragment> {
+        self.fragments
+    }
+    pub(super) const fn edges(&self) -> &'a BTreeMap<EdgeId, Edge> {
+        self.edges
+    }
+    pub(super) const fn constants(&self) -> &'a novarocks_physical_plan::ConstantPools {
+        self.constants
+    }
+    pub(super) const fn parameters(&self) -> &'a SemanticParameters {
+        self.parameters
+    }
+    pub(super) const fn journal(&self) -> &'a SqlLogicalSourceJournal {
+        self.journal
+    }
+    pub(super) const fn functions(&self) -> &'a Arc<dyn crate::compiler::SqlFunctionCatalog> {
+        self.functions
+    }
 }
 
 struct CteProducer {
@@ -661,11 +817,12 @@ fn subtree_inbound_edges(fragment: &Fragment, root: NodeId) -> BTreeSet<EdgeId> 
     edges
 }
 
-fn direct_expression_value(fragment: &Fragment, expression: ExprId) -> Option<ValueId> {
-    match fragment.expressions().get(expression)?.kind {
-        ContractExprKind::Value(value) => Some(value),
-        _ => None,
-    }
+fn direct_expression_value(
+    fragment: &Fragment,
+    node: NodeId,
+    root: RootOrdinal,
+) -> Option<ValueId> {
+    novarocks_physical_plan::expression_value(fragment, node, root)
 }
 
 /// Following one input of a join that republishes the value unchanged.
@@ -799,7 +956,7 @@ fn runtime_filter_scan_lineage(
                     if *output != position.2 {
                         return None;
                     }
-                    let source = direct_expression_value(fragment, *expression)?;
+                    let source = direct_expression_value(fragment, node.id, *expression)?;
                     Some((
                         RuntimeFilterLineageStep::ProjectIdentity {
                             fragment: position.0,
@@ -825,12 +982,10 @@ fn runtime_filter_scan_lineage(
                     .filter(|(_, key)| !key.null_safe)
                     .flat_map(move |(ordinal, key)| {
                         let left = novarocks_physical_plan::join_key_source_value(
-                            fragment.expressions(),
-                            key.left,
+                            fragment, node.id, key.left,
                         );
                         let right = novarocks_physical_plan::join_key_source_value(
-                            fragment.expressions(),
-                            key.right,
+                            fragment, node.id, key.right,
                         );
                         [
                             (ContractJoinSide::Left, left),
@@ -895,7 +1050,7 @@ fn runtime_filter_scan_lineage(
                         (
                             position.0,
                             node.inputs[0],
-                            direct_expression_value(fragment, *expression)?,
+                            direct_expression_value(fragment, node.id, *expression)?,
                         ),
                     ))
                 })
@@ -1192,7 +1347,7 @@ fn materialize_runtime_filter(
                 if candidate.inputs.as_ref() != [*node]
                     || !matches!(phase, ContractTopNPhase::Partial { .. })
                     || order_by.len() != 1
-                    || direct_expression_value(producer_fragment, order_by[0].expr)
+                    || direct_expression_value(producer_fragment, candidate.id, order_by[0].expr)
                         != Some(group_output)
                     || *frozen_limit != u64::from(*limit)
                     || *offset != 0
@@ -1394,6 +1549,37 @@ fn resolve_runtime_filter_activations_observed(
 }
 
 impl<'a> ContractLoweringVisitor<'a> {
+    fn scalar_emission(&mut self, owner: NodeId) -> scalar_emission::ScalarEmission<'_, 'a> {
+        self.scalar_emission_at(self.current_fragment, owner)
+    }
+
+    fn scalar_emission_at(
+        &mut self,
+        fragment: FragmentId,
+        owner: NodeId,
+    ) -> scalar_emission::ScalarEmission<'_, 'a> {
+        scalar_emission::ScalarEmission {
+            root_allow_throw_exception: self.root_allow_throw_exception,
+            constant_policy: self.constant_policy,
+            root_allow_throw_exception_used: &mut self.root_allow_throw_exception_used,
+            functions: &self.functions,
+            control: self.control,
+            work: &mut self.work,
+            constant_emission: &mut self.constant_emission,
+            lambda_scope: &mut self.lambda_scope,
+            storage: scalar_emission::ScalarStorage::Node(scalar_emission::NodeScalarStorage {
+                fragment_id: fragment,
+                node: owner,
+                fragment: self
+                    .fragments
+                    .get_mut(&fragment)
+                    .expect("the current fragment is allocated before lowering"),
+                order: scalar_emission::NodeScalarOrder::new(self.definition_order.entry(fragment)),
+            }),
+            call_sources: &mut self.call_sources,
+        }
+    }
+
     fn new(
         version: PlanVersionId,
         dop_domain: PipelineDopDomain,
@@ -1405,6 +1591,8 @@ impl<'a> ContractLoweringVisitor<'a> {
     ) -> Result<Self, ContractLoweringError> {
         let work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         Ok(Self {
+            #[cfg(test)]
+            original_emission_observer: None,
             root_allow_throw_exception,
             constant_policy,
             root_allow_throw_exception_used: false,
@@ -1414,8 +1602,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             work,
             current_fragment: ROOT_FRAGMENT_ID,
             next_fragment: 1,
-            next_constant_pool: Some(0),
-            constant_sources: BTreeMap::new(),
+            constant_emission: constant_emission::SqlConstantEmission::new(),
             exchange_hash_schemes: BTreeMap::new(),
             write_stage_placements: BTreeMap::new(),
             next_topn_sequence: 1,
@@ -1428,15 +1615,11 @@ impl<'a> ContractLoweringVisitor<'a> {
             unstatable_runtime_filters: BTreeSet::new(),
             lambda_scope: Vec::new(),
             fragments: BTreeMap::from([(ROOT_FRAGMENT_ID, FragmentBuilder::new(ROOT_FRAGMENT_ID))]),
+            definition_order: BTreeMap::new(),
             completions: BTreeMap::new(),
             plan_version: version,
-            plan_builder: PlanBuilder::new(version),
-            call_sources: SqlLogicalSourceJournal {
-                state_sources: AggregateStateSources::default(),
-                expression_entries: BTreeMap::new(),
-                table_entries: BTreeMap::new(),
-                entries: BTreeMap::new(),
-            },
+            plan_builder: PlanBuilder::new(version, constant_policy),
+            call_sources: SqlLogicalSourceJournal::new(),
             provider_partition_definitions: BTreeMap::new(),
             dop_domain,
             provider_reads,
@@ -1452,11 +1635,7 @@ impl<'a> ContractLoweringVisitor<'a> {
     /// One admitted statement authors this source for every arithmetic/cast
     /// occurrence, independently of the occurrence's decimal overflow policy.
     fn root_allow_throw_reference(&mut self) -> SemanticParameterRef {
-        self.root_allow_throw_exception_used = true;
-        SemanticParameterRef {
-            id: SemanticParameterId::new(0),
-            expected_key: SemanticParameterKey::AllowThrowException,
-        }
+        scalar_emission::root_allow_throw_reference(&mut self.root_allow_throw_exception_used)
     }
 
     fn fragment_mut(&mut self) -> &mut FragmentBuilder {
@@ -1825,19 +2004,20 @@ impl<'a> ContractLoweringVisitor<'a> {
         &mut self,
         node: NodeId,
         child: &LoweredNode,
-        expressions: &[(ExprId, ValueId)],
+        expressions: &[(RootOrdinal, ValueId)],
     ) -> Result<(), ContractLoweringError> {
         let mut grouped: BTreeMap<ValueId, Vec<AggregateStateLink>> = BTreeMap::new();
         for (ordinal, (expression, output)) in expressions.iter().enumerate() {
             self.work.flush()?;
-            let source = self
-                .fragment_mut()
-                .expressions()
-                .get(*expression)
-                .map(|actual| match actual.kind {
-                    ContractExprKind::Value(value) => Some(value),
-                    _ => None,
-                });
+            let source = super::unit_source::UnitDefinitions::from_draft(
+                &self.fragments[&self.current_fragment],
+                node,
+            )
+            .root_definition(*expression)
+            .map(|actual| match actual.kind {
+                ContractExprKind::Value(value) => Some(value),
+                _ => None,
+            });
             self.work.step()?;
             let source = source.ok_or(ContractLoweringError::InvalidAggregate {
                 detail: "aggregate state projection expression is absent",
@@ -1912,6 +2092,43 @@ impl<'a> ContractLoweringVisitor<'a> {
         let result: Result<Option<SemanticParameters>, ContractLoweringError> = (|| {
             self.plan_builder.set_result_port(result_port)?;
             self.attach_runtime_filter_endpoints()?;
+            let parameters = scalar_emission::freeze_semantic_parameters(
+                self.root_allow_throw_exception_used,
+                self.root_allow_throw_exception,
+                std::mem::take(&mut self.group_concat_parameters),
+            )?;
+            #[cfg(test)]
+            if let Some(observer) = self.original_emission_observer.take() {
+                observer.observe(
+                    original_emission_test_observer::OriginalEmissionView {
+                        fragments: &self.fragments,
+                        journal: &self.call_sources,
+                        completions: &self.completions,
+                        edges: &self.edges,
+                        constants: self.constant_emission.pools(),
+                        parameters: &parameters,
+                        functions: &self.functions,
+                    },
+                    &mut self.work,
+                )?;
+            }
+            self.admit_original_definitions(&parameters)?;
+            let mut requests = neutral_requests::transfer_neutral_requests_observed(
+                &self.call_sources,
+                &mut self.work,
+                |value, work| {
+                    self.constant_emission
+                        .register(value, value.value_type(), work)
+                },
+            )?;
+            for &fragment in requests.keys() {
+                self.work.step()?;
+                if !self.fragments.contains_key(&fragment) {
+                    return Err(ContractLoweringError::UnknownFragmentCompletion { fragment });
+                }
+            }
+            let mut node_effects = BTreeMap::new();
+
             // Project incoming placement facts once under the original control.
             // This temporary index is bounded by the already authored edge set.
             let mut placement_inputs = BTreeMap::<FragmentId, (bool, BTreeSet<FragmentId>)>::new();
@@ -1940,7 +2157,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
             self.work.flush()?;
             let mut finished_fragments = BTreeMap::new();
-            for (fragment_id, builder) in std::mem::take(&mut self.fragments) {
+            for (fragment_id, mut builder) in std::mem::take(&mut self.fragments) {
                 self.work.step()?;
                 let (root, sink) = self.completions.remove(&fragment_id).ok_or(
                     ContractLoweringError::IncompleteFragment {
@@ -1995,7 +2212,19 @@ impl<'a> ContractLoweringVisitor<'a> {
                         sources: sources.into_boxed_slice(),
                     }
                 };
-                let fragment = builder.finish_definition(root, sink, dop_domain, placement)?;
+                let transferred = requests.remove(&fragment_id).unwrap_or_default();
+                let authored = self.seal_node_units(&mut builder, &parameters, transferred)?;
+                let fragment = builder.finish_structure(
+                    root,
+                    sink,
+                    dop_domain,
+                    novarocks_physical_plan::PlanLimits::FROZEN,
+                    self.control,
+                    placement,
+                )?;
+                let fragment =
+                    fragment.with_call_requests_observed(authored.relations, self.control)?;
+                node_effects.insert(fragment_id, authored.effects);
                 finished_fragments.insert(fragment_id, fragment);
             }
             if let Some((&fragment, _)) = self.completions.first_key_value() {
@@ -2047,18 +2276,38 @@ impl<'a> ContractLoweringVisitor<'a> {
             // Check retained source authors first. The mandatory static request
             // attachment below separately closes every actual call definition,
             // including definitions with no runtime invocation occurrence.
-            for (&(fragment_id, expression_id), entry) in &self.call_sources.expression_entries {
+            for (address, entry) in &self.call_sources.expression_entries {
                 self.work.step()?;
+                let ScalarSourceSite::Node {
+                    fragment: fragment_id,
+                    node: node_id,
+                } = &address.site
+                else {
+                    return Err(ContractLoweringError::InvalidFunctionBinding {
+                        detail: "node publication contains a standalone scalar source".into(),
+                    });
+                };
+                let (fragment_id, node_id) = (*fragment_id, *node_id);
+                let expression_id = address.definition;
                 let fragment = finished_fragments.get(&fragment_id).ok_or(
                     ContractLoweringError::UnknownFragmentCompletion {
                         fragment: fragment_id,
                     },
                 )?;
-                let source = fragment
-                    .expressions()
-                    .get(expression_id)
+                let node = fragment.nodes().get(&node_id).ok_or(
+                    ContractLoweringError::IdentitySpaceExhausted("expression node"),
+                )?;
+                let source = node
+                    .expressions
+                    .as_ref()
+                    .and_then(|unit| unit.definition(expression_id))
                     .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))?;
-                validate_expression_source_entry_observed(entry, source, &mut self.work)?;
+                validate_expression_source_entry_observed(
+                    entry,
+                    address.site.owner(),
+                    source,
+                    &mut self.work,
+                )?;
             }
             for (&(fragment_id, node_id), entry) in &self.call_sources.table_entries {
                 self.work.step()?;
@@ -2071,58 +2320,36 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .nodes()
                     .get(&node_id)
                     .ok_or(ContractLoweringError::IdentitySpaceExhausted("node"))?;
-                validate_table_source_entry_observed(entry, source, &mut self.work)?;
+                validate_table_source_entry_observed(
+                    entry,
+                    super::unit_source::UnitDefinitions::from_node(source),
+                    source,
+                    &mut self.work,
+                )?;
             }
-            let mut requests = neutral_requests::transfer_neutral_requests_observed(
-                &self.call_sources,
-                &mut self.work,
-                |value, work| {
-                    register_constant_source_observed(
-                        &mut self.plan_builder,
-                        &mut self.constant_sources,
-                        &mut self.next_constant_pool,
-                        value,
-                        value.value_type(),
-                        work,
-                    )
-                },
-            )?;
-            for &fragment in requests.keys() {
-                let present = finished_fragments.contains_key(&fragment);
+            let mut call_tables =
+                self.author_relation_tables(&finished_fragments, &node_effects, &parameters)?;
+            let mut authored_fragments = BTreeMap::new();
+            for (id, fragment) in finished_fragments {
+                let calls = call_tables.remove(&id).ok_or(
+                    super::package_semantics::PackageSemanticsError::InvalidSource(
+                        "fragment has no completed original relation call table",
+                    ),
+                )?;
+                let fragment = fragment
+                    .with_frozen_calls_observed(calls, self.control)
+                    .map_err(super::package_semantics::PackageSemanticsError::from)?;
+                authored_fragments.insert(id, fragment);
                 self.work.step()?;
-                if !present {
-                    return Err(ContractLoweringError::UnknownFragmentCompletion { fragment });
-                }
             }
-            for filter in self.materialize_runtime_filters(&finished_fragments)? {
+            for filter in self.materialize_runtime_filters(&authored_fragments)? {
                 self.plan_builder.add_runtime_filter(filter)?;
             }
-            for fragment in finished_fragments.into_values() {
+            for fragment in authored_fragments.into_values() {
                 self.work.step()?;
-                let entries = requests.remove(&fragment.id());
-                self.work.step()?;
-                // An explicit empty author is valid only for a call-free fragment.
-                // The same constructor refuses every missing actual definition.
-                let fragment = fragment
-                    .with_call_requests_observed(entries.unwrap_or_default(), self.control)?;
                 self.plan_builder.add_fragment(fragment)?;
             }
-            if self.root_allow_throw_exception_used {
-                self.group_concat_parameters.insert(
-                    SemanticParameterId::new(0),
-                    SemanticParameterValue::AllowThrowException(self.root_allow_throw_exception),
-                );
-            }
-            if !self.group_concat_parameters.is_empty() {
-                let parameters =
-                    SemanticParameters::try_new(std::mem::take(&mut self.group_concat_parameters))
-                        .map_err(|error| ContractLoweringError::InvalidFunctionBinding {
-                            detail: error.to_string(),
-                        })?;
-                Ok(Some(parameters))
-            } else {
-                Ok(None)
-            }
+            Ok(Some(parameters))
         })();
         if let Err(ContractLoweringError::Control(cause)) = &result {
             return Err(ContractLoweringError::Control(cause.clone()));
@@ -2133,6 +2360,9 @@ impl<'a> ContractLoweringVisitor<'a> {
         if let Some(parameters) = result? {
             self.plan_builder = self.plan_builder.with_semantic_parameters(parameters);
         }
+        self.plan_builder = self
+            .plan_builder
+            .with_constant_pools(self.constant_emission.into_pools());
         Ok(LoweredSqlPhysicalDraft::from_lowering(
             self.plan_builder,
             self.call_sources,
@@ -2436,7 +2666,15 @@ impl<'a> ContractLoweringVisitor<'a> {
                 let predicate = event
                     .predicate
                     .as_ref()
-                    .map(|predicate| self.lower_expression(node, predicate, &child.columns))
+                    .map(|predicate| {
+                        let definition = self.lower_expression(node, predicate, &child.columns)?;
+                        self.root_definition(
+                            node,
+                            definition,
+                            EvaluationDemand::TruthOnly,
+                            RootScope::Port(0),
+                        )
+                    })
                     .transpose()?;
                 let mut assigned = BTreeSet::new();
                 let assignments = event
@@ -2463,7 +2701,14 @@ impl<'a> ContractLoweringVisitor<'a> {
                             .expr
                             .as_ref()
                             .map(|expression| {
-                                self.lower_expression(node, expression, &child.columns)
+                                let definition =
+                                    self.lower_expression(node, expression, &child.columns)?;
+                                self.root_definition(
+                                    node,
+                                    definition,
+                                    EvaluationDemand::Value,
+                                    RootScope::Port(0),
+                                )
                             })
                             .transpose()?;
                         Ok(novarocks_physical_plan::ChangeAssignment {
@@ -2838,6 +3083,17 @@ impl<'a> ContractLoweringVisitor<'a> {
         Ok(sequence)
     }
 
+    fn lower_derived_variant_expression(
+        &mut self,
+        owner: NodeId,
+        source_value: ValueId,
+        source: &Arc<crate::common::variant_source::DerivedVariantSource>,
+        expected_result: &ValueType,
+    ) -> Result<ExprId, ContractLoweringError> {
+        self.scalar_emission(owner)
+            .lower_derived_variant_expression(source_value, source, expected_result)
+    }
+
     fn lower_scan(
         &mut self,
         plan: &PhysicalPlanNode,
@@ -3040,96 +3296,22 @@ impl<'a> ContractLoweringVisitor<'a> {
                     ),
                 });
             }
-            let source_expression = self.fragment_mut().add_expression(
+            let expression = self.lower_derived_variant_expression(
                 node,
-                value_type(source_column),
-                ContractExprKind::Value(source_value),
+                source_value,
+                descriptor.source(),
+                &expected_result,
             )?;
-            let path_expression = self.lower_constant_expression(
-                node,
-                descriptor.source().canonical_path(),
-                ValueType::new(DataType::Utf8, false),
-            )?;
-            let type_expression = self.lower_constant_expression(
-                node,
-                descriptor.source().type_literal(),
-                ValueType::new(DataType::Utf8, false),
-            )?;
-            let mut channels = self.reserve_call_channels(3)?;
-            channels.push(LoweredOperationalChannel {
-                expression: source_expression,
-                role: SqlOperationalChannelRole::ValueWithoutConstant,
-            });
-            self.work.step()?;
-            channels.push(LoweredOperationalChannel {
-                expression: path_expression,
-                role: SqlOperationalChannelRole::DerivedVariantPath,
-            });
-            self.work.step()?;
-            channels.push(LoweredOperationalChannel {
-                expression: type_expression,
-                role: SqlOperationalChannelRole::DerivedVariantTypeLiteral,
-            });
-            self.work.step()?;
-            self.work.flush()?;
-            let channels = channels.into_boxed_slice();
-            self.work.step()?;
-            let arguments = [source_expression, path_expression, type_expression];
-            let canonical = self.author_canonical_call_selection(
-                node,
-                descriptor.source().captured(),
-                Some(SqlExpressionCallKind::DerivedVariant),
-                Some(descriptor.source().as_ref()),
-                &arguments,
-                &channels,
-            )?;
-            let selected = canonical.selected();
-            let novarocks_functions::FunctionResultType::Scalar(result) = &selected.result_type
-            else {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail: "canonical derived VARIANT owner selected a relation result".into(),
-                });
-            };
-            if selected.aggregate.is_some() || result != &expected_result {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail: "canonical derived VARIANT result differs from its exact descriptor"
-                        .into(),
-                });
-            }
-            self.work.flush()?;
-            let function = bound_function_from_selection(binding, selected, result);
-            self.work.step()?;
-            self.work.flush()?;
-            let result_type = result.clone();
-            self.work.step()?;
-            self.work.flush()?;
-            let expression = self.fragment_mut().add_expression(
-                node,
-                result_type.clone(),
-                ContractExprKind::FunctionCall {
-                    function,
-                    args: Box::from(arguments),
-                },
-            )?;
-            self.work.flush()?;
-            let source = Arc::clone(descriptor.source());
-            self.work.step()?;
-            self.work.flush()?;
-            self.record_expression_source_with_data(
+            let root = self.root_definition(
                 node,
                 expression,
-                LoweredExpressionLogicalSource::DerivedVariant(source),
-                SqlExpressionCallKind::DerivedVariant,
-                channels,
-                Some(canonical),
+                EvaluationDemand::Value,
+                RootScope::Port(0),
             )?;
-            let value = self.fragment_mut().add_value(
-                result_type,
-                ValueOrigin::Expr {
-                    node,
-                    expr: expression,
-                },
-            )?;
+            let result_type = self.expression_value_type(node, expression)?;
+            let value = self
+                .fragment_mut()
+                .add_value(result_type, ValueOrigin::Expr { node, root })?;
             insert_output_column("Scan", output_ordinal, output_column, value, &mut columns)?;
             derived_values.push(value);
         }
@@ -3151,7 +3333,13 @@ impl<'a> ContractLoweringVisitor<'a> {
                     actual: predicate.value_type.data_type().clone(),
                 });
             }
-            predicate_expressions.push(self.lower_expression(node, predicate, &columns)?);
+            let definition = self.lower_expression(node, predicate, &columns)?;
+            predicate_expressions.push(self.root_definition(
+                node,
+                definition,
+                EvaluationDemand::TruthOnly,
+                RootScope::Port(0),
+            )?);
         }
         let mut guarantee_by_occurrence = BTreeMap::new();
         for predicate in &contract.predicates {
@@ -3821,6 +4009,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                     });
                 }
                 let expression_id = self.lower_expression(node, expression, &source.columns)?;
+                let expression_root = self.root_definition(
+                    node,
+                    expression_id,
+                    EvaluationDemand::Value,
+                    RootScope::Port(0),
+                )?;
                 let value = match identity_column_ref(expression) {
                     Some(column_id) => source
                         .columns
@@ -3830,18 +4024,18 @@ impl<'a> ContractLoweringVisitor<'a> {
                     None => {
                         let ty = published_value_type(
                             &expression_type(expression),
-                            &self.expression_value_type(expression_id)?,
+                            &self.expression_value_type(node, expression_id)?,
                         );
                         self.fragment_mut().add_value(
                             ty,
                             ValueOrigin::Expr {
                                 node,
-                                expr: expression_id,
+                                root: expression_root,
                             },
                         )?
                     }
                 };
-                expressions.push((expression_id, value));
+                expressions.push((expression_root, value));
                 output.push(value);
             }
         } else {
@@ -3901,18 +4095,24 @@ impl<'a> ContractLoweringVisitor<'a> {
                 if related {
                     // The selected writer assignment owns V -> W construction.
                     // Keep both the real source promise and its original ID.
-                    let expression = self.fragment_mut().add_expression(
+                    let expression = self.add_unscoped_expression(
                         node,
                         source_ty.clone(),
                         ContractExprKind::Value(value),
                     )?;
-                    expressions.push((expression, value));
+                    let expression_root = self.root_definition(
+                        node,
+                        expression,
+                        EvaluationDemand::Value,
+                        RootScope::Port(0),
+                    )?;
+                    expressions.push((expression_root, value));
                     output.push(value);
                 } else {
                     // The target's type is not the statement's, so the plan
                     // says how one becomes the other rather than leaving the
                     // writer to decide.
-                    let read = self.fragment_mut().add_expression(
+                    let read = self.add_unscoped_expression(
                         node,
                         source_ty.clone(),
                         ContractExprKind::Value(value),
@@ -3930,14 +4130,20 @@ impl<'a> ContractLoweringVisitor<'a> {
                         &converted_ty,
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     )?;
+                    let expression_root = self.root_definition(
+                        node,
+                        expression,
+                        EvaluationDemand::Value,
+                        RootScope::Port(0),
+                    )?;
                     let converted = self.fragment_mut().add_value(
                         converted_ty,
                         ValueOrigin::Expr {
                             node,
-                            expr: expression,
+                            root: expression_root,
                         },
                     )?;
-                    expressions.push((expression, converted));
+                    expressions.push((expression_root, converted));
                     output.push(converted);
                 }
             }
@@ -4958,10 +5164,16 @@ impl<'a> ContractLoweringVisitor<'a> {
                                 .iter()
                                 .map(|constant| match constant {
                                     crate::analysis::UnpivotConstant::Scalar(expression) => {
-                                        Ok(ContractUnpivotConstant::Scalar(self.lower_expression(
+                                        let definition = self.lower_expression(
                                             finish,
                                             expression,
                                             &BTreeMap::new(),
+                                        )?;
+                                        Ok(ContractUnpivotConstant::Scalar(self.root_definition(
+                                            finish,
+                                            definition,
+                                            EvaluationDemand::Value,
+                                            RootScope::Port(0),
                                         )?))
                                     }
                                     crate::analysis::UnpivotConstant::Int32List(_)
@@ -5606,9 +5818,17 @@ impl<'a> ContractLoweringVisitor<'a> {
             let compared = self.common_comparison_value_type(&left_key_type, &right_key_type)?;
             let left_expr = self.cast_expression_to(node, left_expr, &compared)?;
             let right_expr = self.cast_expression_to(node, right_expr, &compared)?;
+            let left_root =
+                self.root_definition(node, left_expr, EvaluationDemand::Value, RootScope::Port(0))?;
+            let right_root = self.root_definition(
+                node,
+                right_expr,
+                EvaluationDemand::Value,
+                RootScope::Port(1),
+            )?;
             let key = JoinKey {
-                left: left_expr,
-                right: right_expr,
+                left: left_root,
+                right: right_root,
                 null_safe: condition.null_safe,
             };
             if ordinal < join.condition.keys().len() {
@@ -5641,7 +5861,13 @@ impl<'a> ContractLoweringVisitor<'a> {
                         actual: predicate.value_type.data_type().clone(),
                     });
                 }
-                self.lower_expression(node, predicate, &visible)
+                let definition = self.lower_expression(node, predicate, &visible)?;
+                let demand = if join.condition.is_null_aware() {
+                    EvaluationDemand::Value
+                } else {
+                    EvaluationDemand::TruthOnly
+                };
+                self.root_definition(node, definition, demand, RootScope::AllPorts)
             })
             .transpose()?;
         let lowered_output = self.lower_join_outputs(
@@ -5884,7 +6110,16 @@ impl<'a> ContractLoweringVisitor<'a> {
                         actual: predicate.value_type.data_type().clone(),
                     });
                 }
-                self.lower_expression(node, predicate, &visible)
+                let definition = self.lower_expression(node, predicate, &visible)?;
+                let demand = if matches!(
+                    kind,
+                    ContractJoinKind::NullAwareLeftAnti | ContractJoinKind::LeftMark
+                ) {
+                    EvaluationDemand::Value
+                } else {
+                    EvaluationDemand::TruthOnly
+                };
+                self.root_definition(node, definition, demand, RootScope::AllPorts)
             })
             .transpose()?;
         let JoinOutput {
@@ -6624,29 +6859,34 @@ impl<'a> ContractLoweringVisitor<'a> {
             let expression_id = match input_value {
                 Some(value) => {
                     let ty = self.value_declared_type(value)?;
-                    self.fragment_mut()
-                        .add_expression(node, ty, ContractExprKind::Value(value))?
+                    self.add_unscoped_expression(node, ty, ContractExprKind::Value(value))?
                 }
                 None => self.lower_expression(node, expression, &child.columns)?,
             };
+            let expression_root = self.root_definition(
+                node,
+                expression_id,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            )?;
             let value = match input_value {
                 Some(value) => value,
                 None => {
                     let ty = published_value_type(
                         &value_type(column),
-                        &self.expression_value_type(expression_id)?,
+                        &self.expression_value_type(node, expression_id)?,
                     );
                     self.fragment_mut().add_value(
                         ty,
                         ValueOrigin::Expr {
                             node,
-                            expr: expression_id,
+                            root: expression_root,
                         },
                     )?
                 }
             };
             insert_output_column("HashAggregate", ordinal, column, value, &mut columns)?;
-            group_by.push((expression_id, value));
+            group_by.push((expression_root, value));
             group_input_values.push(input_value);
             output.push(value);
         }
@@ -6716,6 +6956,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             let mut arguments = Vec::new();
             let mut order_by = Vec::new();
             let mut state_input = None;
+            let mut state_definition = None;
             if phase.consumes_logical_arguments() {
                 arguments = call
                     .source
@@ -6742,7 +6983,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                             );
                             self.work.step()?;
                         }
-                        Ok::<_, ContractLoweringError>(emitted)
+                        self.root_definition(
+                            node,
+                            emitted,
+                            EvaluationDemand::Value,
+                            RootScope::Port(0),
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 order_by = call
@@ -6773,7 +7019,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                                     );
                                     self.work.step()?;
                                 }
-                                emitted
+                                self.root_definition(
+                                    node,
+                                    emitted,
+                                    EvaluationDemand::Value,
+                                    RootScope::Port(0),
+                                )?
                             },
                             direction: if item.asc {
                                 SortDirection::Ascending
@@ -6825,10 +7076,14 @@ impl<'a> ContractLoweringVisitor<'a> {
                         detail: "state-consuming aggregate reads a state of another type",
                     });
                 }
-                arguments.push(self.fragment_mut().add_expression(
+                let definition =
+                    self.add_unscoped_expression(node, state_type, ContractExprKind::Value(state))?;
+                state_definition = Some(definition);
+                arguments.push(self.root_definition(
                     node,
-                    state_type,
-                    ContractExprKind::Value(state),
+                    definition,
+                    EvaluationDemand::Value,
+                    RootScope::Port(0),
                 )?);
             }
             let call_id = self.allocate_aggregate_call()?;
@@ -6919,7 +7174,9 @@ impl<'a> ContractLoweringVisitor<'a> {
             let runtime = if phase.consumes_logical_arguments() {
                 AggregateRuntimeDemand::Update
             } else {
-                AggregateRuntimeDemand::ExpressionState(arguments[0])
+                AggregateRuntimeDemand::ExpressionState(
+                    state_definition.expect("state phase emitted its original source definition"),
+                )
             };
             self.record_aggregate_source(
                 site,
@@ -7240,6 +7497,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     actual: row.len(),
                 });
             }
+            self.work.step()?;
             let mut lowered_row = Vec::with_capacity(row.len());
             for (column_ordinal, expression) in row.iter().enumerate() {
                 let expected = value_type(&plan.output_columns[column_ordinal]);
@@ -7278,7 +7536,13 @@ impl<'a> ContractLoweringVisitor<'a> {
                     }
                     None => self.lower_values_expression(node, expression, &expected)?,
                 };
-                lowered_row.push(lowered);
+                let root = self.root_definition(
+                    node,
+                    lowered,
+                    EvaluationDemand::Value,
+                    RootScope::AllPorts,
+                )?;
+                lowered_row.push(root);
             }
             rows.push(lowered_row.into_boxed_slice());
         }
@@ -7329,8 +7593,17 @@ impl<'a> ContractLoweringVisitor<'a> {
         // reason per conjunct never have to re-split a tree.
         let predicates =
             self.lower_boolean_connective(node, predicate, BinOp::And, &child.columns)?;
+        let mut roots = Vec::with_capacity(predicates.len());
+        for definition in predicates {
+            roots.push(self.root_definition(
+                node,
+                definition,
+                EvaluationDemand::TruthOnly,
+                RootScope::Port(0),
+            )?);
+        }
         self.fragment_mut()
-            .add_filter(node, child.node, predicates)?;
+            .add_filter(node, child.node, roots.into_boxed_slice())?;
         let properties = self
             .fragment_mut()
             .node_output_properties(node)
@@ -7360,7 +7633,9 @@ impl<'a> ContractLoweringVisitor<'a> {
             .origin
             .clone();
         match origin {
-            ValueOrigin::Expr { expr, .. } => self.lowered_expression_is_constant_null(expr),
+            ValueOrigin::Expr { node, root } => {
+                self.lowered_expression_is_constant_null(node, root)
+            }
             ValueOrigin::NodeOutput {
                 node,
                 output_ordinal,
@@ -7382,7 +7657,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     )?);
                 }
                 for expression in expressions {
-                    if !self.lowered_expression_is_constant_null(expression)? {
+                    if !self.lowered_expression_is_constant_null(node, expression)? {
                         return Ok(false);
                     }
                 }
@@ -7394,21 +7669,25 @@ impl<'a> ContractLoweringVisitor<'a> {
 
     fn lowered_expression_is_constant_null(
         &mut self,
-        expression: ExprId,
+        node: NodeId,
+        root: RootOrdinal,
     ) -> Result<bool, ContractLoweringError> {
         self.work.step()?;
-        let definition = self
-            .fragment_mut()
-            .expressions()
-            .get(expression)
-            .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))?;
+        let definition = super::unit_source::UnitDefinitions::from_draft(
+            &self.fragments[&self.current_fragment],
+            node,
+        )
+        .root_definition(root)
+        .ok_or(ContractLoweringError::IdentitySpaceExhausted(
+            "expression root",
+        ))?;
         let ContractExprKind::Constant(reference) = definition.kind else {
             return Ok(false);
         };
         let ty = definition.ty.clone();
         let value =
-            self.plan_builder
-                .constants()
+            self.constant_emission
+                .pools()
                 .resolve_observed(reference, &ty, &mut self.work)?;
         self.work.flush()?;
         let null = value.is_null_observed(CompilePhase::Validate, self.control)?;
@@ -7470,35 +7749,35 @@ impl<'a> ContractLoweringVisitor<'a> {
             let expression = if known_null {
                 self.author_literal_expression(node, &LiteralValue::Null, published_type.clone())?
             } else {
-                self.fragment_mut().add_expression(
+                self.add_unscoped_expression(
                     node,
                     source_type.clone(),
                     ContractExprKind::Value(source),
                 )?
             };
-            let (expression, value) = if source_type == published_type {
-                (expression, source)
+            let expression = if source_type == published_type || known_null {
+                expression
             } else {
-                let expression = if known_null {
-                    expression
-                } else {
-                    self.convert_expression_to(
-                        node,
-                        expression,
-                        &published_type,
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    )?
-                };
-                let value = self.fragment_mut().add_value(
-                    published_type,
-                    ValueOrigin::Expr {
-                        node,
-                        expr: expression,
-                    },
-                )?;
-                (expression, value)
+                self.convert_expression_to(
+                    node,
+                    expression,
+                    &published_type,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                )?
             };
-            expressions.push((expression, value));
+            let root = self.root_definition(
+                node,
+                expression,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            )?;
+            let value = if source_type == published_type {
+                source
+            } else {
+                self.fragment_mut()
+                    .add_value(published_type, ValueOrigin::Expr { node, root })?
+            };
+            expressions.push((root, value));
             output.push(value);
             columns.insert(column.column_id, value);
         }
@@ -7555,9 +7834,14 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
             let ty = self.value_declared_type(value)?;
             let expression =
-                self.fragment_mut()
-                    .add_expression(node, ty, ContractExprKind::Value(value))?;
-            expressions.push((expression, value));
+                self.add_unscoped_expression(node, ty, ContractExprKind::Value(value))?;
+            let expression_root = self.root_definition(
+                node,
+                expression,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            )?;
+            expressions.push((expression_root, value));
             output.push(value);
         }
 
@@ -7568,18 +7852,24 @@ impl<'a> ContractLoweringVisitor<'a> {
                 continue;
             }
             let expression_id = self.lower_expression(node, expression, &child.columns)?;
+            let expression_root = self.root_definition(
+                node,
+                expression_id,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            )?;
             let ty = published_value_type(
                 &expression_type(expression),
-                &self.expression_value_type(expression_id)?,
+                &self.expression_value_type(node, expression_id)?,
             );
             let value = self.fragment_mut().add_value(
                 ty,
                 ValueOrigin::Expr {
                     node,
-                    expr: expression_id,
+                    root: expression_root,
                 },
             )?;
-            expressions.push((expression_id, value));
+            expressions.push((expression_root, value));
             output.push(value);
             materialized.push(Some(value));
         }
@@ -7655,6 +7945,12 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
 
             let expression = self.lower_expression(node, &item.expr, &child.columns)?;
+            let expression_root = self.root_definition(
+                node,
+                expression,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            )?;
             let value = match identity_column_ref(&item.expr) {
                 Some(column_id) => child
                     .columns
@@ -7664,13 +7960,13 @@ impl<'a> ContractLoweringVisitor<'a> {
                 None => {
                     let ty = published_value_type(
                         &value_type(column),
-                        &self.expression_value_type(expression)?,
+                        &self.expression_value_type(node, expression)?,
                     );
                     self.fragment_mut().add_value(
                         ty,
                         ValueOrigin::Expr {
                             node,
-                            expr: expression,
+                            root: expression_root,
                         },
                     )?
                 }
@@ -7684,7 +7980,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 }
                 _ => {}
             }
-            expressions.push((expression, value));
+            expressions.push((expression_root, value));
             output.push(value);
         }
 
@@ -7801,10 +8097,13 @@ impl<'a> ContractLoweringVisitor<'a> {
             for constant in &mapping.constants {
                 constants.push(match constant {
                     crate::analysis::UnpivotConstant::Scalar(expression) => {
-                        ContractUnpivotConstant::Scalar(self.lower_expression(
+                        let definition =
+                            self.lower_expression(node, expression, &BTreeMap::new())?;
+                        ContractUnpivotConstant::Scalar(self.root_definition(
                             node,
-                            expression,
-                            &BTreeMap::new(),
+                            definition,
+                            EvaluationDemand::Value,
+                            RootScope::Port(0),
                         )?)
                     }
                     crate::analysis::UnpivotConstant::Int32List(_)
@@ -7992,8 +8291,14 @@ impl<'a> ContractLoweringVisitor<'a> {
             .analytic_partition_by
             .iter()
             .map(|expression| {
+                let definition = self.lower_expression(node, expression, &child.columns)?;
                 Ok(SortExpr {
-                    expr: self.lower_expression(node, expression, &child.columns)?,
+                    expr: self.root_definition(
+                        node,
+                        definition,
+                        EvaluationDemand::Value,
+                        RootScope::Port(0),
+                    )?,
                     direction: SortDirection::Ascending,
                     null_ordering: NullOrdering::First,
                 })
@@ -8420,32 +8725,39 @@ impl<'a> ContractLoweringVisitor<'a> {
         let mut columns = child.columns.clone();
         let mut materialized = BTreeMap::new();
         for (source, column) in child.output.iter().zip(input_columns) {
-            let (expression, value) = if let Some(pair) = materialized.get(&column.column_id) {
-                *pair
-            } else {
-                let ty = self.value_declared_type(*source)?;
-                let expression = self.fragment_mut().add_expression(
-                    node,
-                    ty.clone(),
-                    ContractExprKind::Value(*source),
-                )?;
-                let value = if independent_columns.contains(&column.column_id) {
-                    self.fragment_mut().add_value(
-                        ty,
-                        ValueOrigin::Expr {
-                            node,
-                            expr: expression,
-                        },
-                    )?
+            let (root, value) =
+                if let Some(&(definition, value)) = materialized.get(&column.column_id) {
+                    let root = self.root_definition(
+                        node,
+                        definition,
+                        EvaluationDemand::Value,
+                        RootScope::Port(0),
+                    )?;
+                    (root, value)
                 } else {
-                    *source
+                    let ty = self.value_declared_type(*source)?;
+                    let expression = self.add_unscoped_expression(
+                        node,
+                        ty.clone(),
+                        ContractExprKind::Value(*source),
+                    )?;
+                    let root = self.root_definition(
+                        node,
+                        expression,
+                        EvaluationDemand::Value,
+                        RootScope::Port(0),
+                    )?;
+                    let value = if independent_columns.contains(&column.column_id) {
+                        self.fragment_mut()
+                            .add_value(ty, ValueOrigin::Expr { node, root })?
+                    } else {
+                        *source
+                    };
+                    materialized.insert(column.column_id, (expression, value));
+                    (root, value)
                 };
-                let pair = (expression, value);
-                materialized.insert(column.column_id, pair);
-                pair
-            };
             columns.insert(column.column_id, value);
-            expressions.push((expression, value));
+            expressions.push((root, value));
             output.push(value);
         }
         self.record_state_projection(node, &child, &expressions)?;
@@ -8859,6 +9171,20 @@ impl<'a> ContractLoweringVisitor<'a> {
         let retained_arguments = retained_arguments.into_boxed_slice();
         self.work.step()?;
         self.work.flush()?;
+        let mut root_arguments = Vec::new();
+        root_arguments
+            .try_reserve_exact(arguments.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        for &definition in arguments.iter() {
+            root_arguments.push(self.root_definition(
+                node,
+                definition,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            )?);
+            self.work.step()?;
+        }
+        let root_arguments = root_arguments.into_boxed_slice();
         let mut output = child.output.to_vec();
         let mut outputs = child
             .output
@@ -8944,7 +9270,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             output.clone().into_boxed_slice(),
             NodeKind::TableFunction {
                 function: BoundTableFunction {
-                    legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+                    legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
                         semantic_parameters: Box::default(),
                         volatility: binding.semantics.volatility,
                         argument_evaluation: binding.semantics.argument_evaluation,
@@ -8959,7 +9285,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     // was resolved against, decoration and all.
                     result_types: authored_result_types,
                 },
-                arguments,
+                arguments: root_arguments,
                 outputs: outputs.into_boxed_slice(),
                 left_outer: table_function.is_left_join,
             },
@@ -9111,7 +9437,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             .expressions;
         let mut output = child.output.to_vec();
         let mut columns = child.columns.clone();
-        let mut window_expressions = Vec::with_capacity(expressions.len());
+        let mut window_calls = Vec::with_capacity(expressions.len());
         for (index, (expression, output_column)) in
             expressions.iter().zip(output_columns).enumerate()
         {
@@ -9133,8 +9459,10 @@ impl<'a> ContractLoweringVisitor<'a> {
                     detail: "window output type differs from its original function binding".into(),
                 });
             }
-            let expression_id = self.lower_window_call(node, expression, &child.columns)?;
-            let expression_type = self.expression_value_type(expression_id)?;
+            let pending = self.lower_window_call(node, expression, &child.columns)?;
+            self.work.flush()?;
+            let expression_type = pending.binding.result_type.clone();
+            self.work.step()?;
             // The actual expression owns the answer. An older declaration
             // may omit root null extension, but cannot change the carrier,
             // logical or nested facts, or widen an exact nonnullable answer.
@@ -9148,9 +9476,9 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
             let value = self.fragment_mut().add_value(
                 expression_type,
-                ValueOrigin::Expr {
+                ValueOrigin::NodeOutput {
                     node,
-                    expr: expression_id,
+                    output_ordinal: checked_ordinal("Window output", child.output.len() + index)?,
                 },
             )?;
             insert_output_column(
@@ -9160,10 +9488,36 @@ impl<'a> ContractLoweringVisitor<'a> {
                 value,
                 &mut columns,
             )?;
-            window_expressions.push(WindowExpression {
-                expression: expression_id,
-                output: value,
-            });
+            let site = novarocks_physical_plan::PhysicalCallSite::Window {
+                node,
+                call: checked_ordinal("Window call", index)?,
+            };
+            let (call, source) = pending.into_call(value);
+            self.work.flush()?;
+            let key = (self.current_fragment, site);
+            let duplicate = self.call_sources.window_entries.contains_key(&key);
+            self.work.step()?;
+            if duplicate {
+                return Err(ContractLoweringError::InvalidFunctionBinding {
+                    detail: "window source emission is duplicated".into(),
+                });
+            }
+            self.definition_order
+                .entry(self.current_fragment)
+                .or_default()
+                .events
+                .try_reserve(1)
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            self.call_sources.window_entries.insert(key, source);
+            self.work.step()?;
+            self.definition_order
+                .get_mut(&self.current_fragment)
+                .expect("reserved original nullable construction order")
+                .events
+                .push(NullableEmission::Window { site });
+            self.work.step()?;
+            window_calls.push(call);
+            self.work.step()?;
             output.push(value);
         }
         let properties = child.properties.clone();
@@ -9174,7 +9528,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             NodeKind::Window(WindowSpec {
                 partition_by,
                 order_by,
-                expressions: window_expressions.into_boxed_slice(),
+                calls: window_calls.into_boxed_slice(),
             }),
         )?;
         let mut display_names = child.display_names.to_vec();
@@ -9227,7 +9581,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         owner: NodeId,
         window: &crate::planner::payload::WindowExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
-    ) -> Result<ExprId, ContractLoweringError> {
+    ) -> Result<LoweredWindowCall, ContractLoweringError> {
         let result = self.lower_window_call_inner(owner, window, visible);
         if matches!(
             &result,
@@ -9249,7 +9603,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         owner: NodeId,
         window: &crate::planner::payload::WindowExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
-    ) -> Result<ExprId, ContractLoweringError> {
+    ) -> Result<LoweredWindowCall, ContractLoweringError> {
         let binding = &window.binding;
         if binding.logical_argument_count != window.args.len()
             || binding.selected.argument_types.len()
@@ -9341,6 +9695,24 @@ impl<'a> ContractLoweringVisitor<'a> {
         let args = args.into_boxed_slice();
         self.work.step()?;
         self.work.flush()?;
+        let mut arguments = Vec::new();
+        self.work.flush()?;
+        arguments
+            .try_reserve_exact(args.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work.step()?;
+        for definition in args.iter().copied() {
+            arguments.push(self.root_definition(
+                owner,
+                definition,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            )?);
+            self.work.step()?;
+        }
+        self.work.flush()?;
+        let arguments = arguments.into_boxed_slice();
+        self.work.step()?;
         let mut function_order_by = Vec::new();
         function_order_by
             .try_reserve_exact(window.function_order_by.len())
@@ -9356,7 +9728,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 visible,
             )?;
             function_order_by.push(SortExpr {
-                expr: channel.expression,
+                expr: self.root_definition(
+                    owner,
+                    channel.expression,
+                    EvaluationDemand::Value,
+                    RootScope::Port(0),
+                )?,
                 direction: if key.asc {
                     SortDirection::Ascending
                 } else {
@@ -9381,12 +9758,8 @@ impl<'a> ContractLoweringVisitor<'a> {
             .try_reserve_exact(captured.request().arguments.len())
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         self.work.step()?;
-        for argument in args
-            .iter()
-            .copied()
-            .chain(function_order_by.iter().map(|key| key.expr))
-        {
-            selection_arguments.push(argument);
+        for channel in &channels {
+            selection_arguments.push(channel.expression);
             self.work.step()?;
         }
         self.work.flush()?;
@@ -9431,42 +9804,33 @@ impl<'a> ContractLoweringVisitor<'a> {
         let function = bound_function_from_selection(binding, selected, result_type);
         self.work.step()?;
         self.work.flush()?;
-        let result_type = result_type.clone();
-        self.work.step()?;
-        self.work.flush()?;
         let frame = window
             .window_frame
             .as_ref()
-            .map(|frame| self.lower_window_frame(owner, frame))
+            .map(|frame| self.lower_window_frame(frame))
             .transpose()?;
-        let emitted = self.fragment_mut().add_expression(
-            owner,
-            result_type,
-            ContractExprKind::WindowCall {
-                function,
-                distinct: window.distinct,
-                args,
-                function_order_by,
-                frame,
-                ignore_nulls: window.ignore_nulls,
-                aggregate_binding: aggregate_binding.map(Box::new),
-            },
-        )?;
         self.work.flush()?;
-        self.record_expression_source(
-            owner,
-            emitted,
-            captured,
-            SqlExpressionCallKind::Window,
-            channels,
-            Some(canonical),
-        )?;
-        Ok(emitted)
+        let source_arguments = selection_arguments.into_boxed_slice();
+        self.work.step()?;
+        Ok(LoweredWindowCall {
+            binding: function,
+            distinct: window.distinct,
+            arguments,
+            order_by: function_order_by,
+            frame,
+            ignore_nulls: window.ignore_nulls,
+            aggregate_binding: aggregate_binding.map(Box::new),
+            source: LoweredWindowSourceEntry {
+                captured,
+                canonical_operational: canonical,
+                arguments: source_arguments,
+                channels,
+            },
+        })
     }
 
     fn lower_window_frame(
         &mut self,
-        owner: NodeId,
         frame: &crate::analysis::WindowFrame,
     ) -> Result<ContractWindowFrame, ContractLoweringError> {
         let units = match frame.frame_type {
@@ -9491,15 +9855,14 @@ impl<'a> ContractLoweringVisitor<'a> {
         }
         Ok(ContractWindowFrame {
             units,
-            start: self.lower_window_bound(owner, &frame.start)?,
-            end: self.lower_window_bound(owner, &frame.end)?,
+            start: self.lower_window_bound(&frame.start)?,
+            end: self.lower_window_bound(&frame.end)?,
             exclusion: WindowFrameExclusion::NoOthers,
         })
     }
 
     fn lower_window_bound(
         &mut self,
-        owner: NodeId,
         bound: &crate::analysis::WindowBound,
     ) -> Result<ContractWindowBound, ContractLoweringError> {
         let offset = |visitor: &mut Self, value: i64| {
@@ -9515,12 +9878,16 @@ impl<'a> ContractLoweringVisitor<'a> {
             // It is stated as Int64 because that is what the contract's own
             // window bound reads and what the wire carries; an unsigned
             // literal would say the same number in a type neither accepts.
-            let expression = visitor.author_literal_expression(
-                owner,
+            let ty = ValueType::new(DataType::Int64, false);
+            visitor.work.flush()?;
+            let constant = crate::constant::admit_syntax_constant(
                 &LiteralValue::Int(value),
-                ValueType::new(DataType::Int64, false),
+                &ty,
+                visitor.constant_policy,
+                visitor.control,
             )?;
-            Ok(Some(expression))
+            visitor.work.flush()?;
+            visitor.register_constant_source(&constant, &ty).map(Some)
         };
         Ok(match bound {
             crate::analysis::WindowBound::UnboundedPreceding => {
@@ -9575,6 +9942,12 @@ impl<'a> ContractLoweringVisitor<'a> {
         let start = self.literal_i64_expression(node, series.start)?;
         let stop = self.literal_i64_expression(node, series.end)?;
         let step = self.literal_i64_expression(node, series.step)?;
+        let start =
+            self.root_definition(node, start, EvaluationDemand::Value, RootScope::AllPorts)?;
+        let stop =
+            self.root_definition(node, stop, EvaluationDemand::Value, RootScope::AllPorts)?;
+        let step =
+            self.root_definition(node, step, EvaluationDemand::Value, RootScope::AllPorts)?;
         let value = self.fragment_mut().add_value(
             value_type(column),
             ValueOrigin::NodeOutput {
@@ -9703,7 +10076,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             target,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )?;
-        let lowered_type = self.expression_value_type(lowered)?;
+        let lowered_type = self.expression_value_type(owner, lowered)?;
         if lowered_type == *target {
             return Ok(lowered);
         }
@@ -9715,7 +10088,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         )?;
         let otherwise =
             self.author_literal_expression(owner, &LiteralValue::Null, target.clone())?;
-        Ok(self.fragment_mut().add_expression(
+        self.add_unscoped_expression(
             owner,
             target.clone(),
             ContractExprKind::Case {
@@ -9723,7 +10096,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 when_then: Box::from([(condition, lowered)]),
                 else_expr: Some(otherwise),
             },
-        )?)
+        )
     }
 
     /// Lowers one ordering, and the ordering property it establishes.
@@ -9757,6 +10130,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 }
             };
             let expression = self.lower_expression(owner, &item.expr, visible)?;
+            let expression = self.root_definition(
+                owner,
+                expression,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            )?;
             let direction = if item.asc {
                 SortDirection::Ascending
             } else {
@@ -9806,24 +10185,17 @@ impl<'a> ContractLoweringVisitor<'a> {
         connective: BinOp,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<Box<[ExprId]>, ContractLoweringError> {
-        let mut operands: Vec<&TypedExpr> = Vec::new();
-        let mut pending: Vec<&TypedExpr> = vec![root];
-        while let Some(current) = pending.pop() {
-            match &current.kind {
-                ExprKind::BinaryOp {
-                    left, op, right, ..
-                } if *op == connective => {
-                    pending.push(right);
-                    pending.push(left);
-                }
-                _ => operands.push(current),
-            }
-        }
-        let mut args = Vec::with_capacity(operands.len());
-        for operand in operands {
-            args.push(self.lower_expression(owner, operand, visible)?);
-        }
-        Ok(args.into_boxed_slice())
+        self.scalar_emission(owner)
+            .lower_boolean_connective(root, connective, visible)
+    }
+
+    fn local_derived_value_expression(
+        &mut self,
+        owner: NodeId,
+        value: ValueId,
+    ) -> Result<Option<ExprId>, ContractLoweringError> {
+        self.scalar_emission(owner)
+            .local_derived_value_expression(value)
     }
 
     fn lower_expression(
@@ -9832,22 +10204,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         expression: &TypedExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<ExprId, ContractLoweringError> {
-        let result = self.lower_expression_inner(owner, expression, visible);
-        if matches!(
-            &result,
-            Err(ContractLoweringError::Control(_)
-                | ContractLoweringError::ConstantSource(
-                    novarocks_constant_contract::ConstantError::Limit(_)
-                ))
-        ) {
-            return result;
-        }
-        if result.is_err() {
-            // Observe an ordinary expression refusal's completed tail. The
-            // original control refusal remains primary and has no after-work.
-            self.work.flush()?;
-        }
-        result
+        self.scalar_emission(owner)
+            .lower_expression(expression, visible)
     }
 
     fn lower_expression_inner(
@@ -9856,486 +10214,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         expression: &TypedExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.work.step()?;
-        if let ExprKind::Literal(literal) = &expression.kind {
-            return self.lower_literal_expression(owner, literal, expression);
-        }
-        let mut ty = expression_type(expression);
-        let mut captured_call = None;
-        let kind = match &expression.kind {
-            ExprKind::ColumnRef { column_id, .. } => {
-                // A reference is the value, so it is typed by the value's own
-                // definition rather than by what the statement was analyzed
-                // to say about it. The two differ where an operator between
-                // the two changed it: a grouping set nulls a key the analyzer
-                // had already read as never null.
-                let value = visible
-                    .get(column_id)
-                    .copied()
-                    .ok_or(ContractLoweringError::UnknownColumnReference(*column_id))?;
-                ty = self.value_declared_type(value)?;
-                ContractExprKind::Value(value)
-            }
-            ExprKind::Literal(_) => unreachable!("literal expressions return before dispatch"),
-            ExprKind::Constant(value) => return self.lower_constant_expression(owner, value, ty),
-            ExprKind::BinaryOp {
-                op: op @ (BinOp::And | BinOp::Or),
-                ..
-            } => {
-                let args = self.lower_boolean_connective(owner, expression, *op, visible)?;
-                if matches!(op, BinOp::And) {
-                    ContractExprKind::Conjunction { args }
-                } else {
-                    ContractExprKind::Disjunction { args }
-                }
-            }
-            ExprKind::BinaryOp {
-                left,
-                op,
-                right,
-                decimal_overflow_policy,
-            } => {
-                let lowered_left = self.lower_expression(owner, left, visible)?;
-                let lowered_right = self.lower_expression(owner, right, visible)?;
-                // A comparison answers about one type. Its operands were
-                // reconciled while the statement was analyzed -- an untyped
-                // NULL, a narrower integer -- and the plan states the
-                // comparison it actually performs rather than two sides the
-                // reader has to reconcile again. Arithmetic keeps its own
-                // operands: its result type is derived from the pair.
-                let (lowered_left, lowered_right) = if is_comparison_operator(*op) {
-                    let left_type = self.expression_value_type(lowered_left)?;
-                    let right_type = self.expression_value_type(lowered_right)?;
-                    let compared = self.common_comparison_value_type(&left_type, &right_type)?;
-                    (
-                        self.cast_expression_to(owner, lowered_left, &compared)?,
-                        self.cast_expression_to(owner, lowered_right, &compared)?,
-                    )
-                } else {
-                    (lowered_left, lowered_right)
-                };
-                let allow_throw_exception =
-                    crate::compiler::selected_scalar_call::arithmetic_allows_throw(*op)
-                        .then(|| self.root_allow_throw_reference());
-                let op = lower_binary_operator(*op);
-                ContractExprKind::Binary {
-                    allow_throw_exception,
-                    left: lowered_left,
-                    op,
-                    right: lowered_right,
-                    decimal_overflow_policy: *decimal_overflow_policy,
-                }
-            }
-            ExprKind::UnaryOp { op, expr } => ContractExprKind::Unary {
-                op: lower_unary_operator(*op),
-                expr: self.lower_expression(owner, expr, visible)?,
-            },
-            ExprKind::Cast {
-                expr,
-                decimal_overflow_policy,
-                ..
-            } => {
-                return self.lower_expression_as(
-                    owner,
-                    expr,
-                    visible,
-                    &ty,
-                    *decimal_overflow_policy,
-                );
-            }
-            ExprKind::IsNull { expr, negated } => ContractExprKind::IsNull {
-                expr: self.lower_expression(owner, expr, visible)?,
-                negated: *negated,
-            },
-            ExprKind::InList {
-                expr,
-                list,
-                negated,
-            } => {
-                // A membership test compares one value against many, so all
-                // of them are compared as one type. The engine widens them at
-                // run time; the contract states the comparison it performs,
-                // so the widening is written down here -- the same way a
-                // range test and a comparison operator already do.
-                let input = self.lower_expression(owner, expr, visible)?;
-                let candidates = list
-                    .iter()
-                    .map(|item| self.lower_expression(owner, item, visible))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut compared = self.expression_value_type(input)?;
-                for candidate in &candidates {
-                    let other = self.expression_value_type(*candidate)?;
-                    compared = self.common_comparison_value_type(&compared, &other)?;
-                }
-                let list = candidates
-                    .into_iter()
-                    .map(|candidate| self.cast_expression_to(owner, candidate, &compared))
-                    .collect::<Result<Vec<_>, _>>()?;
-                ContractExprKind::InList {
-                    expr: self.cast_expression_to(owner, input, &compared)?,
-                    list: list.into_boxed_slice(),
-                    negated: *negated,
-                }
-            }
-            ExprKind::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => {
-                // A range test compares one value against two bounds, so all
-                // three are compared as one type. The engine widens them at
-                // run time; the contract states the comparison it performs,
-                // so the widening is written down here.
-                let input = self.lower_expression(owner, expr, visible)?;
-                let low = self.lower_expression(owner, low, visible)?;
-                let high = self.lower_expression(owner, high, visible)?;
-                let mut compared = self.expression_value_type(input)?;
-                for operand in [low, high] {
-                    let other = self.expression_value_type(operand)?;
-                    compared = self.common_comparison_value_type(&compared, &other)?;
-                }
-                ContractExprKind::Between {
-                    expr: self.cast_expression_to(owner, input, &compared)?,
-                    low: self.cast_expression_to(owner, low, &compared)?,
-                    high: self.cast_expression_to(owner, high, &compared)?,
-                    negated: *negated,
-                }
-            }
-            ExprKind::Like {
-                expr,
-                pattern,
-                negated,
-            } => ContractExprKind::Like {
-                expr: self.lower_expression(owner, expr, visible)?,
-                pattern: self.lower_expression(owner, pattern, visible)?,
-                negated: *negated,
-            },
-            ExprKind::Case {
-                operand,
-                when_then,
-                else_expr,
-            } => {
-                // Every branch answers with the type the whole expression
-                // answers with. A branch that says only NULL, or says a
-                // narrower number than its siblings, was reconciled while the
-                // statement was analyzed; carry that reconciliation rather
-                // than leaving each branch its own type.
-                let mut operand = operand
-                    .as_deref()
-                    .map(|item| self.lower_expression(owner, item, visible))
-                    .transpose()?;
-                let mut whens = Vec::with_capacity(when_then.len());
-                for (when, _) in when_then {
-                    whens.push(self.lower_expression(owner, when, visible)?);
-                }
-                // A simple CASE compares its operand against every label, so
-                // the plan states the one type it compares them in the same
-                // way a comparison operator does -- an INT operand against a
-                // BIGINT label is one comparison, not two types.
-                if let Some(subject) = operand {
-                    let mut compared = self.expression_value_type(subject)?;
-                    for when in &whens {
-                        let when_type = self.expression_value_type(*when)?;
-                        compared = self.common_comparison_value_type(&compared, &when_type)?;
-                    }
-                    operand = Some(self.cast_expression_to(owner, subject, &compared)?);
-                    for when in &mut whens {
-                        *when = self.cast_expression_to(owner, *when, &compared)?;
-                    }
-                }
-                let mut branches = Vec::with_capacity(when_then.len());
-                for ((_, then), when) in when_then.iter().zip(whens) {
-                    branches.push((
-                        when,
-                        self.lower_expression_as(
-                            owner,
-                            then,
-                            visible,
-                            &ty,
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        )?,
-                    ));
-                }
-                let else_expr = match else_expr.as_deref() {
-                    Some(item) => Some(self.lower_expression_as(
-                        owner,
-                        item,
-                        visible,
-                        &ty,
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    )?),
-                    None => None,
-                };
-                ContractExprKind::Case {
-                    operand,
-                    when_then: branches.into_boxed_slice(),
-                    else_expr,
-                }
-            }
-            ExprKind::IsTruthValue {
-                expr,
-                value,
-                negated,
-            } => ContractExprKind::IsTruthValue {
-                expr: self.lower_expression(owner, expr, visible)?,
-                value: *value,
-                negated: *negated,
-            },
-            ExprKind::FunctionCall {
-                args,
-                distinct,
-                binding,
-                volatility,
-                name,
-            } => {
-                if *distinct {
-                    return Err(ContractLoweringError::InvalidFunctionBinding {
-                        detail: "scalar call carries DISTINCT".to_string(),
-                    });
-                }
-                if binding.kind != novarocks_physical_plan::FunctionKind::Scalar {
-                    return Err(ContractLoweringError::InvalidFunctionBinding {
-                        detail: format!("scalar expression carries {:?} binding", binding.kind),
-                    });
-                }
-                if binding.logical_argument_count != args.len()
-                    || binding.selected.argument_types.len() != args.len()
-                {
-                    return Err(ContractLoweringError::InvalidFunctionBinding {
-                        detail: format!(
-                            "binding arity logical={} typed={} differs from expression arity {}",
-                            binding.logical_argument_count,
-                            binding.selected.argument_types.len(),
-                            args.len()
-                        ),
-                    });
-                }
-                if *volatility != binding.semantics.volatility {
-                    return Err(ContractLoweringError::InvalidFunctionBinding {
-                        detail: "legacy volatility differs from the exact binding".to_string(),
-                    });
-                }
-                let novarocks_functions::FunctionResultType::Scalar(result_type) =
-                    &binding.selected.result_type
-                else {
-                    return Err(ContractLoweringError::InvalidFunctionBinding {
-                        detail: "scalar expression carries a relation result".to_string(),
-                    });
-                };
-                let result_type = full_source_type(result_type);
-                if result_type != ty {
-                    return Err(ContractLoweringError::InvalidFunctionBinding {
-                        detail: format!(
-                            "function {name}: binding result {result_type:?} differs from expression result {ty:?}"
-                        ),
-                    });
-                }
-                self.work.flush()?;
-                let captured = capture_logical_call_arguments(
-                    binding,
-                    args.len(),
-                    args.iter(),
-                    self.constant_policy,
-                    self.control,
-                )?;
-                self.work.flush()?;
-                let mut argument_types = Vec::new();
-                argument_types
-                    .try_reserve_exact(args.len())
-                    .map_err(|_| CompileControlError::ResourceExhausted)?;
-                self.work.step()?;
-                self.work.flush()?;
-                for argument in binding.selected.argument_types.iter() {
-                    argument_types.push(full_source_argument(argument));
-                    self.work.step()?;
-                }
-                self.work.flush()?;
-                let argument_types = argument_types.into_boxed_slice();
-                self.work.step()?;
-                self.work.flush()?;
-                let mut lowered_args = Vec::new();
-                lowered_args
-                    .try_reserve_exact(args.len())
-                    .map_err(|_| CompileControlError::ResourceExhausted)?;
-                self.work.step()?;
-                self.work.flush()?;
-                let mut channels =
-                    self.reserve_call_channels(captured.request().arguments.len())?;
-                for (ordinal, (argument, expected)) in
-                    args.iter().zip(argument_types.iter()).enumerate()
-                {
-                    let lowered = self.lower_captured_scalar_argument(
-                        owner, argument, ordinal, &captured, visible, expected,
-                    )?;
-                    lowered_args.push(lowered.expression);
-                    self.work.step()?;
-                    channels.push(lowered);
-                    self.work.step()?;
-                }
-                self.work.flush()?;
-                let lowered_args = lowered_args.into_boxed_slice();
-                self.work.step()?;
-                self.work.flush()?;
-                self.work.flush()?;
-                let channels = channels.into_boxed_slice();
-                self.work.step()?;
-                let canonical = self.author_canonical_call_selection(
-                    owner,
-                    &captured,
-                    Some(SqlExpressionCallKind::Scalar),
-                    None,
-                    &lowered_args,
-                    &channels,
-                )?;
-                let selected = canonical.selected();
-                let novarocks_functions::FunctionResultType::Scalar(result) = &selected.result_type
-                else {
-                    return Err(ContractLoweringError::InvalidFunctionBinding {
-                        detail: "canonical scalar owner selected a relation result".into(),
-                    });
-                };
-                self.work.flush()?;
-                let argument_types = selected.argument_types.clone();
-                self.work.step()?;
-                self.work.flush()?;
-                let result_type = result.clone();
-                self.work.step()?;
-                self.work.flush()?;
-                ty = result_type.clone();
-                self.work.step()?;
-                captured_call = Some((captured, channels, canonical));
-                ContractExprKind::FunctionCall {
-                    function: BoundFunction {
-                        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
-                            semantic_parameters: Box::default(),
-                            volatility: binding.semantics.volatility,
-                            argument_evaluation: binding.semantics.argument_evaluation,
-                            failure_behavior: binding.semantics.failure_behavior,
-                            intrinsic_row_error: binding.semantics.intrinsic_row_error,
-                        }),
-                        function_id: binding.function_id.clone(),
-                        overload: binding.selected.overload.clone(),
-                        kind: binding.kind,
-                        argument_types,
-                        result_type,
-                    },
-                    args: lowered_args,
-                }
-            }
-            ExprKind::LambdaFunction { params, body } => {
-                // The lambda's identity exists before its body, because every
-                // parameter reference inside names it.
-                let lambda = self.fragment_mut().reserve_expression_id()?;
-                // A parameter's type is the plan's, the same way every other
-                // type it states is: a provider's decoration on a nested
-                // field would make the declaration and the references to it
-                // read as two different types.
-                let parameter_types = params
-                    .iter()
-                    .map(|param| full_source_type(&param.value_type))
-                    .collect::<Vec<_>>();
-                let enclosing = self.lambda_scope.last().map(|scope| scope.lambda);
-                self.lambda_scope.push(LoweringLambdaScope {
-                    lambda,
-                    parameter_slots: params.iter().map(|param| param.slot_id).collect(),
-                    parameter_types: parameter_types.clone(),
-                });
-                let body_result = self.lower_expression(owner, body, visible);
-                self.lambda_scope.pop();
-                let body_id = body_result?;
-                let body_type = self.expression_value_type(body_id)?;
-                self.fragment_mut()
-                    .insert_expression(novarocks_physical_plan::ExprNode {
-                        id: lambda,
-                        owner,
-                        lambda_scope: enclosing,
-                        ty: body_type,
-                        kind: ContractExprKind::Lambda {
-                            parameter_types: parameter_types.into_boxed_slice(),
-                            body: body_id,
-                        },
-                    })?;
-                return Ok(lambda);
-            }
-            ExprKind::LambdaParamRef { name, slot_id } => {
-                if self.lambda_scope.is_empty() {
-                    return Err(ContractLoweringError::InvalidLambda {
-                        detail: format!("lambda parameter `{name}` stands outside a lambda"),
-                    });
-                }
-                // A name is resolved by the innermost lambda that declares
-                // it, so an inner body reading an outer parameter names the
-                // lambda that owns it rather than the one it stands in.
-                let (lambda, ordinal, declared) = self
-                    .lambda_scope
-                    .iter()
-                    .rev()
-                    .find_map(|scope| {
-                        let ordinal = scope
-                            .parameter_slots
-                            .iter()
-                            .position(|slot| slot == slot_id)?;
-                        Some((
-                            scope.lambda,
-                            ordinal,
-                            scope.parameter_types.get(ordinal)?.clone(),
-                        ))
-                    })
-                    .ok_or_else(|| ContractLoweringError::InvalidLambda {
-                        detail: format!(
-                            "lambda parameter `{name}` is not one any open lambda declares"
-                        ),
-                    })?;
-                // The reference is the parameter, so it is typed by the
-                // declaration it names -- not by what the statement was
-                // analyzed to say at this position.
-                ty = declared;
-                ContractExprKind::LambdaParameter {
-                    lambda,
-                    ordinal: u32::try_from(ordinal).map_err(|_| {
-                        ContractLoweringError::InvalidLambda {
-                            detail: "lambda parameter ordinal exceeds u32".to_string(),
-                        }
-                    })?,
-                }
-            }
-            ExprKind::Nested(inner) => return self.lower_expression(owner, inner, visible),
-            other => {
-                return Err(ContractLoweringError::UnsupportedExpression {
-                    kind: expression_kind_name(other),
-                });
-            }
-        };
-        // Nullability widens on the way out. An operator whose operand may be
-        // null may answer null, whatever the statement was analyzed to say
-        // about an operand that has since passed through something that nulls
-        // it. Only the kinds that answer about their operands' values widen;
-        // `IS NULL` answers about the absence itself and never does.
-        if !ty.nullable() && kind_follows_operand_nullability(&kind) {
-            let mut operands = Vec::new();
-            collect_operand_expressions(&kind, &mut operands);
-            for operand in operands {
-                if self.expression_value_type(operand)?.nullable() {
-                    ty = ty
-                        .with_nullable(true)
-                        .expect("validated root NULL contract");
-                    break;
-                }
-            }
-        }
-        let emitted = self.add_scoped_expression(owner, ty, kind)?;
-        if let Some((captured, channels, canonical)) = captured_call {
-            self.record_expression_source(
-                owner,
-                emitted,
-                captured,
-                SqlExpressionCallKind::Scalar,
-                channels,
-                Some(canonical),
-            )?;
-        }
-        Ok(emitted)
+        self.scalar_emission(owner)
+            .lower_expression_inner(expression, visible)
     }
 
     /// Author the actual call signature before its parent enters
@@ -10350,48 +10230,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         arguments: &[ExprId],
         channels: &[LoweredOperationalChannel],
     ) -> Result<Arc<CanonicalCallOperationalRequest>, ContractLoweringError> {
-        self.work.flush()?;
-        let projection = project_emitted_call_arguments_observed(
-            EmittedOperationalCall {
-                expressions: self.fragments[&self.current_fragment].expressions(),
-                pools: self.plan_builder.constants(),
-                owner,
-                lambda_scope: match kind {
-                    Some(
-                        SqlExpressionCallKind::Scalar | SqlExpressionCallKind::ValueConversion,
-                    ) => self.lambda_scope.last().map(|scope| scope.lambda),
-                    _ => None,
-                },
-                kind,
-                captured: CapturedOperationalSource::call(captured),
-                derived,
-                arguments,
-                channels,
-            },
-            self.control,
-        )
-        .map_err(ContractLoweringError::from);
-        let operational = self.completed_specialization_result(projection)?;
-        let logical_count = captured.request().logical_argument_count;
-        let selected = self.select_canonical_operational_request(
-            captured.binding(),
-            logical_count,
-            &operational,
-        )?;
-        self.work.flush()?;
-        let binding = captured.binding().clone();
-        self.work.step()?;
-        self.work.flush()?;
-        let canonical = Arc::new(CanonicalCallOperationalRequest {
-            binding,
-            arguments: operational,
-            logical_count,
-            selected,
-            result_constraint: captured.binding().result_constraint().cloned(),
-        });
-        self.work.step()?;
-        self.work.flush()?;
-        Ok(canonical)
+        self.scalar_emission(owner)
+            .author_canonical_call_selection(captured, kind, derived, arguments, channels)
     }
 
     fn select_canonical_operational_request(
@@ -10400,11 +10240,13 @@ impl<'a> ContractLoweringVisitor<'a> {
         logical_argument_count: usize,
         arguments: &[novarocks_functions::FunctionArgument],
     ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
-        self.select_canonical_request_with_constraint(
+        scalar_emission::select_canonical_operational_request(
+            &self.functions,
+            self.control,
+            &mut self.work,
             binding,
             logical_argument_count,
             arguments,
-            binding.result_constraint(),
         )
     }
 
@@ -10415,24 +10257,15 @@ impl<'a> ContractLoweringVisitor<'a> {
         arguments: &[novarocks_functions::FunctionArgument],
         constraint: Option<&novarocks_functions::FunctionValueType>,
     ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
-        self.work.flush()?;
-        let selection = crate::compiler::selected_scalar_call::canonical_scalar_request_observed(
-            self.functions.as_ref(),
+        scalar_emission::select_canonical_request_with_constraint(
+            &self.functions,
+            self.control,
+            &mut self.work,
             binding,
             logical_argument_count,
             arguments,
             constraint,
-            self.control,
         )
-        .map_err(|error| match error {
-            novarocks_functions::FunctionBindingError::Control(cause) => {
-                ContractLoweringError::Control(cause)
-            }
-            error => ContractLoweringError::InvalidFunctionBinding {
-                detail: format!("canonical call selection: {error}"),
-            },
-        });
-        self.completed_specialization_result(selection)
     }
 
     /// Single and Partial author their own actual update channels. A Merge
@@ -10456,9 +10289,12 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.work.flush()?;
         let projection = project_emitted_call_arguments_observed(
             EmittedOperationalCall {
-                expressions: self.fragments[&self.current_fragment].expressions(),
-                pools: self.plan_builder.constants(),
-                owner,
+                expressions: super::unit_source::UnitDefinitions::from_draft(
+                    &self.fragments[&self.current_fragment],
+                    owner,
+                ),
+                pools: self.constant_emission.pools(),
+                owner: ScalarUnitOwner::Node(owner),
                 lambda_scope: None,
                 kind: None,
                 captured: CapturedOperationalSource::aggregate(captured),
@@ -10571,12 +10407,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         &mut self,
         outcome: Result<T, ContractLoweringError>,
     ) -> Result<T, ContractLoweringError> {
-        if matches!(&outcome, Err(ContractLoweringError::Control(_))) {
-            return outcome;
-        }
-        self.work.step()?;
-        self.work.flush()?;
-        outcome
+        scalar_emission::completed_specialization_result(&mut self.work, outcome)
     }
 
     /// Retain the original ordered emission association alongside its request.
@@ -10590,10 +10421,9 @@ impl<'a> ContractLoweringVisitor<'a> {
         channels: Box<[LoweredOperationalChannel]>,
         canonical_operational: Option<Arc<CanonicalCallOperationalRequest>>,
     ) -> Result<(), ContractLoweringError> {
-        self.record_expression_source_with_data(
-            owner,
+        self.scalar_emission(owner).record_expression_source(
             emitted,
-            LoweredExpressionLogicalSource::Owned(captured),
+            captured,
             kind,
             channels,
             canonical_operational,
@@ -10609,93 +10439,14 @@ impl<'a> ContractLoweringVisitor<'a> {
         channels: Box<[LoweredOperationalChannel]>,
         canonical_operational: Option<Arc<CanonicalCallOperationalRequest>>,
     ) -> Result<(), ContractLoweringError> {
-        self.work.flush()?;
-        let mut arguments = Vec::new();
-        arguments
-            .try_reserve_exact(captured.request().arguments.len())
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
-        self.work.step()?;
-        self.work.flush()?;
-        let lambda_scope = self.lambda_scope.last().map(|scope| scope.lambda);
-        let source = self.fragments[&self.current_fragment]
-            .expressions()
-            .get(emitted)
-            .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))?;
-        let (args, order) = match (&source.kind, kind) {
-            (
-                ContractExprKind::FunctionCall { args, .. },
-                SqlExpressionCallKind::Scalar
-                | SqlExpressionCallKind::ValueConversion
-                | SqlExpressionCallKind::DerivedVariant,
-            ) => (args.as_ref(), &[][..]),
-            (
-                ContractExprKind::WindowCall {
-                    args,
-                    function_order_by,
-                    ..
-                },
-                SqlExpressionCallKind::Window,
-            ) => (args.as_ref(), function_order_by.as_ref()),
-            _ => {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail: "captured expression source has a different emission lifecycle".into(),
-                });
-            }
-        };
-        let count = args
-            .len()
-            .checked_add(order.len())
-            .ok_or(CompileControlError::ResourceExhausted)?;
-        self.work.step()?;
-        if count != channels.len() || count != captured.request().arguments.len() {
-            return Err(ContractLoweringError::InvalidFunctionBinding {
-                detail: "recorded call channel count differs from its original emission".into(),
-            });
-        }
-        for (argument, channel) in args
-            .iter()
-            .copied()
-            .chain(order.iter().map(|key| key.expr))
-            .zip(channels.iter())
-        {
-            let same = argument == channel.expression;
-            self.work.step()?;
-            if !same {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail: "recorded call channel differs from its original expression".into(),
-                });
-            }
-            arguments.push(argument);
-            self.work.step()?;
-        }
-        self.work.flush()?;
-        let arguments = arguments.into_boxed_slice();
-        self.work.step()?;
-        self.work.flush()?;
-        let key = (self.current_fragment, emitted);
-        let duplicate = self.call_sources.expression_entries.contains_key(&key);
-        self.work.step()?;
-        if duplicate {
-            return Err(ContractLoweringError::InvalidFunctionBinding {
-                detail: "scalar source emission is duplicated".into(),
-            });
-        }
-        // Map allocation and retained request/type/backing coexistence remain
-        // caller admission obligations, not an independently granted wallet.
-        self.call_sources.expression_entries.insert(
-            key,
-            LoweredExpressionSourceEntry {
-                kind,
-                canonical_operational,
+        self.scalar_emission(owner)
+            .record_expression_source_with_data(
+                emitted,
                 captured,
-                owner,
-                lambda_scope,
-                arguments,
+                kind,
                 channels,
-            },
-        );
-        self.work.step()?;
-        Ok(())
+                canonical_operational,
+            )
     }
 
     fn lower_captured_scalar_argument(
@@ -10707,38 +10458,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         visible: &BTreeMap<ColumnId, ValueId>,
         expected: &FunctionArgumentType,
     ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
-        // Preserve the original binding's canonical bare-NULL conversion.
-        // The retained original request still says what analysis authored.
-        if let Some(target) = crate::compiler::selected_scalar_call::canonical_null_target(
-            &argument.value_type,
-            expected,
-        ) {
-            let (expression, value) =
-                self.author_literal_expression_with_source(owner, &LiteralValue::Null, target)?;
-            let channel = LoweredOperationalChannel {
-                expression,
-                role: SqlOperationalChannelRole::CanonicalNull { value },
-            };
-            self.work.step()?;
-            return Ok(channel);
-        }
-        if matches!(argument.kind, ExprKind::Literal(_) | ExprKind::Constant(_)) {
-            self.work.step()?;
-            let Some(novarocks_functions::FunctionArgument::Value {
-                constant: Some(value),
-                ..
-            }) = captured.request().arguments.get(ordinal)
-            else {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail: "literal scalar argument has no captured constant source".into(),
-                });
-            };
-            let expression =
-                self.lower_constant_expression(owner, value, expression_type(argument))?;
-            return self.original_emission_channel(expression, ordinal, captured);
-        }
-        let expression = self.lower_bound_argument(owner, argument, visible, expected)?;
-        self.original_emission_channel(expression, ordinal, captured)
+        self.scalar_emission(owner)
+            .lower_captured_scalar_argument(argument, ordinal, captured, visible, expected)
     }
 
     fn lower_captured_unbound_argument(
@@ -10749,27 +10470,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         captured: &CapturedLogicalCallArguments,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
-        if matches!(
-            expression.kind,
-            ExprKind::Literal(_) | ExprKind::Constant(_)
-        ) {
-            let argument = captured.request().arguments.get(ordinal);
-            self.work.step()?;
-            let Some(novarocks_functions::FunctionArgument::Value {
-                constant: Some(value),
-                ..
-            }) = argument
-            else {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail: "literal call channel has no captured constant source".into(),
-                });
-            };
-            let emitted =
-                self.lower_constant_expression(owner, value, expression_type(expression))?;
-            return self.original_emission_channel(emitted, ordinal, captured);
-        }
-        let emitted = self.lower_expression(owner, expression, visible)?;
-        self.original_emission_channel(emitted, ordinal, captured)
+        self.scalar_emission(owner)
+            .lower_captured_unbound_argument(expression, ordinal, captured, visible)
     }
 
     /// The original captured request decides presence, even when a Cast or
@@ -10780,26 +10482,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         ordinal: usize,
         captured: &CapturedLogicalCallArguments,
     ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
-        let argument = captured.request().arguments.get(ordinal);
-        self.work.step()?;
-        let role = match argument {
-            Some(novarocks_functions::FunctionArgument::Value { constant: None, .. }) => {
-                SqlOperationalChannelRole::ValueWithoutConstant
-            }
-            Some(novarocks_functions::FunctionArgument::Value {
-                constant: Some(_), ..
-            }) => SqlOperationalChannelRole::CapturedConstant,
-            Some(novarocks_functions::FunctionArgument::Lambda { .. }) => {
-                SqlOperationalChannelRole::Lambda
-            }
-            None => {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail: "emitted call channel has no original request occurrence".into(),
-                });
-            }
-        };
-        self.work.step()?;
-        Ok(LoweredOperationalChannel { expression, role })
+        scalar_emission::original_emission_channel(&mut self.work, expression, ordinal, captured)
     }
 
     /// Admission includes the existing payload and retained request/role
@@ -10808,20 +10491,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         &mut self,
         count: usize,
     ) -> Result<Vec<LoweredOperationalChannel>, ContractLoweringError> {
-        if count > novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS {
-            return Err(CompileControlError::ResourceExhausted.into());
-        }
-        std::alloc::Layout::array::<LoweredOperationalChannel>(count)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
-        self.work.step()?;
-        self.work.flush()?;
-        let mut channels = Vec::new();
-        channels
-            .try_reserve_exact(count)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
-        self.work.step()?;
-        self.work.flush()?;
-        Ok(channels)
+        scalar_emission::reserve_call_channels(&mut self.work, count)
     }
 
     fn record_table_source(
@@ -10871,6 +10541,39 @@ impl<'a> ContractLoweringVisitor<'a> {
         Ok(())
     }
 
+    fn reserve_definition(&mut self, owner: NodeId) -> Result<ExprId, ContractLoweringError> {
+        self.scalar_emission(owner).reserve_definition()
+    }
+    fn insert_definition(
+        &mut self,
+        owner: NodeId,
+        scope: Option<ExprId>,
+        ty: ValueType,
+        kind: ContractExprKind,
+    ) -> Result<ExprId, ContractLoweringError> {
+        self.scalar_emission(owner)
+            .insert_definition(scope, ty, kind)
+    }
+    fn add_unscoped_expression(
+        &mut self,
+        owner: NodeId,
+        ty: ValueType,
+        kind: ContractExprKind,
+    ) -> Result<ExprId, ContractLoweringError> {
+        self.scalar_emission(owner)
+            .add_unscoped_expression(ty, kind)
+    }
+    fn root_definition(
+        &mut self,
+        owner: NodeId,
+        definition: ExprId,
+        demand: novarocks_type_contract::EvaluationDemand,
+        scope: novarocks_expression_contract::RootScope,
+    ) -> Result<novarocks_expression_contract::RootOrdinal, ContractLoweringError> {
+        self.scalar_emission(owner)
+            .root_definition(definition, demand, scope)
+    }
+
     /// Builds an expression in the scope that is open.
     ///
     /// An expression written inside a lambda body belongs to that lambda, not
@@ -10883,10 +10586,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         ty: ValueType,
         kind: ContractExprKind,
     ) -> Result<ExprId, ContractLoweringError> {
-        let scope = self.lambda_scope.last().map(|scope| scope.lambda);
-        Ok(self
-            .fragment_mut()
-            .add_expression_in_scope(owner, scope, ty, kind)?)
+        self.scalar_emission(owner).add_scoped_expression(ty, kind)
     }
 
     /// Lowers one argument in the type its binding takes.
@@ -10902,19 +10602,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         visible: &BTreeMap<ColumnId, ValueId>,
         expected: &FunctionArgumentType,
     ) -> Result<ExprId, ContractLoweringError> {
-        if let FunctionArgumentType::Value(expected) = expected
-            && *argument.value_type.data_type() == DataType::Null
-            && *expected.data_type() != DataType::Null
-        {
-            return self.author_literal_expression(
-                owner,
-                &LiteralValue::Null,
-                (expected.clone())
-                    .with_nullable(true)
-                    .expect("validated root NULL contract"),
-            );
-        }
-        self.lower_expression(owner, argument, visible)
+        self.scalar_emission(owner)
+            .lower_bound_argument(argument, visible, expected)
     }
 
     /// The type one already-defined value declares.
@@ -10926,12 +10615,12 @@ impl<'a> ContractLoweringVisitor<'a> {
     }
 
     /// The type one already-lowered expression declares.
-    fn expression_value_type(&mut self, expr: ExprId) -> Result<ValueType, ContractLoweringError> {
-        self.fragment_mut()
-            .expressions()
-            .get(expr)
-            .map(|expression| expression.ty.clone())
-            .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))
+    fn expression_value_type(
+        &mut self,
+        owner: NodeId,
+        expr: ExprId,
+    ) -> Result<ValueType, ContractLoweringError> {
+        self.scalar_emission(owner).expression_value_type(expr)
     }
 
     /// Lowers one expression as `target`.
@@ -10949,31 +10638,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<ExprId, ContractLoweringError> {
-        if let Some(source) = self.null_constant_type(expression)?
-            && source != *target
-        {
-            let mut target = target.clone();
-            target = target
-                .with_nullable(true)
-                .expect("validated root NULL contract");
-            return self.author_literal_expression(owner, &LiteralValue::Null, target);
-        }
-        let lowered = self.lower_expression(owner, expression, visible)?;
-        // A carrier conversion preserves an actual source NULL, including a
-        // value null-extended after analysis. Keep that fact before the CASE
-        // or CAST owner publishes its final output type.
-        if self.expression_value_type(lowered)?.nullable() && !target.nullable() {
-            self.work.flush()?;
-            let mut target = target.clone();
-            self.work.step()?;
-            self.work.flush()?;
-            target = target
-                .with_nullable(true)
-                .expect("validated root NULL contract");
-            self.convert_expression_to(owner, lowered, &target, policy)
-        } else {
-            self.convert_expression_to(owner, lowered, target, policy)
-        }
+        self.scalar_emission(owner)
+            .lower_expression_as(expression, visible, target, policy)
     }
 
     /// The type a NULL constant is lowered in, or `None` for any other
@@ -10986,22 +10652,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         &mut self,
         expression: &TypedExpr,
     ) -> Result<Option<ValueType>, ContractLoweringError> {
-        match &expression.kind {
-            ExprKind::Literal(LiteralValue::Null) => {
-                let mut ty = expression_type(expression);
-                ty = ty
-                    .with_nullable(true)
-                    .expect("validated root NULL contract");
-                Ok(Some(ty))
-            }
-            ExprKind::Constant(value) => {
-                self.work.flush()?;
-                let null = value.is_null_observed(CompilePhase::Validate, self.control)?;
-                self.work.flush()?;
-                Ok(null.then(|| expression_type(expression)))
-            }
-            _ => Ok(None),
-        }
+        scalar_emission::null_constant_type(self.control, &mut self.work, expression)
     }
 
     /// The same expression, compared as `target`.
@@ -11018,12 +10669,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<ExprId, ContractLoweringError> {
-        let result = self.convert_expression_to_inner(owner, expression, target, policy);
-        if matches!(&result, Err(ContractLoweringError::Control(_))) {
-            return result;
-        }
-        self.work.flush()?;
-        result
+        self.scalar_emission(owner)
+            .convert_expression_to(expression, target, policy)
     }
 
     fn convert_expression_to_inner(
@@ -11033,134 +10680,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<ExprId, ContractLoweringError> {
-        let source = self.expression_value_type(expression)?;
-        let plan = crate::compiler::selected_scalar_call::plan_conversion(
-            self.functions.as_ref(),
-            &source,
-            target,
-            policy,
-            self.root_allow_throw_exception,
-            self.control,
-        )
-        .map_err(|error| match error {
-            novarocks_functions::FunctionBindingError::Control(cause) => {
-                ContractLoweringError::Control(cause)
-            }
-            other => ContractLoweringError::InvalidFunctionBinding {
-                detail: format!(
-                    "{other} (assignment fragment={:?}, owner={owner:?}, expression={expression:?}, source-domain={:?}, target-domain={:?}, source-carrier={:?}, target-carrier={:?}; source={source:?}, target={target:?})",
-                    self.current_fragment,
-                    source.logical_type(),
-                    target.logical_type(),
-                    source.data_type(),
-                    target.data_type(),
-                ),
-            },
-        })?;
-        use crate::compiler::selected_scalar_call::PlannedConversion;
-        let (conversion, carrier) = match plan {
-            PlannedConversion::Identity => return Ok(expression),
-            PlannedConversion::Carrier(step) => (None, Some(step)),
-            PlannedConversion::ValueConversion { binding, tail } => (Some(binding), tail),
-        };
-        let expression = if let Some(binding) = conversion {
-            let argument = novarocks_functions::FunctionArgument::Value {
-                value_type: source.clone(),
-                constant: None,
-            };
-            self.work.step()?;
-            self.work.flush()?;
-            let mut arguments = Vec::new();
-            arguments
-                .try_reserve_exact(1)
-                .map_err(|_| CompileControlError::ResourceExhausted)?;
-            self.work.step()?;
-            arguments.push(argument);
-            self.work.step()?;
-            self.work.flush()?;
-            let captured = move_authored_call_arguments_observed(
-                &binding,
-                1,
-                arguments,
-                self.constant_policy,
-                self.control,
-            )?;
-            self.work.flush()?;
-            let resolved = binding.resolved();
-            let mut channels = self.reserve_call_channels(1)?;
-            channels.push(LoweredOperationalChannel {
-                expression,
-                role: SqlOperationalChannelRole::ValueWithoutConstant,
-            });
-            self.work.step()?;
-            self.work.flush()?;
-            let channels = channels.into_boxed_slice();
-            self.work.step()?;
-            let canonical = self.author_canonical_call_selection(
-                owner,
-                &captured,
-                Some(SqlExpressionCallKind::ValueConversion),
-                None,
-                &[expression],
-                &channels,
-            )?;
-            let selected = canonical.selected();
-            let novarocks_functions::FunctionResultType::Scalar(result) = &selected.result_type
-            else {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail: "canonical conversion owner selected a relation result".into(),
-                });
-            };
-            if selected.aggregate.is_some()
-                || captured.binding().result_constraint() != Some(result)
-            {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail:
-                        "canonical conversion result differs from its original intermediate target"
-                            .into(),
-                });
-            }
-            self.work.flush()?;
-            let function = bound_function_from_selection(resolved, selected, result);
-            self.work.step()?;
-            self.work.flush()?;
-            let result_type = result.clone();
-            self.work.step()?;
-            self.work.flush()?;
-            let emitted = self.add_scoped_expression(
-                owner,
-                result_type,
-                ContractExprKind::FunctionCall {
-                    function,
-                    args: Box::from([expression]),
-                },
-            )?;
-            self.record_expression_source(
-                owner,
-                emitted,
-                captured,
-                SqlExpressionCallKind::ValueConversion,
-                channels,
-                Some(canonical),
-            )?;
-            emitted
-        } else {
-            expression
-        };
-        let Some(carrier) = carrier else {
-            return Ok(expression);
-        };
-        let allow_throw_exception = self.root_allow_throw_reference();
-        self.add_scoped_expression(
-            owner,
-            carrier.target().clone(),
-            ContractExprKind::Cast {
-                allow_throw_exception,
-                expr: expression,
-                target: carrier.target().data_type().clone(),
-                decimal_overflow_policy: carrier.decimal_overflow_policy(),
-            },
-        )
+        self.scalar_emission(owner)
+            .convert_expression_to_inner(expression, target, policy)
     }
 
     fn common_comparison_value_type(
@@ -11168,10 +10689,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         left: &ValueType,
         right: &ValueType,
     ) -> Result<ValueType, ContractLoweringError> {
-        self.work.step()?;
-        let result = crate::compiler::selected_scalar_call::comparison_type(left, right);
-        self.control.checkpoint(CompilePhase::Validate, 0)?;
-        result.map_err(ContractLoweringError::ComparisonCoercion)
+        scalar_emission::common_comparison_value_type(self.control, &mut self.work, left, right)
     }
 
     fn cast_expression_to(
@@ -11180,16 +10698,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         expr: ExprId,
         target: &ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
-        let current = self.expression_value_type(expr)?;
-        let target = crate::compiler::selected_scalar_call::comparison_target(target, &current);
-        // This port retains the existing late comparison OutputNull policy.
-        // Request-owned policy freezing is a separate pending semantic gate.
-        self.convert_expression_to(
-            owner,
-            expr,
-            &target,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        )
+        self.scalar_emission(owner).cast_expression_to(expr, target)
     }
 
     fn lower_constant_expression(
@@ -11198,8 +10707,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         value: &novarocks_constant_contract::ConstantValue,
         ty: ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
-        let reference = self.register_constant_source(value, &ty)?;
-        self.add_scoped_expression(owner, ty, ContractExprKind::Constant(reference))
+        self.scalar_emission(owner)
+            .lower_constant_expression(value, ty)
     }
 
     // Scalar expressions and direct collection consumers share the original
@@ -11209,14 +10718,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         value: &novarocks_constant_contract::ConstantValue,
         ty: &ValueType,
     ) -> Result<novarocks_physical_plan::ConstantReference, ContractLoweringError> {
-        register_constant_source_observed(
-            &mut self.plan_builder,
-            &mut self.constant_sources,
-            &mut self.next_constant_pool,
-            value,
-            ty,
-            &mut self.work,
-        )
+        self.constant_emission.register(value, ty, &mut self.work)
     }
 
     fn author_unpivot_collection(
@@ -11277,19 +10779,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         owner: NodeId,
         text: &str,
     ) -> Result<ExprId, ContractLoweringError> {
-        let ty = ValueType::new(DataType::Utf8, false);
-        self.work.flush()?;
-        let field = std::sync::Arc::new(ty.try_to_field("literal")?);
-        let value = novarocks_constant_contract::ConstantValue::from_utf8(
-            field,
-            ty.clone(),
-            text,
-            self.constant_policy,
-            CompilePhase::Validate,
-            self.control,
-        )?;
-        self.work.flush()?;
-        self.lower_constant_expression(owner, &value, ty)
+        self.scalar_emission(owner).author_utf8_expression(text)
     }
 
     fn author_literal_expression(
@@ -11298,8 +10788,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         literal: &LiteralValue,
         ty: ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.author_literal_expression_with_source(owner, literal, ty)
-            .map(|(expression, _)| expression)
+        self.scalar_emission(owner)
+            .author_literal_expression(literal, ty)
     }
 
     /// The same original factory result can be retained by a canonical call
@@ -11310,16 +10800,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         literal: &LiteralValue,
         ty: ValueType,
     ) -> Result<(ExprId, novarocks_constant_contract::ConstantValue), ContractLoweringError> {
-        self.work.flush()?;
-        let value = crate::constant::admit_syntax_constant(
-            literal,
-            &ty,
-            self.constant_policy,
-            self.control,
-        )?;
-        self.work.flush()?;
-        let expression = self.lower_constant_expression(owner, &value, ty)?;
-        Ok((expression, value))
+        self.scalar_emission(owner)
+            .author_literal_expression_with_source(literal, ty)
     }
 
     fn lower_literal_expression(
@@ -11328,13 +10810,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         literal: &LiteralValue,
         expression: &TypedExpr,
     ) -> Result<ExprId, ContractLoweringError> {
-        let mut ty = expression_type(expression);
-        if matches!(literal, LiteralValue::Null) {
-            ty = ty
-                .with_nullable(true)
-                .expect("validated root NULL contract");
-        }
-        self.author_literal_expression(owner, literal, ty)
+        self.scalar_emission(owner)
+            .lower_literal_expression(literal, expression)
     }
 }
 
@@ -11391,6 +10868,50 @@ struct JoinOutput {
     output: Box<[ValueId]>,
     columns: BTreeMap<ColumnId, ValueId>,
     null_extended: Box<[ValueId]>,
+}
+
+struct LoweredWindowCall {
+    binding: novarocks_expression_contract::BoundFunction,
+    distinct: bool,
+    arguments: Box<[RootOrdinal]>,
+    order_by: Box<[SortExpr]>,
+    frame: Option<ContractWindowFrame>,
+    ignore_nulls: bool,
+    aggregate_binding: Option<Box<AggregateBinding>>,
+    source: LoweredWindowSourceEntry,
+}
+impl LoweredWindowCall {
+    fn into_call(self, output: ValueId) -> (WindowCallSpec, LoweredWindowSourceEntry) {
+        (
+            WindowCallSpec {
+                binding: self.binding,
+                distinct: self.distinct,
+                arguments: self.arguments,
+                order_by: self.order_by,
+                frame: self.frame,
+                ignore_nulls: self.ignore_nulls,
+                aggregate_binding: self.aggregate_binding,
+                output,
+            },
+            self.source,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NullableEmission {
+    Definition {
+        node: NodeId,
+        definition: ExprId,
+    },
+    Window {
+        site: novarocks_physical_plan::PhysicalCallSite,
+    },
+}
+#[derive(Default)]
+struct NullableConstructionOrder {
+    definitions: usize,
+    events: Vec<NullableEmission>,
 }
 
 struct LoweredOrdering {
@@ -12255,8 +11776,14 @@ fn lower_window_partition_expressions(
     expressions
         .iter()
         .map(|expression| {
+            let definition = visitor.lower_expression(owner, expression, visible)?;
             Ok(SortExpr {
-                expr: visitor.lower_expression(owner, expression, visible)?,
+                expr: visitor.root_definition(
+                    owner,
+                    definition,
+                    EvaluationDemand::Value,
+                    RootScope::Port(0),
+                )?,
                 direction: SortDirection::Ascending,
                 null_ordering: NullOrdering::First,
             })
@@ -12414,7 +11941,7 @@ fn bound_function_from_selection(
     result_type: &ValueType,
 ) -> BoundFunction {
     BoundFunction {
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             semantic_parameters: Box::default(),
             volatility: binding.semantics.volatility,
             argument_evaluation: binding.semantics.argument_evaluation,
@@ -13138,112 +12665,6 @@ fn lower_unary_operator(operator: UnOp) -> UnaryOperator {
     }
 }
 
-#[cfg(test)]
-fn lower_literal(
-    literal: &LiteralValue,
-    target: &ValueType,
-) -> Result<(ContractLiteralValue, ValueType), ContractLoweringError> {
-    match literal {
-        // A null literal admits null because it is one. Where the statement
-        // was analyzed to say the slot it fills never carries one, the
-        // annotation is what is wrong, and everything above this reads the
-        // expression rather than the annotation.
-        LiteralValue::Null => Ok((
-            ContractLiteralValue::Null,
-            (target.clone())
-                .with_nullable(true)
-                .expect("validated root NULL contract"),
-        )),
-        LiteralValue::Bool(value) => Ok((
-            ContractLiteralValue::Boolean(*value),
-            ValueType::new(DataType::Boolean, false),
-        )),
-        // A date, a time and a timestamp all reach the planner as the integer
-        // they are stored as, and only the position says which. Reading the
-        // position is what makes them that value: an integer converted to a
-        // date instead reads its digits as `YYYYMMDD`, so `DATE '2024-01-10'`
-        // would arrive as a null.
-        LiteralValue::Int(value) if matches!(target.data_type(), DataType::Date32) => {
-            let days =
-                i32::try_from(*value).map_err(|_| ContractLoweringError::InvalidLiteral {
-                    kind: "Date32",
-                    detail: format!("{value} is outside the day range a date is stored in"),
-                })?;
-            Ok((
-                ContractLiteralValue::Date32(days),
-                ValueType::new(DataType::Date32, false),
-            ))
-        }
-        LiteralValue::Int(value) if matches!(target.data_type(), DataType::Time64(_)) => Ok((
-            ContractLiteralValue::Time64(*value),
-            ValueType::new(target.data_type().clone(), false),
-        )),
-        LiteralValue::Int(value) if matches!(target.data_type(), DataType::Timestamp(_, _)) => {
-            Ok((
-                ContractLiteralValue::Timestamp(*value),
-                ValueType::new(target.data_type().clone(), false),
-            ))
-        }
-        LiteralValue::Int(value) => Ok((
-            ContractLiteralValue::Int64(*value),
-            ValueType::new(DataType::Int64, false),
-        )),
-        LiteralValue::LargeInt(value)
-            if target.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt
-                && novarocks_type_contract::is_largeint_data_type(target.data_type()) =>
-        {
-            Ok((
-                ContractLiteralValue::LargeInt(*value),
-                target
-                    .with_nullable(false)
-                    .expect("validated LARGEINT literal type"),
-            ))
-        }
-        LiteralValue::LargeInt(_) => Err(ContractLoweringError::InvalidLiteral {
-            kind: "LargeInt",
-            detail: format!(
-                "requires an authored LARGEINT FixedSizeBinary({}), got {:?}",
-                novarocks_type_contract::LARGEINT_BYTE_WIDTH,
-                target.data_type(),
-            ),
-        }),
-        LiteralValue::Float(value) => Ok((
-            ContractLiteralValue::Float64Bits(value.to_bits()),
-            ValueType::new(DataType::Float64, false),
-        )),
-        LiteralValue::String(value) => Ok((
-            ContractLiteralValue::Utf8(value.clone().into_boxed_str()),
-            ValueType::new(DataType::Utf8, false),
-        )),
-        LiteralValue::Binary(value) => Ok((
-            ContractLiteralValue::Binary(value.clone().into_boxed_slice()),
-            ValueType::new(DataType::Binary, false),
-        )),
-        LiteralValue::Decimal(value) => match &target.data_type() {
-            DataType::Decimal128(precision, scale) => {
-                let unscaled = parse_decimal128(value, *scale)?;
-                require_decimal_precision(unscaled, *precision, "Decimal")?;
-                Ok((
-                    ContractLiteralValue::Decimal128(unscaled),
-                    ValueType::new(target.data_type().clone(), false),
-                ))
-            }
-            DataType::Decimal256(precision, scale) => {
-                let unscaled = parse_decimal256(value, *scale)?;
-                require_decimal256_precision(unscaled, *precision)?;
-                Ok((
-                    ContractLiteralValue::Decimal256(unscaled.to_be_bytes()),
-                    ValueType::new(target.data_type().clone(), false),
-                ))
-            }
-            other => Err(ContractLoweringError::InvalidLiteral {
-                kind: "Decimal",
-                detail: format!("requires a decimal type, got {other:?}"),
-            }),
-        },
-    }
-}
-
 fn require_decimal_precision(
     unscaled: i128,
     precision: u8,
@@ -13504,6 +12925,9 @@ fn expression_kind_name(kind: &ExprKind) -> &'static str {
 pub(crate) enum ContractLoweringError {
     ComparisonCoercion(novarocks_type_contract::ComparisonCoercionFailure),
     ConstantSource(novarocks_constant_contract::ConstantError),
+    Unit(novarocks_expression_contract::UnitError),
+    FunctionBinding(novarocks_functions::FunctionBindingError),
+    Semantics(super::package_semantics::PackageSemanticsError),
     CallRequests(novarocks_physical_plan::CallRequestError),
     Control(CompileControlError),
     AggregateSource(AggregateRequestCaptureError),
@@ -13675,6 +13099,8 @@ pub(crate) enum ContractLoweringError {
 impl fmt::Display for ContractLoweringError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FunctionBinding(cause) => cause.fmt(formatter),
+            Self::Semantics(cause) => cause.fmt(formatter),
             Self::ComparisonCoercion(cause) => cause.fmt(formatter),
             Self::CallRequests(error) => error.fmt(formatter),
             Self::Control(error) => error.fmt(formatter),
@@ -13815,6 +13241,7 @@ impl fmt::Display for ContractLoweringError {
             Self::ConstantSource(cause) => {
                 write!(formatter, "constant admission limit: {cause}")
             }
+            Self::Unit(cause) => cause.fmt(formatter),
             Self::InvalidLiteral { kind, detail } => {
                 write!(formatter, "invalid {kind} literal: {detail}")
             }
@@ -13863,8 +13290,11 @@ impl fmt::Display for ContractLoweringError {
 impl std::error::Error for ContractLoweringError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::FunctionBinding(cause) => Some(cause),
+            Self::Semantics(cause) => Some(cause),
             Self::ComparisonCoercion(cause) => Some(cause),
             Self::ConstantSource(cause) => Some(cause),
+            Self::Unit(cause) => Some(cause),
             Self::UnsupportedWaitCycle(cause) => Some(cause),
             _ => None,
         }
@@ -13992,14 +13422,59 @@ impl From<ContractLoweringError> for crate::compiler::SqlCompileError {
     fn from(error: ContractLoweringError) -> Self {
         match error {
             ContractLoweringError::Control(error) => Self::from(error),
+            ContractLoweringError::FunctionBinding(error) => Self::from(error),
+            ContractLoweringError::Semantics(error) => {
+                Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(error))
+            }
             ContractLoweringError::ComparisonCoercion(cause) => {
                 Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
             }
             ContractLoweringError::ConstantSource(cause) => Self::from(cause),
+            ContractLoweringError::Unit(cause) => {
+                Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
+            }
             ContractLoweringError::UnsupportedWaitCycle(cause) => {
                 Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
             }
             error => Self::Compilation(error.to_string()),
+        }
+    }
+}
+
+impl From<novarocks_physical_plan::FragmentStructureError> for ContractLoweringError {
+    fn from(error: novarocks_physical_plan::FragmentStructureError) -> Self {
+        match error {
+            novarocks_physical_plan::FragmentStructureError::Control(cause) => Self::Control(cause),
+            novarocks_physical_plan::FragmentStructureError::Structure(cause) => {
+                Self::Validation(cause)
+            }
+        }
+    }
+}
+impl From<novarocks_functions::FunctionBindingError> for ContractLoweringError {
+    fn from(error: novarocks_functions::FunctionBindingError) -> Self {
+        match error {
+            novarocks_functions::FunctionBindingError::Control(cause) => Self::Control(cause),
+            error => Self::FunctionBinding(error),
+        }
+    }
+}
+impl From<super::package_semantics::PackageSemanticsError> for ContractLoweringError {
+    fn from(error: super::package_semantics::PackageSemanticsError) -> Self {
+        match error {
+            super::package_semantics::PackageSemanticsError::Control(cause) => Self::Control(cause),
+            super::package_semantics::PackageSemanticsError::ConstantSource(cause) => {
+                Self::from(cause)
+            }
+            error => Self::Semantics(error),
+        }
+    }
+}
+impl From<novarocks_expression_contract::UnitError> for ContractLoweringError {
+    fn from(error: novarocks_expression_contract::UnitError) -> Self {
+        match error {
+            novarocks_expression_contract::UnitError::Control(cause) => Self::Control(cause),
+            other => Self::Unit(other),
         }
     }
 }
@@ -14013,6 +13488,7 @@ impl From<BuildError> for ContractLoweringError {
 impl From<novarocks_physical_plan::PlanConstructionError> for ContractLoweringError {
     fn from(error: novarocks_physical_plan::PlanConstructionError) -> Self {
         match error {
+            novarocks_physical_plan::PlanConstructionError::Calls(error) => Self::from(error),
             novarocks_physical_plan::PlanConstructionError::Requests(error) => Self::from(error),
             novarocks_physical_plan::PlanConstructionError::Constants(error) => Self::from(error),
             novarocks_physical_plan::PlanConstructionError::Structure(error) => Self::from(error),
@@ -14176,9 +13652,11 @@ mod tests {
         };
         let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         let selected = fragment
-            .expressions()
-            .iter()
-            .find_map(|(_, definition)| {
+            .nodes()
+            .values()
+            .filter_map(|node| node.expressions.as_ref())
+            .flat_map(|unit| unit.definitions())
+            .find_map(|definition| {
                 if let ContractExprKind::Constant(reference) = &definition.kind {
                     let control = crate::compiler::SqlCompileControl::unbounded();
                     let mut work =
@@ -14238,9 +13716,11 @@ mod tests {
             assert_eq!(field.alias.as_deref(), Some("to_binary('', 'hex')"));
             let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
             let reference = fragment
-                .expressions()
-                .iter()
-                .find_map(|(_, definition)| {
+                .nodes()
+                .values()
+                .filter_map(|node| node.expressions.as_ref())
+                .flat_map(|unit| unit.definitions())
+                .find_map(|definition| {
                     if let ContractExprKind::Constant(reference) = &definition.kind {
                         Some((*reference, definition.ty.clone()))
                     } else {
@@ -14315,7 +13795,7 @@ mod tests {
     #[test]
     fn actual_literal_table_and_window_limits_precede_late_lowering_control() {
         use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
-        use novarocks_functions::{ConstantError, FunctionArgument};
+        use novarocks_functions::{ConstantError, FunctionArgument, FunctionResultType};
         use std::sync::Mutex;
 
         #[derive(Default)]
@@ -14413,9 +13893,90 @@ mod tests {
             output_column_id: ColumnId::new_for_test(92),
             ignore_nulls: false,
         };
-        for which in 0..3 {
+        let fields: Vec<_> = (0..320)
+            .map(|at| {
+                Arc::new(
+                    arrow::datatypes::Field::new(format!("component-{at}"), DataType::Int64, true)
+                        .with_metadata(std::collections::HashMap::from([(
+                            "provider.id".into(),
+                            at.to_string(),
+                        )])),
+                )
+            })
+            .collect();
+        let wide_type = ValueType::new(
+            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                "item",
+                DataType::Struct(fields.into()),
+                true,
+            ))),
+            true,
+        );
+        let wide_resolved = catalog
+            .resolve_table_binding(
+                "unnest",
+                &[FunctionArgument::Value {
+                    value_type: wide_type.clone(),
+                    constant: None,
+                }],
+                &active,
+            )
+            .unwrap();
+        let FunctionResultType::Relation(results) = &wide_resolved.selected.result_type else {
+            panic!("actual UNNEST relation")
+        };
+        let output_type = results[0].clone();
+        let mut wide_output = column(
+            93,
+            "wide_row",
+            output_type.data_type().clone(),
+            output_type.nullable(),
+        );
+        wide_output.value_type = output_type;
+        let wide_table = PlanTableFunctionNode {
+            function_name: "unnest".into(),
+            args: vec![TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Null),
+                value_type: wide_type,
+            }],
+            binding: SqlFunctionBinding::new(
+                wide_resolved,
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            ),
+            output_columns: vec![wide_output.clone()],
+            alias: None,
+            is_left_join: false,
+        };
+        let wide_plan = PhysicalPlanNode {
+            kind: PhysicalPlanKind::TableFunction(wide_table),
+            children: vec![values(vec![], vec![vec![]])],
+            output_columns: vec![wide_output],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        for which in 0..4 {
             let run = |control: &Control| -> Result<(), ContractLoweringError> {
                 let mut policy = crate::constant::test_constant_policy();
+                if which == 3 {
+                    // Same finite full-type boundary as the original wide
+                    // table source. This is fresh syntax admission, not CV
+                    // consumption under a second constructor policy.
+                    policy.max_type_nodes = 64;
+                    return match lower_final_physical_plan(
+                        &wide_plan,
+                        version(),
+                        dop(),
+                        catalog.snapshot(),
+                        false,
+                        policy,
+                        control,
+                    ) {
+                        Err(error) => Err(error),
+                        Ok(_) => panic!(
+                            "the source limit must refuse before publishing any SQL physical draft"
+                        ),
+                    };
+                }
                 policy.max_rows = 0;
                 let mut visitor = ContractLoweringVisitor::new(
                     version(),
@@ -14449,6 +14010,17 @@ mod tests {
             assert_eq!(expected.class(), FailureClass::Resource);
             assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
             assert_eq!(expected.reason().code(), 2);
+            // Check the original error-carrier projection with the genuine
+            // constructor refusal above. This component test does not claim
+            // that checked-CV consumption invokes a constructor again.
+            let projected = super::super::package_semantics::PackageSemanticsError::from(
+                super::super::physical_fragment_effects::PhysicalFragmentEffectsError::Expressions(
+                    super::super::physical_expression_effects::PhysicalExpressionEffectsError::Argument(
+                        super::super::physical_call_arguments::PhysicalArgumentError::from(expected_source.clone())
+                    )
+                )
+            );
+            assert_eq!(projected.failure_fact(), expected);
             let trace = baseline.trace.lock().unwrap().clone();
             assert!(!trace.is_empty());
             for cause in [
@@ -15096,7 +14668,7 @@ mod tests {
 
     fn checked_constant_for_test(
         plan: &PhysicalPlan,
-        expression: &novarocks_physical_plan::ExprNode,
+        expression: &novarocks_expression_contract::ExprNode,
     ) -> novarocks_constant_contract::ConstantValue {
         let ContractExprKind::Constant(reference) = expression.kind else {
             panic!("expected checked constant reference");
@@ -15434,7 +15006,79 @@ mod tests {
         .unwrap();
         let input = column(1, "order_id", DataType::Int64, false);
         let source = values(vec![input], vec![vec![literal_int(7)]]);
-        let plan = lower_final_physical_write_plan(
+        use super::original_emission_test_observer::{
+            OriginalEmissionObserver, OriginalEmissionView,
+            lower_write_with_original_emission_observer,
+        };
+        struct StatisticsEmission {
+            calls: usize,
+        }
+        impl OriginalEmissionObserver for StatisticsEmission {
+            fn observe(
+                &mut self,
+                view: OriginalEmissionView<'_>,
+                _work: &mut CompileCheckpoints<'_>,
+            ) -> Result<(), ContractLoweringError> {
+                self.calls += 1;
+                let finish = view
+                    .fragments()
+                    .values()
+                    .flat_map(|fragment| fragment.construction_nodes().map(|(_, node)| node))
+                    .find_map(|node| match &node.kind {
+                        NodeKind::TableFinish(finish) => Some(finish),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(finish.final_aggregates.len(), 1);
+                let grouped = finish.grouped_unpivot.as_ref().unwrap();
+                let control = crate::compiler::SqlCompileControl::unbounded();
+                let mut work =
+                    CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+                let mut checked_collections = 0;
+                for mapping in &grouped.mappings {
+                    for constant in &mapping.constants {
+                        match constant {
+                            ContractUnpivotConstant::Int32List(reference) => {
+                                let source = view
+                                    .constants()
+                                    .resolve_source_observed(*reference, &mut work)
+                                    .unwrap();
+                                assert!(!source.value_type().nullable());
+                                let view = source
+                                    .int32_list_observed(CompilePhase::Validate, &control)
+                                    .unwrap()
+                                    .unwrap();
+                                assert_eq!(view.len(), 1);
+                                assert_eq!(view.item_observed(0, &mut work).unwrap(), Some(1));
+                                checked_collections += 1;
+                            }
+                            ContractUnpivotConstant::Utf8Map(reference) => {
+                                let source = view
+                                    .constants()
+                                    .resolve_source_observed(*reference, &mut work)
+                                    .unwrap();
+                                assert!(!source.value_type().nullable());
+                                assert!(
+                                    source
+                                        .utf8_map_observed(CompilePhase::Validate, &control)
+                                        .unwrap()
+                                        .unwrap()
+                                        .is_empty()
+                                );
+                                checked_collections += 1;
+                            }
+                            ContractUnpivotConstant::Scalar(_) => {}
+                        }
+                    }
+                }
+                work.finish().unwrap();
+                assert_eq!(checked_collections, 2);
+                Ok(())
+            }
+        }
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut observer = StatisticsEmission { calls: 0 };
+        let result = lower_write_with_original_emission_observer(
             &source,
             version(),
             dop(),
@@ -15448,65 +15092,13 @@ mod tests {
             crate::compiler::SqlFunctionCatalog::snapshot(&functions),
             false,
             crate::constant::test_constant_policy(),
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .unwrap()
-        .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .unwrap()
-        .plan()
-        .clone();
-        let finish = plan
-            .fragments()
-            .values()
-            .flat_map(|fragment| fragment.nodes().values())
-            .find_map(|node| match &node.kind {
-                NodeKind::TableFinish(finish) => Some(finish),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(finish.final_aggregates.len(), 1);
-        let grouped = finish.grouped_unpivot.as_ref().unwrap();
-        let control = crate::compiler::SqlCompileControl::unbounded();
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
-        let mut checked_collections = 0;
-        for mapping in &grouped.mappings {
-            for constant in &mapping.constants {
-                match constant {
-                    ContractUnpivotConstant::Int32List(reference) => {
-                        let source = plan
-                            .constants()
-                            .resolve_source_observed(*reference, &mut work)
-                            .unwrap();
-                        assert!(!source.value_type().nullable());
-                        let view = source
-                            .int32_list_observed(CompilePhase::Validate, &control)
-                            .unwrap()
-                            .unwrap();
-                        assert_eq!(view.len(), 1);
-                        assert_eq!(view.item_observed(0, &mut work).unwrap(), Some(1));
-                        checked_collections += 1;
-                    }
-                    ContractUnpivotConstant::Utf8Map(reference) => {
-                        let source = plan
-                            .constants()
-                            .resolve_source_observed(*reference, &mut work)
-                            .unwrap();
-                        assert!(!source.value_type().nullable());
-                        assert!(
-                            source
-                                .utf8_map_observed(CompilePhase::Validate, &control)
-                                .unwrap()
-                                .unwrap()
-                                .is_empty()
-                        );
-                        checked_collections += 1;
-                    }
-                    ContractUnpivotConstant::Scalar(_) => {}
-                }
-            }
-        }
-        work.finish().unwrap();
-        assert_eq!(checked_collections, 2);
+            &control,
+            &mut observer,
+        );
+        assert_eq!(observer.calls, 1);
+        assert!(matches!(result, Err(ContractLoweringError::FunctionBinding(
+            novarocks_functions::FunctionBindingError::UnavailableImplementation(ref overload)
+        )) if overload.as_str() == "test/writer-stat/i64/v1"));
     }
 
     #[test]
@@ -16316,7 +15908,7 @@ mod tests {
             stats: stats(),
             probe_runtime_filters: Vec::new(),
         };
-        let computed = column(2, "next", DataType::Int64, false);
+        let computed = column(2, "next", DataType::Int64, true);
         let project = PhysicalPlanNode {
             kind: PhysicalPlanKind::Project(PlanProjectNode {
                 items: vec![
@@ -16336,7 +15928,7 @@ mod tests {
                             },
                             value_type: novarocks_type_contract::FunctionValueType::new(
                                 DataType::Int64,
-                                false,
+                                true,
                             ),
                         },
                         output_name: "next".to_string(),
@@ -16658,16 +16250,6 @@ mod tests {
                 keys: Box::from([1]),
                 scheme: provider_bucket_scheme(52),
             };
-        let reads = FinalizedProviderReadSet::single_for_test(
-            binding,
-            ProviderReadOccurrenceId::new(0),
-            contract.clone(),
-            novarocks_physical_plan::ScanReadBudget {
-                max_batch_rows: 1024,
-                max_batch_bytes: 1 << 20,
-            },
-        );
-
         #[derive(Default)]
         struct PrefixControl {
             trace: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
@@ -16692,261 +16274,260 @@ mod tests {
                 }
             }
         }
+        use super::super::lowered_draft::{
+            SqlExpressionCallKind, SqlSourceJournalError, check_original_unit_source_kind_for_test,
+        };
+        use super::original_emission_test_observer::{
+            OriginalEmissionObserver, OriginalEmissionView,
+            lower_read_with_original_emission_observer,
+        };
+        struct ScanEmission<'a> {
+            calls: usize,
+            plan: &'a PhysicalPlanNode,
+            original_binding: &'a SqlFunctionBinding,
+            bucket: bool,
+        }
+        impl OriginalEmissionObserver for ScanEmission<'_> {
+            fn observe(
+                &mut self,
+                view: OriginalEmissionView<'_>,
+                work: &mut CompileCheckpoints<'_>,
+            ) -> Result<(), ContractLoweringError> {
+                self.calls += 1;
+                let builder = view.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+                let root = builder
+                    .construction_nodes()
+                    .find(|(_, node)| matches!(node.kind, NodeKind::Scan { .. }))
+                    .map(|(_, node)| node)
+                    .unwrap();
+                let values = builder
+                    .construction_values()
+                    .map(|(&id, value)| (id, value))
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(root.output.columns.len(), 3);
+                assert!(matches!(
+                    values[&root.output.columns[0]].origin,
+                    ValueOrigin::ProviderField { .. }
+                ));
+                assert!(matches!(
+                    values[&root.output.columns[1]].origin,
+                    ValueOrigin::Expr { .. }
+                ));
+                assert!(matches!(
+                    values[&root.output.columns[2]].origin,
+                    ValueOrigin::ProviderField { .. }
+                ));
+                let ValueOrigin::Expr {
+                    node: emitted_node,
+                    root: emitted_root,
+                } = values[&root.output.columns[1]].origin
+                else {
+                    unreachable!()
+                };
+                let emitted =
+                    super::super::unit_source::UnitDefinitions::from_draft(builder, emitted_node)
+                        .root_definition(emitted_root)
+                        .unwrap();
+                let loan = view.scalar_loan(ROOT_FRAGMENT_ID, emitted_node)?;
+                let checked = check_original_unit_source_kind_for_test(
+                    &loan,
+                    emitted,
+                    SqlExpressionCallKind::DerivedVariant,
+                    work,
+                )?;
+                let PhysicalPlanKind::Scan(scan) = &self.plan.kind else {
+                    unreachable!()
+                };
+                let original = scan.variant_columns[0].source();
+                assert!(std::ptr::eq(checked.captured(), original.captured()));
+                assert!(std::ptr::eq(
+                    checked.captured().binding().resolved(),
+                    scan.variant_columns[0].binding().resolved()
+                ));
+                assert!(matches!(
+                    &checked.captured().request().arguments[0],
+                    novarocks_functions::FunctionArgument::Value { constant: None, .. }
+                ));
+                work.flush()?;
+                let mut projection_work = CompileCheckpoints::try_new(
+                    work.control(),
+                    CompilePhase::FunctionSpecialization,
+                )?;
+                let projected = checked
+                    .operational_arguments_observed(view.constants(), &mut projection_work)?;
+                let selected = checked
+                    .canonical_selection()
+                    .expect("same-emission derived selection");
+                assert_eq!(
+                    selected.argument_types.as_ref(),
+                    projected
+                        .iter()
+                        .map(novarocks_functions::FunctionArgument::argument_type)
+                        .collect::<Vec<_>>()
+                        .as_slice()
+                );
+                assert_eq!(
+                    selected.result_type,
+                    novarocks_functions::FunctionResultType::Scalar(ValueType::new(
+                        DataType::Utf8,
+                        true
+                    ))
+                );
+                assert!(selected.aggregate.is_none());
+                assert_eq!(emitted.ty, ValueType::new(DataType::Utf8, true));
+                let ContractExprKind::FunctionCall { function, .. } = &emitted.kind else {
+                    unreachable!()
+                };
+                assert_eq!(function.function_id, self.original_binding.function_id);
+                assert_eq!(function.overload, selected.overload);
+                assert_eq!(function.argument_types, selected.argument_types);
+                assert_eq!(function.result_type, emitted.ty);
+                // One actual pre-admission source can be loaned repeatedly.
+                // This is not a clone of an unsupported published SQL owner;
+                // the real supported LOWER clone contract remains elsewhere.
+                let again = check_original_unit_source_kind_for_test(
+                    &loan,
+                    emitted,
+                    SqlExpressionCallKind::DerivedVariant,
+                    work,
+                )?;
+                assert!(Arc::ptr_eq(selected, again.canonical_selection().unwrap()));
+                assert!(std::ptr::eq(checked.captured(), again.captured()));
+                projection_work.finish()?;
+                assert!(matches!(
+                    &projected[0],
+                    novarocks_functions::FunctionArgument::Value { constant: None, .. }
+                ));
+                for (argument, original_value) in projected[1..]
+                    .iter()
+                    .zip([original.canonical_path(), original.type_literal()])
+                {
+                    let novarocks_functions::FunctionArgument::Value {
+                        constant: Some(value),
+                        ..
+                    } = argument
+                    else {
+                        panic!("actual canonical descriptor request");
+                    };
+                    assert_eq!(value.value_type(), original_value.value_type());
+                    assert_eq!(value.ordinal(), original_value.ordinal());
+                    assert_eq!(
+                        value.pool().backing_identity(),
+                        original_value.pool().backing_identity()
+                    );
+                }
+                for (argument, original_value) in checked.arguments()[1..]
+                    .iter()
+                    .zip([original.canonical_path(), original.type_literal()])
+                {
+                    let ContractExprKind::Constant(reference) =
+                        loan.definitions().definition(*argument).unwrap().kind
+                    else {
+                        unreachable!()
+                    };
+                    let actual = view.constants().resolve_source_observed(reference, work)?;
+                    assert_eq!(actual.ordinal(), original_value.ordinal());
+                    assert_eq!(
+                        actual.pool().backing_identity(),
+                        original_value.pool().backing_identity()
+                    );
+                    assert!(Arc::ptr_eq(
+                        actual.pool().field_ref(),
+                        original_value.pool().field_ref()
+                    ));
+                }
+                match check_original_unit_source_kind_for_test(
+                    &loan,
+                    emitted,
+                    SqlExpressionCallKind::Scalar,
+                    work,
+                ) {
+                    Err(SqlSourceJournalError::InvalidSource(
+                        "expression journal loan uses a different call lifecycle",
+                    )) => {}
+                    Err(SqlSourceJournalError::Control(cause)) => return Err(cause.into()),
+                    _ => panic!("ordinary Scalar cannot authenticate a DerivedVariant producer"),
+                }
+                work.flush()?;
+                match (&root.output_properties.distribution, self.bucket) {
+                    (Distribution::Hash { keys, .. }, false)
+                    | (Distribution::BucketShuffle { keys, .. }, true) => {
+                        assert_eq!(keys.as_ref(), &[root.output.columns[2]])
+                    }
+                    _ => panic!("expected the provider's actual hash/bucket-shuffle distribution"),
+                }
+                assert_eq!(
+                    root.output_properties
+                        .ordering
+                        .iter()
+                        .map(|key| key.value)
+                        .collect::<Vec<_>>(),
+                    vec![root.output.columns[2]]
+                );
+                Ok(())
+            }
+        }
         let functions = crate::functions::builtin_sql_function_catalog().snapshot();
-        let capture = |control: &dyn PureCompileControl| {
-            lower_final_physical_plan_with_provider_reads(
+        let capture = |control: &dyn PureCompileControl, bucket: bool| {
+            let mut observer = ScanEmission {
+                calls: 0,
+                plan: &plan,
+                original_binding: &original_binding,
+                bucket,
+            };
+            let reads = FinalizedProviderReadSet::single_for_test(
+                binding,
+                ProviderReadOccurrenceId::new(0),
+                if bucket {
+                    bucket_contract.clone()
+                } else {
+                    contract.clone()
+                },
+                novarocks_physical_plan::ScanReadBudget {
+                    max_batch_rows: 1024,
+                    max_batch_bytes: 1 << 20,
+                },
+            );
+            let result = lower_read_with_original_emission_observer(
                 &plan,
                 version(),
                 dop(),
-                FinalizedProviderReadSet::single_for_test(
-                    binding,
-                    ProviderReadOccurrenceId::new(0),
-                    contract.clone(),
-                    novarocks_physical_plan::ScanReadBudget {
-                        max_batch_rows: 1024,
-                        max_batch_bytes: 1 << 20,
-                    },
-                ),
+                Some(reads),
                 Arc::clone(&functions),
                 false,
                 crate::constant::test_constant_policy(),
                 control,
-            )
+                &mut observer,
+            );
+            (result, observer.calls)
         };
-        let baseline = PrefixControl::default();
-        capture(&baseline).expect("genuine derived source must lower");
-        let trace = baseline.trace.lock().unwrap().clone();
-        for stop in 0..trace.len() {
-            for cause in [
-                CompileControlError::Cancelled,
-                CompileControlError::DeadlineExceeded,
-                CompileControlError::ResourceExhausted,
-            ] {
-                let control = PrefixControl {
-                    refusal: Some((stop, cause.clone())),
-                    ..PrefixControl::default()
-                };
-                assert!(
-                    matches!(capture(&control),Err(ContractLoweringError::Control(actual)) if actual==cause)
-                );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
+        for bucket in [false, true] {
+            let baseline = PrefixControl::default();
+            let (result, calls) = capture(&baseline, bucket);
+            assert_eq!(calls, 1);
+            assert!(
+                matches!(result, Err(ContractLoweringError::FunctionBinding(novarocks_functions::FunctionBindingError::UnavailableImplementation(ref overload))) if overload.as_str() == "builtin.scalar/variant_get/dynamic-v1")
+            );
+            let trace = baseline.trace.lock().unwrap().clone();
+            for stop in 0..trace.len() {
+                for cause in [
+                    CompileControlError::Cancelled,
+                    CompileControlError::DeadlineExceeded,
+                    CompileControlError::ResourceExhausted,
+                ] {
+                    let control = PrefixControl {
+                        refusal: Some((stop, cause.clone())),
+                        ..PrefixControl::default()
+                    };
+                    let (result, calls) = capture(&control, bucket);
+                    assert!(calls <= 1);
+                    assert!(
+                        matches!(result, Err(ContractLoweringError::Control(actual)) if actual == cause)
+                    );
+                    assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
+                }
             }
         }
-
-        let source_owner = lower_final_physical_plan_with_provider_reads(
-            &plan,
-            version(),
-            dop(),
-            reads,
-            crate::functions::builtin_sql_function_catalog().snapshot(),
-            false,
-            crate::constant::test_constant_policy(),
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .unwrap()
-        .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .expect("interleaved scan output must finish validation");
-        let final_plan = source_owner.plan();
-        let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
-        let root = fragment.nodes().get(&fragment.root()).unwrap();
-        assert_eq!(root.output.columns.len(), 3);
-        assert!(matches!(
-            fragment
-                .values()
-                .get(&root.output.columns[0])
-                .unwrap()
-                .origin,
-            ValueOrigin::ProviderField { .. }
-        ));
-        assert!(matches!(
-            fragment
-                .values()
-                .get(&root.output.columns[1])
-                .unwrap()
-                .origin,
-            ValueOrigin::Expr { .. }
-        ));
-        assert!(matches!(
-            fragment
-                .values()
-                .get(&root.output.columns[2])
-                .unwrap()
-                .origin,
-            ValueOrigin::ProviderField { .. }
-        ));
-        let ValueOrigin::Expr { expr, .. } = fragment
-            .values()
-            .get(&root.output.columns[1])
-            .unwrap()
-            .origin
-        else {
-            unreachable!()
-        };
-        let emitted = fragment.expressions().get(expr).unwrap();
-        let loan_control = crate::compiler::SqlCompileControl::unbounded();
-        let mut work = CompileCheckpoints::try_new(&loan_control, CompilePhase::Validate).unwrap();
-        // The source owner loans the exact descriptor creation payload. This
-        // structural scan fixture makes no installed VARIANT capability claim.
-        let checked = source_owner
-            .checked_variant_source_observed(fragment, emitted, &mut work)
-            .unwrap();
-        let PhysicalPlanKind::Scan(scan) = &plan.kind else {
-            unreachable!()
-        };
-        let original = scan.variant_columns[0].source();
-        assert!(std::ptr::eq(checked.captured(), original.captured()));
-        assert!(std::ptr::eq(
-            checked.captured().binding().resolved(),
-            scan.variant_columns[0].binding().resolved()
-        ));
-        assert!(matches!(
-            &checked.captured().request().arguments[0],
-            novarocks_functions::FunctionArgument::Value { constant: None, .. }
-        ));
-        let mut projection_work =
-            CompileCheckpoints::try_new(&loan_control, CompilePhase::FunctionSpecialization)
-                .unwrap();
-        let projected = checked
-            .operational_arguments_observed(final_plan.constants(), &mut projection_work)
-            .unwrap();
-        let selected = checked
-            .canonical_selection()
-            .expect("same-emission derived selection");
-        assert_eq!(
-            selected.argument_types.as_ref(),
-            projected
-                .iter()
-                .map(novarocks_functions::FunctionArgument::argument_type)
-                .collect::<Vec<_>>()
-                .as_slice()
-        );
-        assert_eq!(
-            selected.result_type,
-            novarocks_functions::FunctionResultType::Scalar(ValueType::new(DataType::Utf8, true))
-        );
-        assert!(selected.aggregate.is_none());
-        assert_eq!(emitted.ty, ValueType::new(DataType::Utf8, true));
-        let ContractExprKind::FunctionCall { function, .. } = &emitted.kind else {
-            unreachable!()
-        };
-        assert_eq!(function.function_id, original_binding.function_id);
-        assert_eq!(function.overload, selected.overload);
-        assert_eq!(function.argument_types, selected.argument_types);
-        assert_eq!(function.result_type, emitted.ty);
-        let cloned_owner = source_owner.clone();
-        let again = cloned_owner
-            .checked_variant_source_observed(fragment, emitted, &mut work)
-            .unwrap();
-        assert!(Arc::ptr_eq(selected, again.canonical_selection().unwrap()));
-        assert!(std::ptr::eq(checked.captured(), again.captured()));
-
-        projection_work.finish().unwrap();
-        assert!(matches!(
-            &projected[0],
-            novarocks_functions::FunctionArgument::Value { constant: None, .. }
-        ));
-        for (argument, original_value) in projected[1..]
-            .iter()
-            .zip([original.canonical_path(), original.type_literal()])
-        {
-            let novarocks_functions::FunctionArgument::Value {
-                constant: Some(value),
-                ..
-            } = argument
-            else {
-                panic!("actual canonical descriptor request");
-            };
-            assert_eq!(value.value_type(), original_value.value_type());
-            assert_eq!(value.ordinal(), original_value.ordinal());
-            assert_eq!(
-                value.pool().backing_identity(),
-                original_value.pool().backing_identity()
-            );
-        }
-        for (argument, original_value) in checked.arguments()[1..]
-            .iter()
-            .zip([original.canonical_path(), original.type_literal()])
-        {
-            let ContractExprKind::Constant(reference) =
-                fragment.expressions().get(*argument).unwrap().kind
-            else {
-                unreachable!()
-            };
-            let actual = final_plan
-                .constants()
-                .resolve_source_observed(reference, &mut work)
-                .unwrap();
-            assert_eq!(actual.ordinal(), original_value.ordinal());
-            assert_eq!(
-                actual.pool().backing_identity(),
-                original_value.pool().backing_identity()
-            );
-            assert!(Arc::ptr_eq(
-                actual.pool().field_ref(),
-                original_value.pool().field_ref()
-            ));
-        }
-        assert!(matches!(
-            source_owner.checked_scalar_source_observed(fragment, emitted, &mut work),
-            Err(super::super::lowered_draft::SqlSourceJournalError::InvalidSource(_))
-        ));
-        work.finish().unwrap();
-        let Distribution::Hash { keys, .. } = &root.output_properties.distribution else {
-            panic!("expected provider hash distribution");
-        };
-        assert_eq!(keys.as_ref(), &[root.output.columns[2]]);
-        assert_eq!(
-            root.output_properties
-                .ordering
-                .iter()
-                .map(|key| key.value)
-                .collect::<Vec<_>>(),
-            vec![root.output.columns[2]]
-        );
-
-        let bucket_reads = FinalizedProviderReadSet::single_for_test(
-            binding,
-            ProviderReadOccurrenceId::new(0),
-            bucket_contract,
-            novarocks_physical_plan::ScanReadBudget {
-                max_batch_rows: 1024,
-                max_batch_bytes: 1 << 20,
-            },
-        );
-        let bucket_plan = lower_final_physical_plan_with_provider_reads(
-            &plan,
-            version(),
-            dop(),
-            bucket_reads,
-            crate::functions::builtin_sql_function_catalog().snapshot(),
-            false,
-            crate::constant::test_constant_policy(),
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .unwrap()
-        .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .expect("interleaved bucket scan output must finish validation")
-        .plan()
-        .clone();
-        let bucket_fragment = bucket_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
-        let bucket_root = bucket_fragment
-            .nodes()
-            .get(&bucket_fragment.root())
-            .unwrap();
-        let Distribution::BucketShuffle { keys, .. } = &bucket_root.output_properties.distribution
-        else {
-            panic!("expected provider bucket-shuffle distribution");
-        };
-        assert_eq!(keys.as_ref(), &[bucket_root.output.columns[2]]);
-        assert_eq!(
-            bucket_root
-                .output_properties
-                .ordering
-                .iter()
-                .map(|key| key.value)
-                .collect::<Vec<_>>(),
-            vec![bucket_root.output.columns[2]]
-        );
     }
 
     #[test]
@@ -17021,7 +16602,9 @@ mod tests {
         let NodeKind::Values { rows } = &root.kind else {
             panic!("expected Values root");
         };
-        let expression = fragment.expressions().get(rows[0][0]).unwrap();
+        let expression = fragment
+            .root_expression(fragment.root(), rows[0][0])
+            .unwrap();
         assert_eq!(expression.ty, ValueType::new(DataType::Int32, false));
         let value = checked_constant_for_test(&final_plan, expression);
         assert_eq!(value.value_type(), &expression.ty);
@@ -17041,7 +16624,9 @@ mod tests {
         let NodeKind::Values { rows } = &root.kind else {
             panic!("expected Values root");
         };
-        let first = fragment.expressions().get(rows[0][0]).unwrap();
+        let first = fragment
+            .root_expression(fragment.root(), rows[0][0])
+            .unwrap();
         assert_eq!(first.ty, ValueType::new(DataType::Float64, true));
         let ContractExprKind::Cast {
             expr: source,
@@ -17052,7 +16637,7 @@ mod tests {
             panic!("Int64 row requires an actual carrier conversion")
         };
         assert_eq!(target, &DataType::Float64);
-        let source = fragment.expressions().get(*source).unwrap();
+        let source = fragment.unit(root.id).unwrap().definition(*source).unwrap();
         assert_eq!(source.ty, ValueType::new(DataType::Int64, false));
         assert_eq!(
             checked_constant_for_test(&final_plan, source)
@@ -17060,7 +16645,9 @@ mod tests {
                 .unwrap(),
             Some(7)
         );
-        let second = fragment.expressions().get(rows[1][0]).unwrap();
+        let second = fragment
+            .root_expression(fragment.root(), rows[1][0])
+            .unwrap();
         assert_eq!(second.ty, ValueType::new(DataType::Float64, true));
         let value = checked_constant_for_test(&final_plan, second);
         assert_eq!(value.value_type(), &second.ty);
@@ -17117,7 +16704,9 @@ mod tests {
             panic!("expected Values root");
         };
         for (row, column) in null_cells {
-            let expression = fragment.expressions().get(rows[row][column]).unwrap();
+            let expression = fragment
+                .root_expression(fragment.root(), rows[row][column])
+                .unwrap();
             assert_eq!(
                 expression.ty,
                 ValueType::new(columns[column].value_type.data_type().clone(), true),
@@ -17791,16 +17380,11 @@ mod tests {
         assert_eq!(spec.order_by.len(), 1);
         assert_eq!(spec.order_by[0].direction, SortDirection::Descending);
         assert_eq!(spec.order_by[0].null_ordering, NullOrdering::First);
-        let expression = fragment
-            .expressions()
-            .get(spec.expressions[0].expression)
-            .unwrap();
-        let ContractExprKind::WindowCall {
-            function, frame, ..
-        } = &expression.kind
-        else {
-            panic!("expected WindowCall");
-        };
+        let novarocks_physical_plan::WindowCallSpec {
+            binding: function,
+            frame,
+            ..
+        } = &spec.calls[0];
         assert_eq!(function.function_id, binding.function_id);
         assert!(matches!(
             frame,
@@ -19415,10 +18999,16 @@ mod tests {
             };
             let aligned = fragment.values().get(&input_mappings[1][0]).unwrap();
             assert_eq!(aligned.ty, ValueType::new(DataType::Utf8, true));
-            let ValueOrigin::Expr { expr, .. } = aligned.origin else {
+            let ValueOrigin::Expr {
+                node: expression_node,
+                root: expression_root,
+            } = aligned.origin
+            else {
                 panic!("typed NULL projection");
             };
-            let expression = fragment.expressions().get(expr).unwrap();
+            let expression = fragment
+                .root_expression(expression_node, expression_root)
+                .unwrap();
             assert!(matches!(expression.kind, ContractExprKind::Constant(_)));
             assert!(
                 checked_constant_for_test(&plan, expression)
@@ -19856,7 +19446,9 @@ mod tests {
             panic!("expected GenerateSeries root");
         };
         let literal = |expression| {
-            let expression = fragment.expressions().get(expression).unwrap();
+            let expression = fragment
+                .root_expression(fragment.root(), expression)
+                .unwrap();
             checked_constant_for_test(&final_plan, expression)
                 .try_i64()
                 .unwrap()
@@ -20257,9 +19849,11 @@ mod tests {
         assert_eq!(parse_decimal128("1200", -2).unwrap(), 12);
         assert!(parse_decimal128("12.34", 1).is_err());
         assert!(
-            lower_literal(
+            crate::constant::admit_syntax_constant(
                 &LiteralValue::Decimal("999".to_string()),
                 &ValueType::new(DataType::Decimal128(2, 0), false),
+                crate::test_constants::policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .is_err()
         );
@@ -20289,7 +19883,9 @@ mod tests {
         let NodeKind::Values { rows } = &root.kind else {
             panic!("expected Values root");
         };
-        let expression = fragment.expressions().get(rows[0][0]).unwrap();
+        let expression = fragment
+            .root_expression(fragment.root(), rows[0][0])
+            .unwrap();
         assert_eq!(
             expression.ty.logical_type(),
             novarocks_type_contract::ValueLogicalType::LargeInt
@@ -20338,44 +19934,104 @@ mod tests {
                 })),
             },
         ];
-        for kind in kinds {
+        for (ordinal, kind) in kinds.into_iter().enumerate() {
             let expression = TypedExpr {
                 kind,
                 value_type: ValueType::new(DataType::Boolean, false),
             };
-            let final_plan = finish_for_test(&values(
-                vec![column(1, "answer", DataType::Boolean, false)],
-                vec![vec![expression]],
-            ))
-            .unwrap();
-            let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
-            let mut count = 0;
-            for (_, expression) in fragment.expressions().iter() {
-                if let ContractExprKind::FunctionCall { function, args } = &expression.kind {
+            struct ConversionObserver {
+                calls: usize,
+            }
+            impl original_emission_test_observer::OriginalEmissionObserver for ConversionObserver {
+                fn observe(
+                    &mut self,
+                    view: original_emission_test_observer::OriginalEmissionView<'_>,
+                    _work: &mut CompileCheckpoints<'_>,
+                ) -> Result<(), ContractLoweringError> {
+                    self.calls += 1;
+                    let mut count = 0;
+                    for builder in view.fragments().values() {
+                        for (_, node) in builder.construction_nodes() {
+                            let Some(unit) = builder.construction_unit(node.id) else {
+                                continue;
+                            };
+                            for expression in unit.definitions() {
+                                if let ContractExprKind::FunctionCall { function, args } =
+                                    &expression.kind
+                                {
+                                    assert_eq!(
+                                        function.function_id.as_str(),
+                                        "builtin.scalar/value_domain_conversion/v1"
+                                    );
+                                    assert!(
+                                        function
+                                            .overload
+                                            .as_str()
+                                            .ends_with("signed_to_largeint/v1")
+                                    );
+                                    assert_eq!(
+                                        expression.ty.logical_type(),
+                                        novarocks_type_contract::ValueLogicalType::LargeInt
+                                    );
+                                    assert_eq!(
+                                        unit.definition(args[0]).unwrap().ty,
+                                        ValueType::new(DataType::Int64, false)
+                                    );
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
                     assert_eq!(
-                        function.function_id.as_str(),
-                        "builtin.scalar/value_domain_conversion/v1"
+                        count, 1,
+                        "each exact signed comparison operand needs its real conversion"
                     );
-                    assert!(
-                        function
-                            .overload
-                            .as_str()
-                            .ends_with("signed_to_largeint/v1")
-                    );
-                    assert_eq!(
-                        expression.ty.logical_type(),
-                        novarocks_type_contract::ValueLogicalType::LargeInt
-                    );
-                    assert_eq!(
-                        fragment.expressions().get(args[0]).unwrap().ty,
-                        ValueType::new(DataType::Int64, false)
-                    );
-                    count += 1;
+                    Ok(())
                 }
             }
+            let source = values(
+                vec![column(1, "answer", DataType::Boolean, false)],
+                vec![vec![expression]],
+            );
+            let control = crate::compiler::SqlCompileControl::unbounded();
+            let mut observer = ConversionObserver { calls: 0 };
+            let result =
+                original_emission_test_observer::lower_read_with_original_emission_observer(
+                    &source,
+                    version(),
+                    dop(),
+                    None,
+                    crate::functions::builtin_sql_function_catalog().snapshot(),
+                    false,
+                    crate::constant::test_constant_policy(),
+                    &control,
+                    &mut observer,
+                );
+            assert_eq!(observer.calls, 1);
+            if ordinal != 1 {
+                // Equality, BETWEEN and the CASE comparison retain the real
+                // LargeInt recipe. Only native IN excludes this profile.
+                result.unwrap().finish_observed(&control).unwrap();
+                continue;
+            }
+            let error = match result {
+                Ok(_) => panic!("native LargeInt IN unexpectedly completed"),
+                Err(error) => error,
+            };
+            let ContractLoweringError::Semantics(
+                super::super::package_semantics::PackageSemanticsError::PrimitiveSource {
+                    source,
+                    cast: None,
+                },
+            ) = error
+            else {
+                panic!(
+                    "native LargeInt comparison {ordinal} must retain its unsupported profile: {error:?}"
+                );
+            };
             assert_eq!(
-                count, 1,
-                "each exact signed comparison operand needs its real conversion"
+                source.downcast_ref::<novarocks_functions::ComparisonPrepareError>(),
+                Some(&novarocks_functions::ComparisonPrepareError::Unsupported),
             );
         }
     }
@@ -20383,9 +20039,11 @@ mod tests {
     #[test]
     fn largeint_literal_identity_cannot_be_authored_as_opaque_fixed_binary() {
         assert!(
-            lower_literal(
+            crate::constant::admit_syntax_constant(
                 &LiteralValue::LargeInt(7),
-                &ValueType::new(DataType::FixedSizeBinary(16), false)
+                &ValueType::new(DataType::FixedSizeBinary(16), false),
+                crate::test_constants::policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .is_err()
         );
@@ -20407,7 +20065,9 @@ mod tests {
         let NodeKind::Values { rows } = &root.kind else {
             panic!("expected Values root")
         };
-        let expression = fragment.expressions().get(rows[0][0]).unwrap();
+        let expression = fragment
+            .root_expression(fragment.root(), rows[0][0])
+            .unwrap();
         let ContractExprKind::FunctionCall { function, args } = &expression.kind else {
             panic!("signed assignment must have a real conversion owner");
         };
@@ -20426,7 +20086,12 @@ mod tests {
             novarocks_type_contract::ValueLogicalType::LargeInt
         );
         assert_eq!(
-            fragment.expressions().get(args[0]).unwrap().ty,
+            fragment
+                .unit(root.id)
+                .unwrap()
+                .definition(args[0])
+                .unwrap()
+                .ty,
             ValueType::new(DataType::Int64, false)
         );
     }
@@ -20477,7 +20142,10 @@ mod tests {
         assert_eq!(final_plan.constants().entries().len(), 16);
         let mut occurrences = BTreeSet::new();
         let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
-        assert_eq!(fragment.expressions().len(), 65_536);
+        assert_eq!(
+            fragment.unit(fragment.root()).unwrap().definitions().len(),
+            65_536
+        );
         let root = fragment.nodes().get(&fragment.root()).unwrap();
         let NodeKind::Values { rows } = &root.kind else {
             panic!("expected Values root");
@@ -20487,10 +20155,17 @@ mod tests {
             assert_eq!(expressions.len(), 4);
             for (col, expression) in expressions.iter().enumerate() {
                 assert!(
-                    occurrences.insert(*expression),
+                    occurrences.insert(
+                        fragment
+                            .root_expression(fragment.root(), *expression)
+                            .unwrap()
+                            .id
+                    ),
                     "each original cell retains its own expression occurrence"
                 );
-                let expression = fragment.expressions().get(*expression).unwrap();
+                let expression = fragment
+                    .root_expression(fragment.root(), *expression)
+                    .unwrap();
                 assert_eq!(expression.ty, ValueType::new(DataType::Utf8, true));
                 let value = checked_constant_for_test(&final_plan, expression);
                 assert_eq!(value.ordinal(), (row % 4096) as u32);
@@ -20628,8 +20303,17 @@ mod tests {
         let mut occurrences = BTreeSet::new();
         for (row, cells) in rows.iter().enumerate() {
             for (column, expression) in cells.iter().enumerate() {
-                assert!(occurrences.insert(*expression));
-                let expression = fragment.expressions().get(*expression).unwrap();
+                assert!(
+                    occurrences.insert(
+                        fragment
+                            .root_expression(fragment.root(), *expression)
+                            .unwrap()
+                            .id
+                    )
+                );
+                let expression = fragment
+                    .root_expression(fragment.root(), *expression)
+                    .unwrap();
                 let value = checked_constant_for_test(&plan, expression);
                 if column == 0 {
                     assert_eq!(
@@ -20690,7 +20374,9 @@ mod tests {
             let NodeKind::Values { rows } = &root.kind else {
                 panic!("values");
             };
-            let expression = fragment.expressions().get(rows[0][0]).unwrap();
+            let expression = fragment
+                .root_expression(fragment.root(), rows[0][0])
+                .unwrap();
             assert_eq!(expression.ty, ValueType::new(carrier.clone(), false));
             let constant = checked_constant_for_test(&plan, expression);
             assert_eq!(constant.pool().array().data_type(), &carrier);
@@ -20708,7 +20394,9 @@ mod tests {
         let NodeKind::Values { rows } = &root.kind else {
             panic!("expected Values root")
         };
-        let expression = fragment.expressions().get(rows[0][0]).unwrap();
+        let expression = fragment
+            .root_expression(fragment.root(), rows[0][0])
+            .unwrap();
         assert_eq!(expression.ty, ValueType::new(DataType::Int32, false));
         assert_eq!(
             checked_constant_for_test(&final_plan, expression)
@@ -20828,62 +20516,6 @@ impl From<novarocks_physical_plan::CallRequestError> for ContractLoweringError {
     }
 }
 
-fn register_constant_source_observed(
-    plan_builder: &mut PlanBuilder,
-    sources: &mut BTreeMap<
-        novarocks_constant_contract::ConstantBackingIdentity,
-        novarocks_physical_plan::ConstantPoolId,
-    >,
-    next_pool: &mut Option<u32>,
-    value: &novarocks_constant_contract::ConstantValue,
-    ty: &ValueType,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<novarocks_physical_plan::ConstantReference, ContractLoweringError> {
-    work.flush()?;
-    if !ty.exactly_equals_observed(value.value_type(), || {
-        work.step().map_err(ContractLoweringError::from)
-    })? {
-        return Err(ContractLoweringError::InvalidLiteral {
-            kind: "checked constant",
-            detail: "constant source differs from its complete expression type".into(),
-        });
-    }
-    let source = value.pool().backing_identity();
-    work.step()?;
-    let existing = sources.get(&source);
-    work.step()?;
-    let pool = match existing {
-        Some(id) => *id,
-        None => {
-            let next = (*next_pool).ok_or(ContractLoweringError::IdentitySpaceExhausted(
-                "constant pool",
-            ))?;
-            let id = novarocks_physical_plan::ConstantPoolId::new(next);
-            work.flush()?;
-            let pool = value.pool().clone();
-            work.step()?;
-            let inserted = plan_builder.insert_constant_pool(id, pool);
-            if let Err(novarocks_physical_plan::ConstantReferenceError::Control(cause)) = &inserted
-            {
-                return Err(ContractLoweringError::Control(cause.clone()));
-            }
-            work.step()?;
-            work.flush()?;
-            inserted?;
-            work.flush()?;
-            sources.insert(source, id);
-            work.step()?;
-            work.flush()?;
-            *next_pool = next.checked_add(1);
-            id
-        }
-    };
-    Ok(novarocks_physical_plan::ConstantReference {
-        pool,
-        ordinal: value.ordinal(),
-    })
-}
-
 #[cfg(test)]
 mod constant_limit_category_tests {
     use super::*;
@@ -20957,3 +20589,70 @@ mod constant_limit_category_tests {
         }
     }
 }
+
+impl From<novarocks_constant_contract::ConstantTableError> for ContractLoweringError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(novarocks_physical_plan::ConstantReferenceError::from(error))
+    }
+}
+
+#[cfg(test)]
+pub(super) fn pure_node_effects_for_test(
+    fragment: &Fragment,
+) -> BTreeMap<NodeId, NodeExpressionEffects> {
+    // These fixed relational fixtures contain only literal and input reads.
+    // Their expected argument effect is pure. This test setup borrows the real
+    // installed unit/uses; it neither derives control nor prepares a call.
+    fragment
+        .nodes()
+        .values()
+        .filter_map(|node| {
+            node.expressions.as_ref().map(|unit| {
+                assert!(
+                    unit.definitions().iter().all(|definition| matches!(
+                        definition.kind,
+                        ContractExprKind::Value(_) | ContractExprKind::Constant(_)
+                    )),
+                    "the pure argument fixture must declare any computed behavior explicitly"
+                );
+                assert!(unit.claims().is_empty());
+                let summaries = unit
+                    .control_flow()
+                    .uses()
+                    .iter()
+                    .map(|(&id, invocation)| {
+                        (
+                            id,
+                            novarocks_functions::ScopedExpressionEffects::pure_value(
+                                invocation.context,
+                            ),
+                        )
+                    })
+                    .collect();
+                (
+                    node.id,
+                    NodeExpressionEffects {
+                        unit: unit.clone(),
+                        summaries,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(super) fn node_effects_with_test_summaries(
+    unit: Arc<novarocks_expression_contract::BoundExprSet>,
+    summaries: BTreeMap<
+        novarocks_type_contract::ExpressionUseId,
+        novarocks_functions::ScopedExpressionEffects,
+    >,
+) -> NodeExpressionEffects {
+    // Direct-component tests deliberately supply missing or conservative child
+    // facts to the original relation consumer. This is not a production issuer.
+    NodeExpressionEffects { unit, summaries }
+}
+
+#[cfg(test)]
+pub(in crate::planner::distributed::build) use standalone_scalar::tests::sealed_standalone_source_for_effects;

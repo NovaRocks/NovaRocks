@@ -29,10 +29,10 @@ use arrow_array::{ArrayRef, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompileControlError,
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
-    ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
-    FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
-    SemanticParameters, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
+    DecimalOverflowPolicy, ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior,
+    FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility,
+    ObservableEffects, SemanticParameters, WindowBound, WindowFrame, WindowFrameExclusion,
+    WindowFrameUnits,
 };
 use std::{
     sync::{
@@ -204,11 +204,10 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
-                use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(9),
-                demand: EvaluationDemand::Value,
-            },
+            context: (novarocks_type_contract::RelationEffectContext::call(
+                novarocks_type_contract::RelationCallId::new(0),
+            ))
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.argument_uses),
             function_id: &self.id,
             kind: self.kind,
@@ -336,7 +335,7 @@ impl Fixture {
             self,
             input,
             self.selected.clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             options(),
             &CompileControl::default(),
         )
@@ -1216,7 +1215,7 @@ fn fresh_and_frozen_specialization_refine_prepare_once_preserve_exact_options_an
         owner.counts.refine.store(0, Ordering::Relaxed);
         owner.counts.prepare.store(0, Ordering::Relaxed);
         let input = owner.input();
-        let arguments = ScopedExpressionEffects::pure_value(input.context);
+        let arguments = ScopedRelationalEffects::pure_value(input.context.relation().unwrap());
         let result = if frozen {
             specialize_frozen_window(
                 &owner,
@@ -1246,7 +1245,10 @@ fn fresh_and_frozen_specialization_refine_prepare_once_preserve_exact_options_an
             owner.selected.as_ref()
         ));
         assert_eq!(result.prepared().contract().options(), &prepared_options);
-        let effects = result.effects().for_use(input.context).unwrap();
+        let effects = result
+            .effects()
+            .for_use(input.context.relation().unwrap())
+            .unwrap();
         if let Some(previous) = previous {
             assert_eq!(previous, effects);
         }
@@ -1264,7 +1266,7 @@ fn wrong_kind_frozen_scope_and_returned_contract_reject_at_correct_preparation_b
             &owner,
             input,
             owner.selected.clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             options(),
             &CompileControl::default()
         ),
@@ -1283,20 +1285,20 @@ fn wrong_kind_frozen_scope_and_returned_contract_reject_at_correct_preparation_b
             input,
             owner.selected.clone(),
             &frozen,
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             options(),
             &CompileControl::default()
         ),
         Err(FunctionSpecializationFailure::InvalidInput(_))
     ));
-    let mut context = input.context;
-    context.domain = EvaluationDomainId::new(99);
+    let mut context = input.context.relation().unwrap();
+    context.identity.call = novarocks_type_contract::RelationCallId::new(99);
     assert!(matches!(
         specialize_window(
             &owner,
             input,
             owner.selected.clone(),
-            ScopedExpressionEffects::pure_value(context),
+            ScopedRelationalEffects::pure_value(context),
             options(),
             &CompileControl::default()
         ),
@@ -1311,7 +1313,7 @@ fn wrong_kind_frozen_scope_and_returned_contract_reject_at_correct_preparation_b
             &owner,
             input,
             owner.selected.clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             options(),
             &CompileControl::default()
         ),
@@ -1342,7 +1344,8 @@ fn compile_entry_and_positive_quantum_preserve_typed_controls_before_prepare() {
                 ..CompileControl::default()
             };
             for frozen in [false, true] {
-                let arguments = ScopedExpressionEffects::pure_value(input.context);
+                let arguments =
+                    ScopedRelationalEffects::pure_value(input.context.relation().unwrap());
                 let result = if frozen {
                     specialize_frozen_window(
                         &owner,

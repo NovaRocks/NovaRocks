@@ -17,11 +17,11 @@
 //! Actual TIME corpus journal loans and full SQL metadata profiles.
 use super::sql_test_source::sql_source;
 use arrow::datatypes::{DataType, TimeUnit};
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{
     FunctionArgument, FunctionResultType, FunctionValueType, PureCallLifecycle,
     ResolvedFunctionBinding,
 };
-use novarocks_physical_plan::ExprKind;
 use novarocks_sql::compiler::{
     SqlCallDependencySite, SqlCompileControl, builtin_sql_function_catalog,
 };
@@ -36,7 +36,7 @@ pub(super) fn bindings() -> Vec<ResolvedFunctionBinding> {
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let mut out = Vec::new();
     for fragment in owner.plan().fragments().values() {
-        for (_, source) in fragment.expressions().iter() {
+        for (_source_node, _unit, _, source) in super::sql_test_source::unit_definitions(fragment) {
             let ExprKind::FunctionCall { function, .. } = &source.kind else {
                 continue;
             };
@@ -45,7 +45,11 @@ pub(super) fn bindings() -> Vec<ResolvedFunctionBinding> {
             }
             let loan = owner
                 .borrow_call_dependency_observed(
-                    SqlCallDependencySite::Expression { fragment, source },
+                    SqlCallDependencySite::Expression {
+                        fragment,
+                        node: _source_node,
+                        source,
+                    },
                     &mut work,
                 )
                 .unwrap();

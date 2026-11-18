@@ -83,6 +83,16 @@ pub trait SqlFoldDependencyObserver: Send + Sync {
     ) -> Result<(), novarocks_type_contract::CompileControlError> {
         Ok(())
     }
+    /// Borrow the original completed required scalar source. This is not an
+    /// optional fold, a fragment publication, or statement-success evidence.
+    /// Default observers add no work or checkpoints.
+    fn observe_required_scalar_source_observed(
+        &self,
+        _source: &super::SqlAuthoredScalarUnit,
+        _control: &dyn PureCompileControl,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
+    }
 }
 
 /// Short-lived calculator/observer loan. Neither enters IR or published plans.

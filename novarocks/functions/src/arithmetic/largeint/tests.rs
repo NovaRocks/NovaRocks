@@ -26,7 +26,7 @@ use arrow_array::{
     builder::FixedSizeBinaryBuilder,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+    CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     arithmetic_result_value_type_with_op,
 };
@@ -89,7 +89,7 @@ fn large(nullable: bool) -> FunctionValueType {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(77),
-        domain: EvaluationDomainId::new(3),
+        region: EvaluationRegionId::new(3),
         demand: EvaluationDemand::Value,
     }
 }

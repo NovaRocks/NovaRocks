@@ -17,37 +17,70 @@
 
 use super::*;
 use arrow_schema::TimeUnit;
-use novarocks_physical_plan::ExprId;
+use novarocks_expression::StaticExprKind;
+use novarocks_functions::ConstantValue;
 use novarocks_type_contract::ValueLogicalType;
 
-fn literal_package(ty: FunctionValueType, literal: LiteralValue) -> Arc<FragmentPackage> {
+fn literal_package(value: ConstantValue) -> Arc<FragmentPackage> {
+    use novarocks_physical_plan::{ConstantPoolId, ConstantPools, ConstantReference};
+    let ty = value.value_type().clone();
+    let pool = ConstantPoolId::new(0);
+    let mut constants = ConstantPools::empty();
+    constants.insert(pool, value.pool().clone()).unwrap();
     let mut builder = FragmentBuilder::new(FragmentId::new(63));
     builder
         .add_values(NodeId::new(99), Box::from([Box::default()]), Box::default())
         .unwrap();
-    let expression = builder
-        .add_expression(NodeId::new(8), ty.clone(), ExprKind::Literal(literal))
+    let node = NodeId::new(8);
+    let definition = builder
+        .unit(node)
+        .unwrap()
+        .add(
+            None,
+            ty.clone(),
+            ExprKind::Constant(ConstantReference {
+                pool,
+                ordinal: value.ordinal(),
+            }),
+        )
+        .unwrap();
+    let root = builder
+        .unit(node)
+        .unwrap()
+        .root(
+            definition,
+            EvaluationDemand::Value,
+            novarocks_expression_contract::RootScope::Port(0),
+        )
         .unwrap();
     let value = builder
-        .add_value(
-            ty.clone(),
-            ValueOrigin::Expr {
-                node: NodeId::new(8),
-                expr: expression,
-            },
-        )
+        .add_value(ty.clone(), ValueOrigin::Expr { node, root })
         .unwrap();
     builder
         .add_project(
-            NodeId::new(8),
+            node,
             NodeId::new(99),
-            Box::from([(expression, value)]),
+            Box::from([(root, value)]),
             Box::from([value]),
         )
         .unwrap();
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        &FixtureControl,
+        CompilePhase::Validate,
+    )
+    .unwrap();
+    let ports = builder.node_ports(node).unwrap();
+    let unit = builder
+        .take_unit_builder(node)
+        .unwrap()
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    builder.install_unit(node, Arc::new(unit)).unwrap();
     let fragment = builder
         .finish_definition(
-            NodeId::new(8),
+            node,
             FragmentSink::Result,
             PipelineDopDomain {
                 min: 1,
@@ -56,45 +89,9 @@ fn literal_package(ty: FunctionValueType, literal: LiteralValue) -> Arc<Fragment
             },
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
+        .unwrap()
+        .with_calls_observed(vec![], &FixtureControl)
         .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(17);
-    let mut invocations = vec![];
-    let bindings = roots
-        .sites()
-        .iter()
-        .enumerate()
-        .map(|(ordinal, (&site, root))| {
-            let use_id = ExpressionUseId::new(ordinal as u32 + 42);
-            invocations.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    domain,
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (site, use_id)
-        })
-        .collect();
-    let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let expression_uses =
-        PhysicalRootUses::try_new(&fragment, flow, bindings, &FixtureControl).unwrap();
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &FixtureControl).unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment.id(),
@@ -113,10 +110,9 @@ fn literal_package(ty: FunctionValueType, literal: LiteralValue) -> Arc<Fragment
             FragmentPackageInput {
                 version: PlanVersionId::try_new([63; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 fragment,
-                expression_uses,
-                calls,
+                statement_constant_policy: options(1).constants,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::try_new([]).unwrap(),
@@ -146,81 +142,150 @@ fn compile_literal(
         control,
     )
 }
-fn cases() -> Vec<(FunctionValueType, LiteralValue)> {
-    let mut cases = vec![
-        (
-            FunctionValueType::new(DataType::Boolean, false),
-            LiteralValue::Boolean(true),
-        ),
-        (
-            FunctionValueType::new(DataType::Int64, false),
-            LiteralValue::Int64(i64::MIN),
-        ),
-        (
-            FunctionValueType::new(DataType::UInt64, false),
-            LiteralValue::UInt64(u64::MAX),
-        ),
-        (
-            FunctionValueType::new(DataType::Float64, false),
-            LiteralValue::Float64Bits(0x7ff8_0000_0000_0042),
-        ),
-        (
-            FunctionValueType::try_with_logical_type(
-                DataType::FixedSizeBinary(16),
-                false,
-                ValueLogicalType::LargeInt,
-            )
-            .unwrap(),
-            LiteralValue::LargeInt(i128::MIN),
-        ),
-        (
-            FunctionValueType::new(DataType::Decimal128(38, -3), false),
-            LiteralValue::Decimal128(-123),
-        ),
-        (
-            FunctionValueType::new(DataType::Decimal256(76, 12), false),
-            LiteralValue::Decimal256([255; 32]),
-        ),
-        (
-            FunctionValueType::new(DataType::Date32, false),
-            LiteralValue::Date32(-1234),
-        ),
-    ];
-    cases.push((
+struct ScalarCase {
+    value: ConstantValue,
+    check: Box<dyn Fn(&ConstantValue)>,
+}
+fn cases(nullable: bool) -> Vec<ScalarCase> {
+    let mut cases = Vec::new();
+    macro_rules! case {
+        ($ty:expr, $factory:ident($($payload:expr),*), $getter:ident, $expected:expr) => {{
+            let ty = $ty.with_nullable(nullable).unwrap();
+            let value = ConstantValue::$factory(
+                Arc::new(ty.try_to_field("source").unwrap()),
+                ty,
+                $($payload,)*
+                options(1).constants,
+                CompilePhase::Validate,
+                &FixtureControl,
+            ).unwrap();
+            let expected = $expected;
+            cases.push(ScalarCase {
+                value,
+                check: Box::new(move |actual| assert_eq!(actual.$getter().unwrap(), Some(expected))),
+            });
+        }};
+    }
+    case!(
+        FunctionValueType::new(DataType::Boolean, false),
+        from_boolean(true),
+        try_boolean,
+        true
+    );
+    case!(
+        FunctionValueType::new(DataType::Int64, false),
+        from_i64(i64::MIN),
+        try_i64,
+        i64::MIN
+    );
+    case!(
+        FunctionValueType::new(DataType::UInt64, false),
+        from_u64(u64::MAX),
+        try_u64,
+        u64::MAX
+    );
+    case!(
+        FunctionValueType::new(DataType::Float64, false),
+        from_f64_bits(0x7ff8_0000_0000_0042),
+        try_f64_bits,
+        0x7ff8_0000_0000_0042
+    );
+    case!(
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::LargeInt
+        )
+        .unwrap(),
+        from_largeint(i128::MIN),
+        try_largeint,
+        i128::MIN
+    );
+    case!(
+        FunctionValueType::new(DataType::Decimal128(38, -3), false),
+        from_decimal128(-123),
+        try_decimal128,
+        -123
+    );
+    case!(
+        FunctionValueType::new(DataType::Decimal256(76, 12), false),
+        from_decimal256_be([255; 32]),
+        try_decimal256_be,
+        [255; 32]
+    );
+    case!(
+        FunctionValueType::new(DataType::Date32, false),
+        from_date32(-1234),
+        try_date32,
+        -1234
+    );
+    case!(
         FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
             .unwrap(),
-        LiteralValue::Utf8("{\"x\":17}".into()),
-    ));
-    cases.push((
+        from_utf8("{\"x\":17}"),
+        try_utf8,
+        "{\"x\":17}"
+    );
+    case!(
         FunctionValueType::try_with_logical_type(
             DataType::LargeBinary,
             false,
-            ValueLogicalType::Variant,
+            ValueLogicalType::Variant
         )
         .unwrap(),
-        LiteralValue::Binary(vec![0, 17, 255].into()),
-    ));
+        from_binary(&[0, 17, 255]),
+        try_binary,
+        &[0, 17, 255][..]
+    );
     for carrier in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
-        cases.push((
-            FunctionValueType::new(carrier, false),
-            LiteralValue::Utf8("µ\0雪".repeat(80).into()),
-        ));
+        let ty = FunctionValueType::new(carrier, nullable);
+        let expected = "µ\0雪".repeat(80);
+        let value = ConstantValue::from_utf8(
+            Arc::new(ty.try_to_field("source").unwrap()),
+            ty,
+            &expected,
+            options(1).constants,
+            CompilePhase::Validate,
+            &FixtureControl,
+        )
+        .unwrap();
+        cases.push(ScalarCase {
+            value,
+            check: Box::new(move |actual| {
+                assert_eq!(actual.try_utf8().unwrap(), Some(expected.as_str()))
+            }),
+        });
     }
     for carrier in [
         DataType::Binary,
         DataType::LargeBinary,
         DataType::BinaryView,
     ] {
-        cases.push((
-            FunctionValueType::new(carrier, false),
-            LiteralValue::Binary([0, 255, 17, 128].repeat(80).into()),
-        ));
+        let ty = FunctionValueType::new(carrier, nullable);
+        let expected = [0, 255, 17, 128].repeat(80);
+        let value = ConstantValue::from_binary(
+            Arc::new(ty.try_to_field("source").unwrap()),
+            ty,
+            &expected,
+            options(1).constants,
+            CompilePhase::Validate,
+            &FixtureControl,
+        )
+        .unwrap();
+        cases.push(ScalarCase {
+            value,
+            check: Box::new(move |actual| {
+                assert_eq!(actual.try_binary().unwrap(), Some(expected.as_slice()))
+            }),
+        });
     }
     for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
-        cases.push((
+        case!(
             FunctionValueType::new(DataType::Time64(unit), false),
-            LiteralValue::Time64(-17),
-        ));
+            from_time64(-17),
+            try_time64,
+            -17
+        );
     }
     for unit in [
         TimeUnit::Second,
@@ -229,10 +294,12 @@ fn cases() -> Vec<(FunctionValueType, LiteralValue)> {
         TimeUnit::Nanosecond,
     ] {
         for zone in [None, Some("+05:30".into())] {
-            cases.push((
+            case!(
                 FunctionValueType::new(DataType::Timestamp(unit, zone), false),
-                LiteralValue::Timestamp(-7654),
-            ));
+                from_timestamp(-7654),
+                try_timestamp,
+                -7654
+            );
         }
     }
     for (months, days, nanoseconds) in [
@@ -241,42 +308,28 @@ fn cases() -> Vec<(FunctionValueType, LiteralValue)> {
         (-17, -31, -123456789),
         (0, 0, 0),
     ] {
-        cases.push((
+        case!(
             FunctionValueType::new(
                 DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano),
-                false,
+                false
             ),
-            LiteralValue::IntervalMonthDayNano {
-                months,
-                days,
-                nanoseconds,
-            },
-        ));
+            from_interval_month_day_nano((months, days, nanoseconds)),
+            try_interval_month_day_nano,
+            (months, days, nanoseconds)
+        );
     }
     cases
 }
 #[test]
 fn exact_scalar_literals_compile_through_the_complete_package_owner() {
-    for (ty, literal) in cases() {
-        for nullable in [false, true] {
-            let ty = (ty.clone())
-                .with_nullable(nullable)
-                .expect("valid value root nullability transform");
-            let program = compile_literal(
-                literal_package(ty.clone(), literal.clone()),
-                &FixtureControl,
-            )
-            .unwrap();
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-            let constants = arena
-                .nodes()
+    for nullable in [false, true] {
+        for case in cases(nullable) {
+            let ty = case.value.value_type().clone();
+            let program = compile_literal(literal_package(case.value), &FixtureControl).unwrap();
+            let constants = program
+                .units()
                 .iter()
+                .flat_map(|unit| unit.definitions().nodes().iter())
                 .filter_map(|node| match node.kind() {
                     StaticExprKind::Constant(value) => Some(value),
                     _ => None,
@@ -288,59 +341,27 @@ fn exact_scalar_literals_compile_through_the_complete_package_owner() {
             assert_eq!(value.pool().array().data_type(), ty.data_type());
             assert_eq!(value.pool().array().len(), 1);
             assert!(!value.pool().array().is_null(0));
-            match &literal {
-                LiteralValue::Boolean(x) => assert_eq!(value.try_boolean().unwrap(), Some(*x)),
-                LiteralValue::Int64(x) => assert_eq!(value.try_i64().unwrap(), Some(*x)),
-                LiteralValue::UInt64(x) => assert_eq!(value.try_u64().unwrap(), Some(*x)),
-                LiteralValue::Float64Bits(x) => assert_eq!(value.try_f64_bits().unwrap(), Some(*x)),
-                LiteralValue::LargeInt(x) => assert_eq!(value.try_largeint().unwrap(), Some(*x)),
-                LiteralValue::Decimal128(x) => {
-                    assert_eq!(value.try_decimal128().unwrap(), Some(*x))
-                }
-                LiteralValue::Decimal256(x) => {
-                    assert_eq!(value.try_decimal256_be().unwrap(), Some(*x))
-                }
-                LiteralValue::Utf8(x) => assert_eq!(value.try_utf8().unwrap(), Some(x.as_ref())),
-                LiteralValue::Binary(x) => {
-                    assert_eq!(value.try_binary().unwrap(), Some(x.as_ref()))
-                }
-                LiteralValue::Date32(x) => assert_eq!(value.try_date32().unwrap(), Some(*x)),
-                LiteralValue::Time64(x) => assert_eq!(value.try_time64().unwrap(), Some(*x)),
-                LiteralValue::Timestamp(x) => assert_eq!(value.try_timestamp().unwrap(), Some(*x)),
-                LiteralValue::IntervalMonthDayNano {
-                    months,
-                    days,
-                    nanoseconds,
-                } => {
-                    assert_eq!(
-                        value.try_interval_month_day_nano().unwrap(),
-                        Some((*months, *days, *nanoseconds))
-                    );
-                }
-                _ => panic!("fixture has a ready non-NULL scalar source"),
-            }
+            (case.check)(value);
         }
     }
 }
 #[test]
 fn null_literals_preserve_the_declared_complete_type() {
-    for (mut ty, _) in cases() {
-        ty = ty.with_nullable(true).unwrap();
-        let program = compile_literal(
-            literal_package(ty.clone(), LiteralValue::Null),
+    for case in cases(true) {
+        let ty = case.value.value_type().clone();
+        let null = ConstantValue::null(
+            Arc::new(ty.try_to_field("source").unwrap()),
+            ty.clone(),
+            options(1).constants,
+            CompilePhase::Validate,
             &FixtureControl,
         )
         .unwrap();
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-        let value = arena
-            .nodes()
+        let program = compile_literal(literal_package(null), &FixtureControl).unwrap();
+        let value = program
+            .units()
             .iter()
+            .flat_map(|unit| unit.definitions().nodes().iter())
             .find_map(|node| match node.kind() {
                 StaticExprKind::Constant(value) => Some(value),
                 _ => None,
@@ -362,30 +383,29 @@ fn explicit_interval_components_reach_the_actual_project_root_without_packed_int
     );
     let program = compile_literal(
         literal_package(
-            ty.clone(),
-            LiteralValue::IntervalMonthDayNano {
-                months: -7,
-                days: 23,
-                nanoseconds: i64::MIN,
-            },
+            ConstantValue::from_interval_month_day_nano(
+                Arc::new(ty.try_to_field("source").unwrap()),
+                ty.clone(),
+                (-7, 23, i64::MIN),
+                options(1).constants,
+                CompilePhase::Validate,
+                &FixtureControl,
+            )
+            .unwrap(),
         ),
         &FixtureControl,
     )
     .unwrap();
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let site = ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(1),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+    let novarocks_local_program::ProgramNodeKind::Project { exprs, .. } =
+        program.graph().nodes()[1].kind()
+    else {
+        panic!("actual interval Project")
     };
-    let root = snapshot.roots().sites().get(&site).unwrap();
+    let reference = exprs[0];
+    let unit = &program.units()[reference.unit.index()];
+    let root = unit.root(reference.root).unwrap();
     assert_eq!(root.demand, EvaluationDemand::Value);
-    let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-    let node = arena.node(root.definition).unwrap();
+    let node = unit.definitions().node(root.definition).unwrap();
     let StaticExprKind::Constant(value) = node.kind() else {
         panic!("actual interval root must retain its authored ConstantValue");
     };
@@ -394,8 +414,8 @@ fn explicit_interval_components_reach_the_actual_project_root_without_packed_int
         value.try_interval_month_day_nano().unwrap(),
         Some((-7, 23, i64::MIN))
     );
-    let root_use = snapshot.bindings().get(&site).unwrap();
-    let invocation = &snapshot.flows()[&ProgramExpressionArena::Main].uses()[root_use];
+    let root_use = root.use_id;
+    let invocation = &unit.control_flow().uses()[&root_use];
     assert_eq!(invocation.definition, root.definition);
     assert!(invocation.arguments.is_empty());
 }

@@ -128,20 +128,32 @@ fn finish(expression: TypedExpr) -> SqlAuthoredPhysicalPlan {
     .finish_observed(&control)
     .unwrap()
 }
-fn conversion(owner: &SqlAuthoredPhysicalPlan) -> (&Fragment, &novarocks_physical_plan::ExprNode) {
+fn conversion(
+    owner: &SqlAuthoredPhysicalPlan,
+) -> (
+    &Fragment,
+    &novarocks_physical_plan::PhysicalNode,
+    &novarocks_expression_contract::ExprNode,
+) {
     owner
         .plan()
         .fragments()
         .values()
         .find_map(|fragment| {
-            fragment.expressions().iter().find_map(|(_, source)| {
-                if let ContractExprKind::FunctionCall { function, .. } = &source.kind
-                    && function.function_id.as_str() == CONVERSION
-                {
-                    Some((fragment, source))
-                } else {
-                    None
-                }
+            fragment.nodes().values().find_map(|node| {
+                node.expressions
+                    .as_ref()?
+                    .definitions()
+                    .iter()
+                    .find_map(|source| {
+                        if let ContractExprKind::FunctionCall { function, .. } = &source.kind
+                            && function.function_id.as_str() == CONVERSION
+                        {
+                            Some((fragment, node, source))
+                        } else {
+                            None
+                        }
+                    })
             })
         })
         .expect("real conversion emission")
@@ -149,11 +161,12 @@ fn conversion(owner: &SqlAuthoredPhysicalPlan) -> (&Fragment, &novarocks_physica
 fn loan<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     fragment: &'a Fragment,
-    source: &'a novarocks_physical_plan::ExprNode,
+    unit_node: &'a novarocks_physical_plan::PhysicalNode,
+    source: &'a novarocks_expression_contract::ExprNode,
     control: &dyn PureCompileControl,
 ) -> Result<CheckedExpressionLogicalSourceEntry<'a>, SqlSourceJournalError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-    let result = owner.checked_conversion_source_observed(fragment, source, &mut work);
+    let result = owner.checked_conversion_source_observed(fragment, unit_node, source, &mut work);
     if matches!(&result, Err(SqlSourceJournalError::Control(_))) {
         return result;
     }
@@ -162,10 +175,17 @@ fn loan<'a>(
 }
 fn source_constant(
     owner: &SqlAuthoredPhysicalPlan,
-    fragment: &Fragment,
+    unit_node: &novarocks_physical_plan::PhysicalNode,
     id: ExprId,
 ) -> novarocks_functions::ConstantValue {
-    let ContractExprKind::Constant(reference) = fragment.expressions().get(id).unwrap().kind else {
+    let ContractExprKind::Constant(reference) = unit_node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .definition(id)
+        .unwrap()
+        .kind
+    else {
         panic!("original constant channel")
     };
     let control = Control::default();
@@ -192,8 +212,8 @@ fn conversion_journal_constant_input_preserves_original_none_and_full_binding_lo
         ValueType::new(DataType::Utf8, false),
         DecimalOverflowPolicy::ReportError,
     ));
-    let (fragment, source) = conversion(&owner);
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = conversion(&owner);
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     let request = receipt.captured().request();
     assert_eq!(request.arguments.len(), 1);
     let FunctionArgument::Value {
@@ -217,7 +237,7 @@ fn conversion_journal_constant_input_preserves_original_none_and_full_binding_lo
         matches!(&projected[0], FunctionArgument::Value { value_type, constant: None }
         if value_type == &json(false))
     );
-    let actual = source_constant(&owner, fragment, receipt.arguments()[0]);
+    let actual = source_constant(&owner, unit_node, receipt.arguments()[0]);
     assert_eq!(actual.ordinal(), 1);
     assert!(Arc::ptr_eq(actual.pool().array(), original.pool().array()));
     assert!(Arc::ptr_eq(
@@ -242,7 +262,7 @@ fn conversion_journal_constant_input_preserves_original_none_and_full_binding_lo
     ));
     assert_eq!(expected, &ValueType::new(DataType::Utf8, false));
     let clone = owner.clone();
-    let other = loan(&clone, fragment, source, &Control::default()).unwrap();
+    let other = loan(&clone, fragment, unit_node, source, &Control::default()).unwrap();
     assert!(Arc::ptr_eq(
         owner.function_catalog(),
         clone.function_catalog()
@@ -261,13 +281,16 @@ fn conversion_journal_intermediate_call_is_separate_from_following_cast() {
         ValueType::new(DataType::LargeUtf8, false),
         DecimalOverflowPolicy::OutputNull,
     ));
-    let (fragment, source) = conversion(&owner);
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = conversion(&owner);
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     assert_eq!(source.ty, ValueType::new(DataType::Utf8, false));
-    let wrapper = fragment
-        .expressions()
+    let wrapper = unit_node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .definitions()
         .iter()
-        .find_map(|(_, node)| match &node.kind {
+        .find(|node| match &node.kind {
             ContractExprKind::Cast {
                 expr,
                 target,
@@ -276,16 +299,16 @@ fn conversion_journal_intermediate_call_is_separate_from_following_cast() {
             } if *expr == source.id => {
                 assert_eq!(target, &DataType::LargeUtf8);
                 assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
-                Some(node)
+                true
             }
-            _ => None,
+            _ => false,
         })
         .expect("actual second-stage same-domain CAST");
     assert_ne!(wrapper.id, source.id);
     assert_eq!(wrapper.ty, ValueType::new(DataType::LargeUtf8, false));
     assert!(std::ptr::eq(receipt.source(), source));
     assert!(matches!(
-        loan(&owner, fragment, wrapper, &Control::default()),
+        loan(&owner, fragment, unit_node, wrapper, &Control::default()),
         Err(SqlSourceJournalError::MissingEntry)
     ));
 }
@@ -298,20 +321,24 @@ fn conversion_journal_identity_and_null_fastpaths_have_no_phantom_source() {
         target.clone(),
         DecimalOverflowPolicy::ReportError,
     ));
+    let mut actual_targets = 0;
     for fragment in owner.plan().fragments().values() {
-        assert!(!fragment.expressions().iter().any(|(_, source)| matches!(&source.kind,
-            ContractExprKind::FunctionCall { function, .. } if function.function_id.as_str() == CONVERSION)));
-        let source = fragment
-            .expressions()
-            .iter()
-            .find(|(_, node)| node.ty == target)
-            .unwrap()
-            .1;
-        assert!(matches!(
-            loan(&owner, fragment, source, &Control::default()),
-            Err(SqlSourceJournalError::MissingEntry)
-        ));
+        for unit_node in fragment.nodes().values() {
+            let Some(unit) = &unit_node.expressions else {
+                continue;
+            };
+            assert!(!unit.definitions().iter().any(|source| matches!(&source.kind,
+                ContractExprKind::FunctionCall { function, .. } if function.function_id.as_str() == CONVERSION)));
+            for source in unit.definitions().iter().filter(|node| node.ty == target) {
+                assert!(matches!(
+                    loan(&owner, fragment, unit_node, source, &Control::default()),
+                    Err(SqlSourceJournalError::MissingEntry)
+                ));
+                actual_targets += 1;
+            }
+        }
     }
+    assert!(actual_targets > 0, "actual identity source remains present");
 
     // The NULL fastpath is an original visitor emission fixture only, not
     // publication proof. It types the NULL where it is lowered, so no
@@ -340,12 +367,13 @@ fn conversion_journal_identity_and_null_fastpaths_have_no_phantom_source() {
         .unwrap();
     assert!(visitor.call_sources.expression_entries.is_empty());
     let fragment = &visitor.fragments[&ROOT_FRAGMENT_ID];
-    assert!(!fragment.expressions().iter().any(|(_, source)| matches!(&source.kind,
+    let unit = fragment.construction_unit(NodeId::new(73)).unwrap();
+    assert!(!unit.definitions().any(|source| matches!(&source.kind,
         ContractExprKind::FunctionCall { function, .. } if function.function_id.as_str() == CONVERSION)));
-    let source = fragment.expressions().get(id).unwrap();
+    let source = unit.definition(id).unwrap();
     assert_eq!(source.ty, ValueType::new(DataType::Utf8, true));
     assert!(matches!(source.kind, ContractExprKind::Constant(_)));
-    assert_eq!(fragment.expressions().len(), 1);
+    assert_eq!(unit.len(), 1);
     visitor.work.finish().unwrap();
 }
 
@@ -389,23 +417,36 @@ fn conversion_journal_lambda_scope_matches_the_actual_intermediate_emission() {
     let lambda = visitor
         .lower_expression(NodeId::new(73), &expression, &BTreeMap::new())
         .unwrap();
-    let (_, entry) = visitor
+    let (key, entry) = visitor
         .call_sources
         .expression_entries
         .iter()
         .next()
         .unwrap();
+    let crate::planner::distributed::build::unit_source::ScalarSourceSite::Node {
+        fragment: _,
+        node: key_node,
+    } = key.site.clone()
+    else {
+        panic!("the original fixture owns a real node source")
+    };
     assert_eq!(visitor.call_sources.expression_entries.len(), 1);
     assert_eq!(entry.lambda_scope, Some(lambda));
-    let source=visitor.fragments[&ROOT_FRAGMENT_ID].expressions().iter().find_map(|(_,node)|
-        matches!(&node.kind,ContractExprKind::FunctionCall { function,.. } if function.function_id.as_str()==CONVERSION).then_some(node)).unwrap();
-    assert_eq!(source.owner, NodeId::new(73));
+    let source=visitor.fragments[&ROOT_FRAGMENT_ID].construction_unit(key_node).unwrap().definitions().find(|node|
+        matches!(&node.kind,ContractExprKind::FunctionCall { function,.. } if function.function_id.as_str()==CONVERSION)).unwrap();
+    assert_eq!(key_node, NodeId::new(73));
     assert_eq!(source.lambda_scope, Some(lambda));
     let FunctionArgument::Value { constant, .. } = &entry.captured.request().arguments[0] else {
         unreachable!()
     };
     assert!(constant.is_none());
-    validate_expression_source_entry_observed(entry, source, &mut visitor.work).unwrap();
+    validate_expression_source_entry_observed(
+        entry,
+        crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(key_node),
+        source,
+        &mut visitor.work,
+    )
+    .unwrap();
     visitor.work.finish().unwrap();
 }
 
@@ -416,12 +457,14 @@ fn conversion_journal_foreign_missing_and_each_loan_callback_preserve_original_c
         ValueType::new(DataType::Utf8, false),
         DecimalOverflowPolicy::OutputNull,
     ));
-    let (fragment, source) = conversion(&owner);
+    let (fragment, unit_node, source) = conversion(&owner);
     let foreign_fragment = fragment.clone();
     let foreign_source = source.clone();
-    let missing = fragment
-        .expressions()
-        .get(match &source.kind {
+    let missing = unit_node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .definition(match &source.kind {
             ContractExprKind::FunctionCall { args, .. } => args[0],
             _ => unreachable!(),
         })
@@ -433,7 +476,7 @@ fn conversion_journal_foreign_missing_and_each_loan_callback_preserve_original_c
         (fragment, missing),
     ] {
         let control = Control::default();
-        let result = loan(&owner, fragment, source, &control);
+        let result = loan(&owner, fragment, unit_node, source, &control);
         if std::ptr::eq(source, missing) {
             assert!(matches!(result, Err(SqlSourceJournalError::MissingEntry)));
         } else if std::ptr::eq(fragment, &foreign_fragment) || std::ptr::eq(source, &foreign_source)
@@ -458,7 +501,7 @@ fn conversion_journal_foreign_missing_and_each_loan_callback_preserve_original_c
                     ..Control::default()
                 };
                 assert!(
-                    matches!(loan(&owner,fragment,source,&control),Err(SqlSourceJournalError::Control(actual)) if actual==cause)
+                    matches!(loan(&owner, fragment, unit_node, source,&control),Err(SqlSourceJournalError::Control(actual)) if actual==cause)
                 );
                 assert_eq!(control.trace(), trace[..=stop]);
             }

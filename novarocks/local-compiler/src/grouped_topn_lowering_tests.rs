@@ -54,7 +54,7 @@ fn append_count_chain(
             let ty = builder.value(*key).unwrap().ty.clone();
             groups.push((
                 builder
-                    .add_expression(node, ty, ExprKind::Value(*key))
+                    .fixture_value_root(node, ty, ExprKind::Value(*key))
                     .unwrap(),
                 *key,
             ));
@@ -63,7 +63,7 @@ fn append_count_chain(
             .map(|value| {
                 let ty = builder.value(value).unwrap().ty.clone();
                 Box::from([builder
-                    .add_expression(node, ty, ExprKind::Value(value))
+                    .fixture_value_root(node, ty, ExprKind::Value(value))
                     .unwrap()])
             })
             .unwrap_or_default();
@@ -93,7 +93,9 @@ fn append_count_chain(
             let order = ordering
                 .iter()
                 .map(|&(ordinal, direction, null_ordering)| SortExpr {
-                    expr: groups[ordinal].0,
+                    expr: builder
+                        .fixture_repeated_root(node, groups[ordinal].0)
+                        .unwrap(),
                     direction,
                     null_ordering,
                 })
@@ -137,6 +139,7 @@ fn append_count_chain(
         outputs.push(output);
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: node,
                 inputs: Box::from([input]),
                 required_inputs: Box::from([required]),
@@ -157,7 +160,7 @@ fn append_count_chain(
             let ty = builder.value(keys[ordinal]).unwrap().ty.clone();
             SortExpr {
                 expr: builder
-                    .add_expression(final_topn, ty, ExprKind::Value(keys[ordinal]))
+                    .fixture_value_root(final_topn, ty, ExprKind::Value(keys[ordinal]))
                     .unwrap(),
                 direction,
                 null_ordering,
@@ -198,9 +201,6 @@ fn grouped_package() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
     for value in base.fragment().values().values() {
         builder.insert_value(value.clone()).unwrap();
     }
-    for (_, expression) in base.fragment().expressions().iter() {
-        builder.insert_expression(expression.clone()).unwrap();
-    }
     for node in base.fragment().nodes().values() {
         builder.insert_node_unchecked(node.clone()).unwrap();
     }
@@ -217,8 +217,7 @@ fn grouped_package() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
         ],
         false,
     );
-    let fragment = finish_with_requests(builder, final_topn, FragmentSink::Result);
-    let (expression_uses, calls) = freeze_counts(&fragment, &catalog);
+    let fragment = finish_with_requests(builder, final_topn, FragmentSink::Result, &catalog);
     let mut input = base.as_ref().clone().into_input();
     let output = fragment.nodes()[&final_topn].output.clone();
     input.result = Some(ResultPort {
@@ -239,8 +238,6 @@ fn grouped_package() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
             .collect(),
     });
     input.fragment = fragment;
-    input.expression_uses = expression_uses;
-    input.calls = calls;
     let package =
         Arc::new(FragmentPackage::try_new(input, package_admission(), &FixtureControl).unwrap());
     (package, catalog)
@@ -278,7 +275,7 @@ fn ordered_scan_plan(
         producer_distinct,
     );
     builder.attach_runtime_filter(FILTER).unwrap();
-    let fragment = finish_with_requests(builder, root, FragmentSink::Result);
+    let fragment = finish_with_requests(builder, root, FragmentSink::Result, &catalog);
     let result = ResultPort {
         scalar_schema: None,
         fragment: PROBE,
@@ -297,7 +294,10 @@ fn ordered_scan_plan(
             })
             .collect(),
     };
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        options(None).constants,
+    );
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(result).unwrap();
     plan.add_runtime_filter(ordered_filter(
@@ -326,8 +326,6 @@ fn ordered_scan_package_with_distinct(
 ) -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
     let (plan, catalog) = ordered_scan_plan(nullable, direction, null_ordering, producer_distinct);
     let plan = plan.finish_observed(&FixtureControl).unwrap();
-    let fragment = &plan.fragments()[&PROBE];
-    let (uses, calls) = freeze_counts(fragment, &catalog);
     let read = frozen_read_typed(
         true,
         &[ConnectorValueType::Varchar],
@@ -342,8 +340,6 @@ fn ordered_scan_package_with_distinct(
         &plan,
         &BTreeMap::from([(ProviderReadOccurrenceId::new(0), read)]),
         &BTreeMap::new(),
-        &BTreeMap::from([(PROBE, uses)]),
-        &BTreeMap::from([(PROBE, calls)]),
         &BTreeMap::from([(
             PROBE,
             FrozenFragmentPruning::try_new(PROBE, vec![], &FixtureControl).unwrap(),
@@ -456,32 +452,25 @@ fn ordered_topn_compiler_installs_exact_existing_roots_bindings_and_complete_typ
                         FilterNullOrder::Last
                     }
                 );
-                let snapshot = program
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .resolved_calls()
-                    .snapshot();
-                let group = ProgramExpressionRootSite::Node {
-                    node: aggregate_id,
-                    role: ProgramNodeExpressionRole::AggregateGroup { group: 0 },
-                };
-                let scan = ProgramExpressionRootSite::Node {
-                    node: scan_id,
-                    role: ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
-                };
+                let (group_unit, group_root) =
+                    crate::test_units::compiled_root(&program, filter.group_key_expr);
+                let (scan_unit, scan_root) =
+                    crate::test_units::compiled_root(&program, consumer.expr_id);
+                assert_eq!(filter.group_key_expr, aggregate.0[0]);
                 assert_eq!(
-                    snapshot.flows()[&ProgramExpressionArena::Main].uses()
-                        [&snapshot.bindings()[&group]]
-                        .definition,
-                    filter.group_key_expr
+                    group_unit.control_flow().uses()[&group_root.use_id].definition,
+                    group_root.definition
                 );
                 assert_eq!(
-                    snapshot.flows()[&ProgramExpressionArena::Main].uses()
-                        [&snapshot.bindings()[&scan]]
-                        .definition,
-                    consumer.expr_id
+                    scan_unit.control_flow().uses()[&scan_root.use_id].definition,
+                    scan_root.definition
                 );
+                assert_ne!(filter.group_key_expr.unit, consumer.expr_id.unit);
+                assert_eq!(
+                    crate::test_units::input_ordinal(&program, consumer.expr_id),
+                    0
+                );
+                let _ = (aggregate_id, scan_id);
             }
         }
     }
@@ -551,27 +540,23 @@ fn grouped_topn_installs_intermediate_scope_independent_roots_and_fresh_state_ch
         node.output_layout().schema().field(2).data_type(),
         kernel.contract().intermediate_type().data_type()
     );
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
+    let references = [
+        group_by[0],
+        group_by[1],
+        order_by[0].expr,
+        order_by[1].expr,
+        functions[0].inputs[0],
+    ];
     let mut uses = Vec::new();
-    for role in [
-        ProgramNodeExpressionRole::TopNGroup { group: 0 },
-        ProgramNodeExpressionRole::TopNGroup { group: 1 },
-        ProgramNodeExpressionRole::TopNOrder { key: 0 },
-        ProgramNodeExpressionRole::TopNOrder { key: 1 },
-        ProgramNodeExpressionRole::TopNStateArgument {
-            call: 0,
-            argument: 0,
-        },
-    ] {
-        let root = ProgramExpressionRootSite::Node { node: id, role };
-        uses.push(snapshot.bindings().get(&root).copied().unwrap());
+    for reference in references {
+        let (unit, root) = crate::test_units::compiled_root(&program, reference);
+        uses.push((reference.unit, root.use_id));
+        assert_eq!(
+            unit.scope(root.scope).unwrap().schema().as_ref(),
+            child.output_layout().schema().as_ref()
+        );
         assert!(
-            matches!(novarocks_local_program::root_input_layout(program.graph(), root).unwrap(), novarocks_local_program::ProgramRootInput::Layout { node: source, role: ProgramChannelLayoutRole::NodeOutput } if source == *input)
+            unit.input(root.use_id).unwrap().ordinal < child.output_layout().slots().len() as u32
         );
     }
     assert_eq!(
@@ -582,16 +567,53 @@ fn grouped_topn_installs_intermediate_scope_independent_roots_and_fresh_state_ch
 
 #[test]
 fn ordered_topn_distinct_count_chain_is_refused_before_compilation() {
-    let (plan, _) = ordered_scan_plan(true, SortDirection::Ascending, NullOrdering::Last, true);
-    let error = plan.finish_observed(&FixtureControl).unwrap_err();
-    let diagnostic = format!("{error:?}");
-    assert!(
-        diagnostic.contains("aggregate_sequences[41]"),
-        "{diagnostic}"
+    // The original GroupedStates TopN state-path rejection is proved by
+    // physical-plan's aggregate_sequence_contract::grouped_topn_rejects_missing_contributions_row_budgets_and_binding_drift
+    // for its actual DistinctState input. The native COUNT owner refuses the
+    // real DISTINCT preparation before this compiler can receive that plan.
+    let catalog = count_catalog();
+    let count = CountStar::bind(&catalog);
+    let selected = Arc::new(count.selected.clone());
+    let context = RelationEffectContext::call(RelationCallId::new(0));
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let result = catalog.prepare_fresh(
+        CallEffectInput {
+            context: context.into(),
+            argument_uses: CallArgumentUses::SelectedChannels(&[]),
+            function_id: &count.function_id,
+            kind: FunctionKind::Aggregate,
+            selected: selected.as_ref(),
+            request: FunctionBindingRequest {
+                arguments: &[],
+                logical_argument_count: 0,
+                expected_result_type: None,
+            },
+            environment: &[],
+            parameters: &parameters,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            proof_scope: CallProofScope::Relation(context.identity),
+        },
+        Arc::clone(&selected),
+        PureCallPreparation::Aggregate {
+            arguments: ScopedRelationalEffects::primitive(context, ExpressionEffects::PURE_VALUE),
+            options: AggregatePreparationOptions {
+                state_interpretation: None,
+                phase: AggregateKernelPhase::Partial,
+                distinct: true,
+                order_keys: Arc::from([]),
+                state_input_type: None,
+            },
+        },
+        &FixtureControl,
     );
-    assert!(
-        diagnostic
-            .contains("aggregate state paths do not reduce exactly into their matching final"),
-        "{diagnostic}"
-    );
+    match result {
+        Err(novarocks_functions::FunctionSpecializationFailure::Kernel(
+            novarocks_functions::KernelFailure::InvalidProgram(diagnostic),
+        )) => assert_eq!(
+            diagnostic.message(),
+            "COUNT lifecycle does not implement DISTINCT or function ORDER BY"
+        ),
+        Err(other) => panic!("original COUNT preparation cause: {other}"),
+        Ok(_) => panic!("native COUNT DISTINCT must refuse before compilation"),
+    }
 }

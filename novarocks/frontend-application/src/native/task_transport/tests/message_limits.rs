@@ -69,8 +69,7 @@ fn system_fragment(
     };
     use novarocks_physical_plan as p;
     use novarocks_type_contract::{
-        CompilePhase, ExpressionControlFlow, FunctionValueType, SemanticParameters,
-        ValueTypeStorageLifetime,
+        FunctionValueType, SemanticParameters, ValueTypeStorageLifetime,
     };
     let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
     let node = p::NodeId::new(0);
@@ -117,25 +116,14 @@ fn system_fragment(
             p::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let flow = ExpressionControlFlow::try_new(
-        vec![],
-        vec![],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &control,
-    )
-    .unwrap();
-    let expression_uses = p::PhysicalRootUses::try_new(&fragment, flow, vec![], &control).unwrap();
-    let calls =
-        p::FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &control).unwrap();
     let pruning = p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &control).unwrap();
     let package = p::FragmentPackage::try_new(
         p::FragmentPackageInput {
             version: p::PlanVersionId::try_new([0x72; 16]).unwrap(),
             required: p::RequiredContracts::default(),
             fragment,
-            expression_uses,
-            calls,
+            statement_constant_policy:
+                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
             pruning,
             constants: p::ConstantPools::empty(),
             cuts: p::FragmentCuts::default(),

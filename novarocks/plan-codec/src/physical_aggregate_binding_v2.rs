@@ -28,9 +28,10 @@ use crate::{
     },
     physical_type_v2::EncodedTypeTable,
 };
+use novarocks_expression_contract::BoundFunction;
+use novarocks_physical_plan::AggregateBinding;
 #[cfg(test)]
 use novarocks_physical_plan::AggregatePhase;
-use novarocks_physical_plan::{AggregateBinding, BoundFunction};
 #[cfg(test)]
 use novarocks_proto_models::physical_control_v2;
 use novarocks_proto_models::physical_package_v2 as wire;
@@ -54,9 +55,8 @@ pub use read::{
     prepare_aggregate_binding_headers_in,
 };
 pub(crate) use signature_copy::{
-    copy_aggregate_binding_observed, preflight_aggregate_binding_copy,
-    preflight_aggregate_binding_copy_counts, preflight_aggregate_binding_copy_counts_in,
-    preflight_aggregate_binding_copy_in, preflight_aggregate_binding_copy_types,
+    copy_aggregate_binding_observed, preflight_aggregate_binding_copy_counts,
+    preflight_aggregate_binding_copy_counts_in, preflight_aggregate_binding_copy_types,
     preflight_aggregate_binding_copy_types_in,
 };
 
@@ -275,158 +275,6 @@ impl<'loan, 'source> EncodedAggregateBindings<'loan, 'source> {
     }
 }
 
-pub(crate) struct VerifiedAggregateSignature {
-    matches: bool,
-    work: usize,
-}
-impl VerifiedAggregateSignature {
-    pub(crate) fn matches(&self) -> bool {
-        self.matches
-    }
-    pub(crate) fn work_upper_bound(&self) -> usize {
-        self.work
-    }
-}
-
-/// Compares original full aggregate facts without projecting legacy effects.
-/// The caller admits both original source backings and owns final publication.
-pub(crate) fn verify_aggregate_signature(
-    left: &AggregateBinding,
-    right: &AggregateBinding,
-    source: usize,
-    max_work: usize,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<VerifiedAggregateSignature, BindingCodecError> {
-    let result = verify_aggregate_inner(left, right, source, max_work, None, work);
-    if matches!(&result, Err(BindingCodecError::Control(_))) {
-        return result;
-    }
-    work.flush()?;
-    result
-}
-pub(crate) fn verify_aggregate_signature_admitted(
-    left: &AggregateBinding,
-    right: &AggregateBinding,
-    source: usize,
-    max_work: usize,
-    admit: &mut dyn FnMut(usize) -> Result<(), BindingCodecError>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<VerifiedAggregateSignature, BindingCodecError> {
-    let result = verify_aggregate_inner(left, right, source, max_work, Some(admit), work);
-    if matches!(&result, Err(BindingCodecError::Control(_))) {
-        return result;
-    }
-    work.flush()?;
-    result
-}
-fn verify_aggregate_inner(
-    left: &AggregateBinding,
-    right: &AggregateBinding,
-    source: usize,
-    max_work: usize,
-    mut admit: Option<&mut dyn FnMut(usize) -> Result<(), BindingCodecError>>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<VerifiedAggregateSignature, BindingCodecError> {
-    let policy = Policy(admit.is_some());
-    let sum = |a, b| policy.add(a, b, "aggregate projection arithmetic overflow");
-    let receipt_work = sum(
-        left.state_interpretation
-            .as_ref()
-            .map_or(0, |r| r.order_keys.len()),
-        right
-            .state_interpretation
-            .as_ref()
-            .map_or(0, |r| r.order_keys.len()),
-    )?;
-    let bound = sum(
-        sum(4, receipt_work)?,
-        sum(
-            left.state_format.as_str().len(),
-            right.state_format.as_str().len(),
-        )?,
-    )?;
-    if let Some(parent) = admit.as_mut() {
-        if bound > max_work {
-            return Err(CompileControlError::ResourceExhausted.into());
-        }
-        parent(bound)?;
-    }
-    let roots = if std::ptr::eq(left, right) { 1 } else { 2 };
-    let minimum = mul(roots, size_of::<AggregateBinding>())?;
-    let covers_roots = source >= minimum;
-    work.step()?;
-    if !covers_roots {
-        return Err(invalid("aggregate source invoice omits original roots"));
-    }
-    if bound > max_work {
-        return Err(invalid("aggregate signature work exceeds its envelope"));
-    }
-    let mut facts = VerifiedAggregateSignature {
-        matches: false,
-        work: bound,
-    };
-    let same_interpretation = match (&left.state_interpretation, &right.state_interpretation) {
-        (None, None) => true,
-        (Some(a), Some(b)) => a.matches_observed(b, || work.step())?,
-        _ => false,
-    };
-    let same_headers = same_interpretation
-        && left.phase == right.phase
-        && left.logical_argument_count == right.logical_argument_count
-        && left.state_argument_contract == right.state_argument_contract
-        && left.state_format.as_str() == right.state_format.as_str();
-    // Stable state-format owners bound each complete comparison to 1024 bytes.
-    work.step()?;
-    if !same_headers {
-        return Ok(facts);
-    }
-    let base = facts.work;
-    let verified = if let Some(parent) = admit.as_mut() {
-        crate::physical_binding_v2::verify_scalar_signature_admitted(
-            &left.function,
-            &right.function,
-            source,
-            max_work - base,
-            &mut |prefix| parent(sum(base, prefix)?),
-            work,
-        )?
-    } else {
-        verify_scalar_signature(
-            &left.function,
-            &right.function,
-            source,
-            remaining(max_work, facts.work)?,
-            work,
-        )?
-    };
-    facts.work = sum(base, verified.work_upper_bound())?;
-    if !verified.matches() {
-        return Ok(facts);
-    }
-    let base = facts.work;
-    let verified = if let Some(parent) = admit.as_mut() {
-        crate::borrowed_type_resources::verify_type_binding_admitted(
-            &left.intermediate_type,
-            &right.intermediate_type,
-            source,
-            max_work - base,
-            &mut |prefix| parent(sum(base, prefix.work_upper_bound())?),
-            work,
-        )?
-    } else {
-        verify_type_binding(
-            &left.intermediate_type,
-            &right.intermediate_type,
-            source,
-            remaining(max_work, facts.work)?,
-            work,
-        )?
-    };
-    facts.work = sum(base, verified.work_upper_bound())?;
-    facts.matches = verified.matches();
-    Ok(facts)
-}
-
 pub fn encode_aggregate_bindings<'loan, 'source>(
     types: &'loan EncodedTypeTable<'source>,
     functions: &'loan EncodedFunctionBindings<'loan, 'source>,
@@ -490,10 +338,6 @@ fn invalid(message: &'static str) -> BindingCodecError {
 }
 fn add(left: usize, right: usize) -> Result<usize, BindingCodecError> {
     left.checked_add(right)
-        .ok_or_else(|| invalid("aggregate projection arithmetic overflow"))
-}
-fn mul(left: usize, right: usize) -> Result<usize, BindingCodecError> {
-    left.checked_mul(right)
         .ok_or_else(|| invalid("aggregate projection arithmetic overflow"))
 }
 fn remaining(maximum: usize, used: usize) -> Result<usize, BindingCodecError> {

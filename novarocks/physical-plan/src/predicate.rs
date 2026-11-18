@@ -25,10 +25,7 @@
 //! validating a witness against that same snapshot; never cache or transfer
 //! them as evidence for another plan with reused IDs.
 
-use crate::{
-    ExprId, ExprKind, ExpressionRootRole, ExpressionRootSite, Fragment, FragmentId,
-    PhysicalRootUses,
-};
+use crate::{ExprId, ExprKind, Fragment, FragmentId, NodeId, RootOrdinal};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
     ExpressionEffectContext, ExpressionUseId, MAX_CONTROL_DEPTH, PureCompileControl,
@@ -36,10 +33,18 @@ use novarocks_type_contract::{
 };
 use std::{fmt, sync::Arc};
 
+/// A node-local root position. Search privilege comes only from the actual
+/// Scan residual or Filter field, never from TruthOnly demand alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PredicateSourceSite {
+    pub node: NodeId,
+    pub root: RootOrdinal,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PredicateResponsibilityRef {
     pub fragment: FragmentId,
-    pub site: ExpressionRootSite,
+    pub site: PredicateSourceSite,
     pub use_id: ExpressionUseId,
 }
 
@@ -89,13 +94,13 @@ impl From<CompileControlError> for PredicateSourceError {
 fn definition(
     fragment: &Fragment,
     id: ExprId,
-    site: ExpressionRootSite,
+    site: PredicateSourceSite,
 ) -> Result<&crate::ExprNode, PredicateSourceError> {
     let definition = fragment
-        .expressions()
-        .get(id)
+        .unit(site.node)
+        .and_then(|unit| unit.definition(id))
         .ok_or(PredicateSourceError::InvalidUse)?;
-    if definition.owner != site.node || definition.lambda_scope.is_some() {
+    if definition.lambda_scope.is_some() {
         return Err(PredicateSourceError::InvalidScope);
     }
     if *definition.ty.data_type() != arrow_schema::DataType::Boolean
@@ -108,12 +113,11 @@ fn definition(
 impl ExactPredicateResponsibility {
     pub fn try_new(
         fragment: &Fragment,
-        roots: &PhysicalRootUses,
-        site: ExpressionRootSite,
+        site: PredicateSourceSite,
         control: &dyn PureCompileControl,
     ) -> Result<Self, PredicateSourceError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let value = Self::try_new_in(fragment, roots, site, &mut work)?;
+        let value = Self::try_new_in(fragment, site, &mut work)?;
         work.finish()?;
         Ok(value)
     }
@@ -121,62 +125,52 @@ impl ExactPredicateResponsibility {
     /// The same original responsibility author on the caller's scope.
     pub fn try_new_in(
         fragment: &Fragment,
-        roots: &PhysicalRootUses,
-        site: ExpressionRootSite,
+        site: PredicateSourceSite,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, PredicateSourceError> {
-        if roots.roots().fragment() != fragment.id() {
-            return Err(PredicateSourceError::InvalidFragment);
+        let node = fragment
+            .nodes()
+            .get(&site.node)
+            .ok_or(PredicateSourceError::InvalidSite)?;
+        let predicates = match &node.kind {
+            crate::NodeKind::Filter { predicates } => predicates.as_ref(),
+            crate::NodeKind::Scan { residuals, .. } => residuals.as_ref(),
+            _ => return Err(PredicateSourceError::NotSearchPredicate),
+        };
+        let mut found = false;
+        for predicate in predicates {
+            work.step()?;
+            if *predicate == site.root {
+                found = true;
+                break;
+            }
         }
-        // Join matching predicates require a dedicated relation/multiplicity
-        // proof. No implicit search privilege is inferred from their demand.
-        if !matches!(
-            site.role,
-            ExpressionRootRole::FilterPredicate { .. } | ExpressionRootRole::ScanResidual { .. }
-        ) {
+        if !found {
             return Err(PredicateSourceError::NotSearchPredicate);
         }
-        let id = *roots
-            .bindings()
-            .get(&site)
+        let unit = fragment
+            .unit(site.node)
             .ok_or(PredicateSourceError::InvalidSite)?;
-        let invocation = roots
-            .flow()
+        let root = unit
+            .root(site.root)
+            .ok_or(PredicateSourceError::InvalidSite)?;
+        let id = unit
+            .root_use(site.root)
+            .ok_or(PredicateSourceError::InvalidUse)?;
+        let invocation = unit
+            .control_flow()
             .uses()
             .get(&id)
             .ok_or(PredicateSourceError::InvalidUse)?;
-        if invocation.context.demand != EvaluationDemand::TruthOnly {
+        if invocation.context.demand != EvaluationDemand::TruthOnly
+            || root.demand != EvaluationDemand::TruthOnly
+        {
             return Err(PredicateSourceError::WrongDemand);
         }
-        let root = roots
-            .roots()
-            .sites()
-            .get(&site)
-            .ok_or(PredicateSourceError::InvalidSite)?;
-        if invocation.definition != root.expr {
+        if invocation.definition != root.definition {
             return Err(PredicateSourceError::InvalidUse);
         }
         definition(fragment, invocation.definition, site)?;
-        // Resolve the actual immutable node field again. This catches a changed
-        // root field; the owner must still enforce the frozen snapshot scope.
-        let actual = fragment
-            .nodes()
-            .get(&site.node)
-            .and_then(|node| match (&node.kind, site.role) {
-                (
-                    crate::NodeKind::Filter { predicates },
-                    ExpressionRootRole::FilterPredicate { predicate },
-                ) => predicates.get(predicate as usize),
-                (
-                    crate::NodeKind::Scan { residuals, .. },
-                    ExpressionRootRole::ScanResidual { predicate },
-                ) => residuals.get(predicate as usize),
-                _ => None,
-            })
-            .ok_or(PredicateSourceError::InvalidSite)?;
-        if *actual != invocation.definition {
-            return Err(PredicateSourceError::InvalidUse);
-        }
         work.step()?;
         Ok(Self {
             anchor: PredicateResponsibilityRef {
@@ -213,14 +207,13 @@ pub struct PredicateConjunctSource {
 impl PredicateConjunctSource {
     pub fn try_new(
         fragment: &Fragment,
-        roots: &PhysicalRootUses,
-        site: ExpressionRootSite,
+        site: PredicateSourceSite,
         path: Vec<u32>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, PredicateSourceError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         let (responsibility, definition, context) =
-            Self::checked_parts(fragment, roots, site, &path, false, &mut work)?;
+            Self::checked_parts(fragment, site, &path, false, &mut work)?;
         work.finish()?;
         Ok(Self {
             responsibility,
@@ -234,13 +227,12 @@ impl PredicateConjunctSource {
     /// The final Arc remains an opaque host boundary, not an allocation grant.
     pub fn try_new_in(
         fragment: &Fragment,
-        roots: &PhysicalRootUses,
-        site: ExpressionRootSite,
+        site: PredicateSourceSite,
         path: Vec<u32>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, PredicateSourceError> {
         let (responsibility, definition, context) =
-            Self::checked_parts(fragment, roots, site, &path, true, work)?;
+            Self::checked_parts(fragment, site, &path, true, work)?;
         work.flush()?;
         let path = path.into();
         work.step()?;
@@ -254,8 +246,7 @@ impl PredicateConjunctSource {
     }
     fn checked_parts(
         fragment: &Fragment,
-        roots: &PhysicalRootUses,
-        site: ExpressionRootSite,
+        site: PredicateSourceSite,
         path: &[u32],
         borrowed: bool,
         work: &mut CompileCheckpoints<'_>,
@@ -271,12 +262,15 @@ impl PredicateConjunctSource {
             return Err(PredicateSourceError::TooDeep);
         }
         let responsibility = if borrowed {
-            ExactPredicateResponsibility::try_new_in(fragment, roots, site, work)?
+            ExactPredicateResponsibility::try_new_in(fragment, site, work)?
         } else {
-            ExactPredicateResponsibility::try_new(fragment, roots, site, work.control())?
+            ExactPredicateResponsibility::try_new(fragment, site, work.control())?
         };
-        let mut current = roots
-            .flow()
+        let unit = fragment
+            .unit(site.node)
+            .ok_or(PredicateSourceError::InvalidSite)?;
+        let mut current = unit
+            .control_flow()
             .uses()
             .get(&responsibility.anchor.use_id)
             .ok_or(PredicateSourceError::InvalidUse)?;
@@ -299,15 +293,15 @@ impl PredicateConjunctSource {
                 .arguments
                 .get(ordinal)
                 .ok_or(PredicateSourceError::InvalidArgument)?;
-            let child = roots
-                .flow()
+            let child = unit
+                .control_flow()
                 .uses()
                 .get(child_id)
                 .ok_or(PredicateSourceError::InvalidUse)?;
             if *child_definition != child.definition {
                 return Err(PredicateSourceError::WrongArguments);
             }
-            if child.context.domain != responsibility.context.domain {
+            if child.context.region != responsibility.context.region {
                 return Err(PredicateSourceError::InvalidScope);
             }
             if child.context.demand != EvaluationDemand::TruthOnly {

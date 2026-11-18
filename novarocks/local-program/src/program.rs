@@ -36,9 +36,9 @@ use novarocks_types::SlotId;
 
 use crate::{
     BindingRequirement, BindingRequirements, CompileProfile, DiagnosticSourceNodeId,
-    ImmutableExpressions, LayoutCompileError, ProgramExprId, ProgramNodeId, ScanSourceKind,
-    SinkCompileError, StaticConnectorScan, StaticFilterConsumer, StaticFilterProducer,
-    StaticLayout, StaticSinkProgram, StaticValues,
+    LayoutCompileError, ProgramNodeId, ProgramRootRef, ScanSourceKind, SinkCompileError,
+    StaticConnectorScan, StaticFilterConsumer, StaticFilterProducer, StaticLayout,
+    StaticSinkProgram, StaticValues,
 };
 
 /// Matches the native task-codec preflight, which runs before protobuf decode.
@@ -151,7 +151,7 @@ pub struct UnpivotPassthrough {
 #[derive(Clone, Debug)]
 pub enum UnpivotConstant {
     Scalar {
-        expr_id: ProgramExprId,
+        expr_id: ProgramRootRef,
         nullable: bool,
     },
     Int32List(Vec<i32>),
@@ -168,33 +168,33 @@ pub struct UnpivotMapping {
 pub struct ChangeEventOutputExpr {
     pub write_input: Option<novarocks_type_contract::WriteInputDeclaration>,
     pub output_slot_id: SlotId,
-    pub expr: Option<ProgramExprId>,
+    pub expr: Option<ProgramRootRef>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ChangeEventSpec {
-    pub predicate: Option<ProgramExprId>,
+    pub predicate: Option<ProgramRootRef>,
     pub effect: ConnectorRowMutationEffect,
     pub assignments: Vec<ChangeEventOutputExpr>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FilterConsumerAtExpr {
-    pub expr_id: ProgramExprId,
+    pub expr_id: ProgramRootRef,
     pub consumer: StaticFilterConsumer,
 }
 
 /// An admitted consumer of exactly one key of its owning hash join.
 #[derive(Clone, Debug)]
 pub struct FilterConsumerAtJoinKey {
-    pub expr_id: ProgramExprId,
+    pub expr_id: ProgramRootRef,
     pub key_ordinal: usize,
     pub consumer: StaticFilterConsumer,
 }
 
 #[derive(Clone, Debug)]
 pub struct FilterProducerAtExpr {
-    pub expr_id: ProgramExprId,
+    pub expr_id: ProgramRootRef,
     pub key_ordinal: usize,
     pub producer: StaticFilterProducer,
 }
@@ -219,7 +219,7 @@ pub struct StaticAggregateCall {
     pub frozen: Option<Arc<crate::FrozenAggregateSelection>>,
     pub state_interpretation: Option<novarocks_type_contract::AggregateStateInterpretation>,
     pub name: Arc<str>,
-    pub inputs: Vec<ProgramExprId>,
+    pub inputs: Vec<ProgramRootRef>,
     pub input_is_intermediate: bool,
     pub types: Option<StaticAggregateTypeSignature>,
     pub order: StaticAggregateOrder,
@@ -252,8 +252,8 @@ pub enum JoinType {
 /// NULL-mode or build/probe vector cannot disagree with its arity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProgramJoinKey {
-    pub probe: ProgramExprId,
-    pub build: ProgramExprId,
+    pub probe: ProgramRootRef,
+    pub build: ProgramRootRef,
     pub null_safe: bool,
 }
 
@@ -264,12 +264,12 @@ pub struct ProgramJoinKey {
 pub enum ProgramJoinCondition {
     Ordinary {
         keys: Vec<ProgramJoinKey>,
-        residual_predicate: Option<ProgramExprId>,
+        residual_predicate: Option<ProgramRootRef>,
     },
     NullAwareEqual {
         value_equal_keys: Vec<ProgramJoinKey>,
         scope_keys: Vec<ProgramJoinKey>,
-        eligibility: Option<ProgramExprId>,
+        eligibility: Option<ProgramRootRef>,
     },
 }
 
@@ -289,7 +289,7 @@ impl ProgramJoinCondition {
             Self::NullAwareEqual { scope_keys, .. } => scope_keys,
         }
     }
-    pub fn residual_predicate(&self) -> Option<ProgramExprId> {
+    pub fn residual_predicate(&self) -> Option<ProgramRootRef> {
         match self {
             Self::Ordinary {
                 residual_predicate, ..
@@ -405,7 +405,7 @@ impl WindowFunctionKind {
 pub struct StaticWindowFunction {
     pub frozen_aggregate: Option<Arc<crate::FrozenAggregateSelection>>,
     pub kind: WindowFunctionKind,
-    pub args: Vec<ProgramExprId>,
+    pub args: Vec<ProgramRootRef>,
     pub return_type: DataType,
     pub aggregate_binding: Option<(Arc<str>, ResolvedAggregateSignature)>,
     pub frame: Option<WindowFrame>,
@@ -464,7 +464,7 @@ pub struct WriterFinalAggregatePlan {
 
 #[derive(Clone, Debug)]
 pub struct AggregateTopNFilter {
-    pub group_key_expr: ProgramExprId,
+    pub group_key_expr: ProgramRootRef,
     pub group_key_ordinal: usize,
     pub limit: NonZeroU32,
     pub producer: StaticFilterProducer,
@@ -474,9 +474,8 @@ pub struct AggregateTopNFilter {
 pub struct StaticWriterProjection {
     /// One independent storage declaration per projected input occurrence.
     pub storage_types: Vec<Option<novarocks_type_contract::FunctionValueType>>,
-    /// Writer projection owns a separate expression arena in the current plan.
-    pub arena: Arc<ImmutableExpressions>,
-    pub expressions: Vec<ProgramExprId>,
+    /// Roots address the same compiled unit table as every other node field.
+    pub expressions: Vec<ProgramRootRef>,
     pub layout: StaticLayout,
 }
 
@@ -521,7 +520,7 @@ impl LocalSortMode {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SortExpression {
-    pub expr: ProgramExprId,
+    pub expr: ProgramRootRef,
     pub asc: bool,
     pub nulls_first: bool,
 }
@@ -577,7 +576,7 @@ pub enum ProgramNodeKind {
         is_subordinate: bool,
         /// Check runtime identity input domains at the final result boundary.
         validate_final_result_input: bool,
-        exprs: Vec<ProgramExprId>,
+        exprs: Vec<ProgramRootRef>,
         expr_slot_ids: Vec<SlotId>,
         expr_slot_schemas: Option<ProjectExpressionSlots>,
         output_indices: Option<Vec<usize>>,
@@ -593,7 +592,7 @@ pub enum ProgramNodeKind {
     },
     Filter {
         input: ProgramNodeId,
-        predicates: Box<[ProgramExprId]>,
+        predicates: Box<[ProgramRootRef]>,
     },
     Repeat {
         input: ProgramNodeId,
@@ -633,16 +632,16 @@ pub enum ProgramNodeKind {
     Scan {
         source: ProgramScanSource,
         runtime_filters: crate::ScanFilterConsumers,
-        residuals: Vec<ProgramExprId>,
+        residuals: Vec<ProgramRootRef>,
         limit: Option<usize>,
     },
     ExchangeSource {
         runtime_filters: crate::ScanFilterConsumers,
-        hash_partition_exprs: Vec<ProgramExprId>,
+        hash_partition_exprs: Vec<ProgramRootRef>,
     },
     Aggregate {
         input: ProgramNodeId,
-        group_by: Vec<ProgramExprId>,
+        group_by: Vec<ProgramRootRef>,
         functions: Vec<StaticAggregateCall>,
         need_finalize: bool,
         input_is_intermediate: bool,
@@ -652,7 +651,7 @@ pub enum ProgramNodeKind {
     /// A complete-key budget over intermediate state contributions.
     GroupedTopN {
         input: ProgramNodeId,
-        group_by: Vec<ProgramExprId>,
+        group_by: Vec<ProgramRootRef>,
         order_by: Vec<SortExpression>,
         rank_group_ordinals: Vec<usize>,
         limit: usize,
@@ -675,15 +674,15 @@ pub enum ProgramNodeKind {
         left: ProgramNodeId,
         right: ProgramNodeId,
         join_type: NestedLoopJoinType,
-        join_conjunct: Option<ProgramExprId>,
+        join_conjunct: Option<ProgramRootRef>,
         left_layout: StaticLayout,
         right_layout: StaticLayout,
         join_scope_layout: StaticLayout,
     },
     Analytic {
         input: ProgramNodeId,
-        partition_exprs: Vec<ProgramExprId>,
-        order_by_exprs: Vec<ProgramExprId>,
+        partition_exprs: Vec<ProgramRootRef>,
+        order_by_exprs: Vec<ProgramRootRef>,
         functions: Vec<StaticWindowFunction>,
         output_columns: Vec<AnalyticOutputColumn>,
     },
@@ -784,40 +783,55 @@ impl ProgramNodeKind {
     }
     // None observes a real container/constant/assignment inspection that emits
     // no expression edge; wide empty containers still perform bounded work.
-    fn try_for_each_expression<E>(
+    pub(crate) fn try_for_each_expression<E>(
         &self,
-        mut visit: impl FnMut(Option<ProgramExprId>) -> Result<(), E>,
+        mut visit: impl FnMut(
+            Option<ProgramRootRef>,
+            novarocks_type_contract::EvaluationDemand,
+        ) -> Result<(), E>,
     ) -> Result<(), E> {
+        use novarocks_type_contract::EvaluationDemand::{TruthOnly, Value};
         match self {
-            Self::Values { .. }
-            | Self::SystemRelation { .. }
+            Self::SystemRelation { .. }
             | Self::AssertNumRows { .. }
             | Self::Repeat { .. }
             | Self::UnionAll { .. }
             | Self::Limit { .. }
             | Self::TableFunction { .. }
             | Self::GenerateSeries { .. }
-            | Self::SetOp { .. }
-            | Self::TableWriter { .. } => {}
+            | Self::SetOp { .. } => {}
+            Self::Values { values } => {
+                for cell in values.dynamic_cells() {
+                    visit(Some(cell.definition), Value)?;
+                }
+            }
+            Self::TableWriter { projection, .. } => {
+                for root in &projection.expressions {
+                    visit(Some(*root), Value)?;
+                }
+            }
             Self::Project { exprs, .. } => {
                 for id in exprs {
-                    visit(Some(*id))?;
+                    visit(Some(*id), Value)?;
                 }
             }
             Self::Unpivot { value_mappings, .. } => {
                 for mapping in value_mappings {
-                    visit(None)?;
+                    visit(None, Value)?;
                     for value in &mapping.constants {
-                        visit(match value {
-                            UnpivotConstant::Scalar { expr_id, .. } => Some(*expr_id),
-                            _ => None,
-                        })?;
+                        visit(
+                            match value {
+                                UnpivotConstant::Scalar { expr_id, .. } => Some(*expr_id),
+                                _ => None,
+                            },
+                            Value,
+                        )?;
                     }
                 }
             }
             Self::Filter { predicates, .. } => {
                 for predicate in predicates {
-                    visit(Some(*predicate))?;
+                    visit(Some(*predicate), TruthOnly)?;
                 }
             }
             Self::Scan {
@@ -826,10 +840,10 @@ impl ProgramNodeKind {
                 ..
             } => {
                 for id in residuals {
-                    visit(Some(*id))?;
+                    visit(Some(*id), TruthOnly)?;
                 }
                 for binding in runtime_filters {
-                    visit(Some(binding.expr_id))?;
+                    visit(Some(binding.expr_id), Value)?;
                 }
             }
             Self::ExchangeSource {
@@ -838,10 +852,10 @@ impl ProgramNodeKind {
                 ..
             } => {
                 for id in hash_partition_exprs {
-                    visit(Some(*id))?;
+                    visit(Some(*id), Value)?;
                 }
                 for binding in runtime_filters {
-                    visit(Some(binding.expr_id))?;
+                    visit(Some(binding.expr_id), Value)?;
                 }
             }
             Self::Aggregate {
@@ -851,16 +865,16 @@ impl ProgramNodeKind {
                 ..
             } => {
                 for id in group_by {
-                    visit(Some(*id))?;
+                    visit(Some(*id), Value)?;
                 }
                 for function in functions {
-                    visit(None)?;
+                    visit(None, Value)?;
                     for id in &function.inputs {
-                        visit(Some(*id))?;
+                        visit(Some(*id), Value)?;
                     }
                 }
                 for filter in topn_filters {
-                    visit(Some(filter.group_key_expr))?;
+                    visit(Some(filter.group_key_expr), Value)?;
                 }
             }
             Self::GroupedTopN {
@@ -870,15 +884,15 @@ impl ProgramNodeKind {
                 ..
             } => {
                 for id in group_by {
-                    visit(Some(*id))?;
+                    visit(Some(*id), Value)?;
                 }
                 for key in order_by {
-                    visit(Some(key.expr))?;
+                    visit(Some(key.expr), Value)?;
                 }
                 for function in functions {
-                    visit(None)?;
+                    visit(None, Value)?;
                     for id in &function.inputs {
-                        visit(Some(*id))?;
+                        visit(Some(*id), Value)?;
                     }
                 }
             }
@@ -890,25 +904,43 @@ impl ProgramNodeKind {
             } => {
                 for keys in [condition.keys(), condition.scope_keys()] {
                     for key in keys {
-                        visit(Some(key.probe))?;
+                        visit(Some(key.probe), Value)?;
                     }
                     for key in keys {
-                        visit(Some(key.build))?;
+                        visit(Some(key.build), Value)?;
                     }
                 }
                 if let Some(id) = condition.residual_predicate() {
-                    visit(Some(id))?;
+                    visit(
+                        Some(id),
+                        if condition.is_null_aware() {
+                            Value
+                        } else {
+                            TruthOnly
+                        },
+                    )?;
                 }
                 for filter in runtime_filter_consumers {
-                    visit(Some(filter.expr_id))?;
+                    visit(Some(filter.expr_id), Value)?;
                 }
                 for filter in runtime_filters {
-                    visit(Some(filter.expr_id))?;
+                    visit(Some(filter.expr_id), Value)?;
                 }
             }
-            Self::NestedLoopJoin { join_conjunct, .. } => {
+            Self::NestedLoopJoin {
+                join_conjunct,
+                join_type,
+                ..
+            } => {
                 if let Some(id) = join_conjunct {
-                    visit(Some(*id))?;
+                    visit(
+                        Some(*id),
+                        if matches!(join_type, NestedLoopJoinType::NullAwareLeftAnti) {
+                            Value
+                        } else {
+                            TruthOnly
+                        },
+                    )?;
                 }
             }
             Self::Analytic {
@@ -918,18 +950,18 @@ impl ProgramNodeKind {
                 ..
             } => {
                 for id in partition_exprs.iter().chain(order_by_exprs) {
-                    visit(Some(*id))?;
+                    visit(Some(*id), Value)?;
                 }
                 for function in functions {
-                    visit(None)?;
+                    visit(None, Value)?;
                     for id in &function.args {
-                        visit(Some(*id))?;
+                        visit(Some(*id), Value)?;
                     }
                 }
             }
             Self::RuntimeFilterConsumer { bindings, .. } => {
                 for binding in bindings {
-                    visit(Some(binding.expr_id))?;
+                    visit(Some(binding.expr_id), Value)?;
                 }
             }
             Self::TableFinish {
@@ -937,31 +969,34 @@ impl ProgramNodeKind {
             } => {
                 if let Some(unpivot) = &final_aggregates.unpivot {
                     for mapping in &unpivot.mappings {
-                        visit(None)?;
+                        visit(None, Value)?;
                         for value in &mapping.constants {
-                            visit(match value {
-                                UnpivotConstant::Scalar { expr_id, .. } => Some(*expr_id),
-                                _ => None,
-                            })?;
+                            visit(
+                                match value {
+                                    UnpivotConstant::Scalar { expr_id, .. } => Some(*expr_id),
+                                    _ => None,
+                                },
+                                Value,
+                            )?;
                         }
                     }
                 }
             }
             Self::ChangeEventExpand { events, .. } => {
                 for event in events {
-                    visit(None)?;
+                    visit(None, Value)?;
                     if let Some(id) = event.predicate {
-                        visit(Some(id))?;
+                        visit(Some(id), TruthOnly)?;
                     }
                     for assignment in &event.assignments {
-                        visit(assignment.expr)?;
+                        visit(assignment.expr, Value)?;
                     }
                 }
             }
             Self::PositionShard { .. } | Self::WriteLayoutKey { .. } => {}
             Self::Sort { order_by, mode, .. } => {
                 for sort in order_by.iter().chain(mode.partition_by()) {
-                    visit(Some(sort.expr))?;
+                    visit(Some(sort.expr), Value)?;
                 }
             }
         }
@@ -1069,7 +1104,6 @@ impl ProgramNode {
 pub struct LocalProgramGraph {
     nodes: Arc<[ProgramNode]>,
     root: ProgramNodeId,
-    expressions: Arc<ImmutableExpressions>,
     profile: CompileProfile,
     requirements: BindingRequirements,
     sink: Option<StaticSinkProgram>,
@@ -1268,10 +1302,14 @@ impl ProgramWork<'_> {
         self.flush()?;
         Ok(self.identity(&projected)? == self.identity(expected)?)
     }
-    fn sink(&mut self, sink: &StaticSinkProgram) -> Result<(), ProgramCompileError> {
+    fn sink(
+        &mut self,
+        sink: &StaticSinkProgram,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
+    ) -> Result<(), ProgramCompileError> {
         self.flush()?;
         let result = if let Some(work) = &self.0 {
-            sink.validate_for_compile(work.control())
+            sink.validate_for_compile(units, work.control())
                 .map_err(|error| match error {
                     SinkCompileError::Control(cause) => ProgramCompileError::Control(cause),
                     SinkCompileError::Sink(source) => {
@@ -1279,7 +1317,7 @@ impl ProgramWork<'_> {
                     }
                 })
         } else {
-            sink.validate()
+            sink.validate(units)
                 .map_err(|source| LocalProgramError::Sink(source).into())
         };
         if matches!(&result, Err(ProgramCompileError::Control(_))) {
@@ -1293,35 +1331,27 @@ impl LocalProgramGraph {
     pub fn try_new(
         nodes: Vec<ProgramNode>,
         root: ProgramNodeId,
-        expressions: Arc<ImmutableExpressions>,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
         profile: CompileProfile,
         requirements: BindingRequirements,
     ) -> Result<Self, LocalProgramError> {
-        Self::try_new_with_sink(nodes, root, expressions, profile, requirements, None)
+        Self::try_new_with_sink(nodes, root, units, profile, requirements, None)
     }
     /// Construct a graph with its root sink and no independent side outputs.
     pub fn try_new_with_sink(
         nodes: Vec<ProgramNode>,
         root: ProgramNodeId,
-        expressions: Arc<ImmutableExpressions>,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
         profile: CompileProfile,
         requirements: BindingRequirements,
         sink: Option<StaticSinkProgram>,
     ) -> Result<Self, LocalProgramError> {
-        Self::try_new_with_outputs(
-            nodes,
-            root,
-            expressions,
-            profile,
-            requirements,
-            sink,
-            Vec::new(),
-        )
+        Self::try_new_with_outputs(nodes, root, units, profile, requirements, sink, Vec::new())
     }
     pub fn try_new_with_outputs(
         nodes: Vec<ProgramNode>,
         root: ProgramNodeId,
-        expressions: Arc<ImmutableExpressions>,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
         profile: CompileProfile,
         requirements: BindingRequirements,
         sink: Option<StaticSinkProgram>,
@@ -1330,7 +1360,7 @@ impl LocalProgramGraph {
         match Self::try_new_core(
             nodes,
             root,
-            expressions,
+            units,
             profile,
             requirements,
             sink,
@@ -1347,7 +1377,7 @@ impl LocalProgramGraph {
     pub fn try_new_for_compile(
         nodes: Vec<ProgramNode>,
         root: ProgramNodeId,
-        expressions: Arc<ImmutableExpressions>,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
         profile: CompileProfile,
         requirements: BindingRequirements,
         control: &dyn PureCompileControl,
@@ -1355,7 +1385,7 @@ impl LocalProgramGraph {
         Self::try_new_with_sink_for_compile(
             nodes,
             root,
-            expressions,
+            units,
             profile,
             requirements,
             None,
@@ -1365,7 +1395,7 @@ impl LocalProgramGraph {
     pub fn try_new_with_sink_for_compile(
         nodes: Vec<ProgramNode>,
         root: ProgramNodeId,
-        expressions: Arc<ImmutableExpressions>,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
         profile: CompileProfile,
         requirements: BindingRequirements,
         sink: Option<StaticSinkProgram>,
@@ -1374,7 +1404,7 @@ impl LocalProgramGraph {
         Self::try_new_with_outputs_for_compile(
             nodes,
             root,
-            expressions,
+            units,
             profile,
             requirements,
             sink,
@@ -1385,7 +1415,7 @@ impl LocalProgramGraph {
     pub fn try_new_with_outputs_for_compile(
         nodes: Vec<ProgramNode>,
         root: ProgramNodeId,
-        expressions: Arc<ImmutableExpressions>,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
         profile: CompileProfile,
         requirements: BindingRequirements,
         sink: Option<StaticSinkProgram>,
@@ -1399,7 +1429,7 @@ impl LocalProgramGraph {
         let result = Self::try_new_core(
             nodes,
             root,
-            expressions,
+            units,
             profile,
             requirements,
             sink,
@@ -1415,7 +1445,7 @@ impl LocalProgramGraph {
     fn try_new_core(
         nodes: Vec<ProgramNode>,
         root: ProgramNodeId,
-        expressions: Arc<ImmutableExpressions>,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
         profile: CompileProfile,
         requirements: BindingRequirements,
         sink: Option<StaticSinkProgram>,
@@ -1491,8 +1521,13 @@ impl LocalProgramGraph {
             depths.push(depth);
             expansions.push(expanded);
             work.step()?;
-            node.kind.try_for_each_expression(|expr| {
-                let valid = expr.is_none_or(|id| expressions.node(id).is_some());
+            node.kind.try_for_each_expression(|expr, demand| {
+                let valid = expr.is_none_or(|id| {
+                    crate::unit_refs::root_type(units, id).is_some()
+                        && units[id.unit.index()]
+                            .root(id.root)
+                            .is_some_and(|r| r.demand == demand)
+                });
                 work.step()?;
                 if !valid {
                     return Err(LocalProgramError::InvalidExpression.into());
@@ -1716,7 +1751,7 @@ impl LocalProgramGraph {
             }
         }
         if let Some(sink) = &sink {
-            work.sink(sink)?;
+            work.sink(sink, units)?;
             let mut result_count = 0usize;
             for requirement in requirements.entries() {
                 if matches!(requirement, BindingRequirement::ResultSink { .. }) {
@@ -1878,12 +1913,19 @@ impl LocalProgramGraph {
                 }
             }
         }
+        crate::unit_inputs::validate(
+            &nodes,
+            root,
+            sink.as_ref(),
+            units,
+            || work.step(),
+            || ProgramCompileError::Program(LocalProgramError::InvalidExpression),
+        )?;
         let nodes = work.opaque(|| Arc::from(nodes))?;
         let summaries = work.opaque(|| Arc::from(summaries))?;
         Ok(Self {
             nodes,
             root,
-            expressions,
             profile,
             requirements,
             sink,
@@ -1897,10 +1939,6 @@ impl LocalProgramGraph {
 
     pub const fn root(&self) -> ProgramNodeId {
         self.root
-    }
-
-    pub const fn expressions(&self) -> &Arc<ImmutableExpressions> {
-        &self.expressions
     }
 
     pub const fn profile(&self) -> CompileProfile {
@@ -2411,13 +2449,6 @@ fn validate_shape(
             if bad {
                 return Err(LocalProgramError::InvalidNodeShape.into());
             }
-            for expr in &projection.expressions {
-                let bad = projection.arena.node(*expr).is_none();
-                work.step()?;
-                if bad {
-                    return Err(LocalProgramError::InvalidNodeShape.into());
-                }
-            }
             if !work.writer_projection_matches(&projection.layout, expected_layout)? {
                 return Err(LocalProgramError::InvalidNodeShape.into());
             }
@@ -2477,14 +2508,15 @@ fn validate_shape(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+
     use std::num::{NonZeroU32, NonZeroUsize};
 
     use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
-    use crate::{KernelAbiVersion, LayoutIdentity, StaticExprKind, StaticExprNode};
+    use crate::{KernelAbiVersion, LayoutIdentity};
+    use novarocks_type_contract::EvaluationDemand;
 
     fn values() -> (StaticValues, StaticLayout) {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
@@ -2493,7 +2525,20 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1]))],
         )
         .unwrap();
-        let layout = StaticLayout::try_new(schema, Arc::from([SlotId::new(1)])).unwrap();
+        let layout = StaticLayout::try_new_typed_for_compile(
+            schema,
+            Arc::from([SlotId::new(1)]),
+            vec![(
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false)
+                    .typed_binding()
+                    .clone(),
+                None,
+            )],
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &OriginalControl::default(),
+        )
+        .unwrap();
         (
             StaticValues::try_new(batch, layout.clone()).unwrap(),
             layout,
@@ -2509,6 +2554,20 @@ mod tests {
         )
     }
 
+    fn read_units(layout: &StaticLayout) -> Vec<Arc<novarocks_expression::CompiledExprSet>> {
+        vec![crate::test_support::read_unit(
+            layout,
+            &[novarocks_functions::FunctionValueType::new(
+                DataType::Int64,
+                false,
+            )],
+            &[(
+                novarocks_expression_contract::ValueId::new(1),
+                novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+            )],
+            &[(0, EvaluationDemand::Value)],
+        )]
+    }
     #[test]
     fn grouped_topn_shape_requires_a_complete_rank_permutation_even_at_zero_limit() {
         // The graph owner rejects an invalid rank mapping before an executor
@@ -2517,30 +2576,18 @@ mod tests {
         // call/type/root correspondence is covered by the compiler fixture.
         let make = |rank_group_ordinals| {
             let (values, layout) = values();
-            let expressions = Arc::new(
-                ImmutableExpressions::try_new(
-                    vec![StaticExprNode::new(
-                        StaticExprKind::SlotId(SlotId::new(1)),
-                        DataType::Int64,
-                        None,
-                    )],
-                    false,
-                    HashMap::new(),
-                    None,
-                )
-                .unwrap(),
-            );
+            let units = read_units(&layout);
             LocalProgramGraph::try_new(
                 vec![
                     ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
                     ProgramNode::new(2, ProgramNodeKind::GroupedTopN {
-                        input: ProgramNodeId::new(0), group_by: vec![ProgramExprId::new(0)],
-                        order_by: vec![SortExpression { expr: ProgramExprId::new(0), asc: true, nulls_first: false }],
+                        input: ProgramNodeId::new(0), group_by: vec![crate::test_support::root(0, 0)],
+                        order_by: vec![SortExpression { expr: crate::test_support::root(0, 0), asc: true, nulls_first: false }],
                         rank_group_ordinals, limit: 0,
                         comparator: novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1,
                         functions: vec![],
                     }, layout.clone()),
-                ], ProgramNodeId::new(1), expressions, profile(&layout), BindingRequirements::try_new(Vec::new()).unwrap(),
+                ], ProgramNodeId::new(1), &units, profile(&layout), BindingRequirements::try_new(Vec::new()).unwrap(),
             )
         };
         assert!(make(vec![0]).is_ok());
@@ -2556,19 +2603,10 @@ mod tests {
     fn table_finish_checks_scalar_constants_in_every_grouped_unpivot_mapping() {
         let make_program = |last_constant: UnpivotConstant| {
             let (values, layout) = values();
-            let expressions = Arc::new(
-                ImmutableExpressions::try_new(
-                    vec![StaticExprNode::new(
-                        StaticExprKind::Literal(crate::StaticLiteral::Int64(7)),
-                        DataType::Int64,
-                        None,
-                    )],
-                    false,
-                    HashMap::new(),
-                    None,
-                )
-                .unwrap(),
-            );
+            let units = vec![crate::test_support::constant_unit(
+                &[crate::test_support::integer(7)],
+                &[(0, EvaluationDemand::Value)],
+            )];
             let unpivot = WriterGroupedUnpivotPlan {
                 grouping_input_slot_id: SlotId::new(1),
                 grouping_output_slot_id: SlotId::new(2),
@@ -2585,7 +2623,7 @@ mod tests {
                         grouping_key: 1,
                         input_value_slot_id: SlotId::new(1),
                         constants: vec![UnpivotConstant::Scalar {
-                            expr_id: ProgramExprId::new(0),
+                            expr_id: crate::test_support::root(0, 0),
                             nullable: false,
                         }],
                     },
@@ -2624,7 +2662,7 @@ mod tests {
                     ),
                 ],
                 ProgramNodeId::new(1),
-                expressions,
+                &units,
                 profile(&layout),
                 BindingRequirements::try_new(vec![BindingRequirement::TableFinish {
                     node: ProgramNodeId::new(1),
@@ -2635,7 +2673,7 @@ mod tests {
         };
         assert!(
             make_program(UnpivotConstant::Scalar {
-                expr_id: ProgramExprId::new(0),
+                expr_id: crate::test_support::root(0, 0),
                 nullable: false,
             })
             .is_ok()
@@ -2644,7 +2682,7 @@ mod tests {
         for index in [1, usize::MAX] {
             assert!(matches!(
                 make_program(UnpivotConstant::Scalar {
-                    expr_id: ProgramExprId::new(index),
+                    expr_id: crate::test_support::root(0, (index) as u32),
                     nullable: false,
                 }),
                 Err(LocalProgramError::InvalidExpression)
@@ -2656,19 +2694,7 @@ mod tests {
     fn partition_only_sort_requires_a_valid_partition_expression() {
         let make_program = |partition_exprs: Vec<SortExpression>, topn: bool| {
             let (values, layout) = values();
-            let expressions = Arc::new(
-                ImmutableExpressions::try_new(
-                    vec![StaticExprNode::new(
-                        StaticExprKind::SlotId(SlotId::new(1)),
-                        DataType::Int64,
-                        None,
-                    )],
-                    false,
-                    HashMap::new(),
-                    None,
-                )
-                .unwrap(),
-            );
+            let units = read_units(&layout);
             LocalProgramGraph::try_new(
                 vec![
                     ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
@@ -2693,14 +2719,14 @@ mod tests {
                     ),
                 ],
                 ProgramNodeId::new(1),
-                expressions,
+                &units,
                 profile(&layout),
                 BindingRequirements::try_new(vec![BindingRequirement::ResultSink { layout }])
                     .unwrap(),
             )
         };
         let partition = |index| SortExpression {
-            expr: ProgramExprId::new(index),
+            expr: crate::test_support::root(0, (index) as u32),
             asc: true,
             nulls_first: true,
         };
@@ -2720,26 +2746,19 @@ mod tests {
     #[test]
     fn shares_flat_values_and_expressions_across_instances() {
         let (values, layout) = values();
-        let exprs = Arc::new(
-            ImmutableExpressions::try_new(
-                vec![StaticExprNode::new(
-                    StaticExprKind::SlotId(SlotId::new(1)),
-                    DataType::Int64,
-                    None,
-                )],
-                false,
-                HashMap::new(),
-                None,
-            )
-            .unwrap(),
-        );
+        let exprs = read_units(&layout);
         let nodes = vec![
             ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
             ProgramNode::new(
                 2,
-                ProgramNodeKind::Filter {
+                ProgramNodeKind::Project {
                     input: ProgramNodeId::new(0),
-                    predicates: vec![ProgramExprId::new(0)].into_boxed_slice(),
+                    is_subordinate: false,
+                    validate_final_result_input: false,
+                    exprs: vec![crate::test_support::root(0, 0)],
+                    expr_slot_ids: vec![SlotId::new(1)],
+                    expr_slot_schemas: None,
+                    output_indices: None,
                 },
                 layout.clone(),
             ),
@@ -2747,7 +2766,7 @@ mod tests {
         let program = LocalProgramGraph::try_new(
             nodes,
             ProgramNodeId::new(1),
-            exprs,
+            &exprs,
             profile(&layout),
             BindingRequirements::try_new(vec![BindingRequirement::ResultSink {
                 layout: layout.clone(),
@@ -2757,14 +2776,22 @@ mod tests {
         .unwrap();
         let shared = program.clone();
         assert!(Arc::ptr_eq(&program.nodes, &shared.nodes));
-        assert!(Arc::ptr_eq(program.expressions(), shared.expressions()));
+        assert_eq!(
+            program.nodes()[1]
+                .kind()
+                .clone()
+                .try_for_each_expression(|reference, _| {
+                    assert_eq!(reference, Some(crate::test_support::root(0, 0)));
+                    Ok::<_, ()>(())
+                }),
+            Ok(())
+        );
     }
 
     #[test]
     fn rejects_cycle_before_any_runtime_binding() {
         let (values, layout) = values();
-        let exprs =
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap());
+        let exprs = Vec::new();
         let nodes = vec![
             ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
             ProgramNode::new(
@@ -2781,7 +2808,7 @@ mod tests {
             LocalProgramGraph::try_new(
                 nodes,
                 ProgramNodeId::new(1),
-                exprs,
+                &exprs,
                 profile(&layout),
                 BindingRequirements::try_new(vec![]).unwrap(),
             ),
@@ -2799,7 +2826,7 @@ mod tests {
                 layout.clone(),
             )],
             ProgramNodeId::new(0),
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+            &Vec::new(),
             CompileProfile::new(
                 NonZeroUsize::new(1).unwrap(),
                 None,
@@ -2831,7 +2858,7 @@ mod tests {
         let program = LocalProgramGraph::try_new(
             nodes,
             ProgramNodeId::new(17),
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+            &Vec::new(),
             profile(&layout),
             BindingRequirements::try_new(vec![]).unwrap(),
         );
@@ -2850,9 +2877,7 @@ mod tests {
                     layout.clone(),
                 )],
                 ProgramNodeId::new(0),
-                Arc::new(
-                    ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap(),
-                ),
+                &Vec::new(),
                 profile(&layout),
                 BindingRequirements::try_new(vec![]).unwrap(),
             );
@@ -2872,9 +2897,7 @@ mod tests {
     #[test]
     fn rejects_unreachable_nodes_and_unbound_exchange_source() {
         let (values, layout) = values();
-        let empty_expressions = || {
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap())
-        };
+        let empty_expressions = || Vec::new();
         let unreachable = LocalProgramGraph::try_new(
             vec![
                 ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
@@ -2888,7 +2911,7 @@ mod tests {
                 ),
             ],
             ProgramNodeId::new(0),
-            empty_expressions(),
+            &empty_expressions(),
             profile(&layout),
             BindingRequirements::try_new(vec![]).unwrap(),
         );
@@ -2907,7 +2930,7 @@ mod tests {
                 layout.clone(),
             )],
             ProgramNodeId::new(0),
-            empty_expressions(),
+            &empty_expressions(),
             profile(&layout),
             BindingRequirements::try_new(vec![]).unwrap(),
         );
@@ -2940,15 +2963,16 @@ mod tests {
             let program = LocalProgramGraph::try_new(
                 nodes,
                 ProgramNodeId::new(width),
-                Arc::new(
-                    ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap(),
-                ),
+                &Vec::new(),
                 profile(&layout),
                 BindingRequirements::try_new(vec![]).unwrap(),
             )
             .unwrap();
             assert_eq!(program.nodes().len(), width + 1);
-            assert_eq!(program.expressions().nodes().len(), 0);
+            assert!(program.nodes().iter().all(|node| matches!(
+                node.kind(),
+                ProgramNodeKind::Values { .. } | ProgramNodeKind::Limit { .. }
+            )));
             let shared = program.clone();
             assert!(Arc::ptr_eq(&program.nodes, &shared.nodes));
         }
@@ -2972,7 +2996,7 @@ mod tests {
                 },
             )
             .unwrap(),
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+            &[],
         )
         .unwrap();
         let result = LocalProgramGraph::try_new_with_sink(
@@ -2982,7 +3006,7 @@ mod tests {
                 layout.clone(),
             )],
             ProgramNodeId::new(0),
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+            &Vec::new(),
             profile(&layout),
             BindingRequirements::try_new(vec![]).unwrap(),
             Some(sink),
@@ -2993,8 +3017,7 @@ mod tests {
     #[test]
     fn local_program_rejects_the_pre_policy_kernel_abi() {
         let (_, layout) = values();
-        let expressions =
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap());
+        let units = Vec::new();
         let requirements = BindingRequirements::try_new(vec![]).unwrap();
         let old = CompileProfile::new(
             NonZeroUsize::new(1).unwrap(),
@@ -3006,7 +3029,7 @@ mod tests {
             LocalProgramGraph::try_new(
                 vec![],
                 ProgramNodeId::new(0),
-                expressions.clone(),
+                &units.clone(),
                 old,
                 requirements.clone()
             ),
@@ -3016,7 +3039,7 @@ mod tests {
             LocalProgramGraph::try_new(
                 vec![],
                 ProgramNodeId::new(0),
-                expressions,
+                &units,
                 profile(&layout),
                 requirements
             ),
@@ -3025,6 +3048,16 @@ mod tests {
         assert_eq!(KernelAbiVersion::CURRENT.get(), 2);
     }
 
+    struct GraphFixture {
+        graph: LocalProgramGraph,
+        units: Vec<Arc<novarocks_expression::CompiledExprSet>>,
+    }
+    impl std::ops::Deref for GraphFixture {
+        type Target = LocalProgramGraph;
+        fn deref(&self) -> &Self::Target {
+            &self.graph
+        }
+    }
     #[derive(Default)]
     struct OriginalControl {
         trace: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
@@ -3050,21 +3083,9 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ]
     }
-    fn exchange_fixture(edges: usize, children: bool) -> LocalProgramGraph {
+    fn exchange_fixture(edges: usize, children: bool) -> GraphFixture {
         let (_, layout) = values();
-        let expressions = Arc::new(
-            ImmutableExpressions::try_new(
-                vec![StaticExprNode::new(
-                    StaticExprKind::SlotId(SlotId::new(1)),
-                    DataType::Int64,
-                    None,
-                )],
-                false,
-                HashMap::new(),
-                None,
-            )
-            .unwrap(),
-        );
+        let units = read_units(&layout);
         let mut nodes = vec![ProgramNode::new(
             7,
             ProgramNodeKind::ExchangeSource {
@@ -3072,7 +3093,7 @@ mod tests {
                 hash_partition_exprs: if children {
                     vec![]
                 } else {
-                    vec![ProgramExprId::new(0); edges]
+                    vec![crate::test_support::root(0, 0); edges]
                 },
             },
             layout.clone(),
@@ -3087,10 +3108,10 @@ mod tests {
             ));
         }
         let root = ProgramNodeId::new(nodes.len() - 1);
-        LocalProgramGraph::try_new_with_sink(
+        let graph = LocalProgramGraph::try_new_with_sink(
             nodes,
             root,
-            expressions,
+            &units,
             profile(&layout),
             BindingRequirements::try_new(vec![
                 BindingRequirement::ExchangeInput {
@@ -3105,16 +3126,17 @@ mod tests {
             .unwrap(),
             Some(StaticSinkProgram::Result),
         )
-        .unwrap()
+        .unwrap();
+        GraphFixture { graph, units }
     }
     fn compile_fixture(
-        source: &LocalProgramGraph,
+        source: &GraphFixture,
         control: &dyn PureCompileControl,
     ) -> Result<LocalProgramGraph, ProgramCompileError> {
         LocalProgramGraph::try_new_with_sink_for_compile(
             source.nodes().to_vec(),
             source.root(),
-            source.expressions().clone(),
+            &source.units,
             source.profile(),
             source.requirements().clone(),
             source.sink().cloned(),
@@ -3131,7 +3153,8 @@ mod tests {
             assert_eq!(actual.root(), source.root());
             assert_eq!(actual.nodes().len(), source.nodes().len());
             assert_eq!(actual.profile(), source.profile());
-            assert!(Arc::ptr_eq(actual.expressions(), source.expressions()));
+            assert_eq!(source.units.len(), 1);
+            assert!(Arc::ptr_eq(&source.units[0], &source.units[0].clone()));
             assert_eq!(
                 actual.nodes()[actual.root().index()]
                     .output_layout()
@@ -3152,7 +3175,10 @@ mod tests {
                 else {
                     panic!("expected exact exchange graph");
                 };
-                assert_eq!(hash_partition_exprs, &vec![ProgramExprId::new(0); 320]);
+                assert_eq!(
+                    hash_partition_exprs,
+                    &vec![crate::test_support::root(0, 0); 320]
+                );
             }
             let trace = control.trace.lock().unwrap();
             assert!(trace.iter().any(|(_, units)| *units == 256));
@@ -3203,7 +3229,7 @@ mod tests {
             LocalProgramGraph::try_new_for_compile(
                 vec![],
                 ProgramNodeId::new(0),
-                source.expressions().clone(),
+                &source.units,
                 source.profile(),
                 BindingRequirements::try_new(vec![]).unwrap(),
                 control,
@@ -3247,14 +3273,14 @@ mod tests {
             (
                 ProgramNodeKind::Filter {
                     input: ProgramNodeId::new(1),
-                    predicates: vec![ProgramExprId::new(999)].into_boxed_slice(),
+                    predicates: vec![crate::test_support::root(0, 999)].into_boxed_slice(),
                 },
                 LocalProgramError::InvalidChild,
             ),
             (
                 ProgramNodeKind::Filter {
                     input: ProgramNodeId::new(0),
-                    predicates: vec![ProgramExprId::new(999)].into_boxed_slice(),
+                    predicates: vec![crate::test_support::root(0, 999)].into_boxed_slice(),
                 },
                 LocalProgramError::InvalidExpression,
             ),
@@ -3263,7 +3289,7 @@ mod tests {
                     input: ProgramNodeId::new(0),
                     is_subordinate: false,
                     validate_final_result_input: false,
-                    exprs: vec![ProgramExprId::new(0)],
+                    exprs: vec![crate::test_support::root(0, 0)],
                     expr_slot_ids: vec![],
                     expr_slot_schemas: None,
                     output_indices: None,
@@ -3276,11 +3302,11 @@ mod tests {
                 ProgramNode::new(8, kind, layout.clone()),
             ];
             assert!(
-                matches!(LocalProgramGraph::try_new(nodes.clone(), ProgramNodeId::new(1), source.expressions().clone(), source.profile(), source.requirements().clone()), Err(actual) if actual == expected)
+                matches!(LocalProgramGraph::try_new(nodes.clone(), ProgramNodeId::new(1), &source.units, source.profile(), source.requirements().clone()), Err(actual) if actual == expected)
             );
             let control = OriginalControl::default();
             assert!(
-                matches!(LocalProgramGraph::try_new_for_compile(nodes, ProgramNodeId::new(1), source.expressions().clone(), source.profile(), source.requirements().clone(), &control), Err(ProgramCompileError::Program(actual)) if actual == expected)
+                matches!(LocalProgramGraph::try_new_for_compile(nodes, ProgramNodeId::new(1), &source.units, source.profile(), source.requirements().clone(), &control), Err(ProgramCompileError::Program(actual)) if actual == expected)
             );
         }
         let bad_profile = CompileProfile::new(
@@ -3293,7 +3319,7 @@ mod tests {
             LocalProgramGraph::try_new_for_compile(
                 source.nodes().to_vec(),
                 source.root(),
-                source.expressions().clone(),
+                &source.units,
                 bad_profile,
                 BindingRequirements::try_new(vec![]).unwrap(),
                 &OriginalControl::default()
@@ -3306,7 +3332,7 @@ mod tests {
             LocalProgramGraph::try_new_for_compile(
                 source.nodes().to_vec(),
                 source.root(),
-                source.expressions().clone(),
+                &source.units,
                 source.profile(),
                 BindingRequirements::try_new(vec![]).unwrap(),
                 &OriginalControl::default()
@@ -3336,7 +3362,7 @@ mod tests {
                 },
             )
             .unwrap(),
-            source.expressions().clone(),
+            &source.units,
         )
         .unwrap();
         let requirements = BindingRequirements::try_new(vec![
@@ -3358,7 +3384,7 @@ mod tests {
         let actual = LocalProgramGraph::try_new_with_sink_for_compile(
             source.nodes().to_vec(),
             source.root(),
-            source.expressions().clone(),
+            &source.units,
             source.profile(),
             requirements.clone(),
             Some(sink.clone()),
@@ -3372,7 +3398,7 @@ mod tests {
         LocalProgramGraph::try_new_with_sink(
             source.nodes().to_vec(),
             source.root(),
-            source.expressions().clone(),
+            &source.units,
             source.profile(),
             requirements,
             Some(sink.clone()),
@@ -3382,7 +3408,7 @@ mod tests {
             LocalProgramGraph::try_new_with_sink_for_compile(
                 source.nodes().to_vec(),
                 source.root(),
-                source.expressions().clone(),
+                &source.units,
                 source.profile(),
                 BindingRequirements::try_new(vec![BindingRequirement::ExchangeInput {
                     role: crate::ProgramOutputRole::Relational,

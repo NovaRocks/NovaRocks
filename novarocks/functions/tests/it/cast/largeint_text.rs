@@ -26,7 +26,7 @@ use novarocks_type_contract::ExpressionEffectContext;
 use novarocks_type_contract::FunctionValueType;
 use novarocks_type_contract::PureCompileControl;
 use novarocks_type_contract::ValueLogicalType;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -92,7 +92,7 @@ fn largeint_text_physical_profile_preserves_nominal_gate_and_exact_types() {
         );
         let c = ExpressionEffectContext {
             use_id: ExpressionUseId::new(1),
-            domain: EvaluationDomainId::new(2),
+            region: EvaluationRegionId::new(2),
             demand: EvaluationDemand::Value,
         };
         assert!(!r.own_effects(c).for_use(c).unwrap().may_raise_row_error);

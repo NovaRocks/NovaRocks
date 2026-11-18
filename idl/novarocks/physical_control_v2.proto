@@ -19,20 +19,21 @@ syntax = "proto3";
 
 package novarocks.physical_control_v2;
 
-// The flat invocation/control component of a v2 fragment package. Definitions
-// live in the fragment expression table. IDs are sparse, zero is valid, and
+// The flat invocation/control component of one node expression unit.
+// Definitions live in that same unit. IDs are sparse, zero is valid, and
 // singular reference presence is required by the typed decoder.
 message ExpressionControl {
-  repeated EvaluationDomain domains = 1;
+  repeated EvaluationRegion regions = 1;
   repeated ExpressionUse uses = 2;
-  repeated RootBinding roots = 3;
+  reserved 3;
+  reserved "roots";
 }
-message EvaluationDomain {
+message EvaluationRegion {
   uint32 id = 1;
-  optional uint32 parent_domain_id = 2;
-  DomainGuard guard = 3;
+  optional uint32 parent_region_id = 2;
+  RegionGuard guard = 3;
 }
-message DomainGuard {
+message RegionGuard {
   optional uint32 owner_use_id = 1;
   oneof kind {
     SimpleGuard simple = 2;
@@ -60,7 +61,7 @@ enum EvaluationDemand {
 message ExpressionUse {
   uint32 id = 1;
   optional uint32 definition_id = 2;
-  optional uint32 domain_id = 3;
+  optional uint32 region_id = 3;
   EvaluationDemand demand = 4;
   ControlShape control = 5;
   // Each edge names a separate invocation, even when its definition is shared.
@@ -96,60 +97,7 @@ message HigherOrderControl {
   uint32 body_ordinal = 1;
   EvaluationDemand body_demand = 2;
 }
-message RootBinding {
-  optional uint32 use_id = 1;
-  RootSite site = 2;
-}
 message Empty {}
-message CallArgumentRoot { uint32 call = 1; uint32 argument = 2; }
-message CallOrderRoot { uint32 call = 1; uint32 key = 2; }
-message ValuesRoot { uint32 row = 1; uint32 column = 2; }
-message MappingConstantRoot { uint32 mapping = 1; uint32 constant = 2; }
-message ChangeAssignmentRoot { uint32 event = 1; uint32 assignment = 2; }
-message JoinKeyRoot { uint32 key = 1; JoinSide side = 2; }
-enum JoinSide {
-  JOIN_SIDE_UNSPECIFIED = 0;
-  JOIN_SIDE_LEFT = 1;
-  JOIN_SIDE_RIGHT = 2;
-}
-// These are real node field positions, not indices in a flattened expression
-// list. Optional fields and non-scalar constants do not compact ordinals.
-message RootSite {
-  optional uint32 node_id = 1;
-  oneof role {
-    uint32 scan_residual = 2;
-    uint32 scan_derived = 3;
-    uint32 filter_predicate = 4;
-    uint32 project_output = 5;
-    uint32 aggregate_group = 6;
-    CallArgumentRoot aggregate_argument = 7;
-    CallOrderRoot aggregate_order = 8;
-    JoinKeyRoot join_key = 9;
-    Empty hash_join_residual = 10;
-    Empty nest_loop_predicate = 11;
-    uint32 sort_order = 12;
-    uint32 sort_partition = 13;
-    uint32 top_n_order = 14;
-    uint32 top_n_group = 15;
-    CallArgumentRoot top_n_state_argument = 16;
-    CallOrderRoot top_n_state_order = 17;
-    uint32 window_partition = 18;
-    uint32 window_order = 19;
-    uint32 window_call = 20;
-    ValuesRoot values_cell = 21;
-    Empty series_start = 22;
-    Empty series_stop = 23;
-    Empty series_step = 24;
-    uint32 table_function_argument = 25;
-    MappingConstantRoot unpivot_constant = 26;
-    uint32 change_predicate = 27;
-    ChangeAssignmentRoot change_assignment = 28;
-    MappingConstantRoot finish_unpivot_constant = 29;
-    JoinKeyRoot naa_value_equal_key = 30;
-    JoinKeyRoot naa_scope_key = 31;
-    Empty naa_eligibility = 32;
-  }
-}
 
 // Explicit emitted-source grammar; UNSPECIFIED is always rejected.
 enum TemporalSourceShape {

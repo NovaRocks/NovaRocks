@@ -20,8 +20,8 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    AggregatePhase, Distribution, ExprId, Fragment, FragmentId, NodeId, NodeKind, PhysicalPlan,
-    ValueId,
+    AggregatePhase, Distribution, Fragment, FragmentId, NodeId, NodeKind, PhysicalPlan,
+    RootOrdinal, ValueId,
 };
 
 pub(crate) fn validate_aggregate_sequences(plan: &PhysicalPlan, errors: &mut ValidationContext) {
@@ -87,7 +87,9 @@ pub(crate) fn validate_aggregate_sequences(plan: &PhysicalPlan, errors: &mut Val
         let NodeKind::Aggregate { group_by, .. } = &final_node.kind else {
             continue;
         };
-        let Some(values) = aggregate_state_inputs(final_fragment, group_by, final_call) else {
+        let Some(values) =
+            aggregate_state_inputs(final_fragment, final_node.id, group_by, final_call)
+        else {
             errors.push(ValidationError::new(
                 &path,
                 "aggregate final inputs are not direct grouping/state values",
@@ -139,25 +141,23 @@ pub(crate) fn validate_aggregate_sequences(plan: &PhysicalPlan, errors: &mut Val
 
 pub(crate) fn aggregate_state_inputs(
     fragment: &Fragment,
-    group_by: &[(ExprId, ValueId)],
+    node: NodeId,
+    group_by: &[(RootOrdinal, ValueId)],
     call: &crate::AggregateCall,
 ) -> Option<Vec<ValueId>> {
     let mut values = group_by
         .iter()
-        .map(|(expression, _)| crate::expression_value(fragment.expressions(), *expression))
+        .map(|(expression, _)| crate::expression_value(fragment, node, *expression))
         .collect::<Option<Vec<_>>>()?;
     if call.arguments.len() != 1 || !call.order_by.is_empty() {
         return None;
     }
-    values.push(crate::expression_value(
-        fragment.expressions(),
-        call.arguments[0],
-    )?);
+    values.push(crate::expression_value(fragment, node, call.arguments[0])?);
     Some(values)
 }
 
 pub(crate) fn aggregate_outputs(
-    group_by: &[(ExprId, ValueId)],
+    group_by: &[(RootOrdinal, ValueId)],
     call: &crate::AggregateCall,
 ) -> Vec<ValueId> {
     group_by
@@ -406,7 +406,7 @@ fn aggregate_topn_grouped_parent_matches_with(
         return Ok(false);
     }
     let (producer_expression, key) = producer_keys[0];
-    let Some(expression) = fragment.expressions().get(producer_expression) else {
+    let Some(expression) = fragment.root_expression(aggregate.id, producer_expression) else {
         return Ok(false);
     };
     let crate::ExprKind::Value(input) = expression.kind else {
@@ -419,8 +419,8 @@ fn aggregate_topn_grouped_parent_matches_with(
         return Ok(false);
     };
     if group_by[0].1 != key
-        || crate::expression_value(fragment.expressions(), group_by[0].0) != Some(key)
-        || crate::expression_value(fragment.expressions(), order_by[0].expr) != Some(key)
+        || crate::expression_value(fragment, topn.id, group_by[0].0) != Some(key)
+        || crate::expression_value(fragment, topn.id, order_by[0].expr) != Some(key)
         || aggregate.output.columns[0] != key
         || topn.output.columns[0] != key
         || !state_value_types_match(&expression.ty, &input_definition.ty, false, charge)?
@@ -430,7 +430,7 @@ fn aggregate_topn_grouped_parent_matches_with(
         return Ok(false);
     }
     for expression_id in [group_by[0].0, order_by[0].expr] {
-        let Some(expression) = fragment.expressions().get(expression_id) else {
+        let Some(expression) = fragment.root_expression(topn.id, expression_id) else {
             return Ok(false);
         };
         if !state_value_types_match(&expression.ty, &key_definition.ty, false, charge)? {
@@ -446,7 +446,7 @@ fn aggregate_topn_grouped_parent_matches_with(
             || consumer.distinct
             || !consumer.order_by.is_empty()
             || consumer.arguments.len() != 1
-            || crate::expression_value(fragment.expressions(), consumer.arguments[0])
+            || crate::expression_value(fragment, topn.id, consumer.arguments[0])
                 != Some(producer.output)
             || producer.output == consumer.output
             || aggregate.output.columns[ordinal + 1] != producer.output
@@ -474,7 +474,7 @@ fn aggregate_topn_grouped_parent_matches_with(
                 return Ok(false);
             }
         }
-        let Some(argument) = fragment.expressions().get(consumer.arguments[0]) else {
+        let Some(argument) = fragment.root_expression(topn.id, consumer.arguments[0]) else {
             return Ok(false);
         };
         if !state_value_types_match(
@@ -620,7 +620,9 @@ pub(crate) fn trace_aggregate_sequence_inputs(
                         if !matched_intermediates.insert(call_ref) {
                             return false;
                         }
-                        let Some(values) = aggregate_state_inputs(fragment, group_by, call) else {
+                        let Some(values) =
+                            aggregate_state_inputs(fragment, node.id, group_by, call)
+                        else {
                             return false;
                         };
                         let Some(input) = node.inputs.first().copied() else {
@@ -790,7 +792,8 @@ pub(crate) fn validate_topn_reductions(plan: &PhysicalPlan, errors: &mut Validat
         let Some(required_partial_limit) = limit.checked_add(*offset) else {
             continue;
         };
-        let Some(expected_ordering) = derive_ordering(final_fragment, &[], order_by) else {
+        let Some(expected_ordering) = derive_ordering(final_fragment, final_node.id, &[], order_by)
+        else {
             continue;
         };
         let Some(input) = final_node.inputs.first().copied() else {
@@ -1046,8 +1049,7 @@ pub(crate) fn trace_topn_reduction_inputs(
                     };
                     let Some(source) =
                         fragment
-                            .expressions()
-                            .get(*expression)
+                            .root_expression(node.id, *expression)
                             .and_then(|expression| match expression.kind {
                                 crate::ExprKind::Value(source) => Some(source),
                                 _ => None,

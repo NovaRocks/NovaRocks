@@ -32,8 +32,8 @@ use arrow::datatypes::DataType;
 use novarocks_local_program::{CompiledAggregateGrouping, LocalProgram, ProgramNodeKind};
 use novarocks_physical_plan::{
     AggregateCallId, AggregateGrouping, AggregatePhase, AggregateSequenceId, Distribution, EdgeId,
-    FragmentBuilder, FragmentId, FragmentSink, LiteralValue, OutputPort, PhysicalPlan, PlanBuilder,
-    PlanVersionId, ResultField, ResultPort, ValueId,
+    FragmentId, FragmentSink, OutputPort, PhysicalPlan, PlanVersionId, ResultField, ResultPort,
+    ValueId,
 };
 use novarocks_type_contract::FunctionValueType;
 use novarocks_types::UniqueId;
@@ -114,7 +114,7 @@ fn grouped_oracle(rows: &[Row]) -> BTreeMap<Option<i64>, Aggregates> {
     groups
 }
 
-fn literal_rows(rows: &[Row]) -> Vec<Vec<LiteralValue>> {
+fn literal_rows(rows: &[Row]) -> Vec<Vec<novarocks_functions::ConstantValue>> {
     rows.iter().map(|(k, v)| vec![cell(*k), cell(*v)]).collect()
 }
 
@@ -211,8 +211,19 @@ impl Calls {
 /// -> Stream(Hash[k] or Gather)` | `ExchangeSource -> Final Aggregate ->
 /// Result`. A grouped plan groups by `k`; a group-less one aggregates all
 /// rows and gathers every partial state to one Final.
-fn two_phase_plan(calls: &Calls, rows: &[Row], grouped: bool) -> PhysicalPlan {
-    let mut source = FragmentBuilder::new(SOURCE);
+fn two_phase_plan(
+    catalog: &novarocks_functions::PureEngineFunctionCatalog,
+    calls: &Calls,
+    rows: &[Row],
+    grouped: bool,
+) -> PhysicalPlan {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
+
+    let mut source = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        SOURCE,
+        &fixture_sources,
+    );
     let values_node = source.reserve_node_id().unwrap();
     let columns = values(
         &mut source,
@@ -225,9 +236,15 @@ fn two_phase_plan(calls: &Calls, rows: &[Row], grouped: bool) -> PhysicalPlan {
         values_node,
         FragmentSink::Stream { edge: TO_PARTIAL },
         1,
+        catalog,
+        &parameters,
     );
 
-    let mut partial = FragmentBuilder::new(PARTIAL);
+    let mut partial =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            PARTIAL,
+            &fixture_sources,
+        );
     let partial_receiver = partial.reserve_node_id().unwrap();
     let partial_inputs = receive(
         &mut partial,
@@ -253,9 +270,14 @@ fn two_phase_plan(calls: &Calls, rows: &[Row], grouped: bool) -> PhysicalPlan {
         partial_node,
         FragmentSink::Stream { edge: TO_FINAL },
         u32::try_from(DOP).unwrap(),
+        catalog,
+        &parameters,
     );
 
-    let mut last = FragmentBuilder::new(FINAL);
+    let mut last = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        FINAL,
+        &fixture_sources,
+    );
     let final_receiver = last.reserve_node_id().unwrap();
     let mut sent = Vec::new();
     if grouped {
@@ -289,6 +311,8 @@ fn two_phase_plan(calls: &Calls, rows: &[Row], grouped: bool) -> PhysicalPlan {
         final_node,
         FragmentSink::Result,
         u32::try_from(DOP).unwrap(),
+        catalog,
+        &parameters,
     );
     let output = last.nodes()[&final_node].output.clone();
     let mut types = Vec::new();
@@ -297,7 +321,11 @@ fn two_phase_plan(calls: &Calls, rows: &[Row], grouped: bool) -> PhysicalPlan {
     }
     types.extend(calls.all().map(Bound::result_type));
 
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        version(),
+        &fixture_sources,
+    )
+    .with_semantic_parameters(parameters.clone());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(partial).unwrap();
     plan.add_fragment(last).unwrap();
@@ -366,8 +394,8 @@ fn try_run_two_phase(
     rows: &[Row],
     grouped: bool,
 ) -> Result<TwoPhaseRun, String> {
-    let plan = two_phase_plan(calls, rows, grouped);
-    let mut packages = packages(&plan, catalog);
+    let plan = two_phase_plan(catalog, calls, rows, grouped);
+    let mut packages = packages(&plan);
     let source = compile(packages.remove(&SOURCE).unwrap(), catalog, 1, false);
     let partial = compile(packages.remove(&PARTIAL).unwrap(), catalog, DOP, false);
     let last = compile(packages.remove(&FINAL).unwrap(), catalog, DOP, true);
@@ -531,16 +559,27 @@ fn float_key_plan(
     catalog: &novarocks_functions::PureEngineFunctionCatalog,
     keys: &[Option<f64>],
 ) -> PhysicalPlan {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
+
     let count = bind(catalog, "count", &[]);
     let key_type = FunctionValueType::new(DataType::Float64, true);
-    let mut only = FragmentBuilder::new(SOURCE);
+    let mut only = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        SOURCE,
+        &fixture_sources,
+    );
     let values_node = only.reserve_node_id().unwrap();
     let rows = keys
         .iter()
         .map(|key| {
-            vec![key.map_or(LiteralValue::Null, |key| {
-                LiteralValue::Float64Bits(key.to_bits())
-            })]
+            vec![key.map_or(
+                crate::exec::operators::family_fixture::constant_sources::null(),
+                |key| {
+                    crate::exec::operators::family_fixture::constant_sources::f64_bits(
+                        key.to_bits(),
+                    )
+                },
+            )]
         })
         .collect::<Vec<_>>();
     let columns = values(
@@ -567,9 +606,15 @@ fn float_key_plan(
         node,
         FragmentSink::Result,
         u32::try_from(DOP).unwrap(),
+        catalog,
+        &parameters,
     );
     let port_output = only.nodes()[&node].output.clone();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        version(),
+        &fixture_sources,
+    )
+    .with_semantic_parameters(parameters.clone());
     plan.add_fragment(only).unwrap();
     plan.set_result_port(result_port(
         SOURCE,
@@ -585,7 +630,7 @@ fn run_single(
     plan: &PhysicalPlan,
     catalog: &novarocks_functions::PureEngineFunctionCatalog,
 ) -> Vec<Chunk> {
-    let mut packages = packages(plan, catalog);
+    let mut packages = packages(plan);
     let program = compile(packages.remove(&SOURCE).unwrap(), catalog, DOP, true);
     assert_eq!(grouping(&program), CompiledAggregateGrouping::Complete);
     let output = ResultSinkBuffer::new();
@@ -665,9 +710,15 @@ fn group_keys_equate_null_every_nan_and_signed_zero_as_the_key_table_owns_them()
 
 #[test]
 fn single_phase_group_less_aggregate_on_empty_input_publishes_one_row() {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
+
     let catalog = extrema_catalog();
     let calls = Calls::extrema(&catalog);
-    let mut only = FragmentBuilder::new(SOURCE);
+    let mut only = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        SOURCE,
+        &fixture_sources,
+    );
     let values_node = only.reserve_node_id().unwrap();
     let columns = values(&mut only, values_node, &[int64(true), int64(true)], &[]);
     let (node, _) = add_aggregate(
@@ -682,9 +733,15 @@ fn single_phase_group_less_aggregate_on_empty_input_publishes_one_row() {
         node,
         FragmentSink::Result,
         u32::try_from(DOP).unwrap(),
+        &catalog,
+        &parameters,
     );
     let port_output = only.nodes()[&node].output.clone();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        version(),
+        &fixture_sources,
+    )
+    .with_semantic_parameters(parameters.clone());
     plan.add_fragment(only).unwrap();
     let types = calls.all().map(Bound::result_type).collect::<Vec<_>>();
     plan.set_result_port(result_port(SOURCE, port_output, &types))
@@ -786,9 +843,15 @@ fn two_phase_bigint_sum_overflow_fails_only_the_final_value() {
 
 #[test]
 fn distinct_aggregate_the_owner_does_not_implement_is_an_explicit_compile_refusal() {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
+
     let catalog = extrema_catalog();
     let count = bind(&catalog, "count", &[int64(true)]);
-    let mut only = FragmentBuilder::new(SOURCE);
+    let mut only = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        SOURCE,
+        &fixture_sources,
+    );
     let values_node = only.reserve_node_id().unwrap();
     let columns = values(
         &mut only,
@@ -809,9 +872,13 @@ fn distinct_aggregate_the_owner_does_not_implement_is_an_explicit_compile_refusa
         }],
         AggregateGrouping::Complete,
     );
-    let only = finish(only, node, FragmentSink::Result, 1);
+    let only = finish(only, node, FragmentSink::Result, 1, &catalog, &parameters);
     let port_output = only.nodes()[&node].output.clone();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        version(),
+        &fixture_sources,
+    )
+    .with_semantic_parameters(parameters.clone());
     plan.add_fragment(only).unwrap();
     plan.set_result_port(result_port(
         SOURCE,
@@ -822,7 +889,7 @@ fn distinct_aggregate_the_owner_does_not_implement_is_an_explicit_compile_refusa
     let plan = plan
         .finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the DISTINCT plan validates: {error:?}"));
-    let mut packages = packages(&plan, &catalog);
+    let mut packages = packages(&plan);
     // COUNT(DISTINCT) has no pure lifecycle here: the frozen preparation
     // refuses it, never a fallback.
     let error =
@@ -835,12 +902,18 @@ fn distinct_aggregate_the_owner_does_not_implement_is_an_explicit_compile_refusa
 // selection) still carries its input's row count.
 #[test]
 fn zero_width_project_carries_its_row_count_into_count_star() {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
+
     let catalog = extrema_catalog();
     let count = bind(&catalog, "count", &[]);
-    let mut only = FragmentBuilder::new(SOURCE);
+    let mut only = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+        SOURCE,
+        &fixture_sources,
+    );
     let values_node = only.reserve_node_id().unwrap();
     let rows = (1..=3)
-        .map(|v| vec![LiteralValue::Int64(v)])
+        .map(|v| vec![crate::exec::operators::family_fixture::constant_sources::i64(v)])
         .collect::<Vec<_>>();
     values(&mut only, values_node, &[int64(false)], &rows);
     let project = only.reserve_node_id().unwrap();
@@ -864,9 +937,15 @@ fn zero_width_project_carries_its_row_count_into_count_star() {
         node,
         FragmentSink::Result,
         u32::try_from(DOP).unwrap(),
+        &catalog,
+        &parameters,
     );
     let port_output = only.nodes()[&node].output.clone();
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        version(),
+        &fixture_sources,
+    )
+    .with_semantic_parameters(parameters.clone());
     plan.add_fragment(only).unwrap();
     plan.set_result_port(result_port(SOURCE, port_output, &[count.result_type()]))
         .unwrap();
@@ -881,6 +960,9 @@ fn zero_width_project_carries_its_row_count_into_count_star() {
 /// instances. Empty siblings still send their initial aggregate states and EOS.
 #[test]
 fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two() {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
+
     use super::aggregate_fixture::{
         aggregate_catalog, compile_with_providers, packages_with_reads, try_run_with_scans,
     };
@@ -903,7 +985,11 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
     ]);
     for dop in [1, 2] {
         for has_unit in [true, false] {
-            let mut partial = FragmentBuilder::new(PARTIAL);
+            let mut partial =
+                crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                    PARTIAL,
+                    &fixture_sources,
+                );
             let scan = partial.reserve_node_id().unwrap();
             let (columns, read): (_, FrozenConnectorRead) =
                 add_typed_scan(&mut partial, scan, &[int64(false), int64(false)], vec![]);
@@ -919,8 +1005,14 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
                 aggregate,
                 FragmentSink::Stream { edge: TO_FINAL },
                 dop,
+                &catalog,
+                &parameters,
             );
-            let mut last = FragmentBuilder::new(FINAL);
+            let mut last =
+                crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                    FINAL,
+                    &fixture_sources,
+                );
             let receiver = last.reserve_node_id().unwrap();
             let sent = states
                 .iter()
@@ -937,9 +1029,21 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
                 &calls.merge(&inputs),
                 AggregateGrouping::Complete,
             );
-            let last = finish(last, aggregate, FragmentSink::Result, dop);
+            let last = finish(
+                last,
+                aggregate,
+                FragmentSink::Result,
+                dop,
+                &catalog,
+                &parameters,
+            );
             let output = last.nodes()[&aggregate].output.clone();
-            let mut plan = PlanBuilder::new(version());
+            let mut plan =
+                crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+                    version(),
+                    &fixture_sources,
+                )
+                .with_semantic_parameters(parameters.clone());
             plan.add_fragment(partial).unwrap();
             plan.add_fragment(last).unwrap();
             plan.add_edge(edge(
@@ -961,7 +1065,6 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
                 .expect("scan aggregate plan");
             let mut packages = packages_with_reads(
                 &plan,
-                &catalog,
                 &BTreeMap::from([(ProviderReadOccurrenceId::new(0), read)]),
             );
             let partial = compile_with_providers(

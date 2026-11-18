@@ -17,15 +17,14 @@
 
 //! Fresh aggregate update facts from the actual independent argument roots.
 
-use std::{alloc::Layout, collections::BTreeMap, sync::Arc};
+use std::{alloc::Layout, sync::Arc};
 
 use novarocks_functions::{
     CallEffectInput, MAX_CALL_EFFECT_ARGUMENTS, PureCallSpecialization, PureKernelAbi,
-    ScopedExpressionEffects,
+    ScopedRelationalEffects,
 };
 use novarocks_physical_plan::{
-    AggregateCall, ExpressionRootRole, ExpressionRootSite, Fragment, FrozenPhysicalCall,
-    PhysicalCallSite, PhysicalNode,
+    AggregateCall, Fragment, FrozenPhysicalCall, PhysicalCallSite, PhysicalNode,
 };
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileCheckpoints, CompileControlError,
@@ -86,7 +85,7 @@ pub(crate) struct PhysicalAggregateOccurrenceInput<'a> {
     pub source: &'a AggregateCall,
     pub request: &'a AuthoredPhysicalAggregateUpdateRequest<'a>,
     pub occurrences: &'a AuthoredPhysicalOccurrences<'a>,
-    pub child_effects: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    pub child_effects: Option<&'a super::contract_lowering::NodeExpressionEffects>,
     pub parameters: &'a SemanticParameters,
     pub environment: &'a [SemanticParameterRef],
     pub decimal_overflow_policy: DecimalOverflowPolicy,
@@ -128,7 +127,7 @@ pub(crate) fn prepare_physical_aggregate_occurrence_observed(
     let same_source = actual.is_some_and(|node| std::ptr::eq(node, input.node))
         && std::ptr::eq(input.node, input.request.node())
         && std::ptr::eq(input.source, input.request.source())
-        && input.occurrences.root_uses.roots().fragment() == input.fragment.id();
+        && std::ptr::eq(input.occurrences.fragment(), input.fragment);
     work.step()?;
     if !same_source {
         return Err(PhysicalAggregateOccurrenceError::InvalidSource(
@@ -145,9 +144,8 @@ pub(crate) fn prepare_physical_aggregate_occurrence_observed(
         }
     }
     let site = input.request.site();
-    let (node, call, topn) = match site {
-        PhysicalCallSite::Aggregate { node, call } => (node, call, false),
-        PhysicalCallSite::TopNState { node, call } => (node, call, true),
+    let node = match site {
+        PhysicalCallSite::Aggregate { node, .. } | PhysicalCallSite::TopNState { node, .. } => node,
         _ => {
             return Err(PhysicalAggregateOccurrenceError::InvalidSource(
                 "aggregate update request has a different lifecycle site",
@@ -221,46 +219,25 @@ pub(crate) fn prepare_physical_aggregate_occurrence_observed(
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     work.flush()?;
     let mut children = ExpressionEffects::PURE_VALUE;
-    for (ordinal, &definition) in input.source.arguments.iter().enumerate() {
-        let ordinal = u32::try_from(ordinal);
-        work.step()?;
-        let ordinal = ordinal.map_err(|_| CompileControlError::ResourceExhausted)?;
-        let role = if topn {
-            ExpressionRootRole::TopNStateArgument {
-                call,
-                argument: ordinal,
-            }
-        } else {
-            ExpressionRootRole::AggregateArgument {
-                call,
-                argument: ordinal,
-            }
-        };
+    let unit = input.node.expressions.as_deref();
+    for root in input
+        .source
+        .arguments
+        .iter()
+        .copied()
+        .chain(input.source.order_by.iter().map(|key| key.expr))
+    {
+        let unit = unit.ok_or(PhysicalAggregateOccurrenceError::InvalidSource(
+            "aggregate parameter has no actual node unit",
+        ))?;
         let (id, effects) = relational_root_effects_observed(
-            &input.occurrences.root_uses,
-            ExpressionRootSite { node, role },
-            definition,
-            input.child_effects,
-            work,
-        )?;
-        children = children.join(effects);
-        argument_uses.push(Some(id));
-        work.step()?;
-    }
-    for (ordinal, key) in input.source.order_by.iter().enumerate() {
-        let ordinal = u32::try_from(ordinal);
-        work.step()?;
-        let ordinal = ordinal.map_err(|_| CompileControlError::ResourceExhausted)?;
-        let role = if topn {
-            ExpressionRootRole::TopNStateOrder { call, key: ordinal }
-        } else {
-            ExpressionRootRole::AggregateOrder { call, key: ordinal }
-        };
-        let (id, effects) = relational_root_effects_observed(
-            &input.occurrences.root_uses,
-            ExpressionRootSite { node, role },
-            key.expr,
-            input.child_effects,
+            unit,
+            root,
+            input
+                .child_effects
+                .ok_or(PhysicalAggregateOccurrenceError::InvalidSource(
+                    "parameter has no original unit summaries",
+                ))?,
             work,
         )?;
         children = children.join(effects);
@@ -268,7 +245,7 @@ pub(crate) fn prepare_physical_aggregate_occurrence_observed(
         work.step()?;
     }
     let call = CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
         function_id: &function.function_id,
         kind: FunctionKind::Aggregate,
@@ -282,7 +259,7 @@ pub(crate) fn prepare_physical_aggregate_occurrence_observed(
     work.flush()?;
     let options = input
         .request
-        .preparation(ScopedExpressionEffects::primitive(context, children));
+        .preparation(ScopedRelationalEffects::primitive(context, children));
     work.flush()?;
     let preparation = functions
         .prepare_fresh_selected(
@@ -295,9 +272,6 @@ pub(crate) fn prepare_physical_aggregate_occurrence_observed(
     work.flush()?;
     let frozen = FrozenPhysicalCall {
         materialized_writer_input: None,
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
-        temporal_source: None,
         site,
         context,
         effects: preparation.call_contract().effects().clone(),
@@ -317,7 +291,7 @@ pub(crate) struct PhysicalAggregateMergeOccurrenceInput<'a> {
     pub request:
         &'a super::physical_aggregate_requests::AuthoredPhysicalAggregateMergeRequest<'a, 'a>,
     pub occurrences: &'a AuthoredPhysicalOccurrences<'a>,
-    pub child_effects: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    pub child_effects: Option<&'a super::contract_lowering::NodeExpressionEffects>,
     pub parameters: &'a SemanticParameters,
     pub environment: &'a [SemanticParameterRef],
     pub decimal_overflow_policy: DecimalOverflowPolicy,
@@ -339,10 +313,10 @@ pub(crate) fn prepare_physical_aggregate_merge_occurrence_observed(
     let same = std::ptr::eq(input.fragment, input.request.fragment())
         && std::ptr::eq(input.node, input.request.node())
         && std::ptr::eq(input.source, input.request.source())
-        && input.occurrences.root_uses.roots().fragment() == input.fragment.id()
+        && std::ptr::eq(input.occurrences.fragment(), input.fragment)
         && state_root.fragment == input.fragment.id()
         && input.node.inputs.as_ref() == [state_root.node]
-        && matches!(input.request.state().kind, novarocks_physical_plan::ExprKind::Value(value) if value == state_root.value);
+        && matches!(input.request.state().kind, novarocks_expression_contract::ExprKind::Value(value) if value == state_root.value);
     work.step()?;
     if !same {
         return Err(PhysicalAggregateOccurrenceError::InvalidSource(
@@ -357,15 +331,20 @@ pub(crate) fn prepare_physical_aggregate_merge_occurrence_observed(
         ));
     }
     let site = input.request.site();
-    let (node, call, topn) = match site {
-        PhysicalCallSite::Aggregate { node, call } => (node, call, false),
-        PhysicalCallSite::TopNState { node, call } => (node, call, true),
+    let node = match site {
+        PhysicalCallSite::Aggregate { node, .. } | PhysicalCallSite::TopNState { node, .. } => node,
         _ => {
             return Err(PhysicalAggregateOccurrenceError::InvalidSource(
                 "aggregate merge has a different lifecycle site",
             ));
         }
     };
+    work.step()?;
+    if node != input.node.id {
+        return Err(PhysicalAggregateOccurrenceError::InvalidSource(
+            "aggregate merge site has another actual node",
+        ));
+    }
     let context = relational_context_observed(input.occurrences, site, work)?;
     let function = input.request.function();
     work.flush()?;
@@ -394,19 +373,22 @@ pub(crate) fn prepare_physical_aggregate_merge_occurrence_observed(
             "installed merge owner has different aggregate argument control",
         ));
     }
-    let role = if topn {
-        ExpressionRootRole::TopNStateArgument { call, argument: 0 }
-    } else {
-        ExpressionRootRole::AggregateArgument { call, argument: 0 }
-    };
+    let unit = input.node.expressions.as_deref().ok_or(
+        PhysicalAggregateOccurrenceError::InvalidSource(
+            "aggregate state parameter has no actual node unit",
+        ),
+    )?;
     let (state_use, children) = relational_root_effects_observed(
-        &input.occurrences.root_uses,
-        ExpressionRootSite { node, role },
-        input.request.state_id(),
-        input.child_effects,
+        unit,
+        input.request.state_root(),
+        input
+            .child_effects
+            .ok_or(PhysicalAggregateOccurrenceError::InvalidSource(
+                "state parameter has no original unit summaries",
+            ))?,
         work,
     )?;
-    let invocation = input.occurrences.root_uses.flow().uses().get(&state_use);
+    let invocation = unit.control_flow().uses().get(&state_use);
     work.step()?;
     let state_context = invocation
         .ok_or(PhysicalAggregateOccurrenceError::InvalidSource(
@@ -414,10 +396,10 @@ pub(crate) fn prepare_physical_aggregate_merge_occurrence_observed(
         ))?
         .context;
     let call = CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: novarocks_functions::CallArgumentUses::AggregateMerge {
             phase: input.request.phase(),
-            state_context,
+            state_context: state_context.into(),
             state_input_type: &input.request.state().ty,
         },
         function_id: &function.function_id,
@@ -432,7 +414,7 @@ pub(crate) fn prepare_physical_aggregate_merge_occurrence_observed(
     work.flush()?;
     let options = input
         .request
-        .preparation(ScopedExpressionEffects::primitive(context, children));
+        .preparation(ScopedRelationalEffects::primitive(context, children));
     work.flush()?;
     let preparation = functions
         .prepare_fresh_selected(
@@ -445,9 +427,6 @@ pub(crate) fn prepare_physical_aggregate_merge_occurrence_observed(
     work.flush()?;
     let frozen = FrozenPhysicalCall {
         materialized_writer_input: None,
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
-        temporal_source: None,
         site,
         context,
         effects: preparation.call_contract().effects().clone(),

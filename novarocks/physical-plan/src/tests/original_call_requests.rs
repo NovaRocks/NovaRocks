@@ -21,7 +21,7 @@
 
 use crate::{
     ConstantPolicy, Fragment, FrozenCallError, FunctionArgumentType, PhysicalCallBinding,
-    PhysicalCallDefinition, PhysicalCallRequest, StaticFunctionArgument,
+    PhysicalCallRequest, StaticFunctionArgument,
 };
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
@@ -49,7 +49,7 @@ fn fixture_constant_policy() -> ConstantPolicy {
 /// position in the node's call list. That holds in every phase: a merging
 /// phase still requests the logical argument types, never its state type. A
 /// table function requests its bound arguments. No argument is a constant.
-pub(super) fn with_original_relational_requests(
+pub(crate) fn with_original_relational_requests(
     fragment: Fragment,
     control: &dyn PureCompileControl,
 ) -> Fragment {
@@ -72,9 +72,15 @@ pub(super) fn with_original_relational_requests(
                 PhysicalCallBinding::Table(function) => {
                     (&*function.argument_types, function.argument_types.len())
                 }
-                PhysicalCallBinding::Scalar(_) | PhysicalCallBinding::Window { .. } => {
-                    unreachable!("relational sites never bind scalar or window calls")
-                }
+                PhysicalCallBinding::Window {
+                    function,
+                    aggregate,
+                } => (
+                    &*function.argument_types,
+                    aggregate.map_or(function.argument_types.len(), |binding| {
+                        binding.logical_argument_count as usize
+                    }),
+                ),
             };
             let arguments = argument_types
                 .iter()
@@ -89,7 +95,7 @@ pub(super) fn with_original_relational_requests(
                 })
                 .collect();
             entries.push((
-                PhysicalCallDefinition::Relational(site),
+                site,
                 PhysicalCallRequest {
                     arguments,
                     logical_argument_count,

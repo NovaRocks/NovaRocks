@@ -18,9 +18,8 @@
 use super::*;
 use crate::physical_binding_v2::finish;
 use arrow::datatypes::{DataType, Field};
-use novarocks_physical_plan::{
-    AggregatePhase, AggregateSequenceId, BoundFunction, LegacyBindingMetadata,
-};
+use novarocks_expression_contract::{BoundFunction, LegacyBindingMetadata};
+use novarocks_physical_plan::{AggregatePhase, AggregateSequenceId};
 use novarocks_type_contract::{
     AggregateStateArgumentContract, CompileControlError, CompilePhase, FunctionArgumentEvaluation,
     FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,

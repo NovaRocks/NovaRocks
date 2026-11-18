@@ -24,7 +24,7 @@ use crate::{
     AggregateCallContract, AggregatePreparationOptions, CallEffectInput, FullPartitionWindowInput,
     FunctionBindingError, FunctionBindingResolver, FunctionBindingSelection, FunctionCallContract,
     FunctionEffectOwner, FunctionSpecializationFailure, KernelEvaluationControl, KernelFailure,
-    PreparedAggregateKernel, PureAggregateImplementation, ScopedExpressionEffects, SelectedValues,
+    PreparedAggregateKernel, PureAggregateImplementation, ScopedRelationalEffects, SelectedValues,
     Selection, WindowCallContract, WindowCallOptions, WindowOutputProjection,
 };
 use novarocks_type_contract::{
@@ -296,13 +296,13 @@ pub trait PureAggregateWindowImplementation: PureAggregateImplementation {
 #[derive(Debug)]
 pub struct WindowSpecialization {
     prepared: Arc<dyn PreparedWindowKernel>,
-    effects: ScopedExpressionEffects,
+    effects: ScopedRelationalEffects,
 }
 impl WindowSpecialization {
     pub fn prepared(&self) -> &Arc<dyn PreparedWindowKernel> {
         &self.prepared
     }
-    pub const fn effects(&self) -> ScopedExpressionEffects {
+    pub const fn effects(&self) -> ScopedRelationalEffects {
         self.effects
     }
     pub fn into_prepared(self) -> Arc<dyn PreparedWindowKernel> {
@@ -313,7 +313,7 @@ pub fn specialize_window<O: PureWindowImplementation + ?Sized>(
     owner: &O,
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: WindowCallOptions,
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, FunctionSpecializationFailure> {
@@ -324,7 +324,7 @@ pub fn specialize_frozen_window<O: PureWindowImplementation + ?Sized>(
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: &CallEffects,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: WindowCallOptions,
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, FunctionSpecializationFailure> {
@@ -343,7 +343,7 @@ fn specialize_window_once<O: PureWindowImplementation + ?Sized>(
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: WindowCallOptions,
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, FunctionSpecializationFailure> {
@@ -374,7 +374,7 @@ pub(crate) fn specialize_window_once_checked<O: PureWindowImplementation + ?Size
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: WindowCallOptions,
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, crate::CheckedOwnerFailure<FunctionSpecializationFailure>> {
@@ -417,12 +417,12 @@ fn specialize_window_once_core<
     input: CallEffectInput<'a>,
     selected: Arc<FunctionBindingSelection>,
     _frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: WindowCallOptions,
     control: &dyn PureCompileControl,
     refine: impl FnOnce(
-        ScopedExpressionEffects,
-    ) -> Result<(crate::RefinedCallEffects<'a>, ScopedExpressionEffects), E>,
+        ScopedRelationalEffects,
+    ) -> Result<(crate::RefinedCallEffects<'a>, ScopedRelationalEffects), E>,
     prepare: impl FnOnce(Arc<WindowCallContract>) -> Result<Arc<dyn PreparedWindowKernel>, E>,
 ) -> Result<WindowSpecialization, E> {
     let (receipt, effects) = refine(arguments)?;
@@ -458,7 +458,7 @@ pub fn specialize_aggregate_window<O: PureAggregateWindowImplementation + ?Sized
     owner: &O,
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: AggregateWindowPreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, FunctionSpecializationFailure> {
@@ -469,7 +469,7 @@ pub fn specialize_frozen_aggregate_window<O: PureAggregateWindowImplementation +
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: &CallEffects,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: AggregateWindowPreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, FunctionSpecializationFailure> {
@@ -488,7 +488,7 @@ fn specialize_aggregate_window_once<O: PureAggregateWindowImplementation + ?Size
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: AggregateWindowPreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, FunctionSpecializationFailure> {
@@ -513,7 +513,7 @@ pub(crate) fn specialize_aggregate_window_once_checked<
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     options: AggregateWindowPreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, crate::CheckedOwnerFailure<FunctionSpecializationFailure>> {

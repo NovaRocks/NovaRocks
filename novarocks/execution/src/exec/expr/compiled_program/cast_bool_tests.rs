@@ -162,20 +162,11 @@ fn assert_zero_one(
         ),
     }
 }
-fn root_context(program: &LocalProgram) -> (ProgramUseRef, ExpressionEffectContext) {
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let occurrence = ProgramUseRef {
-        arena: root().arena(),
-        use_id: snapshot.bindings()[&root()],
-    };
+fn root_context(program: &LocalProgram) -> (ExpressionUseId, ExpressionEffectContext) {
+    let occurrence = cast_root_use(program);
     (
         occurrence,
-        snapshot.flows()[&occurrence.arena].uses()[&occurrence.use_id].context,
+        root_unit(program).control_flow().uses()[&occurrence].context,
     )
 }
 
@@ -198,7 +189,7 @@ fn actual_compiled_bool_cast_thirteen_profiles_keep_sparse_sliced_nulls_and_exac
                     allow,
                 );
                 let (occurrence, context) = root_context(&program);
-                let recipe = program.cast_recipe(occurrence).unwrap();
+                let recipe = root_unit(&program).recipes().cast(occurrence).unwrap();
                 assert_eq!(recipe.source_type(), &source_type);
                 assert_eq!(recipe.result_type(), &target_type);
                 assert_eq!(recipe.allow_throw_exception(), allow);
@@ -282,8 +273,9 @@ fn actual_compiled_bool_cast_nonnullable_bool_literal_and_true_constant_broadcas
                     assert!(output.errors().is_empty());
                     assert_eq!(output.values().null_count(), 0);
                     assert!(
-                        !program
-                            .cast_recipe(root_context(&program).0)
+                        !root_unit(&program)
+                            .recipes()
+                            .cast(root_context(&program).0)
                             .unwrap()
                             .result_type()
                             .nullable()
@@ -600,7 +592,10 @@ fn actual_compiled_largeint_identity_preserves_extreme_bytes_nulls_and_full_meta
                         policy,
                         allow,
                     );
-                    let recipe = program.cast_recipe(root_context(&program).0).unwrap();
+                    let recipe = root_unit(&program)
+                        .recipes()
+                        .cast(root_context(&program).0)
+                        .unwrap();
                     assert!(recipe.is_identity());
                     assert_eq!(recipe.source_type(), &source);
                     assert_eq!(recipe.result_type(), &result);

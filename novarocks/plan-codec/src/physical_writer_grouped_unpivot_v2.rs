@@ -401,7 +401,7 @@ fn preflight_grouped_decode_core(
                 .as_ref()
                 .ok_or_else(|| invalid("grouped Unpivot constant kind is absent"));
             match &kind {
-                Ok(wire::unpivot_constant::Kind::ScalarExprId(_)) => scalars = add(scalars, 1)?,
+                Ok(wire::unpivot_constant::Kind::ScalarRoot(_)) => scalars = add(scalars, 1)?,
                 Ok(_) => pools = add(pools, 1)?,
                 Err(_) => {}
             }

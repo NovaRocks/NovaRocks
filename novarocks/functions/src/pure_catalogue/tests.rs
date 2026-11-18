@@ -20,7 +20,7 @@ use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
+    EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, ExpressionUseId,
     FunctionFailureBehavior, SemanticParameters,
 };
 use std::{
@@ -143,7 +143,7 @@ impl Owner {
             instance_state: base.instance_state,
             observable_effects: base.observable_effects,
             environment: Box::new([]),
-            proof_scope: CallProofScope::Domain(EvaluationDomainId::new(7)),
+            proof_scope: CallProofScope::Region(EvaluationRegionId::new(7)),
         }
     }
 }
@@ -399,7 +399,7 @@ fn higher_arguments() -> Vec<FunctionArgument> {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(0),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     }
 }
@@ -411,7 +411,7 @@ fn call_input<'a>(
     parameters: &'a SemanticParameters,
 ) -> CallEffectInput<'a> {
     CallEffectInput {
-        context: context(),
+        context: (context()).into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
         function_id: function,
         kind: FunctionKind::Scalar,
@@ -424,7 +424,7 @@ fn call_input<'a>(
         environment: &[],
         parameters,
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context().domain),
+        proof_scope: CallProofScope::Region(context().region),
     }
 }
 fn scalar_options() -> PureCallPreparation {
@@ -435,7 +435,7 @@ fn scalar_options() -> PureCallPreparation {
 fn higher_options() -> PureCallPreparation {
     let body_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(10),
-        domain: EvaluationDomainId::new(11),
+        region: EvaluationRegionId::new(11),
         demand: EvaluationDemand::Value,
     };
     PureCallPreparation::HigherOrder(HigherOrderPreparationOptions {
@@ -1723,7 +1723,7 @@ fn exact_control_intrinsic_coalesce_fresh_frozen_keeps_descriptor_and_skips_ordi
         };
         assert!(Arc::ptr_eq(contract.selected_owner(), &selected));
         assert_eq!(contract.effects(), &frozen_facts);
-        assert_eq!(contract.context(), context());
+        assert_eq!(contract.context(), context().into());
         assert_eq!(contract.function_id(), &id(FUNCTION));
         assert_eq!(
             contract.effects().argument_control,

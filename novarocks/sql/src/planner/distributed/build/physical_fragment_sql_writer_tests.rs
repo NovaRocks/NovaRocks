@@ -17,12 +17,15 @@
 
 //! Actual Writer statistics publication through the retained SQL catalogue.
 
+use super::super::contract_lowering::{NodeExpressionEffects, pure_node_effects_for_test};
 use super::super::{
     contract_lowering::lowered_writer_state_tests::{authored, authored_with_catalog, final_call},
     expression_occurrences::author_physical_occurrences_observed,
     lowered_draft::AggregateStateTransport,
 };
 use super::*;
+use crate::compiler::SqlAuthoredPhysicalPlan;
+
 use arrow::datatypes::DataType;
 use novarocks_connector_iceberg_functions::{
     ICEBERG_THETA_STATE_FORMAT_IDENTITY, iceberg_theta_registration,
@@ -130,7 +133,7 @@ fn scopes<'a>(
                 decimal_overflow_policy: captured.binding().decimal_overflow_policy(),
                 // The installed original Theta declaration has no environment keys.
                 environment: &[],
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Relation(context.identity),
             },
         );
     }
@@ -143,7 +146,7 @@ fn input<'a>(
     occurrences: &'a AuthoredPhysicalOccurrences<'a>,
     policy: ConstantPolicy,
     relational: &'a BTreeMap<PhysicalCallSite, PhysicalRelationalCallSourceScope<'a>>,
-    expressions: &'a BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'a>>,
+    expressions: &'a BTreeMap<novarocks_physical_plan::NodeId, NodeExpressionEffects>,
 ) -> PhysicalFragmentEffectsInput<'a> {
     PhysicalFragmentEffectsInput {
         fragment,
@@ -151,7 +154,7 @@ fn input<'a>(
         constants: owner.plan().constants(),
         parameters: owner.plan().parameters(),
         literal_policy: policy,
-        expression_scopes: expressions,
+        node_effects: expressions,
         relational_scopes: relational,
     }
 }
@@ -191,9 +194,9 @@ fn assert_fresh(owner: &SqlAuthoredPhysicalPlan, expected: (usize, usize)) {
         .unwrap();
         assert!(std::ptr::eq(occurrences.fragment(), fragment));
         let (policy, relational) = scopes(owner, fragment, &occurrences);
-        let expressions = BTreeMap::new();
+        let expressions = pure_node_effects_for_test(fragment);
         let result = author_sql_fragment_effects_observed(
-            owner,
+            owner.relational_sources(),
             input(
                 owner,
                 fragment,
@@ -228,21 +231,20 @@ fn assert_fresh(owner: &SqlAuthoredPhysicalPlan, expected: (usize, usize)) {
                 writer_uses.iter().find(|entry| entry.0 == site).unwrap();
             assert_eq!(value_site, site);
             assert!(std::ptr::eq(value, &fragment.values()[&call.input]));
-            assert_ne!(value_context.use_id, context.use_id);
-            assert_ne!(value_context.domain, context.domain);
+            assert_eq!(value_context.identity.call, context.identity.call);
+            assert_ne!(value_context.identity.role, context.identity.role);
+            assert!(value_context.is_materialized_input_of(context));
             assert_eq!(
                 value_context.demand,
                 novarocks_type_contract::EvaluationDemand::Value
             );
+            // Materialized relation inputs have their own typed role. They
+            // cannot masquerade as scalar uses or callable relation contexts.
             assert!(
-                !occurrences
-                    .root_uses
-                    .flow()
-                    .uses()
-                    .contains_key(&value_context.use_id)
+                !novarocks_type_contract::CallEffectContext::Relation(value_context)
+                    .matches_kind(FunctionKind::Scalar)
             );
-            let domain = &occurrences.root_uses.flow().domains()[&value_context.domain];
-            assert!(domain.parent.is_none() && domain.guard.is_none());
+            assert!(!value_context.is_call());
             assert_eq!(
                 call.binding.state_format.as_str(),
                 ICEBERG_THETA_STATE_FORMAT_IDENTITY
@@ -256,15 +258,11 @@ fn assert_fresh(owner: &SqlAuthoredPhysicalPlan, expected: (usize, usize)) {
                 .unwrap()
                 .2;
             assert_eq!(frozen.materialized_writer_input, Some(original));
+            assert!(original.is_materialized_input_of(frozen.context));
             assert!(
-                !occurrences
-                    .root_uses
-                    .flow()
-                    .uses()
-                    .contains_key(&original.use_id)
+                !novarocks_type_contract::CallEffectContext::Relation(original)
+                    .matches_kind(FunctionKind::Aggregate)
             );
-            let root = &occurrences.root_uses.flow().domains()[&original.domain];
-            assert!(root.parent.is_none() && root.guard.is_none());
 
             assert_eq!(
                 frozen.decimal_overflow_policy,
@@ -295,12 +293,12 @@ fn assert_fresh(owner: &SqlAuthoredPhysicalPlan, expected: (usize, usize)) {
             assert!(frozen.effects.environment.is_empty());
             assert_eq!(
                 frozen.effects.proof_scope,
-                CallProofScope::Domain(context.domain)
+                CallProofScope::Relation(context.identity)
             );
         }
         result
             .calls
-            .validate_fragment(fragment, &occurrences.root_uses, &Control::default())
+            .validate_fragment(fragment, &Control::default())
             .unwrap();
     }
     assert_eq!((partial, final_count), expected);
@@ -431,11 +429,11 @@ fn real_writer_fragment_all_success_and_policy_refusal_callbacks_keep_original_c
         )
         .unwrap();
         let (policy, mut relational) = scopes(&owner, fragment, &occurrences);
-        let expressions = BTreeMap::new();
+        let expressions = pure_node_effects_for_test(fragment);
         prefixes(
             |control| {
                 author_sql_fragment_effects_observed(
-                    &owner,
+                    owner.relational_sources(),
                     input(
                         &owner,
                         fragment,
@@ -457,7 +455,7 @@ fn real_writer_fragment_all_success_and_policy_refusal_callbacks_keep_original_c
         }
         assert!(
             author_sql_fragment_effects_observed(
-                &owner,
+                owner.relational_sources(),
                 input(
                     &owner,
                     fragment,
@@ -473,7 +471,7 @@ fn real_writer_fragment_all_success_and_policy_refusal_callbacks_keep_original_c
         prefixes(
             |control| {
                 author_sql_fragment_effects_observed(
-                    &owner,
+                    owner.relational_sources(),
                     input(
                         &owner,
                         fragment,
@@ -501,7 +499,7 @@ fn real_writer_fragment_refuses_equal_foreign_occurrence_source_and_missing_scop
         )
         .unwrap();
         let (policy, mut relational) = scopes(&owner, fragment, &occurrences);
-        let expressions = BTreeMap::new();
+        let expressions = pure_node_effects_for_test(fragment);
         let foreign = fragment.clone();
         assert_eq!(foreign.id(), fragment.id());
         assert_eq!(foreign.nodes(), fragment.nodes());
@@ -520,7 +518,14 @@ fn real_writer_fragment_refuses_equal_foreign_occurrence_source_and_missing_scop
             &expressions,
         );
         source.occurrences = &foreign_occurrences;
-        assert!(author_sql_fragment_effects_observed(&owner, source, &Control::default()).is_err());
+        assert!(
+            author_sql_fragment_effects_observed(
+                owner.relational_sources(),
+                source,
+                &Control::default()
+            )
+            .is_err()
+        );
         prefixes(
             |control| {
                 let mut source = input(
@@ -532,14 +537,16 @@ fn real_writer_fragment_refuses_equal_foreign_occurrence_source_and_missing_scop
                     &expressions,
                 );
                 source.occurrences = &foreign_occurrences;
-                author_sql_fragment_effects_observed(&owner, source, control)
+                author_sql_fragment_effects_observed(owner.relational_sources(), source, control)
             },
             false,
         );
         let (missing, _) = relational.pop_first().unwrap();
-        assert!(matches!(author_sql_fragment_effects_observed(&owner,
+        assert!(
+            matches!(author_sql_fragment_effects_observed(owner.relational_sources(),
             input(&owner, fragment, &occurrences, policy, &relational, &expressions), &Control::default()),
-            Err(PhysicalFragmentEffectsError::MissingScope(site)) if site == missing));
+            Err(PhysicalFragmentEffectsError::MissingScope(site)) if site == missing)
+        );
     }
 }
 
@@ -765,7 +772,7 @@ fn real_writer_fragment_checks_late_contributor_state_and_publishes_no_partial_t
     )
     .unwrap();
     let (policy, relational) = scopes(&owner, fragment, &occurrences);
-    let expressions = BTreeMap::new();
+    let expressions = pure_node_effects_for_test(fragment);
     let earlier_updates = occurrences
         .relational_contexts
         .iter()
@@ -777,7 +784,7 @@ fn real_writer_fragment_checks_late_contributor_state_and_publishes_no_partial_t
     for fault in [SelectionFault::StateFormat, SelectionFault::NominalState] {
         functions.arm(bad_request, fault);
         let refusal = author_sql_fragment_effects_observed(
-            &owner,
+            owner.relational_sources(),
             input(
                 &owner,
                 fragment,
@@ -800,7 +807,7 @@ fn real_writer_fragment_checks_late_contributor_state_and_publishes_no_partial_t
             |control| {
                 functions.arm(bad_request, fault);
                 author_sql_fragment_effects_observed(
-                    &owner,
+                    owner.relational_sources(),
                     input(
                         &owner,
                         fragment,
@@ -871,10 +878,10 @@ fn real_writer_wide_fresh_calls_sample_actual_control_quantums_without_losing_sp
         )
         .unwrap();
         let (policy, relational) = scopes(&owner, fragment, &occurrences);
-        let expressions = BTreeMap::new();
+        let expressions = pure_node_effects_for_test(fragment);
         let baseline = Control::default();
         author_sql_fragment_effects_observed(
-            &owner,
+            owner.relational_sources(),
             input(
                 &owner,
                 fragment,
@@ -911,7 +918,7 @@ fn real_writer_wide_fresh_calls_sample_actual_control_quantums_without_losing_sp
                     refusal: Some((stop, cause.clone())),
                 };
                 let result = author_sql_fragment_effects_observed(
-                    &owner,
+                    owner.relational_sources(),
                     input(
                         &owner,
                         fragment,
@@ -942,7 +949,7 @@ fn real_writer_frozen_materialized_receipt_rejects_absence_foreign_domain_and_du
         )
         .unwrap();
         let (policy, relational) = scopes(&owner, fragment, &occurrences);
-        let expressions = BTreeMap::new();
+        let expressions = pure_node_effects_for_test(fragment);
         let source = input(
             &owner,
             fragment,
@@ -951,8 +958,12 @@ fn real_writer_frozen_materialized_receipt_rejects_absence_foreign_domain_and_du
             &relational,
             &expressions,
         );
-        let authored =
-            author_sql_fragment_effects_observed(&owner, source, &Control::default()).unwrap();
+        let authored = author_sql_fragment_effects_observed(
+            owner.relational_sources(),
+            source,
+            &Control::default(),
+        )
+        .unwrap();
         let original = authored
             .calls
             .entries()
@@ -960,41 +971,48 @@ fn real_writer_frozen_materialized_receipt_rejects_absence_foreign_domain_and_du
             .cloned()
             .collect::<Vec<_>>();
         assert!(original.len() >= 2);
-        let check = |calls| {
-            FrozenFragmentCalls::try_new(
-                fragment,
-                &occurrences.root_uses,
-                calls,
-                &Control::default(),
-            )
-        };
+        let check = |calls| FrozenFragmentCalls::try_new(fragment, calls, &Control::default());
         check(original.clone()).unwrap();
         let mut absent = original.clone();
         absent[0].materialized_writer_input = None;
         assert!(matches!(check(absent), Err(FrozenCallError::WrongContext)));
         let mut foreign = original.clone();
+        let foreign_call = novarocks_type_contract::RelationCallId::new(u32::MAX);
+        assert!(
+            !occurrences
+                .relational_contexts
+                .iter()
+                .any(|(_, context)| context.identity.call == foreign_call)
+        );
         foreign[0]
             .materialized_writer_input
             .as_mut()
             .unwrap()
-            .domain = novarocks_type_contract::EvaluationDomainId::new(u32::MAX);
-        assert!(
-            !occurrences
-                .root_uses
-                .flow()
-                .domains()
-                .contains_key(&novarocks_type_contract::EvaluationDomainId::new(u32::MAX))
-        );
-        assert!(matches!(
-            check(foreign),
-            Err(FrozenCallError::InvalidDomain)
-        ));
+            .identity
+            .call = foreign_call;
+        assert!(matches!(check(foreign), Err(FrozenCallError::WrongContext)));
         let mut duplicate = original.clone();
         duplicate[1]
             .materialized_writer_input
             .as_mut()
             .unwrap()
-            .use_id = original[0].materialized_writer_input.unwrap().use_id;
-        assert!(matches!(check(duplicate), Err(FrozenCallError::SharedUse)));
+            .identity
+            .call = original[0].materialized_writer_input.unwrap().identity.call;
+        assert!(matches!(
+            check(duplicate),
+            Err(FrozenCallError::WrongContext)
+        ));
+        let mut shared_call = original.clone();
+        shared_call[1].context.identity.call = original[0].context.identity.call;
+        shared_call[1]
+            .materialized_writer_input
+            .as_mut()
+            .unwrap()
+            .identity
+            .call = original[0].context.identity.call;
+        assert!(matches!(
+            check(shared_call),
+            Err(FrozenCallError::DuplicateIdentity)
+        ));
     }
 }

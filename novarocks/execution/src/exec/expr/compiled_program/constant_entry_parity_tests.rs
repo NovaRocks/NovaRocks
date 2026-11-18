@@ -37,18 +37,18 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::{RecordBatch, RecordBatchOptions},
 };
+use novarocks_expression::{CompiledExprSet, StaticExprKind};
+use novarocks_expression_contract::RootOrdinal;
 use novarocks_functions::{
     CastOperation, ConstantPolicy, ConstantValue, FunctionArgumentType, FunctionValueType,
     KernelEvaluationControl, KernelFailure, PreparedPureKernel, PureEngineFunctionCatalog,
     Selection,
 };
-use novarocks_local_program::{
-    LocalProgram, ProgramCallSite, ProgramExpressionRootSite, ProgramNodeKind, ProgramRootInput,
-    ProgramUseRef, StaticExprKind, root_input_layout,
-};
+use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef, ProgramUnitId};
+
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
 use novarocks_type_contract::{
-    ArithmeticOperator, CompileControlError, CompilePhase, DecimalOverflowPolicy,
+    ArithmeticOperator, CompileControlError, CompilePhase, DecimalOverflowPolicy, ExpressionUseId,
     PureCompileControl, ValueLogicalType,
 };
 use std::{sync::Arc, time::Duration};
@@ -98,11 +98,8 @@ impl Family {
             Self::Arithmetic => matches!(kind, StaticExprKind::PreparedArithmetic { .. }),
             Self::Comparison => kind.ordinary_comparison().is_some(),
             Self::NullSafe => matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }),
-            Self::And => matches!(
-                kind,
-                StaticExprKind::And(..) | StaticExprKind::NaryAnd { .. }
-            ),
-            Self::Or => matches!(kind, StaticExprKind::Or(..) | StaticExprKind::NaryOr { .. }),
+            Self::And => matches!(kind, StaticExprKind::NaryAnd { .. }),
+            Self::Or => matches!(kind, StaticExprKind::NaryOr { .. }),
             Self::Not => matches!(kind, StaticExprKind::Not(_)),
             Self::Carrier => matches!(
                 kind,
@@ -120,8 +117,8 @@ impl Family {
 
 struct Fixture {
     program: Arc<LocalProgram>,
-    root: ProgramExpressionRootSite,
-    occurrence: ProgramUseRef,
+    root: ProgramRootRef,
+    occurrence: ExpressionUseId,
     sql: String,
 }
 impl Fixture {
@@ -160,59 +157,38 @@ impl Fixture {
                     .all(|node| !matches!(node.kind(), ProgramNodeKind::Scan { .. })),
                 "constant-only SQL must not contain a scan: {sql}"
             );
-            let typed = program.checked().channels().expressions();
-            let snapshot = typed.resolved_calls().snapshot();
-            for (&root, &use_id) in snapshot.bindings() {
-                let occurrence = ProgramUseRef {
-                    arena: root.arena(),
-                    use_id,
-                };
-                let flow = &snapshot.flows()[&root.arena()];
-                let definition = flow.uses()[&use_id].definition;
-                let node = snapshot.roots().arenas()[&root.arena()]
-                    .node(definition)
-                    .unwrap();
-                let call = typed
-                    .resolved_calls()
-                    .calls()
-                    .get(&ProgramCallSite::Expression(occurrence));
-                if family.matches(
-                    node.kind(),
-                    call.map(|c| c.call_contract().function_id().as_str()),
-                ) {
-                    let FunctionArgumentType::Value(actual) =
-                        typed.definition_type(root.arena(), definition).unwrap()
-                    else {
-                        panic!("the actual SQL root is a scalar value")
+            for (unit_ordinal, unit) in program.units().iter().enumerate() {
+                for (root_ordinal, compiled_root) in unit.roots().iter().enumerate() {
+                    let root = ProgramRootRef {
+                        unit: ProgramUnitId::new(unit_ordinal),
+                        root: RootOrdinal::new(u32::try_from(root_ordinal).unwrap()),
                     };
-                    // This preserves the REAL frozen nullable declaration, including
-                    // nullable outputs whose particular row is not NULL. Never derive
-                    // a type from null_count(), and never widen to true for convenience.
-                    assert_eq!(actual, &declared, "SQL/program complete root type: {sql}");
-                    eprintln!(
-                        "CONSTANT_ENTRY_PARITY frozen root sql={sql:?} result={actual:?} nullable={}",
-                        actual.nullable()
-                    );
-                    // A Project over the original zero-column VALUES port and
-                    // an original ValuesCell both have an empty one-row input.
-                    // Read the real layout; do not substitute a single-column scan.
-                    let schema = match root_input_layout(program.graph(), root).unwrap() {
-                        ProgramRootInput::Empty => Arc::new(Schema::empty()),
-                        ProgramRootInput::Layout { node, role } => program
-                            .checked()
-                            .channels()
-                            .channel_layout(node, role)
-                            .unwrap()
-                            .schema()
-                            .clone(),
-                    };
-                    assert!(schema.fields().is_empty(), "empty original input: {sql}");
-                    found.push(Self {
-                        program: program.clone(),
-                        root,
-                        occurrence,
-                        sql: sql.clone(),
-                    });
+                    let occurrence = compiled_root.use_id;
+                    let definition = compiled_root.definition;
+                    let node = unit.definitions().node(definition).unwrap();
+                    let call = unit.calls().get(&occurrence);
+                    if family.matches(
+                        node.kind(),
+                        call.map(|c| c.call_contract().function_id().as_str()),
+                    ) {
+                        let FunctionArgumentType::Value(actual) = &unit.types()[definition.index()]
+                        else {
+                            panic!("the actual SQL root is a scalar value")
+                        };
+                        assert_eq!(actual, &declared, "SQL/program complete root type: {sql}");
+                        eprintln!(
+                            "CONSTANT_ENTRY_PARITY frozen root sql={sql:?} result={actual:?} nullable={}",
+                            actual.nullable()
+                        );
+                        let schema = unit.scope(compiled_root.scope).unwrap().schema();
+                        assert!(schema.fields().is_empty(), "empty original input: {sql}");
+                        found.push(Self {
+                            program: program.clone(),
+                            root,
+                            occurrence,
+                            sql: sql.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -223,58 +199,27 @@ impl Fixture {
         );
         found.pop().unwrap()
     }
-    fn kind(&self, at: ProgramUseRef) -> &StaticExprKind {
-        let snapshot = self
-            .program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        let definition = snapshot.flows()[&at.arena].uses()[&at.use_id].definition;
-        snapshot.roots().arenas()[&at.arena]
-            .node(definition)
-            .unwrap()
-            .kind()
+    fn unit(&self) -> &CompiledExprSet {
+        self.program.unit(self.root.unit).unwrap()
     }
-    fn ty(&self, at: ProgramUseRef) -> &FunctionValueType {
-        let typed = self.program.checked().channels().expressions();
-        let snapshot = typed.resolved_calls().snapshot();
-        let definition = snapshot.flows()[&at.arena].uses()[&at.use_id].definition;
-        let FunctionArgumentType::Value(ty) = typed.definition_type(at.arena, definition).unwrap()
-        else {
+    fn kind(&self, at: ExpressionUseId) -> &StaticExprKind {
+        let definition = self.unit().control_flow().uses()[&at].definition;
+        self.unit().definitions().node(definition).unwrap().kind()
+    }
+    fn ty(&self, at: ExpressionUseId) -> &FunctionValueType {
+        let definition = self.unit().control_flow().uses()[&at].definition;
+        let FunctionArgumentType::Value(ty) = &self.unit().types()[definition.index()] else {
             panic!("value occurrence required")
         };
         ty
     }
-    fn args(&self, at: ProgramUseRef) -> Vec<ProgramUseRef> {
-        let snapshot = self
-            .program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        snapshot.flows()[&at.arena].uses()[&at.use_id]
-            .arguments
-            .iter()
-            .map(|&use_id| ProgramUseRef {
-                arena: at.arena,
-                use_id,
-            })
-            .collect()
+    fn args(&self, at: ExpressionUseId) -> Vec<ExpressionUseId> {
+        self.unit().control_flow().uses()[&at].arguments.to_vec()
     }
-    fn call(&self, at: ProgramUseRef) -> &PreparedPureKernel {
-        self.program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()[&ProgramCallSite::Expression(at)]
-            .specialization()
-            .prepared()
+    fn call(&self, at: ExpressionUseId) -> &PreparedPureKernel {
+        self.unit().calls()[&at].prepared()
     }
-    fn constant(&self, at: ProgramUseRef, array: ArrayRef) -> ConstantValue {
+    fn constant(&self, at: ExpressionUseId, array: ArrayRef) -> ConstantValue {
         let ty = self.ty(at);
         assert_eq!(
             ty.data_type(),
@@ -313,8 +258,8 @@ impl Fixture {
                 left: ConstantConversion::Identity,
                 right: ConstantConversion::Identity,
             },
-            StaticExprKind::And(..) | StaticExprKind::NaryAnd { .. } => ConstantNode::Conjunction,
-            StaticExprKind::Or(..) | StaticExprKind::NaryOr { .. } => ConstantNode::Disjunction,
+            StaticExprKind::NaryAnd { .. } => ConstantNode::Conjunction,
+            StaticExprKind::NaryOr { .. } => ConstantNode::Disjunction,
             StaticExprKind::Not(_) => ConstantNode::Not,
             StaticExprKind::PreparedCast {
                 operation: CastOperation::Carrier,
@@ -326,7 +271,7 @@ impl Fixture {
             kind => panic!("unexpected original root: {kind:?}"),
         }
     }
-    fn carrier(&self, at: ProgramUseRef) -> ConstantCarrierStep<'_> {
+    fn carrier(&self, at: ExpressionUseId) -> ConstantCarrierStep<'_> {
         let StaticExprKind::PreparedCast {
             operation: CastOperation::Carrier,
             decimal_overflow_policy,
@@ -347,9 +292,9 @@ impl Fixture {
     // Only the actual selected conversion and at most one carrier tail are admitted.
     fn conversion_from(
         &self,
-        at: ProgramUseRef,
+        at: ExpressionUseId,
         source: &DataType,
-    ) -> (ProgramUseRef, ConstantConversion<'_>) {
+    ) -> (ExpressionUseId, ConstantConversion<'_>) {
         if self.ty(at).data_type() == source {
             return (at, ConstantConversion::Identity);
         }
@@ -415,17 +360,13 @@ impl Fixture {
         children: Vec<ConstantValue>,
         expected: Expected,
     ) {
-        let schema = match root_input_layout(self.program.graph(), self.root).unwrap() {
-            ProgramRootInput::Empty => Arc::new(Schema::empty()),
-            ProgramRootInput::Layout { node, role } => self
-                .program
-                .checked()
-                .channels()
-                .channel_layout(node, role)
-                .unwrap()
-                .schema()
-                .clone(),
-        };
+        let compiled_root = self.unit().root(self.root.root).unwrap();
+        let schema = self
+            .unit()
+            .scope(compiled_root.scope)
+            .unwrap()
+            .schema()
+            .clone();
         assert!(schema.fields().is_empty());
         let batch = RecordBatch::try_new_with_options(
             schema,
@@ -433,8 +374,12 @@ impl Fixture {
             &RecordBatchOptions::new().with_row_count(Some(1)),
         )
         .unwrap();
-        let mut instance =
-            CompiledExpressionInstance::try_new(self.program.clone(), self.root, &Control).unwrap();
+        let mut instance = CompiledExpressionInstance::try_new(
+            self.program.unit(self.root.unit).unwrap().clone(),
+            self.root.root,
+            &Control,
+        )
+        .unwrap();
         let compiled = instance
             .evaluate(&batch, Selection::all(1), &Control)
             .unwrap();
@@ -639,10 +584,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         );
         for at in fixture.args(fixture.occurrence) {
             assert!(
-                matches!(
-                    fixture.kind(at),
-                    StaticExprKind::Constant(_) | StaticExprKind::Literal(_)
-                ),
+                matches!(fixture.kind(at), StaticExprKind::Constant(_)),
                 "T1 uses one actual node over constant leaves: {expression}"
             );
         }
@@ -1034,55 +976,57 @@ fn metadata_cv_source_cross_entry(functions: &PureEngineFunctionCatalog, spare_e
     let programs = programs_with_catalogue(&source, functions);
     let mut found = 0;
     for program in programs.values() {
-        let expressions = program.checked().channels().expressions();
-        let snapshot = expressions.resolved_calls().snapshot();
-        for (&root, &use_id) in snapshot.bindings() {
-            let definition = snapshot.flows()[&root.arena()].uses()[&use_id].definition;
-            let node = snapshot.roots().arenas()[&root.arena()]
-                .node(definition)
-                .unwrap();
-            let StaticExprKind::Constant(actual) = node.kind() else {
-                continue;
-            };
-            if !actual
-                .equals_observed(&original, CompilePhase::Validate, &Control)
-                .unwrap()
-            {
-                continue;
-            }
-            assert_eq!(actual.ordinal(), 1);
-            assert_eq!(actual.pool().backing_identity(), source_identity);
-            assert_eq!(
-                expressions.definition_type(root.arena(), definition),
-                Some(&FunctionArgumentType::Value(ty.clone()))
-            );
-            found += 1;
-            let mut instance =
-                CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
-            for (rows, selected) in [(1usize, vec![0]), (7, vec![1, 4, 6]), (7, vec![])] {
-                let batch = RecordBatch::try_new_with_options(
-                    Arc::new(Schema::empty()),
-                    vec![],
-                    &RecordBatchOptions::new().with_row_count(Some(rows)),
+        for unit in program.units() {
+            for (root_ordinal, root) in unit.roots().iter().enumerate() {
+                let definition = root.definition;
+                let node = unit.definitions().node(definition).unwrap();
+                let StaticExprKind::Constant(actual) = node.kind() else {
+                    continue;
+                };
+                if !actual
+                    .equals_observed(&original, CompilePhase::Validate, &Control)
+                    .unwrap()
+                {
+                    continue;
+                }
+                assert_eq!(actual.ordinal(), 1);
+                assert_eq!(actual.pool().backing_identity(), source_identity);
+                assert_eq!(
+                    unit.types().get(definition.index()),
+                    Some(&FunctionArgumentType::Value(ty.clone()))
+                );
+                found += 1;
+                let mut instance = CompiledExpressionInstance::try_new(
+                    unit.clone(),
+                    RootOrdinal::new(u32::try_from(root_ordinal).unwrap()),
+                    &Control,
                 )
                 .unwrap();
-                let selection = Selection::try_sparse(rows, &selected).unwrap();
-                let compiled = instance.evaluate(&batch, selection, &Control).unwrap();
-                assert!(compiled.errors().is_empty());
-                assert_eq!(compiled.values().data_type(), ty.data_type());
-                let list = compiled
-                    .values()
-                    .as_any()
-                    .downcast_ref::<ListArray>()
+                for (rows, selected) in [(1usize, vec![0]), (7, vec![1, 4, 6]), (7, vec![])] {
+                    let batch = RecordBatch::try_new_with_options(
+                        Arc::new(Schema::empty()),
+                        vec![],
+                        &RecordBatchOptions::new().with_row_count(Some(rows)),
+                    )
                     .unwrap();
-                assert_eq!(list.len(), selected.len());
-                let values = list.values().as_any().downcast_ref::<Int32Array>().unwrap();
-                assert_eq!(
-                    values.iter().collect::<Vec<_>>(),
-                    (0..selected.len())
-                        .flat_map(|_| [Some(22), Some(33)])
-                        .collect::<Vec<_>>()
-                );
+                    let selection = Selection::try_sparse(rows, &selected).unwrap();
+                    let compiled = instance.evaluate(&batch, selection, &Control).unwrap();
+                    assert!(compiled.errors().is_empty());
+                    assert_eq!(compiled.values().data_type(), ty.data_type());
+                    let list = compiled
+                        .values()
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .unwrap();
+                    assert_eq!(list.len(), selected.len());
+                    let values = list.values().as_any().downcast_ref::<Int32Array>().unwrap();
+                    assert_eq!(
+                        values.iter().collect::<Vec<_>>(),
+                        (0..selected.len())
+                            .flat_map(|_| [Some(22), Some(33)])
+                            .collect::<Vec<_>>()
+                    );
+                }
             }
         }
     }

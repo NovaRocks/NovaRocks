@@ -15,23 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Synthesized reads share the checked unit compiler with actual node units.
+use crate::test_units::{compiled_root, input_ordinal};
 use crate::{
     FragmentCompileError,
-    union_flow::{UnionRoot, append_union_roots},
+    union_lowering_tests::{self as fixture, Case},
 };
-use novarocks_local_program::{
-    ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId, ProgramExpressionArena,
-    ProgramExpressionRootSite, ProgramExpressionUse, ProgramLexicalSource,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramRootUseBinding, ProgramSlotBinding,
-    ProgramUseRef,
-};
+use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDemand, EvaluationDomainId,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionUseId,
-    MAX_CONTROL_USE_REFERENCES, PureCompileControl,
+    CompileControlError, CompilePhase, EvaluationDemand, MAX_CONTROL_USE_REFERENCES,
+    PureCompileControl,
 };
 use std::{collections::BTreeSet, sync::Mutex};
-
 #[derive(Default)]
 struct Control {
     trace: Mutex<Vec<(CompilePhase, u32)>>,
@@ -39,278 +34,117 @@ struct Control {
 }
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+        assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
-        let ordinal = trace.len();
+        let at = trace.len();
         trace.push((phase, units));
-        match self.refusal.clone() {
-            Some((stop, cause)) if stop == ordinal => Err(cause),
+        match &self.refusal {
+            Some((stop, cause)) if *stop == at => Err(cause.clone()),
             _ => Ok(()),
         }
     }
 }
-impl Control {
-    fn observed(&self) -> Vec<(CompilePhase, u32)> {
-        self.trace.lock().unwrap().clone()
-    }
+fn synthetic(program: &LocalProgram) -> Vec<Vec<ProgramRootRef>> {
+    program
+        .graph()
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.kind() {
+            ProgramNodeKind::Project {
+                is_subordinate: true,
+                exprs,
+                ..
+            } => Some(exprs.to_vec()),
+            _ => None,
+        })
+        .collect()
 }
-
-#[derive(Clone, Debug, PartialEq)]
-struct Records {
-    domains: Vec<ExpressionEvaluationDomain>,
-    uses: Vec<ProgramExpressionUse>,
-    bindings: Vec<ProgramRootUseBinding>,
-    slots: Vec<ProgramSlotBinding>,
-}
-impl Records {
-    fn empty() -> Self {
-        Self {
-            domains: vec![],
-            uses: vec![],
-            bindings: vec![],
-            slots: vec![],
-        }
-    }
-    fn append(
-        &mut self,
-        roots: &[UnionRoot],
-        control: &Control,
-    ) -> Result<(), FragmentCompileError> {
-        self.append_minted(roots, &BTreeSet::new(), control)
-    }
-    fn append_minted(
-        &mut self,
-        roots: &[UnionRoot],
-        minted: &BTreeSet<ExpressionUseId>,
-        control: &Control,
-    ) -> Result<(), FragmentCompileError> {
-        append_union_roots(
-            roots,
-            minted,
-            &mut self.domains,
-            &mut self.uses,
-            &mut self.bindings,
-            &mut self.slots,
-            control,
-        )
-    }
-    fn sparse() -> Self {
-        let domains = [0, u32::MAX, 3]
-            .map(|id| ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(id),
-                parent: None,
-                guard: None,
-            })
-            .to_vec();
-        let uses = [(0, 0), (u32::MAX, u32::MAX), (2, 3)]
-            .map(|(id, domain)| ProgramExpressionUse {
-                context: ExpressionEffectContext {
-                    use_id: ExpressionUseId::new(id),
-                    domain: EvaluationDomainId::new(domain),
-                    demand: EvaluationDemand::Value,
-                },
-                definition: ProgramExprId::new(0),
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            })
-            .to_vec();
-        Self {
-            domains,
-            uses,
-            bindings: vec![],
-            slots: vec![],
-        }
-    }
-}
-
-fn input(node: usize, ordinal: u32) -> ProgramChannelSite {
-    ProgramChannelSite::Layout {
-        node: ProgramNodeId::new(node),
-        role: ProgramChannelLayoutRole::NodeOutput,
-        ordinal,
-    }
-}
-
 #[test]
 fn union_flow_sparse_max_ids_author_fresh_exact_root_contexts_and_channels() {
-    let mut records = Records::sparse();
-    let original = records.clone();
-    let roots = [
-        UnionRoot {
-            node: ProgramNodeId::new(8),
-            ordinal: 0,
-            definition: ProgramExprId::new(5),
-            source: input(4, 2),
-        },
-        UnionRoot {
-            node: ProgramNodeId::new(8),
-            ordinal: 1,
-            definition: ProgramExprId::new(6),
-            source: input(4, 0),
-        },
-        UnionRoot {
-            node: ProgramNodeId::new(9),
-            ordinal: 0,
-            definition: ProgramExprId::new(7),
-            source: input(6, 1),
-        },
-    ];
-    records.append(&roots, &Control::default()).unwrap();
-    assert_eq!(&records.domains[..3], &original.domains);
-    assert_eq!(&records.uses[..3], &original.uses);
-    // Hand-authored holes differ between the two independent ID namespaces.
-    assert_eq!(
-        records.domains[3..]
-            .iter()
-            .map(|d| d.id.get())
-            .collect::<Vec<_>>(),
-        [1, 2, 4]
-    );
-    assert_eq!(
-        records.uses[3..]
-            .iter()
-            .map(|u| u.context.use_id.get())
-            .collect::<Vec<_>>(),
-        [1, 3, 4]
-    );
-    for (index, (use_id, domain, definition, node, ordinal, source)) in [
-        (1, 1, 5, 8, 0, input(4, 2)),
-        (3, 2, 6, 8, 1, input(4, 0)),
-        (4, 4, 7, 9, 0, input(6, 1)),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let invocation = &records.uses[3 + index];
-        assert_eq!(
-            invocation.context,
-            ExpressionEffectContext {
-                use_id: ExpressionUseId::new(use_id),
-                domain: EvaluationDomainId::new(domain),
-                demand: EvaluationDemand::Value,
-            }
-        );
-        assert_eq!(invocation.definition, ProgramExprId::new(definition));
-        assert_eq!(invocation.control, ControlShape::Eager);
-        assert!(invocation.arguments.is_empty());
-        assert_eq!(records.domains[3 + index].parent, None);
-        assert_eq!(records.domains[3 + index].guard, None);
-        assert_eq!(
-            records.bindings[index],
-            ProgramRootUseBinding {
-                site: ProgramExpressionRootSite::Node {
-                    node: ProgramNodeId::new(node),
-                    role: ProgramNodeExpressionRole::ProjectOutput {
-                        expression: ordinal
-                    }
-                },
-                use_id: ExpressionUseId::new(use_id),
-            }
-        );
-        assert_eq!(
-            records.slots[index],
-            ProgramSlotBinding {
-                occurrence: ProgramUseRef {
-                    arena: ProgramExpressionArena::Main,
-                    use_id: ExpressionUseId::new(use_id)
-                },
-                source: ProgramLexicalSource::Input(source),
-            }
-        );
+    let source = fixture::fixture(Case::ordinary());
+    let program = fixture::compile(&source, &fixture::functions(), &Control::default()).unwrap();
+    let roots = synthetic(&program);
+    assert_eq!(roots.len(), 2);
+    let mut contexts = BTreeSet::new();
+    for branch in &roots {
+        for (ordinal, &reference) in branch.iter().enumerate() {
+            let (unit, root) = compiled_root(&program, reference);
+            let invocation = &unit.control_flow().uses()[&root.use_id];
+            assert_eq!(invocation.definition, root.definition);
+            assert_eq!(root.demand, EvaluationDemand::Value);
+            assert!(invocation.arguments.is_empty());
+            let region = &unit.control_flow().regions()[&invocation.context.region];
+            assert!(region.parent.is_none() && region.guard.is_none());
+            assert!(contexts.insert((reference.unit, root.use_id)));
+            assert_eq!(
+                input_ordinal(&program, reference),
+                if ordinal % 3 == 1 { 0 } else { 1 }
+            );
+        }
     }
+    assert_eq!(contexts.len(), 6);
+    assert_ne!(roots[0][0].unit, roots[1][0].unit);
+    assert!(
+        program
+            .graph()
+            .nodes()
+            .iter()
+            .any(|n| n.physical_sources().iter().any(|id| id.get() == u32::MAX))
+    );
 }
-
-// A package-minted identity that is not a flow occurrence, such as a
-// relational call context, is never reused by a fresh occurrence.
 #[test]
 fn union_flow_fresh_uses_skip_every_package_minted_identity() {
-    let mut records = Records::sparse();
-    let roots = [0, 1, 2].map(|ordinal| UnionRoot {
-        node: ProgramNodeId::new(8),
-        ordinal,
-        definition: ProgramExprId::new(5),
-        source: input(4, 0),
-    });
-    // 1 and 3 are the smallest holes; 3 also stands for a minted occurrence
-    // already in the flow's numbering.
-    let minted = BTreeSet::from([1, 3, 4].map(ExpressionUseId::new));
-    records
-        .append_minted(&roots, &minted, &Control::default())
-        .unwrap();
+    // Package-wide use-ID minting retired. The full unit address now provides
+    // separation even when both actual unit authors choose local occurrence 0.
+    let source = fixture::fixture(Case::ordinary());
+    let program = fixture::compile(&source, &fixture::functions(), &Control::default()).unwrap();
+    let roots = synthetic(&program);
+    let (left, a) = compiled_root(&program, roots[0][0]);
+    let (right, b) = compiled_root(&program, roots[1][0]);
+    assert_eq!(a.use_id, b.use_id);
+    assert_eq!(a.use_id.get(), 0);
+    assert_ne!(roots[0][0].unit, roots[1][0].unit);
+    assert!(!std::ptr::eq(left, right));
     assert_eq!(
-        records.uses[3..]
-            .iter()
-            .map(|u| u.context.use_id.get())
-            .collect::<Vec<_>>(),
-        [5, 6, 7]
+        source
+            .package
+            .fragment()
+            .nodes()
+            .values()
+            .filter(|n| n.expressions.is_some())
+            .count(),
+        2
     );
-    // Domains are an independent namespace and keep their smallest holes.
-    assert_eq!(
-        records.domains[3..]
-            .iter()
-            .map(|d| d.id.get())
-            .collect::<Vec<_>>(),
-        [1, 2, 4]
-    );
+    assert_eq!(program.units().len(), 4);
 }
-
 #[test]
 fn union_flow_duplicate_project_sources_keep_ordered_independent_occurrences() {
-    let mut records = Records::empty();
-    let source = input(3, 4);
-    let roots = [0, 1, 2].map(|ordinal| UnionRoot {
-        node: ProgramNodeId::new(7),
-        ordinal,
-        definition: ProgramExprId::new(11),
-        source,
-    });
-    records.append(&roots, &Control::default()).unwrap();
-    assert_eq!(records.uses.len(), 3);
-    assert_eq!(records.domains.len(), 3);
-    for (index, expected_id) in [0, 1, 2].into_iter().enumerate() {
-        assert_eq!(records.uses[index].definition, ProgramExprId::new(11));
+    let source = fixture::fixture(Case::ordinary());
+    let program = fixture::compile(&source, &fixture::functions(), &Control::default()).unwrap();
+    for branch in synthetic(&program) {
+        let (_, first) = compiled_root(&program, branch[0]);
+        let (_, repeated) = compiled_root(&program, branch[2]);
+        assert_ne!(first.use_id, repeated.use_id);
         assert_eq!(
-            records.uses[index].context.use_id,
-            ExpressionUseId::new(expected_id)
+            input_ordinal(&program, branch[0]),
+            input_ordinal(&program, branch[2])
         );
+        assert_eq!(input_ordinal(&program, branch[1]), 0);
         assert_eq!(
-            records.uses[index].context.domain,
-            EvaluationDomainId::new(expected_id)
-        );
-        assert_eq!(
-            records.bindings[index].site,
-            ProgramExpressionRootSite::Node {
-                node: ProgramNodeId::new(7),
-                role: ProgramNodeExpressionRole::ProjectOutput {
-                    expression: expected_id,
-                },
-            }
-        );
-        assert_eq!(
-            records.slots[index].source,
-            ProgramLexicalSource::Input(source)
+            branch.iter().map(|r| r.root.get()).collect::<Vec<_>>(),
+            [0, 1, 2]
         );
     }
-    assert_ne!(records.slots[0].occurrence, records.slots[1].occurrence);
-    assert_ne!(records.slots[1].occurrence, records.slots[2].occurrence);
-    // These vectors test the append component, not a complete Project graph.
 }
-
 #[test]
 fn union_flow_every_actual_small_control_prefix_preserves_all_three_first_causes() {
-    let roots = [UnionRoot {
-        node: ProgramNodeId::new(6),
-        ordinal: 0,
-        definition: ProgramExprId::new(3),
-        source: input(2, 1),
-    }];
+    let source = fixture::fixture(Case::ordinary());
+    let functions = fixture::functions();
     let control = Control::default();
-    Records::sparse().append(&roots, &control).unwrap();
-    let baseline = control.observed();
+    fixture::compile(&source, &functions, &control).unwrap();
+    let baseline = control.trace.into_inner().unwrap();
     assert_eq!(baseline[0], (CompilePhase::LowerProgram, 0));
-    assert!(
-        baseline.last().unwrap().1 > 0,
-        "actual completed publication footer"
-    );
+    assert!(baseline.last().unwrap().1 > 0);
     for stop in 0..baseline.len() {
         for cause in [
             CompileControlError::Cancelled,
@@ -321,55 +155,27 @@ fn union_flow_every_actual_small_control_prefix_preserves_all_three_first_causes
                 refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
-            let mut records = Records::sparse();
-            assert!(matches!(records.append(&roots, &control),
-                Err(FragmentCompileError::Control(actual)) if actual == cause));
-            assert_eq!(control.observed(), baseline[..=stop]);
+            assert!(
+                matches!(fixture::compile(&source,&functions,&control),Err(FragmentCompileError::Control(actual)) if actual==cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), baseline[..=stop]);
         }
     }
 }
-
 #[test]
 fn union_flow_reference_ceiling_refuses_before_reserve_or_output_publication() {
-    let mut records = Records::sparse();
-    // Existing numerical references exactly fill the shared ceiling. This
-    // input is a count-admission fixture, not a validated complete flow graph.
-    let existing_uses = records.uses.len();
-    records.uses[0].arguments =
-        vec![ExpressionUseId::new(2); MAX_CONTROL_USE_REFERENCES - existing_uses]
-            .into_boxed_slice();
-    let roots = [UnionRoot {
-        node: ProgramNodeId::new(6),
-        ordinal: 0,
-        definition: ProgramExprId::new(3),
-        source: input(2, 1),
-    }];
-    let original = records.clone();
-    let capacities = (
-        records.domains.capacity(),
-        records.uses.capacity(),
-        records.bindings.capacity(),
-        records.slots.capacity(),
-    );
-    let control = Control {
-        refusal: Some((1, CompileControlError::Cancelled)),
-        ..Control::default()
-    };
+    // Four real source roots coexist with both normalization branches. No raw
+    // malformed flow or duplicate numeric use is needed to exceed the sum.
+    let width = MAX_CONTROL_USE_REFERENCES / 2;
+    let source = fixture::fixture_width(width);
+    let original = source.package.clone();
+    let control = Control::default();
     assert!(matches!(
-        records.append(&roots, &control),
+        fixture::compile(&source, &fixture::functions(), &control),
         Err(FragmentCompileError::Control(
             CompileControlError::ResourceExhausted
         ))
     ));
-    assert_eq!(control.observed(), [(CompilePhase::LowerProgram, 0)]);
-    assert_eq!(records, original);
-    assert_eq!(
-        (
-            records.domains.capacity(),
-            records.uses.capacity(),
-            records.bindings.capacity(),
-            records.slots.capacity()
-        ),
-        capacities
-    );
+    assert!(std::sync::Arc::ptr_eq(&source.package, &original));
+    assert_eq!(source.package.fragment().nodes().len(), 3);
 }

@@ -30,14 +30,15 @@ use crate::{
         ConnectorPayloadProjectionLimits, decode_connector_payloads, encode_connector_payloads,
     },
     physical_expression_v2::{
-        ExpressionProjectionLimits, ExpressionTypeIds, decode_expression_definitions,
-        encode_expression_definitions,
+        ExpressionDefinitionSource, ExpressionProjectionLimits, ExpressionTypeIds,
+        decode_expression_definitions, encode_expression_definitions,
     },
     physical_type_v2::{TypeProjectionLimits, decode_type_table, encode_type_table_sources},
     physical_value_origin_v2::ValueOriginProjectionLimits,
     physical_value_v2::{ValueProjectionLimits, ValueSource, decode_values, encode_values},
 };
 use arrow::datatypes::{DataType, Field};
+use novarocks_expression_contract::{ExprId, RootOrdinal};
 use novarocks_proto_models::physical_control_v2::Empty;
 use novarocks_type_contract::{
     AggregateStateArgumentContract, AggregateStateFormatId, CompileControlError,
@@ -220,7 +221,7 @@ fn nominal() -> FunctionValueType {
 fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
     p::AggregateBinding {
         state_interpretation: None,
-        function: p::BoundFunction::from_exact_signature(
+        function: novarocks_expression_contract::BoundFunction::from_exact_signature(
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
             FunctionKind::Aggregate,
@@ -238,6 +239,7 @@ fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
 }
 fn node() -> p::PhysicalNode {
     p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(u32::MAX),
         inputs: Box::from([p::NodeId::new(0)]),
         required_inputs: Box::from([p::PhysicalProperties {
@@ -262,9 +264,9 @@ fn node() -> p::PhysicalNode {
             },
             reduction: p::TopNReduction::GroupedStates {
                 group_by: Box::from([
-                    (p::ExprId::new(u32::MAX), p::ValueId::new(0)),
-                    (p::ExprId::new(0), p::ValueId::new(u32::MAX)),
-                    (p::ExprId::new(u32::MAX), p::ValueId::new(0)),
+                    (RootOrdinal::new(1), p::ValueId::new(0)),
+                    (RootOrdinal::new(0), p::ValueId::new(u32::MAX)),
+                    (RootOrdinal::new(1), p::ValueId::new(0)),
                 ]),
                 calls: Box::from([
                     p::AggregateCall {
@@ -273,19 +275,19 @@ fn node() -> p::PhysicalNode {
                             sequence: p::AggregateSequenceId::new(0),
                         }),
                         arguments: Box::from([
-                            p::ExprId::new(0),
-                            p::ExprId::new(u32::MAX),
-                            p::ExprId::new(0),
+                            RootOrdinal::new(0),
+                            RootOrdinal::new(1),
+                            RootOrdinal::new(0),
                         ]),
                         distinct: true,
                         order_by: Box::from([
                             p::SortExpr {
-                                expr: p::ExprId::new(u32::MAX),
+                                expr: RootOrdinal::new(1),
                                 direction: p::SortDirection::Descending,
                                 null_ordering: p::NullOrdering::First,
                             },
                             p::SortExpr {
-                                expr: p::ExprId::new(0),
+                                expr: RootOrdinal::new(0),
                                 direction: p::SortDirection::Ascending,
                                 null_ordering: p::NullOrdering::Last,
                             },
@@ -311,17 +313,17 @@ fn node() -> p::PhysicalNode {
 fn keys() -> Box<[p::SortExpr]> {
     Box::from([
         p::SortExpr {
-            expr: p::ExprId::new(u32::MAX),
+            expr: RootOrdinal::new(1),
             direction: p::SortDirection::Descending,
             null_ordering: p::NullOrdering::First,
         },
         p::SortExpr {
-            expr: p::ExprId::new(0),
+            expr: RootOrdinal::new(0),
             direction: p::SortDirection::Ascending,
             null_ordering: p::NullOrdering::Last,
         },
         p::SortExpr {
-            expr: p::ExprId::new(u32::MAX),
+            expr: RootOrdinal::new(1),
             direction: p::SortDirection::Descending,
             null_ordering: p::NullOrdering::Last,
         },
@@ -358,17 +360,17 @@ fn grouped(n: &mut wire::PhysicalNode) -> &mut wire::GroupedStates {
 fn expected_keys() -> Vec<wire::SortExpression> {
     vec![
         wire::SortExpression {
-            expr_id: Some(u32::MAX),
+            root_ordinal: Some(1),
             direction: wire::SortDirection::Descending as i32,
             null_ordering: wire::NullOrdering::First as i32,
         },
         wire::SortExpression {
-            expr_id: Some(0),
+            root_ordinal: Some(0),
             direction: wire::SortDirection::Ascending as i32,
             null_ordering: wire::NullOrdering::Last as i32,
         },
         wire::SortExpression {
-            expr_id: Some(u32::MAX),
+            root_ordinal: Some(1),
             direction: wire::SortDirection::Descending as i32,
             null_ordering: wire::NullOrdering::Last as i32,
         },
@@ -376,6 +378,7 @@ fn expected_keys() -> Vec<wire::SortExpression> {
 }
 fn expected() -> wire::PhysicalNode {
     wire::PhysicalNode {
+        expressions: None,
         id: u32::MAX,
         input_node_ids: vec![0],
         required_inputs: vec![wp(true)],
@@ -396,15 +399,15 @@ fn expected() -> wire::PhysicalNode {
                     wire::GroupedStates {
                         group_by: vec![
                             wire::ExpressionOutput {
-                                expr_id: Some(u32::MAX),
+                                root_ordinal: Some(1),
                                 value_id: Some(0),
                             },
                             wire::ExpressionOutput {
-                                expr_id: Some(0),
+                                root_ordinal: Some(0),
                                 value_id: Some(u32::MAX),
                             },
                             wire::ExpressionOutput {
-                                expr_id: Some(u32::MAX),
+                                root_ordinal: Some(1),
                                 value_id: Some(0),
                             },
                         ],
@@ -412,16 +415,16 @@ fn expected() -> wire::PhysicalNode {
                             wire::AggregateCall {
                                 id: 0,
                                 aggregate_binding_id: Some(0),
-                                argument_expr_ids: vec![0, u32::MAX, 0],
+                                argument_roots: vec![0, 1, 0],
                                 distinct: true,
                                 order_by: vec![
                                     wire::SortExpression {
-                                        expr_id: Some(u32::MAX),
+                                        root_ordinal: Some(1),
                                         direction: wire::SortDirection::Descending as i32,
                                         null_ordering: wire::NullOrdering::First as i32,
                                     },
                                     wire::SortExpression {
-                                        expr_id: Some(0),
+                                        root_ordinal: Some(0),
                                         direction: wire::SortDirection::Ascending as i32,
                                         null_ordering: wire::NullOrdering::Last as i32,
                                     },
@@ -431,7 +434,7 @@ fn expected() -> wire::PhysicalNode {
                             wire::AggregateCall {
                                 id: u32::MAX,
                                 aggregate_binding_id: Some(u32::MAX),
-                                argument_expr_ids: vec![],
+                                argument_roots: vec![],
                                 distinct: false,
                                 order_by: vec![],
                                 output_value_id: Some(0),
@@ -444,17 +447,54 @@ fn expected() -> wire::PhysicalNode {
         })),
     }
 }
+
+fn unit_from_sources(
+    nodes: impl IntoIterator<Item = novarocks_expression_contract::ExprNode>,
+    values: &[p::ValueDef],
+    control: &dyn PureCompileControl,
+) -> novarocks_expression_contract::BoundExprSet {
+    use novarocks_expression_contract::{BoundExprSetBuilder, ExprPort, RootScope, UnitLimits};
+    use novarocks_type_contract::{CompileCheckpoints, EvaluationDemand};
+    let mut builder = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: p::PlanLimits::FROZEN.expression_semantic_depth,
+    });
+    for node in nodes {
+        let demand = if *node.ty.data_type() == DataType::Boolean {
+            EvaluationDemand::TruthOnly
+        } else {
+            EvaluationDemand::Value
+        };
+        let id = builder.add(node.lambda_scope, node.ty, node.kind).unwrap();
+        assert_eq!(id, node.id);
+        builder.root(id, demand, RootScope::Port(0)).unwrap();
+    }
+    let ports = vec![ExprPort {
+        values: values
+            .iter()
+            .map(|value| (value.id, value.ty.clone()))
+            .collect(),
+    }];
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+    let unit = builder
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(std::collections::BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    unit
+}
+
 struct Fixture {
     roots: Vec<(u32, FunctionValueType)>,
     values: Vec<p::ValueDef>,
-    arena: p::ExprArena,
+    unit: novarocks_expression_contract::BoundExprSet,
     parameters: SemanticParameters,
     pools: p::ConstantPools,
 }
 impl Fixture {
     fn new() -> Self {
         let ty = FunctionValueType::new(DataType::Int64, true);
-        let values = [0, u32::MAX]
+        let values: Vec<p::ValueDef> = [0, u32::MAX]
             .into_iter()
             .enumerate()
             .map(|(i, id)| p::ValueDef {
@@ -466,22 +506,22 @@ impl Fixture {
                 },
             })
             .collect();
-        let arena = p::ExprArena::try_from_definitions_observed(
-            [0, u32::MAX].into_iter().map(|id| p::ExprNode {
-                id: p::ExprId::new(id),
-                owner: p::NodeId::new(u32::MAX),
-                lambda_scope: None,
-                ty: ty.clone(),
-                kind: p::ExprKind::Value(p::ValueId::new(id)),
+        let unit = unit_from_sources(
+            [0, u32::MAX].into_iter().enumerate().map(|(ordinal, id)| {
+                novarocks_expression_contract::ExprNode {
+                    id: ExprId::new(ordinal as u32),
+                    lambda_scope: None,
+                    ty: ty.clone(),
+                    kind: novarocks_expression_contract::ExprKind::Value(p::ValueId::new(id)),
+                }
             }),
-            &p::PlanLimits::default(),
+            &values,
             &Control::default(),
-        )
-        .unwrap();
+        );
         Self {
             roots: vec![(0, ty), (1, dictionary()), (2, nested()), (3, nominal())],
             values,
-            arena,
+            unit,
             parameters: SemanticParameters::try_new([]).unwrap(),
             pools: p::ConstantPools::empty(),
         }
@@ -648,20 +688,20 @@ impl Fixture {
         )
         .unwrap();
         let einputs = self
-            .arena
+            .unit
+            .definitions()
             .iter()
-            .map(|(expr, _)| ExpressionTypeIds {
-                expr: *expr,
+            .map(|node| ExpressionTypeIds {
+                expr: node.id,
                 value_type_id: 0,
                 lambda_parameter_type_ids: &[],
                 function_binding_id: None,
-                aggregate_binding_id: None,
             })
             .collect::<Vec<_>>();
         let mut expression_limits = el();
         expression_limits.max_coexisting_source_and_request_bytes = 4 * SOURCE;
         let expressions = encode_expression_definitions(
-            &self.arena,
+            Some(ExpressionDefinitionSource::from_unit(&self.unit)),
             &einputs,
             &types,
             &functions,
@@ -673,8 +713,10 @@ impl Fixture {
             c,
         )
         .unwrap();
+        let wire_roots = crate::test_constants::wire_roots(&self.unit);
         let read = decode_expression_definitions(
             expressions.as_wire(),
+            &wire_roots,
             &read_values,
             &fh,
             &ah,
@@ -812,7 +854,7 @@ fn topn_grouped_states_preserve_complete_independent_wire_and_owned_payloads() {
                 .iter()
                 .map(|e| e.get())
                 .collect::<Vec<_>>(),
-            [0, u32::MAX, 0]
+            [0, 1, 0]
         );
         assert!(calls[0].distinct);
         assert_eq!(calls[0].order_by.len(), 2);
@@ -928,10 +970,10 @@ fn topn_presence_comparator_sort_and_sparse_references_refuse_during_prepare() {
         w.output_properties = None;
         cases.push(w);
         let mut w = expected();
-        body(&mut w).order_by[0].expr_id = None;
+        body(&mut w).order_by[0].root_ordinal = None;
         cases.push(w);
         let mut w = expected();
-        body(&mut w).order_by[0].expr_id = Some(17);
+        body(&mut w).order_by[0].root_ordinal = Some(17);
         cases.push(w);
         let mut w = expected();
         body(&mut w).order_by[0].direction = 0;
@@ -940,7 +982,7 @@ fn topn_presence_comparator_sort_and_sparse_references_refuse_during_prepare() {
         body(&mut w).order_by[0].null_ordering = 999;
         cases.push(w);
         let mut w = expected();
-        grouped(&mut w).group_by[0].expr_id = None;
+        grouped(&mut w).group_by[0].root_ordinal = None;
         cases.push(w);
         let mut w = expected();
         grouped(&mut w).group_by[0].value_id = Some(17);
@@ -955,7 +997,7 @@ fn topn_presence_comparator_sort_and_sparse_references_refuse_during_prepare() {
         grouped(&mut w).calls[0].output_value_id = None;
         cases.push(w);
         let mut w = expected();
-        grouped(&mut w).calls[0].argument_expr_ids[0] = 17;
+        grouped(&mut w).calls[0].argument_roots[0] = 17;
         cases.push(w);
         let mut w = expected();
         grouped(&mut w).calls[0].order_by[0].null_ordering = 0;
@@ -1003,9 +1045,9 @@ fn topn_independent_layout_and_exact_seven_axes_cover_rows_and_inline_states() {
                 0
             };
             let receiver_extra = if grouped_mode {
-                2 * (layout::<(p::ExprId, p::ValueId)>(3)
+                2 * (layout::<(RootOrdinal, p::ValueId)>(3)
                     + layout::<p::AggregateCall>(2)
-                    + layout::<p::ExprId>(3)
+                    + layout::<RootOrdinal>(3)
                     + layout::<p::SortExpr>(2))
             } else {
                 0
@@ -1066,9 +1108,7 @@ fn topn_independent_layout_and_exact_seven_axes_cover_rows_and_inline_states() {
             ));
             if grouped_mode {
                 let mut over = wire.clone();
-                grouped(&mut over).calls[0]
-                    .argument_expr_ids
-                    .reserve(SOURCE);
+                grouped(&mut over).calls[0].argument_roots.reserve(SOURCE);
                 assert!(matches!(
                     prepare_topn_node_decode(&over, d, a, SOURCE, limits()),
                     Err(Error::InvalidShape(_))
@@ -1167,7 +1207,7 @@ fn topn_wide_actual_sort_and_nested_lists_observe_quantum_and_numeric_first_refu
             *order_by = vec![keys()[0]; 320].into_boxed_slice();
         }
         if grouped_mode {
-            calls(&mut n)[0].arguments = vec![p::ExprId::new(0); 320].into_boxed_slice();
+            calls(&mut n)[0].arguments = vec![RootOrdinal::new(0); 320].into_boxed_slice();
         }
         let c = Control::default();
         Fixture::new().with(&n, &c, |v, e, d, a| {
@@ -1457,7 +1497,7 @@ fn topn_caller_owned_actual320_ordered_rows_and_grouped_paths_share_same_parent(
             *order_by = vec![keys()[0]; 320].into_boxed_slice();
         }
         if grouped_mode {
-            calls(&mut n)[0].arguments = vec![p::ExprId::new(0); 320].into_boxed_slice();
+            calls(&mut n)[0].arguments = vec![RootOrdinal::new(0); 320].into_boxed_slice();
         }
         let c = Control::default();
         Fixture::new().with(&n, &c, |v, e, d, a| {

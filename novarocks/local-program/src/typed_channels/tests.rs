@@ -21,7 +21,7 @@ use crate::*;
 use arrow_array::{RecordBatch, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_functions::{AggregateKernelPhase, FunctionKind, PureKernelAbi};
-use novarocks_type_contract::{FunctionArgumentType, MAX_CONTROL_USE_REFERENCES, ValueLogicalType};
+use novarocks_type_contract::{MAX_CONTROL_USE_REFERENCES, ValueLogicalType};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Mutex};
 
 #[derive(Default)]
@@ -56,29 +56,136 @@ fn site(node: usize, role: ProgramChannelLayoutRole, ordinal: u32) -> ProgramCha
 fn output(node: usize) -> ProgramChannelSite {
     site(node, ProgramChannelLayoutRole::NodeOutput, 0)
 }
-fn expression_types(calls: ProgramResolvedCalls, nullable: bool) -> ProgramTypedExpressions {
-    // Every definition in these real relational fixtures is an Int64 literal.
-    let types = calls
-        .snapshot()
-        .roots()
-        .arenas()
+// Fragment tests keep the real graph/table alongside relation attachments;
+// no checked expression wrapper supplies a second graph or type namespace.
+#[derive(Clone, Debug)]
+struct TypedFixture {
+    graph: LocalProgramGraph,
+    units: Vec<Arc<novarocks_expression::CompiledExprSet>>,
+    calls: ProgramResolvedCalls,
+}
+fn resolve_source(
+    source: fixture::Fixture,
+    tokens: Vec<(ProgramCallSite, novarocks_functions::PureCallSpecialization)>,
+    control: &dyn PureCompileControl,
+) -> Result<TypedFixture, ProgramResolvedCallsError> {
+    let calls = ProgramResolvedCalls::try_new(&source.graph, &source.units, tokens, control)?;
+    Ok(TypedFixture {
+        graph: source.graph,
+        units: source.units,
+        calls,
+    })
+}
+fn declared_expression_calls(
+    mut source: TypedFixture,
+    types: &[FunctionValueType],
+) -> TypedFixture {
+    source.units = source
+        .units
         .iter()
-        .map(|(arena, definitions)| {
-            assert!(
-                definitions
-                    .nodes()
-                    .iter()
-                    .all(|node| node.data_type() == &DataType::Int64)
-            );
-            (
-                *arena,
-                vec![FunctionArgumentType::Value(i64_type(nullable)); definitions.nodes().len()],
-            )
+        .map(|unit| {
+            let values = unit
+                .definitions()
+                .nodes()
+                .iter()
+                .zip(types)
+                .map(|(node, ty)| {
+                    let novarocks_expression::StaticExprKind::Constant(value) = node.kind() else {
+                        panic!("fixture source is a checked integer constant")
+                    };
+                    match ty.data_type() {
+                        DataType::Int64 => crate::test_support::integer_typed(
+                            value.try_i64().unwrap().unwrap(),
+                            ty.clone(),
+                        ),
+                        DataType::Int32 => crate::test_support::int32_typed(
+                            value
+                                .pool()
+                                .array()
+                                .as_any()
+                                .downcast_ref::<arrow_array::Int32Array>()
+                                .unwrap()
+                                .value(value.ordinal() as usize),
+                            ty.clone(),
+                        ),
+                        _ => panic!("fixture constant has no declared integer factory"),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let roots = unit
+                .roots()
+                .iter()
+                .map(|r| (r.definition.index(), r.demand))
+                .collect::<Vec<_>>();
+            crate::test_support::constant_unit(&values, &roots)
         })
         .collect();
-    ProgramTypedExpressions::try_new(calls, types, &Control::default()).unwrap()
+    source
 }
-fn aggregate(phase: AggregateKernelPhase, nullable: bool) -> ProgramTypedExpressions {
+fn expression_types(source: TypedFixture, nullable: bool) -> TypedFixture {
+    let count = source
+        .units
+        .iter()
+        .map(|u| u.definitions().nodes().len())
+        .max()
+        .unwrap_or(0);
+    declared_expression_calls(source, &vec![i64_type(nullable); count])
+}
+#[derive(Debug)]
+struct CheckedChannels {
+    fixture: TypedFixture,
+    channels: ProgramTypedChannels,
+}
+impl std::ops::Deref for CheckedChannels {
+    type Target = ProgramTypedChannels;
+    fn deref(&self) -> &Self::Target {
+        &self.channels
+    }
+}
+impl CheckedChannels {
+    fn channel_layout(
+        &self,
+        node: ProgramNodeId,
+        role: ProgramChannelLayoutRole,
+    ) -> Option<&StaticLayout> {
+        self.channels
+            .channel_layout(&self.fixture.graph, node, role)
+    }
+    fn channel_slot(&self, site: ProgramChannelSite) -> Option<SlotId> {
+        self.channels.channel_slot(&self.fixture.graph, site)
+    }
+}
+fn check_channels(
+    fixture: TypedFixture,
+    entries: Vec<(ProgramChannelSite, FunctionValueType)>,
+    control: &dyn PureCompileControl,
+) -> Result<CheckedChannels, ProgramChannelTypeError> {
+    let channels = ProgramTypedChannels::try_new(
+        &fixture.graph,
+        &fixture.units,
+        &fixture.calls,
+        entries,
+        control,
+    )?;
+    Ok(CheckedChannels { fixture, channels })
+}
+fn check_channels_created<H>(
+    fixture: TypedFixture,
+    entries: Vec<(ProgramChannelSite, FunctionValueType)>,
+    creation: &mut dyn ValueSchemaCreationScope<H>,
+    control: &dyn PureCompileControl,
+) -> Result<CheckedChannels, ProgramCreationFailure<ProgramChannelTypeError, H>> {
+    let channels = ProgramTypedChannels::try_new_with_creator_in(
+        &fixture.graph,
+        &fixture.units,
+        &fixture.calls,
+        entries,
+        creation,
+        control,
+    )?;
+    Ok(CheckedChannels { fixture, channels })
+}
+fn aggregate(phase: AggregateKernelPhase, nullable: bool) -> TypedFixture {
     let owner = Arc::new(fixture::Owner::new(
         FunctionKind::Aggregate,
         &[PureKernelAbi::AggregateWindowV1],
@@ -93,22 +200,22 @@ fn aggregate(phase: AggregateKernelPhase, nullable: bool) -> ProgramTypedExpress
         StaticAggregateOrder::default(),
         0,
     );
-    let calls = ProgramResolvedCalls::try_new(
-        fixture::snapshot(p),
+    let calls = resolve_source(
+        p,
         vec![(fixture::aggregate_site(), token)],
         &Control::default(),
     )
     .unwrap();
     expression_types(calls, nullable)
 }
-fn writer() -> ProgramTypedExpressions {
+fn writer() -> TypedFixture {
     let owner = Arc::new(fixture::Owner::new(
         FunctionKind::Aggregate,
         &[PureKernelAbi::AggregateWindowV1],
     ));
     let catalog = fixture::aggregate_catalog(owner.clone());
-    let calls = ProgramResolvedCalls::try_new(
-        fixture::snapshot(fixture::writer_program(&owner, 1, 2)),
+    let calls = resolve_source(
+        fixture::writer_program(&owner, 1, 2),
         fixture::writer_tokens(&catalog, &owner),
         &Control::default(),
     )
@@ -134,12 +241,12 @@ fn writer_channels() -> Vec<(ProgramChannelSite, FunctionValueType)> {
     .map(|key| (key, i64_type(false)))
     .collect()
 }
-fn table() -> ProgramTypedExpressions {
+fn table() -> TypedFixture {
     let (owner, catalog) = fixture::table_fixture();
     let call = fixture::Call::new(&owner, 0);
     let token = fixture::prepare_table_token(&catalog, &call);
-    let calls = ProgramResolvedCalls::try_new(
-        fixture::snapshot(fixture::table_program(DataType::Int64, DataType::Int64, 1)),
+    let calls = resolve_source(
+        fixture::table_program(DataType::Int64, DataType::Int64, 1),
         vec![(fixture::table_site(), token)],
         &Control::default(),
     )
@@ -159,7 +266,7 @@ fn table_channels() -> Vec<(ProgramChannelSite, FunctionValueType)> {
         ),
     ]
 }
-fn rebuild(original: &LocalProgramGraph, nodes: Vec<ProgramNode>) -> LocalProgramGraph {
+fn rebuild(original: &fixture::Fixture, nodes: Vec<ProgramNode>) -> fixture::Fixture {
     let root = original.root();
     let profile = CompileProfile::new(
         NonZeroUsize::new(1).unwrap(),
@@ -167,18 +274,20 @@ fn rebuild(original: &LocalProgramGraph, nodes: Vec<ProgramNode>) -> LocalProgra
         nodes[root.index()].output_layout().identity().unwrap(),
         KernelAbiVersion::CURRENT,
     );
-    LocalProgramGraph::try_new(
+    let graph = LocalProgramGraph::try_new(
         nodes,
         root,
-        original.expressions().clone(),
+        &original.units,
         profile,
         original.requirements().clone(),
     )
-    .unwrap()
+    .unwrap();
+    fixture::Fixture {
+        graph,
+        units: original.units.clone(),
+    }
 }
-fn retyped_table(
-    mut change: impl FnMut(&mut ProgramNodeKind, &mut StaticLayout),
-) -> ProgramTypedExpressions {
+fn retyped_table(mut change: impl FnMut(&mut ProgramNodeKind, &mut StaticLayout)) -> TypedFixture {
     let original = fixture::table_program(DataType::Int64, DataType::Int64, 1);
     let nodes = original
         .nodes()
@@ -201,12 +310,8 @@ fn retyped_table(
     let (owner, catalog) = fixture::table_fixture();
     let call = fixture::Call::new(&owner, 0);
     let token = fixture::prepare_table_token(&catalog, &call);
-    let calls = ProgramResolvedCalls::try_new(
-        fixture::snapshot(p),
-        vec![(fixture::table_site(), token)],
-        &Control::default(),
-    )
-    .unwrap();
+    let calls =
+        resolve_source(p, vec![(fixture::table_site(), token)], &Control::default()).unwrap();
     expression_types(calls, false)
 }
 
@@ -219,17 +324,16 @@ fn actual_four_phase_inputs_and_emissions_are_typed_without_copying_the_prepared
         AggregateKernelPhase::Final,
     ] {
         let expressions = aggregate(phase, false);
-        let call = expressions.resolved_calls().calls()[&fixture::aggregate_site()].call_contract()
-            as *const _;
-        let typed = ProgramTypedChannels::try_new(
+        let call =
+            expressions.calls.calls()[&fixture::aggregate_site()].call_contract() as *const _;
+        let typed = check_channels(
             expressions,
             vec![(output(0), i64_type(false)), (output(1), i64_type(false))],
             &Control::default(),
         )
         .unwrap();
         assert_eq!(
-            typed.expressions().resolved_calls().calls()[&fixture::aggregate_site()].call_contract()
-                as *const _,
+            typed.fixture.calls.calls()[&fixture::aggregate_site()].call_contract() as *const _,
             call
         );
         assert_eq!(typed.channel_slot(output(1)), Some(SlotId::new(1)));
@@ -245,8 +349,7 @@ fn actual_four_phase_inputs_and_emissions_are_typed_without_copying_the_prepared
                 .unwrap()
         ));
         let ProgramStateTemplate::Aggregate { kernel, .. } =
-            typed.expressions().resolved_calls().calls()[&fixture::aggregate_site()]
-                .state_template()
+            typed.fixture.calls.calls()[&fixture::aggregate_site()].state_template()
         else {
             panic!("aggregate handle")
         };
@@ -260,7 +363,7 @@ fn nullable_actual_argument_cannot_enter_a_nonnullable_selected_aggregate_channe
         AggregateKernelPhase::Intermediate,
     ] {
         assert_eq!(
-            ProgramTypedChannels::try_new(
+            check_channels(
                 aggregate(phase, true),
                 vec![(output(0), i64_type(false)), (output(1), i64_type(false))],
                 &Control::default()
@@ -272,8 +375,7 @@ fn nullable_actual_argument_cannot_enter_a_nonnullable_selected_aggregate_channe
 }
 #[test]
 fn writer_internal_final_slot_has_an_explicit_output_type_outside_input_multiplex() {
-    let typed =
-        ProgramTypedChannels::try_new(writer(), writer_channels(), &Control::default()).unwrap();
+    let typed = check_channels(writer(), writer_channels(), &Control::default()).unwrap();
     let internal = ProgramChannelSite::WriterFinalOutput {
         node: ProgramNodeId::new(2),
         call: 0,
@@ -296,14 +398,7 @@ fn writer_internal_final_slot_has_an_explicit_output_type_outside_input_multiple
                 ProgramChannelLayoutRole::WriterProjection
             )
             .unwrap(),
-        match typed
-            .expressions()
-            .resolved_calls()
-            .snapshot()
-            .program()
-            .nodes()[1]
-            .kind()
-        {
+        match typed.fixture.graph.nodes()[1].kind() {
             ProgramNodeKind::TableWriter { projection, .. } => &projection.layout,
             _ => unreachable!(),
         }
@@ -311,7 +406,7 @@ fn writer_internal_final_slot_has_an_explicit_output_type_outside_input_multiple
     let mut missing = writer_channels();
     missing.retain(|(key, _)| *key != internal);
     assert_eq!(
-        ProgramTypedChannels::try_new(writer(), missing, &Control::default()).unwrap_err(),
+        check_channels(writer(), missing, &Control::default()).unwrap_err(),
         ProgramChannelTypeError::MissingSite(internal)
     );
 }
@@ -321,13 +416,13 @@ fn mandatory_channel_coverage_has_no_default_and_duplicate_keys_never_replace_fa
     let mut channels = table_channels();
     channels.push(channels[0].clone());
     assert_eq!(
-        ProgramTypedChannels::try_new(source.clone(), channels, &Control::default()).unwrap_err(),
+        check_channels(source.clone(), channels, &Control::default()).unwrap_err(),
         ProgramChannelTypeError::DuplicateSite
     );
     let mut missing = table_channels();
     missing.remove(1);
     assert_eq!(
-        ProgramTypedChannels::try_new(source.clone(), missing, &Control::default()).unwrap_err(),
+        check_channels(source.clone(), missing, &Control::default()).unwrap_err(),
         ProgramChannelTypeError::MissingSite(output(1))
     );
     let mut extra = table_channels();
@@ -336,7 +431,7 @@ fn mandatory_channel_coverage_has_no_default_and_duplicate_keys_never_replace_fa
         i64_type(false),
     ));
     assert_eq!(
-        ProgramTypedChannels::try_new(source, extra, &Control::default()).unwrap_err(),
+        check_channels(source, extra, &Control::default()).unwrap_err(),
         ProgramChannelTypeError::InvalidSite
     );
 }
@@ -367,9 +462,7 @@ fn unprojected_table_results_remain_mandatory_independent_of_outer_projection() 
         )
         .unwrap();
     });
-    let typed =
-        ProgramTypedChannels::try_new(source.clone(), table_channels(), &Control::default())
-            .unwrap();
+    let typed = check_channels(source.clone(), table_channels(), &Control::default()).unwrap();
     assert_eq!(typed.channel_slot(output(1)), Some(SlotId::new(1)));
     assert_eq!(
         typed.channel_type(ProgramChannelSite::TableResult {
@@ -381,7 +474,7 @@ fn unprojected_table_results_remain_mandatory_independent_of_outer_projection() 
     let mut missing = table_channels();
     missing.pop();
     assert_eq!(
-        ProgramTypedChannels::try_new(source, missing, &Control::default()).unwrap_err(),
+        check_channels(source, missing, &Control::default()).unwrap_err(),
         ProgramChannelTypeError::MissingSite(ProgramChannelSite::TableResult {
             node: ProgramNodeId::new(1),
             result: 0
@@ -407,7 +500,7 @@ fn left_outer_table_projection_widens_only_projected_results_without_changing_fu
     });
     let mut channels = table_channels();
     channels[1].1 = channels[1].1.with_nullable(true).unwrap();
-    let typed = ProgramTypedChannels::try_new(source, channels, &Control::default()).unwrap();
+    let typed = check_channels(source, channels, &Control::default()).unwrap();
     assert!(typed.channel_type(output(1)).unwrap().nullable());
     assert!(
         !typed
@@ -420,7 +513,7 @@ fn left_outer_table_projection_widens_only_projected_results_without_changing_fu
     );
 }
 
-fn values_program(fields: Vec<Field>) -> ProgramTypedExpressions {
+fn values_program(fields: Vec<Field>) -> TypedFixture {
     let schema = Arc::new(Schema::new(fields));
     let arrays = schema
         .fields()
@@ -438,19 +531,7 @@ fn values_program(fields: Vec<Field>) -> ProgramTypedExpressions {
         layout.identity().unwrap(),
         KernelAbiVersion::CURRENT,
     );
-    let arena = Arc::new(
-        ImmutableExpressions::try_new(
-            vec![StaticExprNode::new(
-                StaticExprKind::Literal(StaticLiteral::Int64(7)),
-                DataType::Int64,
-                None,
-            )],
-            false,
-            HashMap::new(),
-            None,
-        )
-        .unwrap(),
-    );
+
     let program = LocalProgramGraph::try_new(
         vec![ProgramNode::new(
             10,
@@ -460,14 +541,20 @@ fn values_program(fields: Vec<Field>) -> ProgramTypedExpressions {
             layout,
         )],
         ProgramNodeId::new(0),
-        arena,
+        &[],
         profile,
         BindingRequirements::try_new(vec![]).unwrap(),
     )
     .unwrap();
-    let calls =
-        ProgramResolvedCalls::try_new(fixture::snapshot(program), vec![], &Control::default())
-            .unwrap();
+    let calls = resolve_source(
+        fixture::Fixture {
+            graph: program,
+            units: vec![],
+        },
+        vec![],
+        &Control::default(),
+    )
+    .unwrap();
     expression_types(calls, false)
 }
 #[test]
@@ -480,10 +567,9 @@ fn explicit_json_root_identity_is_required_without_inferring_it_from_plain_utf8(
         "json".into(),
     )]));
     let source = values_program(vec![field]);
-    ProgramTypedChannels::try_new(source.clone(), vec![(output(0), json)], &Control::default())
-        .unwrap();
+    check_channels(source.clone(), vec![(output(0), json)], &Control::default()).unwrap();
     assert_eq!(
-        ProgramTypedChannels::try_new(
+        check_channels(
             source,
             vec![(output(0), FunctionValueType::new(DataType::Utf8, true))],
             &Control::default()
@@ -497,9 +583,7 @@ fn explicit_json_root_identity_is_required_without_inferring_it_from_plain_utf8(
     let json =
         FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
             .unwrap();
-    let checked =
-        ProgramTypedChannels::try_new(source, vec![(output(0), json)], &Control::default())
-            .unwrap();
+    let checked = check_channels(source, vec![(output(0), json)], &Control::default()).unwrap();
     assert_eq!(
         checked.channel_type(output(0)).unwrap().logical_type(),
         ValueLogicalType::Json
@@ -528,14 +612,14 @@ fn nested_nullability_is_semantic_but_dictionary_ids_and_source_attributes_are_n
     };
     let actual = nested(1, true, "first");
     let source = values_program(vec![Field::new("struct", actual.clone(), true)]);
-    ProgramTypedChannels::try_new(
+    check_channels(
         source.clone(),
         vec![(output(0), FunctionValueType::new(actual, true))],
         &Control::default(),
     )
     .unwrap();
     for changed in [nested(2, true, "first"), nested(1, true, "changed")] {
-        ProgramTypedChannels::try_new(
+        check_channels(
             source.clone(),
             vec![(output(0), FunctionValueType::new(changed, true))],
             &Control::default(),
@@ -543,7 +627,7 @@ fn nested_nullability_is_semantic_but_dictionary_ids_and_source_attributes_are_n
         .unwrap();
     }
     assert_eq!(
-        ProgramTypedChannels::try_new(
+        check_channels(
             source,
             vec![(
                 output(0),
@@ -593,33 +677,27 @@ fn full_window_argument_and_output_types_borrow_the_same_frozen_partition_owner(
             &OwnerControl,
         )
         .unwrap();
-    let calls = ProgramResolvedCalls::try_new(
-        fixture::snapshot(fixture::window_program(
-            &owner,
-            false,
-            Some(fixture::local_frame()),
-            false,
-        )),
+    let calls = resolve_source(
+        fixture::window_program(&owner, false, Some(fixture::local_frame()), false),
         vec![(fixture::window_site(), token)],
         &Control::default(),
     )
     .unwrap();
     let channels = vec![(output(0), i64_type(false)), (output(1), i64_type(false))];
-    let typed = ProgramTypedChannels::try_new(
+    let typed = check_channels(
         expression_types(calls.clone(), false),
         channels.clone(),
         &Control::default(),
     )
     .unwrap();
     let ProgramStateTemplate::WindowPartition { kernel, .. } =
-        typed.expressions().resolved_calls().calls()[&fixture::window_site()].state_template()
+        typed.fixture.calls.calls()[&fixture::window_site()].state_template()
     else {
         panic!("actual window handle")
     };
     fixture::run_window(kernel.clone(), &[3, 5]);
     assert_eq!(
-        ProgramTypedChannels::try_new(expression_types(calls, true), channels, &Control::default())
-            .unwrap_err(),
+        check_channels(expression_types(calls, true), channels, &Control::default()).unwrap_err(),
         ProgramChannelTypeError::TypeMismatch
     );
 }
@@ -649,8 +727,7 @@ fn typed_channel_entry_and_positive_work_preserve_control_categories() {
                 seen: Mutex::default(),
             };
             assert_eq!(
-                ProgramTypedChannels::try_new(source.clone(), entries.clone(), &control)
-                    .unwrap_err(),
+                check_channels(source.clone(), entries.clone(), &control).unwrap_err(),
                 ProgramChannelTypeError::Control(error.clone())
             );
             assert!(control.seen.lock().unwrap().contains(&at));
@@ -691,9 +768,9 @@ fn schema_channel_positions_use_an_independent_checked_definition_budget() {
             )
         })
         .collect();
-    let typed = ProgramTypedChannels::try_new(source, entries, &Control::default()).unwrap();
+    let typed = check_channels(source, entries, &Control::default()).unwrap();
     assert_eq!(typed.channels().len(), width);
-    assert!(typed.expressions().resolved_calls().calls().is_empty());
+    assert!(typed.fixture.calls.calls().is_empty());
 }
 
 #[test]
@@ -754,19 +831,7 @@ fn actual_join_side_and_scope_layouts_keep_separate_explicit_logical_domains() {
             joined.clone(),
         ),
     ];
-    let arena = Arc::new(
-        ImmutableExpressions::try_new(
-            vec![StaticExprNode::new(
-                StaticExprKind::Literal(StaticLiteral::Int64(7)),
-                DataType::Int64,
-                None,
-            )],
-            false,
-            HashMap::new(),
-            None,
-        )
-        .unwrap(),
-    );
+
     let profile = CompileProfile::new(
         NonZeroUsize::new(1).unwrap(),
         None,
@@ -776,14 +841,21 @@ fn actual_join_side_and_scope_layouts_keep_separate_explicit_logical_domains() {
     let program = LocalProgramGraph::try_new(
         nodes,
         ProgramNodeId::new(2),
-        arena,
+        &[],
         profile,
         BindingRequirements::try_new(vec![]).unwrap(),
     )
     .unwrap();
     let source = expression_types(
-        ProgramResolvedCalls::try_new(fixture::snapshot(program), vec![], &Control::default())
-            .unwrap(),
+        resolve_source(
+            fixture::Fixture {
+                graph: program,
+                units: vec![],
+            },
+            vec![],
+            &Control::default(),
+        )
+        .unwrap(),
         false,
     );
     let json =
@@ -800,9 +872,7 @@ fn actual_join_side_and_scope_layouts_keep_separate_explicit_logical_domains() {
         (site(2, Role::JoinScope, 0), json),
         (site(2, Role::JoinScope, 1), plain.clone()),
     ];
-    let checked =
-        ProgramTypedChannels::try_new(source.clone(), channels.clone(), &Control::default())
-            .unwrap();
+    let checked = check_channels(source.clone(), channels.clone(), &Control::default()).unwrap();
     assert_eq!(
         checked
             .slot_type(ProgramNodeId::new(2), Role::JoinLeft, SlotId::new(1))
@@ -820,13 +890,13 @@ fn actual_join_side_and_scope_layouts_keep_separate_explicit_logical_domains() {
     let mut missing = channels.clone();
     missing.retain(|(key, _)| *key != site(2, Role::JoinScope, 1));
     assert_eq!(
-        ProgramTypedChannels::try_new(source.clone(), missing, &Control::default()).unwrap_err(),
+        check_channels(source.clone(), missing, &Control::default()).unwrap_err(),
         ProgramChannelTypeError::MissingSite(site(2, Role::JoinScope, 1))
     );
     let mut wrong_side = channels;
     wrong_side[4].1 = plain;
     assert_eq!(
-        ProgramTypedChannels::try_new(source, wrong_side, &Control::default()).unwrap_err(),
+        check_channels(source, wrong_side, &Control::default()).unwrap_err(),
         ProgramChannelTypeError::TypeMismatch
     );
 }
@@ -1018,8 +1088,8 @@ impl novarocks_functions::KernelEvaluationControl for RuntimeControl {
 fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_separate_channel() {
     use novarocks_functions::*;
     use novarocks_type_contract::{
-        CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-        ExpressionEffectContext, ExpressionUseId, SemanticParameters,
+        CallProofScope, DecimalOverflowPolicy, RelationCallId, RelationEffectContext,
+        SemanticParameters,
     };
     let owner = Arc::new(OrderedOwner::new());
     let mut builder = EngineFunctionCatalogBuilder::new();
@@ -1045,15 +1115,22 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
             constant: None,
         },
     ];
-    let uses = [Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))];
-    let parameters = SemanticParameters::default();
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(u32::MAX),
-        domain: EvaluationDomainId::new(1),
-        demand: EvaluationDemand::Value,
-    };
+    let argument_unit = crate::test_support::argument_unit(&[
+        i64_type(false),
+        FunctionValueType::new(DataType::Int32, false),
+    ]);
+    let uses = [0, 1].map(|ordinal| {
+        Some(
+            argument_unit
+                .root(novarocks_expression_contract::RootOrdinal::new(ordinal))
+                .unwrap()
+                .use_id,
+        )
+    });
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let context = RelationEffectContext::call(RelationCallId::new(u32::MAX));
     let input = CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Aggregate,
@@ -1074,7 +1151,7 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
             owner.selected.clone(),
             &owner.inner.frozen(&owner.selected),
             PureCallPreparation::Aggregate {
-                arguments: ScopedExpressionEffects::pure_value(context),
+                arguments: ScopedRelationalEffects::pure_value(context),
                 options: AggregatePreparationOptions {
                     state_interpretation: None,
                     phase: AggregateKernelPhase::Single,
@@ -1101,7 +1178,10 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
     let ProgramNodeKind::Aggregate { functions, .. } = &mut kind else {
         unreachable!()
     };
-    functions[0].inputs = vec![ProgramExprId::new(0), ProgramExprId::new(1)];
+    functions[0].inputs = vec![
+        crate::test_support::root(0, 0),
+        crate::test_support::root(0, 1),
+    ];
     functions[0].resolved = owner.signature();
     // The adapted call has an independently declared order channel. Publish
     // the actual ordered owner's complete selection, replacing the original
@@ -1120,26 +1200,16 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
         nulls_first: vec![false],
         ..Default::default()
     };
-    let arena = Arc::new(
-        ImmutableExpressions::try_new(
-            vec![
-                StaticExprNode::new(
-                    StaticExprKind::Literal(StaticLiteral::Int64(7)),
-                    DataType::Int64,
-                    None,
-                ),
-                StaticExprNode::new(
-                    StaticExprKind::Literal(StaticLiteral::Int32(9)),
-                    DataType::Int32,
-                    None,
-                ),
-            ],
-            false,
-            HashMap::new(),
-            None,
-        )
-        .unwrap(),
-    );
+    let units = vec![crate::test_support::constant_unit(
+        &[
+            crate::test_support::integer(7),
+            crate::test_support::int32(9),
+        ],
+        &[
+            (0, novarocks_type_contract::EvaluationDemand::Value),
+            (1, novarocks_type_contract::EvaluationDemand::Value),
+        ],
+    )];
     let program = LocalProgramGraph::try_new(
         vec![
             original.nodes()[0].clone(),
@@ -1150,35 +1220,35 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
             ),
         ],
         original.root(),
-        arena,
+        &units,
         original.profile(),
         original.requirements().clone(),
     )
     .unwrap();
-    let calls = ProgramResolvedCalls::try_new(
-        fixture::snapshot(program),
+    let calls = resolve_source(
+        fixture::Fixture {
+            graph: program,
+            units,
+        },
         vec![(fixture::aggregate_site(), token)],
         &Control::default(),
     )
     .unwrap();
     let types = |nullable| {
-        BTreeMap::from([(
-            ProgramExpressionArena::Main,
-            vec![
-                FunctionArgumentType::Value(i64_type(false)),
-                FunctionArgumentType::Value(FunctionValueType::new(DataType::Int32, nullable)),
-            ],
-        )])
+        vec![
+            i64_type(false),
+            FunctionValueType::new(DataType::Int32, nullable),
+        ]
     };
     let entries = vec![(output(0), i64_type(false)), (output(1), i64_type(false))];
-    let typed = ProgramTypedChannels::try_new(
-        ProgramTypedExpressions::try_new(calls.clone(), types(false), &Control::default()).unwrap(),
+    let typed = check_channels(
+        declared_expression_calls(calls.clone(), &types(false)),
         entries.clone(),
         &Control::default(),
     )
     .unwrap();
     let ProgramStateTemplate::Aggregate { kernel, .. } =
-        typed.expressions().resolved_calls().calls()[&fixture::aggregate_site()].state_template()
+        typed.fixture.calls.calls()[&fixture::aggregate_site()].state_template()
     else {
         panic!("actual ordered kernel")
     };
@@ -1226,8 +1296,8 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
         8
     );
     assert_eq!(
-        ProgramTypedChannels::try_new(
-            ProgramTypedExpressions::try_new(calls, types(true), &Control::default()).unwrap(),
+        check_channels(
+            declared_expression_calls(calls, &types(true)),
             entries,
             &Control::default()
         )
@@ -1280,20 +1350,13 @@ fn created_channel_maps_and_independent_type_clones_retain_only_their_actual_own
         .into_iter()
         .map(|(site, _)| (site, ty.clone()))
         .collect::<Vec<_>>();
-    let expected =
-        ProgramTypedChannels::try_new(source.clone(), channels.clone(), &Control::default())
-            .unwrap();
+    let expected = check_channels(source.clone(), channels.clone(), &Control::default()).unwrap();
     let mut request = |_: std::alloc::Layout| -> Result<(), CallerRefusal> { Ok(()) };
     let mut opaque = |_: usize| -> Result<(), CallerRefusal> { Ok(()) };
     let mut creation =
         ValueSchemaCreation::new(creation_storage(&new_drops), &mut request, &mut opaque);
-    let checked = ProgramTypedChannels::try_new_with_creator_in(
-        source,
-        channels,
-        &mut creation,
-        &Control::default(),
-    )
-    .unwrap();
+    let checked =
+        check_channels_created(source, channels, &mut creation, &Control::default()).unwrap();
     assert_eq!(checked.channels(), expected.channels());
     let independent_type = checked.channel_type(output(0)).unwrap().clone();
     let late_map = checked.slots.clone();
@@ -1347,7 +1410,7 @@ fn every_channel_quote_preserves_first_caller_payload_and_original_type_failure(
         };
         let mut creation =
             ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
-        ProgramTypedChannels::try_new_with_creator_in(
+        check_channels_created(
             source.clone(),
             channels.clone(),
             &mut creation,
@@ -1376,12 +1439,7 @@ fn every_channel_quote_preserves_first_caller_payload_and_original_type_failure(
     let mut creation =
         ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
     assert!(matches!(
-        ProgramTypedChannels::try_new_with_creator_in(
-            source,
-            wrong,
-            &mut creation,
-            &Control::default()
-        ),
+        check_channels_created(source, wrong, &mut creation, &Control::default()),
         Err(ProgramCreationFailure::Owner(
             ProgramChannelTypeError::TypeMismatch
         ))

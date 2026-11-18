@@ -73,6 +73,7 @@ fn insert(
     builder
         .insert_node_unchecked(PhysicalNode {
             id,
+            expressions: None,
             inputs: inputs.into_boxed_slice(),
             required_inputs: required.into_iter().map(property).collect(),
             output_properties: property(provided),
@@ -169,6 +170,7 @@ fn edge(
 }
 
 fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, FragmentPackage> {
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(ROUTER);
     let source = builder.reserve_node_id().unwrap();
     let source_type = ty(DataType::Int64, false);
@@ -182,10 +184,16 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
         )
         .unwrap();
     let source_expression = builder
-        .add_expression(
+        .add_root(
             source,
             source_type.clone(),
-            ExprKind::Literal(LiteralValue::Int64(17)),
+            crate::test_constants::i64(
+                &mut constants,
+                &source_type,
+                17,
+                options(1, None).constants,
+            ),
+            RootScope::AllPorts,
         )
         .unwrap();
     insert(
@@ -219,8 +227,39 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
         )
         .unwrap();
     let expression = builder
-        .add_expression(root, source_type, ExprKind::Value(source_value))
+        .add_root(
+            root,
+            source_type,
+            ExprKind::Value(source_value),
+            RootScope::Port(0),
+        )
         .unwrap();
+    let definition =
+        builder.construction_unit(root).unwrap().roots()[expression.get() as usize].definition;
+    let events = [
+        ConnectorRowMutationEffect::Insert,
+        ConnectorRowMutationEffect::Replace,
+        ConnectorRowMutationEffect::Delete,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(ordinal, effect)| {
+        let occurrence = if ordinal == 0 {
+            expression
+        } else {
+            builder
+                .unit(root)
+                .unwrap()
+                .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+                .unwrap()
+        };
+        ChangeEventSpec {
+            predicate: None,
+            effect,
+            assignments: Box::from([ChangeAssignment::exact(data, Some(occurrence))]),
+        }
+    })
+    .collect::<Box<[_]>>();
     insert(
         &mut builder,
         root,
@@ -228,20 +267,7 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
         vec![effect, data],
         NodeKind::ChangeEventExpand {
             effect_output: effect,
-            events: [
-                ConnectorRowMutationEffect::Insert,
-                ConnectorRowMutationEffect::Replace,
-                ConnectorRowMutationEffect::Delete,
-            ]
-            .map(|effect| ChangeEventSpec {
-                predicate: None,
-                effect,
-                assignments: Box::from([novarocks_physical_plan::ChangeAssignment::exact(
-                    data,
-                    Some(expression),
-                )]),
-            })
-            .into(),
+            events,
         },
         Distribution::Unconstrained,
         vec![Distribution::Unconstrained],
@@ -304,14 +330,20 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
         .collect();
     builder.set_summaries(Box::new([summary]));
     let router = builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Router { effect, routes },
             dop_domain(),
             StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([31; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([31; 16]).unwrap(),
+        options(1, None).constants,
+    );
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(router).unwrap();
     let mut writer_fields = Vec::new();
     let mut edges = Vec::new();
@@ -376,7 +408,7 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             vec![receiver_distribution.clone()],
         );
         let fragment = builder
-            .finish_definition(
+            .finish_fixture_definition(
                 writer,
                 FragmentSink::Stream {
                     edge: RESULTS[index],
@@ -555,7 +587,7 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
     );
     plan.add_fragment(
         builder
-            .finish_definition(
+            .finish_fixture_definition(
                 finish,
                 FragmentSink::Result,
                 dop_domain(),
@@ -586,18 +618,10 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             .collect(),
     })
     .unwrap();
-    let plan = plan.finish().unwrap();
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
+    let plan = plan.finish_observed(&FixtureControl).unwrap();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let roots = root_uses(fragment);
-        calls.insert(
-            id,
-            FrozenFragmentCalls::try_new(fragment, &roots, vec![], &FixtureControl).unwrap(),
-        );
-        uses.insert(id, roots);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
@@ -611,8 +635,6 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             (ordinals[0], drafts[0].clone()),
             (ordinals[1], drafts[1].clone()),
         ]),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,
@@ -641,15 +663,17 @@ fn router_has_independent_summary_and_occurrence_preserving_provider_branches() 
         );
         for (ordinal, expected) in input_slots.iter().enumerate() {
             assert!(
-                matches!(graph.expressions().node(exprs[ordinal]).unwrap().kind(),
-                StaticExprKind::SlotId(actual) if actual == expected)
+                root_input_slot(
+                    &program,
+                    exprs[ordinal],
+                    graph.nodes()[input.index()].output_layout()
+                ) == *expected
             );
         }
         let Some(StaticSinkProgram::ChangeStreamRouter {
             branches,
             routes,
             effect_slot,
-            arena,
         }) = graph.sink()
         else {
             panic!("router")
@@ -707,12 +731,11 @@ fn router_has_independent_summary_and_occurrence_preserving_provider_branches() 
                     .iter()
                     .position(|candidate| candidate == slot)
                     .unwrap();
-                let StaticExprKind::SlotId(source) =
-                    graph.expressions().node(exprs[ordinal]).unwrap().kind()
-                else {
-                    panic!("source read")
-                };
-                read_slots.push(*source);
+                read_slots.push(root_input_slot(
+                    &program,
+                    exprs[ordinal],
+                    graph.nodes()[input.index()].output_layout(),
+                ));
             }
             assert_eq!(
                 read_slots,
@@ -737,7 +760,11 @@ fn router_has_independent_summary_and_occurrence_preserving_provider_branches() 
                     );
                     assert_eq!(branch.partition_exprs().len(), 1);
                     assert!(
-                        matches!(arena.node(branch.partition_exprs()[0]).unwrap().kind(), StaticExprKind::SlotId(slot) if *slot == root.output_layout().slots()[1])
+                        root_input_slot(
+                            &program,
+                            branch.partition_exprs()[0],
+                            root.output_layout()
+                        ) == root.output_layout().slots()[1]
                     );
                 }
             }

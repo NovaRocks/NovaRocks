@@ -236,7 +236,7 @@ impl ControlOwner {
             }
             if !input.environment.is_empty()
                 || (input.proof_scope != CallProofScope::Unconditional
-                    && input.proof_scope != CallProofScope::Domain(input.context.domain))
+                    && input.proof_scope != input.context.proof_scope())
             {
                 return Err(FunctionBindingError::InvalidBinding(
                     "IF/COALESCE requires no environment and its exact proof scope".into(),

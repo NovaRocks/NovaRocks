@@ -16,7 +16,10 @@
 // under the License.
 
 //! Original request sender borrows real completed SQL requests, pools and full types.
-use novarocks_physical_plan::{ConstantPools, FragmentCallRequests, StaticFunctionArgument};
+use arrow::array::StringArray;
+use novarocks_physical_plan::{
+    ConstantPools, FragmentCallRequests, NodeKind, PhysicalCallSite, StaticFunctionArgument,
+};
 use novarocks_plan_codec::{
     host_projection_v2::{AdmissionRefusal, ProjectionFailure},
     physical_binding_v2::ArgumentTypeIds,
@@ -112,13 +115,39 @@ fn source<T>(
         &ConstantPools,
     ) -> T,
 ) -> T {
-    let owner = super::exact("SELECT upper('kept') AS source_call");
+    let owner = super::exact("SELECT max('kept') AS source_call FROM (VALUES (1), (2)) AS t(n)");
     let fragment = owner
         .plan()
         .fragments()
         .values()
-        .find(|v| !v.call_requests().entries().is_empty())
-        .unwrap();
+        .find(|fragment| {
+            fragment
+                .call_requests()
+                .entries()
+                .iter()
+                .any(|(site, request)| {
+                    let PhysicalCallSite::Aggregate { node, call } = site else {
+                        return false;
+                    };
+                    let NodeKind::Aggregate { calls, .. } = &fragment.nodes()[node].kind else {
+                        return false;
+                    };
+                    calls[*call as usize]
+                        .binding
+                        .phase
+                        .consumes_logical_arguments()
+                        && request.arguments.iter().any(|argument| {
+                            matches!(
+                                argument,
+                                StaticFunctionArgument::Value {
+                                    constant: Some(_),
+                                    ..
+                                }
+                            )
+                        })
+                })
+        })
+        .expect("actual SQL must publish an aggregate request with its literal");
     let requests = fragment.call_requests();
     let pools = owner.plan().constants();
     let mut values = Vec::new();
@@ -136,7 +165,7 @@ fn source<T>(
                 constant,
             } = argument
             else {
-                panic!("real UPPER fixture has value channels");
+                panic!("real MAX fixture has value channels");
             };
             let id = u32::try_from(values.len() + 100).unwrap();
             values.push((id, value_type.clone()));
@@ -146,6 +175,10 @@ fn source<T>(
                     .resolve_source_observed(*reference, &mut source_work)
                     .unwrap();
                 assert_eq!(selected.value_type(), value_type);
+                assert_eq!(selected.ordinal(), reference.ordinal);
+                let backing = selected.pool().array();
+                let array = backing.as_any().downcast_ref::<StringArray>().unwrap();
+                assert_eq!(array.value(selected.ordinal() as usize), "kept");
                 constants += 1;
             }
         }

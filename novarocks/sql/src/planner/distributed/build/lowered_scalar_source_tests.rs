@@ -128,24 +128,29 @@ fn emission_plan(expression: TypedExpr) -> PhysicalPlanNode {
 pub(in crate::planner::distributed::build) fn authored(
     expression: TypedExpr,
 ) -> SqlAuthoredPhysicalPlan {
-    let source = emission_plan(expression);
     let control = Control::default();
+    lower_draft_with_control(expression, &control)
+        .unwrap()
+        .finish_observed(&control)
+        .unwrap()
+}
+
+pub(in crate::planner::distributed::build) fn lower_draft_with_control(
+    expression: TypedExpr,
+    control: &dyn PureCompileControl,
+) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan(
-        &source,
+        &emission_plan(expression),
         version(),
         dop(),
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
-        &control,
+        control,
     )
-    .unwrap()
-    .finish_observed(&control)
-    .unwrap()
 }
 
-pub(in crate::planner::distributed::build) fn authored_lambda_source_for_test()
--> SqlAuthoredPhysicalPlan {
+pub(in crate::planner::distributed::build) fn analyzed_lambda_expression_for_test() -> TypedExpr {
     // The real analyzer supplies the selected Lambda and LOWER declarations.
     // This emitter fixture does not assert an installed ARRAY_MAP pure kernel
     // or bypass the public compiler's implementation-presence admission.
@@ -163,18 +168,32 @@ pub(in crate::planner::distributed::build) fn authored_lambda_source_for_test()
     let crate::analysis::QueryBody::Select(select) = query.body else {
         panic!("Lambda projection")
     };
-    authored(select.projection.into_iter().next().unwrap().expr)
+    select.projection.into_iter().next().unwrap().expr
+}
+
+pub(in crate::planner::distributed::build) fn authored_lambda_source_for_test()
+-> SqlAuthoredPhysicalPlan {
+    authored(analyzed_lambda_expression_for_test())
 }
 
 pub(in crate::planner::distributed::build) fn scalar_source(
     owner: &SqlAuthoredPhysicalPlan,
-) -> (&Fragment, &novarocks_physical_plan::ExprNode) {
+) -> (
+    &Fragment,
+    &novarocks_physical_plan::PhysicalNode,
+    &novarocks_expression_contract::ExprNode,
+) {
     for fragment in owner.plan().fragments().values() {
-        for (_, source) in fragment.expressions().iter() {
-            if let ContractExprKind::FunctionCall { function, .. } = &source.kind
-                && function.function_id.as_str().contains("lower")
-            {
-                return (fragment, source);
+        for node in fragment.nodes().values() {
+            let Some(unit) = &node.expressions else {
+                continue;
+            };
+            for source in unit.definitions() {
+                if let ContractExprKind::FunctionCall { function, .. } = &source.kind
+                    && function.function_id.as_str().contains("lower")
+                {
+                    return (fragment, node, source);
+                }
             }
         }
     }
@@ -183,11 +202,12 @@ pub(in crate::planner::distributed::build) fn scalar_source(
 fn loan<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     fragment: &'a Fragment,
-    source: &'a novarocks_physical_plan::ExprNode,
+    unit_node: &'a novarocks_physical_plan::PhysicalNode,
+    source: &'a novarocks_expression_contract::ExprNode,
     control: &dyn PureCompileControl,
 ) -> Result<CheckedExpressionLogicalSourceEntry<'a>, SqlSourceJournalError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-    let result = owner.checked_scalar_source_observed(fragment, source, &mut work);
+    let result = owner.checked_scalar_source_observed(fragment, unit_node, source, &mut work);
     if matches!(&result, Err(SqlSourceJournalError::Control(_))) {
         return result;
     }
@@ -216,10 +236,10 @@ fn operational_arguments(
 }
 fn physical_constant(
     owner: &SqlAuthoredPhysicalPlan,
-    fragment: &Fragment,
+    receipt: &CheckedExpressionLogicalSourceEntry<'_>,
     id: ExprId,
 ) -> novarocks_functions::ConstantValue {
-    let node = fragment.expressions().get(id).unwrap();
+    let node = receipt.definitions().definition(id).unwrap();
     let ContractExprKind::Constant(reference) = &node.kind else {
         panic!("constant emission")
     };
@@ -247,15 +267,22 @@ fn scalar_journal_real_sql_retains_same_owner_binding_and_request_loans() {
         owner.function_catalog(),
         clone.function_catalog()
     ));
-    let (fragment, source) = scalar_source(&owner);
-    let original = loan(&owner, fragment, source, &Control::default()).unwrap();
-    let cloned = loan(&clone, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = scalar_source(&owner);
+    let original = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
+    let cloned = loan(&clone, fragment, unit_node, source, &Control::default()).unwrap();
     assert!(std::ptr::eq(original.captured(), cloned.captured()));
     assert!(std::ptr::eq(
         original.captured().binding().resolved(),
         cloned.captured().binding().resolved()
     ));
-    assert!(std::ptr::eq(original.fragment(), fragment));
+    assert_eq!(
+        original.definitions().owner(),
+        crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(unit_node.id)
+    );
+    assert!(std::ptr::eq(
+        fragment.nodes().get(&unit_node.id).unwrap(),
+        unit_node
+    ));
     assert!(std::ptr::eq(original.source(), source));
     assert!(constant(&original.captured().request().arguments[0]).is_none());
     let ContractExprKind::FunctionCall { args, .. } = &source.kind else {
@@ -265,12 +292,30 @@ fn scalar_journal_real_sql_retains_same_owner_binding_and_request_loans() {
     assert_eq!(original.captured().constant_policy(), policy());
     let foreign_fragment = fragment.clone();
     let foreign_source = source.clone();
-    for (fragment, source) in [(&foreign_fragment, source), (fragment, &foreign_source)] {
+    let foreign_node = unit_node.clone();
+    for (fragment, node, source, reason) in [
+        (
+            &foreign_fragment,
+            unit_node,
+            source,
+            "expression journal loans a foreign plan or node",
+        ),
+        (
+            fragment,
+            &foreign_node,
+            source,
+            "expression journal loans a foreign plan or node",
+        ),
+        (
+            fragment,
+            unit_node,
+            &foreign_source,
+            "expression journal loans a foreign unit definition",
+        ),
+    ] {
         assert!(matches!(
-            loan(&owner, fragment, source, &Control::default()),
-            Err(SqlSourceJournalError::InvalidSource(
-                "expression journal loans a foreign plan or expression"
-            ))
+            loan(&owner, fragment, node, source, &Control::default()),
+            Err(SqlSourceJournalError::InvalidSource(actual)) if actual == reason
         ));
     }
 }
@@ -298,8 +343,8 @@ fn scalar_journal_literal_and_selected_cv_emit_the_same_original_backing_once() 
         },
     ] {
         let owner = authored(lower_call(input, DecimalOverflowPolicy::ReportError));
-        let (fragment, source) = scalar_source(&owner);
-        let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+        let (fragment, unit_node, source) = scalar_source(&owner);
+        let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
         assert_eq!(
             receipt.captured().binding().decimal_overflow_policy(),
             DecimalOverflowPolicy::ReportError
@@ -319,7 +364,7 @@ fn scalar_journal_literal_and_selected_cv_emit_the_same_original_backing_once() 
             projected.pool().field_ref(),
             captured.pool().field_ref()
         ));
-        let emitted = physical_constant(&owner, fragment, receipt.arguments()[0]);
+        let emitted = physical_constant(&owner, &receipt, receipt.arguments()[0]);
         assert_eq!(emitted.ordinal(), captured.ordinal());
         assert!(Arc::ptr_eq(emitted.pool().array(), captured.pool().array()));
         assert!(Arc::ptr_eq(
@@ -353,13 +398,13 @@ fn scalar_journal_original_cast_and_nested_none_survive_constant_emission() {
         },
     ] {
         let owner = authored(lower_call(argument, DecimalOverflowPolicy::OutputNull));
-        let (fragment, source) = scalar_source(&owner);
-        let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+        let (fragment, unit_node, source) = scalar_source(&owner);
+        let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
         assert!(constant(&receipt.captured().request().arguments[0]).is_none());
         let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
         assert!(constant(&operational[0]).is_none());
         assert_eq!(
-            physical_constant(&owner, fragment, receipt.arguments()[0])
+            physical_constant(&owner, &receipt, receipt.arguments()[0])
                 .try_utf8()
                 .unwrap(),
             Some("ABC")
@@ -410,33 +455,52 @@ fn scalar_journal_lambda_body_call_keeps_its_actual_emission_scope() {
         .iter()
         .next()
         .unwrap();
+    let crate::planner::distributed::build::unit_source::ScalarSourceSite::Node {
+        fragment: key_fragment,
+        node: key_node,
+    } = key.site.clone()
+    else {
+        panic!("the original fixture owns a real node source")
+    };
     assert_eq!(visitor.call_sources.expression_entries.len(), 1);
-    assert_eq!(key.0, ROOT_FRAGMENT_ID);
-    assert_eq!(entry.owner, NodeId::new(73));
+    assert_eq!(key_fragment, ROOT_FRAGMENT_ID);
+    assert_eq!(key_node, NodeId::new(73));
     assert_eq!(entry.lambda_scope, Some(lambda));
     assert!(constant(&entry.captured.request().arguments[0]).is_none());
     let source = visitor.fragments[&ROOT_FRAGMENT_ID]
-        .expressions()
-        .get(key.1)
+        .construction_unit(key_node)
+        .unwrap()
+        .definition(key.definition)
         .unwrap();
     assert_eq!(source.lambda_scope, Some(lambda));
-    validate_expression_source_entry_observed(entry, source, &mut visitor.work).unwrap();
+    validate_expression_source_entry_observed(
+        entry,
+        crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(key_node),
+        source,
+        &mut visitor.work,
+    )
+    .unwrap();
     visitor.work.finish().unwrap();
 }
 
 #[test]
 fn scalar_journal_loan_success_and_ordinary_errors_observe_every_original_control_prefix() {
     let owner = authored(lower_call(text("ABC"), DecimalOverflowPolicy::OutputNull));
-    let (fragment, source) = scalar_source(&owner);
+    let (fragment, unit_node, source) = scalar_source(&owner);
     let foreign_source = source.clone();
     let argument_id = match &source.kind {
         ContractExprKind::FunctionCall { args, .. } => args[0],
         _ => unreachable!(),
     };
-    let missing = fragment.expressions().get(argument_id).unwrap();
+    let missing = unit_node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .definition(argument_id)
+        .unwrap();
     for source in [source, &foreign_source, missing] {
         let control = Control::default();
-        let result = loan(&owner, fragment, source, &control);
+        let result = loan(&owner, fragment, unit_node, source, &control);
         if std::ptr::eq(source, missing) {
             assert!(matches!(result, Err(SqlSourceJournalError::MissingEntry)));
         } else if std::ptr::eq(source, &foreign_source) {
@@ -464,8 +528,10 @@ fn scalar_journal_loan_success_and_ordinary_errors_observe_every_original_contro
                     refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
-                assert!(matches!(loan(&owner, fragment, source, &control),
-                    Err(SqlSourceJournalError::Control(actual)) if actual == cause));
+                assert!(
+                    matches!(loan(&owner, fragment, unit_node, source, &control),
+                    Err(SqlSourceJournalError::Control(actual)) if actual == cause)
+                );
                 assert_eq!(control.trace(), baseline[..=stop]);
             }
         }
@@ -482,8 +548,8 @@ fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources
         value_type: ValueType::new(DataType::Null, true),
     };
     let owner = authored(lower_call(null.clone(), DecimalOverflowPolicy::ReportError));
-    let (fragment, source) = scalar_source(&owner);
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = scalar_source(&owner);
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     let captured_request = receipt.captured().request();
     let FunctionArgument::Value {
         value_type,
@@ -504,7 +570,7 @@ fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources
         selected_argument,
         &FunctionArgumentType::Value(ValueType::new(DataType::Utf8, true))
     );
-    let emitted = physical_constant(&owner, fragment, receipt.arguments()[0]);
+    let emitted = physical_constant(&owner, &receipt, receipt.arguments()[0]);
     assert_eq!(emitted.value_type(), &ValueType::new(DataType::Utf8, true));
     assert_eq!(emitted.try_utf8().unwrap(), None);
     let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
@@ -553,11 +619,19 @@ fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources
             &BTreeMap::new(),
         )
         .unwrap();
-    let entry = &visitor.call_sources.expression_entries[&(ROOT_FRAGMENT_ID, emitted_call)];
+    let entry = &visitor.call_sources.expression_entries
+        [&crate::planner::distributed::build::unit_source::ScalarDefinitionAddress::new(
+            crate::planner::distributed::build::unit_source::ScalarSourceSite::Node {
+                fragment: ROOT_FRAGMENT_ID,
+                node: NodeId::new(74),
+            },
+            emitted_call,
+        )];
     assert!(constant(&entry.captured.request().arguments[0]).is_none());
     let emitted = visitor.fragments[&ROOT_FRAGMENT_ID]
-        .expressions()
-        .get(entry.arguments[0])
+        .construction_unit(NodeId::new(74))
+        .unwrap()
+        .definition(entry.arguments[0])
         .unwrap();
     assert_eq!(emitted.ty, ValueType::new(DataType::Utf8, true));
     assert!(matches!(emitted.kind, ContractExprKind::Constant(_)));

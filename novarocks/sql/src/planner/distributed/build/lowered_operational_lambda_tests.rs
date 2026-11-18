@@ -15,36 +15,117 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::original_emission_test_observer::{
+    OriginalEmissionObserver, OriginalEmissionView, lower_read_with_original_emission_observer,
+};
 use super::*;
 use crate::planner::distributed::build::lowered_draft::SqlOperationalChannelRole;
 use arrow::datatypes::Field;
 
-fn array_map_source(
-    owner: &SqlAuthoredPhysicalPlan,
-) -> (&Fragment, &novarocks_physical_plan::ExprNode) {
-    owner
-        .plan()
-        .fragments()
-        .values()
-        .find_map(|fragment| {
-            fragment
-                .expressions()
-                .iter()
-                .find_map(|(_, expression)| match &expression.kind {
-                    ContractExprKind::FunctionCall { function, .. }
-                        if function.function_id.as_str() == "builtin.scalar/array_map/v1" =>
-                    {
-                        Some((fragment, expression))
-                    }
-                    _ => None,
-                })
-        })
-        .expect("actual nonfolded ARRAY_MAP source with a Lambda argument")
+fn array_map_source<'source>(
+    view: &OriginalEmissionView<'source>,
+) -> (
+    FragmentId,
+    &'source novarocks_physical_plan::PhysicalNode,
+    &'source novarocks_expression_contract::ExprNode,
+) {
+    for (&fragment, builder) in view.fragments() {
+        for (&node, actual) in builder.construction_nodes() {
+            let Some(unit) = builder.construction_unit(node) else {
+                continue;
+            };
+            if let Some(source) = unit.definitions().find(|source| {
+                matches!(&source.kind,
+                ContractExprKind::FunctionCall { function, .. }
+                    if function.function_id.as_str() == "builtin.scalar/array_map/v1")
+            }) {
+                return (fragment, actual, source);
+            }
+        }
+    }
+    panic!("actual original ARRAY_MAP source with a Lambda argument")
+}
+struct Observe<F> {
+    calls: usize,
+    check: F,
+}
+impl<F> OriginalEmissionObserver for Observe<F>
+where
+    F: for<'source, 'control> FnMut(
+        OriginalEmissionView<'source>,
+        &mut CompileCheckpoints<'control>,
+    ) -> Result<(), ContractLoweringError>,
+{
+    fn observe(
+        &mut self,
+        view: OriginalEmissionView<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), ContractLoweringError> {
+        self.calls += 1;
+        (self.check)(view, work)
+    }
+}
+fn observe_original_lambda(
+    expression: TypedExpr,
+    check: impl for<'source, 'control> FnMut(
+        OriginalEmissionView<'source>,
+        &mut CompileCheckpoints<'control>,
+    ) -> Result<(), ContractLoweringError>,
+) {
+    let plan = emission_plan(expression);
+    let mut observer = Observe { calls: 0, check };
+    let control = Control::default();
+    let result = lower_read_with_original_emission_observer(
+        &plan,
+        version(),
+        dop(),
+        None,
+        crate::functions::builtin_sql_function_catalog().snapshot(),
+        false,
+        policy(),
+        &control,
+        &mut observer,
+    );
+    assert_eq!(observer.calls, 1);
+    assert!(matches!(result, Err(ContractLoweringError::FunctionBinding(
+        novarocks_functions::FunctionBindingError::UnavailableImplementation(ref overload)
+    )) if overload.as_str() == "builtin.scalar/array_map/dynamic-v1"));
+}
+fn original_operational_arguments(
+    view: &OriginalEmissionView<'_>,
+    receipt: &CheckedExpressionLogicalSourceEntry<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = receipt.operational_arguments_observed(view.constants(), &mut work);
+    if matches!(&result, Err(SqlOperationalProjectionError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+fn original_physical_constant(
+    view: &OriginalEmissionView<'_>,
+    receipt: &CheckedExpressionLogicalSourceEntry<'_>,
+    id: ExprId,
+) -> novarocks_functions::ConstantValue {
+    let source = receipt.definitions().definition(id).unwrap();
+    let ContractExprKind::Constant(reference) = source.kind else {
+        panic!("actual emitted constant")
+    };
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let result = view
+        .constants()
+        .resolve_source_observed(reference, &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    result
 }
 
 fn assert_lambda_projection(
-    owner: &SqlAuthoredPhysicalPlan,
-    fragment: &Fragment,
+    view: &OriginalEmissionView<'_>,
+    unit_node: &novarocks_physical_plan::PhysicalNode,
     receipt: &CheckedExpressionLogicalSourceEntry<'_>,
     projected: &[FunctionArgument],
 ) {
@@ -64,7 +145,10 @@ fn assert_lambda_projection(
     else {
         panic!("original captured Lambda")
     };
-    let lambda = fragment.expressions().get(receipt.arguments()[0]).unwrap();
+    let lambda = receipt
+        .definitions()
+        .definition(receipt.arguments()[0])
+        .unwrap();
     let ContractExprKind::Lambda {
         parameter_types,
         body,
@@ -72,10 +156,16 @@ fn assert_lambda_projection(
     else {
         panic!("actual emitted Lambda")
     };
-    let body = fragment.expressions().get(*body).unwrap();
-    assert_eq!(lambda.owner, receipt.source().owner);
+    let body = receipt.definitions().definition(*body).unwrap();
+    assert_eq!(
+        receipt.definitions().owner(),
+        crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(unit_node.id)
+    );
     assert_eq!(lambda.lambda_scope, receipt.source().lambda_scope);
-    assert_eq!(body.owner, lambda.owner);
+    assert!(std::ptr::eq(
+        receipt.definitions().definition(body.id).unwrap(),
+        body
+    ));
     assert_eq!(body.lambda_scope, Some(lambda.id));
     assert_eq!(lambda.ty, body.ty);
     let FunctionArgument::Lambda {
@@ -95,7 +185,10 @@ fn assert_lambda_projection(
     else {
         panic!("operational source array Value")
     };
-    let actual = fragment.expressions().get(receipt.arguments()[1]).unwrap();
+    let actual = receipt
+        .definitions()
+        .definition(receipt.arguments()[1])
+        .unwrap();
     assert_eq!(value_type, &actual.ty);
     match (constant(&original_request.arguments[1]), projected_constant) {
         (None, None) => {
@@ -109,7 +202,7 @@ fn assert_lambda_projection(
                 receipt.channels()[1].role,
                 SqlOperationalChannelRole::CapturedConstant
             ));
-            let emitted = physical_constant(owner, fragment, receipt.arguments()[1]);
+            let emitted = original_physical_constant(view, receipt, receipt.arguments()[1]);
             assert_eq!(value.ordinal(), original.ordinal());
             assert_eq!(value.ordinal(), emitted.ordinal());
             assert_eq!(
@@ -135,47 +228,68 @@ fn assert_lambda_projection(
 
 #[test]
 fn operational_lambda_analyzed_source_loans_original_parameters_and_actual_body_scope() {
-    // The analyzer and actual emitter author the source and request projection.
-    // This does not certify public completion or prepare a HOF kernel.
-    let owner = authored_lambda_source_for_test();
-    let cloned_owner = owner.clone();
-    let (fragment, source) = array_map_source(&owner);
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
-    let cloned = loan(&cloned_owner, fragment, source, &Control::default()).unwrap();
-    assert!(std::ptr::eq(receipt.captured(), cloned.captured()));
-    assert!(std::ptr::eq(receipt.source(), source));
-    assert!(std::ptr::eq(receipt.fragment(), fragment));
-    assert_eq!(receipt.captured().constant_policy(), policy());
-    assert_eq!(
-        receipt.captured().binding().decimal_overflow_policy(),
-        DecimalOverflowPolicy::OutputNull
-    );
-    let projected = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
-    assert_lambda_projection(&owner, fragment, &receipt, &projected);
-    let FunctionArgument::Lambda {
-        parameter_types,
-        result_type,
-    } = &projected[0]
-    else {
-        unreachable!()
-    };
-    assert_eq!(parameter_types.len(), 1);
-    assert_eq!(parameter_types[0].data_type().clone(), DataType::Utf8);
-    assert_eq!(result_type, &ValueType::new(DataType::Utf8, true));
-    let lambda = fragment.expressions().get(receipt.arguments()[0]).unwrap();
-    let ContractExprKind::Lambda { body, .. } = &lambda.kind else {
-        unreachable!()
-    };
-    let body = fragment.expressions().get(*body).unwrap();
-    assert!(
-        matches!(&body.kind, ContractExprKind::FunctionCall { function, .. }
+    // Inspect the actual analyzer/emitter before mandatory capability admission.
+    // ARRAY_MAP remains unsupported after the successful callback.
+    observe_original_lambda(analyzed_lambda_expression_for_test(), |view, work| {
+        let (fragment, unit_node, source) = array_map_source(&view);
+        let receipt = view
+            .checked_scalar_source(fragment, unit_node.id, source.id, work)
+            .unwrap();
+        // This is a repeated loan of the one original source, not a cloned
+        // completed HOF owner. The supported LOWER owner clone contract remains
+        // in scalar_journal_real_sql_retains_same_owner_binding_and_request_loans.
+        let repeated = view
+            .checked_scalar_source(fragment, unit_node.id, source.id, work)
+            .unwrap();
+        assert!(std::ptr::eq(receipt.captured(), repeated.captured()));
+        assert!(std::ptr::eq(receipt.source(), source));
+        assert_eq!(
+            receipt.definitions().owner(),
+            crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(unit_node.id)
+        );
+        assert!(std::ptr::eq(
+            view.actual_node(fragment, unit_node.id).unwrap(),
+            unit_node
+        ));
+        assert_eq!(receipt.captured().constant_policy(), policy());
+        assert_eq!(
+            receipt.captured().binding().decimal_overflow_policy(),
+            DecimalOverflowPolicy::OutputNull
+        );
+        let projected =
+            original_operational_arguments(&view, &receipt, &Control::default()).unwrap();
+        assert_lambda_projection(&view, unit_node, &receipt, &projected);
+        let FunctionArgument::Lambda {
+            parameter_types,
+            result_type,
+        } = &projected[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(parameter_types.len(), 1);
+        assert_eq!(parameter_types[0].data_type().clone(), DataType::Utf8);
+        assert_eq!(result_type, &ValueType::new(DataType::Utf8, true));
+        let lambda = receipt
+            .definitions()
+            .definition(receipt.arguments()[0])
+            .unwrap();
+        let ContractExprKind::Lambda { body, .. } = &lambda.kind else {
+            unreachable!()
+        };
+        let body = receipt.definitions().definition(*body).unwrap();
+        assert!(
+            matches!(&body.kind, ContractExprKind::FunctionCall { function, .. }
         if function.function_id.as_str() == "builtin.scalar/lower/v1")
-    );
-    let body_receipt = loan(&owner, fragment, body, &Control::default()).unwrap();
-    assert!(constant(&body_receipt.captured().request().arguments[0]).is_none());
+        );
+        let body_receipt = view
+            .checked_scalar_source(fragment, unit_node.id, body.id, work)
+            .unwrap();
+        assert!(constant(&body_receipt.captured().request().arguments[0]).is_none());
+        Ok(())
+    });
 }
 
-fn nested_identity_lambda_owner() -> (SqlAuthoredPhysicalPlan, ValueType) {
+fn nested_identity_lambda_expression() -> (TypedExpr, ValueType) {
     // Honest already-typed emitter fixture, resolved by the actual ARRAY_MAP
     // catalog. No declaration is added and no nested runtime capability is
     // inferred from this generic source signature projection.
@@ -241,73 +355,84 @@ fn nested_identity_lambda_owner() -> (SqlAuthoredPhysicalPlan, ValueType) {
         },
         value_type,
     };
-    (authored(expression), parameter_type)
+    (expression, parameter_type)
 }
 
 #[test]
 fn operational_lambda_actual_catalog_typed_emitter_preserves_nested_parameter_metadata() {
-    let (owner, expected) = nested_identity_lambda_owner();
-    let (fragment, source) = array_map_source(&owner);
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
-    let projected = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
-    assert_lambda_projection(&owner, fragment, &receipt, &projected);
-    let FunctionArgument::Lambda {
-        parameter_types,
-        result_type,
-    } = &projected[0]
-    else {
-        unreachable!()
-    };
-    assert_eq!(parameter_types.as_ref(), std::slice::from_ref(&expected));
-    assert_eq!(result_type, &expected);
-    let DataType::Struct(fields) = &parameter_types[0].data_type() else {
-        unreachable!()
-    };
-    assert_eq!(fields[0].name(), "provider_leaf");
-    assert!(fields[0].metadata().is_empty());
-    assert_eq!(
-        parameter_types[0].child_at(0).unwrap().logical_type(),
-        novarocks_type_contract::ValueLogicalType::Physical
-    );
-    assert!(!fields[0].is_nullable());
-    assert_eq!(
-        receipt.captured().binding().decimal_overflow_policy(),
-        DecimalOverflowPolicy::ReportError
-    );
+    let (expression, expected) = nested_identity_lambda_expression();
+    observe_original_lambda(expression, |view, work| {
+        let (fragment, unit_node, source) = array_map_source(&view);
+        let receipt = view
+            .checked_scalar_source(fragment, unit_node.id, source.id, work)
+            .unwrap();
+        let projected =
+            original_operational_arguments(&view, &receipt, &Control::default()).unwrap();
+        assert_lambda_projection(&view, unit_node, &receipt, &projected);
+        let FunctionArgument::Lambda {
+            parameter_types,
+            result_type,
+        } = &projected[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(parameter_types.as_ref(), std::slice::from_ref(&expected));
+        assert_eq!(result_type, &expected);
+        let DataType::Struct(fields) = &parameter_types[0].data_type() else {
+            unreachable!()
+        };
+        assert_eq!(fields[0].name(), "provider_leaf");
+        assert!(fields[0].metadata().is_empty());
+        assert_eq!(
+            parameter_types[0].child_at(0).unwrap().logical_type(),
+            novarocks_type_contract::ValueLogicalType::Physical
+        );
+        assert!(!fields[0].is_nullable());
+        assert_eq!(
+            receipt.captured().binding().decimal_overflow_policy(),
+            DecimalOverflowPolicy::ReportError
+        );
+        Ok(())
+    });
 }
 
 #[test]
 fn operational_lambda_projector_preserves_every_actual_small_control_prefix() {
-    let owner = authored_lambda_source_for_test();
-    let (fragment, source) = array_map_source(&owner);
-    // Setup, validation and source loan use a separate unrefused control. Only
-    // the real Lambda projection plus its caller footer enters the trace.
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
-    let baseline_control = Control::default();
-    let projected = operational_arguments(&owner, &receipt, &baseline_control).unwrap();
-    assert_lambda_projection(&owner, fragment, &receipt, &projected);
-    let baseline = baseline_control.trace();
-    assert!(baseline.len() > 2);
-    assert_eq!(baseline[0], (CompilePhase::FunctionSpecialization, 0));
-    assert!(
-        baseline
-            .iter()
-            .all(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
-    );
-    assert_eq!(baseline.last().unwrap().1, 0);
-    for stop in 0..baseline.len() {
-        for cause in [
-            CompileControlError::Cancelled,
-            CompileControlError::DeadlineExceeded,
-            CompileControlError::ResourceExhausted,
-        ] {
-            let control = Control {
-                refusal: Some((stop, cause.clone())),
-                ..Control::default()
-            };
-            assert!(matches!(operational_arguments(&owner, &receipt, &control),
-                Err(SqlOperationalProjectionError::Control(actual)) if actual == cause));
-            assert_eq!(control.trace(), baseline[..=stop]);
+    observe_original_lambda(analyzed_lambda_expression_for_test(), |view, work| {
+        let (fragment, unit_node, source) = array_map_source(&view);
+        let receipt = view
+            .checked_scalar_source(fragment, unit_node.id, source.id, work)
+            .unwrap();
+        // The real projection and its caller footer alone enter this trace.
+        let baseline_control = Control::default();
+        let projected = original_operational_arguments(&view, &receipt, &baseline_control).unwrap();
+        assert_lambda_projection(&view, unit_node, &receipt, &projected);
+        let baseline = baseline_control.trace();
+        assert!(baseline.len() > 2);
+        assert_eq!(baseline[0], (CompilePhase::FunctionSpecialization, 0));
+        assert!(
+            baseline
+                .iter()
+                .all(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
+        );
+        assert_eq!(baseline.last().unwrap().1, 0);
+        for stop in 0..baseline.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = Control {
+                    refusal: Some((stop, cause.clone())),
+                    ..Control::default()
+                };
+                assert!(
+                    matches!(original_operational_arguments(&view, &receipt, &control),
+                Err(SqlOperationalProjectionError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(control.trace(), baseline[..=stop]);
+            }
         }
-    }
+        Ok(())
+    });
 }

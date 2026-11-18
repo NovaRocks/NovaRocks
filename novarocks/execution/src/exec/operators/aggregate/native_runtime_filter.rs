@@ -202,16 +202,32 @@ impl AggregateTopNProducerSessionFactory {
         host: &OrderedTopNAllocationHost,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<Self> {
+        Self::try_from_producers(
+            specs.iter().map(|spec| &spec.producer),
+            session,
+            actual_dop,
+            host,
+            control,
+        )
+    }
+
+    fn try_from_producers<'a>(
+        producers: impl ExactSizeIterator<Item = &'a novarocks_local_program::StaticFilterProducer>,
+        session: execution::RuntimeFilterSessionRef,
+        actual_dop: i32,
+        host: &OrderedTopNAllocationHost,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<Self> {
         let local_partition_count = validate_partition_count(actual_dop)?;
         control.checkpoint(0)?;
         let mut bindings = AggregateVec::new_in(host.vector_allocator());
         bindings
-            .try_reserve_exact(specs.len())
+            .try_reserve_exact(producers.len())
             .map_err(|_| KernelFailure::ResourceExhausted)?;
-        for spec in specs {
+        for producer in producers {
             control.checkpoint(1)?;
-            if spec.producer.kind() != novarocks_local_program::FilterProducerKind::OrderedBound
-                || spec.producer.reduction()
+            if producer.kind() != novarocks_local_program::FilterProducerKind::OrderedBound
+                || producer.reduction()
                     != novarocks_local_program::FilterReduction::TightenOrderedBound
             {
                 return Err(execution::RuntimeFilterContractViolation::new(
@@ -221,15 +237,15 @@ impl AggregateTopNProducerSessionFactory {
                 .into());
             }
 
-            let order = host.shared_order_contract(spec.producer.contract(), control)?;
+            let order = host.shared_order_contract(producer.contract(), control)?;
             let contract = execution::RuntimeFilterProducerContract::ordered_bound(
-                execution::RuntimeFilterBindingId::new(spec.producer.binding_id()),
-                execution::RuntimeFilterChannelId::new(spec.producer.channel_id()),
+                execution::RuntimeFilterBindingId::new(producer.binding_id()),
+                execution::RuntimeFilterChannelId::new(producer.channel_id()),
                 RuntimeFilterExecutionContract::Ordered(order),
             )?;
             bindings.push(
                 AggregateTopNProducerBinding::from_parts(
-                    spec.producer.binding_id(),
+                    producer.binding_id(),
                     contract,
                     Arc::clone(&session),
                     || {
@@ -973,15 +989,13 @@ mod tests {
     }
     impl TestFactory {
         fn new(
-            specs: &[novarocks_local_program::AggregateTopNFilter],
+            specs: &[FixtureSpec],
             session: execution::RuntimeFilterSessionRef,
             dop: i32,
         ) -> crate::runtime::task::ExecutionResult<Self> {
             let (_tracker, host) = owned_host();
             let control = OwnedControl::pass();
-            let actual = AggregateTopNProducerSessionFactory::try_from_compiled(
-                specs, session, dop, &host, &control,
-            )?;
+            let actual = try_from_fixture(specs, session, dop, &host, &control)?;
             Ok(Self {
                 actual,
                 host,
@@ -1032,8 +1046,8 @@ mod tests {
         }
     }
 
-    fn binding(binding_id: u32, limit: u32) -> novarocks_local_program::AggregateTopNFilter {
-        let mut spec = compiled_spec(binding_id);
+    fn binding(binding_id: u32, limit: u32) -> FixtureSpec {
+        let mut spec = fixture_spec(binding_id);
         spec.limit = NonZeroU32::new(limit).expect("non-zero TopN limit");
         spec
     }
@@ -1055,7 +1069,7 @@ mod tests {
 
     fn boundary(
         factory: &TestFactory,
-        spec: &novarocks_local_program::AggregateTopNFilter,
+        spec: &FixtureSpec,
         values: &[&str],
     ) -> super::OwnedAggregateTopNBoundaryState {
         let contract = factory
@@ -1380,7 +1394,28 @@ mod tests {
             panic!("aggregate TopN session never waits")
         }
     }
-    fn compiled_spec(binding_id: u32) -> novarocks_local_program::AggregateTopNFilter {
+    struct FixtureSpec {
+        producer: novarocks_local_program::StaticFilterProducer,
+        limit: NonZeroU32,
+    }
+
+    fn try_from_fixture(
+        specs: &[FixtureSpec],
+        session: execution::RuntimeFilterSessionRef,
+        actual_dop: i32,
+        host: &execution::OrderedTopNAllocationHost,
+        control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> crate::runtime::task::ExecutionResult<AggregateTopNProducerSessionFactory> {
+        AggregateTopNProducerSessionFactory::try_from_producers(
+            specs.iter().map(|spec| &spec.producer),
+            session,
+            actual_dop,
+            host,
+            control,
+        )
+    }
+
+    fn fixture_spec(binding_id: u32) -> FixtureSpec {
         use novarocks_local_program::*;
         // The original canonical UTF8 ascending/NULL-last framing, pinned
         // independently from the strict production contract author.
@@ -1403,9 +1438,7 @@ mod tests {
             .try_into()
             .unwrap(),
         };
-        AggregateTopNFilter {
-            group_key_expr: ProgramExprId::new(1),
-            group_key_ordinal: 0,
+        FixtureSpec {
             limit: NonZeroU32::new(1).unwrap(),
             producer: StaticFilterProducer::try_new(
                 binding_id,
@@ -1432,8 +1465,8 @@ mod tests {
         let (tracker, host) = owned_host();
         let control = OwnedControl::pass();
         let state = Arc::new(RecordingState::with_open_actions([]));
-        let factory = AggregateTopNProducerSessionFactory::try_from_compiled(
-            &[compiled_spec(31)],
+        let factory = try_from_fixture(
+            &[fixture_spec(31)],
             recording_session(state.clone()),
             2,
             &host,
@@ -1506,8 +1539,8 @@ mod tests {
             OpenAction::Bound,
             OpenAction::Rejected,
         ]));
-        let factory = AggregateTopNProducerSessionFactory::try_from_compiled(
-            &[compiled_spec(32), compiled_spec(33)],
+        let factory = try_from_fixture(
+            &[fixture_spec(32), fixture_spec(33)],
             recording_session(state.clone()),
             1,
             &host,
@@ -1560,10 +1593,10 @@ mod tests {
         use std::sync::atomic::Ordering;
         let (tracker, host) = owned_host();
         let state = Arc::new(RecordingState::with_open_actions([]));
-        let spec = compiled_spec(34);
+        let spec = fixture_spec(34);
         let pass = OwnedControl::pass();
         drop(
-            AggregateTopNProducerSessionFactory::try_from_compiled(
+            try_from_fixture(
                 std::slice::from_ref(&spec),
                 recording_session(state.clone()),
                 1,
@@ -1584,7 +1617,7 @@ mod tests {
                     cause: cause.clone(),
                     ..OwnedControl::pass()
                 };
-                let error = AggregateTopNProducerSessionFactory::try_from_compiled(
+                let error = try_from_fixture(
                     std::slice::from_ref(&spec),
                     recording_session(state.clone()),
                     1,
@@ -1613,8 +1646,8 @@ mod tests {
         let (tracker, host) = owned_host();
         let control = OwnedControl::pass();
         let state = Arc::new(RecordingState::with_open_actions([]));
-        let factory = AggregateTopNProducerSessionFactory::try_from_compiled(
-            &[compiled_spec(35)],
+        let factory = try_from_fixture(
+            &[fixture_spec(35)],
             recording_session(state.clone()),
             1,
             &host,
@@ -1672,8 +1705,8 @@ mod tests {
         let host = execution::OrderedTopNAllocationHost::new(tracker.clone());
         let control = OwnedControl::pass();
         let state = Arc::new(RecordingState::with_open_actions([]));
-        let error = AggregateTopNProducerSessionFactory::try_from_compiled(
-            &[compiled_spec(36)],
+        let error = try_from_fixture(
+            &[fixture_spec(36)],
             recording_session(state.clone()),
             1,
             &host,
@@ -1698,8 +1731,8 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(SubmitAction::TerminalNoop);
-        let factory = AggregateTopNProducerSessionFactory::try_from_compiled(
-            &[compiled_spec(37)],
+        let factory = try_from_fixture(
+            &[fixture_spec(37)],
             recording_session(state.clone()),
             2,
             &host,
@@ -1762,8 +1795,8 @@ mod tests {
         let (tracker, host) = owned_host();
         let control = OwnedControl::pass();
         let state = Arc::new(RecordingState::with_open_actions([]));
-        let factory = AggregateTopNProducerSessionFactory::try_from_compiled(
-            &[compiled_spec(38)],
+        let factory = try_from_fixture(
+            &[fixture_spec(38)],
             recording_session(state.clone()),
             2,
             &host,

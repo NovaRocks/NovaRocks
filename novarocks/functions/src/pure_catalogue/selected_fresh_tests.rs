@@ -19,7 +19,7 @@ use super::*;
 use arrow_array::{Array, Int32Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, EvaluationDemand, EvaluationDomainId,
+    CallProofScope, CompileControlError, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, FunctionKind, FunctionValueType, SemanticParameters,
 };
 use std::sync::{
@@ -156,13 +156,13 @@ impl Fixture {
     fn context(&self) -> ExpressionEffectContext {
         ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         }
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: self.context(),
+            context: (self.context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Scalar,
@@ -175,7 +175,7 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(self.context().domain),
+            proof_scope: CallProofScope::Region(self.context().region),
         }
     }
     fn options(&self) -> PureCallPreparation {
@@ -222,7 +222,7 @@ fn ordinary_selected_fresh_uses_the_actual_abs_attachment_once_without_a_catalog
         prepared.call_contract().selected_owner(),
         &fixture.selected
     ));
-    assert_eq!(prepared.call_contract().context(), fixture.context());
+    assert_eq!(prepared.call_contract().context(), fixture.context().into());
     assert_eq!(
         prepared.call_contract().decimal_overflow_policy(),
         fixture.input().decimal_overflow_policy
@@ -350,7 +350,7 @@ fn ordinary_selected_fresh_checks_identity_options_complete_source_and_domain_be
                     constant: None,
                 }]
             }
-            4 => input.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(8)),
+            4 => input.proof_scope = CallProofScope::Region(EvaluationRegionId::new(8)),
             5 => {
                 selected.result_type =
                     FunctionResultType::Scalar(FunctionValueType::new(DataType::Boolean, false))
@@ -380,7 +380,11 @@ fn ordinary_selected_fresh_checks_identity_options_complete_source_and_domain_be
                 fixture.input(),
                 fixture.selected.clone(),
                 PureCallPreparation::Table {
-                    arguments: ScopedExpressionEffects::pure_value(fixture.context())
+                    arguments: ScopedRelationalEffects::pure_value(
+                        novarocks_type_contract::RelationEffectContext::call(
+                            novarocks_type_contract::RelationCallId::new(700)
+                        )
+                    )
                 },
                 &Control::default()
             )
@@ -519,7 +523,11 @@ fn selected_fresh_original_controls_cover_success_and_pre_failure_prefixes() {
                 fixture.input(),
                 fixture.selected.clone(),
                 PureCallPreparation::Table {
-                    arguments: ScopedExpressionEffects::pure_value(fixture.context()),
+                    arguments: ScopedRelationalEffects::pure_value(
+                        novarocks_type_contract::RelationEffectContext::call(
+                            novarocks_type_contract::RelationCallId::new(700),
+                        ),
+                    ),
                 },
                 control,
             )
@@ -653,7 +661,11 @@ fn selected_fresh_wrong_abi_and_unknown_identity_keep_real_semantic_failure_with
                 fixture.options()
             } else {
                 PureCallPreparation::Table {
-                    arguments: ScopedExpressionEffects::pure_value(fixture.context()),
+                    arguments: ScopedRelationalEffects::pure_value(
+                        novarocks_type_contract::RelationEffectContext::call(
+                            novarocks_type_contract::RelationCallId::new(700),
+                        ),
+                    ),
                 }
             };
             fixture.catalog.prepare_fresh_selected(

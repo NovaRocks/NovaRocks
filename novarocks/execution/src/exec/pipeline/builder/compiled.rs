@@ -68,8 +68,7 @@ use crate::runtime::task::ExecutionResult;
 use crate::runtime_filter::OrderedTopNAllocationHost;
 use novarocks_local_program::{
     AssertRowsMode, BindingRequirement, FilterConsumerActivation, FilterConsumerAtExpr,
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind, RowAssertion, StaticFilterContract,
+    LocalProgram, ProgramNodeId, ProgramNodeKind, RowAssertion, StaticFilterContract,
 };
 
 #[derive(Clone)]
@@ -430,7 +429,7 @@ fn compiled_runtime_filter_consumers_selected(
         return Ok(None);
     }
     let mut contracts = Vec::with_capacity(bindings.len());
-    for (ordinal, binding) in bindings.iter().enumerate() {
+    for binding in bindings {
         let consumer = &binding.consumer;
         if matches!(consumer.contract(), StaticFilterContract::Ordered { .. }) {
             if omit_ordered {
@@ -458,20 +457,12 @@ fn compiled_runtime_filter_consumers_selected(
             ));
         }
         runtime_filter_session(&ctx.runtime_filter_execution, consumer.binding_id())?;
-        contracts.push((
-            u32::try_from(ordinal).map_err(|_| {
-                program_failure(
-                    FragmentBindingErrorKind::InvalidAssignment,
-                    "compiled runtime-filter binding count exceeds u32",
-                )
-            })?,
-            runtime_filter_consumer_contract(consumer)?,
-        ));
+        contracts.push((binding.expr_id, runtime_filter_consumer_contract(consumer)?));
     }
     if contracts.is_empty() {
         return Ok(None);
     }
-    CompiledRuntimeFilterConsumers::try_new_at_ordinals(
+    CompiledRuntimeFilterConsumers::try_new(
         owner,
         Arc::clone(program),
         id,
@@ -749,10 +740,7 @@ fn build_node(
                 .factories
                 .push(Box::new(CompiledFilterProcessorFactory::try_new(
                     Arc::clone(program),
-                    ProgramExpressionRootSite::Node {
-                        node: id,
-                        role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
-                    },
+                    id,
                     Arc::clone(error),
                 )?));
             Ok(build)
@@ -849,10 +837,7 @@ fn build_node(
                 .then(|| {
                     CompiledFilterProcessorFactory::try_new(
                         Arc::clone(program),
-                        ProgramExpressionRootSite::Node {
-                            node: id,
-                            role: ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
-                        },
+                        id,
                         Arc::clone(error),
                     )
                 })

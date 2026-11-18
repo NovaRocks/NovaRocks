@@ -72,21 +72,11 @@ impl PureCompileControl for Setup {
 fn int() -> FunctionValueType {
     FunctionValueType::new(DataType::Int64, false)
 }
-fn dictionary() -> FunctionValueType {
-    FunctionValueType::new(
-        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-        true,
-    )
-}
-fn properties() -> p::PhysicalProperties {
-    p::PhysicalProperties {
-        distribution: p::Distribution::Singleton,
-        row_multiplicity: p::RowMultiplicity::SingleCopy,
-        ordering: Box::default(),
-    }
-}
-fn function(kind: FunctionKind, args: Box<[FunctionArgumentType]>) -> p::BoundFunction {
-    p::BoundFunction::from_exact_signature(
+fn function(
+    kind: FunctionKind,
+    args: Box<[FunctionArgumentType]>,
+) -> novarocks_expression_contract::BoundFunction {
+    novarocks_expression_contract::BoundFunction::from_exact_signature(
         FunctionId::try_new("fixture/binding-source").unwrap(),
         FunctionOverloadId::try_new("fixture/selected-v1").unwrap(),
         kind,
@@ -94,8 +84,10 @@ fn function(kind: FunctionKind, args: Box<[FunctionArgumentType]>) -> p::BoundFu
         int(),
     )
 }
-fn request(args: Box<[p::StaticFunctionArgument<p::ConstantReference>]>) -> p::PhysicalCallRequest {
-    p::PhysicalCallRequest {
+fn request(
+    args: Box<[p::StaticFunctionArgument<p::ConstantReference>]>,
+) -> novarocks_expression_contract::PhysicalCallRequest {
+    novarocks_expression_contract::PhysicalCallRequest {
         logical_argument_count: args.len(),
         arguments: args,
         expected_result_type: None,
@@ -113,442 +105,12 @@ fn request(args: Box<[p::StaticFunctionArgument<p::ConstantReference>]>) -> p::P
         },
     }
 }
-fn context(id: u32, domain: u32) -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(id),
-        domain: EvaluationDomainId::new(domain),
-        demand: EvaluationDemand::Value,
-    }
-}
-fn effects(kind: FunctionKind, ctx: ExpressionEffectContext) -> CallEffects {
-    CallEffects {
-        value_stability: FunctionVolatility::Immutable,
-        own_row_error: if kind == FunctionKind::Aggregate {
-            FunctionIntrinsicRowError::NotRowEvaluated
-        } else {
-            FunctionIntrinsicRowError::NoRowError
-        },
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: FunctionNullBehavior::CalledOnNull,
-        argument_control: match kind {
-            FunctionKind::Scalar => ArgumentControl::HigherOrder {
-                body_ordinal: 0,
-                body_demand: EvaluationDemand::Value,
-            },
-            FunctionKind::Aggregate => ArgumentControl::Aggregate,
-            FunctionKind::Table => ArgumentControl::Table,
-            FunctionKind::Window => unreachable!(),
-        },
-        instance_state: match kind {
-            FunctionKind::Scalar => FunctionInstanceState::None,
-            FunctionKind::Aggregate => FunctionInstanceState::AggregateInstance,
-            FunctionKind::Table => FunctionInstanceState::TableInstance,
-            FunctionKind::Window => unreachable!(),
-        },
-        observable_effects: ObservableEffects::NONE,
-        environment: Box::default(),
-        proof_scope: CallProofScope::Domain(ctx.domain),
-    }
-}
-fn node(
-    id: p::NodeId,
-    inputs: Box<[p::NodeId]>,
-    columns: Box<[p::ValueId]>,
-    kind: p::NodeKind,
-) -> p::PhysicalNode {
-    p::PhysicalNode {
-        id,
-        required_inputs: vec![properties(); inputs.len()].into_boxed_slice(),
-        inputs,
-        output_properties: properties(),
-        output: p::OutputPort { node: id, columns },
-        kind,
-    }
-}
 
 // Original sparse construction and every mandatory publication author are
 // exercised. Exact signatures and fixture effect claims certify no installed
 // function or executable implementation.
 fn package() -> p::FragmentPackage {
-    let source = p::NodeId::new(0);
-    let agg = p::NodeId::new(7);
-    let table = p::NodeId::new(u32::MAX);
-    let scalar = p::ExprId::new(0);
-    let lambda = p::ExprId::new(1);
-    let body = p::ExprId::new(u32::MAX);
-    let expressions = p::ExprArena::try_from_definitions_observed(
-        vec![
-            p::ExprNode {
-                id: scalar,
-                owner: source,
-                lambda_scope: None,
-                ty: int(),
-                kind: p::ExprKind::FunctionCall {
-                    function: function(
-                        FunctionKind::Scalar,
-                        Box::from([FunctionArgumentType::Lambda {
-                            parameter_types:
-                                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
-                                    Box::from([dictionary(), int()]),
-                                ),
-                            result_type: int(),
-                        }]),
-                    ),
-                    args: Box::from([lambda]),
-                },
-            },
-            p::ExprNode {
-                id: lambda,
-                owner: source,
-                lambda_scope: None,
-                ty: int(),
-                kind: p::ExprKind::Lambda {
-                    parameter_types: Box::from([dictionary(), int()]),
-                    body,
-                },
-            },
-            p::ExprNode {
-                id: body,
-                owner: source,
-                lambda_scope: Some(lambda),
-                ty: int(),
-                kind: p::ExprKind::Literal(p::LiteralValue::Int64(42)),
-            },
-        ]
-        .into_iter(),
-        &p::PlanLimits::FROZEN,
-        &Setup,
-    )
-    .unwrap();
-    let source_value = p::ValueId::new(0);
-    let a = p::ValueId::new(1);
-    let b = p::ValueId::new(u32::MAX);
-    let t0 = p::ValueId::new(2);
-    let t1 = p::ValueId::new(3);
-    let calls = [0, u32::MAX]
-        .into_iter()
-        .zip([a, b])
-        .map(|(id, output)| p::AggregateCall {
-            id: p::AggregateCallId::new(id),
-            binding: p::AggregateBinding {
-                state_interpretation: None,
-                state_argument_contract: AggregateStateArgumentContract::ExactSignature,
-                function: function(FunctionKind::Aggregate, Box::default()),
-                phase: p::AggregatePhase::Single,
-                logical_argument_count: 0,
-                intermediate_type: FunctionValueType::new(DataType::Binary, false),
-                state_format: AggregateStateFormatId::try_new("fixture/state-v1").unwrap(),
-            },
-            arguments: Box::default(),
-            distinct: false,
-            order_by: Box::default(),
-            output,
-        })
-        .collect::<Box<[_]>>();
-    let values = [
-        p::ValueDef {
-            id: source_value,
-            ty: int(),
-            origin: p::ValueOrigin::NodeOutput {
-                node: source,
-                output_ordinal: 0,
-            },
-        },
-        p::ValueDef {
-            id: a,
-            ty: int(),
-            origin: p::ValueOrigin::AggregateResult {
-                call: p::AggregateCallId::new(0),
-            },
-        },
-        p::ValueDef {
-            id: b,
-            ty: int(),
-            origin: p::ValueOrigin::AggregateResult {
-                call: p::AggregateCallId::new(u32::MAX),
-            },
-        },
-        p::ValueDef {
-            id: t0,
-            ty: int(),
-            origin: p::ValueOrigin::NodeOutput {
-                node: table,
-                output_ordinal: 2,
-            },
-        },
-        p::ValueDef {
-            id: t1,
-            ty: dictionary(),
-            origin: p::ValueOrigin::NodeOutput {
-                node: table,
-                output_ordinal: 3,
-            },
-        },
-    ]
-    .into_iter()
-    .map(|v| (v.id, v))
-    .collect();
-    let nodes = [
-        node(
-            source,
-            Box::default(),
-            Box::from([source_value]),
-            p::NodeKind::Values {
-                rows: Box::from([Box::from([scalar]), Box::from([scalar])]),
-            },
-        ),
-        node(
-            agg,
-            Box::from([source]),
-            Box::from([a, b]),
-            p::NodeKind::Aggregate {
-                group_by: Box::default(),
-                calls,
-                grouping: p::AggregateGrouping::Complete,
-            },
-        ),
-        node(
-            table,
-            Box::from([agg]),
-            Box::from([a, b, t0, t1]),
-            p::NodeKind::TableFunction {
-                function: p::BoundTableFunction::from_exact_signature(
-                    FunctionId::try_new("fixture/table-source").unwrap(),
-                    FunctionOverloadId::try_new("fixture/table-v1").unwrap(),
-                    novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::default()),
-                    novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::from([
-                        int(),
-                        dictionary(),
-                    ])),
-                ),
-                arguments: Box::default(),
-                outputs: Box::from([
-                    p::TableFunctionOutput::PassThrough(a),
-                    p::TableFunctionOutput::PassThrough(b),
-                    p::TableFunctionOutput::FunctionResult {
-                        result_ordinal: 0,
-                        value: t0,
-                    },
-                    p::TableFunctionOutput::FunctionResult {
-                        result_ordinal: 1,
-                        value: t1,
-                    },
-                ]),
-                left_outer: false,
-            },
-        ),
-    ]
-    .into_iter()
-    .map(|v| (v.id, v))
-    .collect();
-    let fragment = p::Fragment::try_from_structure_observed(
-        p::FragmentStructureInput {
-            summaries: Box::default(),
-            stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
-            id: p::FragmentId::new(u32::MAX),
-            root: table,
-            values,
-            expressions,
-            nodes,
-            sink: p::FragmentSink::Noop,
-            dop_domain: p::PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            runtime_filters: Box::default(),
-        },
-        p::PlanLimits::FROZEN,
-        &Setup,
-    )
-    .unwrap();
-    let fragment = fragment
-        .with_call_requests_observed(
-            vec![
-                (
-                    p::PhysicalCallDefinition::Expression(scalar),
-                    request(Box::from([p::StaticFunctionArgument::Lambda {
-                        parameter_types:
-                            novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
-                                Box::from([dictionary(), int()]),
-                            ),
-                        result_type: int(),
-                    }])),
-                ),
-                (
-                    p::PhysicalCallDefinition::Relational(p::PhysicalCallSite::Aggregate {
-                        node: agg,
-                        call: 0,
-                    }),
-                    request(Box::default()),
-                ),
-                (
-                    p::PhysicalCallDefinition::Relational(p::PhysicalCallSite::Aggregate {
-                        node: agg,
-                        call: 1,
-                    }),
-                    request(Box::default()),
-                ),
-                (
-                    p::PhysicalCallDefinition::Relational(p::PhysicalCallSite::Table {
-                        node: table,
-                    }),
-                    request(Box::default()),
-                ),
-            ],
-            &Setup,
-        )
-        .unwrap();
-    // Two actual rows invoke one definition separately; each lambda has the
-    // guarded body domain required by the original HigherOrder author.
-    let mut invocations = Vec::new();
-    let mut domains = vec![ExpressionEvaluationDomain {
-        id: EvaluationDomainId::new(0),
-        parent: None,
-        guard: None,
-    }];
-    for row in 0..2 {
-        let base = row * 3;
-        let domain = row + 1;
-        domains.push(ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(domain),
-            parent: Some(EvaluationDomainId::new(0)),
-            guard: Some(DomainGuard {
-                owner: ExpressionUseId::new(base),
-                kind: GuardKind::LambdaInvocation,
-            }),
-        });
-        invocations.extend([
-            ExpressionInvocation {
-                context: context(base, 0),
-                definition: scalar,
-                control: ControlShape::HigherOrder {
-                    body_ordinal: 0,
-                    body_demand: EvaluationDemand::Value,
-                },
-                arguments: Box::from([ExpressionUseId::new(base + 1)]),
-            },
-            ExpressionInvocation {
-                context: context(base + 1, domain),
-                definition: lambda,
-                control: ControlShape::LambdaBody,
-                arguments: Box::from([ExpressionUseId::new(base + 2)]),
-            },
-            ExpressionInvocation {
-                context: context(base + 2, domain),
-                definition: body,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            },
-        ]);
-    }
-    let flow = ExpressionControlFlow::try_new(
-        domains,
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Setup,
-    )
-    .unwrap();
-    let uses = p::PhysicalRootUses::try_new(
-        &fragment,
-        flow,
-        (0..2)
-            .map(|row| {
-                (
-                    p::ExpressionRootSite {
-                        node: source,
-                        role: p::ExpressionRootRole::ValuesCell { row, column: 0 },
-                    },
-                    ExpressionUseId::new(row * 3),
-                )
-            })
-            .collect(),
-        &Setup,
-    )
-    .unwrap();
-    let mut claims = [0, 3]
-        .into_iter()
-        .map(|id| {
-            let ctx = context(id, 0);
-            p::FrozenPhysicalCall {
-                materialized_writer_input: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                site: p::PhysicalCallSite::Expression(ctx.use_id),
-                context: ctx,
-                effects: effects(FunctionKind::Scalar, ctx),
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            }
-        })
-        .collect::<Vec<_>>();
-    for (use_id, site, kind) in [
-        (
-            6,
-            p::PhysicalCallSite::Aggregate { node: agg, call: 0 },
-            FunctionKind::Aggregate,
-        ),
-        (
-            7,
-            p::PhysicalCallSite::Aggregate { node: agg, call: 1 },
-            FunctionKind::Aggregate,
-        ),
-        (
-            u32::MAX,
-            p::PhysicalCallSite::Table { node: table },
-            FunctionKind::Table,
-        ),
-    ] {
-        let ctx = context(use_id, 0);
-        claims.push(p::FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site,
-            context: ctx,
-            effects: effects(kind, ctx),
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        });
-    }
-    let claims = p::FrozenFragmentCalls::try_new(&fragment, &uses, claims, &Setup).unwrap();
-    p::FragmentPackage::try_new(
-        p::FragmentPackageInput {
-            constants: p::ConstantPools::empty(),
-            version: p::PlanVersionId::try_new([3; 16]).unwrap(),
-            required: p::RequiredContracts {
-                plan_contract_revision: p::PLAN_CONTRACT_REVISION,
-            },
-            pruning: p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &Setup).unwrap(),
-            expression_uses: uses,
-            calls: claims,
-            fragment,
-            cuts: p::FragmentCuts {
-                inbound: Box::default(),
-                outbound: Box::default(),
-                runtime_filters: Box::default(),
-                runtime_filter_bindings: Box::default(),
-            },
-            result: None,
-            parameters: SemanticParameters::try_new([]).unwrap(),
-            scans: BTreeMap::new(),
-            writes: BTreeMap::new(),
-            annotations: Box::default(),
-            layouts: Default::default(),
-        },
-        p::FragmentPackageAdmission {
-            plan_limits: p::PlanLimits::FROZEN,
-            source_retained_bytes: SOURCE,
-            property_projection_limits: p::PropertyProofProjectionLimits {
-                max_request_bytes: 64 * 1024 * 1024,
-                max_coexisting_bytes: 512 * 1024 * 1024,
-                max_projection_work: 64 * 1024 * 1024,
-            },
-        },
-        &Setup,
-    )
-    .unwrap()
+    super::super::definition_sources::tests::rich_package()
 }
 
 fn limits() -> TypeViewLimits {
@@ -693,23 +255,42 @@ fn project(
         let sources =
             collect_binding_sources_in(package, &views, source_limits(), &mut budget, &mut work)?;
         assert_eq!(
-            (sources.functions().len(), sources.aggregates().len()),
+            (sources.functions().len(), sources.aggregates.len()),
             (4, 2)
         );
         // Two occurrences of the scalar call in the control graph remain one
         // original definition source. Equal aggregate signatures stay distinct.
-        assert_eq!(package.calls().entries().len(), 5);
-        assert_eq!(package.fragment().call_requests().entries().len(), 4);
+        assert_eq!(package.calls().entries().len(), 3);
+        assert_eq!(
+            package
+                .fragment()
+                .unit(p::NodeId::new(0))
+                .unwrap()
+                .claims()
+                .len(),
+            2
+        );
+        assert_eq!(package.fragment().call_requests().entries().len(), 3);
+        assert_eq!(
+            package
+                .fragment()
+                .unit(p::NodeId::new(0))
+                .unwrap()
+                .requests()
+                .len(),
+            1
+        );
         for (id, row) in sources.functions().iter().enumerate() {
             assert_eq!(row.id, id as u32);
         }
-        let p::ExprKind::FunctionCall {
+        let novarocks_expression_contract::ExprKind::FunctionCall {
             function: original_scalar,
             ..
         } = &package
             .fragment()
-            .expressions()
-            .get(p::ExprId::new(0))
+            .unit(p::NodeId::new(0))
+            .unwrap()
+            .definition(p::ExprId::new(0))
             .unwrap()
             .kind
         else {
@@ -721,21 +302,24 @@ fn project(
         assert!(std::ptr::eq(scalar, original_scalar));
         assert_eq!(
             sources.functions()[0].occurrence,
-            BindingOccurrence::Scalar(p::ExprId::new(0))
+            BindingOccurrence::Scalar {
+                node: p::NodeId::new(0),
+                definition: p::ExprId::new(0)
+            }
         );
         let p::NodeKind::Aggregate { calls, .. } =
             &package.fragment().nodes()[&p::NodeId::new(7)].kind
         else {
             panic!("original aggregate")
         };
-        for (ordinal, row) in sources.aggregates().iter().enumerate() {
+        for (ordinal, row) in sources.aggregates.iter().enumerate() {
             assert_eq!(
                 (row.id, row.function_id),
                 (ordinal as u32, ordinal as u32 + 1)
             );
             assert!(std::ptr::eq(row.source, &calls[ordinal].binding));
             assert_eq!(
-                row.occurrence,
+                sources.functions()[row.function_id as usize].occurrence,
                 BindingOccurrence::Aggregate {
                     node: p::NodeId::new(7),
                     ordinal,
@@ -745,8 +329,8 @@ fn project(
             assert_eq!(row.source.phase, p::AggregatePhase::Single);
         }
         assert!(!std::ptr::eq(
-            sources.aggregates()[0].source,
-            sources.aggregates()[1].source
+            sources.aggregates[0].source,
+            sources.aggregates[1].source
         ));
         let p::NodeKind::TableFunction {
             function: original_table,
@@ -885,7 +469,7 @@ fn project(
                 Some(wire::aggregate_phase::Kind::Single(_))
             ));
         }
-        for (row, input) in sources.aggregates().iter().zip(&aggregate_inputs) {
+        for (row, input) in sources.aggregates.iter().zip(&aggregate_inputs) {
             assert_eq!(input.id, row.id);
             assert!(std::ptr::eq(
                 aggregates
@@ -912,13 +496,20 @@ fn actual_checked_scalar_lambda_table_and_aggregate_sources_reach_original_encod
     let facts = project(&package, &control, limits()).unwrap();
     assert!(facts.allocation_requests_upper_bound > 0);
     assert!(facts.value_root_count > 0);
-    assert_eq!(facts.field_root_count, 0);
+    // The checked scalar now contributes its original source Field as well
+    // as its complete value type; the Field is not a function binding root.
+    assert_eq!(facts.field_root_count, 1);
+    assert_eq!(package.constants().entries().len(), 1);
+    let pool = package.constants().entries().values().next().unwrap();
+    assert_eq!(pool.value_type(), &int());
+    assert_eq!(pool.value(0).unwrap().try_i64().unwrap(), Some(42));
     assert_eq!(package.fragment().id(), p::FragmentId::new(u32::MAX));
     assert!(
         package
             .fragment()
-            .expressions()
-            .get(p::ExprId::new(u32::MAX))
+            .unit(p::NodeId::new(0))
+            .unwrap()
+            .definition(p::ExprId::new(2))
             .is_some()
     );
 }
@@ -1226,17 +817,20 @@ fn actual_binding_header_limits_preserve_exact_counts_and_refuse_each_one_under(
 // only two expression definitions. Reusing the reachable literal prevents the
 // outer definition walk from accidentally supplying the Count quantum oracle.
 fn wide_package() -> p::FragmentPackage {
+    let mut constants = p::ConstantPools::empty();
+    let literal_source =
+        crate::test_constants::insert(&mut constants, crate::test_constants::i64(42)(&int()));
     let node_id = p::NodeId::new(u32::MAX);
     let scalar = p::ExprId::new(0);
     let value = p::ValueId::new(u32::MAX);
     let literal = p::ExprId::new(1);
     let args = (0..320).map(|_| literal).collect::<Box<[_]>>();
-    let mut definitions = vec![p::ExprNode {
+    let mut definitions = vec![novarocks_expression_contract::ExprNode {
         id: scalar,
-        owner: node_id,
+
         lambda_scope: None,
         ty: int(),
-        kind: p::ExprKind::FunctionCall {
+        kind: novarocks_expression_contract::ExprKind::FunctionCall {
             function: function(
                 FunctionKind::Scalar,
                 (0..320)
@@ -1246,19 +840,30 @@ fn wide_package() -> p::FragmentPackage {
             args,
         },
     }];
-    definitions.push(p::ExprNode {
+    definitions.push(novarocks_expression_contract::ExprNode {
         id: literal,
-        owner: node_id,
+
         lambda_scope: None,
         ty: int(),
-        kind: p::ExprKind::Literal(p::LiteralValue::Int64(42)),
+        kind: literal_source,
     });
-    let expressions = p::ExprArena::try_from_definitions_observed(
-        definitions.into_iter(),
-        &p::PlanLimits::FROZEN,
-        &Setup,
-    )
-    .unwrap();
+    let expressions = definitions;
+    let unit = super::super::definition_sources::tests::checked_fixture_unit(
+        expressions,
+        &[scalar],
+        BTreeMap::from([(
+            scalar,
+            request(
+                (0..320)
+                    .map(|_| p::StaticFunctionArgument::Value {
+                        value_type: int(),
+                        constant: None,
+                    })
+                    .collect(),
+            ),
+        )]),
+        ControlShape::Eager,
+    );
     let fragment = p::Fragment::try_from_structure_observed(
         p::FragmentStructureInput {
             summaries: Box::default(),
@@ -1276,15 +881,17 @@ fn wide_package() -> p::FragmentPackage {
                     },
                 },
             )]),
-            expressions,
             nodes: BTreeMap::from([(
                 node_id,
-                node(
+                super::super::definition_sources::tests::unit_node(
+                    unit,
                     node_id,
                     Box::default(),
                     Box::from([value]),
                     p::NodeKind::Values {
-                        rows: Box::from([Box::from([scalar])]),
+                        rows: Box::from([Box::from([
+                            novarocks_expression_contract::RootOrdinal::new(0),
+                        ])]),
                     },
                 ),
             )]),
@@ -1300,86 +907,19 @@ fn wide_package() -> p::FragmentPackage {
         &Setup,
     )
     .unwrap()
-    .with_call_requests_observed(
-        vec![(
-            p::PhysicalCallDefinition::Expression(scalar),
-            request(
-                (0..320)
-                    .map(|_| p::StaticFunctionArgument::Value {
-                        value_type: int(),
-                        constant: None,
-                    })
-                    .collect(),
-            ),
-        )],
-        &Setup,
-    )
-    .unwrap();
-    let mut invocations = vec![ExpressionInvocation {
-        context: context(0, 0),
-        definition: scalar,
-        control: ControlShape::Eager,
-        arguments: (1..=320).map(ExpressionUseId::new).collect(),
-    }];
-    invocations.extend((1..=320).map(|id| ExpressionInvocation {
-        context: context(id, 0),
-        definition: literal,
-        control: ControlShape::Eager,
-        arguments: Box::default(),
-    }));
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Setup,
-    )
-    .unwrap();
-    let uses = p::PhysicalRootUses::try_new(
-        &fragment,
-        flow,
-        vec![(
-            p::ExpressionRootSite {
-                node: node_id,
-                role: p::ExpressionRootRole::ValuesCell { row: 0, column: 0 },
-            },
-            ExpressionUseId::new(0),
-        )],
-        &Setup,
-    )
-    .unwrap();
-    let mut claim = effects(FunctionKind::Scalar, context(0, 0));
-    claim.argument_control = ArgumentControl::Eager;
-    let calls = p::FrozenFragmentCalls::try_new(
-        &fragment,
-        &uses,
-        vec![p::FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: p::PhysicalCallSite::Expression(ExpressionUseId::new(0)),
-            context: context(0, 0),
-            effects: claim,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        }],
-        &Setup,
-    )
+    .with_call_requests_observed(vec![], &Setup)
+    .unwrap()
+    .with_calls_observed(vec![], &Setup)
     .unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
-            constants: p::ConstantPools::empty(),
+            statement_constant_policy: request(Box::default()).constant_policy,
+            constants,
             version: p::PlanVersionId::try_new([4; 16]).unwrap(),
             required: p::RequiredContracts {
                 plan_contract_revision: p::PLAN_CONTRACT_REVISION,
             },
             pruning: p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &Setup).unwrap(),
-            expression_uses: uses,
-            calls,
             fragment,
             cuts: p::FragmentCuts {
                 inbound: Box::default(),
@@ -1440,15 +980,17 @@ fn actual_wide_count_observes_256_before_reserve_or_fill_lookup_and_keeps_primar
             Ok(sources) => {
                 assert!(expect_success);
                 assert_eq!(
-                    (sources.functions().len(), sources.aggregates().len()),
+                    (sources.functions().len(), sources.aggregates.len()),
                     (1, 0)
                 );
-                let p::ExprKind::FunctionCall { function, .. } = &package
-                    .fragment()
-                    .expressions()
-                    .get(p::ExprId::new(0))
-                    .unwrap()
-                    .kind
+                let novarocks_expression_contract::ExprKind::FunctionCall { function, .. } =
+                    &package
+                        .fragment()
+                        .unit(p::NodeId::new(u32::MAX))
+                        .unwrap()
+                        .definition(p::ExprId::new(0))
+                        .unwrap()
+                        .kind
                 else {
                     panic!("wide actual scalar")
                 };
@@ -1476,9 +1018,10 @@ fn actual_wide_count_observes_256_before_reserve_or_fill_lookup_and_keeps_primar
                     };
                     let occurrence = PackageTypeOccurrence {
                         fragment: package.fragment().id(),
-                        owner: PackageTypeOwner::Binding(BindingOccurrence::Scalar(
-                            p::ExprId::new(0),
-                        )),
+                        owner: PackageTypeOwner::Binding(BindingOccurrence::Scalar {
+                            node: p::NodeId::new(u32::MAX),
+                            definition: p::ExprId::new(0),
+                        }),
                         channel: Channel::Argument(ordinal),
                     };
                     assert_eq!(

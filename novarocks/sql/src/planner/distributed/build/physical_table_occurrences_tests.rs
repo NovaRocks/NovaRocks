@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::contract_lowering::{NodeExpressionEffects, node_effects_with_test_summaries};
 use super::super::{
     expression_occurrences::{AuthoredPhysicalOccurrences, author_physical_occurrences_observed},
     physical_expression_effects::{
@@ -28,6 +29,7 @@ use super::super::{
 };
 use super::*;
 use crate::functions::build_builtin_engine_function_catalog;
+use crate::test_constants::{self as checked, Fragment, FragmentBuilder};
 use arrow::{
     array::{Array, Int64Array, ListArray},
     buffer::OffsetBuffer,
@@ -35,20 +37,25 @@ use arrow::{
 };
 use novarocks_functions::{
     ConstantPolicy, ConstantPool, EngineFunctionCatalog, FunctionArgument, FunctionResultType,
-    PreparedPureKernel,
-};
-use novarocks_physical_plan::{
-    BinaryOperator, BoundTableFunction, ConstantPoolId, ConstantPools, ConstantReference,
-    Distribution, ExprId, ExprKind, ExpressionRootRole, ExpressionRootSite, Fragment,
-    FragmentBuilder, FragmentId, FragmentSink, LiteralValue, NodeId, NodeKind, PipelineDopDomain,
-    PlanLimits, TableFunctionOutput, ValueOrigin,
+    PreparedPureKernel, ScopedExpressionEffects,
 };
 use novarocks_type_contract::{
-    CompilePhase, ExpressionEffectContext, FunctionInstanceState, FunctionIntrinsicRowError,
-    FunctionNullBehavior, FunctionValueType, PureCompileControl, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterValue,
+    CompilePhase, EvaluationDemand, ExpressionEffectContext, FunctionInstanceState,
+    FunctionIntrinsicRowError, FunctionNullBehavior, FunctionValueType, PureCompileControl,
+    RelationEffectContext, SemanticParameterId, SemanticParameterKey, SemanticParameterValue,
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+use {
+    novarocks_expression_contract::{BinaryOperator, ExprKind, RootOrdinal, RootScope},
+    novarocks_physical_plan::{
+        BoundTableFunction, ConstantPoolId, ConstantPools, ConstantReference, Distribution, ExprId,
+        FragmentId, FragmentSink, NodeId, NodeKind, PipelineDopDomain, PlanLimits,
+        TableFunctionOutput, ValueOrigin,
+    },
+};
 
 const PHASE: CompilePhase = CompilePhase::FunctionSpecialization;
 const CAUSES: [CompileControlError; 3] = [
@@ -118,6 +125,7 @@ struct Fixture {
     owner: NodeId,
     args: Vec<ExprId>,
     catalog: EngineFunctionCatalog,
+    effects: BTreeMap<NodeId, NodeExpressionEffects>,
 }
 impl Fixture {
     fn new(types: &[FunctionValueType], sources: &[Source], left: bool, bad_result: bool) -> Self {
@@ -149,13 +157,14 @@ impl Fixture {
         let leaf = NodeId::new(7);
         let owner = NodeId::new(901);
         let input_type = types[0].clone();
-        let initial = builder
-            .add_expression(
-                leaf,
-                input_type.clone(),
-                ExprKind::Literal(LiteralValue::Null),
-            )
-            .unwrap();
+        let initial = constant(
+            &mut builder,
+            &mut pools,
+            leaf,
+            input_type.clone(),
+            checked::null(),
+        );
+        let initial_root = root(&mut builder, leaf, initial, RootScope::AllPorts);
         let value = builder
             .add_value(
                 input_type,
@@ -166,7 +175,11 @@ impl Fixture {
             )
             .unwrap();
         builder
-            .add_values(leaf, Box::from([Box::from([initial])]), Box::from([value]))
+            .add_values(
+                leaf,
+                Box::from([Box::from([initial_root])]),
+                Box::from([value]),
+            )
             .unwrap();
         let mut args = Vec::new();
         for (at, (&source, value_type)) in sources.iter().zip(types).enumerate() {
@@ -176,27 +189,27 @@ impl Fixture {
                 continue;
             }
             let kind = match source {
-                Source::Literal => ExprKind::Literal(LiteralValue::Null),
+                Source::Literal => constant_kind(&mut pools, value_type, checked::null()),
                 Source::Pool => ExprKind::Constant(ConstantReference {
                     pool: ConstantPoolId::new(u32::MAX),
                     ordinal: 1,
                 }),
                 Source::Value => ExprKind::Value(value),
                 Source::ChildError => {
-                    let a = builder
-                        .add_expression(
-                            owner,
-                            ty(DataType::Int64, false),
-                            ExprKind::Literal(LiteralValue::Int64(i64::MAX)),
-                        )
-                        .unwrap();
-                    let b = builder
-                        .add_expression(
-                            owner,
-                            ty(DataType::Int64, false),
-                            ExprKind::Literal(LiteralValue::Int64(1)),
-                        )
-                        .unwrap();
+                    let a = constant(
+                        &mut builder,
+                        &mut pools,
+                        owner,
+                        ty(DataType::Int64, false),
+                        checked::i64(i64::MAX),
+                    );
+                    let b = constant(
+                        &mut builder,
+                        &mut pools,
+                        owner,
+                        ty(DataType::Int64, false),
+                        checked::i64(1),
+                    );
                     let add = builder
                         .add_expression(
                             owner,
@@ -220,20 +233,20 @@ impl Fixture {
                             },
                         )
                         .unwrap();
-                    let then = builder
-                        .add_expression(
-                            owner,
-                            value_type.clone(),
-                            ExprKind::Literal(LiteralValue::Null),
-                        )
-                        .unwrap();
-                    let otherwise = builder
-                        .add_expression(
-                            owner,
-                            value_type.clone(),
-                            ExprKind::Literal(LiteralValue::Null),
-                        )
-                        .unwrap();
+                    let then = constant(
+                        &mut builder,
+                        &mut pools,
+                        owner,
+                        value_type.clone(),
+                        checked::null(),
+                    );
+                    let otherwise = constant(
+                        &mut builder,
+                        &mut pools,
+                        owner,
+                        value_type.clone(),
+                        checked::null(),
+                    );
                     ExprKind::Case {
                         operand: None,
                         when_then: Box::from([(test, then)]),
@@ -274,7 +287,7 @@ impl Fixture {
             overload: resolved.selected.overload,
             argument_types: resolved.selected.argument_types,
             result_types: result_types.clone(),
-            legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
                 volatility: resolved.semantics.volatility,
                 argument_evaluation: resolved.semantics.argument_evaluation,
                 failure_behavior: resolved.semantics.failure_behavior,
@@ -305,6 +318,10 @@ impl Fixture {
                 value: result,
             });
         }
+        let argument_roots = args
+            .iter()
+            .map(|&id| root(&mut builder, owner, id, RootScope::Port(0)))
+            .collect::<Box<[_]>>();
         builder
             .add_row_expanding(
                 owner,
@@ -313,12 +330,13 @@ impl Fixture {
                 output.into_boxed_slice(),
                 NodeKind::TableFunction {
                     function,
-                    arguments: args.clone().into_boxed_slice(),
+                    arguments: argument_roots,
                     outputs: outputs.into_boxed_slice(),
                     left_outer: left,
                 },
             )
             .unwrap();
+        let effects = seal_fixture_units(&mut builder, &pools, &catalog);
         let fragment = builder
             .finish_structure(
                 owner,
@@ -333,12 +351,14 @@ impl Fixture {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
+        checked::merge(&mut pools, fragment.constants());
         Self {
             fragment,
             pools,
             owner,
             args,
             catalog,
+            effects,
         }
     }
     fn source(&self) -> &PhysicalNode {
@@ -349,6 +369,104 @@ impl Fixture {
             .unwrap()
     }
 }
+
+fn constant_kind(
+    pools: &mut ConstantPools,
+    ty: &FunctionValueType,
+    source: checked::Source,
+) -> ExprKind {
+    checked::insert(pools, source(ty))
+}
+fn constant(
+    builder: &mut FragmentBuilder,
+    pools: &mut ConstantPools,
+    node: NodeId,
+    ty: FunctionValueType,
+    source: checked::Source,
+) -> ExprId {
+    let kind = constant_kind(pools, &ty, source);
+    builder.add_expression(node, ty, kind).unwrap()
+}
+fn root(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    definition: ExprId,
+    scope: RootScope,
+) -> RootOrdinal {
+    builder
+        .unit(node)
+        .unwrap()
+        .root(definition, EvaluationDemand::Value, scope)
+        .unwrap()
+}
+fn seal_fixture_units(
+    builder: &mut FragmentBuilder,
+    pools: &ConstantPools,
+    catalog: &EngineFunctionCatalog,
+) -> BTreeMap<NodeId, NodeExpressionEffects> {
+    // Fixed structural fixtures retain the original scalar author's summaries
+    // beside exactly the Arc installed in their real node. No SQL journal is
+    // minted and no scalar control/effect derivation is duplicated here.
+    let nodes = builder
+        .construction_nodes()
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    let parameters = SemanticParameters::try_new([(
+        allow_ref().id,
+        SemanticParameterValue::AllowThrowException(false),
+    )])
+    .unwrap();
+    let mut effects = BTreeMap::new();
+    for node in nodes {
+        if builder.construction_unit(node).is_none() {
+            continue;
+        }
+        let ports = builder.node_ports(node).unwrap();
+        let draft = builder.take_unit_builder(node).unwrap();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let sealed = draft.seal(ports, &mut work).unwrap();
+        let authored = author_physical_expression_effects_observed(
+            PhysicalExpressionEffectsInput {
+                owner: crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(node),
+                unit: &sealed,
+                constants: pools,
+                parameters: &parameters,
+                literal_policy: policy(),
+                call_scopes: &BTreeMap::new(),
+            },
+            catalog,
+            &Control::default(),
+        )
+        .unwrap();
+        let unit = Arc::new(sealed.finish(authored.calls, &mut work).unwrap());
+        work.finish().unwrap();
+        effects.insert(
+            node,
+            node_effects_with_test_summaries(unit.clone(), authored.summaries),
+        );
+        builder.install_unit(node, unit).unwrap();
+    }
+    effects
+}
+fn summaries(fixture: &Fixture) -> BTreeMap<NodeId, NodeExpressionEffects> {
+    fixture
+        .effects
+        .iter()
+        .map(|(&node, effects)| {
+            let unit = fixture.fragment.nodes()[&node]
+                .expressions
+                .as_ref()
+                .unwrap()
+                .clone();
+            (
+                node,
+                node_effects_with_test_summaries(unit, effects.summaries().clone()),
+            )
+        })
+        .collect()
+}
+
 fn allow_ref() -> SemanticParameterRef {
     SemanticParameterRef {
         id: SemanticParameterId::new(71),
@@ -379,18 +497,7 @@ fn copy_occurrences<'a>(
 ) -> AuthoredPhysicalOccurrences<'a> {
     source.clone()
 }
-fn summaries(
-    occurrences: &AuthoredPhysicalOccurrences,
-) -> BTreeMap<ExpressionUseId, ScopedExpressionEffects> {
-    occurrences
-        .root_uses
-        .flow()
-        .uses()
-        .iter()
-        .map(|(&id, use_)| (id, ScopedExpressionEffects::pure_value(use_.context)))
-        .collect()
-}
-fn context(occurrences: &AuthoredPhysicalOccurrences, owner: NodeId) -> ExpressionEffectContext {
+fn context(occurrences: &AuthoredPhysicalOccurrences, owner: NodeId) -> RelationEffectContext {
     occurrences
         .relational_contexts
         .iter()
@@ -398,21 +505,19 @@ fn context(occurrences: &AuthoredPhysicalOccurrences, owner: NodeId) -> Expressi
         .unwrap()
         .1
 }
-fn child(
-    occurrences: &AuthoredPhysicalOccurrences,
-    owner: NodeId,
-    ordinal: u32,
-) -> ExpressionUseId {
-    occurrences.root_uses.bindings()[&ExpressionRootSite {
-        node: owner,
-        role: ExpressionRootRole::TableFunctionArgument { argument: ordinal },
-    }]
+fn child(fixture: &Fixture, ordinal: u32) -> ExpressionUseId {
+    let NodeKind::TableFunction { arguments, .. } = &fixture.source().kind else {
+        panic!("table")
+    };
+    let unit = fixture.source().expressions.as_ref().unwrap();
+    unit.root_use_ids()[arguments[ordinal as usize].get() as usize]
 }
+
 fn input<'a>(
     fixture: &'a Fixture,
     req: &'a AuthoredPhysicalTableRequest<'a>,
     occ: &'a AuthoredPhysicalOccurrences<'a>,
-    effects: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    effects: &'a BTreeMap<NodeId, NodeExpressionEffects>,
     params: &'a SemanticParameters,
 ) -> PhysicalTableOccurrenceInput<'a> {
     PhysicalTableOccurrenceInput {
@@ -420,11 +525,11 @@ fn input<'a>(
         source: fixture.source(),
         request: req,
         occurrences: occ,
-        child_effects: effects,
+        child_effects: effects.get(&fixture.owner),
         parameters: params,
         environment: &[],
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context(occ, fixture.owner).domain),
+        proof_scope: CallProofScope::Relation(context(occ, fixture.owner).identity),
     }
 }
 fn run(
@@ -571,7 +676,7 @@ fn table_occurrences_installed_unnest_keeps_nested_metadata_relation_and_left_ho
         let f = Fixture::new(std::slice::from_ref(&t), &[Source::Value], left, false);
         let occ = f.occurrences();
         let req = request(f.source(), &f, &Control::default()).unwrap();
-        let effects = summaries(&occ);
+        let effects = summaries(&f);
         let params = SemanticParameters::try_new([]).unwrap();
         let result = run(
             input(&f, &req, &occ, &effects, &params),
@@ -636,19 +741,26 @@ fn table_occurrences_repeated_definition_keeps_independent_roots_and_operator_co
     );
     assert_eq!(f.args[0], f.args[1]);
     let occ = f.occurrences();
-    let a = child(&occ, f.owner, 0);
-    let b = child(&occ, f.owner, 1);
+    let a = child(&f, 0);
+    let b = child(&f, 1);
     assert_ne!(a, b);
-    let flow = occ.root_uses.flow();
+    let flow = f.source().expressions.as_ref().unwrap().control_flow();
     assert_ne!(
-        flow.uses()[&a].context.domain,
-        flow.uses()[&b].context.domain
+        flow.uses()[&a].context.region,
+        flow.uses()[&b].context.region
     );
     let ctx = context(&occ, f.owner);
-    assert!(!flow.uses().contains_key(&ctx.use_id));
-    assert_ne!(ctx.domain, flow.uses()[&a].context.domain);
+    assert!(ctx.is_call());
+    assert_eq!(
+        novarocks_type_contract::CallEffectContext::from(ctx),
+        novarocks_type_contract::CallEffectContext::Relation(ctx)
+    );
+    assert_ne!(
+        novarocks_type_contract::CallEffectContext::from(ctx),
+        flow.uses()[&a].context.into()
+    );
     let req = request(f.source(), &f, &Control::default()).unwrap();
-    let effects = summaries(&occ);
+    let effects = summaries(&f);
     let params = SemanticParameters::try_new([]).unwrap();
     prefixes(
         |c| run(input(&f, &req, &occ, &effects, &params), &f.catalog, c),
@@ -656,7 +768,7 @@ fn table_occurrences_repeated_definition_keeps_independent_roots_and_operator_co
         false,
     );
     let mut changed = copy_occurrences(&occ);
-    changed.relational_contexts[0].1 = flow.uses()[&a].context;
+    changed.relational_contexts[0].1 = RelationEffectContext::materialized_input(ctx.identity.call);
     assert!(matches!(
         run(
             input(&f, &req, &changed, &effects, &params),
@@ -681,11 +793,19 @@ fn table_occurrences_missing_or_foreign_child_scope_environment_and_proof_refuse
     let f = Fixture::new(&[list_type()], &[Source::Value], false, false);
     let occ = f.occurrences();
     let req = request(f.source(), &f, &Control::default()).unwrap();
-    let effects = summaries(&occ);
+    let effects = summaries(&f);
     let params = SemanticParameters::try_new([]).unwrap();
-    let id = child(&occ, f.owner, 0);
-    let mut missing = effects.clone();
-    missing.remove(&id);
+    let id = child(&f, 0);
+    let mut missing = summaries(&f);
+    let mut missing_children = missing[&f.owner].summaries().clone();
+    missing_children.remove(&id);
+    missing.insert(
+        f.owner,
+        node_effects_with_test_summaries(
+            f.source().expressions.as_ref().unwrap().clone(),
+            missing_children,
+        ),
+    );
     assert!(
         matches!(run(input(&f,&req,&occ,&missing,&params),&f.catalog,&Control::default()),Err(PhysicalTableOccurrenceError::MissingChildEffects(actual)) if actual==id)
     );
@@ -694,10 +814,29 @@ fn table_occurrences_missing_or_foreign_child_scope_environment_and_proof_refuse
         false,
         false,
     );
-    let mut foreign = effects.clone();
-    foreign.insert(
+    let mut foreign = summaries(&f);
+    let mut foreign_children = foreign[&f.owner].summaries().clone();
+    let actual = f
+        .source()
+        .expressions
+        .as_ref()
+        .unwrap()
+        .control_flow()
+        .uses()[&id]
+        .context;
+    foreign_children.insert(
         id,
-        ScopedExpressionEffects::pure_value(context(&occ, f.owner)),
+        ScopedExpressionEffects::pure_value(ExpressionEffectContext {
+            demand: EvaluationDemand::TruthOnly,
+            ..actual
+        }),
+    );
+    foreign.insert(
+        f.owner,
+        node_effects_with_test_summaries(
+            f.source().expressions.as_ref().unwrap().clone(),
+            foreign_children,
+        ),
     );
     assert!(matches!(
         run(
@@ -742,8 +881,16 @@ fn table_occurrences_missing_or_foreign_child_scope_environment_and_proof_refuse
     prefixes(
         |c| {
             let mut call = input(&f, &req, &occ, &effects, &params);
-            call.proof_scope =
-                CallProofScope::Domain(occ.root_uses.flow().uses()[&id].context.domain);
+            call.proof_scope = CallProofScope::Region(
+                f.source()
+                    .expressions
+                    .as_ref()
+                    .unwrap()
+                    .control_flow()
+                    .uses()[&id]
+                    .context
+                    .region,
+            );
             run(call, &f.catalog, c)
         },
         false,
@@ -755,7 +902,7 @@ fn table_occurrences_complete_relation_mismatch_is_refused_by_actual_unnest_owne
     let f = Fixture::new(&[list_type()], &[Source::Value], false, true);
     let occ = f.occurrences();
     let req = request(f.source(), &f, &Control::default()).unwrap();
-    let effects = summaries(&occ);
+    let effects = summaries(&f);
     let params = SemanticParameters::try_new([]).unwrap();
     assert!(matches!(
         run(
@@ -780,30 +927,25 @@ fn table_occurrences_genuine_case_arithmetic_child_error_is_not_erased_by_called
         SemanticParameterValue::AllowThrowException(false),
     )])
     .unwrap();
-    let scoped = author_physical_expression_effects_observed(
-        PhysicalExpressionEffectsInput {
-            temporal_sources: None,
-            fragment: &f.fragment,
-            roots: &occ.root_uses,
-            constants: &f.pools,
-            parameters: &params,
-            literal_policy: policy(),
-            call_scopes: &BTreeMap::new(),
-        },
-        &f.catalog,
-        &Control::default(),
-    )
-    .unwrap();
-    let id = child(&occ, f.owner, 0);
+    let scoped = summaries(&f);
+    let id = child(&f, 0);
     assert!(
-        scoped.summaries[&id]
-            .for_use(occ.root_uses.flow().uses()[&id].context)
+        scoped[&f.owner].summaries()[&id]
+            .for_use(
+                f.source()
+                    .expressions
+                    .as_ref()
+                    .unwrap()
+                    .control_flow()
+                    .uses()[&id]
+                    .context
+            )
             .unwrap()
             .may_raise_row_error
     );
     let req = request(f.source(), &f, &Control::default()).unwrap();
     let result = run(
-        input(&f, &req, &occ, &scoped.summaries, &params),
+        input(&f, &req, &occ, &scoped, &params),
         &f.catalog,
         &Control::default(),
     )
@@ -843,7 +985,7 @@ fn table_occurrences_wide_source_fields_observe_actual_quantum_without_rebinding
     let f = Fixture::new(&[t], &[Source::Value], false, false);
     let occ = f.occurrences();
     let req = request(f.source(), &f, &Control::default()).unwrap();
-    let effects = summaries(&occ);
+    let effects = summaries(&f);
     let params = SemanticParameters::try_new([]).unwrap();
     prefixes(
         |c| run(input(&f, &req, &occ, &effects, &params), &f.catalog, c),
@@ -857,7 +999,7 @@ fn table_occurrences_missing_installed_table_owner_never_falls_back_to_scalar() 
     let f = Fixture::new(&[list_type()], &[Source::Value], false, false);
     let occ = f.occurrences();
     let req = request(f.source(), &f, &Control::default()).unwrap();
-    let effects = summaries(&occ);
+    let effects = summaries(&f);
     let params = SemanticParameters::try_new([]).unwrap();
     let mut builder = novarocks_functions::EngineFunctionCatalogBuilder::new();
     builder
@@ -906,7 +1048,7 @@ fn fragment_run(
             constants: &fixture.pools,
             parameters,
             literal_policy: policy(),
-            expression_scopes: &BTreeMap::new(),
+            node_effects: &summaries(fixture),
             relational_scopes: scopes,
         },
         &fixture.catalog,
@@ -928,7 +1070,7 @@ fn fragment_scopes<'a>(
             source: fixture.source(),
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             environment: &[],
-            proof_scope: CallProofScope::Domain(context(occurrences, fixture.owner).domain),
+            proof_scope: CallProofScope::Relation(context(occurrences, fixture.owner).identity),
         },
     )])
 }
@@ -1065,20 +1207,25 @@ fn table_fragment_composer_keeps_real_child_error_and_publishes_exact_complete_c
         call.effects.own_row_error,
         FunctionIntrinsicRowError::NoRowError
     );
-    let child = child(&occurrences, fixture.owner, 0);
+    let child = child(&fixture, 0);
     assert!(
-        result.summaries[&child]
-            .for_use(occurrences.root_uses.flow().uses()[&child].context)
+        fixture.effects[&fixture.owner].summaries()[&child]
+            .for_use(
+                fixture
+                    .source()
+                    .expressions
+                    .as_ref()
+                    .unwrap()
+                    .control_flow()
+                    .uses()[&child]
+                    .context
+            )
             .unwrap()
             .may_raise_row_error
     );
     result
         .calls
-        .validate_fragment(
-            &fixture.fragment,
-            &occurrences.root_uses,
-            &Control::default(),
-        )
+        .validate_fragment(&fixture.fragment, &Control::default())
         .unwrap();
     fragment_prefixes(
         |control| fragment_run(&fixture, &occurrences, &parameters, &scopes, control),
@@ -1117,7 +1264,7 @@ fn table_fragment_composer_missing_extra_and_equal_foreign_source_scopes_refuse_
             source: fixture.source(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             environment: &[],
-            proof_scope: CallProofScope::Domain(context(&occurrences, fixture.owner).domain),
+            proof_scope: CallProofScope::Relation(context(&occurrences, fixture.owner).identity),
         },
     );
     assert!(matches!(
@@ -1152,60 +1299,6 @@ fn table_fragment_composer_missing_extra_and_equal_foreign_source_scopes_refuse_
             "relational scope does not loan this actual source call"
         ))
     ));
-    fragment_prefixes(
-        |control| fragment_run(&fixture, &occurrences, &parameters, &scopes, control),
-        false,
-        false,
-    );
-}
-
-#[test]
-fn table_fragment_composer_source_literal_limits_remain_primary_without_partial_call_table() {
-    let fields: Vec<_> = (0..320)
-        .map(|at| {
-            Arc::new(
-                Field::new(format!("component-{at}"), DataType::Int64, true).with_metadata(
-                    std::collections::HashMap::from([("provider.id".into(), at.to_string())]),
-                ),
-            )
-        })
-        .collect();
-    let source_type = ty(
-        DataType::List(Arc::new(Field::new(
-            "item",
-            DataType::Struct(fields.into()),
-            true,
-        ))),
-        true,
-    );
-    let fixture = Fixture::new(&[source_type], &[Source::Value], false, false);
-    let occurrences = fixture.occurrences();
-    let parameters = SemanticParameters::try_new([]).unwrap();
-    let scopes = fragment_scopes(&fixture, &occurrences);
-    let error = fragment_run(
-        &fixture,
-        &occurrences,
-        &parameters,
-        &scopes,
-        &Control::default(),
-    )
-    .unwrap_err();
-    use super::super::physical_call_arguments::PhysicalArgumentError;
-    use super::super::physical_fragment_effects::PhysicalFragmentEffectsError;
-    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
-    use novarocks_functions::ConstantError;
-    let PhysicalFragmentEffectsError::Expressions(PhysicalExpressionEffectsError::Argument(
-        PhysicalArgumentError::Constant(source @ ConstantError::Limit(_)),
-    )) = &error
-    else {
-        panic!("the actual table argument must retain its original constant limit: {error:?}");
-    };
-    let expected = source.failure_fact();
-    assert_eq!(expected.class(), FailureClass::Resource);
-    assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
-    assert_eq!(expected.reason().code(), 2);
-    let package = super::super::package_semantics::PackageSemanticsError::from(error);
-    assert_eq!(package.failure_fact(), expected);
     fragment_prefixes(
         |control| fragment_run(&fixture, &occurrences, &parameters, &scopes, control),
         false,

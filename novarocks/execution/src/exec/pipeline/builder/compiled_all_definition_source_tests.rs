@@ -15,13 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Permanent source probes on the real builders, without owner preparation.
+//! Permanent borrowed source probes; the visitor never prepares an owner.
 
 use super::*;
 use std::sync::Mutex;
 
 use arrow::array::StringArray;
-use novarocks_physical_plan::BoundFunction;
+use novarocks_expression_contract::{BoundFunction, DefinitionControl, ExpressionCallClaim};
+use novarocks_functions::{
+    CallArgumentUses, EngineFunctionCatalog, FunctionSpecializationFailure, ScopedExpressionEffects,
+};
+use novarocks_physical_plan::{FrozenCallError, PhysicalCallBinding};
 use novarocks_plan_codec::physical_package_v2::{
     FragmentDefinitionSource, visit_fragment_definitions_observed,
 };
@@ -29,20 +33,53 @@ use novarocks_plan_codec::physical_type_v2::{
     PackageTypeProjectionLimits, TypeProjectionLimits, decode_type_table,
     encode_borrowed_type_table_writer_sources_in,
 };
+use novarocks_type_contract::ControlShape;
 use novarocks_type_contract::{CompileControlError, PureCompileControl, ValueLogicalType};
 
 struct SourceFixture {
-    fragment: Fragment,
+    fragment: crate::exec::operators::family_fixture::constant_sources::Fragment,
     pools: ConstantPools,
     first: ExprId,
     later: ExprId,
     source: ConstantReference,
+    project: NodeId,
 }
 
-fn scalar_binding(name: &str, request: &[FunctionArgument]) -> BoundFunction {
-    let actual =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let bound = actual
+fn scalar_catalogue(actual: &EngineFunctionCatalog) -> PureEngineFunctionCatalog {
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    let mut installed = Vec::new();
+    for name in ["concat", "abs"] {
+        let definition = actual.definition(name, FunctionKind::Scalar).unwrap();
+        builder.register(definition.clone()).unwrap();
+        for overload in definition.binding_declaration().unwrap().overloads() {
+            let declaration = actual
+                .pure_overload_declaration_observed(
+                    definition.binding_declaration().unwrap().function_id(),
+                    FunctionKind::Scalar,
+                    &overload.identity,
+                    &FixtureControl,
+                )
+                .unwrap();
+            installed.push(InstalledPureKernel {
+                function: definition
+                    .binding_declaration()
+                    .unwrap()
+                    .function_id()
+                    .clone(),
+                kind: FunctionKind::Scalar,
+                implementation: declaration.implementation().clone(),
+                aggregate_state_format: None,
+            });
+        }
+    }
+    builder.seal_pure(installed).unwrap()
+}
+fn scalar_binding(
+    functions: &EngineFunctionCatalog,
+    name: &str,
+    request: &[FunctionArgument],
+) -> (BoundFunction, Arc<FunctionBindingSelection>) {
+    let bound = functions
         .resolve_bound_user(
             name,
             FunctionKind::Scalar,
@@ -54,6 +91,7 @@ fn scalar_binding(name: &str, request: &[FunctionArgument]) -> BoundFunction {
             &FixtureControl,
         )
         .unwrap();
+    let selected = Arc::new(bound.selected.clone());
     let FunctionResultType::Scalar(result) = bound.selected.result_type else {
         panic!("actual scalar resolver must select a scalar result")
     };
@@ -71,11 +109,17 @@ fn scalar_binding(name: &str, request: &[FunctionArgument]) -> BoundFunction {
         intrinsic_row_error: bound.semantics.intrinsic_row_error,
         semantic_parameters: Box::default(),
     });
-    function
+    (function, selected)
 }
 
 fn source_fixture() -> SourceFixture {
-    let mut builder = FragmentBuilder::new(SOLE);
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            SOLE,
+            &fixture_sources,
+        );
     let input = builder.reserve_node_id().unwrap();
     let mut pools = Pools::new();
     let (key, _lists) = values(
@@ -122,22 +166,43 @@ fn source_fixture() -> SourceFixture {
             constant: Some(pool.value(1).unwrap()),
         },
     ];
-    let function = scalar_binding("aes_encrypt", &arguments);
+    let actual =
+        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
+    let functions = scalar_catalogue(&actual);
+    let (aes, _) = scalar_binding(&actual, "aes_encrypt", &arguments);
+    assert!(matches!(
+        actual.pure_overload_declaration_observed(
+            &aes.function_id, FunctionKind::Scalar, &aes.overload, &FixtureControl,
+        ),
+        Err(FunctionSpecializationFailure::MissingPureImplementation(overload))
+            if overload == aes.overload
+    ));
+    // AES still owns the original metadata selection. The sealed visitor
+    // source uses an installed eager owner over the same complete signature.
+    let (function, first_selected) = scalar_binding(functions.metadata(), "concat", &arguments);
+    assert_eq!(function.argument_types, aes.argument_types);
+    assert_eq!(function.result_type, aes.result_type);
     let first_type = function.result_type.clone();
     pools.0.insert(pool_id, pool).unwrap();
-    let plaintext = builder
-        .add_expression(project, utf8.clone(), ExprKind::Constant(source))
+    let payload = builder
+        .unit(project)
+        .unwrap()
+        .add(None, utf8.clone(), ExprKind::Constant(source))
         .unwrap();
-    let cipher_key = builder
-        .add_expression(project, utf8.clone(), ExprKind::Constant(key_source))
+    let key_literal = builder
+        .unit(project)
+        .unwrap()
+        .add(None, utf8.clone(), ExprKind::Constant(key_source))
         .unwrap();
     let first = builder
-        .add_expression(
-            project,
+        .unit(project)
+        .unwrap()
+        .add(
+            None,
             function.result_type.clone(),
             ExprKind::FunctionCall {
                 function,
-                args: Box::from([plaintext, cipher_key]),
+                args: Box::from([payload, key_literal]),
             },
         )
         .unwrap();
@@ -145,14 +210,18 @@ fn source_fixture() -> SourceFixture {
         value_type: int64(false),
         constant: None,
     }];
-    let function = scalar_binding("abs", &numeric_request);
+    let (function, later_selected) = scalar_binding(functions.metadata(), "abs", &numeric_request);
     let later_type = function.result_type.clone();
     let read = builder
-        .add_expression(project, int64(false), ExprKind::Value(key))
+        .unit(project)
+        .unwrap()
+        .add(None, int64(false), ExprKind::Value(key))
         .unwrap();
     let later = builder
-        .add_expression(
-            project,
+        .unit(project)
+        .unwrap()
+        .add(
+            None,
             function.result_type.clone(),
             ExprKind::FunctionCall {
                 function,
@@ -161,12 +230,22 @@ fn source_fixture() -> SourceFixture {
         )
         .unwrap();
 
+    let first_root = builder
+        .unit(project)
+        .unwrap()
+        .root(first, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let later_root = builder
+        .unit(project)
+        .unwrap()
+        .root(later, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let first_output = builder
         .add_value(
             first_type,
             ValueOrigin::Expr {
                 node: project,
-                expr: first,
+                root: first_root,
             },
         )
         .unwrap();
@@ -175,33 +254,22 @@ fn source_fixture() -> SourceFixture {
             later_type,
             ValueOrigin::Expr {
                 node: project,
-                expr: later,
+                root: later_root,
             },
         )
         .unwrap();
+    super::super::family_fixture::seal_no_call_units(&mut builder);
     builder
         .add_project(
             project,
             input,
-            Box::from([(first, first_output), (later, later_output)]),
+            Box::from([(first_root, first_output), (later_root, later_output)]),
             Box::from([first_output, later_output]),
-        )
-        .unwrap();
-    let fragment = builder
-        .finish_definition(
-            project,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let requests = vec![
         (
-            PhysicalCallDefinition::Expression(first),
+            first,
             PhysicalCallRequest {
                 arguments: Box::from([
                     StaticFunctionArgument::Value {
@@ -219,7 +287,7 @@ fn source_fixture() -> SourceFixture {
             },
         ),
         (
-            PhysicalCallDefinition::Expression(later),
+            later,
             PhysicalCallRequest {
                 arguments: Box::from([StaticFunctionArgument::Value {
                     value_type: int64(false),
@@ -231,20 +299,165 @@ fn source_fixture() -> SourceFixture {
             },
         ),
     ];
+    for (definition, request) in requests {
+        builder
+            .unit(project)
+            .unwrap()
+            .request(definition, request)
+            .unwrap();
+    }
+    let owners = BTreeMap::from([
+        (first, (first_selected, arguments.to_vec())),
+        (later, (later_selected, numeric_request.to_vec())),
+    ]);
+    for (&definition, (selected, _)) in &owners {
+        let function = match &builder
+            .construction_unit(project)
+            .unwrap()
+            .definition(definition)
+            .unwrap()
+            .kind
+        {
+            ExprKind::FunctionCall { function, .. } => function,
+            _ => panic!("actual scalar source"),
+        };
+        let declaration = functions
+            .metadata()
+            .pure_overload_declaration_observed(
+                &function.function_id,
+                FunctionKind::Scalar,
+                &selected.overload,
+                &FixtureControl,
+            )
+            .unwrap();
+        assert!(
+            declaration
+                .effects()
+                .argument_control
+                .matches_scalar_shape(ControlShape::Eager)
+        );
+        builder
+            .unit(project)
+            .unwrap()
+            .definition_control(
+                definition,
+                DefinitionControl {
+                    shape: ControlShape::Eager,
+                    temporal_sources: None,
+                },
+            )
+            .unwrap();
+    }
+    let ports = builder.node_ports(project).unwrap();
+    let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
+    let sealed = builder
+        .take_unit_builder(project)
+        .unwrap()
+        .seal(ports, &mut work)
+        .unwrap();
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let mut claims = BTreeMap::new();
+    for (&id, invocation) in sealed.uses() {
+        let Some((selected, original)) = owners.get(&invocation.definition) else {
+            continue;
+        };
+        let context = invocation.context;
+        let definition = sealed.definition(invocation.definition).unwrap();
+        let ExprKind::FunctionCall { function, .. } = &definition.kind else {
+            panic!("actual original scalar request")
+        };
+        // All ordinary arguments in this fixture are original constant or
+        // input leaves. Use the SDK's actual edges and context to compose them.
+        let mut children = ScopedExpressionEffects::pure_value(context);
+        for (ordinal, use_id) in invocation.arguments.iter().enumerate() {
+            let child = &sealed.uses()[use_id];
+            assert!(matches!(
+                sealed.definition(child.definition).unwrap().kind,
+                ExprKind::Constant(_) | ExprKind::Value(_)
+            ));
+            children = children
+                .join_control_argument(
+                    ScopedExpressionEffects::pure_value(child.context),
+                    sealed.control_flow(),
+                    ordinal,
+                )
+                .unwrap();
+        }
+        let uses = invocation
+            .arguments
+            .iter()
+            .map(|id| Some(*id))
+            .collect::<Vec<_>>();
+        let token = functions
+            .prepare_fresh(
+                CallEffectInput {
+                    context: context.into(),
+                    argument_uses: CallArgumentUses::SelectedChannels(&uses),
+                    function_id: &function.function_id,
+                    kind: FunctionKind::Scalar,
+                    selected: selected.as_ref(),
+                    request: FunctionBindingRequest {
+                        arguments: original,
+                        logical_argument_count: original.len(),
+                        expected_result_type: None,
+                    },
+                    environment: &[],
+                    parameters: &parameters,
+                    decimal_overflow_policy: POLICY,
+                    proof_scope: CallProofScope::Region(context.region),
+                },
+                selected.clone(),
+                PureCallPreparation::Scalar {
+                    arguments: children,
+                },
+                &FixtureControl,
+            )
+            .unwrap();
+        claims.insert(
+            id,
+            ExpressionCallClaim {
+                context,
+                effects: token.call_contract().effects().clone(),
+                decimal_overflow_policy: POLICY,
+                temporal_source: None,
+                regexp_count_pattern_source: None,
+                to_base64_byte_source: None,
+            },
+        );
+    }
+    let unit = sealed.finish(claims, &mut work).unwrap();
+    builder.install_unit(project, Arc::new(unit)).unwrap();
+    work.finish().unwrap();
+    let fragment = builder
+        .finish_definition(
+            project,
+            FragmentSink::Result,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
     SourceFixture {
-        fragment: fragment
-            .with_call_requests_observed(requests, &FixtureControl)
-            .unwrap(),
+        fragment,
         pools: pools.0,
         first,
         later,
         source,
+        project,
     }
 }
 
 fn source_count(fragment: &Fragment) -> usize {
     fragment.values().len()
-        + fragment.expressions().iter().count()
+        + fragment
+            .nodes()
+            .values()
+            .filter_map(|node| fragment.unit(node.id))
+            .map(|unit| unit.definitions().len() + unit.requests().len())
+            .sum::<usize>()
         + fragment.call_requests().entries().len()
 }
 
@@ -263,13 +476,18 @@ fn all_definition_source_preserves_actual_project_bindings_requests_and_typed_nu
                 FragmentDefinitionSource::Value { id, value } => {
                     assert!(std::ptr::eq(value, fragment.values().get(&id).unwrap()));
                 }
-                FragmentDefinitionSource::Expression { id, expression } => {
+                FragmentDefinitionSource::Expression {
+                    node,
+                    id,
+                    expression,
+                } => {
                     assert!(std::ptr::eq(
                         expression,
-                        fragment.expressions().get(id).unwrap()
+                        fragment.unit(node).unwrap().definition(id).unwrap()
                     ));
                     if let ExprKind::FunctionCall { function, .. } = &expression.kind {
                         calls.push((
+                            node,
                             id,
                             function.function_id.clone(),
                             function.overload.clone(),
@@ -278,17 +496,18 @@ fn all_definition_source_preserves_actual_project_bindings_requests_and_typed_nu
                         ));
                     }
                 }
-                FragmentDefinitionSource::Request {
+                FragmentDefinitionSource::ExpressionRequest {
+                    node,
                     definition,
                     request,
                 } => {
                     assert!(std::ptr::eq(
                         request,
-                        fragment.call_requests().get(definition).unwrap()
+                        &fragment.unit(node).unwrap().requests()[&definition]
                     ));
-                    definitions.push(definition);
+                    definitions.push((node, definition));
                     assert!(request.expected_result_type.is_none());
-                    if definition == PhysicalCallDefinition::Expression(fixture.first) {
+                    if node == fixture.project && definition == fixture.first {
                         assert_eq!(request.logical_argument_count, 2);
                         let StaticFunctionArgument::Value {
                             constant,
@@ -300,12 +519,15 @@ fn all_definition_source_preserves_actual_project_bindings_requests_and_typed_nu
                         assert_eq!(*constant, Some(fixture.source));
                         assert_eq!(*value_type, FunctionValueType::new(DataType::Utf8, true));
                     }
-                    if definition == PhysicalCallDefinition::Expression(fixture.later) {
+                    if node == fixture.project && definition == fixture.later {
                         assert!(matches!(
                             &request.arguments[0],
                             StaticFunctionArgument::Value { constant: None, .. }
                         ));
                     }
+                }
+                FragmentDefinitionSource::Request { .. } => {
+                    panic!("this scalar source has no relation request")
                 }
             }
             work.step()
@@ -313,13 +535,19 @@ fn all_definition_source_preserves_actual_project_bindings_requests_and_typed_nu
     )
     .unwrap();
     assert_eq!(
-        calls.iter().map(|call| call.0).collect::<Vec<_>>(),
-        [fixture.first, fixture.later]
+        calls
+            .iter()
+            .map(|call| (call.0, call.1))
+            .collect::<Vec<_>>(),
+        [
+            (fixture.project, fixture.first),
+            (fixture.project, fixture.later)
+        ]
     );
-    for (id, function, overload, arguments, result) in calls {
+    for (node, id, function, overload, arguments, result) in calls {
         let ExprKind::FunctionCall {
             function: original, ..
-        } = &fragment.expressions().get(id).unwrap().kind
+        } = &fragment.unit(node).unwrap().definition(id).unwrap().kind
         else {
             unreachable!()
         };
@@ -331,8 +559,8 @@ fn all_definition_source_preserves_actual_project_bindings_requests_and_typed_nu
     assert_eq!(
         definitions,
         [
-            PhysicalCallDefinition::Expression(fixture.first),
-            PhysicalCallDefinition::Expression(fixture.later),
+            (fixture.project, fixture.first),
+            (fixture.project, fixture.later),
         ]
     );
     let constant = fixture
@@ -396,7 +624,13 @@ fn all_definition_source_does_not_add_step_scope_or_success_footer() {
     assert_eq!(captures, source_count(&fixture.fragment));
     assert_eq!(*meter.events.lock().unwrap(), [0]);
     work.finish().unwrap();
-    assert_eq!(*meter.events.lock().unwrap(), [0, captures as u32]);
+    assert_eq!(
+        *meter.events.lock().unwrap(),
+        [
+            0,
+            u32::try_from(captures + fixture.fragment.nodes().len()).unwrap()
+        ]
+    );
 }
 
 #[test]
@@ -436,7 +670,13 @@ fn all_definition_source_first_control_cause_stops_every_callback_prefix() {
 
 #[test]
 fn all_definition_source_uses_real_unnest_relational_binding_author() {
-    let mut builder = FragmentBuilder::new(SOLE);
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            SOLE,
+            &fixture_sources,
+        );
     let mut pools = Pools::new();
     let input = builder.reserve_node_id().unwrap();
     let (key, lists) = values(
@@ -446,8 +686,17 @@ fn all_definition_source_uses_real_unnest_relational_binding_author() {
         &[(1, vec![Some(vec![Some(2)])])],
         1,
     );
-    let (table, _) = add_table_function(&mut builder, input, key, &lists, &Spec::unnest(false));
-    let fragment = finish(builder, table, FragmentSink::Result, 1);
+    let (table, _, source_call) =
+        add_table_function(&mut builder, input, key, &lists, &Spec::unnest(false));
+    let fragment = finish(
+        builder,
+        table,
+        FragmentSink::Result,
+        1,
+        BTreeMap::from([(table, source_call)]),
+        &pools.0,
+        &parameters(&Spec::unnest(false)),
+    );
     let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Encode).unwrap();
     let mut requests = Vec::new();
     visit_fragment_definitions_observed::<CompileControlError>(
@@ -474,7 +723,7 @@ fn all_definition_source_uses_real_unnest_relational_binding_author() {
                 panic!("real UNNEST table binding")
             };
             bindings.push((
-                PhysicalCallDefinition::Relational(site),
+                site,
                 function.argument_types.len(),
                 function.function_id.clone(),
                 function.overload.clone(),
@@ -594,7 +843,13 @@ fn all_definition_source_borrowed_type_encoder_keeps_nested_provider_and_nominal
 
 #[test]
 fn all_definition_source_original_publication_rejects_unreachable_definition() {
-    let mut builder = FragmentBuilder::new(SOLE);
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            SOLE,
+            &fixture_sources,
+        );
     let mut pools = Pools::new();
     let input = builder.reserve_node_id().unwrap();
     values(
@@ -604,28 +859,24 @@ fn all_definition_source_original_publication_rejects_unreachable_definition() {
         &[(1, vec![Some(vec![Some(2)])])],
         1,
     );
-    builder
-        .add_expression(
-            input,
-            int64(false),
-            ExprKind::Literal(LiteralValue::Int64(99)),
-        )
-        .unwrap();
-    let error = builder
-        .finish_definition(
-            input,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap_err();
+    let unreachable = builder.constant(
+        input,
+        int64(false),
+        crate::exec::operators::family_fixture::constant_sources::i64(99),
+    );
+    let ports = builder.node_ports(input).unwrap();
+    let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
+    let error = match builder
+        .take_unit_builder(input)
+        .unwrap()
+        .seal(ports, &mut work)
+    {
+        Ok(_) => panic!("original unreachable definition must be rejected"),
+        Err(error) => error,
+    };
     assert!(
-        error
-            .to_string()
-            .contains("expression arena contains definitions unreachable from operator roots")
+        matches!(error, novarocks_expression_contract::UnitError::Invalid {
+        definition: Some(actual), root: None, ref message
+    } if actual == unreachable && message == "definition is unreachable from all roots")
     );
 }

@@ -19,7 +19,7 @@ use novarocks_connector_contract::{
     ConnectorEncodedPayload, ConnectorReadBinding, ConnectorReadRelationPayload,
 };
 
-use crate::{ExprId, IdentityError, PhysicalProperties, ValueType, stable_identity};
+use crate::{IdentityError, PhysicalProperties, RootOrdinal, ValueType, stable_identity};
 
 pub use novarocks_connector_contract::ConnectorReadInputVersion as ExactInputVersion;
 
@@ -58,7 +58,7 @@ pub enum PredicateGuaranteeKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PredicateGuarantee {
-    pub predicate: ExprId,
+    pub predicate: RootOrdinal,
     pub kind: PredicateGuaranteeKind,
 }
 

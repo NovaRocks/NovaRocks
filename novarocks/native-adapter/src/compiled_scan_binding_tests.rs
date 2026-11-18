@@ -354,7 +354,7 @@ fn recipe(read: &FrozenConnectorRead) -> ConnectorReadProgramRecipe {
         .expect("the fixture provider seals its read")
 }
 
-fn layout() -> StaticLayout {
+pub(crate) fn layout() -> StaticLayout {
     let value = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
     let schema = Arc::new(Schema::new(vec![
         Field::new("v0", DataType::Int64, false),
@@ -423,26 +423,120 @@ fn bind_filtered(
     )
 }
 
-/// A blocking membership consumer site of `binding_id` over `v0`.
-fn consumer(binding_id: u32) -> FilterConsumerAtExpr {
-    use novarocks_local_program::{
-        FilterConsumerActivation, FilterNullSemantics, FilterReduction, ProgramExprId,
-        StaticFilterConsumer, StaticFilterContract,
-    };
-    FilterConsumerAtExpr {
-        expr_id: ProgramExprId::new(0),
-        consumer: StaticFilterConsumer::try_new(
-            binding_id,
-            7,
-            FilterConsumerActivation::BlockingSnapshot,
-            StaticFilterContract::membership(
-                &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-                FilterNullSemantics::NeverMatches,
-            )
-            .expect("membership contract"),
-            FilterReduction::SetUnion,
+/// The component binder consumes binding metadata. Keep its input root with
+/// the actual compiled unit from the same two-column test layout.
+pub(crate) struct ScanMembershipKey {
+    unit: Arc<novarocks_expression::CompiledExprSet>,
+    root: novarocks_local_program::ProgramRootRef,
+}
+
+impl ScanMembershipKey {
+    pub(crate) fn new(layout: &StaticLayout) -> Self {
+        use crate::backend_task_execution::execution_host::tests::compiled_package_host::{
+            constants, sealed_rand_subset,
+        };
+        use novarocks_expression::{
+            EvaluationEnvironment, ScopeColumn, ScopeLayout, ScopeLayouts, compile_expr_set_pure,
+        };
+        use novarocks_expression_contract::{
+            BoundExprSetBuilder, ExprKind, ExprPort, RootScope, UnitLimits, ValueId,
+        };
+        use novarocks_physical_plan::{ConstantPools, PlanLimits};
+        use novarocks_type_contract::{
+            EvaluationDemand, FunctionValueType, SemanticParameters, ValueTypeStorageLifetime,
+        };
+        let mut work = CompileCheckpoints::try_new(&Unbounded, CompilePhase::LowerProgram).unwrap();
+        let columns = layout
+            .slots()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| ScopeColumn {
+                value: ValueId::new(u32::try_from(index).unwrap()),
+                ordinal: u32::try_from(index).unwrap(),
+                ty: FunctionValueType::try_from_typed_binding(
+                    layout.value_binding_at(index).unwrap().clone(),
+                )
+                .unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let key = &columns[0];
+        let mut draft = BoundExprSetBuilder::new(UnitLimits {
+            expression_semantic_depth: PlanLimits::FROZEN.expression_semantic_depth,
+        });
+        let definition = draft
+            .add(None, key.ty.clone(), ExprKind::Value(key.value))
+            .unwrap();
+        let root = draft
+            .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
+        let port = ExprPort {
+            values: columns
+                .iter()
+                .map(|column| (column.value, column.ty.clone()))
+                .collect(),
+        };
+        let source = draft
+            .seal(vec![port], &mut work)
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        let scope = ScopeLayout::try_new(
+            Arc::clone(layout.schema()),
+            columns.iter().map(|column| column.ty.clone()).collect(),
+            Arc::from(columns),
+            ValueTypeStorageLifetime::pure(),
+            &mut work,
         )
-        .expect("blocking membership consumer"),
+        .unwrap();
+        let unit = compile_expr_set_pure(
+            &source,
+            EvaluationEnvironment {
+                constants: &ConstantPools::empty(),
+                parameters: &SemanticParameters::try_new([]).unwrap(),
+            },
+            ScopeLayouts {
+                ports: &[scope],
+                all_ports: None,
+            },
+            constants(),
+            &sealed_rand_subset(),
+            &mut work,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        let binding = unit.input(unit.root(root).unwrap().use_id).unwrap();
+        assert_eq!(binding.scope, RootScope::Port(0));
+        assert_eq!(binding.ordinal, 0);
+        let root = novarocks_local_program::ProgramRootRef::new(
+            novarocks_local_program::ProgramUnitId::new(0),
+            root,
+        );
+        Self { unit, root }
+    }
+
+    pub(crate) fn consumer(&self, binding_id: u32) -> FilterConsumerAtExpr {
+        use novarocks_local_program::{
+            FilterConsumerActivation, FilterNullSemantics, FilterReduction, StaticFilterConsumer,
+            StaticFilterContract,
+        };
+        let compiled = self.unit.root(self.root.root).unwrap();
+        let novarocks_type_contract::FunctionArgumentType::Value(ty) =
+            self.unit.types().get(compiled.definition.index()).unwrap()
+        else {
+            panic!("scan membership key has its complete value type");
+        };
+        FilterConsumerAtExpr {
+            expr_id: self.root,
+            consumer: StaticFilterConsumer::try_new(
+                binding_id,
+                7,
+                FilterConsumerActivation::BlockingSnapshot,
+                StaticFilterContract::membership(ty, FilterNullSemantics::NeverMatches)
+                    .expect("membership contract"),
+                FilterReduction::SetUnion,
+            )
+            .expect("blocking membership consumer"),
+        }
     }
 }
 
@@ -621,6 +715,8 @@ fn facts_about_a_column_assigned_twice_are_bound_at_its_first_ordinal() {
 // names exactly the scan's consumer binding of that filter.
 #[test]
 fn a_compiled_read_binds_dynamic_filters_that_match_its_consumer_bindings() {
+    let layout = layout();
+    let key = ScanMembershipKey::new(&layout);
     let runtime = test_support::typed_scan_runtime();
     let source = bind_filtered(
         &runtime,
@@ -629,9 +725,9 @@ fn a_compiled_read_binds_dynamic_filters_that_match_its_consumer_bindings() {
             TupleDomain::all(),
             vec![StaticScanDynamicFilter::new(7, Arc::from("v0"))],
         )),
-        &[consumer(3)],
+        &[key.consumer(3)],
         &scan_source_binding(),
-        &layout(),
+        &layout,
     )
     .expect("dynamic filter 7 is binding 3's");
     assert_eq!(source.profile_name().as_deref(), Some("TypedConnectorScan"));
@@ -642,6 +738,8 @@ fn a_compiled_read_binds_dynamic_filters_that_match_its_consumer_bindings() {
 
 #[test]
 fn dynamic_filters_that_do_not_match_the_consumer_bindings_are_refused_before_registration() {
+    let layout = layout();
+    let key = ScanMembershipKey::new(&layout);
     use crate::compiled_runtime_filter::CompiledRuntimeFilterBindingError as Refusal;
     let filtered = |filter_id| {
         recipe(&frozen_read(
@@ -661,19 +759,19 @@ fn dynamic_filters_that_do_not_match_the_consumer_bindings_are_refused_before_re
         // A dynamic filter of another filter than the site's binding.
         (
             filtered(8),
-            vec![consumer(3)],
+            vec![key.consumer(3)],
             Refusal::MissingDynamicConsumer { filter: 8 },
         ),
         // A scan-source consumer whose dynamic filter the read does not state.
         (
             unfiltered,
-            vec![consumer(3)],
+            vec![key.consumer(3)],
             Refusal::MissingFrozenDynamicFilter { filter: 7 },
         ),
         // A site binding the package does not number.
         (
             filtered(7),
-            vec![consumer(4)],
+            vec![key.consumer(4)],
             Refusal::UnnumberedScanBinding { binding: 4 },
         ),
     ] {
@@ -683,7 +781,7 @@ fn dynamic_filters_that_do_not_match_the_consumer_bindings_are_refused_before_re
             &recipe,
             &consumers,
             &scan_source_binding(),
-            &layout(),
+            &layout,
         ) {
             Ok(_) => panic!("the mismatched read must be refused"),
             Err(error) => error,
@@ -731,14 +829,11 @@ pub(crate) fn system_scan_producer_package() -> (Vec<u8>, u32) {
 }
 
 fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32) {
+    use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
     use novarocks_physical_plan::*;
     use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
     use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
-    use novarocks_type_contract::{
-        ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-        ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-        ExpressionInvocation, ExpressionUseId, control_argument_semantics,
-    };
+    use novarocks_type_contract::{DecimalOverflowPolicy, EvaluationDemand};
     use prost::Message;
 
     const PRODUCER: FragmentId = FragmentId::new(1);
@@ -773,22 +868,23 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    let column = builder
-        .add_expression(SCAN, int64(), ExprKind::Value(provider[0]))
+    let unit = builder.unit(SCAN).unwrap();
+    let column = unit
+        .add(None, int64(), ExprKind::Value(provider[0]))
         .unwrap();
     // The v2 encoder publishes literals only as checked constants: `7` is
     // the one row of its own pool.
     let pool = ConstantPoolId::new(7007);
-    let literal = builder
-        .add_expression(
-            SCAN,
+    let literal = unit
+        .add(
+            None,
             int64(),
             ExprKind::Constant(ConstantReference { pool, ordinal: 0 }),
         )
         .unwrap();
-    let residual = builder
-        .add_expression(
-            SCAN,
+    let comparison = unit
+        .add(
+            None,
             ValueType::new(DataType::Boolean, false),
             ExprKind::Binary {
                 left: column,
@@ -798,6 +894,9 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
                 allow_throw_exception: None,
             },
         )
+        .unwrap();
+    let residual = unit
+        .root(comparison, EvaluationDemand::TruthOnly, RootScope::Port(0))
         .unwrap();
     builder
         .add_scan(
@@ -879,7 +978,6 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
         max: 1,
         requires_power_of_two: false,
     };
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     // Explicit fixture admission; these values are not production defaults.
     let constants = novarocks_functions::ConstantPolicy {
         max_rows: 16,
@@ -893,6 +991,18 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
     };
+    let ports = builder.node_ports(SCAN).unwrap();
+    let mut work = CompileCheckpoints::try_new(&Unbounded, CompilePhase::Validate).unwrap();
+    let unit = builder
+        .take_unit_builder(SCAN)
+        .unwrap()
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    builder.install_unit(SCAN, Arc::new(unit)).unwrap();
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap(), constants);
     plan.insert_constant_pool(
         pool,
         ConstantPool::try_new(
@@ -1005,87 +1115,9 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
     .unwrap();
     let plan = plan.finish_observed(&Unbounded).unwrap();
 
-    // One complete eager use tree per physical root site in one root domain.
-    fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
-        struct Author<'a> {
-            fragment: &'a Fragment,
-            next: u32,
-            uses: Vec<ExpressionInvocation<ExprId>>,
-        }
-        impl Author<'_> {
-            fn visit(&mut self, expr: ExprId, demand: EvaluationDemand) -> ExpressionUseId {
-                let id = ExpressionUseId::new(self.next);
-                self.next += 1;
-                let args = match &self.fragment.expressions().get(expr).unwrap().kind {
-                    ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                    ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
-                    _ => panic!("the scan fixture has only comparisons, values and constants"),
-                };
-                let arguments = args
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, &child)| {
-                        let (child_demand, guard) = control_argument_semantics(
-                            ControlShape::Eager,
-                            args.len(),
-                            ordinal,
-                            demand,
-                        )
-                        .unwrap();
-                        assert!(guard.is_none());
-                        self.visit(child, child_demand)
-                    })
-                    .collect::<Box<[_]>>();
-                self.uses.push(ExpressionInvocation {
-                    context: ExpressionEffectContext {
-                        use_id: id,
-                        domain: EvaluationDomainId::new(0),
-                        demand,
-                    },
-                    definition: expr,
-                    control: ControlShape::Eager,
-                    arguments,
-                });
-                id
-            }
-        }
-        let roots = PhysicalExpressionRoots::try_new(fragment, &Unbounded).unwrap();
-        let mut author = Author {
-            fragment,
-            next: 0,
-            uses: vec![],
-        };
-        let bindings = roots
-            .sites()
-            .iter()
-            .map(|(&site, root)| (site, author.visit(root.expr, root.demand)))
-            .collect();
-        let flow = ExpressionControlFlow::<ExprId>::try_new(
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
-                parent: None,
-                guard: None,
-            }],
-            author.uses,
-            fragment.expressions(),
-            CompilePhase::Validate,
-            &Unbounded,
-        )
-        .unwrap();
-        PhysicalRootUses::try_new(fragment, flow, bindings, &Unbounded).unwrap()
-    }
-
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let root_uses = root_uses(fragment);
-        calls.insert(
-            id,
-            FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &Unbounded).unwrap(),
-        );
-        uses.insert(id, root_uses);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &Unbounded).unwrap(),
@@ -1112,8 +1144,6 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
         &plan,
         &scans,
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &Unbounded,

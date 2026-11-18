@@ -5349,6 +5349,8 @@ mod tests {
                         Err(error) => panic!("accept S3 request: {error}"),
                     }
                 };
+                // The accepted socket can inherit nonblocking mode from its listener.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();

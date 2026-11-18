@@ -104,6 +104,7 @@ fn properties() -> PhysicalProperties {
 fn node(id: u32, kind: NodeKind) -> PhysicalNode {
     let id = NodeId::new(id);
     PhysicalNode {
+        expressions: None,
         id,
         inputs: Box::default(),
         required_inputs: Box::default(),
@@ -126,7 +127,274 @@ fn schema() -> WriterRelationSchema {
         }]),
     }
 }
-fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
+// This is an uninstalled resource fixture, never an implementation grant.
+struct UnitControl;
+impl PureCompileControl for UnitControl {
+    fn checkpoint(&self, _phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+        assert!(units <= 256);
+        Ok(())
+    }
+}
+fn fixture_policy() -> novarocks_constant_contract::ConstantPolicy {
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 1024,
+        max_array_nodes: 4096,
+        max_logical_elements: 1_000_000,
+        max_retained_buffer_bytes: 16_777_216,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 16,
+        max_metadata_bytes: 1_048_576,
+        max_library_validation_work: 67_108_864,
+        max_library_validation_bytes: 67_108_864,
+    }
+}
+// The original fixture producer records the retained control constructor's
+// actual public requests. This is a quote of source geometry, not an SDK
+// capacity inference or a runtime grant. Temporary requests are kept separate.
+#[derive(Default)]
+struct SourceQuote {
+    bytes: usize,
+}
+impl novarocks_type_contract::ValueSchemaCreationScope<std::convert::Infallible> for SourceQuote {
+    fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        novarocks_type_contract::ValueTypeStorageLifetime::pure()
+    }
+    fn request_layout(&mut self, layout: Layout) -> Result<(), std::convert::Infallible> {
+        self.bytes = self.bytes.checked_add(layout.size()).unwrap();
+        Ok(())
+    }
+    fn observe_opaque_upper_bound(&mut self, bytes: usize) -> Result<(), std::convert::Infallible> {
+        self.bytes = self.bytes.checked_add(bytes).unwrap();
+        Ok(())
+    }
+}
+struct Definitions(usize);
+impl novarocks_type_contract::ExpressionDefinitionMembership<ExprId> for Definitions {
+    fn definition_count(&self) -> usize {
+        self.0
+    }
+    fn contains_definition(&self, id: ExprId) -> bool {
+        (id.get() as usize) < self.0
+    }
+}
+fn checked_scalar_unit() -> (
+    std::sync::Arc<novarocks_expression_contract::BoundExprSet>,
+    ConstantPools,
+    usize,
+) {
+    use novarocks_expression_contract::{
+        BoundExprSet, BoundExprSetBuilder, DefinitionControl, ExpressionCallClaim,
+        PhysicalCallRequest, RootScope, UnitLimits,
+    };
+    use novarocks_type_contract::{
+        ArgumentControl, CallEffects, CallProofScope, ControlShape, EvaluationDemand,
+        FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError,
+        FunctionNullBehavior, FunctionVolatility, ObservableEffects,
+    };
+    let policy = fixture_policy();
+    let value = novarocks_constant_contract::ConstantValue::from_i64(
+        std::sync::Arc::new(arrow_schema::Field::new("source", DataType::Int64, false)),
+        ty(),
+        11,
+        policy,
+        CompilePhase::Validate,
+        &UnitControl,
+    )
+    .unwrap();
+    let reference = ConstantReference {
+        pool: ConstantPoolId::new(77),
+        ordinal: value.ordinal(),
+    };
+    let mut pools = ConstantPools::empty();
+    pools.insert(reference.pool, value.pool().clone()).unwrap();
+    let mut builder = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: novarocks_type_contract::MAX_CONTROL_DEPTH,
+    });
+    let lambda = builder.reserve().unwrap();
+    let body = builder
+        .add(
+            Some(lambda),
+            ty(),
+            ExprKind::LambdaParameter { lambda, ordinal: 0 },
+        )
+        .unwrap();
+    builder
+        .insert(
+            lambda,
+            None,
+            ty(),
+            ExprKind::Lambda {
+                parameter_types: Box::new([ty(), ty()]),
+                body,
+            },
+        )
+        .unwrap();
+    let argument = builder
+        .add(None, ty(), ExprKind::Constant(reference))
+        .unwrap();
+    let call_function = function(FunctionKind::Scalar, true);
+    let mut source = function_heap(&call_function) + 2 * size_of::<ValueType>();
+    let original = PhysicalCallRequest {
+        arguments: Box::new([
+            novarocks_function_contract::FunctionArgument::Value {
+                value_type: ty(),
+                constant: Some(reference),
+            },
+            novarocks_function_contract::FunctionArgument::Lambda {
+                parameter_types: match &call_function.argument_types[1] {
+                    FunctionArgumentType::Lambda {
+                        parameter_types, ..
+                    } => parameter_types.clone(),
+                    _ => unreachable!(),
+                },
+                result_type: ty(),
+            },
+        ]),
+        logical_argument_count: 2,
+        expected_result_type: None,
+        constant_policy: policy,
+    };
+    let call = builder
+        .add(
+            None,
+            ty(),
+            ExprKind::FunctionCall {
+                function: call_function,
+                args: Box::new([argument, lambda]),
+            },
+        )
+        .unwrap();
+    builder.request(call, original).unwrap();
+    builder
+        .definition_control(
+            call,
+            DefinitionControl {
+                shape: ControlShape::HigherOrder {
+                    body_ordinal: 1,
+                    body_demand: EvaluationDemand::Value,
+                },
+                temporal_sources: None,
+            },
+        )
+        .unwrap();
+    let cast = builder
+        .add(
+            None,
+            ValueType::new(DataType::Int32, false),
+            ExprKind::Cast {
+                expr: call,
+                target: DataType::Int32,
+                decimal_overflow_policy:
+                    novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+                allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
+                    id: novarocks_type_contract::SemanticParameterId::new(0),
+                    expected_key:
+                        novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+                },
+            },
+        )
+        .unwrap();
+    builder
+        .root(call, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    builder
+        .root(cast, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let mut work = CompileCheckpoints::try_new(&UnitControl, CompilePhase::Validate).unwrap();
+    let sealed = builder.seal(vec![], &mut work).unwrap();
+    let claims = sealed
+        .uses()
+        .iter()
+        .filter(|(_, invocation)| invocation.definition == call)
+        .map(|(&use_id, invocation)| {
+            (
+                use_id,
+                ExpressionCallClaim {
+                    context: invocation.context,
+                    effects: CallEffects {
+                        value_stability: FunctionVolatility::Immutable,
+                        own_row_error: FunctionIntrinsicRowError::NoRowError,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        null_behavior: FunctionNullBehavior::CalledOnNull,
+                        argument_control: ArgumentControl::HigherOrder {
+                            body_ordinal: 1,
+                            body_demand: EvaluationDemand::Value,
+                        },
+                        instance_state: FunctionInstanceState::None,
+                        observable_effects: ObservableEffects::NONE,
+                        environment: Box::default(),
+                        proof_scope: CallProofScope::Region(invocation.context.region),
+                    },
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+                    temporal_source: None,
+                    regexp_count_pattern_source: None,
+                    to_base64_byte_source: None,
+                },
+            )
+        })
+        .collect();
+    let unit = sealed.finish(claims, &mut work).unwrap();
+    work.finish().unwrap();
+    assert_eq!(unit.definitions().len(), 5);
+    assert_eq!(unit.roots().len(), 2);
+    assert_eq!(unit.requests().len(), 1);
+    assert_eq!(unit.claims().len(), 2);
+    // Replace only the pure producer's control container, through that same
+    // real control constructor. Its retained requests quote private headers;
+    // no private layout is reconstructed in this consumer fixture.
+    let mut parts = unit.into_parts();
+    let mut temporary = SourceQuote::default();
+    let mut retained = SourceQuote::default();
+    let mut work = CompileCheckpoints::try_new(&UnitControl, CompilePhase::Validate).unwrap();
+    parts.control = novarocks_type_contract::ExpressionControlFlow::try_new_with_creator_in(
+        parts.control.regions().values().copied().collect(),
+        parts.control.uses().values().cloned().collect(),
+        &Definitions(parts.definitions.len()),
+        &mut temporary,
+        &mut retained,
+        &mut work,
+    )
+    .unwrap();
+    source += retained.bytes;
+    // Actual owned argument boxes were supplied to the control constructor.
+    source += parts
+        .control
+        .uses()
+        .values()
+        .map(|u| u.arguments.len() * size_of::<novarocks_type_contract::ExpressionUseId>())
+        .sum::<usize>();
+    source += parts.definitions.len() * size_of::<ExprNode>()
+        + parts.roots.len() * size_of::<novarocks_expression_contract::ExprRoot>()
+        + parts.root_uses.len() * size_of::<novarocks_type_contract::ExpressionUseId>();
+    source +=
+        btree::insertion_only::<novarocks_type_contract::ExpressionUseId, ExpressionCallClaim>(
+            parts.claims.len(),
+        )
+        .unwrap()
+        .request_bytes_upper_bound;
+    source += btree::insertion_only::<ExprId, PhysicalCallRequest>(parts.requests.len())
+        .unwrap()
+        .request_bytes_upper_bound;
+    source += 2 * size_of::<novarocks_function_contract::FunctionArgument<ConstantReference>>();
+    source +=
+        novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<BoundExprSet>())
+            .unwrap()
+            .size();
+    let unit = BoundExprSet::try_from_parts_in(
+        parts,
+        UnitLimits {
+            expression_semantic_depth: novarocks_type_contract::MAX_CONTROL_DEPTH,
+        },
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    (std::sync::Arc::new(unit), pools, source)
+}
+
+fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, ConstantPools, usize) {
     let mut values = BTreeMap::new();
     for ordinal in 0..width {
         let id = ValueId::new(ordinal);
@@ -146,7 +414,6 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
             },
         );
     }
-    let mut expressions = ExprArena::default();
     let mut nodes = BTreeMap::new();
     nodes.insert(
         NodeId::new(0),
@@ -158,48 +425,14 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
         ),
     );
     let mut heap = 0;
+    let mut pools = ConstantPools::empty();
     if rich {
-        // These are exact resource-law fixtures, not installed capability/effect proofs.
-        let call = function(FunctionKind::Scalar, true);
-        heap += function_heap(&call);
-        expressions.insert(ExprNode {
-            id: ExprId::new(0),
-            owner: NodeId::new(0),
-            lambda_scope: None,
-            ty: ty(),
-            kind: ExprKind::FunctionCall {
-                function: call,
-                args: Box::default(),
-            },
-        });
-        heap += 2 * size_of::<ValueType>();
-        expressions.insert(ExprNode {
-            id: ExprId::new(1),
-            owner: NodeId::new(0),
-            lambda_scope: None,
-            ty: ty(),
-            kind: ExprKind::Lambda {
-                parameter_types: Box::from([ty(), ty()]),
-                body: ExprId::new(0),
-            },
-        });
-        expressions.insert(ExprNode {
-            id: ExprId::new(2),
-            owner: NodeId::new(0),
-            lambda_scope: None,
-            ty: ty(),
-            kind: ExprKind::Cast {
-                expr: ExprId::new(0),
-                target: DataType::Int32,
-                decimal_overflow_policy:
-                    novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
-                    id: novarocks_type_contract::SemanticParameterId::new(0),
-                    expected_key:
-                        novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-                },
-            },
-        });
+        // Only the outer relation fixture isolates resource laws; every
+        // installed expression unit is genuinely sealed and type-correct.
+        let (unit, actual_pools, unit_source) = checked_scalar_unit();
+        pools = actual_pools;
+        heap += unit_source;
+        nodes.get_mut(&NodeId::new(0)).unwrap().expressions = Some(unit);
         let aggregate = binding();
         heap += binding_heap(&aggregate) + size_of::<AggregateCall>();
         nodes.insert(
@@ -277,38 +510,50 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
                 }),
             ),
         );
-        let call = function(FunctionKind::Window, false);
+        // Aggregate OVER is an actual WindowCallSpec, never a scalar ExprKind.
         let aggregate = binding();
-        heap += function_heap(&call) + binding_heap(&aggregate) + size_of::<AggregateBinding>();
-        expressions.insert(ExprNode {
-            id: ExprId::new(3),
-            owner: NodeId::new(0),
-            lambda_scope: None,
-            ty: ty(),
-            kind: ExprKind::WindowCall {
-                function: call,
-                distinct: false,
-                args: Box::default(),
-                function_order_by: Box::default(),
-                frame: None,
-                ignore_nulls: false,
-                aggregate_binding: Some(Box::new(aggregate)),
-            },
-        });
+        let call = aggregate.function.clone();
+        // The binding's shared signature metadata is one source; the window
+        // owns its independent boxed aggregate descriptor and call array.
+        heap +=
+            binding_heap(&aggregate) + size_of::<AggregateBinding>() + size_of::<WindowCallSpec>();
+        nodes.insert(
+            NodeId::new(4),
+            node(
+                4,
+                NodeKind::Window(WindowSpec {
+                    partition_by: Box::default(),
+                    order_by: Box::default(),
+                    calls: Box::new([WindowCallSpec {
+                        binding: call,
+                        distinct: false,
+                        arguments: Box::default(),
+                        order_by: Box::default(),
+                        frame: None,
+                        ignore_nulls: false,
+                        aggregate_binding: Some(Box::new(aggregate)),
+                        output: ValueId::new(0),
+                    }]),
+                }),
+            ),
+        );
     }
+
     // These maps are actually fresh insertion-only sources. The sole locked
     // BTree bound funds their backing, not a private retained-capacity guess.
     let source = size_of::<Fragment>()
         + novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
-            BTreeMap<PhysicalCallDefinition, PhysicalCallRequest>,
+            BTreeMap<PhysicalCallSite, PhysicalCallRequest>,
+        >())
+        .unwrap()
+        .size()
+        + novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
+            BTreeMap<PhysicalCallSite, FrozenPhysicalCall>,
         >())
         .unwrap()
         .size()
         + heap
         + btree::insertion_only::<ValueId, ValueDef>(values.len())
-            .unwrap()
-            .request_bytes_upper_bound
-        + btree::insertion_only::<ExprId, ExprNode>(expressions.len())
             .unwrap()
             .request_bytes_upper_bound
         + btree::insertion_only::<NodeId, PhysicalNode>(nodes.len())
@@ -320,7 +565,6 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
         id: FragmentId::new(7),
         root: NodeId::new(0),
         values,
-        expressions,
         nodes,
         sink: FragmentSink::Noop,
         dop_domain: PipelineDopDomain {
@@ -330,8 +574,9 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
         },
         runtime_filters: Box::default(),
         call_requests: FragmentCallRequests::unpublished_empty(FragmentId::new(7)),
+        calls: FrozenFragmentCalls::unpublished_empty(FragmentId::new(7)),
     });
-    (fragment, source)
+    (fragment, pools, source)
 }
 fn function_heap(function: &BoundFunction) -> usize {
     function.function_id.as_str().len()
@@ -401,18 +646,20 @@ fn assert_primitives(facts: ControlOwnedResourceFacts, data_roots: usize, logica
 
 #[test]
 fn actual_fragment_call_lambda_cast_window_aggregate_table_and_writer_types_keep_occurrences() {
-    let (fragment, source) = fragment(1, true, false);
+    let (fragment, _pools, source) = fragment(1, true, false);
     let actual = run_fragment(&fragment, source, &Control::default()).unwrap();
     assert_plain(&fragment, &actual);
     assert!(actual.errors.is_empty());
-    // Value1 + scalar6 + Lambda3 + Cast2 + Window6 + Aggregate3 + Table5 + Finish5.
-    // Cast's target consumes only Arrow law; its Expr type consumes both laws.
-    assert_primitives(actual.facts, 31, 30);
+    // Value1 + checked unit13 + Window5 + Aggregate3 + Table5 + Finish5.
+    // Unit: Lambda3 + real body1 + actual constant1 + scalar6 + Cast2.
+    // WindowCallSpec has no fake expression-result FVT; its binding has two
+    // occurrences and aggregate binding has three. Cast target is Arrow only.
+    assert_primitives(actual.facts, 32, 31);
 }
 
 #[test]
 fn actual_wide_fragment_preserves_all_320_original_value_type_occurrences() {
-    let (fragment, source) = fragment(320, false, false);
+    let (fragment, _pools, source) = fragment(320, false, false);
     let actual = run_fragment(&fragment, source, &Control::default()).unwrap();
     assert_plain(&fragment, &actual);
     assert_primitives(actual.facts, 320, 320);
@@ -518,7 +765,7 @@ fn cuts_source(cuts: &FragmentCuts) -> usize {
 }
 #[test]
 fn actual_cuts_keep_inbound_writer_and_both_outbound_type_occurrences_and_filter() {
-    let (fragment, fragment_source) = fragment(0, false, false);
+    let (fragment, _pools, fragment_source) = fragment(0, false, false);
     let cuts = cuts();
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
@@ -550,7 +797,7 @@ fn actual_cuts_keep_inbound_writer_and_both_outbound_type_occurrences_and_filter
 #[test]
 fn each_actual_small_fragment_type_variant_callback_keeps_caller_cause() {
     for bad in [false, true] {
-        let (fragment, source) = fragment(1, false, bad);
+        let (fragment, _pools, source) = fragment(1, false, bad);
         let control = Control::default();
         let actual = run_fragment(&fragment, source, &control).unwrap();
         assert_plain(&fragment, &actual);
@@ -574,7 +821,7 @@ fn each_actual_small_fragment_type_variant_callback_keeps_caller_cause() {
 
 #[test]
 fn original_type_request_in_fragment_cuts_and_filter_wins_before_actual_pending_late_controls() {
-    let (fragment, fragment_source) = fragment(1, false, false);
+    let (fragment, _pools, fragment_source) = fragment(1, false, false);
     let cuts = cuts();
     let filter = filter();
     for route in 0..3 {
@@ -686,7 +933,7 @@ fn actual_scan_relation_schema_and_ordered_runtime_filter_use_the_same_type_auth
         predicate_guarantees: Box::default(),
         provided_properties: properties(),
     });
-    let (base, base_source) = fragment(0, false, false);
+    let (base, _pools, base_source) = fragment(0, false, false);
     let mut parts = base.into_parts();
     parts.nodes.insert(
         NodeId::new(0),
@@ -764,7 +1011,7 @@ fn actual_scan_relation_schema_and_ordered_runtime_filter_use_the_same_type_auth
 
 #[test]
 fn actual_fragment_three_numeric_axes_accept_exact_snapshot_and_refuse_one_under() {
-    let (fragment, source) = fragment(1, true, false);
+    let (fragment, _pools, source) = fragment(1, true, false);
     let complete = run_fragment(&fragment, source, &Control::default())
         .unwrap()
         .facts;

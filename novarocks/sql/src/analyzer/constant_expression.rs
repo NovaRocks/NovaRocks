@@ -27,22 +27,16 @@ use arrow::datatypes::DataType;
 use novarocks_functions::FunctionVolatility;
 use novarocks_parser::ast::Visit;
 use novarocks_parser::{Span, ast};
-use novarocks_physical_plan::PipelineDopDomain;
 use novarocks_type_contract::{CompilePhase, FunctionValueType, PureCompileControl, ValueKind};
 
 use crate::compiler::{
     PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
-    RequiredConstantTarget, SqlCompileError,
+    RequiredConstantTarget, SqlAuthoredScalarUnit, SqlCompileError,
 };
-use crate::planner::{
-    distributed::build::{SqlPublicationError, lower_final_physical_plan_with_root_semantics},
-    payload::{PlanProjectNode, PlanValuesNode},
-    physical::{PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlannerConfidence},
-};
+use crate::planner::distributed::build::lower_required_constant_unit;
 use crate::{
-    analysis::{ExprKind, ProjectItem, TypedExpr},
+    analysis::{ExprKind, TypedExpr},
     analyze_error::AnalyzeError,
-    common::OutputColumn,
 };
 
 pub(crate) fn prepare(
@@ -57,7 +51,6 @@ pub(crate) fn prepare(
         sql_semantics,
         constant_policy,
         control,
-        version,
     } = request;
     control.check()?;
     let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
@@ -119,88 +112,27 @@ pub(crate) fn prepare(
         constant_policy,
         control,
     )?;
-    let value_type = expression.value_type.clone();
     let original_value = match &expression.kind {
         ExprKind::Constant(value) => Some(value.clone()),
         _ => None,
     };
-    let column_id = context.alloc_column_id(None, "value".into(), value_type.clone());
-    let column = OutputColumn {
-        column_id,
-        name: "value".into(),
-        value_type: value_type.clone(),
-        is_internal: false,
-    };
-    let stats = || PhysicalPlanStats {
-        output_row_count: 1.0,
-        row_count_confidence: PlannerConfidence::Exact,
-        column_statistics: HashMap::new(),
-        cost_estimate: None,
-        broadcast_decision: None,
-    };
-    let input = PhysicalPlanNode {
-        kind: PhysicalPlanKind::Values(PlanValuesNode {
-            rows: vec![vec![]],
-            columns: vec![],
-        }),
-        children: vec![],
-        output_columns: vec![],
-        stats: stats(),
-        probe_runtime_filters: vec![],
-    };
-    let plan = PhysicalPlanNode {
-        kind: PhysicalPlanKind::Project(PlanProjectNode {
-            items: vec![ProjectItem {
-                expr: expression,
-                output_name: "value".into(),
-                output_column_id: column_id,
-            }],
-            output_qualifier: None,
-        }),
-        children: vec![input],
-        output_columns: vec![column],
-        stats: stats(),
-        probe_runtime_filters: vec![],
-    };
-    let semantics = crate::compiler::root_output::RootOutputSemantics::from_declared_names(
-        &plan.output_columns,
-        Box::from([Some("value".into())]),
-    )
-    .map_err(SqlCompileError::Compilation)?
-    .with_analysis_span(span);
     drop(context);
-    // This is a local one-row expression domain, not a backend topology fact.
-    let draft = lower_final_physical_plan_with_root_semantics(
-        &plan,
-        version,
-        PipelineDopDomain {
-            min: 1,
-            max: 1,
-            requires_power_of_two: false,
-        },
-        None,
-        semantics,
-        functions,
-        sql_semantics.sql_mode().allow_throw_exception(),
-        constant_policy,
-        control,
-    )
-    .map_err(required_lowering_error)?;
-    let source = draft
-        .finish_with_dependency_observer_observed(control)
-        .map_err(|error| match error {
-            SqlPublicationError::Construction(
-                novarocks_physical_plan::PlanConstructionError::Constants(
-                    novarocks_physical_plan::ConstantReferenceError::Control(cause),
-                ),
-            ) => SqlCompileError::from(cause),
-            SqlPublicationError::Construction(error) => SqlCompileError::CompilationSource(
-                novarocks_failure_contract::SharedFailureCause::new(RequiredConstructionFailure(
-                    error,
-                )),
-            ),
-            SqlPublicationError::Support(error) => error.into_compile_error(),
-        })?;
+    let source = SqlAuthoredScalarUnit::from_emission(
+        lower_required_constant_unit(
+            &expression,
+            functions,
+            sql_semantics.sql_mode().allow_throw_exception(),
+            constant_policy,
+            control,
+        )
+        .map_err(required_lowering_error)?,
+    );
+    // This is the actual completed scalar source. Required preparation never
+    // enters optional folding or constructs a physical plan for observation.
+    if let Some(observer) = control.fold_dependency_observer() {
+        observer.observe_required_scalar_source_observed(&source, control)?;
+    }
+    let value_type = source.value_type().clone();
     control.check()?;
     Ok(PreparedRequiredConstant {
         source,
@@ -218,6 +150,9 @@ fn required_lowering_error(
     use crate::planner::distributed::build::ContractLoweringError as E;
     match error {
         E::Control(cause) => cause.into(),
+        E::Unit(cause) => SqlCompileError::CompilationSource(
+            novarocks_failure_contract::SharedFailureCause::new(cause),
+        ),
         E::LogicalCallSource(crate::binding::LogicalCallArgumentCaptureError::Control(cause)) => {
             cause.into()
         }
@@ -244,6 +179,7 @@ impl std::error::Error for RequiredLoweringFailure {
             E::ComparisonCoercion(cause) => cause,
             E::ConstantSource(cause) => cause,
             E::CallRequests(cause) => cause,
+            E::Unit(cause) => cause,
             E::Control(cause) => cause,
             E::LogicalCallSource(cause) => cause,
             E::AggregateSource(cause) => cause,
@@ -258,44 +194,18 @@ impl novarocks_failure_contract::FailureProjection for RequiredLoweringFailure {
         use crate::planner::distributed::build::ContractLoweringError as E;
         match &self.0 {
             E::Control(cause) => cause.failure_fact(),
+            E::FunctionBinding(cause) => cause.failure_fact(),
+            E::Semantics(cause) => cause.failure_fact(),
             E::ComparisonCoercion(cause) => cause.failure_fact(),
             E::ConstantSource(cause) => cause.failure_fact(),
             E::CallRequests(cause) => cause.failure_fact(),
+            E::Unit(cause) => cause.failure_fact(),
             E::UnsupportedWaitCycle(cause) => cause.failure_fact(),
             E::UnsupportedExpression { .. } | E::UnsupportedNode { .. } => {
                 PackageSemanticsError::UnsupportedCapability(String::new()).failure_fact()
             }
             _ => PackageSemanticsError::InvalidSource("required expression lowering invariant")
                 .failure_fact(),
-        }
-    }
-}
-#[derive(Debug)]
-struct RequiredConstructionFailure(novarocks_physical_plan::PlanConstructionError);
-impl std::fmt::Display for RequiredConstructionFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-impl std::error::Error for RequiredConstructionFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(match &self.0 {
-            novarocks_physical_plan::PlanConstructionError::Requests(cause) => cause,
-            novarocks_physical_plan::PlanConstructionError::Constants(cause) => cause,
-            novarocks_physical_plan::PlanConstructionError::Structure(cause) => cause,
-        })
-    }
-}
-impl novarocks_failure_contract::FailureProjection for RequiredConstructionFailure {
-    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        match &self.0 {
-            novarocks_physical_plan::PlanConstructionError::Requests(cause) => cause.failure_fact(),
-            novarocks_physical_plan::PlanConstructionError::Constants(cause) => {
-                cause.failure_fact()
-            }
-            novarocks_physical_plan::PlanConstructionError::Structure(cause) => {
-                cause.failure_fact()
-            }
         }
     }
 }

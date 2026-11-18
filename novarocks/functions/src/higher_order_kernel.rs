@@ -212,15 +212,21 @@ fn specialize_once_core<
             0,
         )
         .map_err(FunctionSpecializationFailure::Control)?;
+    let context = input
+        .context
+        .expression()
+        .ok_or(FunctionSpecializationFailure::InvalidInput(
+            "higher-order preparation requires its exact scalar context",
+        ))?;
     let ordinary = options
         .arguments
-        .for_use(input.context)
+        .for_use(context)
         .map_err(FunctionSpecializationFailure::Effects)?;
     let body_effects = options
         .body_effects
         .for_use(options.body_context)
         .map_err(FunctionSpecializationFailure::Effects)?;
-    let children = ScopedExpressionEffects::primitive(input.context, ordinary.join(body_effects));
+    let children = ScopedExpressionEffects::primitive(context, ordinary.join(body_effects));
     let (receipt, effects) = refine(children)?;
     let contract = Arc::new(
         HigherOrderCallContract::from_refined(input, &receipt, selected, control)

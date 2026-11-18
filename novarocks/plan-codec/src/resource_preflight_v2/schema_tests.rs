@@ -254,6 +254,7 @@ fn closed_public_model_uses_the_canonical_fragment_root_dimensions() {
 }
 
 static INVALID_ROOT: ObjectLayout = ObjectLayout {
+    reserved: &[],
     schema_id: "fixture.mismatched_root",
     kind: ObjectKind::Message,
     size: 0,
@@ -282,5 +283,134 @@ fn private_schema_builder_refuses_inconsistent_or_unregistered_root_identity() {
     assert!(matches!(
         schema::build::<UnregisteredRoot>(&mut work),
         Err(ResourceModelError::Schema(_))
+    ));
+}
+
+#[test]
+fn retired_ranges_are_rejected_at_their_exact_generated_message_after_prost() {
+    use crate::physical_package_v2::{
+        PackageDecodeLimits, PackageWireError, prepare_package_wire_in,
+    };
+    use prost::{
+        Message,
+        encoding::{WireType, encode_key, encode_varint},
+    };
+    struct DecodeControl;
+    impl PureCompileControl for DecodeControl {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert!(units <= 256);
+            Ok(())
+        }
+    }
+    fn ld(tag: u32, payload: &[u8]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        encode_key(tag, WireType::LengthDelimited, &mut raw);
+        encode_varint(payload.len() as u64, &mut raw);
+        raw.extend_from_slice(payload);
+        raw
+    }
+    fn at_path(path: &[u32], tag: u32) -> Vec<u8> {
+        let mut raw = Vec::new();
+        encode_key(tag, WireType::Varint, &mut raw);
+        encode_varint(0, &mut raw);
+        for &parent in path.iter().rev() {
+            raw = ld(parent, &raw);
+        }
+        raw
+    }
+    let model = FragmentDecodeResourceModel::try_new(&OriginalScope::default()).unwrap();
+    let mut paths = vec![None; model.schema.objects.len()];
+    paths[model.schema.root] = Some(Vec::new());
+    let mut pending = vec![model.schema.root];
+    while let Some(index) = pending.pop() {
+        for (&tag, field) in &model.schema.objects[index].fields {
+            if let Some(child) = field.message
+                && paths[child].is_none()
+            {
+                let mut path = paths[index].as_ref().unwrap().clone();
+                path.push(tag);
+                paths[child] = Some(path);
+                pending.push(child);
+            }
+        }
+    }
+    let mut retired = 0;
+    for (index, object) in model.schema.objects.iter().enumerate() {
+        for &(start, end) in object.layout.reserved {
+            for tag in BTreeSet::from([start, end - 1]) {
+                let raw = at_path(paths[index].as_ref().unwrap(), tag);
+                // The original generated decoder accepts a lawful unknown field.
+                assert!(
+                    FragmentPackage::decode(raw.as_slice()).is_ok(),
+                    "{}:{tag}",
+                    object.layout.schema_id
+                );
+                let mut work =
+                    CompileCheckpoints::try_new(&DecodeControl, CompilePhase::Decode).unwrap();
+                let prepared = prepare_package_wire_in(
+                    &raw,
+                    &model,
+                    PackageDecodeLimits::FROZEN.wire,
+                    &mut |_| Ok(()),
+                    &mut work,
+                )
+                .unwrap();
+                assert!(
+                    prepared.projection().contains_retired_field,
+                    "{}:{tag}",
+                    object.layout.schema_id
+                );
+                assert!(matches!(
+                    prepared.materialize_in(&mut |_| Ok(()), &mut work),
+                    Err(PackageWireError::InvalidSource(
+                        "package contains a retired wire field"
+                    ))
+                ));
+                work.finish().unwrap();
+                retired += 1;
+            }
+        }
+        // The same message still accepts an unrelated, lawful unknown field.
+        let mut unknown = 9001;
+        while object.fields.contains_key(&unknown)
+            || object
+                .layout
+                .reserved
+                .iter()
+                .any(|&(a, b)| unknown >= a && unknown < b)
+        {
+            unknown += 1;
+        }
+        let raw = at_path(paths[index].as_ref().unwrap(), unknown);
+        let mut work = CompileCheckpoints::try_new(&DecodeControl, CompilePhase::Decode).unwrap();
+        let prepared = prepare_package_wire_in(
+            &raw,
+            &model,
+            PackageDecodeLimits::FROZEN.wire,
+            &mut |_| Ok(()),
+            &mut work,
+        )
+        .unwrap();
+        assert!(!prepared.projection().contains_retired_field);
+        prepared.materialize_in(&mut |_| Ok(()), &mut work).unwrap();
+        work.finish().unwrap();
+    }
+    assert!(retired > 20);
+    // A later format failure remains Prost's verdict, before retired semantics.
+    let mut raw = at_path(&[], 13);
+    raw.push(0xff);
+    let mut work = CompileCheckpoints::try_new(&DecodeControl, CompilePhase::Decode).unwrap();
+    let prepared = prepare_package_wire_in(
+        &raw,
+        &model,
+        PackageDecodeLimits::FROZEN.wire,
+        &mut |_| Ok(()),
+        &mut work,
+    )
+    .unwrap();
+    assert!(prepared.projection().contains_retired_field);
+    assert!(matches!(
+        prepared.materialize_in(&mut |_| Ok(()), &mut work),
+        Err(PackageWireError::Protobuf(_))
     ));
 }

@@ -536,6 +536,7 @@ fn emit_encode(
         }
     };
     let node = wire::PhysicalNode {
+        expressions: None,
         id: input.id.get(),
         input_node_ids: inputs,
         required_inputs,
@@ -600,6 +601,7 @@ fn emit_decode(
         }
     };
     let node = p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(input.id),
         inputs,
         required_inputs,

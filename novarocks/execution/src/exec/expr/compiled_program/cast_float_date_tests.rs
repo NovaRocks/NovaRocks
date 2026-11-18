@@ -89,16 +89,7 @@ fn float_date_actual_compiler_all_profiles_root_nullability_allow_policies_slice
                         );
                         let batch = float_batch(&program, source.clone());
                         let mut evaluator = instance(&program);
-                        let snapshot = program
-                            .checked()
-                            .channels()
-                            .expressions()
-                            .resolved_calls()
-                            .snapshot();
-                        let occurrence = ProgramUseRef {
-                            arena: root().arena(),
-                            use_id: snapshot.bindings()[&root()],
-                        };
+                        let occurrence = cast_root_use(&program);
                         let summary = evaluator.effects[&occurrence];
                         assert!(
                             summary

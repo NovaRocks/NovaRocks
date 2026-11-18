@@ -29,7 +29,10 @@ use crate::planner::physical::{
 };
 use arrow::datatypes::DataType;
 use novarocks_functions::FunctionResultType;
-use novarocks_type_contract::{DecimalOverflowPolicy, PureCompileControl};
+use novarocks_type_contract::{
+    AggregateStateInterpretation, AggregateStateOrderKey, AggregateStateOrderKeys,
+    DecimalOverflowPolicy, PureCompileControl,
+};
 use std::collections::HashMap;
 fn integer(value: i64) -> TypedExpr {
     TypedExpr {
@@ -74,6 +77,7 @@ fn aggregate(
     name: &str,
     arguments: Vec<TypedExpr>,
     order: Vec<SortItem>,
+    state_interpretation: Option<AggregateStateInterpretation>,
     child: PhysicalPlanNode,
 ) -> PhysicalPlanNode {
     let control = crate::compiler::SqlCompileControl::unbounded();
@@ -102,7 +106,10 @@ fn aggregate(
         result.nullable(),
     );
     output.value_type = result.clone();
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    let mut binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    if let Some(source) = state_interpretation {
+        binding = binding.with_aggregate_state_source(source);
+    }
     PhysicalPlanNode {
         kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
             mode: AggMode::Single,
@@ -126,7 +133,7 @@ fn aggregate(
     }
 }
 fn local(name: &str, args: Vec<TypedExpr>) -> PhysicalPlanNode {
-    let mut result = aggregate(name, args, vec![], values(vec![], vec![vec![]]));
+    let mut result = aggregate(name, args, vec![], None, values(vec![], vec![vec![]]));
     let PhysicalPlanKind::HashAggregate(spec) = &mut result.kind else {
         unreachable!()
     };
@@ -159,7 +166,7 @@ fn merge(
     child: PhysicalPlanNode,
     intermediate: bool,
 ) -> PhysicalPlanNode {
-    let mut result = aggregate(name, args, vec![], child);
+    let mut result = aggregate(name, args, vec![], None, child);
     let PhysicalPlanKind::HashAggregate(spec) = &mut result.kind else {
         unreachable!()
     };
@@ -357,10 +364,20 @@ pub fn ordered_array_state_source_for_test(
         asc: true,
         nulls_first: true,
     };
+    // The fixture directly authors a typed call, so it retains the same
+    // original ORDER interpretation that normal analysis records.
+    let state_interpretation = AggregateStateInterpretation {
+        distinct: false,
+        order_keys: AggregateStateOrderKeys::from_pure_boxed(Box::new([AggregateStateOrderKey {
+            ascending: order.asc,
+            nulls_first: order.nulls_first,
+        }])),
+    };
     let mut partial = aggregate(
         "array_agg",
         vec![integer(7)],
         vec![order],
+        Some(state_interpretation),
         values(vec![], vec![vec![]]),
     );
     let result_columns = partial.output_columns.clone();

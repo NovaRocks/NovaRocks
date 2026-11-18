@@ -18,7 +18,6 @@
 //! Single Frame source phase tests; no replacement evaluator or source walker.
 use super::*;
 use arrow::array::{BinaryArray, Date32Array, TimestampMicrosecondArray};
-use novarocks_local_program::ProgramExpressionArena;
 use novarocks_type_contract::{ExpressionUseId, TemporalSourceShape as S};
 use std::sync::Mutex;
 struct Control {
@@ -65,10 +64,7 @@ fn source_domain() -> Arc<super::input_source::ActualInvocationDomain> {
 }
 fn frame(work: &mut Work<'_, '_>) -> Frame {
     Frame::new(
-        ProgramUseRef {
-            arena: ProgramExpressionArena::Main,
-            use_id: ExpressionUseId::new(1),
-        },
+        ExpressionUseId::new(1),
         ControlShape::TemporalSource(S::SecondsCastOther),
         &DataType::Int64,
         vec![1, 3, 5],
@@ -312,10 +308,7 @@ fn deepest(control: &Control) -> Result<(), KernelFailure> {
         scalar_scope: None,
     };
     let frame = Frame::new(
-        ProgramUseRef {
-            arena: ProgramExpressionArena::Main,
-            use_id: ExpressionUseId::new(1),
-        },
+        ExpressionUseId::new(1),
         ControlShape::TemporalSource(S::SecondsCastOther),
         &DataType::Int64,
         vec![1, 3, 5],

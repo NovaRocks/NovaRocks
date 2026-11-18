@@ -71,7 +71,6 @@ pub(crate) fn materialize_compiled_sink(
             program,
             graph.nodes()[graph.root().index()].output_layout(),
             branch,
-            0,
             destinations,
             *sender_id,
             task_key,
@@ -120,14 +119,13 @@ fn materialize_stream_branch(
     program: &std::sync::Arc<novarocks_local_program::LocalProgram>,
     output_layout: &novarocks_local_program::StaticLayout,
     branch: &StaticStreamBranch,
-    branch_index: u32,
     destinations: &[crate::runtime::endpoint::TaskDestination],
     sender_id: Option<i32>,
     task_key: novarocks_types::UniqueId,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
 ) -> Result<Box<dyn OperatorFactory>, LocalTaskLaunchError> {
-    let partition_keys = compiled_partition_keys(program, branch, branch_index)?;
+    let partition_keys = compiled_partition_keys(program, branch)?;
     if let Some(limit) = branch.limit() {
         return Err(materialization_contract(format!(
             "compiled stream sink limit {limit} is not executable yet"
@@ -256,7 +254,6 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
             program,
             root_layout,
             branch,
-            0,
             assigned
                 .get(0)
                 .ok_or_else(|| materialization_contract("root stream assignment is absent"))?,
@@ -299,7 +296,6 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
                     program,
                     root_layout,
                     branch,
-                    route.branch,
                     assigned.get(index).ok_or_else(|| {
                         materialization_contract("router provider assignment is absent")
                     })?,
@@ -343,8 +339,6 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
             program,
             output.layout(),
             output.branch(),
-            u32::try_from(index)
-                .map_err(|_| materialization_contract("summary branch index exceeds u32"))?,
             assigned
                 .get(index)
                 .ok_or_else(|| materialization_contract("summary assignment is absent"))?,
@@ -369,7 +363,6 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
 fn compiled_partition_keys(
     program: &std::sync::Arc<novarocks_local_program::LocalProgram>,
     branch: &StaticStreamBranch,
-    branch_index: u32,
 ) -> Result<Option<CompiledPartitionKeys>, LocalTaskLaunchError> {
     let keys = branch.partition_exprs().len();
     if !branch.partition_type().requires_exprs() {
@@ -387,30 +380,17 @@ fn compiled_partition_keys(
             branch.partition_type().display_name()
         )));
     }
-    let mut sites = Vec::with_capacity(keys);
-    for key in 0..keys {
-        let key = sink_failure::key_identity(key).map_err(materialization_error)?;
-        sites.push(
-            novarocks_local_program::ProgramExpressionRootSite::SinkPartition {
-                branch: branch_index,
-                key,
-            },
-        );
-    }
-    use novarocks_local_program::{ProgramExpressionRootSite, StaticStreamRouting};
+    let sites = branch.partition_exprs().to_vec();
+    use novarocks_local_program::StaticStreamRouting;
     let program = std::sync::Arc::clone(program);
     Ok(Some(match branch.contract().routing {
         StaticStreamRouting::Ordinary => CompiledPartitionKeys::new(program, sites),
         StaticStreamRouting::HierarchicalHashV1 => {
             CompiledPartitionKeys::hierarchical(program, sites)
         }
-        StaticStreamRouting::ConditionalKeyV1 { .. } => CompiledPartitionKeys::conditional(
-            program,
-            sites,
-            ProgramExpressionRootSite::SinkApplicability {
-                branch: branch_index,
-            },
-        ),
+        StaticStreamRouting::ConditionalKeyV1 { applies } => {
+            CompiledPartitionKeys::conditional(program, sites, applies)
+        }
     }))
 }
 fn materialization_error(source: impl Into<ExecutionFailure>) -> LocalTaskLaunchError {

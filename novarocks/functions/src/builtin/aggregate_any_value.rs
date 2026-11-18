@@ -368,9 +368,8 @@ mod failure_tests {
     use crate::aggregate_scalar::AggScalarValue as V;
     use arrow_schema::{Field, Fields};
     use novarocks_type_contract::{
-        CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-        EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
-        SemanticParameters,
+        CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, ExpressionUseId,
+        PureCompileControl, SemanticParameters,
     };
     use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
 
@@ -489,11 +488,9 @@ mod failure_tests {
             .resolve_bound_user("any_value", FunctionKind::Aggregate, request, &Compile)
             .unwrap();
         let selected = Arc::new(bound.selected);
-        let context = ExpressionEffectContext {
-            use_id: ExpressionUseId::new(331),
-            domain: EvaluationDomainId::new(19),
-            demand: EvaluationDemand::Value,
-        };
+        let context = novarocks_type_contract::RelationEffectContext::call(
+            novarocks_type_contract::RelationCallId::new(331),
+        );
         let parameters = SemanticParameters::try_new([]).unwrap();
         let uses = [Some(ExpressionUseId::new(332))];
         let prepared = catalog
@@ -504,15 +501,15 @@ mod failure_tests {
                     selected: &selected,
                     request,
                     argument_uses: CallArgumentUses::SelectedChannels(&uses),
-                    context,
+                    context: context.into(),
                     parameters: &parameters,
                     environment: &[],
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Relation(context.identity),
                 },
                 selected.clone(),
                 PureCallPreparation::Aggregate {
-                    arguments: ScopedExpressionEffects::pure_value(context),
+                    arguments: ScopedRelationalEffects::pure_value(context),
                     options: AggregatePreparationOptions {
                         state_interpretation: None,
                         phase: AggregateKernelPhase::Single,

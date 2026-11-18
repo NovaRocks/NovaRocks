@@ -172,15 +172,14 @@ fn compile_origins_core(
 mod tests {
     use super::*;
     use crate::{
-        BindingRequirements, CompileProfile, ImmutableExpressions, KernelAbiVersion,
-        LocalOperatorId, LocalOperatorOrigin, MetricAggregation, OperatorMetricAggregation,
-        ProgramNode, ProgramNodeKind, StaticLayout, StaticValues, SyntheticOperatorReason,
+        BindingRequirements, CompileProfile, KernelAbiVersion, LocalOperatorId,
+        LocalOperatorOrigin, MetricAggregation, OperatorMetricAggregation, ProgramNode,
+        ProgramNodeKind, StaticLayout, StaticValues, SyntheticOperatorReason,
     };
     use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use novarocks_types::SlotId;
     use std::{
-        collections::HashMap,
         num::NonZeroUsize,
         sync::{Arc, Mutex},
     };
@@ -236,7 +235,7 @@ mod tests {
         LocalProgramGraph::try_new(
             nodes,
             root,
-            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+            &[],
             CompileProfile::new(
                 NonZeroUsize::new(1).unwrap(),
                 None,

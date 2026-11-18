@@ -16,7 +16,8 @@
 // under the License.
 
 //! Mandatory complete types for actual operator/layout channel positions.
-//! Calls borrow the same frozen prepared owner through ProgramTypedExpressions;
+//! Relation calls borrow the same frozen prepared owner; scalar facts belong to
+//! the actual compiled units. This channel table borrows that one graph/table;
 //! this table is not a second function binding or logical-type inference path.
 //! Root field attributes remain in the actual immutable StaticLayout. Explicit
 //! value types add NULL/logical facts; optional legacy slot metadata is ignored.
@@ -25,12 +26,12 @@
 
 use crate::creation::{ProgramCreation, ProgramCreationFailure};
 use crate::{
-    AnalyticOutputColumn, ProgramCallSite, ProgramExpressionArena, ProgramNodeId, ProgramNodeKind,
-    ProgramTypedExpressions, StaticLayout, TableFunctionOutputSlot,
+    AnalyticOutputColumn, LocalProgramGraph, ProgramCallSite, ProgramNodeId, ProgramNodeKind,
+    ProgramResolvedCalls, ProgramRootRef, StaticLayout, TableFunctionOutputSlot,
 };
 use novarocks_functions::{
-    AggregateCallContract, FunctionArgumentType, FunctionValueType, KernelFailure,
-    PreparedPureKernel, validate_function_value_type_observed,
+    AggregateCallContract, FunctionValueType, KernelFailure, PreparedPureKernel,
+    validate_function_value_type_observed,
 };
 #[cfg(test)]
 use novarocks_type_contract::ValueSchemaCreation;
@@ -139,29 +140,36 @@ impl<H> From<ValueTypeError> for ProgramCreationFailure<ProgramChannelTypeError,
 type SlotPosition = (ProgramNodeId, ProgramChannelLayoutRole, SlotId);
 #[derive(Clone, Debug)]
 pub struct ProgramTypedChannels {
-    expressions: ProgramTypedExpressions,
     channels: Arc<ChannelFacts<BTreeMap<ProgramChannelSite, FunctionValueType>>>,
     slots: Arc<ChannelFacts<BTreeMap<SlotPosition, u32>>>,
 }
 impl ProgramTypedChannels {
     pub fn try_new(
-        expressions: ProgramTypedExpressions,
+        program: &LocalProgramGraph,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
+        calls: &ProgramResolvedCalls,
         channels: Vec<(ProgramChannelSite, FunctionValueType)>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramChannelTypeError> {
-        Self::try_new_core::<std::convert::Infallible>(expressions, channels, None, control)
-            .map_err(pure_programchanneltypeerror)
+        Self::try_new_core::<std::convert::Infallible>(
+            program, units, calls, channels, None, control,
+        )
+        .map_err(pure_programchanneltypeerror)
     }
     pub fn try_new_with_creator_in<H>(
-        expressions: ProgramTypedExpressions,
+        program: &LocalProgramGraph,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
+        calls: &ProgramResolvedCalls,
         channels: Vec<(ProgramChannelSite, FunctionValueType)>,
         creation: &mut dyn ValueSchemaCreationScope<H>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramCreationFailure<ProgramChannelTypeError, H>> {
-        Self::try_new_core(expressions, channels, Some(creation), control)
+        Self::try_new_core(program, units, calls, channels, Some(creation), control)
     }
     fn try_new_core<H>(
-        expressions: ProgramTypedExpressions,
+        program: &LocalProgramGraph,
+        units: &[Arc<novarocks_expression::CompiledExprSet>],
+        calls: &ProgramResolvedCalls,
         channels: Vec<(ProgramChannelSite, FunctionValueType)>,
         creator: Option<&mut dyn ValueSchemaCreationScope<H>>,
         control: &dyn PureCompileControl,
@@ -171,7 +179,6 @@ impl ProgramTypedChannels {
         if channels.len() > MAX_PROGRAM_TYPED_CHANNELS {
             return Err(ProgramChannelTypeError::TooManyChannels.into());
         }
-        let program = expressions.resolved_calls().snapshot().program();
         let mut expected_count = 0usize;
         for node in program.nodes() {
             work.step()?;
@@ -317,17 +324,16 @@ impl ProgramTypedChannels {
             },
             &mut work,
         )?;
-        let checked = Self {
-            expressions,
-            channels,
-            slots,
-        };
-        checked.validate_operators(&mut work)?;
+        let checked = Self { channels, slots };
+        ChannelValidation {
+            channels: &checked,
+            program,
+            units,
+            calls,
+        }
+        .validate_operators(&mut work)?;
         work.finish()?;
         Ok(checked)
-    }
-    pub const fn expressions(&self) -> &ProgramTypedExpressions {
-        &self.expressions
     }
     pub fn channels(&self) -> &BTreeMap<ProgramChannelSite, FunctionValueType> {
         &self.channels
@@ -348,64 +354,65 @@ impl ProgramTypedChannels {
             ordinal,
         })
     }
-    pub fn channel_layout(
+    pub fn channel_layout<'a>(
         &self,
+        program: &'a LocalProgramGraph,
         node: ProgramNodeId,
         role: ProgramChannelLayoutRole,
-    ) -> Option<&StaticLayout> {
-        let node = self
-            .expressions
-            .resolved_calls()
-            .snapshot()
-            .program()
-            .nodes()
-            .get(node.index())?;
+    ) -> Option<&'a StaticLayout> {
+        let node = program.nodes().get(node.index())?;
         layout_for(node.kind(), node.output_layout(), role)
     }
-    pub fn channel_slot(&self, site: ProgramChannelSite) -> Option<SlotId> {
+    pub fn channel_slot(
+        &self,
+        program: &LocalProgramGraph,
+        site: ProgramChannelSite,
+    ) -> Option<SlotId> {
         match site {
             ProgramChannelSite::Layout {
                 node,
                 role,
                 ordinal,
             } => self
-                .channel_layout(node, role)?
+                .channel_layout(program, node, role)?
                 .slots()
                 .get(ordinal as usize)
                 .copied(),
-            ProgramChannelSite::WriterFinalOutput { node, call } => match self
-                .expressions
-                .resolved_calls()
-                .snapshot()
-                .program()
-                .nodes()
-                .get(node.index())?
-                .kind()
-            {
-                ProgramNodeKind::TableFinish {
-                    final_aggregates, ..
-                } => final_aggregates
-                    .calls
-                    .get(call as usize)
-                    .map(|call| call.final_output_slot_id),
-                _ => None,
-            },
-            ProgramChannelSite::TableResult { node, result } => match self
-                .expressions
-                .resolved_calls()
-                .snapshot()
-                .program()
-                .nodes()
-                .get(node.index())?
-                .kind()
-            {
-                ProgramNodeKind::TableFunction {
-                    fn_result_slots, ..
-                } => fn_result_slots.get(result as usize).copied(),
-                _ => None,
-            },
+            ProgramChannelSite::WriterFinalOutput { node, call } => {
+                match program.nodes().get(node.index())?.kind() {
+                    ProgramNodeKind::TableFinish {
+                        final_aggregates, ..
+                    } => final_aggregates
+                        .calls
+                        .get(call as usize)
+                        .map(|call| call.final_output_slot_id),
+                    _ => None,
+                }
+            }
+            ProgramChannelSite::TableResult { node, result } => {
+                match program.nodes().get(node.index())?.kind() {
+                    ProgramNodeKind::TableFunction {
+                        fn_result_slots, ..
+                    } => fn_result_slots.get(result as usize).copied(),
+                    _ => None,
+                }
+            }
         }
     }
+}
+struct ChannelValidation<'a> {
+    channels: &'a ProgramTypedChannels,
+    program: &'a LocalProgramGraph,
+    units: &'a [Arc<novarocks_expression::CompiledExprSet>],
+    calls: &'a ProgramResolvedCalls,
+}
+impl std::ops::Deref for ChannelValidation<'_> {
+    type Target = ProgramTypedChannels;
+    fn deref(&self) -> &Self::Target {
+        self.channels
+    }
+}
+impl ChannelValidation<'_> {
     fn actual_slot(
         &self,
         node: ProgramNodeId,
@@ -430,21 +437,16 @@ impl ProgramTypedChannels {
     }
     fn definition(
         &self,
-        arena: ProgramExpressionArena,
-        id: crate::ProgramExprId,
+        reference: ProgramRootRef,
     ) -> Result<&FunctionValueType, ProgramChannelTypeError> {
-        match self.expressions.definition_type(arena, id) {
-            Some(FunctionArgumentType::Value(ty)) => Ok(ty),
-            _ => Err(ProgramChannelTypeError::WrongKind),
-        }
+        crate::unit_refs::root_type(self.units, reference).ok_or(ProgramChannelTypeError::WrongKind)
     }
     fn aggregate(
         &self,
         site: ProgramCallSite,
     ) -> Result<&AggregateCallContract, ProgramChannelTypeError> {
         match self
-            .expressions
-            .resolved_calls()
+            .calls
             .calls()
             .get(&site)
             .map(|entry| entry.specialization().prepared())
@@ -458,7 +460,7 @@ impl ProgramTypedChannels {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), ProgramChannelTypeError> {
         use ProgramChannelLayoutRole as Role;
-        let program = self.expressions.resolved_calls().snapshot().program();
+        let program = self.program;
         for (index, node) in program.nodes().iter().enumerate() {
             work.step()?;
             let node_id = ProgramNodeId::new(index);
@@ -469,7 +471,7 @@ impl ProgramTypedChannels {
                     for cell in values.dynamic_cells() {
                         same_value(
                             self.output(node_id, cell.column as usize)?,
-                            self.definition(ProgramExpressionArena::Main, cell.definition)?,
+                            self.definition(cell.definition)?,
                             false,
                             work,
                         )?;
@@ -513,39 +515,25 @@ impl ProgramTypedChannels {
                         ..
                     } = node.kind()
                     {
-                        let arena = &self
-                            .expressions
-                            .resolved_calls()
-                            .snapshot()
-                            .roots()
-                            .arenas()[&ProgramExpressionArena::Main];
                         for (key, group) in order_by.iter().zip(rank_group_ordinals) {
                             work.step()?;
                             let id = *group_by
                                 .get(*group)
                                 .ok_or(ProgramChannelTypeError::WrongShape)?;
-                            let group_slot = arena
-                                .node(id)
-                                .ok_or(ProgramChannelTypeError::InvalidSite)?
-                                .kind();
-                            let rank_slot = arena
-                                .node(key.expr)
-                                .ok_or(ProgramChannelTypeError::InvalidSite)?
-                                .kind();
-                            if !matches!((group_slot, rank_slot), (crate::StaticExprKind::SlotId(a), crate::StaticExprKind::SlotId(b)) if a == b)
-                            {
+                            let input = |reference: ProgramRootRef| {
+                                let unit = self.units.get(reference.unit.index())?;
+                                let root = unit.root(reference.root)?;
+                                unit.input(root.use_id)
+                                    .map(|binding| (reference.unit, binding))
+                            };
+                            if input(id).is_none() || input(id) != input(key.expr) {
                                 return Err(ProgramChannelTypeError::WrongShape);
                             }
-                            let ty = self.definition(ProgramExpressionArena::Main, id)?;
+                            let ty = self.definition(id)?;
                             if !comparator.supports_value_type(ty)
                                 || !novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1.supports_partition_key(ty.data_type())
                             { return Err(ProgramChannelTypeError::TypeMismatch); }
-                            same_value(
-                                ty,
-                                self.definition(ProgramExpressionArena::Main, key.expr)?,
-                                false,
-                                work,
-                            )?;
+                            same_value(ty, self.definition(key.expr)?, false, work)?;
                         }
                     }
                     // Actual aggregate arrays are group keys followed by call
@@ -553,7 +541,7 @@ impl ProgramTypedChannels {
                     for (ordinal, id) in group_by.iter().enumerate() {
                         same_value(
                             self.output(node_id, ordinal)?,
-                            self.definition(ProgramExpressionArena::Main, *id)?,
+                            self.definition(*id)?,
                             false,
                             work,
                         )?;
@@ -583,19 +571,14 @@ impl ProgramTypedChannels {
                                 return Err(ProgramChannelTypeError::WrongShape);
                             }
                             for (id, expected) in source.inputs.iter().zip(expected) {
-                                same_value(
-                                    self.definition(ProgramExpressionArena::Main, *id)?,
-                                    expected,
-                                    true,
-                                    work,
-                                )?;
+                                same_value(self.definition(*id)?, expected, true, work)?;
                             }
                         } else {
                             if source.inputs.len() != 1 {
                                 return Err(ProgramChannelTypeError::WrongShape);
                             }
                             same_value(
-                                self.definition(ProgramExpressionArena::Main, source.inputs[0])?,
+                                self.definition(source.inputs[0])?,
                                 contract
                                     .state_input_type()
                                     .ok_or(ProgramChannelTypeError::WrongShape)?,
@@ -635,8 +618,7 @@ impl ProgramTypedChannels {
                             call: ordinal_id(ordinal)?,
                         };
                         let Some(PreparedPureKernel::Window(kernel)) = self
-                            .expressions
-                            .resolved_calls()
+                            .calls
                             .calls()
                             .get(&site)
                             .map(|entry| entry.specialization().prepared())
@@ -651,12 +633,7 @@ impl ProgramTypedChannels {
                             return Err(ProgramChannelTypeError::WrongShape);
                         }
                         for (id, expected) in source.args.iter().zip(expected) {
-                            same_value(
-                                self.definition(ProgramExpressionArena::Main, *id)?,
-                                expected,
-                                true,
-                                work,
-                            )?;
+                            same_value(self.definition(*id)?, expected, true, work)?;
                         }
                     }
                     for (ordinal, output) in output_columns.iter().enumerate() {
@@ -671,8 +648,7 @@ impl ProgramTypedChannels {
                                     call: ordinal_id(*call)?,
                                 };
                                 let Some(PreparedPureKernel::Window(kernel)) = self
-                                    .expressions
-                                    .resolved_calls()
+                                    .calls
                                     .calls()
                                     .get(&site)
                                     .map(|entry| entry.specialization().prepared())
@@ -700,8 +676,7 @@ impl ProgramTypedChannels {
                         let output = self
                             .channel_type(site)
                             .ok_or(ProgramChannelTypeError::WrongShape)?;
-                        let source = self
-                            .definition(ProgramExpressionArena::WriterProjection(node_id), *id)?;
+                        let source = self.definition(*id)?;
                         let storage = projection
                             .storage_types
                             .get(ordinal)
@@ -834,8 +809,7 @@ impl ProgramTypedChannels {
                 } => {
                     let site = ProgramCallSite::Table { node: node_id };
                     let Some(PreparedPureKernel::Table(kernel)) = self
-                        .expressions
-                        .resolved_calls()
+                        .calls
                         .calls()
                         .get(&site)
                         .map(|entry| entry.specialization().prepared())
@@ -958,7 +932,7 @@ impl ProgramTypedChannels {
                             return Err(ProgramChannelTypeError::WrongShape);
                         }
                         same_ordered_value(
-                            self.definition(ProgramExpressionArena::Main, filter.group_key_expr)?,
+                            self.definition(filter.group_key_expr)?,
                             &key.value_type,
                             work,
                         )?;
@@ -979,7 +953,7 @@ impl ProgramTypedChannels {
                                 continue;
                             }
                             same_ordered_value(
-                                self.definition(ProgramExpressionArena::Main, filter.expr_id)?,
+                                self.definition(filter.expr_id)?,
                                 &key.value_type,
                                 work,
                             )?;

@@ -24,7 +24,7 @@ use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, EffectContractError, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffects, ExpressionUseId, FunctionEffectDeclaration,
+    EvaluationRegionId, ExpressionEffects, ExpressionUseId, FunctionEffectDeclaration,
     FunctionFailureBehavior, FunctionInstanceState, FunctionNullBehavior, FunctionVolatility,
     ObservableEffects, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
     SemanticParameterValue,
@@ -160,11 +160,12 @@ impl Owner {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
+            context: (ExpressionEffectContext {
                 use_id: ExpressionUseId::new(9),
-                domain: EvaluationDomainId::new(11),
+                region: EvaluationRegionId::new(11),
                 demand: EvaluationDemand::Value,
-            },
+            })
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Scalar,
@@ -282,7 +283,7 @@ impl PureScalarImplementation for Owner {
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
         self.counts.prepare.fetch_add(1, Ordering::Relaxed);
         self.counts.stage.store(2, Ordering::Relaxed);
-        assert_eq!(contract.context(), input.context);
+        assert_eq!(contract.context(), input.context.expression().unwrap());
         assert!(std::ptr::eq(contract.selected(), input.selected));
         assert_eq!(contract.effects(), &self.frozen());
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
@@ -345,7 +346,7 @@ fn exact_owner_is_refined_and_prepared_once_without_reselection_or_instance_crea
         &owner,
         input,
         owner.selected.clone(),
-        ScopedExpressionEffects::pure_value(input.context),
+        ScopedExpressionEffects::pure_value(input.context.expression().unwrap()),
         &Control::default(),
     )
     .unwrap();
@@ -364,7 +365,8 @@ fn argument_summary(input: CallEffectInput<'_>) -> ScopedExpressionEffects {
         ExpressionEffectContext {
             use_id: match input.argument_uses {
                 crate::CallArgumentUses::SelectedChannels(uses) => uses[0].unwrap(),
-                crate::CallArgumentUses::AggregateMerge { .. } => {
+                crate::CallArgumentUses::AggregateMerge { .. }
+                | crate::CallArgumentUses::MaterializedInput { .. } => {
                     panic!("scalar fixture has aggregate merge channels")
                 }
                 crate::CallArgumentUses::TemporalSources { .. }
@@ -373,7 +375,7 @@ fn argument_summary(input: CallEffectInput<'_>) -> ScopedExpressionEffects {
                     panic!("eager scalar fixture has temporal source channels")
                 }
             },
-            ..input.context
+            ..input.context.expression().unwrap()
         },
         ExpressionEffects {
             may_raise_invocation_data: false,
@@ -387,8 +389,8 @@ fn argument_summary(input: CallEffectInput<'_>) -> ScopedExpressionEffects {
             },
         },
     );
-    ScopedExpressionEffects::pure_value(input.context)
-        .join_same_domain(child)
+    ScopedExpressionEffects::pure_value(input.context.expression().unwrap())
+        .join_same_region(child)
         .unwrap()
 }
 #[test]
@@ -419,7 +421,10 @@ fn fresh_and_frozen_entries_preserve_equivalent_complete_child_and_call_effects_
     owner.assert_calls(1, 1);
     assert_eq!(fresh.effects(), checked.effects());
     assert_eq!(fresh.prepared().contract(), checked.prepared().contract());
-    let effects = checked.effects().for_use(input.context).unwrap();
+    let effects = checked
+        .effects()
+        .for_use(input.context.expression().unwrap())
+        .unwrap();
     assert_eq!(effects.value_stability, FunctionVolatility::Volatile);
     assert!(effects.may_raise_row_error);
     assert!(effects.has_instance_state);
@@ -483,7 +488,7 @@ fn every_frozen_effect_field_and_environment_reference_is_compared_before_prepar
             facts.observable_effects.controlled_wait = true
         }),
         ("scope", |facts| {
-            facts.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(11))
+            facts.proof_scope = CallProofScope::Region(EvaluationRegionId::new(11))
         }),
         ("environment missing", |facts| {
             facts.environment = Box::default()
@@ -509,7 +514,7 @@ fn every_frozen_effect_field_and_environment_reference_is_compared_before_prepar
             input,
             owner.selected.clone(),
             &forged,
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedExpressionEffects::pure_value(input.context.expression().unwrap()),
             &Control::default(),
         )
         .unwrap_err();
@@ -532,15 +537,15 @@ fn child_summary_use_domain_and_demand_mismatches_fail_before_prepare() {
     for context in [
         ExpressionEffectContext {
             use_id: ExpressionUseId::new(10),
-            ..input.context
+            ..input.context.expression().unwrap()
         },
         ExpressionEffectContext {
-            domain: EvaluationDomainId::new(12),
-            ..input.context
+            region: EvaluationRegionId::new(12),
+            ..input.context.expression().unwrap()
         },
         ExpressionEffectContext {
             demand: EvaluationDemand::TruthOnly,
-            ..input.context
+            ..input.context.expression().unwrap()
         },
     ] {
         for frozen in [false, true] {
@@ -583,7 +588,7 @@ fn a_value_equal_foreign_signature_arc_is_not_the_exact_selected_owner() {
     assert!(!Arc::ptr_eq(&foreign, &owner.selected));
     for frozen in [false, true] {
         owner.reset();
-        let arguments = ScopedExpressionEffects::pure_value(input.context);
+        let arguments = ScopedExpressionEffects::pure_value(input.context.expression().unwrap());
         let error = if frozen {
             specialize_frozen_scalar(
                 &owner,
@@ -618,7 +623,7 @@ fn preparation_cannot_replace_even_a_value_equal_immutable_call_contract() {
     let input = owner.input();
     for frozen in [false, true] {
         owner.reset();
-        let arguments = ScopedExpressionEffects::pure_value(input.context);
+        let arguments = ScopedExpressionEffects::pure_value(input.context.expression().unwrap());
         let error = if frozen {
             specialize_frozen_scalar(
                 &owner,
@@ -655,7 +660,12 @@ fn frozen_validation_returns_one_borrowed_receipt_for_composition_and_contract_c
     let effects = receipt
         .compose_for_use(input, argument_summary(input))
         .unwrap();
-    assert!(effects.for_use(input.context).unwrap().may_raise_row_error);
+    assert!(
+        effects
+            .for_use(input.context.expression().unwrap())
+            .unwrap()
+            .may_raise_row_error
+    );
     let contract = ScalarCallContract::from_refined(
         input,
         &receipt,
@@ -679,7 +689,7 @@ fn type_only_retains_static_signature_without_runtime_argument_uses_or_expressio
         input,
         owner.selected.clone(),
         &owner.frozen(),
-        ScopedExpressionEffects::pure_value(input.context),
+        ScopedExpressionEffects::pure_value(input.context.expression().unwrap()),
         &Control::default(),
     )
     .unwrap();
@@ -689,7 +699,10 @@ fn type_only_retains_static_signature_without_runtime_argument_uses_or_expressio
         1
     );
     assert_eq!(result.prepared().contract().value_argument_types().len(), 0);
-    let effects = result.effects().for_use(input.context).unwrap();
+    let effects = result
+        .effects()
+        .for_use(input.context.expression().unwrap())
+        .unwrap();
     assert!(!effects.may_raise_row_error);
     assert!(!effects.has_instance_state);
     assert!(effects.observable_effects.is_empty());
@@ -704,7 +717,7 @@ fn pure_specialization_owns_frozen_facts_after_input_drops_and_creates_state_onl
             &owner,
             input,
             owner.selected.clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedExpressionEffects::pure_value(input.context.expression().unwrap()),
             &Control::default(),
         )
         .unwrap();
@@ -747,7 +760,8 @@ fn entry_and_bounded_wrapper_or_owner_refinement_failures_keep_typed_compile_cat
                     stage: stage.map(|stage| (owner.counts.clone(), stage)),
                     ..Default::default()
                 };
-                let arguments = ScopedExpressionEffects::pure_value(input.context);
+                let arguments =
+                    ScopedExpressionEffects::pure_value(input.context.expression().unwrap());
                 let error = if frozen {
                     specialize_frozen_scalar(
                         &owner,
@@ -779,7 +793,8 @@ fn entry_and_bounded_wrapper_or_owner_refinement_failures_keep_typed_compile_cat
                 positive_only: true,
                 ..Default::default()
             };
-            let arguments = ScopedExpressionEffects::pure_value(input.context);
+            let arguments =
+                ScopedExpressionEffects::pure_value(input.context.expression().unwrap());
             let error = if frozen {
                 specialize_frozen_scalar(
                     &owner,
@@ -823,7 +838,7 @@ fn bounded_prepare_control_failures_are_outer_kernel_failures_and_allocate_no_in
                 &owner,
                 input,
                 owner.selected.clone(),
-                ScopedExpressionEffects::pure_value(input.context),
+                ScopedExpressionEffects::pure_value(input.context.expression().unwrap()),
                 &control,
             )
             .unwrap_err();

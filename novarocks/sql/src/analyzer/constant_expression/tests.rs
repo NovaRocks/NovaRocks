@@ -50,7 +50,6 @@ fn syntax(
         sql_semantics: &crate::sql_mode::SqlSemanticSettings::default(),
         constant_policy: crate::constant::test_constant_policy(),
         control: &SqlCompileControl::unbounded(),
-        version: PlanVersionId::try_new([1; 16]).unwrap(),
     })
 }
 
@@ -69,7 +68,22 @@ fn required_constant_implicit_targets_do_not_use_general_cast_admission() {
     ] {
         let prepared = syntax(sql, target).unwrap_or_else(|error| panic!("{sql}: {error}"));
         assert_eq!(prepared.value_type().data_type(), &datatype, "{sql}");
-        assert_eq!(prepared.source().plan().fragments().len(), 1);
+        let source = prepared.source();
+        assert!(source.unit().ports().is_empty());
+        assert_eq!(source.unit().roots().len(), 1);
+        let root = source.unit().root(source.root()).unwrap();
+        assert_eq!(
+            root.scope,
+            novarocks_expression_contract::RootScope::AllPorts
+        );
+        assert_eq!(
+            root.demand,
+            novarocks_type_contract::EvaluationDemand::Value
+        );
+        assert_eq!(
+            &source.unit().definition(root.definition).unwrap().ty,
+            prepared.value_type()
+        );
     }
     for (sql, target) in [
         ("1", Boolean),
@@ -159,7 +173,6 @@ fn required_materialized_value_keeps_its_pool_and_nonzero_ordinal() {
         sql_semantics: &crate::sql_mode::SqlSemanticSettings::default(),
         constant_policy: policy,
         control: &control,
-        version: PlanVersionId::try_new([2; 16]).unwrap(),
     })
     .unwrap();
     let original = prepared.original_value().expect("unchanged checked value");
@@ -169,9 +182,33 @@ fn required_materialized_value_keeps_its_pool_and_nonzero_ordinal() {
     );
     assert_eq!(original.ordinal(), 1);
     assert_eq!(original.try_i64().unwrap(), Some(7));
+    let unit = prepared.source().unit();
+    let root = unit.root(prepared.source().root()).unwrap();
+    let novarocks_expression_contract::ExprKind::Constant(reference) =
+        unit.definition(root.definition).unwrap().kind
+    else {
+        panic!("unchanged materialized input must remain the actual constant root");
+    };
+    let mut work =
+        novarocks_type_contract::CompileCheckpoints::try_new(&control, CompilePhase::Validate)
+            .unwrap();
+    let emitted = prepared
+        .source()
+        .constants()
+        .resolve_source_observed(reference, &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    assert_eq!(emitted.ordinal(), 1);
+    assert_eq!(
+        emitted.pool().backing_identity(),
+        value.pool().backing_identity()
+    );
+    assert!(Arc::ptr_eq(
+        emitted.pool().field_ref(),
+        value.pool().field_ref()
+    ));
+    assert!(Arc::ptr_eq(emitted.pool().array(), value.pool().array()));
 }
-
-use novarocks_physical_plan::PlanVersionId;
 
 #[test]
 fn required_preparation_does_not_fold_and_preserves_original_publication_source() {
@@ -197,11 +234,13 @@ fn required_preparation_does_not_fold_and_preserves_original_publication_source(
         ) {
             panic!("required preparation must not enter optional folding")
         }
-        fn observe_published_source_observed(
+        fn observe_required_scalar_source_observed(
             &self,
-            _: &crate::compiler::SqlAuthoredPhysicalPlan,
+            source: &crate::compiler::SqlAuthoredScalarUnit,
             _: &dyn PureCompileControl,
         ) -> Result<(), CompileControlError> {
+            assert!(source.unit().ports().is_empty());
+            assert_eq!(source.unit().roots().len(), 1);
             Err(self.cause.clone())
         }
     }
@@ -223,7 +262,6 @@ fn required_preparation_does_not_fold_and_preserves_original_publication_source(
         sql_semantics: &crate::sql_mode::SqlSemanticSettings::default(),
         constant_policy: crate::constant::test_constant_policy(),
         control: &control,
-        version: PlanVersionId::try_new([3; 16]).unwrap(),
     });
     let Err(SqlCompileError::CompilationSource(actual)) = result else {
         panic!("original source refusal");
@@ -284,4 +322,38 @@ fn required_implicit_coercion_uses_semantic_kind_not_encoded_layout() {
                 .is_ok()
         );
     }
+}
+
+#[test]
+fn required_scalar_unit_errors_keep_original_resource_fact_and_control_source() {
+    use crate::planner::distributed::build::ContractLoweringError;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_type_contract::CompileControlError;
+    let original =
+        novarocks_expression_contract::UnitError::Resource("original unit resource refusal");
+    let expected = original.failure_fact();
+    assert_eq!(expected.class(), FailureClass::Resource);
+    let error = required_lowering_error(ContractLoweringError::from(original));
+    let SqlCompileError::CompilationSource(actual) = error else {
+        panic!("the original typed unit resource source must be retained");
+    };
+    assert_eq!(actual.failure_fact(), expected);
+    assert!(matches!(
+        actual.downcast_ref::<novarocks_expression_contract::UnitError>(),
+        Some(novarocks_expression_contract::UnitError::Resource(
+            "original unit resource refusal"
+        ))
+    ));
+    let source = novarocks_failure_contract::SharedFailureCause::new(
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+    );
+    let error = required_lowering_error(ContractLoweringError::from(
+        novarocks_expression_contract::UnitError::Control(CompileControlError::Source(
+            source.clone(),
+        )),
+    ));
+    let SqlCompileError::CompilationSource(actual) = error else {
+        panic!("the original unit control source must be retained");
+    };
+    assert_eq!(actual, source);
 }

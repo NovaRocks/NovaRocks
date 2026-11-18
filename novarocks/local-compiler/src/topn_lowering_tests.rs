@@ -20,15 +20,12 @@ use super::*;
 use crate::FragmentCompileError;
 use crate::{compile_fragment, topn::lower_topn};
 use arrow_array::{ArrayRef, Int64Array, StringArray, StructArray};
-use novarocks_local_program::{
-    LocalSortMode, ProgramExpressionArena, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind,
-};
+use novarocks_local_program::{LocalSortMode, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::NodeKind;
 use novarocks_physical_plan::{
     NullOrdering, SortDirection, SortExpr, SortMode, TopNPhase, TopNSequenceId,
 };
-use novarocks_type_contract::{ControlShape, ValueLogicalType};
+use novarocks_type_contract::ValueLogicalType;
 
 fn compile(
     package: Arc<FragmentPackage>,
@@ -41,9 +38,6 @@ fn builder_from(base: &FragmentPackage) -> FragmentBuilder {
     for value in base.fragment().values().values() {
         builder.insert_value(value.clone()).unwrap();
     }
-    for (_, expr) in base.fragment().expressions().iter() {
-        builder.insert_expression(expr.clone()).unwrap();
-    }
     for node in base.fragment().nodes().values() {
         builder.insert_node_unchecked(node.clone()).unwrap();
     }
@@ -54,7 +48,7 @@ fn complete(
     builder: FragmentBuilder,
     root: NodeId,
 ) -> Result<Arc<FragmentPackage>, Box<dyn std::error::Error>> {
-    let fragment = builder.finish_definition(
+    let fragment = builder.finish_fixture(
         root,
         FragmentSink::Result,
         PipelineDopDomain {
@@ -64,46 +58,6 @@ fn complete(
         },
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good())?;
-    let domain = EvaluationDomainId::new(0);
-    let mut uses = Vec::new();
-    let bindings = roots
-        .sites()
-        .iter()
-        .enumerate()
-        .map(|(ordinal, (&site, source))| {
-            let use_id = ExpressionUseId::new(match ordinal {
-                0 => 0,
-                1 => u32::MAX,
-                n => u32::try_from(n - 1).unwrap(),
-            });
-            uses.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    domain,
-                    demand: source.demand,
-                },
-                definition: source.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (site, use_id)
-        })
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::good(),
-    )?;
-    let expression_uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control::good())?;
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &Control::good())?;
     let output = fragment.nodes()[&root].output.clone();
     let fields = output
         .columns
@@ -124,8 +78,6 @@ fn complete(
         fields,
     });
     input.fragment = fragment;
-    input.calls = calls;
-    input.expression_uses = expression_uses;
     Ok(Arc::new(FragmentPackage::try_new(
         input,
         package_admission(),
@@ -159,9 +111,6 @@ fn phased(
     for value in input.fragment.values().values() {
         builder.insert_value(value.clone()).unwrap();
     }
-    for (_, expr) in input.fragment.expressions().iter() {
-        builder.insert_expression(expr.clone()).unwrap();
-    }
     for node in input.fragment.nodes().values() {
         let mut node = node.clone();
         if node.id == NodeId::new(0) {
@@ -191,19 +140,21 @@ fn component(
 ) -> Result<(ProgramNodeKind, novarocks_local_program::StaticLayout), FragmentCompileError> {
     let program = compile(Arc::new(package.clone()), &Control::good()).unwrap();
     let layout = program.graph().nodes()[0].output_layout();
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let site = ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(1),
-        role: ProgramNodeExpressionRole::SortOrder { key: 0 },
+    let physical = &package.fragment().nodes()[&NodeId::new(0)];
+    let NodeKind::TopN { order_by, .. } = &physical.kind else {
+        panic!("TopN")
     };
-    let use_id = snapshot.bindings()[&site];
-    let definition = snapshot.flows()[&ProgramExpressionArena::Main].uses()[&use_id].definition;
-    let mut ids = BTreeMap::from([(ExprId::new(1000), definition)]);
+    let ProgramNodeKind::Sort {
+        order_by: local, ..
+    } = program.graph().nodes()[1].kind()
+    else {
+        panic!("compiled TopN")
+    };
+    let mut ids = order_by
+        .iter()
+        .zip(local)
+        .map(|(source, local)| (source.expr, local.expr))
+        .collect::<BTreeMap<_, _>>();
     if missing {
         ids.clear();
     }
@@ -241,35 +192,27 @@ fn single_topn_public_compile_preserves_ordered_keys_root_occurrences_and_exact_
             .collect::<Vec<_>>(),
         [(false, true), (true, false), (false, true)]
     );
-    assert!(order_by.iter().all(|k| k.expr == order_by[0].expr));
+    assert!(
+        order_by
+            .iter()
+            .all(|k| root_definition(&program, k.expr)
+                == root_definition(&program, order_by[0].expr))
+    );
     assert_eq!(
         program.graph().nodes()[0].output_layout().slots(),
         program.graph().nodes()[1].output_layout().slots()
     );
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let roles = snapshot
-        .bindings()
-        .keys()
-        .filter_map(|site| match site {
-            ProgramExpressionRootSite::Node {
-                node,
-                role: ProgramNodeExpressionRole::SortOrder { key },
-            } if node.index() == 1 => Some(*key),
-            _ => None,
-        })
+    let roles = order_by
+        .iter()
+        .map(|key| key.expr.root.get())
         .collect::<Vec<_>>();
     assert_eq!(roles, [0, 1, 2]);
-    let physical = package
-        .expression_uses()
-        .bindings()
-        .iter()
-        .filter(|(site, _)| site.node == NodeId::new(0))
-        .count();
+    let physical = package.fragment().nodes()[&NodeId::new(0)]
+        .expressions
+        .as_ref()
+        .unwrap()
+        .roots()
+        .len();
     assert_eq!(physical, 3);
     let ProgramNodeKind::Values { values } = program.graph().nodes()[0].kind() else {
         panic!("actual values")
@@ -326,9 +269,6 @@ fn single_topn_zero_and_host_representable_max_rows_preserve_values_without_buff
     let mut builder = FragmentBuilder::new(input.fragment.id());
     for value in input.fragment.values().values() {
         builder.insert_value(value.clone()).unwrap();
-    }
-    for (_, expr) in input.fragment.expressions().iter() {
-        builder.insert_expression(expr.clone()).unwrap();
     }
     for node in input.fragment.nodes().values() {
         let mut node = node.clone();
@@ -393,26 +333,31 @@ fn topn_duplicate_passthrough_occurrences_keep_independent_slots_and_nested_fiel
     let columns = &base.fragment().nodes()[&input].output.columns;
     let project = NodeId::new(7);
     let expression = builder
-        .add_expression(
+        .add_root(
             project,
             base.fragment().values()[&columns[0]].ty.clone(),
             ExprKind::Value(columns[0]),
+            RootScope::Port(0),
+            EvaluationDemand::Value,
         )
         .unwrap();
     let nested_expr = builder
-        .add_expression(
+        .add_root(
             project,
             base.fragment().values()[&columns[1]].ty.clone(),
             ExprKind::Value(columns[1]),
+            RootScope::Port(0),
+            EvaluationDemand::Value,
         )
         .unwrap();
+    let repeated = builder.repeat_root(project, expression);
     builder
         .add_project(
             project,
             input,
             Box::from([
                 (expression, columns[0]),
-                (expression, columns[0]),
+                (repeated, columns[0]),
                 (nested_expr, columns[1]),
             ]),
             Box::from([columns[0], columns[0], columns[1]]),
@@ -420,10 +365,12 @@ fn topn_duplicate_passthrough_occurrences_keep_independent_slots_and_nested_fiel
         .unwrap();
     let topn = NodeId::new(0);
     let key = builder
-        .add_expression(
+        .add_root(
             topn,
             base.fragment().values()[&columns[0]].ty.clone(),
             ExprKind::Value(columns[0]),
+            RootScope::Port(0),
+            EvaluationDemand::Value,
         )
         .unwrap();
     builder
@@ -447,7 +394,7 @@ fn topn_duplicate_passthrough_occurrences_keep_independent_slots_and_nested_fiel
     assert_eq!(child.slots(), top.slots());
     assert_eq!(top.slots().len(), 3);
     assert_ne!(top.slots()[0], top.slots()[1]);
-    let channel = program.checked().channels();
+    let channel = program.channels();
     // Complete nested types come from the existing channel owner, not a raw carrier retag.
     let output = channel
         .channel_type(novarocks_local_program::ProgramChannelSite::Layout {
@@ -479,9 +426,6 @@ fn actual_closed_partial_final_topn_package_lowers_both_phases_and_keeps_origina
     for value in input.fragment.values().values() {
         builder.insert_value(value.clone()).unwrap();
     }
-    for (_, expr) in input.fragment.expressions().iter() {
-        builder.insert_expression(expr.clone()).unwrap();
-    }
     for node in input.fragment.nodes().values() {
         let mut node = node.clone();
         if let NodeKind::TopN {
@@ -502,10 +446,12 @@ fn actual_closed_partial_final_topn_package_lowers_both_phases_and_keeps_origina
     let final_node = NodeId::new(7);
     let column = input.fragment.nodes()[&NodeId::new(0)].output.columns[0];
     let expr = builder
-        .add_expression(
+        .add_root(
             final_node,
             input.fragment.values()[&column].ty.clone(),
             ExprKind::Value(column),
+            RootScope::Port(0),
+            EvaluationDemand::Value,
         )
         .unwrap();
     builder
@@ -559,21 +505,27 @@ fn actual_closed_partial_final_topn_package_lowers_both_phases_and_keeps_origina
         ]
     );
     assert_eq!(program.graph().root().index(), 2);
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let orders = snapshot
-        .bindings()
-        .keys()
-        .filter_map(|site| match site {
-            ProgramExpressionRootSite::Node {
-                node,
-                role: ProgramNodeExpressionRole::SortOrder { key },
-            } => Some((node.index(), *key)),
-            _ => None,
+    let orders = program
+        .graph()
+        .nodes()
+        .iter()
+        .enumerate()
+        .flat_map(|(node, definition)| match definition.kind() {
+            ProgramNodeKind::Sort { order_by, .. } => order_by
+                .iter()
+                .enumerate()
+                .map(|(ordinal, key)| {
+                    assert!(
+                        program
+                            .unit(key.expr.unit)
+                            .unwrap()
+                            .root(key.expr.root)
+                            .is_some()
+                    );
+                    (node, ordinal as u32)
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
         })
         .collect::<Vec<_>>();
     assert_eq!(orders, [(1, 0), (2, 0)]);
@@ -745,14 +697,17 @@ fn partial_and_final_topn_lower_to_the_ordinary_window_with_no_phase_state() {
         .unwrap();
         let roots = |program: &novarocks_local_program::LocalProgram| {
             program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot()
-                .bindings()
-                .keys()
-                .copied()
+                .graph()
+                .nodes()
+                .iter()
+                .enumerate()
+                .flat_map(|(node, definition)| match definition.kind() {
+                    ProgramNodeKind::Sort { order_by, .. } => order_by
+                        .iter()
+                        .map(|key| (node, key.expr))
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(roots(&single), roots(&phased));
@@ -778,24 +733,19 @@ fn partial_and_final_topn_keep_one_sort_order_root_per_occurrence() {
             &Control::good(),
         )
         .unwrap();
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        let roles = snapshot
-            .bindings()
-            .keys()
-            .filter_map(|site| match site {
-                ProgramExpressionRootSite::Node {
-                    node,
-                    role: ProgramNodeExpressionRole::SortOrder { key },
-                } if node.index() == 1 => Some(*key),
-                _ => None,
-            })
+        let ProgramNodeKind::Sort { order_by, .. } = program.graph().nodes()[1].kind() else {
+            panic!("Sort")
+        };
+        let roles = order_by
+            .iter()
+            .map(|key| key.expr.root.get())
             .collect::<Vec<_>>();
         assert_eq!(roles, [0, 1, 2]);
+        let uses = order_by
+            .iter()
+            .map(|key| root_use(&program, key.expr))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(uses.len(), 3);
     }
 }
 
@@ -808,9 +758,16 @@ fn topn_owner_refuses_a_partial_offset_and_a_grouped_state_reduction() {
     let NodeKind::TopN { order_by, .. } = &original.kind else {
         panic!("actual ordinary TopN")
     };
+    let ProgramNodeKind::Sort {
+        order_by: local, ..
+    } = program.graph().nodes()[1].kind()
+    else {
+        panic!("Sort")
+    };
     let ids = order_by
         .iter()
-        .map(|key| (key.expr, novarocks_local_program::ProgramExprId::new(0)))
+        .zip(local)
+        .map(|(source, local)| (source.expr, local.expr))
         .collect::<BTreeMap<_, _>>();
     let sequence = TopNSequenceId::new(3);
     // A partial offset would drop rows the final window needs.
@@ -860,20 +817,20 @@ fn topn_owner_refuses_a_partial_offset_and_a_grouped_state_reduction() {
 /// validated, so the sequence pairing is a checked fact, and each fragment
 /// compiles on its own.
 mod scan_split {
+    use super::super::UnitFixture;
     use crate::{
         FragmentCompileError, LocalCompileOptions, compile_fragment, validate_fragment_providers,
     };
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_connector_contract::*;
+    use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
     use novarocks_local_program::{
         KernelAbiVersion, LocalProgram, LocalSortMode, ProgramNodeKind, StaticSinkProgram,
     };
     use novarocks_physical_plan::*;
     use novarocks_type_contract::{
-        CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDomainId,
-        ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-        ExpressionInvocation, ExpressionUseId, PureCompileControl,
+        CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, PureCompileControl,
     };
     use std::{
         collections::BTreeMap,
@@ -980,42 +937,7 @@ mod scan_split {
         .unwrap()
     }
 
-    /// Every root here is a value read; each gets one eager use.
-    fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
-        let roots = PhysicalExpressionRoots::try_new(fragment, &Good).unwrap();
-        let domain = EvaluationDomainId::new(0);
-        let mut uses = Vec::new();
-        let mut bindings = Vec::new();
-        for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-            let id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
-            uses.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id: id,
-                    domain,
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            bindings.push((*site, id));
-        }
-        let flow = ExpressionControlFlow::try_new(
-            vec![ExpressionEvaluationDomain {
-                id: domain,
-                parent: None,
-                guard: None,
-            }],
-            uses,
-            fragment.expressions(),
-            CompilePhase::Validate,
-            &Good,
-        )
-        .unwrap();
-        PhysicalRootUses::try_new(fragment, flow, bindings, &Good).unwrap()
-    }
-
-    fn descending(expr: ExprId) -> Box<[SortExpr]> {
+    fn descending(expr: RootOrdinal) -> Box<[SortExpr]> {
         Box::from([SortExpr {
             expr,
             direction: SortDirection::Descending,
@@ -1093,7 +1015,13 @@ mod scan_split {
             )
             .unwrap();
         let key = producer
-            .add_expression(PARTIAL, int64(), ExprKind::Value(provider[0]))
+            .add_root(
+                PARTIAL,
+                int64(),
+                ExprKind::Value(provider[0]),
+                RootScope::Port(0),
+                EvaluationDemand::Value,
+            )
             .unwrap();
         producer
             .add_top_n(
@@ -1111,7 +1039,7 @@ mod scan_split {
             requires_power_of_two: false,
         };
         let producer = producer
-            .finish_definition(
+            .finish_fixture(
                 PARTIAL,
                 FragmentSink::Stream { edge: EDGE },
                 dop,
@@ -1150,7 +1078,13 @@ mod scan_split {
             )
             .unwrap();
         let key = consumer
-            .add_expression(FINAL, int64(), ExprKind::Value(received[0]))
+            .add_root(
+                FINAL,
+                int64(),
+                ExprKind::Value(received[0]),
+                RootScope::Port(0),
+                EvaluationDemand::Value,
+            )
             .unwrap();
         consumer
             .add_top_n(
@@ -1163,7 +1097,7 @@ mod scan_split {
             )
             .map_err(|error| error.to_string())?;
         let consumer = consumer
-            .finish_definition(
+            .finish_fixture(
                 FINAL,
                 FragmentSink::Result,
                 dop,
@@ -1171,7 +1105,7 @@ mod scan_split {
             )
             .map_err(|error| error.to_string())?;
 
-        let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+        let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap(), super::policy());
         plan.add_fragment(producer).unwrap();
         plan.add_fragment(consumer).unwrap();
         plan.add_edge(Edge {
@@ -1258,17 +1192,9 @@ mod scan_split {
             ProviderReadOccurrenceId::new(0),
             FrozenConnectorRead::try_new(scan, public).unwrap(),
         )]);
-        let mut uses = BTreeMap::new();
-        let mut calls = BTreeMap::new();
         let mut pruning = BTreeMap::new();
         let mut admissions = BTreeMap::new();
-        for (&id, fragment) in plan.fragments() {
-            let root_uses = root_uses(fragment);
-            calls.insert(
-                id,
-                FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &Good).unwrap(),
-            );
-            uses.insert(id, root_uses);
+        for &id in plan.fragments().keys() {
             pruning.insert(
                 id,
                 FrozenFragmentPruning::try_new(id, vec![], &Good).unwrap(),
@@ -1279,8 +1205,6 @@ mod scan_split {
             &plan,
             &scans,
             &BTreeMap::new(),
-            &uses,
-            &calls,
             &pruning,
             &admissions,
             &Good,
@@ -1395,7 +1319,12 @@ fn grouped_topn_refuses_invalid_phase_offset_and_empty_keys_before_construction(
         panic!("TopN")
     };
     let expr = order_by[0].expr;
-    let ExprKind::Value(value) = package.fragment().expressions().get(expr).unwrap().kind else {
+    let ExprKind::Value(value) = package
+        .fragment()
+        .root_expression(NodeId::new(0), expr)
+        .unwrap()
+        .kind
+    else {
         panic!("direct key")
     };
     let sequence = TopNSequenceId::new(3);
@@ -1487,7 +1416,10 @@ fn grouped_topn_rejects_a_key_outside_the_partition_domain() {
         unreachable!()
     };
     let expr = order_by[0].expr;
-    let definition = package.fragment().expressions().get(expr).unwrap();
+    let definition = package
+        .fragment()
+        .root_expression(NodeId::new(0), expr)
+        .unwrap();
     let ExprKind::Value(value) = definition.kind else {
         unreachable!()
     };

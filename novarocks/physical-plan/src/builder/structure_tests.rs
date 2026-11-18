@@ -16,10 +16,11 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::*;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEvaluationDomain, FunctionArgumentEvaluation, FunctionFailureBehavior,
+    CompileControlError, CompilePhase, FunctionArgumentEvaluation, FunctionFailureBehavior,
     FunctionIntrinsicRowError, FunctionVolatility, PureCompileControl,
 };
 use std::sync::Mutex;
@@ -37,7 +38,7 @@ fn structure_stage_keeps_actual_nested_loop_placement_before_effect_proof() {
         builder
             .add_values(
                 NodeId::new(1),
-                Box::from([Box::<[ExprId]>::default()]),
+                Box::from([Box::<[crate::RootOrdinal]>::default()]),
                 Box::default(),
             )
             .unwrap();
@@ -52,6 +53,7 @@ fn structure_stage_keeps_actual_nested_loop_placement_before_effect_proof() {
         let required_right = right.output_properties.clone();
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: NodeId::new(u32::MAX),
                 inputs: Box::from([NodeId::new(0), NodeId::new(1)]),
                 required_inputs: Box::from([properties(), required_right]),
@@ -86,7 +88,7 @@ fn structure_stage_keeps_actual_nested_loop_placement_before_effect_proof() {
         )
         .unwrap();
         make(mode, 0)
-            .finish_definition(
+            .finish_fixture_definition(
                 NodeId::new(u32::MAX),
                 FragmentSink::Noop,
                 dop(),
@@ -144,7 +146,7 @@ fn empty_builder(node: u32) -> FragmentBuilder {
     builder
         .add_values(
             NodeId::new(node),
-            Box::from([Box::<[ExprId]>::default()]),
+            Box::from([Box::<[crate::RootOrdinal]>::default()]),
             Box::default(),
         )
         .unwrap();
@@ -165,53 +167,140 @@ fn finish(
         crate::StagePlacementPolicy::Singleton,
     )
 }
-fn function_builder() -> FragmentBuilder {
+fn source_function() -> BoundFunction {
+    BoundFunction {
+        function_id: FunctionId::try_new("fixture/structure/scalar").unwrap(),
+        overload: FunctionOverloadId::try_new("fixture/structure/zero-to-i64").unwrap(),
+        kind: FunctionKind::Scalar,
+        argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::default()),
+        result_type: ValueType::new(DataType::Int64, false),
+        legacy_metadata: Some(crate::LegacyBindingMetadata {
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+            semantic_parameters: Box::default(),
+        }),
+    }
+}
+fn function_unit(
+    function: BoundFunction,
+) -> Result<novarocks_expression_contract::BoundExprSet, novarocks_expression_contract::UnitError> {
+    use novarocks_expression_contract::{
+        BoundExprSetBuilder, DefinitionControl, RootScope, UnitLimits,
+    };
+    use novarocks_type_contract::*;
+    let mut draft = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: PlanLimits::FROZEN.expression_semantic_depth,
+    });
+    let call = draft.add(
+        None,
+        ValueType::new(DataType::Int64, false),
+        ExprKind::FunctionCall {
+            function,
+            args: Box::default(),
+        },
+    )?;
+    draft.root(call, EvaluationDemand::Value, RootScope::AllPorts)?;
+    draft.request(
+        call,
+        PhysicalCallRequest {
+            arguments: Box::default(),
+            logical_argument_count: 0,
+            expected_result_type: None,
+            constant_policy: crate::tests::constant_fixture::policy(),
+        },
+    )?;
+    draft.definition_control(
+        call,
+        DefinitionControl {
+            shape: ControlShape::Eager,
+            temporal_sources: None,
+        },
+    )?;
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate)?;
+    let sealed = draft.seal(vec![], &mut work)?;
+    let claims = sealed
+        .uses()
+        .iter()
+        .map(|(&id, invocation)| {
+            (
+                id,
+                novarocks_expression_contract::ExpressionCallClaim {
+                    context: invocation.context,
+                    effects: CallEffects {
+                        value_stability: FunctionVolatility::Immutable,
+                        own_row_error: FunctionIntrinsicRowError::NoRowError,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        null_behavior: FunctionNullBehavior::CalledOnNull,
+                        argument_control: ArgumentControl::Eager,
+                        instance_state: FunctionInstanceState::None,
+                        observable_effects: ObservableEffects::NONE,
+                        environment: Box::default(),
+                        proof_scope: CallProofScope::Region(invocation.context.region),
+                    },
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    temporal_source: None,
+                    regexp_count_pattern_source: None,
+                    to_base64_byte_source: None,
+                },
+            )
+        })
+        .collect();
+    let result = sealed.finish(claims, &mut work);
+    if matches!(
+        result,
+        Err(novarocks_expression_contract::UnitError::Control(_))
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+fn builder_with_unit(unit: novarocks_expression_contract::BoundExprSet) -> FragmentBuilder {
     let mut builder = FragmentBuilder::new(FragmentId::new(0));
     let node = NodeId::new(0);
-    let ty = ValueType::new(DataType::Int64, false);
-    let expr = builder
-        .add_expression(
-            node,
-            ty.clone(),
-            ExprKind::FunctionCall {
-                function: BoundFunction {
-                    function_id: FunctionId::try_new("fixture/structure/scalar").unwrap(),
-                    overload: FunctionOverloadId::try_new("fixture/structure/zero-to-i64").unwrap(),
-                    kind: FunctionKind::Scalar,
-                    argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
-                        Box::default(),
-                    ),
-                    result_type: ty.clone(),
-                    legacy_metadata: Some(crate::LegacyBindingMetadata {
-                        volatility: FunctionVolatility::Immutable,
-                        argument_evaluation: FunctionArgumentEvaluation::Eager,
-                        failure_behavior: FunctionFailureBehavior::Propagate,
-                        intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-                        semantic_parameters: Box::default(),
-                    }),
-                },
-                args: Box::default(),
-            },
-        )
-        .unwrap();
     let value = builder
         .add_value(
-            ty,
+            ValueType::new(DataType::Int64, false),
             ValueOrigin::NodeOutput {
                 node,
                 output_ordinal: 0,
             },
         )
         .unwrap();
+    // This is the receiving seam for an independently checked source unit.
+    // Draft-only typed constructors cannot resolve a not-yet-installed unit.
     builder
-        .add_values(node, Box::from([Box::from([expr])]), Box::from([value]))
+        .insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: properties(),
+            output: OutputPort {
+                node,
+                columns: Box::from([value]),
+            },
+            kind: NodeKind::Values {
+                rows: Box::from([Box::from([crate::RootOrdinal::new(0)])]),
+            },
+            expressions: None,
+        })
         .unwrap();
     builder
+        .install_unit(node, std::sync::Arc::new(unit))
+        .unwrap();
+    builder
+}
+fn function_builder() -> FragmentBuilder {
+    builder_with_unit(function_unit(source_function()).unwrap())
 }
 fn project_builder() -> FragmentBuilder {
     let mut builder = empty_builder(0);
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: NodeId::new(u32::MAX),
             inputs: Box::from([NodeId::new(0)]),
             required_inputs: Box::from([properties()]),
@@ -234,7 +323,7 @@ fn reject_both(make: impl Fn() -> FragmentBuilder, root: u32) {
     ));
     assert!(
         make()
-            .finish_definition(
+            .finish_fixture_definition(
                 NodeId::new(root),
                 FragmentSink::Noop,
                 dop(),
@@ -313,7 +402,7 @@ fn structure_stage_defers_property_derivation_but_definition_and_package_still_r
     );
     assert!(
         make()
-            .finish_definition(
+            .finish_fixture_definition(
                 NodeId::new(u32::MAX),
                 FragmentSink::Noop,
                 dop(),
@@ -322,28 +411,13 @@ fn structure_stage_defers_property_derivation_but_definition_and_package_still_r
             .is_err()
     );
     let setup = Control::default();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        vec![],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &setup,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, vec![], &setup).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &setup).unwrap();
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &setup).unwrap();
     let input = FragmentPackageInput {
         constants: ConstantPools::empty(),
         version: PlanVersionId::try_new([9; 16]).unwrap(),
         required: RequiredContracts::default(),
         fragment,
-        expression_uses: uses,
-        calls,
+        statement_constant_policy: crate::tests::constant_fixture::policy(),
         pruning,
         cuts: FragmentCuts::default(),
         result: None,
@@ -358,7 +432,7 @@ fn structure_stage_defers_property_derivation_but_definition_and_package_still_r
 
 #[test]
 fn structure_stage_keeps_reference_type_owner_and_both_dag_rejection() {
-    for fault in 0..6 {
+    for fault in [0, 1, 4, 5] {
         reject_both(
             || {
                 let mut builder = function_builder();
@@ -369,29 +443,11 @@ fn structure_stage_keeps_reference_type_owner_and_both_dag_rejection() {
                         else {
                             unreachable!()
                         };
-                        rows[0][0] = ExprId::new(u32::MAX);
+                        rows[0][0] = crate::RootOrdinal::new(u32::MAX);
                     }
                     1 => {
-                        let mut expr = builder.expressions.get(ExprId::new(0)).unwrap().clone();
-                        expr.ty = ValueType::new(DataType::Boolean, false);
-                        builder.expressions.insert(expr);
-                    }
-                    2 => {
-                        let mut expr = builder.expressions.get(ExprId::new(0)).unwrap().clone();
-                        expr.owner = NodeId::new(u32::MAX);
-                        builder.expressions.insert(expr);
-                    }
-                    3 => {
-                        let mut expr = builder.expressions.get(ExprId::new(0)).unwrap().clone();
-                        let ExprKind::FunctionCall { function, args } = &mut expr.kind else {
-                            unreachable!()
-                        };
-                        function.argument_types =
-                            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-                                FunctionArgumentType::Value(expr.ty.clone()),
-                            ]));
-                        *args = Box::from([ExprId::new(0)]);
-                        builder.expressions.insert(expr);
+                        builder.values.get_mut(&ValueId::new(0)).unwrap().ty =
+                            ValueType::new(DataType::Boolean, false);
                     }
                     4 => {
                         let node = builder.nodes.get_mut(&NodeId::new(0)).unwrap();
@@ -442,53 +498,34 @@ fn structure_stage_keeps_property_keys_requirements_and_replica_shape() {
 }
 
 #[test]
-fn structure_stage_defers_legacy_intrinsic_bits_without_deferring_kind_or_signature() {
-    let make = || {
-        let mut builder = function_builder();
-        let mut expr = builder.expressions.get(ExprId::new(0)).unwrap().clone();
-        let ExprKind::FunctionCall { function, .. } = &mut expr.kind else {
-            unreachable!()
-        };
-        function
-            .legacy_metadata
-            .as_mut()
-            .unwrap()
-            .intrinsic_row_error = FunctionIntrinsicRowError::NotRowEvaluated;
-        builder.expressions.insert(expr);
-        builder
-    };
+fn structure_stage_consumes_sealed_effects_without_legacy_intrinsic_authority() {
+    let mut function = source_function();
+    function
+        .legacy_metadata
+        .as_mut()
+        .unwrap()
+        .intrinsic_row_error = FunctionIntrinsicRowError::NotRowEvaluated;
+    let make = || builder_with_unit(function_unit(function.clone()).unwrap());
     finish(make(), 0, PlanLimits::FROZEN, &Control::default()).unwrap();
-    assert!(
-        make()
-            .finish_definition(
-                NodeId::new(0),
-                FragmentSink::Noop,
-                dop(),
-                crate::StagePlacementPolicy::Singleton
-            )
-            .is_err()
-    );
+    make()
+        .finish_fixture_definition(
+            NodeId::new(0),
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
     for kind_or_signature in 0..2 {
-        reject_both(
-            || {
-                let mut builder = make();
-                let mut expr = builder.expressions.get(ExprId::new(0)).unwrap().clone();
-                let ExprKind::FunctionCall { function, .. } = &mut expr.kind else {
-                    unreachable!()
-                };
-                if kind_or_signature == 0 {
-                    function.kind = FunctionKind::Table;
-                } else {
-                    function.argument_types =
-                        novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-                            FunctionArgumentType::Value(ValueType::new(DataType::Int64, false)),
-                        ]));
-                }
-                builder.expressions.insert(expr);
-                builder
-            },
-            0,
-        );
+        let mut wrong = function.clone();
+        if kind_or_signature == 0 {
+            wrong.kind = FunctionKind::Table;
+        } else {
+            wrong.argument_types =
+                novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                    FunctionArgumentType::Value(ValueType::new(DataType::Int64, false)),
+                ]));
+        }
+        assert!(function_unit(wrong).is_err());
     }
 }
 
@@ -589,13 +626,7 @@ fn structure_stage_original_controls_cover_success_ordinary_tail_and_runtime_fil
 
 #[test]
 fn structure_signature_correspondence_ignores_only_legacy_effects_and_keeps_full_types() {
-    let builder = function_builder();
-    let ExprKind::FunctionCall {
-        function: original, ..
-    } = &builder.expressions.get(ExprId::new(0)).unwrap().kind
-    else {
-        unreachable!()
-    };
+    let original = &source_function();
     let mut legacy_changed = original.clone();
     legacy_changed.legacy_metadata.as_mut().unwrap().volatility = FunctionVolatility::Volatile;
     legacy_changed
@@ -731,85 +762,40 @@ fn package_admission() -> crate::FragmentPackageAdmission {
 }
 
 #[test]
-fn exact_signature_structure_keeps_types_but_requires_legacy_publication_provenance() {
-    let make = |fault: u8| {
-        let mut builder = function_builder();
-        let mut definition = builder.expressions.get(ExprId::new(0)).unwrap().clone();
-        let ExprKind::FunctionCall { function, .. } = &mut definition.kind else {
-            unreachable!()
-        };
-        *function = BoundFunction::from_exact_signature(
-            function.function_id.clone(),
-            function.overload.clone(),
-            function.kind,
-            function.argument_types.clone(),
-            function.result_type.clone(),
-        );
-        match fault {
-            0 => {}
-            1 => function.kind = FunctionKind::Window,
-            2 => {
-                function.result_type = ValueType::new(
-                    DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
-                        "element",
-                        DataType::Int64,
-                        false,
-                    ))),
-                    false,
-                );
-            }
-            _ => unreachable!(),
-        }
-        builder.expressions.insert(definition);
-        builder
-    };
-    let fragment = finish(make(0), 0, PlanLimits::FROZEN, &Control::default()).unwrap();
-    assert_eq!(
-        expressions_are_replica_deterministic(fragment.expressions(), [ExprId::new(0)], true),
-        Err(MissingLegacyBindingMetadata)
+fn exact_signature_keeps_full_types_and_sealed_calls_supply_effect_authority() {
+    let source = source_function();
+    let exact = BoundFunction::from_exact_signature(
+        source.function_id.clone(),
+        source.overload.clone(),
+        source.kind,
+        source.argument_types.clone(),
+        source.result_type.clone(),
     );
-    let errors = make(0)
-        .finish_definition(
+    assert!(exact.legacy_metadata.is_none());
+    let make = || builder_with_unit(function_unit(exact.clone()).unwrap());
+    finish(make(), 0, PlanLimits::FROZEN, &Control::default()).unwrap();
+    make()
+        .finish_fixture_definition(
             NodeId::new(0),
             FragmentSink::Noop,
             dop(),
             crate::StagePlacementPolicy::Singleton,
         )
-        .unwrap_err();
-    assert!(
-        errors
-            .errors()
-            .iter()
-            .any(|error| { error.category() == ValidationErrorCategory::UnsupportedCapability })
-    );
-    for fault in [1, 2] {
-        reject_both(|| make(fault), 0);
-    }
-
-    let mut builder = make(0);
-    let node = NodeId::new(1);
-    let mut definition = builder.expressions.get(ExprId::new(0)).unwrap().clone();
-    definition.id = ExprId::new(1);
-    definition.owner = node;
-    builder.insert_expression(definition).unwrap();
-    let value = builder
-        .add_value(
-            ValueType::new(DataType::Int64, false),
-            ValueOrigin::NodeOutput {
-                node,
-                output_ordinal: 0,
-            },
-        )
         .unwrap();
-    assert!(matches!(
-        builder.add_project(
-            node,
-            NodeId::new(0),
-            Box::from([(ExprId::new(1), value)]),
-            Box::from([value])
-        ),
-        Err(BuildError::MissingLegacyMetadata(
-            MissingLegacyBindingMetadata
-        ))
-    ));
+    for fault in [1, 2] {
+        let mut wrong = exact.clone();
+        if fault == 1 {
+            wrong.kind = FunctionKind::Window;
+        } else {
+            wrong.result_type = ValueType::new(
+                DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
+                    "element",
+                    DataType::Int64,
+                    false,
+                ))),
+                false,
+            );
+        }
+        assert!(function_unit(wrong).is_err());
+    }
 }

@@ -23,7 +23,7 @@ use crate::{
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    ArgumentControl, CallProofScope, CompileControlError, EvaluationDemand, EvaluationDomainId,
+    ArgumentControl, CallProofScope, CompileControlError, EvaluationDemand, EvaluationRegionId,
     ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
     SemanticParameterId, SemanticParameterRef, SemanticParameterValue,
@@ -136,11 +136,12 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
+            context: (ExpressionEffectContext {
                 use_id: ExpressionUseId::new(u32::MAX),
-                domain: EvaluationDomainId::new(0),
+                region: EvaluationRegionId::new(0),
                 demand: EvaluationDemand::Value,
-            },
+            })
+            .into(),
             argument_uses: CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Scalar,
@@ -399,3 +400,5 @@ fn real_wide_signature_reports_256_and_stops_before_projection_on_refusal() {
         "real signature walk reaches the first quantum before delegated projection"
     );
 }
+
+use novarocks_type_contract::ExpressionEffectContext;

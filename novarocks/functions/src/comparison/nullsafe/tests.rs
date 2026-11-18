@@ -18,7 +18,7 @@
 use super::*;
 use crate::{ConstantPolicy, ConstantPool, RowDataError, SelectedValues, Selection};
 use arrow_schema::Field;
-use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+use novarocks_type_contract::{EvaluationDemand, EvaluationRegionId, ExpressionUseId};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -98,7 +98,7 @@ fn row(
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(91),
-        domain: EvaluationDomainId::new(21),
+        region: EvaluationRegionId::new(21),
         demand: EvaluationDemand::Value,
     }
 }
@@ -217,7 +217,7 @@ fn all_fourteen_legacy_nonnull_profiles_and_null_have_total_independent_truth_ta
             ExpressionEffects::PURE_VALUE
         );
         let foreign = ExpressionEffectContext {
-            domain: EvaluationDomainId::new(22),
+            region: EvaluationRegionId::new(22),
             ..context()
         };
         assert!(prepared.own_effects(context()).for_use(foreign).is_err());

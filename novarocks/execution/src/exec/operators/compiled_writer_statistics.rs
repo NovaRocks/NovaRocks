@@ -28,8 +28,8 @@
 //!   target group once at finish in ascending target order.
 //! * A finish's grouped Unpivot expands each target's final values through
 //!   that target's own mappings with the shared compiled Unpivot core.
-//!   Scalar constants are the program's `FinishUnpivotConstant` roots,
-//!   evaluated once per final batch over one row of the Root port.
+//!   Its scalar constant roots evaluate once per final batch over an empty
+//!   projection of one row in the declared writer-results port.
 //!
 //! Every call runs through the exact prepared aggregate handle its compiler
 //! attached at its writer site: no implementation is selected by name, no
@@ -47,7 +47,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int8Array, Int32Array, new_null_array};
+use arrow::array::{Array, ArrayRef, Int32Array, new_null_array};
 use arrow::datatypes::{DataType, Field};
 use novarocks_functions::{
     AggregateCallContract, AggregateKernelPhase, AggregateStateAllocator, AggregateStateColumn,
@@ -55,16 +55,13 @@ use novarocks_functions::{
     SelectedAggregateMergeInput, SelectedAggregateUpdateInput, Selection,
 };
 use novarocks_local_program::{
-    LocalProgram, ProgramCallSite, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind, ProgramStateTemplate, StaticLayout, UnpivotConstant,
-    WriterGroupedUnpivotPlan,
+    LocalProgram, ProgramCallSite, ProgramNodeId, ProgramNodeKind, ProgramRootRef,
+    ProgramStateTemplate, StaticLayout, UnpivotConstant, WriterGroupedUnpivotPlan,
 };
-use novarocks_spi::connector::write_stack::{
-    RootRowKind, target_ordinal_from_wire, target_ordinal_to_wire,
-};
+use novarocks_spi::connector::write_stack::{target_ordinal_from_wire, target_ordinal_to_wire};
 use novarocks_types::SlotId;
 
-use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
+use super::compiled_expression::{RuntimeKernelControl, evaluate_projected_chunk_all, instances};
 use super::compiled_unpivot::{
     LiteralSource, Producer, UnpivotExpansion, list_item_field, map_entries_field,
 };
@@ -76,6 +73,7 @@ use crate::exec::chunk::{
     ArrayNormalizationStep, Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
 };
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use crate::exec::expr::compiled_program::input_source::InputColumnProjection;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputConstructionOwner, InputEncodingPolicy,
     Operator,
@@ -997,8 +995,8 @@ pub(crate) struct CompiledFinishStatistics {
     plan: WriterGroupedUnpivotPlan,
     mappings: Vec<GroupedMapping>,
     /// Every scalar constant root, in mapping-then-literal order.
-    constant_sites: Vec<ProgramExpressionRootSite>,
-    /// The Root port each scalar constant root reads.
+    constant_sites: Vec<ProgramRootRef>,
+    /// The Root layout that receives the grouped artifact fields.
     root_port: StaticLayout,
     error: Arc<RuntimeErrorState>,
 }
@@ -1122,18 +1120,10 @@ impl CompiledFinishStatistics {
                 )));
             }
             let mut literals = Vec::with_capacity(mapping.constants.len());
-            for (constant_ordinal, (constant, literal_type)) in
-                mapping.constants.iter().zip(&literal_types).enumerate()
-            {
+            for (constant, literal_type) in mapping.constants.iter().zip(&literal_types) {
                 literals.push(match constant {
-                    UnpivotConstant::Scalar { .. } => {
-                        constant_sites.push(ProgramExpressionRootSite::Node {
-                            node,
-                            role: ProgramNodeExpressionRole::FinishUnpivotConstant {
-                                mapping: failure::index(IndexKind::Mapping, mapping_ordinal)?,
-                                constant: failure::index(IndexKind::Literal, constant_ordinal)?,
-                            },
-                        });
+                    UnpivotConstant::Scalar { expr_id, .. } => {
+                        constant_sites.push(*expr_id);
                         LiteralSource::Root(constant_sites.len() - 1)
                     }
                     UnpivotConstant::Int32List(values) => {
@@ -1191,12 +1181,12 @@ impl CompiledFinishStatistics {
         )))
     }
 
-    /// Evaluate every scalar constant root once over one row of the Root
-    /// port: an `ARTIFACT_DRAFT` kind and NULL in every other field. A
-    /// constant reads no channel, so the row only gives it its one row.
+    /// The constants read no columns from the writer-results input. Retain
+    /// its exact prepared declaration and evaluate an explicit empty projection.
     fn evaluate_constants(
         &self,
         receiver: &RuntimeKernelControl,
+        writer_schema: &ChunkSchema,
         root_schema: &ChunkSchemaRef,
         factory: &Arc<dyn InputConstructionFactory>,
         tracker: Option<&Arc<MemTracker>>,
@@ -1208,8 +1198,8 @@ impl CompiledFinishStatistics {
                 storage: owner.storage_lifetime(),
             });
         }
-        // The compiler's complete declared Root port is retained as a layout,
-        // and its actual already-prepared schema remains the Arrow author.
+        // Keep the prepared Root artifact check separate from the input port
+        // that these constants were compiled against.
         for slot in root_schema.slots() {
             let original = self
                 .root_port
@@ -1229,46 +1219,22 @@ impl CompiledFinishStatistics {
                 )));
             }
         }
-        let temporary = factory.begin_typed_construction(root_schema)?;
-        let mut columns = super::unpivot_processor::unpivot_vec::<ArrayRef>(
-            root_schema.slots().len(),
-            temporary.as_ref(),
-        )?;
-        let mut control = receiver.for_receiver();
+        let temporary = factory.begin_typed_construction(writer_schema)?;
+        let mut control = receiver.for_receiver().at_expression_node(self.node);
         if let Some(tracker) = tracker {
             control.bind_mem_tracker(Arc::clone(tracker));
         }
         control.bind_construction_factory(Arc::clone(factory));
-        for (ordinal, slot) in root_schema.slots().iter().enumerate() {
-            if ordinal == 0 {
-                grouped_primitive_adoption(temporary.as_ref(), &control)?;
-                grouped_arc::<Int8Array>(temporary.as_ref())?;
-                columns.push(
-                    Arc::new(Int8Array::from(vec![RootRowKind::ArtifactDraft.to_wire()]))
-                        as ArrayRef,
-                );
-            } else if slot.field().is_nullable() {
-                columns.push(grouped_null_array(
-                    slot.typed_binding().layout(),
-                    1,
-                    temporary.as_ref(),
-                    &control,
-                )?);
-            } else {
-                return Err(ExecutionFailure::from(FragmentBindingError::new(
-                    FragmentBindingTarget::Program,
-                    FragmentBindingErrorKind::SchemaMismatch,
-                    format!(
-                        "compiled grouped Unpivot at local node {} has a NOT NULL Root field {}",
-                        self.node.index(),
-                        slot.field().name()
-                    ),
-                )));
-            }
-        }
+        let compact =
+            project_statistics_schema(&self.final_layout, std::iter::empty(), temporary.as_ref())?;
+        grouped_arc::<InputColumnProjection>(temporary.as_ref())?;
+        let projection = Arc::new(InputColumnProjection::from_owned(
+            Vec::new(),
+            temporary.storage_lifetime(),
+        ));
         let row = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
-            Arc::clone(root_schema),
-            columns,
+            compact,
+            Vec::new(),
             1,
             temporary.storage_lifetime(),
             |step| temporary.observe(0, &[], step),
@@ -1287,7 +1253,14 @@ impl CompiledFinishStatistics {
             owner.as_ref(),
         )?;
         for (instance, site) in created.iter_mut().zip(&self.constant_sites) {
-            constants.push(evaluate_all(instance, *site, row.record_batch(), &control)?);
+            constants.push(evaluate_projected_chunk_all(
+                instance,
+                *site,
+                &row,
+                writer_schema,
+                &projection,
+                &control,
+            )?);
         }
         // This hold covers only this actual constant/reference scaffold.
         // Evaluated payload custody belongs to the original scalar kernel;
@@ -1348,6 +1321,7 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
         &self,
         receiver: &RuntimeKernelControl,
         mut final_chunk: Chunk,
+        writer_schema: &ChunkSchema,
         root_schema: ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
         factory: Arc<dyn InputConstructionFactory>,
@@ -1493,8 +1467,13 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
                 }
             }
         }
-        let constants =
-            self.evaluate_constants(receiver, &root_schema, &factory, tracker.as_ref())?;
+        let constants = self.evaluate_constants(
+            receiver,
+            writer_schema,
+            &root_schema,
+            &factory,
+            tracker.as_ref(),
+        )?;
         let count = self
             .plan
             .literal_output_slot_ids

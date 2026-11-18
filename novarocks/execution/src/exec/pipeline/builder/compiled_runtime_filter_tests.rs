@@ -18,10 +18,9 @@
 //! Compiled runtime filters: blocking and Batch live membership consumers at
 //! compiled scan sources and join probe keys, and join build-key producers.
 //!
-//! Programs reuse compiled fixtures whose checked chain is rebuilt over the
-//! same graph with runtime-filter sites, their binding requirements and their
-//! key roots added. The Task's runtime-filter session is a test double that
-//! records what the operators ask of it.
+//! These fixtures retain their compiled graph and append units with exact
+//! input declarations for runtime-filter roots. The Task's runtime-filter
+//! session is a test double that records what the operators ask of it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -33,20 +32,15 @@ use novarocks_local_program::{
     BindingRequirement, BindingRequirements, CompiledProgramFacts, FilterConsumerActivation,
     FilterConsumerAtExpr, FilterLateApplyGranularity, FilterNullOrder, FilterNullSemantics,
     FilterOrderKey, FilterProducerAtExpr, FilterProducerKind, FilterReduction, FilterSortDirection,
-    ImmutableExpressions, LocalOperatorId, LocalOperatorOrigin, LocalOperatorProvenance,
-    LocalProgram, LocalProgramGraph, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramControlFlow, ProgramExprId, ProgramExpressionArena, ProgramExpressionRootSite,
-    ProgramExpressionUse, ProgramLexicalBindings, ProgramLexicalSource, ProgramNode,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, ProgramResolvedCalls,
-    ProgramRootControlBindings, ProgramRootUseBinding, ProgramSlotBinding, ProgramTypedChannels,
-    ProgramTypedExpressions, ProgramUseRef, StaticExprKind, StaticExprNode, StaticFilterConsumer,
-    StaticFilterContract, StaticFilterProducer,
+    LocalOperatorId, LocalOperatorOrigin, LocalOperatorProvenance, LocalProgram, LocalProgramGraph,
+    ProgramChannelLayoutRole, ProgramChannelSite, ProgramNode, ProgramNodeId, ProgramNodeKind,
+    ProgramRootRef, ProgramUnitId, StaticFilterConsumer, StaticFilterContract,
+    StaticFilterProducer,
 };
 use novarocks_physical_plan::{JoinKind, JoinSide};
 use novarocks_spi::connector::ConnectorScalarValue;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, EvaluationDemand, ExpressionEffectContext, ExpressionUseId,
-    FunctionValueType, PureCompileControl,
+    CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType, PureCompileControl,
 };
 
 use super::aggregate_fixture::result_sink;
@@ -83,368 +77,57 @@ impl PureCompileControl for NoControl {
     }
 }
 
-/// One added key root: its site, and the existing leaf root whose control,
-/// definition and lexical source it shares, unless `definition` and `source`
-/// name its own definition and the slot of its own input port.
-struct AddedRoot {
-    site: ProgramExpressionRootSite,
-    like: ProgramExpressionRootSite,
-    definition: Option<ProgramExprId>,
-    source: Option<ProgramLexicalSource>,
-}
-
-/// What a rebuilt program adds to the compiled one.
+/// Actual units and fragment facts added by one fixture author.
 #[derive(Default)]
 struct Additions {
-    /// A separately prepared, complete scalar occurrence over the SAME Scan port.
-    scalar_root: Option<(
-        ProgramExpressionRootSite,
-        ProgramExpressionRootSite,
-        novarocks_functions::PureEngineFunctionCatalog,
-    )>,
-    /// A new root node, when an added node is the new root.
     root: Option<ProgramNodeId>,
-    /// Definitions appended to the main expression arena, with their types.
-    definitions: Vec<(StaticExprNode, FunctionValueType)>,
+    units: Vec<Arc<novarocks_expression::CompiledExprSet>>,
     requirements: Vec<BindingRequirement>,
-    roots: Vec<AddedRoot>,
     channels: Vec<(ProgramChannelSite, FunctionValueType)>,
     operators: Vec<LocalOperatorProvenance>,
 }
 
-/// `program` with its checked chain rebuilt over `nodes` and `additions`:
-/// extra requirements, one eager key use per added root, the channels and
-/// operators of added nodes. Every other checked fact, provider address and
-/// provenance is carried over as is.
+/// Publish the same actual graph with real unit-table and relation facts.
 fn rebuild(
     program: &LocalProgram,
     nodes: Vec<ProgramNode>,
     additions: Additions,
 ) -> Result<Arc<LocalProgram>, String> {
-    let Additions {
-        scalar_root,
-        root,
-        definitions: added_definitions,
-        requirements,
-        roots,
-        channels: added_channels,
-        operators: added_operators,
-    } = additions;
     let control = NoControl;
     let graph = program.graph();
     let mut entries = graph.requirements().entries().to_vec();
-    entries.extend(requirements);
-    let main = graph.expressions();
-    let arena = if added_definitions.is_empty() {
-        Arc::clone(main)
-    } else {
-        Arc::new(
-            ImmutableExpressions::try_new(
-                main.nodes()
-                    .iter()
-                    .cloned()
-                    .chain(added_definitions.iter().map(|(node, _)| node.clone()))
-                    .collect(),
-                main.allow_throw_exception(),
-                main.query_global_dicts().clone(),
-                main.session_time_zone().map(Arc::from),
-            )
-            .map_err(|error| format!("{error:?}"))?,
-        )
-    };
-    let rebuilt = LocalProgramGraph::try_new_with_sink(
+    entries.extend(additions.requirements);
+    let mut units = program.units().to_vec();
+    units.extend(additions.units);
+    let graph = LocalProgramGraph::try_new_with_outputs(
         nodes,
-        root.unwrap_or(graph.root()),
-        Arc::clone(&arena),
+        additions.root.unwrap_or(graph.root()),
+        &units,
         graph.profile(),
         BindingRequirements::try_new(entries).map_err(|error| format!("{error:?}"))?,
         graph.sink().cloned(),
+        graph.summaries().to_vec(),
     )
     .map_err(|error| error.to_string())?;
-    let checked = program.checked();
-    let channels = checked.channels();
-    let expressions = channels.expressions();
-    let calls = expressions.resolved_calls();
-    let snapshot = calls.snapshot();
-    let mut flows = snapshot
-        .flows()
-        .iter()
-        .map(|(arena, flow)| {
-            (
-                *arena,
-                (
-                    flow.domains().values().cloned().collect::<Vec<_>>(),
-                    flow.uses().values().cloned().collect::<Vec<_>>(),
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut bindings = snapshot
-        .bindings()
-        .iter()
-        .map(|(site, use_id)| ProgramRootUseBinding {
-            site: *site,
-            use_id: *use_id,
-        })
-        .collect::<Vec<_>>();
-    let mut slots = checked
-        .slots()
-        .iter()
-        .map(|(occurrence, source)| ProgramSlotBinding {
-            occurrence: *occurrence,
-            source: *source,
-        })
-        .collect::<Vec<_>>();
-    for root in &roots {
-        let arena = root.site.arena();
-        let like_use = *snapshot
-            .bindings()
-            .get(&root.like)
-            .ok_or("the template root is bound")?;
-        let like = snapshot.flows()[&arena].uses()[&like_use].clone();
-        if !like.arguments.is_empty() {
-            return Err("a key root template must be a leaf".to_string());
-        }
-        let (_, uses) = flows.get_mut(&arena).ok_or("the root arena has a flow")?;
-        let next = uses
-            .iter()
-            .map(|existing| existing.context.use_id.get())
-            .max()
-            .map_or(0, |max| max + 1);
-        let use_id = ExpressionUseId::new(next);
-        uses.push(ProgramExpressionUse {
-            context: ExpressionEffectContext {
-                use_id,
-                domain: like.context.domain,
-                demand: EvaluationDemand::Value,
-            },
-            definition: root.definition.unwrap_or(like.definition),
-            control: like.control,
-            arguments: Box::default(),
-        });
-        bindings.push(ProgramRootUseBinding {
-            site: root.site,
-            use_id,
-        });
-        let source = match root.source {
-            Some(source) => source,
-            None => *checked
-                .slots()
-                .get(&ProgramUseRef {
-                    arena,
-                    use_id: like_use,
-                })
-                .ok_or("the template root reads a slot")?,
-        };
-        slots.push(ProgramSlotBinding {
-            occurrence: ProgramUseRef { arena, use_id },
-            source,
-        });
-    }
-    let mut prepared_calls = calls
+    let calls = program
+        .resolved_calls()
         .calls()
         .iter()
         .map(|(site, call)| (*site, call.specialization().clone()))
-        .collect::<Vec<_>>();
-    if let Some((new_site, like_site, functions)) = scalar_root {
-        use novarocks_functions::{
-            CallArgumentUses, CallEffectInput, FunctionArgument, FunctionBindingRequest,
-            FunctionKind, PureCallPreparation, ScopedExpressionEffects,
-        };
-        let scope = new_site.arena();
-        assert_eq!(scope, like_site.arena());
-        let old_use = snapshot.bindings()[&like_site];
-        let original = &snapshot.flows()[&scope].uses()[&old_use];
-        assert!(matches!(
-            arena.nodes()[original.definition.index()].kind(),
-            StaticExprKind::BoundCall { .. }
-        ));
-        let old_call =
-            &calls.calls()[&novarocks_local_program::ProgramCallSite::Expression(ProgramUseRef {
-                arena: scope,
-                use_id: old_use,
-            })];
-        let contract = old_call.call_contract();
-        let (_, uses) = flows.get_mut(&scope).unwrap();
-        let mut next = uses.iter().map(|v| v.context.use_id.get()).max().unwrap() + 1;
-        let mut arguments = Vec::new();
-        for old_child in &original.arguments {
-            let old = &snapshot.flows()[&scope].uses()[old_child];
-            assert!(
-                old.arguments.is_empty(),
-                "this fixture requires two original slot children"
-            );
-            assert!(matches!(
-                arena.nodes()[old.definition.index()].kind(),
-                StaticExprKind::SlotId(_)
-            ));
-            let use_id = ExpressionUseId::new(next);
-            next += 1;
-            uses.push(ProgramExpressionUse {
-                context: ExpressionEffectContext {
-                    use_id,
-                    ..old.context
-                },
-                definition: old.definition,
-                control: old.control,
-                arguments: Box::default(),
-            });
-            // Project and the Scan key both read this exact Scan NodeOutput port.
-            let source = *checked
-                .slots()
-                .get(&ProgramUseRef {
-                    arena: scope,
-                    use_id: *old_child,
-                })
-                .unwrap();
-            assert!(matches!(
-                source,
-                ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                    role: ProgramChannelLayoutRole::NodeOutput,
-                    ..
-                })
-            ));
-            slots.push(ProgramSlotBinding {
-                occurrence: ProgramUseRef {
-                    arena: scope,
-                    use_id,
-                },
-                source,
-            });
-            arguments.push(use_id);
-        }
-        assert_eq!(arguments.len(), 2);
-        let use_id = ExpressionUseId::new(next);
-        let context = ExpressionEffectContext {
-            use_id,
-            ..original.context
-        };
-        uses.push(ProgramExpressionUse {
-            context,
-            definition: original.definition,
-            control: original.control,
-            arguments: arguments.clone().into_boxed_slice(),
-        });
-        bindings.push(ProgramRootUseBinding {
-            site: new_site,
-            use_id,
-        });
-        let selected = Arc::clone(contract.selected_owner());
-        let request = selected
-            .argument_types
-            .iter()
-            .map(|ty| match ty {
-                novarocks_type_contract::FunctionArgumentType::Value(value_type) => {
-                    FunctionArgument::Value {
-                        value_type: value_type.clone(),
-                        constant: None,
-                    }
-                }
-                _ => panic!("the original shift has two value channels"),
-            })
-            .collect::<Vec<_>>();
-        let argument_uses = arguments.iter().copied().map(Some).collect::<Vec<_>>();
-        let token = functions
-            .prepare_frozen(
-                CallEffectInput {
-                    context,
-                    argument_uses: CallArgumentUses::SelectedChannels(&argument_uses),
-                    function_id: contract.function_id(),
-                    kind: FunctionKind::Scalar,
-                    selected: &selected,
-                    request: FunctionBindingRequest {
-                        arguments: &request,
-                        logical_argument_count: request.len(),
-                        expected_result_type: None,
-                    },
-                    environment: &[],
-                    parameters: contract.parameters(),
-                    decimal_overflow_policy: contract.decimal_overflow_policy(),
-                    proof_scope: contract.effects().proof_scope,
-                },
-                selected.clone(),
-                contract.effects(),
-                PureCallPreparation::Scalar {
-                    arguments: ScopedExpressionEffects::primitive(
-                        context,
-                        novarocks_type_contract::ExpressionEffects::PURE_VALUE,
-                    ),
-                },
-                &control,
-            )
-            .unwrap();
-        let novarocks_functions::PreparedPureKernel::Scalar(kernel) = token.prepared() else {
-            panic!("actual ScalarV1 source")
-        };
-        assert!(kernel.invocation_resource_profile().is_some());
-        prepared_calls.push((
-            novarocks_local_program::ProgramCallSite::Expression(ProgramUseRef {
-                arena: scope,
-                use_id,
-            }),
-            token,
-        ));
-    }
-    let main_definitions = arena.nodes().len();
-    let flows = flows
-        .into_iter()
-        .map(|(arena, (domains, uses))| {
-            let definitions = if arena == ProgramExpressionArena::Main {
-                main_definitions
-            } else {
-                snapshot.roots().arenas()[&arena].nodes().len()
-            };
-            ProgramControlFlow::try_new(domains, uses, definitions, &control)
-                .map(|flow| (arena, flow))
-                .map_err(|error| format!("{error:?}"))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let snapshot = ProgramRootControlBindings::try_new(rebuilt, flows, bindings, &control)
-        .map_err(|error| format!("{error:?}"))?;
-    let calls = ProgramResolvedCalls::try_new(snapshot, prepared_calls, &control)
-        .map_err(|error| error.to_string())?;
-    let typed = ProgramTypedExpressions::try_new(
-        calls,
-        expressions
-            .types()
-            .iter()
-            .map(|(arena, types)| {
-                let mut types = types.to_vec();
-                if *arena == ProgramExpressionArena::Main {
-                    types.extend(added_definitions.iter().map(|(_, value)| {
-                        novarocks_type_contract::FunctionArgumentType::Value(value.clone())
-                    }));
-                }
-                (*arena, types)
-            })
-            .collect(),
-        &control,
-    )
-    .map_err(|error| error.to_string())?;
-    let typed_channels = ProgramTypedChannels::try_new(
-        typed,
-        channels
-            .channels()
-            .iter()
-            .map(|(site, value)| (*site, value.clone()))
-            .chain(added_channels)
-            .collect(),
-        &control,
-    )
-    .map_err(|error| error.to_string())?;
-    let lexical = ProgramLexicalBindings::try_new(
-        typed_channels,
-        checked.lambdas().values().cloned().collect(),
-        slots,
-        &control,
-    )
-    .map_err(|error| error.to_string())?;
+        .collect();
+    let channels = program
+        .channels()
+        .channels()
+        .iter()
+        .map(|(site, value)| (*site, value.clone()))
+        .chain(additions.channels)
+        .collect();
     let operators = program
         .provenance()
         .operators()
         .values()
         .cloned()
-        .chain(added_operators)
+        .chain(additions.operators)
         .collect::<Vec<_>>();
     let allowed = operators
         .iter()
@@ -457,7 +140,10 @@ fn rebuild(
         )
         .collect::<BTreeSet<_>>();
     LocalProgram::try_new(
-        lexical,
+        graph,
+        units,
+        calls,
+        channels,
         operators,
         &allowed,
         CompiledProgramFacts {
@@ -470,6 +156,209 @@ fn rebuild(
     )
     .map(Arc::new)
     .map_err(|error| error.to_string())
+}
+
+struct AuthoredInputRoot {
+    unit: Arc<novarocks_expression::CompiledExprSet>,
+    root: novarocks_expression_contract::RootOrdinal,
+}
+
+/// Author an independent root for a Scan consumer over the original input facts.
+fn read_unit_like(program: &LocalProgram, like: ProgramRootRef) -> AuthoredInputRoot {
+    use novarocks_expression::{EvaluationEnvironment, ScopeLayouts, compile_expr_set_pure};
+    use novarocks_expression_contract::{BoundExprSetBuilder, ExprKind, ExprPort, UnitLimits};
+    use novarocks_type_contract::{CompileCheckpoints, SemanticParameters};
+    let source = program.unit(like.unit).unwrap();
+    let root = source.root(like.root).unwrap();
+    assert!(matches!(
+        source.definitions().node(root.definition).unwrap().kind(),
+        novarocks_expression::StaticExprKind::Input
+    ));
+    let input = source.input(root.use_id).unwrap();
+    assert_eq!(input.scope, root.scope);
+    let scope = source.scope(input.scope).unwrap();
+    let column = scope
+        .columns()
+        .iter()
+        .find(|column| column.ordinal == input.ordinal)
+        .unwrap();
+    let ports = source
+        .scopes()
+        .iter()
+        .map(|scope| ExprPort {
+            values: scope
+                .columns()
+                .iter()
+                .map(|column| (column.value, column.ty.clone()))
+                .collect(),
+        })
+        .collect();
+    let mut work = CompileCheckpoints::try_new(&NoControl, CompilePhase::Validate).unwrap();
+    let mut draft = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: novarocks_type_contract::MAX_CONTROL_DEPTH,
+    });
+    let definition = draft
+        .add(None, column.ty.clone(), ExprKind::Value(column.value))
+        .unwrap();
+    let root = draft
+        .root(definition, EvaluationDemand::Value, root.scope)
+        .unwrap();
+    let unit = draft
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    let pools = novarocks_physical_plan::ConstantPools::empty();
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let mut work = CompileCheckpoints::try_new(&NoControl, CompilePhase::LowerProgram).unwrap();
+    let compiled = compile_expr_set_pure(
+        &unit,
+        EvaluationEnvironment {
+            constants: &pools,
+            parameters: &parameters,
+        },
+        ScopeLayouts {
+            ports: source.scopes(),
+            all_ports: source.scope(novarocks_expression_contract::RootScope::AllPorts),
+        },
+        super::family_fixture::constant_policy(),
+        &functions,
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    AuthoredInputRoot {
+        unit: compiled,
+        root,
+    }
+}
+
+/// The added consumer reads the same probe value as published by the actual Join output.
+fn read_join_output_unit(
+    program: &LocalProgram,
+    like: ProgramRootRef,
+    layout: &novarocks_local_program::StaticLayout,
+    ordinal: usize,
+) -> AuthoredInputRoot {
+    use novarocks_expression::{
+        EvaluationEnvironment, ScopeColumn, ScopeLayout, ScopeLayouts, compile_expr_set_pure,
+    };
+    use novarocks_expression_contract::{
+        BoundExprSetBuilder, ExprKind, ExprPort, RootScope, UnitLimits,
+    };
+    use novarocks_type_contract::{
+        CompileCheckpoints, SemanticParameters, ValueTypeStorageLifetime,
+    };
+    let source = program.unit(like.unit).unwrap();
+    let root = source.root(like.root).unwrap();
+    let binding = source.input(root.use_id).unwrap();
+    let value = source
+        .scope(binding.scope)
+        .unwrap()
+        .columns()
+        .iter()
+        .find(|column| column.ordinal == binding.ordinal)
+        .unwrap()
+        .value;
+    let types = (0..layout.slots().len())
+        .map(|at| {
+            FunctionValueType::try_from_typed_binding(layout.value_binding_at(at).unwrap().clone())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let ty = types[ordinal].clone();
+    let mut work = CompileCheckpoints::try_new(&NoControl, CompilePhase::Validate).unwrap();
+    let mut draft = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: novarocks_type_contract::MAX_CONTROL_DEPTH,
+    });
+    let definition = draft.add(None, ty.clone(), ExprKind::Value(value)).unwrap();
+    let root = draft
+        .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let unit = draft
+        .seal(
+            vec![ExprPort {
+                values: Box::from([(value, ty.clone())]),
+            }],
+            &mut work,
+        )
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    let mut work = CompileCheckpoints::try_new(&NoControl, CompilePhase::LowerProgram).unwrap();
+    let scope = ScopeLayout::try_new(
+        layout.schema().clone(),
+        types.into(),
+        Arc::from([ScopeColumn {
+            value,
+            ordinal: u32::try_from(ordinal).unwrap(),
+            ty,
+        }]),
+        ValueTypeStorageLifetime::pure(),
+        &mut work,
+    )
+    .unwrap();
+    let pools = novarocks_physical_plan::ConstantPools::empty();
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let catalog = crate::exec::expr::compiled_program::tests::rng_subset();
+    let compiled = compile_expr_set_pure(
+        &unit,
+        EvaluationEnvironment {
+            constants: &pools,
+            parameters: &parameters,
+        },
+        ScopeLayouts {
+            ports: &[scope],
+            all_ports: None,
+        },
+        super::family_fixture::constant_policy(),
+        &catalog,
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    AuthoredInputRoot {
+        unit: compiled,
+        root,
+    }
+}
+
+fn appended_root(
+    program: &LocalProgram,
+    added: usize,
+    root: novarocks_expression_contract::RootOrdinal,
+) -> ProgramRootRef {
+    ProgramRootRef::new(ProgramUnitId::new(program.units().len() + added), root)
+}
+
+fn project_root(program: &LocalProgram, node: ProgramNodeId, output: usize) -> ProgramRootRef {
+    let ProgramNodeKind::Project { exprs, .. } = program.graph().nodes()[node.index()].kind()
+    else {
+        panic!("actual Project source")
+    };
+    exprs[output]
+}
+
+fn scan_consumer_root(program: &LocalProgram, scan: ProgramNodeId) -> ProgramRootRef {
+    let ProgramNodeKind::Scan {
+        runtime_filters, ..
+    } = program.graph().nodes()[scan.index()].kind()
+    else {
+        panic!("the fixture consumer belongs to a Scan");
+    };
+    assert_eq!(runtime_filters.len(), 1);
+    runtime_filters[0].expr_id
+}
+
+fn probe_root(program: &LocalProgram, node: ProgramNodeId, key: usize) -> ProgramRootRef {
+    let ProgramNodeKind::Join { condition, .. } = program.graph().nodes()[node.index()].kind()
+    else {
+        panic!("actual Join source")
+    };
+    condition.keys()[key].probe
 }
 
 /// `program`'s nodes with the node at `id` replaced by `kind`.
@@ -494,10 +383,6 @@ fn with_kind(program: &LocalProgram, id: ProgramNodeId, kind: ProgramNodeKind) -
             )
         })
         .collect()
-}
-
-fn site(node: ProgramNodeId, role: ProgramNodeExpressionRole) -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node { node, role }
 }
 
 fn requirement(binding_id: u32) -> BindingRequirement {
@@ -815,12 +700,6 @@ fn scan_with_consumers(
     let base = scan_program(dop, false);
     let scan = *base.scan_inputs().keys().next().expect("one scan");
     let project = base.graph().root();
-    let snapshot = base
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
     let ProgramNodeKind::Scan {
         source,
         residuals,
@@ -831,29 +710,17 @@ fn scan_with_consumers(
         panic!("the fixture scan is a Scan");
     };
     let mut runtime_filters = Vec::new();
-    let mut roots = Vec::new();
+    let mut units = Vec::new();
     let mut requirements = Vec::new();
-    for (binding, (consumer, output)) in consumers.into_iter().enumerate() {
-        let like = site(
-            project,
-            ProgramNodeExpressionRole::ProjectOutput { expression: output },
-        );
-        let definition = snapshot.roots().sites()[&like].definition;
+    for (consumer, output) in consumers {
+        let like = project_root(&base, project, output as usize);
+        let unit = read_unit_like(&base, like);
+        let definition = appended_root(&base, units.len(), unit.root);
+        units.push(unit.unit);
         requirements.push(requirement(consumer.binding_id()));
         runtime_filters.push(FilterConsumerAtExpr {
             expr_id: definition,
             consumer,
-        });
-        roots.push(AddedRoot {
-            site: site(
-                scan,
-                ProgramNodeExpressionRole::RuntimeFilter {
-                    binding: u32::try_from(binding).unwrap(),
-                },
-            ),
-            like,
-            definition: None,
-            source: None,
         });
     }
     let kind = ProgramNodeKind::Scan {
@@ -867,7 +734,7 @@ fn scan_with_consumers(
         with_kind(&base, scan, kind),
         Additions {
             requirements,
-            roots,
+            units,
             ..Additions::default()
         },
     )
@@ -1487,13 +1354,17 @@ fn a_compiled_scan_gate_honors_explicit_scan_specific_precedence() {
         let session = FakeSession::consumers(&[(7, &subscription)]);
         let state = state(Some(session), wait, scan_wait);
         let op = FixtureScanOp::new(Vec::new(), true);
+        let scan = *program.scan_inputs().keys().next().unwrap();
 
         let consumers =
             crate::exec::operators::runtime_filter::CompiledRuntimeFilterConsumers::try_new(
                 "Scan",
                 Arc::clone(&program),
-                *program.scan_inputs().keys().next().unwrap(),
-                vec![super::runtime_filter_consumer_contract(&blocking_consumer(7)).unwrap()],
+                scan,
+                vec![(
+                    scan_consumer_root(&program, scan),
+                    super::runtime_filter_consumer_contract(&blocking_consumer(7)).unwrap(),
+                )],
                 state.error_state(),
             )
             .expect("compiled consumers");
@@ -1650,20 +1521,9 @@ fn compiled_runtime_filter_bindings_must_match_the_requirements_and_a_session() 
     let ProgramNodeKind::Scan { source, .. } = base.graph().nodes()[scan.index()].kind() else {
         unreachable!()
     };
-    let definition = base
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot()
-        .roots()
-        .sites()[&site(
-        base.graph().root(),
-        ProgramNodeExpressionRole::ProjectOutput {
-            expression: V0_OUTPUT,
-        },
-    )]
-        .definition;
+    let like = project_root(&base, base.graph().root(), V0_OUTPUT as usize);
+    let unit = read_unit_like(&base, like);
+    let definition = appended_root(&base, 0, unit.root);
     let missing = rebuild(
         &base,
         with_kind(
@@ -1681,20 +1541,7 @@ fn compiled_runtime_filter_bindings_must_match_the_requirements_and_a_session() 
             },
         ),
         Additions {
-            roots: vec![AddedRoot {
-                site: site(
-                    scan,
-                    ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
-                ),
-                like: site(
-                    base.graph().root(),
-                    ProgramNodeExpressionRole::ProjectOutput {
-                        expression: V0_OUTPUT,
-                    },
-                ),
-                definition: None,
-                source: None,
-            }],
+            units: vec![unit.unit],
             ..Additions::default()
         },
     );
@@ -2061,13 +1908,10 @@ fn join_under_consumer_node(program: &LocalProgram) -> Result<Arc<LocalProgram>,
     let join = join_node(program);
     assert_eq!(join, graph.root(), "the single join is the fragment result");
     let consumer = ProgramNodeId::new(graph.nodes().len());
-    // The probe key's leaf use lends its control; the key itself is a new
-    // definition of the probe key column as the join outputs it.
-    let like = site(join, ProgramNodeExpressionRole::JoinProbeKey { key: 0 });
+    let like = probe_root(program, join, 0);
     let output = graph.nodes()[join.index()].output_layout();
     let ordinal = 0;
     let key_type = program
-        .checked()
         .channels()
         .channel_type(ProgramChannelSite::Layout {
             node: join,
@@ -2076,7 +1920,8 @@ fn join_under_consumer_node(program: &LocalProgram) -> Result<Arc<LocalProgram>,
         })
         .expect("the join output is typed")
         .clone();
-    let definition = ProgramExprId::new(graph.expressions().nodes().len());
+    let unit = read_join_output_unit(program, like, output, ordinal as usize);
+    let definition = appended_root(program, 0, unit.root);
     let sources = graph.nodes()[join.index()].physical_sources().to_vec();
     let mut nodes = with_kind(program, join, graph.nodes()[join.index()].kind().clone());
     nodes.push(ProgramNode::new_local(
@@ -2092,7 +1937,6 @@ fn join_under_consumer_node(program: &LocalProgram) -> Result<Arc<LocalProgram>,
         output.clone(),
     ));
     let channels = program
-        .checked()
         .channels()
         .channels()
         .iter()
@@ -2128,34 +1972,20 @@ fn join_under_consumer_node(program: &LocalProgram) -> Result<Arc<LocalProgram>,
             .unwrap()
             + 1,
     );
+    // The published root retains exactly the original typed key domain.
+    let novarocks_type_contract::FunctionArgumentType::Value(actual_type) =
+        &unit.unit.types()[unit.unit.root(unit.root).unwrap().definition.index()]
+    else {
+        panic!("real consumer value root")
+    };
+    assert_eq!(actual_type, &key_type);
     rebuild(
         program,
         nodes,
         Additions {
-            scalar_root: None,
             root: Some(consumer),
-            definitions: vec![(
-                StaticExprNode::new(
-                    StaticExprKind::SlotId(output.slots()[0]),
-                    key_type.data_type().clone(),
-                    None,
-                ),
-                key_type,
-            )],
+            units: vec![unit.unit],
             requirements: vec![requirement(7)],
-            roots: vec![AddedRoot {
-                site: site(
-                    consumer,
-                    ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
-                ),
-                like,
-                definition: Some(definition),
-                source: Some(ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                    node: join,
-                    role: ProgramChannelLayoutRole::NodeOutput,
-                    ordinal,
-                })),
-            }],
             channels,
             operators: vec![LocalOperatorProvenance {
                 id,
@@ -2196,8 +2026,7 @@ fn a_compiled_join_probe_key_consumer_node_is_refused_by_name() {
     assert!(subscription.records().is_empty());
 }
 
-// A join-owned consumer retains its key definition but receives one fresh
-// actual use and an exact JoinLeft lexical source, independent of probe uses.
+// A join-owned consumer follows the equality witness to the actual probe key.
 fn join_with_probe_consumers(
     program: &LocalProgram,
     consumers: Vec<StaticFilterConsumer>,
@@ -2212,39 +2041,16 @@ fn join_with_probe_consumers(
     else {
         unreachable!()
     };
-    let definition = condition.keys()[0].probe;
-    let like = site(join, ProgramNodeExpressionRole::JoinProbeKey { key: 0 });
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let like_use = snapshot.bindings()[&like];
-    let source = program.checked().slots()[&ProgramUseRef {
-        arena: ProgramExpressionArena::Main,
-        use_id: like_use,
-    }];
+    let probe = condition.keys()[0].probe;
     let mut additions = Additions::default();
-    for (binding, consumer) in consumers.into_iter().enumerate() {
+    for consumer in consumers {
         additions
             .requirements
             .push(requirement(consumer.binding_id()));
         runtime_filter_consumers.push(novarocks_local_program::FilterConsumerAtJoinKey {
-            expr_id: definition,
+            expr_id: probe,
             key_ordinal: 0,
             consumer,
-        });
-        additions.roots.push(AddedRoot {
-            site: site(
-                join,
-                ProgramNodeExpressionRole::RuntimeFilter {
-                    binding: binding.try_into().unwrap(),
-                },
-            ),
-            like,
-            definition: Some(definition),
-            source: Some(source),
         });
     }
     rebuild(program, with_kind(program, join, kind), additions)
@@ -2255,26 +2061,38 @@ fn join_probe_owned_consumer_actual_root_and_runtime_membership_empty_unavailabl
     let base = single_join(false);
     let program = join_with_probe_consumers(&base, vec![blocking_consumer(7)]).unwrap();
     let join = join_node(&program);
-    let rf = site(
-        join,
-        ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
-    );
-    let probe = site(join, ProgramNodeExpressionRole::JoinProbeKey { key: 0 });
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
+    let ProgramNodeKind::Join {
+        condition,
+        runtime_filter_consumers,
+        left_layout,
+        ..
+    } = program.graph().nodes()[join.index()].kind()
+    else {
+        unreachable!()
+    };
+    let rf = runtime_filter_consumers[0].expr_id;
+    let probe = condition.keys()[0].probe;
     assert_eq!(
-        snapshot.roots().sites()[&rf].definition,
-        snapshot.roots().sites()[&probe].definition
+        rf, probe,
+        "the equality witness names the actual probe key root"
     );
-    assert_ne!(snapshot.bindings()[&rf], snapshot.bindings()[&probe]);
-    let use_id = snapshot.bindings()[&rf];
-    assert!(
-        matches!(program.checked().slots()[&ProgramUseRef { arena: ProgramExpressionArena::Main, use_id }],
-        ProgramLexicalSource::Input(ProgramChannelSite::Layout { node, role: ProgramChannelLayoutRole::JoinLeft, .. }) if node == join)
+    let unit = program.unit(rf.unit).unwrap();
+    let rf_root = unit.root(rf.root).unwrap();
+    let input = unit.input(rf_root.use_id).unwrap();
+    let actual_scope = unit.scope(input.scope).unwrap();
+    assert!(Arc::ptr_eq(actual_scope.schema(), left_layout.schema()));
+    assert_eq!(
+        input.ordinal, 0,
+        "membership reads the original left key column"
+    );
+    assert_eq!(
+        actual_scope
+            .ordinal_type(input.ordinal as usize)
+            .unwrap()
+            .typed_binding(),
+        left_layout
+            .value_binding_at(input.ordinal as usize)
+            .unwrap()
     );
     for values in [vec![1, 2, 3, 4, 6], vec![1], vec![]] {
         let subscription = ControlledSubscription::new();
@@ -2316,7 +2134,7 @@ fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observab
             "Join",
             program.clone(),
             join,
-            vec![contract],
+            vec![(probe_root(&program, join, 0), contract)],
             Arc::new(RuntimeErrorState::default()),
         )
         .unwrap(),
@@ -2447,10 +2265,14 @@ fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latc
     let program =
         join_with_probe_consumers(&single_join(false), vec![blocking_consumer(7)]).unwrap();
     let join = join_node(&program);
-    let root = site(
-        join,
-        ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
-    );
+    let ProgramNodeKind::Join {
+        runtime_filter_consumers,
+        ..
+    } = program.graph().nodes()[join.index()].kind()
+    else {
+        unreachable!()
+    };
+    let root = runtime_filter_consumers[0].expr_id;
     let ProgramNodeKind::Join { left_layout, .. } = program.graph().nodes()[join.index()].kind()
     else {
         unreachable!()
@@ -2473,7 +2295,12 @@ fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latc
             calls: Mutex::new(vec![]),
             refusal: None,
         };
-        CompiledExpressionInstance::try_new(program.clone(), root, &construction).unwrap()
+        CompiledExpressionInstance::try_new(
+            program.unit(root.unit).unwrap().clone(),
+            root.root,
+            &construction,
+        )
+        .unwrap()
     };
     let baseline = Control {
         calls: Mutex::new(vec![]),
@@ -2627,22 +2454,99 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
         QueryId,
         identity::{AttemptId, QueryExecutionId},
     };
-    let (base, functions) =
-        crate::exec::expr::runtime_scalar_memory_actual_sql_tests::scan_shift_base();
+    let (authored, functions) =
+        crate::exec::expr::runtime_scalar_memory_actual_sql_tests::scan_shift_source();
+    let (fragment_id, base) =
+        crate::exec::expr::runtime_scalar_memory_actual_sql_tests::scan_shift_base(
+            &authored, &functions,
+        );
     let scan = *base.scan_inputs().keys().next().unwrap();
-    let like = site(
-        base.graph().root(),
-        ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+    let like = project_root(&base, base.graph().root(), 0);
+    let original = base.unit(like.unit).unwrap();
+    let original_root = original.root(like.root).unwrap();
+    let original_call = &original.calls()[&original_root.use_id];
+    assert!(matches!(
+        original
+            .definitions()
+            .node(original_root.definition)
+            .unwrap()
+            .kind(),
+        novarocks_expression::StaticExprKind::BoundCall { .. }
+    ));
+    let invocation = &original.control_flow().uses()[&original_root.use_id];
+    assert_eq!(invocation.arguments.len(), 2);
+    for child in &invocation.arguments {
+        let child_source = &original.control_flow().uses()[child];
+        assert!(
+            child_source.arguments.is_empty(),
+            "this fixture requires the two original Input children"
+        );
+        assert!(matches!(
+            original
+                .definitions()
+                .node(child_source.definition)
+                .unwrap()
+                .kind(),
+            novarocks_expression::StaticExprKind::Input
+        ));
+        let input = original.input(*child).unwrap();
+        assert!(Arc::ptr_eq(
+            original.scope(input.scope).unwrap().schema(),
+            base.graph().nodes()[scan.index()].output_layout().schema()
+        ));
+    }
+    let fragment = &authored.plan().fragments()[&fragment_id];
+    let local_project = &base.graph().nodes()[base.graph().root().index()];
+    let [source] = local_project.physical_sources() else {
+        panic!("the original Project has one physical source");
+    };
+    let source_project = &fragment.nodes()[&novarocks_physical_plan::NodeId::new(source.get())];
+    let novarocks_physical_plan::NodeKind::Project { expressions } = &source_project.kind else {
+        panic!("the original Project publishes the shift");
+    };
+    let [(actual_root, _)] = expressions.as_ref() else {
+        panic!("the original Project publishes one expression");
+    };
+    let actual_root = *actual_root;
+    let retained = source_project.expressions.as_ref().unwrap();
+    let source_definition = retained.root(actual_root).unwrap().definition;
+    assert_eq!(
+        original.compiled_definition(source_definition),
+        Some(original_root.definition)
     );
-    let definition = base
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot()
-        .roots()
-        .sites()[&like]
-        .definition;
+    let source_call = retained.definition(source_definition).unwrap();
+    assert!(
+        matches!(&source_call.kind, novarocks_expression_contract::ExprKind::FunctionCall { function, .. }
+        if &function.function_id == original_call.call_contract().function_id())
+    );
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        &NoControl,
+        CompilePhase::LowerProgram,
+    )
+    .unwrap();
+    let unit = novarocks_expression::compile_expr_set_pure(
+        retained,
+        novarocks_expression::EvaluationEnvironment {
+            constants: authored.plan().constants(),
+            parameters: authored.plan().parameters(),
+        },
+        novarocks_expression::ScopeLayouts {
+            ports: original.scopes(),
+            all_ports: original.scope(novarocks_expression_contract::RootScope::AllPorts),
+        },
+        authored.plan().statement_constant_policy(),
+        &functions,
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    let actual_call = &unit.calls()[&unit.root(actual_root).unwrap().use_id];
+    let novarocks_functions::PreparedPureKernel::Scalar(kernel) = actual_call.prepared() else {
+        panic!("actual ScalarV1 source")
+    };
+    assert!(kernel.invocation_resource_profile().is_some());
+
+    let definition = appended_root(&base, 0, actual_root);
     let consumer = blocking_consumer(7);
     let ProgramNodeKind::Scan {
         source,
@@ -2671,14 +2575,7 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
         ),
         Additions {
             requirements: vec![requirement(consumer.binding_id())],
-            scalar_root: Some((
-                site(
-                    scan,
-                    ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
-                ),
-                like,
-                functions,
-            )),
+            units: vec![unit],
             ..Default::default()
         },
     )
@@ -2734,7 +2631,10 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
                 "Scan",
                 program.clone(),
                 scan,
-                vec![super::runtime_filter_consumer_contract(&consumer).unwrap()],
+                vec![(
+                    scan_consumer_root(&program, scan),
+                    super::runtime_filter_consumer_contract(&consumer).unwrap(),
+                )],
                 state.error_state(),
             )
             .unwrap();
@@ -2858,25 +2758,33 @@ pub(crate) fn ordered_scan_with_numeric_membership_fixture(
         })
         .collect::<Vec<_>>();
     assert_eq!(partials.len(), 1);
-    let like = site(
-        partials[0],
-        ProgramNodeExpressionRole::AggregateInput {
-            call: 1,
-            argument: 0,
-        },
+    let ProgramNodeKind::Aggregate { functions, .. } =
+        program.graph().nodes()[partials[0].index()].kind()
+    else {
+        unreachable!()
+    };
+    let like = functions[1].inputs[0];
+    let original_unit = program.unit(like.unit).unwrap();
+    let original_root = original_unit.root(like.root).unwrap();
+    let source_binding = original_unit.input(original_root.use_id).unwrap();
+    assert!(
+        matches!(
+            original_unit
+                .definitions()
+                .node(original_root.definition)
+                .unwrap()
+                .kind(),
+            novarocks_expression::StaticExprKind::Input
+        ) && source_binding.ordinal == 1
+            && Arc::ptr_eq(
+                original_unit.scope(source_binding.scope).unwrap().schema(),
+                program.graph().nodes()[scan.index()]
+                    .output_layout()
+                    .schema()
+            )
     );
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let definition = snapshot.roots().sites()[&like].definition;
-    assert!(matches!(
-        program.graph().expressions().nodes()[definition.index()].kind(),
-        StaticExprKind::SlotId(slot)
-        if *slot == program.graph().nodes()[scan.index()].output_layout().slots()[1]
-    ));
+    let unit = read_unit_like(program, like);
+    let definition = appended_root(program, 0, unit.root);
     let consumer = StaticFilterConsumer::try_new(
         73,
         74,
@@ -2918,19 +2826,7 @@ pub(crate) fn ordered_scan_with_numeric_membership_fixture(
         ),
         Additions {
             requirements: vec![requirement(consumer.binding_id())],
-            roots: vec![AddedRoot {
-                site: site(
-                    scan,
-                    ProgramNodeExpressionRole::RuntimeFilter { binding: 1 },
-                ),
-                like,
-                definition: None,
-                source: Some(ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                    node: scan,
-                    role: ProgramChannelLayoutRole::NodeOutput,
-                    ordinal: 1,
-                })),
-            }],
+            units: vec![unit.unit],
             ..Default::default()
         },
     )?;
@@ -3357,6 +3253,7 @@ fn compiled_scan_installs_final_membership_as_batch_live() {
 fn live_batch_outputs(
     program: &Arc<LocalProgram>,
     node: ProgramNodeId,
+    root: ProgramRootRef,
     owner: &'static str,
     chunks: Vec<Chunk>,
     between: impl FnOnce(&ControlledLiveSubscription),
@@ -3375,7 +3272,7 @@ fn live_batch_outputs(
             owner,
             program.clone(),
             node,
-            vec![contract.clone()],
+            vec![(root, contract.clone())],
             runtime.error_state(),
         )
         .unwrap(),
@@ -3419,9 +3316,15 @@ fn live_batch_outputs(
 fn compiled_scan_live_membership_changes_only_the_next_batch_and_terminal_passes_through() {
     let program = scan_with_consumers(1, vec![(live_consumer(7), V0_OUTPUT)]).unwrap();
     let scan = *program.scan_inputs().keys().next().unwrap();
-    let output = live_batch_outputs(&program, scan, "Scan", input(&program), |subscription| {
-        subscription.publish(&[20])
-    });
+    let root = scan_consumer_root(&program, scan);
+    let output = live_batch_outputs(
+        &program,
+        scan,
+        root,
+        "Scan",
+        input(&program),
+        |subscription| subscription.publish(&[20]),
+    );
     // Direct scan output is (v0,v1), before the fixture's projection.
     assert_eq!(
         int64_rows(&output),
@@ -3443,6 +3346,7 @@ fn compiled_scan_live_membership_changes_only_the_next_batch_and_terminal_passes
             int64_rows(&live_batch_outputs(
                 &program,
                 scan,
+                root,
                 "Scan",
                 original,
                 |subscription| subscription.terminate(terminal)
@@ -3486,6 +3390,7 @@ fn probe_batches(program: &Arc<LocalProgram>) -> Vec<Chunk> {
 fn compiled_probe_live_membership_keeps_the_unfiltered_join_result() {
     let program = join_with_probe_consumers(&single_join(false), vec![live_consumer(7)]).unwrap();
     let join = join_node(&program);
+    let root = probe_root(&program, join, 0);
     let build_keys = RIGHT_ROWS
         .iter()
         .filter_map(|row| row.0)
@@ -3493,6 +3398,7 @@ fn compiled_probe_live_membership_keeps_the_unfiltered_join_result() {
     let output = live_batch_outputs(
         &program,
         join,
+        root,
         "Join",
         probe_batches(&program),
         |subscription| subscription.publish(&build_keys),
@@ -3538,7 +3444,7 @@ fn compiled_probe_live_membership_keeps_the_unfiltered_join_result() {
     ] {
         let original = probe_batches(&program);
         let original_rows = int64_rows(&original);
-        let output = live_batch_outputs(&program, join, "Join", original, |subscription| {
+        let output = live_batch_outputs(&program, join, root, "Join", original, |subscription| {
             subscription.terminate(terminal)
         });
         assert_eq!(int64_rows(&output), original_rows);

@@ -428,12 +428,6 @@ impl<'parent> Model<'parent> {
         let size = bytes::<T>(count)?;
         self.charge_requests(usize::from(size != 0) * times, mul(size, times)?, size)
     }
-    /// Temporary requests coexist during construction but are not backing of
-    /// the published output. They use the same cumulative admission model.
-    pub(crate) fn temporary_request<T>(&mut self, count: usize, times: usize) -> Result<(), Error> {
-        let size = bytes::<T>(count)?;
-        self.charge_requests(usize::from(size != 0) * times, mul(size, times)?, 0)
-    }
     /// Charge actual layout requests without treating their conservative
     /// upper bound as a measured necessary floor of retained private storage.
     pub(crate) fn request_layouts(&mut self, layout: Layout, requests: usize) -> Result<(), Error> {

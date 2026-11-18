@@ -69,16 +69,7 @@ fn decimal_text_actual_compiler_both_widths_scales_sparse_slice_and_empty() {
                     let rows = [0, 1, 2];
                     let selection = Selection::try_sparse(3, &rows).unwrap();
                     let mut evaluator = instance(&program);
-                    let snapshot = program
-                        .checked()
-                        .channels()
-                        .expressions()
-                        .resolved_calls()
-                        .snapshot();
-                    let occurrence = ProgramUseRef {
-                        arena: root().arena(),
-                        use_id: snapshot.bindings()[&root()],
-                    };
+                    let occurrence = cast_root_use(&program);
                     let summary = evaluator.effects[&occurrence];
                     assert_eq!(
                         summary

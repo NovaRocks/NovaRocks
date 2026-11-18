@@ -20,8 +20,9 @@ use arrow::array::{Array, Decimal128Array, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::{ExprKind, RootOrdinal};
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
-use novarocks_local_program::{ProgramRootInput, StaticExprKind, root_input_layout};
 use novarocks_sql_testkit::sql_source;
 use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
@@ -53,16 +54,22 @@ fn integral_decimal128_actual_sql_required_i64_to_four_zero_bound_source_and_fra
         DataType::Int64,
     );
     let mut count = 0;
-    for fragment in source.plan().fragments().values() {
-        for (_, node) in fragment.expressions().iter() {
-            if let novarocks_physical_plan::ExprKind::Cast {
+    for unit in source
+        .plan()
+        .fragments()
+        .values()
+        .flat_map(|f| f.nodes().values())
+        .filter_map(|node| node.expressions.as_deref())
+    {
+        for node in unit.definitions() {
+            if let ExprKind::Cast {
                 expr,
                 target: bound,
                 decimal_overflow_policy,
                 ..
             } = &node.kind
                 && *bound == target
-                && *fragment.expressions().get(*expr).unwrap().ty.data_type() == DataType::Int64
+                && *unit.definition(*expr).unwrap().ty.data_type() == DataType::Int64
             {
                 count += 1;
                 assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
@@ -73,39 +80,23 @@ fn integral_decimal128_actual_sql_required_i64_to_four_zero_bound_source_and_fra
     let functions = novarocks_sql_testkit::installed_builtin_owner_catalogue();
     let programs = programs_with_catalogue(&source, &functions);
     let mut found = None;
-    for program in programs.values() {
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        for (&site, &root) in snapshot.bindings() {
-            let invocation = &snapshot.flows()[&site.arena()].uses()[&root];
+    for unit in programs.values().flat_map(|program| program.units()) {
+        for (ordinal, root) in unit.roots().iter().enumerate() {
             if matches!(
-                snapshot.roots().arenas()[&site.arena()]
-                    .node(invocation.definition)
-                    .unwrap()
-                    .kind(),
+                unit.definitions().node(root.definition).unwrap().kind(),
                 StaticExprKind::PreparedCast { .. }
             ) {
                 assert!(found.is_none());
-                found = Some((program.clone(), site));
+                found = Some((
+                    unit.clone(),
+                    RootOrdinal::new(u32::try_from(ordinal).unwrap()),
+                ));
             }
         }
     }
-    let (program, site) = found.expect("actual SQL CAST root");
-    let ProgramRootInput::Layout { node, role } = root_input_layout(program.graph(), site).unwrap()
-    else {
-        panic!("actual scan input")
-    };
-    let schema = program
-        .checked()
-        .channels()
-        .channel_layout(node, role)
-        .unwrap()
-        .schema()
-        .clone();
+    let (unit, root) = found.expect("actual SQL CAST root");
+    let scope = unit.root(root).unwrap().scope;
+    let schema = unit.scope(scope).unwrap().schema().clone();
     assert_eq!(schema.fields().len(), 1);
     assert_eq!(schema.field(0).data_type(), &DataType::Int64);
     // Pure input data. For target scale zero, the stored coefficient is the
@@ -114,8 +105,7 @@ fn integral_decimal128_actual_sql_required_i64_to_four_zero_bound_source_and_fra
     let expected = [Some(-100_i128), Some(0), Some(150)];
     let data = RecordBatch::try_new(schema, vec![input]).unwrap();
     for rows in [vec![0, 1, 2], vec![0, 2], Vec::new()] {
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(unit.clone(), root, &Control).unwrap();
         let output = frame
             .evaluate(&data, Selection::try_sparse(3, &rows).unwrap(), &Control)
             .unwrap();

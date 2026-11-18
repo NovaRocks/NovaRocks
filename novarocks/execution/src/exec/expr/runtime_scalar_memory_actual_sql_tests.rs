@@ -63,19 +63,17 @@ fn runtime_scalar_memory_actual_sql_window_target_uses_same_binding() {
         }
     }
     let (program, node) = found.expect("actual SQL has one Analytic");
-    let ProgramNodeKind::Analytic { input, .. } = program.graph().nodes()[node.index()].kind()
+    let ProgramNodeKind::Analytic {
+        input, functions, ..
+    } = program.graph().nodes()[node.index()].kind()
     else {
         unreachable!()
     };
-    let wanted = novarocks_local_program::ProgramExpressionRootSite::Node {
-        node,
-        role: novarocks_local_program::ProgramNodeExpressionRole::WindowInput {
-            call: 0,
-            argument: 0,
-        },
-    };
-    assert!(program.checked().channels().expressions().resolved_calls().calls().values().any(|call| {
-        matches!(call.state_template(), novarocks_local_program::ProgramStateTemplate::Scalar { scope, kernel } if scope.root == wanted && kernel.invocation_resource_profile().is_some())
+    let wanted = functions[0].args[0];
+    let unit = program.unit(wanted.unit).unwrap();
+    let root_use = unit.root(wanted.root).unwrap().use_id;
+    assert!(unit.calls().iter().any(|(use_id, call)| {
+        matches!(call.prepared(), novarocks_functions::PreparedPureKernel::Scalar(kernel) if unit.root_of_use(*use_id) == Some(wanted.root) && *use_id == root_use && kernel.invocation_resource_profile().is_some())
     }), "the actual Window input owns an installed covered shift");
     let layout = program.graph().nodes()[input.index()].output_layout();
     let batch = RecordBatch::try_new(
@@ -188,8 +186,8 @@ fn runtime_scalar_memory_actual_sql_window_target_uses_same_binding() {
 
 /// Actual SQL supplies the installed scalar and its original checked tree.
 /// The RF fixture separately authors a new complete checked occurrence.
-pub(crate) fn scan_shift_base() -> (
-    Arc<novarocks_local_program::LocalProgram>,
+pub(crate) fn scan_shift_source() -> (
+    novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
     novarocks_functions::PureEngineFunctionCatalog,
 ) {
     let source = sql_source_with_columns(
@@ -197,12 +195,22 @@ pub(crate) fn scan_shift_base() -> (
         &[("v", DataType::Int64), ("c", DataType::Int64)],
     );
     let functions = installed_builtin_owner_catalogue();
+    (source, functions)
+}
+
+pub(crate) fn scan_shift_base(
+    source: &novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
+) -> (
+    novarocks_physical_plan::FragmentId,
+    Arc<novarocks_local_program::LocalProgram>,
+) {
     let mut found = None;
-    for program in compiler_results(&source, &functions).into_values() {
+    for (fragment, program) in compiler_results(source, functions) {
         let program = program.unwrap();
         if !program.scan_inputs().is_empty() {
-            assert!(found.replace(Arc::new(program)).is_none());
+            assert!(found.replace((fragment, Arc::new(program))).is_none());
         }
     }
-    (found.unwrap(), functions)
+    found.unwrap()
 }

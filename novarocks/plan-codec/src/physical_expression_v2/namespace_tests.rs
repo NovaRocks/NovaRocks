@@ -29,10 +29,10 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
+use novarocks_expression_contract::{BoundFunction, UnaryOperator};
 use novarocks_physical_plan::{
-    AggregateBinding, AggregatePhase, AggregateSequenceId, BoundFunction, ConstantPoolId,
-    ConstantReference, LiteralValue, NodeId, NullOrdering, PlanLimits, SortDirection, SortExpr,
-    UnaryOperator, ValueId, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
+    AggregateBinding, AggregatePhase, AggregateSequenceId, ConstantPoolId, ConstantReference,
+    ValueId,
 };
 use novarocks_type_contract::{
     AggregateStateFormatId, CompileControlError, DecimalOverflowPolicy, FunctionArgumentEvaluation,
@@ -129,7 +129,7 @@ fn function(kind: FunctionKind) -> BoundFunction {
         )),
         result_type: int(),
 
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: FunctionVolatility::Immutable,
             argument_evaluation: FunctionArgumentEvaluation::Eager,
             failure_behavior: FunctionFailureBehavior::Propagate,
@@ -152,14 +152,12 @@ fn aggregate(function: &BoundFunction) -> AggregateBinding {
         state_format: AggregateStateFormatId::try_new("test.expression/state-v1").unwrap(),
     }
 }
-fn arena(nodes: Vec<ExprNode>) -> ExprArena {
-    ExprArena::try_from_definitions_observed(nodes.into_iter(), &PlanLimits::default(), &Setup)
-        .unwrap()
+fn definitions(nodes: Vec<ExprNode>) -> Box<[ExprNode]> {
+    nodes.into_boxed_slice()
 }
 fn node(id: u32, kind: ExprKind, ty: FunctionValueType) -> ExprNode {
     ExprNode {
         id: ExprId::new(id),
-        owner: NodeId::new(if id == 0 { 0 } else { u32::MAX }),
         lambda_scope: None,
         ty,
         kind,
@@ -171,10 +169,9 @@ struct Input {
     type_id: u32,
     parameters: Vec<u32>,
     function: Option<u32>,
-    aggregate: Option<u32>,
 }
 struct Fixture {
-    arena: ExprArena,
+    definitions: Box<[ExprNode]>,
     roots: Vec<(u32, FunctionValueType)>,
     input: Vec<Input>,
     functions: [BoundFunction; 3],
@@ -208,19 +205,7 @@ impl Fixture {
                 },
                 function: match n.kind {
                     ExprKind::FunctionCall { .. } => Some(0),
-                    ExprKind::WindowCall { .. } => Some(1),
                     _ => None,
-                },
-                aggregate: if matches!(
-                    n.kind,
-                    ExprKind::WindowCall {
-                        aggregate_binding: Some(_),
-                        ..
-                    }
-                ) {
-                    Some(u32::MAX)
-                } else {
-                    None
                 },
             })
             .collect();
@@ -237,7 +222,7 @@ impl Fixture {
         let mut pools = ConstantPools::empty();
         pools.insert(ConstantPoolId::new(u32::MAX), pool).unwrap();
         Self {
-            arena: arena(nodes),
+            definitions: definitions(nodes),
             roots: vec![
                 (0, int()),
                 (7, FunctionValueType::new(DataType::Int64, false)),
@@ -263,13 +248,9 @@ impl Fixture {
         }
     }
     fn replace(&mut self, index: usize, edit: impl FnOnce(&mut ExprNode)) {
-        let mut nodes = self
-            .arena
-            .iter()
-            .map(|(_, node)| node.clone())
-            .collect::<Vec<_>>();
+        let mut nodes = self.definitions.to_vec();
         edit(&mut nodes[index]);
-        self.arena = arena(nodes);
+        self.definitions = definitions(nodes);
     }
     fn single(kind: ExprKind) -> Self {
         Self::new(vec![node(0, kind, int())])
@@ -308,7 +289,7 @@ impl Fixture {
     ) -> Result<T, Error> {
         self.with_sources(|types, functions, aggregates, input| {
             let prepared = prepare_expression_definitions(
-                &self.arena,
+                Some(ExpressionDefinitionSource::new(&self.definitions, &[])),
                 input,
                 types,
                 functions,
@@ -394,7 +375,6 @@ impl Fixture {
                 value_type_id: x.type_id,
                 lambda_parameter_type_ids: &x.parameters,
                 function_binding_id: x.function,
-                aggregate_binding_id: x.aggregate,
             })
             .collect::<Vec<_>>();
         consume(
@@ -421,10 +401,8 @@ fn policy() -> ConstantPolicy {
 }
 fn all_kinds() -> Fixture {
     let scalar = function(FunctionKind::Scalar);
-    let window = function(FunctionKind::Window);
-    let agg = aggregate(&function(FunctionKind::Aggregate));
     let a = ExprId::new(0);
-    let z = ExprId::new(u32::MAX);
+    let z = ExprId::new(15);
     let kinds = vec![
         ExprKind::Value(ValueId::new(u32::MAX)),
         ExprKind::LambdaParameter {
@@ -496,37 +474,12 @@ fn all_kinds() -> Fixture {
             value: false,
             negated: true,
         },
-        ExprKind::WindowCall {
-            function: window,
-            distinct: true,
-            args: Box::from([z]),
-            function_order_by: Box::from([
-                SortExpr {
-                    expr: a,
-                    direction: SortDirection::Descending,
-                    null_ordering: NullOrdering::First,
-                },
-                SortExpr {
-                    expr: z,
-                    direction: SortDirection::Ascending,
-                    null_ordering: NullOrdering::Last,
-                },
-            ]),
-            frame: Some(WindowFrame {
-                units: WindowFrameUnits::Groups,
-                start: WindowBound::Preceding(a),
-                end: WindowBound::Following(z),
-                exclusion: WindowFrameExclusion::Ties,
-            }),
-            ignore_nulls: true,
-            aggregate_binding: Some(Box::new(agg)),
-        },
     ];
     let nodes = kinds
         .into_iter()
         .enumerate()
         .map(|(i, kind)| {
-            let id = if i == 16 { u32::MAX } else { i as u32 };
+            let id = i as u32;
             let ty = if matches!(i, 5 | 6 | 10 | 11 | 12 | 13 | 15) {
                 boolean()
             } else {
@@ -573,21 +526,17 @@ fn prefixes(
 }
 
 #[test]
-fn namespace_all_seventeen_kinds_preserve_sparse_headers_and_ordered_occurrences() {
+fn namespace_all_sixteen_scalar_kinds_preserve_dense_headers_and_ordered_occurrences() {
     use wire::expression_definition::Kind;
     let f = all_kinds();
     let (facts, out) = f.run(&Control::default(), SOURCE, limits(), true).unwrap();
-    assert_eq!(out.len(), 17);
-    assert_eq!(facts.definition_count, 17);
-    assert_eq!(facts.type_reference_count, 20);
-    assert_eq!(facts.expression_reference_count, 36);
+    assert_eq!(out.len(), 16);
+    assert_eq!(facts.definition_count, 16);
+    assert_eq!(facts.type_reference_count, 19);
+    assert_eq!(facts.expression_reference_count, 31);
     for (index, def) in out.iter().enumerate() {
-        let id = if index == 16 { u32::MAX } else { index as u32 };
+        let id = index as u32;
         assert_eq!(def.id, id);
-        assert_eq!(
-            def.owner_node_id,
-            Some(if index == 0 { 0 } else { u32::MAX })
-        );
         assert_eq!(
             def.lambda_scope_expr_id,
             if index == 1 { Some(8) } else { None }
@@ -604,7 +553,7 @@ fn namespace_all_seventeen_kinds_preserve_sparse_headers_and_ordered_occurrences
     );
     assert_eq!(
         out[2].kind,
-        Some(Kind::Literal(wire::ConstantReference {
+        Some(Kind::Constant(wire::ConstantReference {
             pool_id: Some(u32::MAX),
             row_ordinal: 2
         }))
@@ -613,7 +562,7 @@ fn namespace_all_seventeen_kinds_preserve_sparse_headers_and_ordered_occurrences
         out[3].kind,
         Some(Kind::Unary(wire::UnaryExpression {
             op: wire::UnaryOperator::Minus as i32,
-            expr_id: Some(u32::MAX)
+            expr_id: Some(15)
         }))
     );
     let Some(Kind::Binary(binary)) = &out[4].kind else {
@@ -621,26 +570,26 @@ fn namespace_all_seventeen_kinds_preserve_sparse_headers_and_ordered_occurrences
     };
     assert_eq!(
         (binary.left_expr_id, binary.right_expr_id, binary.op),
-        (Some(u32::MAX), Some(0), wire::BinaryOperator::Add as i32)
+        (Some(15), Some(0), wire::BinaryOperator::Add as i32)
     );
     assert_eq!(binary.allow_throw_exception.as_ref().unwrap().id, Some(0));
     assert_eq!(
         out[5].kind,
         Some(Kind::Conjunction(wire::ExpressionIds {
-            expr_ids: vec![u32::MAX, 0, u32::MAX]
+            expr_ids: vec![15, 0, 15]
         }))
     );
     assert_eq!(
         out[6].kind,
         Some(Kind::Disjunction(wire::ExpressionIds {
-            expr_ids: vec![0, u32::MAX, 0]
+            expr_ids: vec![0, 15, 0]
         }))
     );
     assert_eq!(
         out[7].kind,
         Some(Kind::FunctionCall(wire::FunctionCall {
             function_binding_id: Some(0),
-            argument_expr_ids: vec![u32::MAX]
+            argument_expr_ids: vec![15]
         }))
     );
     assert_eq!(
@@ -678,16 +627,16 @@ fn namespace_all_seventeen_kinds_preserve_sparse_headers_and_ordered_occurrences
         out[11].kind,
         Some(Kind::InList(wire::InListExpression {
             expr_id: Some(0),
-            list_expr_ids: vec![u32::MAX, 0, u32::MAX],
+            list_expr_ids: vec![15, 0, 15],
             negated: true
         }))
     );
     assert_eq!(
         out[12].kind,
         Some(Kind::Between(wire::BetweenExpression {
-            expr_id: Some(u32::MAX),
+            expr_id: Some(15),
             low_expr_id: Some(0),
-            high_expr_id: Some(u32::MAX),
+            high_expr_id: Some(15),
             negated: false
         }))
     );
@@ -695,18 +644,18 @@ fn namespace_all_seventeen_kinds_preserve_sparse_headers_and_ordered_occurrences
         out[13].kind,
         Some(Kind::Like(wire::LikeExpression {
             expr_id: Some(0),
-            pattern_expr_id: Some(u32::MAX),
+            pattern_expr_id: Some(15),
             negated: true
         }))
     );
     assert_eq!(
         out[14].kind,
         Some(Kind::CaseExpression(wire::CaseExpression {
-            operand_expr_id: Some(u32::MAX),
+            operand_expr_id: Some(15),
             arms: vec![
                 wire::WhenThen {
                     when_expr_id: Some(0),
-                    then_expr_id: Some(u32::MAX)
+                    then_expr_id: Some(15)
                 },
                 wire::WhenThen {
                     when_expr_id: Some(0),
@@ -719,52 +668,10 @@ fn namespace_all_seventeen_kinds_preserve_sparse_headers_and_ordered_occurrences
     assert_eq!(
         out[15].kind,
         Some(Kind::IsTruthValue(wire::TruthValueExpression {
-            expr_id: Some(u32::MAX),
+            expr_id: Some(15),
             value: false,
             negated: true
         }))
-    );
-    let Some(Kind::WindowCall(window)) = &out[16].kind else {
-        panic!("window")
-    };
-    assert_eq!(window.function_binding_id, Some(1));
-    assert_eq!(window.aggregate_binding_id, Some(u32::MAX));
-    assert!(window.distinct && window.ignore_nulls);
-    assert_eq!(window.argument_expr_ids, vec![u32::MAX]);
-    assert_eq!(
-        window
-            .function_order_by
-            .iter()
-            .map(|x| (x.expr_id, x.direction, x.null_ordering))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                Some(0),
-                wire::SortDirection::Descending as i32,
-                wire::NullOrdering::First as i32
-            ),
-            (
-                Some(u32::MAX),
-                wire::SortDirection::Ascending as i32,
-                wire::NullOrdering::Last as i32
-            )
-        ]
-    );
-    let frame = window.frame.as_ref().unwrap();
-    assert_eq!(
-        (frame.units, frame.exclusion),
-        (
-            wire::WindowFrameUnits::Groups as i32,
-            wire::WindowFrameExclusion::Ties as i32
-        )
-    );
-    assert_eq!(
-        frame.start.as_ref().unwrap().kind,
-        Some(wire::window_bound::Kind::PrecedingExprId(0))
-    );
-    assert_eq!(
-        frame.end.as_ref().unwrap().kind,
-        Some(wire::window_bound::Kind::FollowingExprId(u32::MAX))
     );
     // This is definition projection, not proof of a complete executable graph.
 }
@@ -786,9 +693,6 @@ fn namespace_full_type_and_original_binding_tokens_refuse_substitution() {
     rejected(&f); // root nullable differs
     let mut f = all_kinds();
     f.input[7].function = Some(17);
-    rejected(&f);
-    let mut f = all_kinds();
-    f.input[16].aggregate = Some(0);
     rejected(&f);
     let mut f = all_kinds();
     f.input[8].parameters.swap(0, 1);
@@ -817,19 +721,6 @@ fn namespace_full_type_and_original_binding_tokens_refuse_substitution() {
     });
     rejected(&f);
     let mut f = all_kinds();
-    f.replace(16, |n| {
-        if let ExprKind::WindowCall {
-            aggregate_binding: Some(binding),
-            ..
-        } = &mut n.kind
-        {
-            binding.phase = AggregatePhase::Final {
-                sequence: AggregateSequenceId::new(0),
-            }
-        }
-    });
-    rejected(&f);
-    let mut f = all_kinds();
     f.replace(7, |n| {
         if let ExprKind::FunctionCall { function, .. } = &mut n.kind {
             function.argument_types =
@@ -851,8 +742,6 @@ fn namespace_full_type_and_original_binding_tokens_refuse_substitution() {
     rejected(&f);
     let mut f = all_kinds();
     f.input[0].parameters = vec![0];
-    rejected(&f);
-    let f = Fixture::single(ExprKind::Literal(LiteralValue::Int64(71)));
     rejected(&f);
     for (left, right) in [
         (
@@ -1012,7 +901,7 @@ fn namespace_constant_selected_ordinal_and_retained_floor_are_checked_before_emi
         .1;
     assert_eq!(
         out[0].kind,
-        Some(Kind::Literal(wire::ConstantReference {
+        Some(Kind::Constant(wire::ConstantReference {
             pool_id: Some(u32::MAX),
             row_ordinal: 2
         }))
@@ -1047,7 +936,7 @@ fn namespace_constant_selected_ordinal_and_retained_floor_are_checked_before_emi
         .1;
     assert_eq!(
         null_output[0].kind,
-        Some(Kind::Literal(wire::ConstantReference {
+        Some(Kind::Constant(wire::ConstantReference {
             pool_id: Some(u32::MAX),
             row_ordinal: 1,
         }))
@@ -1166,7 +1055,7 @@ fn namespace_seven_projection_limits_admit_exact_facts_and_refuse_one_over() {
     let functions = encode_function_bindings(&types, &[], 0, binding_limits(), &Setup).unwrap();
     let aggregates =
         encode_aggregate_bindings(&types, &functions, &[], 0, binding_limits(), &Setup).unwrap();
-    let arena = arena(vec![]);
+    let empty_definitions = definitions(vec![]);
     let parameters = SemanticParameters::default();
     let pools = ConstantPools::empty();
     let c = Control::default();
@@ -1180,7 +1069,7 @@ fn namespace_seven_projection_limits_admit_exact_facts_and_refuse_one_over() {
         max_cumulative_work: limits().max_cumulative_work,
     };
     let prepared = prepare_expression_definitions(
-        &arena,
+        Some(ExpressionDefinitionSource::new(&empty_definitions, &[])),
         &[],
         &types,
         &functions,
@@ -1200,7 +1089,7 @@ fn namespace_seven_projection_limits_admit_exact_facts_and_refuse_one_over() {
     under.max_cumulative_work = empty_work - 1;
     assert!(
         prepare_expression_definitions(
-            &arena,
+            Some(ExpressionDefinitionSource::new(&empty_definitions, &[])),
             &[],
             &types,
             &functions,
@@ -1289,11 +1178,11 @@ fn namespace_prepare_and_consuming_emit_preserve_every_small_callback_and_ordina
 }
 
 #[test]
-fn sealed_namespace_preserves_original_loans_sparse_sources_and_selected_constant() {
+fn sealed_namespace_preserves_original_loans_dense_sources_and_selected_constant() {
     let f = Fixture::new(vec![
         node(0, ExprKind::Value(ValueId::new(u32::MAX)), int()),
         node(
-            u32::MAX,
+            1,
             ExprKind::Constant(ConstantReference {
                 pool: ConstantPoolId::new(u32::MAX),
                 ordinal: 2,
@@ -1303,13 +1192,16 @@ fn sealed_namespace_preserves_original_loans_sparse_sources_and_selected_constan
     ]);
     let c = Control::default();
     f.with_prepared(&c, SOURCE, limits(), |prepared| {
-        let arena = prepared.arena;
+        let definitions = prepared.unit.unwrap().definitions();
         let types = prepared.types;
         let functions = prepared._functions;
         let aggregates = prepared._aggregates;
         let facts = prepared.facts;
         let encoded = prepared.emit()?;
-        assert!(std::ptr::eq(encoded.arena(), arena));
+        assert!(std::ptr::eq(
+            encoded.source().unwrap().definitions(),
+            definitions
+        ));
         assert!(std::ptr::eq(encoded.types(), types));
         assert!(std::ptr::eq(encoded.functions(), functions));
         assert!(std::ptr::eq(encoded.aggregates(), aggregates));
@@ -1323,15 +1215,15 @@ fn sealed_namespace_preserves_original_loans_sparse_sources_and_selected_constan
         assert_eq!(encoded.source_count(), 2);
         assert_eq!(
             encoded.as_wire().iter().map(|n| n.id).collect::<Vec<_>>(),
-            [0, u32::MAX]
+            [0, 1]
         );
-        for id in [0, u32::MAX] {
-            let original = f.arena.get(ExprId::new(id)).unwrap();
+        for id in [0, 1] {
+            let original = f.definitions.get(id as usize).unwrap();
             assert!(std::ptr::eq(encoded.expression(id)?.unwrap(), original));
             assert_eq!(encoded.source_id(original)?, id);
         }
-        assert!(encoded.expression(1)?.is_none());
-        let mut foreign = f.arena.get(ExprId::new(0)).unwrap().clone();
+        assert!(encoded.expression(2)?.is_none());
+        let mut foreign = f.definitions.first().unwrap().clone();
         assert!(matches!(
             encoded.source_id(&foreign),
             Err(Error::InvalidShape(_))
@@ -1342,7 +1234,7 @@ fn sealed_namespace_preserves_original_loans_sparse_sources_and_selected_constan
             Err(Error::InvalidShape(_))
         ));
         assert_eq!(encoded.lookup_work_upper_bound()?, 48);
-        let Some(wire::expression_definition::Kind::Literal(reference)) =
+        let Some(wire::expression_definition::Kind::Constant(reference)) =
             &encoded.as_wire()[1].kind
         else {
             panic!("selected constant reference")
@@ -1404,7 +1296,7 @@ fn sealed_namespace_empty_public_encoder_keeps_zero_requests_and_real_lookup_tai
     let functions = encode_function_bindings(&types, &[], 0, binding_limits(), &Setup).unwrap();
     let aggregates =
         encode_aggregate_bindings(&types, &functions, &[], 0, binding_limits(), &Setup).unwrap();
-    let arena = arena(vec![]);
+    let empty_definitions = definitions(vec![]);
     let parameters = SemanticParameters::default();
     let pools = ConstantPools::empty();
     let c = Control::default();
@@ -1418,7 +1310,7 @@ fn sealed_namespace_empty_public_encoder_keeps_zero_requests_and_real_lookup_tai
         max_cumulative_work: limits().max_cumulative_work,
     };
     let encoded = encode_expression_definitions(
-        &arena,
+        Some(ExpressionDefinitionSource::new(&empty_definitions, &[])),
         &[],
         &types,
         &functions,
@@ -1450,21 +1342,21 @@ fn sealed_namespace_empty_public_encoder_keeps_zero_requests_and_real_lookup_tai
 #[test]
 fn sealed_namespace_queries_keep_every_original_control_prefix_and_ordinary_tail() {
     let f = Fixture::single(ExprKind::Value(ValueId::new(0)));
-    let foreign = f.arena.get(ExprId::new(0)).unwrap().clone();
+    let foreign = f.definitions.first().unwrap().clone();
     for ordinary in [false, true] {
         let invoke = |control: &Control| {
             f.with_prepared(control, SOURCE, limits(), |prepared| {
                 let encoded = prepared.emit()?;
                 assert!(std::ptr::eq(
                     encoded.expression(0)?.unwrap(),
-                    f.arena.get(ExprId::new(0)).unwrap()
+                    f.definitions.first().unwrap()
                 ));
                 assert!(encoded.expression(u32::MAX)?.is_none());
                 encoded.retained_invoice_floor()?;
                 if ordinary {
                     encoded.source_id(&foreign)?;
                 } else {
-                    assert_eq!(encoded.source_id(f.arena.get(ExprId::new(0)).unwrap())?, 0);
+                    assert_eq!(encoded.source_id(f.definitions.first().unwrap())?, 0);
                 }
                 Ok(())
             })
@@ -1544,3 +1436,20 @@ fn namespace_real_wide_lists_and_definitions_reject_original_quantum_without_rep
 
 #[path = "namespace_owned_tests.rs"]
 mod caller_owned_tests;
+
+#[test]
+fn namespace_rejects_sparse_or_duplicate_local_definition_ids_without_reminting() {
+    for ids in [[0, 7], [0, u32::MAX], [0, 0]] {
+        let fixture = Fixture::new(
+            ids.into_iter()
+                .map(|id| node(id, ExprKind::Value(ValueId::new(u32::MAX)), int()))
+                .collect(),
+        );
+        assert!(matches!(
+            fixture.run(&Control::default(), SOURCE, limits(), true),
+            Err(Error::InvalidShape(
+                "expression binding order differs from original definitions"
+            ))
+        ));
+    }
+}

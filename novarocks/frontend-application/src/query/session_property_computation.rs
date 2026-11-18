@@ -108,7 +108,6 @@ impl SessionPropertyCpuInput {
                     sql_semantics: self.staged.sql_semantics(),
                     constant_policy: self.policy,
                     control: &self.control,
-                    version: crate::query_execution::physical_encoding::mint_plan_version(),
                 })
             }
             .map_err(compile_error)?;

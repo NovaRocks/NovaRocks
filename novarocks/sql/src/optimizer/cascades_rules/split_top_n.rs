@@ -286,7 +286,9 @@ mod tests {
             fragment: &novarocks_physical_plan::Fragment,
             node: &novarocks_physical_plan::PhysicalNode,
         ) {
-            use novarocks_physical_plan::{ExprKind, RowMultiplicity};
+            use {
+                novarocks_expression_contract::ExprKind, novarocks_physical_plan::RowMultiplicity,
+            };
             assert_eq!(
                 node.output_properties.row_multiplicity,
                 RowMultiplicity::SingleCopy
@@ -300,7 +302,7 @@ mod tests {
                     // Only an identity projection may carry this fixture's
                     // completed row contract through to its quota.
                     assert!(expressions.iter().all(|(expression, _)| matches!(
-                        fragment.expressions().get(*expression).unwrap().kind,
+                        fragment.root_expression(node.id, *expression).unwrap().kind,
                         ExprKind::Value(_)
                     )));
                     assert_eq!(node.inputs.len(), 1);

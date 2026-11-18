@@ -21,9 +21,9 @@
 use super::{ExpressionCodecError, PreparedExpressionIds};
 use crate::allocation_exit_v2::reserve_exit;
 use crate::physical_semantics_v2::{encode_decimal_policy, encode_reference};
+use novarocks_expression_contract::{BinaryOperator, ExprKind, ExprNode, UnaryOperator};
 use novarocks_physical_plan::{
-    BinaryOperator, ExprId, ExprKind, ExprNode, NullOrdering, SortDirection, UnaryOperator,
-    WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
+    ExprId, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
 };
 use novarocks_proto_models::{physical_control_v2, physical_package_v2 as wire};
 use novarocks_type_contract::{CompileCheckpoints, SemanticParameterKey, SemanticParameterRef};
@@ -44,12 +44,7 @@ pub(super) fn encode_kind(
                 ordinal: *ordinal,
             })
         }
-        ExprKind::Literal(_) => {
-            return Err(ExpressionCodecError::InvalidShape(
-                "legacy literal cannot be encoded as a constant reference",
-            ));
-        }
-        ExprKind::Constant(reference) => Kind::Literal(wire::ConstantReference {
+        ExprKind::Constant(reference) => Kind::Constant(wire::ConstantReference {
             pool_id: Some(reference.pool.get()),
             row_ordinal: reference.ordinal,
         }),
@@ -173,47 +168,6 @@ pub(super) fn encode_kind(
             value: *value,
             negated: *negated,
         }),
-        ExprKind::WindowCall {
-            distinct,
-            args,
-            function_order_by,
-            frame,
-            ignore_nulls,
-            aggregate_binding,
-            ..
-        } => {
-            let binding = required_binding(authored.function_binding_id)?;
-            let aggregate_matches =
-                aggregate_binding.is_some() == authored.aggregate_binding_id.is_some();
-            work.step()?;
-            if !aggregate_matches {
-                return Err(ExpressionCodecError::InvalidShape(
-                    "window aggregate binding ID presence does not match its source",
-                ));
-            }
-            Kind::WindowCall(wire::WindowCall {
-                function_binding_id: Some(binding),
-                distinct: *distinct,
-                argument_expr_ids: expression_ids(args, work)?,
-                function_order_by: project(function_order_by, work, |sort| wire::SortExpression {
-                    expr_id: Some(sort.expr.get()),
-                    direction: match sort.direction {
-                        SortDirection::Ascending => wire::SortDirection::Ascending,
-                        SortDirection::Descending => wire::SortDirection::Descending,
-                    } as i32,
-                    null_ordering: match sort.null_ordering {
-                        NullOrdering::First => wire::NullOrdering::First,
-                        NullOrdering::Last => wire::NullOrdering::Last,
-                    } as i32,
-                })?,
-                frame: frame
-                    .as_ref()
-                    .map(|frame| window_frame(frame, work))
-                    .transpose()?,
-                ignore_nulls: *ignore_nulls,
-                aggregate_binding_id: authored.aggregate_binding_id,
-            })
-        }
     })
 }
 
@@ -292,7 +246,7 @@ fn binary(op: BinaryOperator) -> i32 {
     }) as i32
 }
 
-fn window_frame(
+pub(crate) fn window_frame(
     frame: &WindowFrame,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::WindowFrame, ExpressionCodecError> {
@@ -323,9 +277,15 @@ fn window_bound(
     use wire::window_bound::Kind;
     let kind = match bound {
         WindowBound::UnboundedPreceding => Kind::UnboundedPreceding(physical_control_v2::Empty {}),
-        WindowBound::Preceding(expr) => Kind::PrecedingExprId(expr.get()),
+        WindowBound::Preceding(expr) => Kind::Preceding(wire::ConstantReference {
+            pool_id: Some(expr.pool.get()),
+            row_ordinal: expr.ordinal,
+        }),
         WindowBound::CurrentRow => Kind::CurrentRow(physical_control_v2::Empty {}),
-        WindowBound::Following(expr) => Kind::FollowingExprId(expr.get()),
+        WindowBound::Following(expr) => Kind::Following(wire::ConstantReference {
+            pool_id: Some(expr.pool.get()),
+            row_ordinal: expr.ordinal,
+        }),
         WindowBound::UnboundedFollowing => Kind::UnboundedFollowing(physical_control_v2::Empty {}),
     };
     work.step()?;

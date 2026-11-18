@@ -616,8 +616,8 @@ mod tests {
     ) -> novarocks_query_application::preparation::FrozenExecutionDescription {
         use arrow::datatypes::DataType;
         use novarocks_physical_plan::{
-            ExprKind, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, PipelineDopDomain,
-            PlanBuilder, PlanVersionId, ValueOrigin, ValueType,
+            FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, PlanBuilder,
+            PlanVersionId, ValueOrigin, ValueType,
         };
         use novarocks_query_application::preparation::{
             CompletedPhysicalPlanCandidate, ExecutionResourceRequirements, FrozenCostEstimate,
@@ -630,12 +630,45 @@ mod tests {
         let mut fragment = FragmentBuilder::new(FragmentId::new(13));
         let node = fragment.reserve_node_id().unwrap();
         let ty = ValueType::new(DataType::Int64, false);
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        let policy = novarocks_functions::ConstantPolicy {
+            max_rows: 8,
+            max_array_nodes: 32,
+            max_logical_elements: 4096,
+            max_retained_buffer_bytes: 4 << 20,
+            max_type_depth: 16,
+            max_type_nodes: 64,
+            max_dictionary_depth: 4,
+            max_metadata_bytes: 65536,
+            max_library_validation_work: 64 << 20,
+            max_library_validation_bytes: 64 << 20,
+        };
+        let source = novarocks_functions::ConstantValue::from_i64(
+            std::sync::Arc::new(ty.try_to_field("fixture").unwrap()),
+            ty.clone(),
+            4,
+            policy,
+            novarocks_type_contract::CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let pool = novarocks_physical_plan::ConstantPoolId::new(0);
+        let reference = novarocks_physical_plan::ConstantReference {
+            pool,
+            ordinal: source.ordinal(),
+        };
+        use novarocks_expression_contract::{ExprKind, RootScope};
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase, EvaluationDemand};
         let literal = fragment
-            .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(4)))
+            .unit(node)
+            .unwrap()
+            .add(None, ty.clone(), ExprKind::Constant(reference))
             .unwrap();
         let cast = fragment
-            .add_expression(
-                node,
+            .unit(node)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 ExprKind::Cast {
                     expr: literal,
@@ -647,6 +680,11 @@ mod tests {
                     },
                 },
             )
+            .unwrap();
+        let cast = fragment
+            .unit(node)
+            .unwrap()
+            .root(cast, EvaluationDemand::Value, RootScope::AllPorts)
             .unwrap();
         let value = fragment
             .add_value(
@@ -660,6 +698,19 @@ mod tests {
         fragment
             .add_values(node, Box::from([Box::from([cast])]), Box::from([value]))
             .unwrap();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let ports = fragment.node_ports(node).unwrap();
+        let unit = fragment
+            .take_unit_builder(node)
+            .unwrap()
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(Default::default(), &mut work)
+            .unwrap();
+        fragment
+            .install_unit(node, std::sync::Arc::new(unit))
+            .unwrap();
+        work.finish().unwrap();
         let fragment = fragment
             .finish_definition(
                 node,
@@ -672,7 +723,7 @@ mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
-        let mut builder = PlanBuilder::new(PlanVersionId::try_new([29; 16]).unwrap())
+        let mut builder = PlanBuilder::new(PlanVersionId::try_new([29; 16]).unwrap(), policy)
             .with_semantic_parameters(
                 SemanticParameters::try_new([(
                     SemanticParameterId::new(u32::MAX),
@@ -680,9 +731,12 @@ mod tests {
                 )])
                 .unwrap(),
             );
+        builder
+            .insert_constant_pool(pool, source.pool().clone())
+            .unwrap();
         builder.add_fragment(fragment).unwrap();
         let candidate = CompletedPhysicalPlanCandidate::for_program(
-            builder.finish().unwrap(),
+            builder.finish_observed(&control).unwrap(),
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();

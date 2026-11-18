@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::exec::expr::compiled_program::checked_constants;
 
 fn float_batch(program: &LocalProgram, values: &[Option<f64>]) -> RecordBatch {
     let schema = program.graph().nodes()[1].output_layout().schema().clone();
@@ -141,19 +142,9 @@ fn float_signed_eight_profiles_preserve_arrow_edges_sparse_slices_null_and_both_
                         policy,
                         allow,
                     );
-                    let snapshot = program
-                        .checked()
-                        .channels()
-                        .expressions()
-                        .resolved_calls()
-                        .snapshot();
-                    let occurrence = ProgramUseRef {
-                        arena: root().arena(),
-                        use_id: snapshot.bindings()[&root()],
-                    };
-                    let recipe = program.cast_recipe(occurrence).unwrap();
-                    let context =
-                        snapshot.flows()[&occurrence.arena].uses()[&occurrence.use_id].context;
+                    let occurrence = cast_root_use(&program);
+                    let recipe = root_unit(&program).recipes().cast(occurrence).unwrap();
+                    let context = root_unit(&program).control_flow().uses()[&occurrence].context;
                     assert_eq!(
                         recipe
                             .own_effects(context)
@@ -252,6 +243,7 @@ pub(super) fn inherited_round_fixture_with_target(
     allow: bool,
     target: DataType,
 ) -> (PureEngineFunctionCatalog, Arc<FragmentPackage>) {
+    let mut source_pools = novarocks_physical_plan::ConstantPools::empty();
     let functions = catalogue(Shape::Decimal);
     let fid = FragmentId::new(214);
     let input_node = NodeId::new(41);
@@ -273,11 +265,21 @@ pub(super) fn inherited_round_fixture_with_target(
     let mut items = Vec::new();
     for (id, ty) in &inputs {
         let expr = builder
-            .add_expression(
-                input_node,
+            .unit(input_node)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
-                ExprKind::Literal(LiteralValue::Null),
+                checked_constants::kind(
+                    &mut source_pools,
+                    checked_constants::null(&(ty.clone()), options().constants),
+                ),
             )
+            .unwrap();
+        let expr = builder
+            .unit(input_node)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -285,7 +287,7 @@ pub(super) fn inherited_round_fixture_with_target(
                 ty: ty.clone(),
                 origin: ValueOrigin::Expr {
                     node: input_node,
-                    expr,
+                    root: expr,
                 },
             })
             .unwrap();
@@ -300,14 +302,21 @@ pub(super) fn inherited_round_fixture_with_target(
         )
         .unwrap();
     let decimal_expr = builder
-        .add_expression(output_node, decimal.clone(), ExprKind::Value(inputs[1].0))
+        .unit(output_node)
+        .unwrap()
+        .add(None, decimal.clone(), ExprKind::Value(inputs[1].0))
         .unwrap();
     let digits_type = FunctionValueType::new(DataType::Int64, false);
     let digits = builder
-        .add_expression(
-            output_node,
+        .unit(output_node)
+        .unwrap()
+        .add(
+            None,
             digits_type.clone(),
-            ExprKind::Literal(LiteralValue::Int64(-1)),
+            checked_constants::kind(
+                &mut source_pools,
+                checked_constants::i64(&(digits_type.clone()), -1, options().constants),
+            ),
         )
         .unwrap();
     let mut authors = BTreeMap::new();
@@ -324,8 +333,10 @@ pub(super) fn inherited_round_fixture_with_target(
     );
     let boolean = FunctionValueType::new(DataType::Boolean, false);
     let condition = builder
-        .add_expression(
-            output_node,
+        .unit(output_node)
+        .unwrap()
+        .add(
+            None,
             boolean.clone(),
             ExprKind::IsNull {
                 expr: round,
@@ -334,10 +345,14 @@ pub(super) fn inherited_round_fixture_with_target(
         )
         .unwrap();
     let left = builder
-        .add_expression(output_node, float.clone(), ExprKind::Value(inputs[0].0))
+        .unit(output_node)
+        .unwrap()
+        .add(None, float.clone(), ExprKind::Value(inputs[0].0))
         .unwrap();
     let right = builder
-        .add_expression(output_node, float.clone(), ExprKind::Value(inputs[0].0))
+        .unit(output_node)
+        .unwrap()
+        .add(None, float.clone(), ExprKind::Value(inputs[0].0))
         .unwrap();
     let child = call(
         &mut builder,
@@ -356,8 +371,10 @@ pub(super) fn inherited_round_fixture_with_target(
     );
     let result_type = FunctionValueType::new(target.clone(), true);
     let expression = builder
-        .add_expression(
-            output_node,
+        .unit(output_node)
+        .unwrap()
+        .add(
+            None,
             result_type.clone(),
             ExprKind::Cast {
                 expr: child,
@@ -367,12 +384,17 @@ pub(super) fn inherited_round_fixture_with_target(
             },
         )
         .unwrap();
+    let expression = builder
+        .unit(output_node)
+        .unwrap()
+        .root(expression, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let value = builder
         .add_value(
             result_type.clone(),
             ValueOrigin::Expr {
                 node: output_node,
-                expr: expression,
+                root: expression,
             },
         )
         .unwrap();
@@ -384,22 +406,14 @@ pub(super) fn inherited_round_fixture_with_target(
             Box::from([value]),
         )
         .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output_node,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fid,
-        output: fragment.nodes()[&output_node].output.clone(),
+        output: builder
+            .construction_node(output_node)
+            .unwrap()
+            .output
+            .clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "float_cast_after_round".into(),
@@ -408,7 +422,15 @@ pub(super) fn inherited_round_fixture_with_target(
             ty: result_type,
         }]),
     };
-    let package = package(&functions, fragment, &authors, result, allow);
+    let package = package(
+        &functions,
+        builder,
+        output_node,
+        &authors,
+        result,
+        allow,
+        source_pools,
+    );
     (functions, package)
 }
 
@@ -567,16 +589,7 @@ fn float_cast_errors_remain_terminal_under_coalesce_and_is_null_with_full_child_
                 allow,
             );
             let batch = float_batch(&program, &[Some(f64::NAN), Some(7.9), None]);
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            let occurrence = ProgramUseRef {
-                arena: root().arena(),
-                use_id: snapshot.bindings()[&root()],
-            };
+            let occurrence = cast_root_use(&program);
             let mut evaluator = instance(&program);
             let summary = evaluator.effects[&occurrence];
             assert_eq!(

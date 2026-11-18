@@ -27,14 +27,16 @@ use novarocks_execution::{
     },
 };
 use novarocks_execution_contract::TaskIdentity;
+use novarocks_expression_contract::{
+    BoundFunction, DefinitionControl, ExprKind, ExpressionCallClaim, LegacyBindingMetadata,
+    PhysicalCallRequest, RootScope,
+};
 use novarocks_functions::{
     CallArgumentUses, CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder,
     FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
     InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog, ScopedExpressionEffects,
 };
-use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind,
-};
+use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_native_adapter::backend_task_execution::node_test_support::NativeNodePreparation;
 use novarocks_native_adapter::backend_task_execution::{
     CompiledPackageInterpreter, CompiledTaskOptions, PreparedProjectMetadataForTest,
@@ -206,7 +208,9 @@ fn source_for_arguments(
         inputs.push(input);
         children.push(
             builder
-                .add_expression(project, ty.clone(), ExprKind::Value(input))
+                .unit(project)
+                .unwrap()
+                .add(None, ty.clone(), ExprKind::Value(input))
                 .unwrap(),
         );
     }
@@ -214,21 +218,51 @@ fn source_for_arguments(
         .add_values(values, Box::default(), inputs.into_boxed_slice())
         .unwrap();
     let expr = builder
-        .add_expression(
-            project,
+        .unit(project)
+        .unwrap()
+        .add(
+            None,
             result_type.clone(),
             ExprKind::FunctionCall {
                 function,
-                args: children.clone().into_boxed_slice(),
+                args: children.into_boxed_slice(),
             },
         )
         .unwrap();
+    let unit = builder.unit(project).unwrap();
+    let root = unit
+        .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    unit.definition_control(
+        expr,
+        DefinitionControl {
+            shape: ControlShape::Eager,
+            temporal_sources: None,
+        },
+    )
+    .unwrap();
+    unit.request(
+        expr,
+        PhysicalCallRequest {
+            arguments: types
+                .iter()
+                .map(|ty| StaticFunctionArgument::Value {
+                    value_type: ty.clone(),
+                    constant: None,
+                })
+                .collect(),
+            logical_argument_count: types.len(),
+            expected_result_type: None,
+            constant_policy: constants(),
+        },
+    )
+    .unwrap();
     let output = builder
         .add_value(
             result_type.clone(),
             ValueOrigin::Expr {
                 node: project,
-                expr,
+                root,
             },
         )
         .unwrap();
@@ -236,10 +270,64 @@ fn source_for_arguments(
         .add_project(
             project,
             values,
-            Box::from([(expr, output)]),
+            Box::from([(root, output)]),
             Box::from([output]),
         )
         .unwrap();
+    let ports = builder.node_ports(project).unwrap();
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    let sealed = builder
+        .take_unit_builder(project)
+        .unwrap()
+        .seal(ports, &mut work)
+        .unwrap();
+    assert_eq!(sealed.root_use_ids().len(), 1);
+    let use_id = sealed.root_use_ids()[root.get() as usize];
+    let invocation = &sealed.uses()[&use_id];
+    let context = invocation.context;
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let argument_uses = invocation
+        .arguments
+        .iter()
+        .copied()
+        .map(Some)
+        .collect::<Vec<_>>();
+    work.flush().unwrap();
+    let token = functions
+        .prepare_fresh(
+            CallEffectInput {
+                context: context.into(),
+                argument_uses: CallArgumentUses::SelectedChannels(&argument_uses),
+                function_id: &bound.function_id,
+                kind: FunctionKind::Scalar,
+                selected: &selected,
+                request,
+                environment: &[],
+                parameters: &parameters,
+                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                proof_scope: CallProofScope::Region(context.region),
+            },
+            selected.clone(),
+            PureCallPreparation::Scalar {
+                arguments: ScopedExpressionEffects::pure_value(context),
+            },
+            &Control,
+        )
+        .unwrap();
+    let claims = BTreeMap::from([(
+        use_id,
+        ExpressionCallClaim {
+            context,
+            effects: token.call_contract().effects().clone(),
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            regexp_count_pattern_source: None,
+            to_base64_byte_source: None,
+            temporal_source: None,
+        },
+    )]);
+    let unit = sealed.finish(claims, &mut work).unwrap();
+    work.finish().unwrap();
+    builder.install_unit(project, Arc::new(unit)).unwrap();
     let fragment = builder
         .finish_definition(
             project,
@@ -249,107 +337,9 @@ fn source_for_arguments(
                 max: 1,
                 requires_power_of_two: false,
             },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap()
-        .with_call_requests_observed(
-            vec![(
-                PhysicalCallDefinition::Expression(expr),
-                PhysicalCallRequest {
-                    arguments: types
-                        .iter()
-                        .map(|ty| StaticFunctionArgument::Value {
-                            value_type: ty.clone(),
-                            constant: None,
-                        })
-                        .collect(),
-                    logical_argument_count: types.len(),
-                    expected_result_type: None,
-                    constant_policy: constants(),
-                },
-            )],
-            &Control,
+            StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    assert_eq!(roots.sites().len(), 1);
-    let (site, root) = roots.sites().iter().next().unwrap();
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(0),
-        domain: EvaluationDomainId::new(0),
-        demand: root.demand,
-    };
-    let child_ids = (1..=types.len())
-        .map(|ordinal| ExpressionUseId::new(u32::try_from(ordinal).unwrap()))
-        .collect::<Vec<_>>();
-    let mut invocations = vec![];
-    for (&definition, &use_id) in children.iter().zip(&child_ids) {
-        invocations.push(ExpressionInvocation {
-            context: ExpressionEffectContext { use_id, ..context },
-            definition,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-    }
-    invocations.push(ExpressionInvocation {
-        context,
-        definition: expr,
-        control: ControlShape::Eager,
-        arguments: child_ids.clone().into_boxed_slice(),
-    });
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: context.domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, vec![(*site, context.use_id)], &Control)
-        .unwrap();
-    let parameters = SemanticParameters::try_new([]).unwrap();
-    let argument_uses = child_ids.iter().copied().map(Some).collect::<Vec<_>>();
-    let token = functions
-        .prepare_fresh(
-            CallEffectInput {
-                context,
-                argument_uses: CallArgumentUses::SelectedChannels(&argument_uses),
-                function_id: &bound.function_id,
-                kind: FunctionKind::Scalar,
-                selected: &selected,
-                request,
-                environment: &[],
-                parameters: &parameters,
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
-            },
-            selected.clone(),
-            PureCallPreparation::Scalar {
-                arguments: ScopedExpressionEffects::pure_value(context),
-            },
-            &Control,
-        )
-        .unwrap();
-    let calls = FrozenFragmentCalls::try_new(
-        &fragment,
-        &uses,
-        vec![FrozenPhysicalCall {
-            site: PhysicalCallSite::Expression(context.use_id),
-            context,
-            effects: token.call_contract().effects().clone(),
-            materialized_writer_input: None,
-            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-        }],
-        &Control,
-    )
-    .unwrap();
     let id = fragment.id();
     let result = ResultPort {
         scalar_schema: None,
@@ -373,8 +363,7 @@ fn source_for_arguments(
             required: RequiredContracts::default(),
             fragment,
             constants: ConstantPools::empty(),
-            expression_uses: uses,
-            calls,
+            statement_constant_policy: constants(),
             pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -460,11 +449,13 @@ pub(super) fn program_for_arguments(
     drop(schema);
     program
 }
-pub(super) fn site(program: &LocalProgram) -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: program.graph().root(),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-    }
+pub(super) fn site(program: &LocalProgram) -> ProgramRootRef {
+    let ProgramNodeKind::Project { exprs, .. } =
+        program.graph().nodes()[program.graph().root().index()].kind()
+    else {
+        panic!("original computing Project")
+    };
+    exprs[0]
 }
 pub(super) fn batch_for_arguments(program: &LocalProgram, columns: Vec<ArrayRef>) -> RecordBatch {
     let ProgramNodeKind::Project { input, .. } =

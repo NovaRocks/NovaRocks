@@ -20,10 +20,9 @@
 
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use novarocks_local_program::{
-    ChangeEventOutputExpr, ChangeEventSpec, ProgramExprId, ProgramNodeId, ProgramNodeKind,
-    StaticLayout,
+    ChangeEventOutputExpr, ChangeEventSpec, ProgramNodeId, ProgramNodeKind, StaticLayout,
 };
-use novarocks_physical_plan::{ExprId, FragmentPackage, NodeKind, PhysicalNode};
+use novarocks_physical_plan::{FragmentPackage, NodeKind, PhysicalNode};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use novarocks_types::SlotId;
 use std::collections::BTreeMap;
@@ -34,7 +33,7 @@ pub(crate) fn lower_change_events_with_creation<H>(
     local: ProgramNodeId,
     child: ProgramNodeId,
     slots: &[SlotId],
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
+    expressions: &crate::expressions::RootMap,
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
@@ -55,7 +54,7 @@ fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
-    input: (ProgramNodeId, &BTreeMap<ExprId, ProgramExprId>),
+    input: (ProgramNodeId, &crate::expressions::RootMap),
     slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
@@ -130,7 +129,7 @@ fn lower_core_with_creation<H>(
     let effect_slot_id = effect_slot.ok_or(FragmentCompileError::Invalid(
         "missing change-event effect output",
     ))?;
-    let resolve = |id: ExprId| {
+    let resolve = |id: novarocks_expression_contract::RootOrdinal| {
         expressions
             .get(&id)
             .copied()

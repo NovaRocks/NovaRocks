@@ -17,12 +17,13 @@
 
 //! Pure physical-plan facts shared by runtime-filter codec tests.
 
+use novarocks_expression_contract::ExprKind;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use novarocks_functions::FunctionValueType;
 use novarocks_physical_plan::{
-    Distribution, Edge, EdgeId, EdgeKind, ExprKind, FragmentBuilder, FragmentId, FragmentSink,
+    Distribution, Edge, EdgeId, EdgeKind, FragmentBuilder, FragmentId, FragmentSink,
     JoinDistribution, JoinKey, JoinKind, JoinSide, NodeId, NodeKind, OutputPort, PhysicalNode,
     PhysicalPlan, PhysicalProperties, PipelineDopDomain, PlanBuilder, PlanVersionId, ResultField,
     ResultPort, RowMultiplicity, ValueId, ValueOrigin, ValueType,
@@ -101,9 +102,13 @@ pub(crate) fn append_test_i64_values(
 ) -> (NodeId, ValueId) {
     let node = builder.reserve_node_id().unwrap();
     let ty = ValueType::new(DataType::Int64, false);
-    let literal = builder
-        .add_expression(node, ty.clone(), fixture_i64_reference(literal_value))
-        .unwrap();
+    let literal = crate::test_constants::pure_root(
+        builder,
+        node,
+        ty.clone(),
+        fixture_i64_reference(literal_value),
+        novarocks_expression_contract::RootScope::AllPorts,
+    );
     let value = builder
         .add_value(
             ty,
@@ -115,6 +120,7 @@ pub(crate) fn append_test_i64_values(
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -128,6 +134,7 @@ pub(crate) fn append_test_i64_values(
             },
         })
         .unwrap();
+    crate::test_constants::seal_pure_units(builder);
     (node, value)
 }
 
@@ -235,6 +242,7 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
     };
     join_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: left,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -270,6 +278,7 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
     };
     join_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: right,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -285,11 +294,16 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
         })
         .unwrap();
     let aggregate = join_builder.reserve_node_id().unwrap();
-    let group_key = join_builder
-        .add_expression(aggregate, ty.clone(), ExprKind::Value(right_value))
-        .unwrap();
+    let group_key = crate::test_constants::pure_root(
+        &mut join_builder,
+        aggregate,
+        ty.clone(),
+        ExprKind::Value(right_value),
+        novarocks_expression_contract::RootScope::Port(0),
+    );
     join_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: aggregate,
             inputs: Box::from([right]),
             required_inputs: Box::from([right_properties.clone()]),
@@ -306,14 +320,23 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
         })
         .unwrap();
     let join = join_builder.reserve_node_id().unwrap();
-    let left_key = join_builder
-        .add_expression(join, ty.clone(), ExprKind::Value(left_value))
-        .unwrap();
-    let right_key = join_builder
-        .add_expression(join, ty.clone(), ExprKind::Value(right_value))
-        .unwrap();
+    let left_key = crate::test_constants::pure_root(
+        &mut join_builder,
+        join,
+        ty.clone(),
+        ExprKind::Value(left_value),
+        novarocks_expression_contract::RootScope::Port(0),
+    );
+    let right_key = crate::test_constants::pure_root(
+        &mut join_builder,
+        join,
+        ty.clone(),
+        ExprKind::Value(right_value),
+        novarocks_expression_contract::RootScope::Port(1),
+    );
     join_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: join,
             inputs: Box::from([left, aggregate]),
             required_inputs: Box::from([left_properties.clone(), right_properties]),
@@ -340,6 +363,7 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
         .unwrap();
     let filter_id = RuntimeFilterId::new(40);
     join_builder.attach_runtime_filter(filter_id).unwrap();
+    crate::test_constants::seal_pure_units(&mut join_builder);
     let join_stage = join_builder
         .finish_definition(
             join,
@@ -419,8 +443,11 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
         },
     };
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([40; 16]).unwrap())
-        .with_constant_pools(fixture_i64_constants());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([40; 16]).unwrap(),
+        codec_constant_policy(),
+    )
+    .with_constant_pools(fixture_i64_constants());
     plan.add_fragment(left_source).unwrap();
     plan.add_fragment(right_source).unwrap();
     plan.add_fragment(join_stage).unwrap();

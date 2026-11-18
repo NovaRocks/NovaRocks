@@ -23,10 +23,10 @@ use super::sql_test_source::sql_source_with_single_field_and_core_residuals;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::RootOrdinal;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
-use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramRootInput, StaticExprKind, root_input_layout,
-};
+use novarocks_local_program::{LocalProgram, ProgramRootRef, ProgramUnitId};
 
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, PureCompileControl,
@@ -51,45 +51,35 @@ impl KernelEvaluationControl for Control {
         panic!("IN never waits")
     }
 }
-fn compiled(sql: &str, dtype: DataType) -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
+fn compiled(sql: &str, dtype: DataType) -> (Arc<LocalProgram>, ProgramRootRef) {
     let source = sql_source_with_single_field_and_core_residuals(sql, Field::new("k", dtype, true));
     let functions =
         super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
     let programs = programs_with_catalogue_and_original_inlist_source(&source, &functions);
     let mut found = None;
     for program in programs.values() {
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        for (&site, &root) in snapshot.bindings() {
-            let flow = &snapshot.flows()[&site.arena()];
-            let occurrence = &flow.uses()[&root];
-            let definition = snapshot.roots().arenas()[&site.arena()]
-                .node(occurrence.definition)
-                .unwrap();
-            if matches!(definition.kind(), StaticExprKind::PreparedInList { .. }) {
-                assert!(found.is_none(), "one actual IN root");
-                found = Some((program.clone(), site));
+        for (unit_ordinal, unit) in program.units().iter().enumerate() {
+            for (root_ordinal, root) in unit.roots().iter().enumerate() {
+                let definition = unit.definitions().node(root.definition).unwrap();
+                if matches!(definition.kind(), StaticExprKind::PreparedInList { .. }) {
+                    assert!(found.is_none(), "one actual IN root");
+                    found = Some((
+                        program.clone(),
+                        ProgramRootRef {
+                            unit: ProgramUnitId::new(unit_ordinal),
+                            root: RootOrdinal::new(u32::try_from(root_ordinal).unwrap()),
+                        },
+                    ));
+                }
             }
         }
     }
     found.expect("actual SQL IN root survived original lowering")
 }
-fn batch(program: &LocalProgram, site: ProgramExpressionRootSite, input: ArrayRef) -> RecordBatch {
-    let ProgramRootInput::Layout { node, role } = root_input_layout(program.graph(), site).unwrap()
-    else {
-        panic!("actual source input");
-    };
-    let schema = program
-        .checked()
-        .channels()
-        .channel_layout(node, role)
-        .unwrap()
-        .schema()
-        .clone();
+fn batch(program: &LocalProgram, site: ProgramRootRef, input: ArrayRef) -> RecordBatch {
+    let unit = program.unit(site.unit).unwrap();
+    let root = unit.root(site.root).unwrap();
+    let schema = unit.scope(root.scope).unwrap().schema().clone();
     assert_eq!(schema.fields().len(), 1);
     assert_eq!(schema.field(0).data_type(), input.data_type());
     RecordBatch::try_new(schema, vec![input]).unwrap()
@@ -106,14 +96,9 @@ fn values(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<bool>>
 #[test]
 fn inlist_signed_actual_source_definitions_ordered_uses_guards_and_exact_recipe() {
     let (program, site) = compiled("SELECT k IN (k,-k,k) FROM t0", DataType::Int64);
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let flow = &snapshot.flows()[&site.arena()];
-    let occurrence = &flow.uses()[&snapshot.bindings()[&site]];
+    let unit = program.unit(site.unit).unwrap();
+    let flow = unit.control_flow();
+    let occurrence = &flow.uses()[&unit.root(site.root).unwrap().use_id];
     assert_eq!(
         occurrence.control,
         ControlShape::Membership { negated: false }
@@ -121,9 +106,7 @@ fn inlist_signed_actual_source_definitions_ordered_uses_guards_and_exact_recipe(
     assert_eq!(occurrence.arguments.len(), 4);
     assert_ne!(occurrence.arguments[0], occurrence.arguments[1]);
     assert_ne!(occurrence.arguments[1], occurrence.arguments[3]);
-    let definition = snapshot.roots().arenas()[&site.arena()]
-        .node(occurrence.definition)
-        .unwrap();
+    let definition = unit.definitions().node(occurrence.definition).unwrap();
     let StaticExprKind::PreparedInList { child, values, .. } = definition.kind() else {
         panic!("actual original IN definition");
     };
@@ -144,17 +127,15 @@ fn inlist_signed_actual_source_definitions_ordered_uses_guards_and_exact_recipe(
             novarocks_type_contract::EvaluationDemand::Value
         );
         assert_eq!(
-            flow.domains()[&child.context.domain].guard.unwrap().kind,
+            flow.regions()[&child.context.region].guard.unwrap().kind,
             novarocks_type_contract::GuardKind::MembershipAfterSource {
                 ordinal: (ordinal - 1) as u32
             }
         );
     }
-    let recipe = program
-        .native_inlist_recipe(novarocks_local_program::ProgramUseRef {
-            arena: site.arena(),
-            use_id: snapshot.bindings()[&site],
-        })
+    let recipe = unit
+        .recipes()
+        .native_inlist(unit.root(site.root).unwrap().use_id)
         .unwrap();
     assert_eq!(recipe.source_type().data_type().clone(), DataType::Int64);
     assert_eq!(recipe.candidate_types().len(), 3);
@@ -225,19 +206,9 @@ fn inlist_signed_actual_all_widths_value_truthonly_null_sparse_sliced_empty() {
             (negative_truth.as_str(), vec![Some(false); 4]),
         ] {
             let (program, site) = compiled(sql, ty.clone());
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            let use_id = snapshot.bindings()[&site];
-            let recipe = program
-                .native_inlist_recipe(novarocks_local_program::ProgramUseRef {
-                    arena: site.arena(),
-                    use_id,
-                })
-                .unwrap();
+            let unit = program.unit(site.unit).unwrap();
+            let use_id = unit.root(site.root).unwrap().use_id;
+            let recipe = unit.recipes().native_inlist(use_id).unwrap();
             assert_eq!(recipe.source_type().data_type().clone(), ty);
             assert!(
                 recipe
@@ -248,8 +219,12 @@ fn inlist_signed_actual_all_widths_value_truthonly_null_sparse_sliced_empty() {
             let data = batch(&program, site, input.clone());
             for rows in [vec![0, 1, 2, 3], vec![1, 3], vec![]] {
                 let selection = Selection::try_sparse(4, &rows).unwrap();
-                let mut frame =
-                    CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+                let mut frame = CompiledExpressionInstance::try_new(
+                    program.unit(site.unit).unwrap().clone(),
+                    site.root,
+                    &Control,
+                )
+                .unwrap();
                 let out = frame.evaluate(&data, selection, &Control).unwrap();
                 assert!(out.errors().is_empty());
                 assert_eq!(
@@ -277,8 +252,12 @@ fn inlist_signed_actual_match_never_masks_later_data_error_and_sparse_isolates_i
             site,
             Arc::new(Int64Array::from(vec![i64::MIN, 7, 0])),
         );
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &Control,
+        )
+        .unwrap();
         let out = frame.evaluate(&data, Selection::all(3), &Control).unwrap();
         assert_eq!(values(&out), vec![None, Some(!negated), Some(!negated)]);
         assert_eq!(out.errors().len(), 1);
@@ -290,8 +269,12 @@ fn inlist_signed_actual_match_never_masks_later_data_error_and_sparse_isolates_i
         );
         let rows = [1, 2];
         let selection = Selection::try_sparse(3, &rows).unwrap();
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &Control,
+        )
+        .unwrap();
         let out = frame.evaluate(&data, selection, &Control).unwrap();
         assert!(out.errors().is_empty());
         assert_eq!(values(&out), vec![Some(!negated); 2]);
@@ -343,13 +326,18 @@ fn inlist_signed_actual_every_constructor_phase_callback_seven_causes_no_footer_
     let (program, site) = compiled("SELECT k IN (1,5,NULL) FROM t0", DataType::Int64);
     let data = batch(&program, site, Arc::new(Int64Array::from(vec![0, 3, 9])));
     let record = Callback::new(usize::MAX, KernelFailure::Cancelled);
-    CompiledExpressionInstance::try_new(program.clone(), site, &record).unwrap();
+    CompiledExpressionInstance::try_new(
+        program.unit(site.unit).unwrap().clone(),
+        site.root,
+        &record,
+    )
+    .unwrap();
     let trace = record.trace.lock().unwrap().clone();
     for stop in 1..=trace.len() {
         for cause in causes() {
             let c = Callback::new(stop, cause.clone());
             assert!(
-                matches!(CompiledExpressionInstance::try_new(program.clone(),site,&c),Err(actual) if actual==cause)
+                matches!(CompiledExpressionInstance::try_new(program.unit(site.unit).unwrap().clone(), site.root,&c),Err(actual) if actual==cause)
             );
             assert_eq!(*c.trace.lock().unwrap(), trace[..stop]);
         }
@@ -357,14 +345,22 @@ fn inlist_signed_actual_every_constructor_phase_callback_seven_causes_no_footer_
     for rows in [vec![0, 1, 2], vec![0, 2], Vec::new()] {
         let selection = Selection::try_sparse(3, &rows).unwrap();
         let record = Callback::new(usize::MAX, KernelFailure::Cancelled);
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &Control,
+        )
+        .unwrap();
         frame.evaluate(&data, selection, &record).unwrap();
         let trace = record.trace.lock().unwrap().clone();
         for stop in 1..=trace.len() {
             for cause in causes() {
-                let mut frame =
-                    CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+                let mut frame = CompiledExpressionInstance::try_new(
+                    program.unit(site.unit).unwrap().clone(),
+                    site.root,
+                    &Control,
+                )
+                .unwrap();
                 let c = Callback::new(stop, cause.clone());
                 assert!(matches!(frame.evaluate(&data,selection,&c),Err(actual) if actual==cause));
                 assert_eq!(*c.trace.lock().unwrap(), trace[..stop]);
@@ -401,45 +397,55 @@ fn inlist_signed_actual_original_control_codec_roundtrip_and_invalid_ordered_use
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         };
-        let semantics =
-            novarocks_sql::compiler::author_fragment_package_semantics(&source, policy, &Control)
-                .unwrap();
+        source.require_statement_constant_policy(policy).unwrap();
         let mut seen = 0;
-        for (id, semantic) in semantics {
-            let fragment = &source.plan().fragments()[&id];
-            let mut encoded = novarocks_plan_codec::physical_control_v2::encode_expression_control(
-                &semantic.expression_uses,
-                &Control,
-            )
-            .unwrap();
-            let decoded = novarocks_plan_codec::physical_control_v2::decode_expression_control(
-                fragment, &encoded, &Control,
-            )
-            .unwrap();
-            assert_eq!(decoded.flow(), semantic.expression_uses.flow());
-            assert_eq!(decoded.bindings(), semantic.expression_uses.bindings());
-            let before = seen;
-            for (&id, invocation) in semantic.expression_uses.flow().uses() {
-                if invocation.control == (ControlShape::Membership { negated }) {
-                    let emitted = encoded
-                        .uses
-                        .iter_mut()
-                        .find(|entry| entry.id == id.get())
-                        .unwrap();
-                    assert_eq!(emitted.argument_use_ids.len(), 4);
-                    // No invented expression ID: remove one original use to
-                    // verify the existing codec/source correspondence author.
-                    emitted.argument_use_ids.pop();
-                    seen += 1;
-                }
-            }
-            if seen != before {
-                assert!(
-                    novarocks_plan_codec::physical_control_v2::decode_expression_control(
-                        fragment, &encoded, &Control,
+        for fragment in source.plan().fragments().values() {
+            for node in fragment.nodes().values() {
+                let Some(unit) = fragment.unit(node.id) else {
+                    continue;
+                };
+                let mut encoded =
+                    novarocks_plan_codec::physical_control_v2::encode_expression_control(
+                        unit.control_flow(),
+                        &Control,
                     )
-                    .is_err()
-                );
+                    .unwrap();
+                let decoded = novarocks_plan_codec::physical_control_v2::decode_expression_control(
+                    unit.definitions(),
+                    &encoded,
+                    &Control,
+                )
+                .unwrap();
+                assert_eq!(&decoded, unit.control_flow());
+                assert_eq!(decoded.root_use_ids(), unit.control_flow().root_use_ids());
+                // Root declarations are unit-owned; control wire retains uses.
+                for (root, use_id) in unit.roots().iter().zip(unit.root_use_ids()) {
+                    assert_eq!(decoded.uses()[use_id].definition, root.definition);
+                    assert_eq!(decoded.uses()[use_id].context.demand, root.demand);
+                }
+                let before = seen;
+                for (&id, invocation) in unit.control_flow().uses() {
+                    if invocation.control == (ControlShape::Membership { negated }) {
+                        let emitted = encoded
+                            .uses
+                            .iter_mut()
+                            .find(|entry| entry.id == id.get())
+                            .unwrap();
+                        assert_eq!(emitted.argument_use_ids.len(), 4);
+                        emitted.argument_use_ids.pop();
+                        seen += 1;
+                    }
+                }
+                if seen != before {
+                    assert!(
+                        novarocks_plan_codec::physical_control_v2::decode_expression_control(
+                            unit.definitions(),
+                            &encoded,
+                            &Control
+                        )
+                        .is_err()
+                    );
+                }
             }
         }
         assert_eq!(seen, 1);
@@ -464,14 +470,9 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
                 "SELECT {source} {operator} ({prefix},CASE WHEN k < 0 THEN -k ELSE k END) FROM t0"
             );
             let (program, site) = compiled(&sql, DataType::Int64);
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            let flow = &snapshot.flows()[&site.arena()];
-            let membership = &flow.uses()[&snapshot.bindings()[&site]];
+            let unit = program.unit(site.unit).unwrap();
+            let flow = unit.control_flow();
+            let membership = &flow.uses()[&unit.root(site.root).unwrap().use_id];
             assert_eq!(membership.control, ControlShape::Membership { negated });
             assert_eq!(membership.arguments.len(), 3);
             let case_use = &flow.uses()[&membership.arguments[2]];
@@ -488,12 +489,10 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
                 novarocks_type_contract::EvaluationDemand::Value
             );
             assert_eq!(
-                flow.domains()[&case_use.context.domain].guard.unwrap().kind,
+                flow.regions()[&case_use.context.region].guard.unwrap().kind,
                 novarocks_type_contract::GuardKind::MembershipAfterSource { ordinal: 1 }
             );
-            let definition = snapshot.roots().arenas()[&site.arena()]
-                .node(membership.definition)
-                .unwrap();
+            let definition = unit.definitions().node(membership.definition).unwrap();
             let StaticExprKind::PreparedInList {
                 values: definitions,
                 ..
@@ -521,8 +520,12 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
             let expected = [None, Some(!negated), Some(!negated), None];
             for rows in [vec![0, 1, 2, 3], vec![0, 2], vec![1, 2, 3], vec![]] {
                 let selection = Selection::try_sparse(4, &rows).unwrap();
-                let mut frame =
-                    CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+                let mut frame = CompiledExpressionInstance::try_new(
+                    program.unit(site.unit).unwrap().clone(),
+                    site.root,
+                    &Control,
+                )
+                .unwrap();
                 let output = frame.evaluate(&data, selection, &Control).unwrap();
                 assert_eq!(output.selection(), selection);
                 assert_eq!(
@@ -549,8 +552,12 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
                 Arc::new(Int64Array::from(vec![Some(-7), Some(0), Some(9), None])),
             );
             let record = Callback::new(usize::MAX, KernelFailure::Cancelled);
-            let mut frame =
-                CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+            let mut frame = CompiledExpressionInstance::try_new(
+                program.unit(site.unit).unwrap().clone(),
+                site.root,
+                &Control,
+            )
+            .unwrap();
             let output = frame
                 .evaluate(&success, Selection::all(4), &record)
                 .unwrap();
@@ -559,9 +566,12 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
             assert!(!trace.is_empty());
             for stop in 1..=trace.len() {
                 for cause in causes() {
-                    let mut frame =
-                        CompiledExpressionInstance::try_new(program.clone(), site, &Control)
-                            .unwrap();
+                    let mut frame = CompiledExpressionInstance::try_new(
+                        program.unit(site.unit).unwrap().clone(),
+                        site.root,
+                        &Control,
+                    )
+                    .unwrap();
                     let refused = Callback::new(stop, cause.clone());
                     assert_eq!(
                         frame

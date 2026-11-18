@@ -255,13 +255,12 @@ fn sql_dependency_resolved_binding_real_fold_keeps_original_selection_without_ph
     assert!(probe.produced.load(Ordering::Relaxed));
     assert!(probe.kept.lock().unwrap().is_some());
     assert!(
-        plan.plan()
-            .fragments()
-            .values()
-            .all(|f| f.expressions().iter().all(|(_, e)| !matches!(
-                e.kind,
-                novarocks_physical_plan::ExprKind::FunctionCall { .. }
-            )))
+        super::sql_fold_dependency_observation_tests::expression_sources(&plan).all(
+            |(_, _, source)| !matches!(
+                source.kind,
+                novarocks_expression_contract::ExprKind::FunctionCall { .. }
+            )
+        )
     );
 }
 #[test]

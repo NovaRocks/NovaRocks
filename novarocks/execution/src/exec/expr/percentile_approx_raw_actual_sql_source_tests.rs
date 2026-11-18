@@ -16,9 +16,9 @@
 // under the License.
 //! Complete actual required SQL and original schema facts, without another plan author.
 use arrow::datatypes::DataType;
-use novarocks_physical_plan::{
-    ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
-};
+use novarocks_expression_contract::ExprKind;
+use novarocks_physical_plan::FunctionArgumentType;
+use novarocks_physical_plan::StaticFunctionArgument;
 
 const SEMANTICS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -66,17 +66,15 @@ fn percentile_approx_raw_actual_original_required_sql_full_signature_source() {
     for source in sources() {
         let mut seen = 0;
         for fragment in source.plan().fragments().values() {
-            for (id, node) in fragment.expressions().iter() {
+            for (_source_node, unit, id, node) in super::sql_test_source::unit_definitions(fragment)
+            {
                 let ExprKind::FunctionCall { function, args } = &node.kind else {
                     continue;
                 };
                 if function.function_id.as_str() != "builtin.scalar/percentile_approx_raw/v1" {
                     continue;
                 }
-                let request = fragment
-                    .call_requests()
-                    .get(PhysicalCallDefinition::Expression(*id))
-                    .unwrap();
+                let request = unit.requests().get(id).unwrap();
                 assert_eq!(args.len(), 2);
                 assert_eq!(request.logical_argument_count, 2);
                 assert_eq!(request.arguments.len(), 2);
@@ -107,11 +105,11 @@ fn percentile_approx_raw_actual_original_required_sql_full_signature_source() {
                     "exact original SQL decimal literal author"
                 );
                 assert_eq!(node.ty.data_type().clone(), DataType::Float64);
-                assert_eq!(&fragment.expressions().get(args[0]).unwrap().ty, payload);
+                assert_eq!(&unit.definition(args[0]).unwrap().ty, payload);
                 eprintln!(
                     "PERCENTILE_APPROX_RAW original definition={id:?} fullbinding={function:?} request={request:?} payloadSource={:?} quantileSource={:?} output={:?}",
-                    fragment.expressions().get(args[0]),
-                    fragment.expressions().get(args[1]),
+                    unit.definition(args[0]),
+                    unit.definition(args[1]),
                     node.ty
                 );
                 seen += 1;

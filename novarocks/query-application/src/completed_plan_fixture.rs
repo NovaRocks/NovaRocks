@@ -120,7 +120,10 @@ pub(crate) fn completed_noop_plan(version: [u8; 16]) -> CompletedPlanWithAccess<
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .expect("no-op fragment");
-    let mut builder = PlanBuilder::new(PlanVersionId::try_new(version).expect("plan version"));
+    let mut builder = PlanBuilder::new(
+        PlanVersionId::try_new(version).expect("plan version"),
+        test_constant_policy(),
+    );
     builder.add_fragment(fragment).expect("one fragment");
     let candidate = CompletedPhysicalPlanCandidate::for_program(
         builder.finish().expect("plan"),
@@ -222,7 +225,10 @@ pub(crate) fn completed_scan_candidate(version: [u8; 16]) -> CompletedPhysicalPl
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .expect("scan fragment");
-    let mut builder = PlanBuilder::new(PlanVersionId::try_new(version).expect("plan version"));
+    let mut builder = PlanBuilder::new(
+        PlanVersionId::try_new(version).expect("plan version"),
+        test_constant_policy(),
+    );
     builder.add_fragment(fragment).expect("one fragment");
     CompletedPhysicalPlanCandidate::for_program(
         builder.finish().expect("scan plan"),

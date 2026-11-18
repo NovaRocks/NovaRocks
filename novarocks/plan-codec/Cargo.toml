@@ -31,6 +31,7 @@ doctest = false
 # Generous whole-package limits for dependent crates' tests.
 
 [dependencies]
+novarocks-expression-contract.workspace = true
 novarocks-arrow-batch-codec.workspace = true
 novarocks-failure-contract.workspace = true
 flatbuffers.workspace = true

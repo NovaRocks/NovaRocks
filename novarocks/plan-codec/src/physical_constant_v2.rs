@@ -710,3 +710,11 @@ pub use record_scopes::{
     ConstantRecordConstructionFacts, ScopedPreparedConstantRecord,
     prepare_constant_record_from_sources_input_derived_with_factory_in,
 };
+
+impl<H> From<novarocks_constant_contract::ConstantTableError>
+    for crate::host_projection_v2::ProjectionFailure<PhysicalConstantCodecError, H>
+{
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(novarocks_physical_plan::ConstantReferenceError::from(error))
+    }
+}

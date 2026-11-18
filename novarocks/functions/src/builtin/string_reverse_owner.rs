@@ -312,7 +312,7 @@ pub(super) fn prepared_for_test_with_control(
 ) -> Result<Arc<dyn PreparedScalarKernel>, crate::FunctionSpecializationFailure> {
     use crate::{FunctionArgument, ScopedExpressionEffects, specialize_scalar};
     use novarocks_type_contract::{
-        EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
+        EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, ExpressionUseId,
         SemanticParameters,
     };
     let owner = owner_for_test(name);
@@ -328,13 +328,13 @@ pub(super) fn prepared_for_test_with_control(
     let selected = Arc::new(owner.resolve(request, control)?);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     };
     let parameters = SemanticParameters::try_new([]).unwrap();
     let uses = [Some(ExpressionUseId::new(42))];
     let input = CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Scalar,
@@ -373,7 +373,7 @@ impl StringReverseOwner {
             }
             if !input.environment.is_empty()
                 || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                    && input.proof_scope != input.context.proof_scope()
             {
                 return Err(FunctionBindingError::InvalidBinding(
                 "string reversal has no environment dependencies and requires an exact proof scope".into(),
@@ -408,7 +408,8 @@ impl StringReverseOwner {
                 || input.kind != FunctionKind::Scalar
                 || contract.function_id() != input.function_id
                 || !std::ptr::eq(contract.selected(), input.selected)
-                || contract.context() != input.context
+                || novarocks_type_contract::CallEffectContext::from(contract.context())
+                    != input.context
                 || contract.decimal_overflow_policy() != input.decimal_overflow_policy
                 || contract.effects() != &self.call_effects(input.proof_scope)
                 || !input.environment.is_empty()

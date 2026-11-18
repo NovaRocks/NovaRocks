@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::contract_lowering::{NodeExpressionEffects, node_effects_with_test_summaries};
+use super::super::physical_expression_effects::{
+    PhysicalExpressionEffectsInput, author_physical_expression_effects_observed,
+};
 use super::super::{
     expression_occurrences::author_physical_occurrences_observed,
     physical_window_requests::{
@@ -23,26 +27,33 @@ use super::super::{
 };
 use super::*;
 use crate::functions::build_builtin_engine_function_catalog;
+use crate::test_constants as checked;
 use arrow::{
     array::{Array, DictionaryArray, Int8Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Int8Type},
 };
+use novarocks_functions::ScopedExpressionEffects;
 use novarocks_functions::{
     AggregateKernelPhase, ConstantPolicy, ConstantPool, EngineFunctionCatalog, FunctionArgument,
     FunctionArgumentType, FunctionResultType, PreparedPureKernel, WindowCallContract,
 };
-use novarocks_physical_plan::{
-    AggregateBinding, AggregatePhase, BoundFunction, ConstantPoolId, ConstantPools,
-    ConstantReference, Fragment, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, NodeId,
-    NodeKind, PhysicalRootUses, PipelineDopDomain, PlanLimits, ValueOrigin, WindowBound,
-    WindowExpression, WindowFrame, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
-};
 use novarocks_type_contract::{
-    AggregateStateFormatId, ArgumentControl, CompilePhase, FunctionInstanceState,
+    AggregateStateFormatId, ArgumentControl, CompilePhase, EvaluationDemand, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionValueType, PureCompileControl,
     SemanticParameterId, SemanticParameterKey, SemanticParameterValue,
 };
-use std::sync::Mutex;
+use std::collections::BTreeMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex};
+use {
+    novarocks_expression_contract::{BoundFunction, ExprId, ExprKind, RootOrdinal, RootScope},
+    novarocks_physical_plan::{
+        AggregateBinding, AggregatePhase, ConstantPoolId, ConstantPools, ConstantReference,
+        FragmentId, FragmentSink, NodeId, NodeKind, PipelineDopDomain, PlanLimits, ValueOrigin,
+        WindowBound, WindowCallSpec, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
+        WindowSpec,
+    },
+};
 const PHASE: CompilePhase = CompilePhase::FunctionSpecialization;
 const CAUSES: [CompileControlError; 3] = [
     CompileControlError::Cancelled,
@@ -93,6 +104,56 @@ fn policy() -> ConstantPolicy {
     }
 }
 
+struct FragmentBuilder {
+    builder: novarocks_physical_plan::FragmentBuilder,
+    pools: ConstantPools,
+}
+impl Deref for FragmentBuilder {
+    type Target = novarocks_physical_plan::FragmentBuilder;
+    fn deref(&self) -> &Self::Target {
+        &self.builder
+    }
+}
+impl DerefMut for FragmentBuilder {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.builder
+    }
+}
+impl FragmentBuilder {
+    fn new(id: FragmentId) -> Self {
+        Self {
+            builder: novarocks_physical_plan::FragmentBuilder::new(id),
+            pools: ConstantPools::empty(),
+        }
+    }
+    fn add_expression(
+        &mut self,
+        node: NodeId,
+        ty: FunctionValueType,
+        kind: ExprKind,
+    ) -> Result<ExprId, novarocks_expression_contract::UnitError> {
+        self.builder.unit(node).unwrap().add(None, ty, kind)
+    }
+    fn constant_kind(&mut self, ty: &FunctionValueType, source: checked::Source) -> ExprKind {
+        checked::insert(&mut self.pools, source(ty))
+    }
+}
+struct Fragment {
+    fragment: novarocks_physical_plan::Fragment,
+    pools: ConstantPools,
+    effects: BTreeMap<NodeId, NodeExpressionEffects>,
+}
+impl Deref for Fragment {
+    type Target = novarocks_physical_plan::Fragment;
+    fn deref(&self) -> &Self::Target {
+        &self.fragment
+    }
+}
+impl Fragment {
+    fn constants(&self) -> &ConstantPools {
+        &self.pools
+    }
+}
 fn empty() -> (FragmentBuilder, NodeId, NodeId) {
     let mut builder = FragmentBuilder::new(FragmentId::new(71));
     let input = NodeId::new(7);
@@ -100,26 +161,75 @@ fn empty() -> (FragmentBuilder, NodeId, NodeId) {
     builder
         .add_values(
             input,
-            Box::from([Box::<[ExprId]>::default()]),
+            Box::from([Box::<[RootOrdinal]>::default()]),
             Box::default(),
         )
         .unwrap();
     (builder, input, owner)
 }
-
 fn literal(
     builder: &mut FragmentBuilder,
     owner: NodeId,
     ty: FunctionValueType,
-    value: LiteralValue,
+    value: checked::Source,
 ) -> ExprId {
+    let kind = builder.constant_kind(&ty, value);
+    builder.add_expression(owner, ty, kind).unwrap()
+}
+fn root(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    definition: ExprId,
+    scope: RootScope,
+) -> RootOrdinal {
     builder
-        .add_expression(owner, ty, ExprKind::Literal(value))
+        .unit(node)
+        .unwrap()
+        .root(definition, EvaluationDemand::Value, scope)
         .unwrap()
 }
-
-fn finish(builder: FragmentBuilder, root: NodeId) -> Fragment {
-    builder
+fn finish(mut builder: FragmentBuilder, root: NodeId, external: &ConstantPools) -> Fragment {
+    let mut pools = external.clone();
+    checked::merge(&mut pools, &builder.pools);
+    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let nodes = builder
+        .construction_nodes()
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    let mut effects = BTreeMap::new();
+    for node in nodes {
+        if builder.construction_unit(node).is_none() {
+            continue;
+        }
+        let ports = builder.node_ports(node).unwrap();
+        let draft = builder.take_unit_builder(node).unwrap();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let sealed = draft.seal(ports, &mut work).unwrap();
+        let authored = author_physical_expression_effects_observed(
+            PhysicalExpressionEffectsInput {
+                owner: crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(node),
+                unit: &sealed,
+                constants: &pools,
+                parameters: &parameters,
+                literal_policy: policy(),
+                call_scopes: &BTreeMap::new(),
+            },
+            &catalog,
+            &Control::default(),
+        )
+        .unwrap();
+        let unit = Arc::new(sealed.finish(authored.calls, &mut work).unwrap());
+        work.finish().unwrap();
+        effects.insert(
+            node,
+            node_effects_with_test_summaries(unit.clone(), authored.summaries),
+        );
+        builder.install_unit(node, unit).unwrap();
+    }
+    let fragment = builder
+        .builder
         .finish_structure(
             root,
             FragmentSink::Noop,
@@ -132,13 +242,28 @@ fn finish(builder: FragmentBuilder, root: NodeId) -> Fragment {
             &Control::default(),
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
-        .unwrap()
+        .unwrap();
+    Fragment {
+        fragment,
+        pools,
+        effects,
+    }
 }
-
-fn uses(fragment: &Fragment, catalog: &EngineFunctionCatalog) -> PhysicalRootUses {
-    author_physical_occurrences_observed(fragment, catalog, &Control::default())
-        .unwrap()
-        .root_uses
+fn uses<'a>(
+    fragment: &'a Fragment,
+    catalog: &EngineFunctionCatalog,
+) -> AuthoredPhysicalOccurrences<'a> {
+    author_physical_occurrences_observed(fragment, catalog, &Control::default()).unwrap()
+}
+fn window_source(fragment: &Fragment, site: PhysicalCallSite) -> (&PhysicalNode, &WindowCallSpec) {
+    let PhysicalCallSite::Window { node, call } = site else {
+        panic!("Window fixture site")
+    };
+    let node = &fragment.nodes()[&node];
+    let NodeKind::Window(spec) = &node.kind else {
+        panic!("Window fixture node")
+    };
+    (node, &spec.calls[call as usize])
 }
 
 fn scalar(resolved: novarocks_functions::ResolvedFunctionBinding) -> BoundFunction {
@@ -151,7 +276,7 @@ fn scalar(resolved: novarocks_functions::ResolvedFunctionBinding) -> BoundFuncti
         kind: resolved.kind,
         argument_types: resolved.selected.argument_types,
         result_type,
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: resolved.semantics.volatility,
             argument_evaluation: resolved.semantics.argument_evaluation,
             failure_behavior: resolved.semantics.failure_behavior,
@@ -215,7 +340,7 @@ fn window(
     ignore_nulls: bool,
     aggregate: Option<AggregateBinding>,
     distinct: bool,
-) -> ExprId {
+) -> PhysicalCallSite {
     window_with_passthrough(
         builder,
         input,
@@ -241,29 +366,18 @@ fn window_with_passthrough(
     aggregate: Option<AggregateBinding>,
     distinct: bool,
     passthrough: &[novarocks_physical_plan::ValueId],
-) -> ExprId {
+) -> PhysicalCallSite {
     let result = function.result_type.clone();
-    let root = builder
-        .add_expression(
-            owner,
-            result.clone(),
-            ExprKind::WindowCall {
-                function,
-                distinct,
-                args: args.into(),
-                function_order_by: Box::default(),
-                frame,
-                ignore_nulls,
-                aggregate_binding: aggregate.map(Box::new),
-            },
-        )
-        .unwrap();
+    let arguments = args
+        .iter()
+        .map(|&id| root(builder, owner, id, RootScope::Port(0)))
+        .collect();
     let output = builder
         .add_value(
             result,
-            ValueOrigin::Expr {
+            ValueOrigin::NodeOutput {
                 node: owner,
-                expr: root,
+                output_ordinal: u32::try_from(passthrough.len()).unwrap(),
             },
         )
         .unwrap();
@@ -279,67 +393,101 @@ fn window_with_passthrough(
             NodeKind::Window(WindowSpec {
                 partition_by: Box::default(),
                 order_by: Box::default(),
-                expressions: Box::from([WindowExpression {
-                    expression: root,
+                calls: Box::from([WindowCallSpec {
+                    binding: function,
+                    distinct,
+                    arguments,
+                    order_by: Box::default(),
+                    frame,
+                    ignore_nulls,
+                    aggregate_binding: aggregate.map(Box::new),
                     output,
                 }]),
             }),
         )
         .unwrap();
-    root
+    PhysicalCallSite::Window {
+        node: owner,
+        call: 0,
+    }
 }
+
 fn request<'a>(
-    source: &'a ExprNode,
+    source: &'a WindowCallSpec,
     fragment: &Fragment,
     pools: &ConstantPools,
     control: &Control,
 ) -> Result<AuthoredPhysicalWindowRequest<'a>, PhysicalWindowRequestError> {
+    let mut sources = pools.clone();
+    checked::merge(&mut sources, fragment.constants());
     let mut work = CompileCheckpoints::try_new(control, PHASE)?;
-    let result =
-        author_physical_window_request_observed(source, fragment, pools, policy(), &mut work);
+    let result = author_physical_window_request_observed(
+        source,
+        window_node(fragment),
+        &sources,
+        policy(),
+        &mut work,
+    );
     if matches!(&result, Err(PhysicalWindowRequestError::Control(_))) {
         return result;
     }
     work.finish()?;
     result
 }
-fn pure_children(
-    flow: &ExpressionControlFlow<ExprId>,
-) -> BTreeMap<ExpressionUseId, ScopedExpressionEffects> {
-    flow.uses()
+fn window_node(fragment: &Fragment) -> &PhysicalNode {
+    fragment
+        .nodes()
+        .values()
+        .find(|node| matches!(node.kind, NodeKind::Window(_)))
+        .unwrap()
+}
+fn pure_children(fragment: &Fragment) -> BTreeMap<NodeId, NodeExpressionEffects> {
+    fragment
+        .effects
         .iter()
-        .map(|(&id, item)| (id, ScopedExpressionEffects::pure_value(item.context)))
+        .map(|(&node, effects)| {
+            (
+                node,
+                node_effects_with_test_summaries(
+                    fragment.nodes()[&node]
+                        .expressions
+                        .as_ref()
+                        .unwrap()
+                        .clone(),
+                    effects.summaries().clone(),
+                ),
+            )
+        })
         .collect()
 }
-fn root_use(roots: &PhysicalRootUses, root: ExprId) -> ExpressionUseId {
-    *roots
-        .flow()
-        .uses()
-        .iter()
-        .find(|(_, item)| item.definition == root)
-        .unwrap()
-        .0
-}
 fn input<'a>(
-    source: &'a ExprNode,
+    source: &'a WindowCallSpec,
     request: &'a AuthoredPhysicalWindowRequest<'a>,
-    flow: &'a ExpressionControlFlow<ExprId>,
-    id: ExpressionUseId,
-    children: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    occurrences: &'a AuthoredPhysicalOccurrences<'a>,
+    site: PhysicalCallSite,
+    children: &'a BTreeMap<NodeId, NodeExpressionEffects>,
     params: &'a SemanticParameters,
 ) -> PhysicalWindowOccurrenceInput<'a> {
+    let context = occurrences
+        .relational_contexts
+        .iter()
+        .find(|(actual, _)| *actual == site)
+        .unwrap()
+        .1;
     PhysicalWindowOccurrenceInput {
+        node: &occurrences.fragment().nodes()[&site.node()],
+        site,
         source,
         request,
-        flow,
-        use_id: id,
-        child_effects: children,
+        occurrences,
+        child_effects: children.get(&site.node()),
         parameters: params,
         environment: &[],
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(flow.uses()[&id].context.domain),
+        proof_scope: CallProofScope::Relation(context.identity),
     }
 }
+
 fn run(
     input: PhysicalWindowOccurrenceInput<'_>,
     catalog: &EngineFunctionCatalog,
@@ -400,7 +548,12 @@ fn prefixes(
     }
     trace
 }
-fn request_prefixes(source: &ExprNode, fragment: &Fragment, pools: &ConstantPools, success: bool) {
+fn request_prefixes(
+    source: &WindowCallSpec,
+    fragment: &Fragment,
+    pools: &ConstantPools,
+    success: bool,
+) {
     let baseline = Control::default();
     assert_eq!(request(source, fragment, pools, &baseline).is_ok(), success);
     let trace = baseline.trace();
@@ -419,24 +572,17 @@ fn request_prefixes(source: &ExprNode, fragment: &Fragment, pools: &ConstantPool
 }
 fn prepared(
     fragment: &Fragment,
-    root: ExprId,
-    roots: &PhysicalRootUses,
+    root: PhysicalCallSite,
+    roots: &AuthoredPhysicalOccurrences,
     pools: &ConstantPools,
     catalog: &EngineFunctionCatalog,
 ) -> FreshPhysicalWindowOccurrence {
-    let source = fragment.expressions().get(root).unwrap();
+    let source = window_source(fragment, root).1;
     let req = request(source, fragment, pools, &Control::default()).unwrap();
     let params = SemanticParameters::try_new([]).unwrap();
-    let children = pure_children(roots.flow());
+    let children = pure_children(fragment);
     let result = run(
-        input(
-            source,
-            &req,
-            roots.flow(),
-            root_use(roots, root),
-            &children,
-            &params,
-        ),
+        input(source, &req, roots, root, &children, &params),
         catalog,
         &Control::default(),
     )
@@ -474,9 +620,9 @@ fn window_occurrences_real_rank_row_number_keep_zero_channels_optional_frame_ign
                     None,
                     false,
                 );
-                let fragment = finish(builder, owner);
+                let fragment = finish(builder, owner, &pools);
                 let roots = uses(&fragment, &catalog);
-                let source = fragment.expressions().get(root).unwrap();
+                let source = window_source(&fragment, root).1;
                 let req = request(source, &fragment, &pools, &Control::default()).unwrap();
                 assert!(std::ptr::eq(req.source(), source));
                 assert_eq!(req.request().logical_argument_count, 0);
@@ -540,9 +686,9 @@ fn window_occurrences_lead_lag_checked_default_nonzero_ordinal_keeps_original_d_
             &mut builder,
             owner,
             text.clone(),
-            LiteralValue::Utf8("value".into()),
+            checked::utf8("value".into()),
         );
-        let offset = literal(&mut builder, owner, integer.clone(), LiteralValue::Int64(1));
+        let offset = literal(&mut builder, owner, integer.clone(), checked::i64(1));
         let default = builder
             .add_expression(
                 owner,
@@ -564,10 +710,10 @@ fn window_occurrences_lead_lag_checked_default_nonzero_ordinal_keeps_original_d_
             None,
             false,
         );
-        let fragment = finish(builder, owner);
+        let fragment = finish(builder, owner, &pools);
         let roots = uses(&fragment, &catalog);
         let req = request(
-            fragment.expressions().get(root).unwrap(),
+            window_source(&fragment, root).1,
             &fragment,
             &pools,
             &Control::default(),
@@ -609,33 +755,58 @@ fn window_occurrences_ntile_constant_valid_null_and_dynamic_are_distinct_owner_p
     let pools = ConstantPools::empty();
     let params = SemanticParameters::try_new([]).unwrap();
     for mode in 0..3 {
-        let (mut builder, leaf, owner) = empty();
         let integer = ty(DataType::Int64, mode == 1);
-        let literal_ = literal(
-            &mut builder,
-            owner,
-            integer.clone(),
-            if mode == 1 {
-                LiteralValue::Null
-            } else {
-                LiteralValue::Int64(3)
-            },
-        );
-        let arg = if mode == 2 {
-            builder
-                .add_expression(
-                    owner,
+        let (mut builder, leaf, owner, arg) = if mode == 2 {
+            // A runtime parameter is an actual input Value. Unary Plus is not
+            // an emitted SQL primitive and cannot manufacture a dynamic source.
+            let mut builder = FragmentBuilder::new(FragmentId::new(71));
+            let leaf = NodeId::new(7);
+            let owner = NodeId::new(901);
+            let seed = literal(&mut builder, leaf, integer.clone(), checked::i64(3));
+            let seed_root = root(&mut builder, leaf, seed, RootScope::AllPorts);
+            let value = builder
+                .add_value(
                     integer.clone(),
-                    ExprKind::Unary {
-                        op: novarocks_physical_plan::UnaryOperator::Plus,
-                        expr: literal_,
+                    ValueOrigin::NodeOutput {
+                        node: leaf,
+                        output_ordinal: 0,
                     },
                 )
-                .unwrap()
+                .unwrap();
+            builder
+                .add_values(
+                    leaf,
+                    Box::from([Box::from([seed_root])]),
+                    Box::from([value]),
+                )
+                .unwrap();
+            let arg = builder
+                .add_expression(owner, integer.clone(), ExprKind::Value(value))
+                .unwrap();
+            (builder, leaf, owner, arg)
         } else {
-            literal_
+            let (mut builder, leaf, owner) = empty();
+            let arg = literal(
+                &mut builder,
+                owner,
+                integer.clone(),
+                if mode == 1 {
+                    checked::null()
+                } else {
+                    checked::i64(3)
+                },
+            );
+            (builder, leaf, owner, arg)
         };
-        let root = window(
+        let passthrough = builder
+            .construction_nodes()
+            .find(|(id, _)| **id == leaf)
+            .unwrap()
+            .1
+            .output
+            .columns
+            .clone();
+        let root = window_with_passthrough(
             &mut builder,
             leaf,
             owner,
@@ -645,15 +816,31 @@ fn window_occurrences_ntile_constant_valid_null_and_dynamic_are_distinct_owner_p
             false,
             None,
             false,
+            &passthrough,
         );
-        let fragment = finish(builder, owner);
+        let fragment = finish(builder, owner, &pools);
         let roots = uses(&fragment, &catalog);
-        let source = fragment.expressions().get(root).unwrap();
+        let source = window_source(&fragment, root).1;
         let req = request(source, &fragment, &pools, &Control::default()).unwrap();
-        let children = pure_children(roots.flow());
-        let id = root_use(&roots, root);
+        let FunctionArgument::Value {
+            value_type,
+            constant,
+        } = &req.request().arguments[0]
+        else {
+            panic!("original NTILE value channel")
+        };
+        assert_eq!(value_type, &ty(DataType::Int64, mode == 1));
+        assert_eq!(constant.is_none(), mode == 2);
+        if let Some(value) = constant {
+            assert_eq!(
+                value.int64_observed(PHASE, &Control::default()).unwrap(),
+                (mode == 0).then_some(3)
+            );
+        }
+        let children = pure_children(&fragment);
+
         let outcome = run(
-            input(source, &req, roots.flow(), id, &children, &params),
+            input(source, &req, &roots, root, &children, &params),
             &catalog,
             &Control::default(),
         );
@@ -667,7 +854,7 @@ fn window_occurrences_ntile_constant_valid_null_and_dynamic_are_distinct_owner_p
         prefixes(
             |control| {
                 run(
-                    input(source, &req, roots.flow(), id, &children, &params),
+                    input(source, &req, &roots, root, &children, &params),
                     &catalog,
                     control,
                 )
@@ -692,7 +879,7 @@ fn window_occurrences_count_over_keeps_single_signature_state_format_and_complet
                     &mut builder,
                     owner,
                     integer.clone(),
-                    LiteralValue::Int64(7),
+                    checked::i64(7),
                 )]
             } else {
                 vec![]
@@ -718,7 +905,7 @@ fn window_occurrences_count_over_keeps_single_signature_state_format_and_complet
                 Some(binding),
                 false,
             );
-            let fragment = finish(builder, owner);
+            let fragment = finish(builder, owner, &empty_pools);
             let roots = uses(&fragment, &catalog);
             let result = prepared(&fragment, root, &roots, &empty_pools, &catalog);
             let contract = window_contract(&result);
@@ -756,19 +943,16 @@ fn window_occurrences_count_over_keeps_single_signature_state_format_and_complet
         } else {
             ty(DataType::Null, true)
         };
+        let kind = if encoded_root {
+            ExprKind::Constant(ConstantReference {
+                pool: ConstantPoolId::new(7),
+                ordinal: 0,
+            })
+        } else {
+            builder.constant_kind(&argument_type, checked::null())
+        };
         let arg = builder
-            .add_expression(
-                owner,
-                argument_type.clone(),
-                if encoded_root {
-                    ExprKind::Constant(ConstantReference {
-                        pool: ConstantPoolId::new(7),
-                        ordinal: 0,
-                    })
-                } else {
-                    ExprKind::Literal(LiteralValue::Null)
-                },
-            )
+            .add_expression(owner, argument_type.clone(), kind)
             .unwrap();
         let binding = count_binding(&catalog, &[argument_type]);
         let root = window(
@@ -782,22 +966,15 @@ fn window_occurrences_count_over_keeps_single_signature_state_format_and_complet
             Some(binding),
             false,
         );
-        let fragment = finish(builder, owner);
+        let fragment = finish(builder, owner, &pools);
         let roots = uses(&fragment, &catalog);
-        let source = fragment.expressions().get(root).unwrap();
+        let source = window_source(&fragment, root).1;
         let req = request(source, &fragment, &pools, &Control::default()).unwrap();
-        let children = pure_children(roots.flow());
+        let children = pure_children(&fragment);
         let params = SemanticParameters::try_new([]).unwrap();
         // This validates pure selected preparation, not a runtime Dictionary capability.
         let prepared = run(
-            input(
-                source,
-                &req,
-                roots.flow(),
-                root_use(&roots, root),
-                &children,
-                &params,
-            ),
+            input(source, &req, &roots, root, &children, &params),
             &catalog,
             &Control::default(),
         )
@@ -818,7 +995,7 @@ fn window_occurrences_frame_pool_offsets_are_ordered_children_not_function_chann
     let integer = ty(DataType::Int64, false);
     let pool = ConstantPool::try_new(
         Arc::new(Field::new("offset", DataType::Int64, false)),
-        integer.clone(),
+        integer,
         Int64Array::from(vec![99, 2, 1, 0]).to_data(),
         policy(),
         CompilePhase::Validate,
@@ -829,28 +1006,23 @@ fn window_occurrences_frame_pool_offsets_are_ordered_children_not_function_chann
     pools.insert(ConstantPoolId::new(0), pool).unwrap();
     for bad_zero in [false, true] {
         let (mut builder, leaf, owner) = empty();
-        let mut ids = Vec::new();
-        for ordinal in [if bad_zero { 3 } else { 1 }, 2] {
-            ids.push(
-                builder
-                    .add_expression(
-                        owner,
-                        integer.clone(),
-                        ExprKind::Constant(ConstantReference {
-                            pool: ConstantPoolId::new(0),
-                            ordinal,
-                        }),
-                    )
-                    .unwrap(),
-            );
-        }
+        let references = [
+            ConstantReference {
+                pool: ConstantPoolId::new(0),
+                ordinal: if bad_zero { 3 } else { 1 },
+            },
+            ConstantReference {
+                pool: ConstantPoolId::new(0),
+                ordinal: 2,
+            },
+        ];
         let frame = WindowFrame {
             units: WindowFrameUnits::Rows,
-            start: WindowBound::Preceding(ids[0]),
-            end: WindowBound::Preceding(ids[1]),
+            start: WindowBound::Preceding(references[0]),
+            end: WindowBound::Preceding(references[1]),
             exclusion: WindowFrameExclusion::NoOthers,
         };
-        let root = window(
+        let site = window(
             &mut builder,
             leaf,
             owner,
@@ -861,9 +1033,21 @@ fn window_occurrences_frame_pool_offsets_are_ordered_children_not_function_chann
             None,
             false,
         );
-        let fragment = finish(builder, owner);
-        let roots = uses(&fragment, &catalog);
-        let source = fragment.expressions().get(root).unwrap();
+        let fragment = finish(builder, owner, &pools);
+        let occurrences = uses(&fragment, &catalog);
+        let (node, source) = window_source(&fragment, site);
+        assert!(
+            node.expressions.is_none(),
+            "static frame constants do not create scalar uses"
+        );
+        assert_eq!(
+            source.frame.as_ref().unwrap().start,
+            WindowBound::Preceding(references[0])
+        );
+        assert_eq!(
+            source.frame.as_ref().unwrap().end,
+            WindowBound::Preceding(references[1])
+        );
         let result = request(source, &fragment, &pools, &Control::default());
         if bad_zero {
             assert!(matches!(
@@ -875,13 +1059,7 @@ fn window_occurrences_frame_pool_offsets_are_ordered_children_not_function_chann
             let req = result.unwrap();
             assert_eq!(req.request().logical_argument_count, 0);
             assert!(req.request().arguments.is_empty());
-            let id = root_use(&roots, root);
-            let invocation = &roots.flow().uses()[&id];
-            assert_eq!(invocation.arguments.len(), 2);
-            for (ordinal, &child) in invocation.arguments.iter().enumerate() {
-                assert_eq!(roots.flow().uses()[&child].definition, ids[ordinal]);
-            }
-            let prepared = prepared(&fragment, root, &roots, &pools, &catalog);
+            let prepared = prepared(&fragment, site, &occurrences, &pools, &catalog);
             let frame = window_contract(&prepared).options().frame().unwrap();
             assert_eq!(
                 frame.start,
@@ -891,40 +1069,44 @@ fn window_occurrences_frame_pool_offsets_are_ordered_children_not_function_chann
                 frame.end,
                 novarocks_type_contract::WindowBound::Preceding(1)
             );
-            // The generic flow remains lawful while the source association is
-            // intentionally wrong. This tests the leaf's own ordered-edge gate,
-            // not a claim that the modified graph passes RootUses admission.
-            let mut invocations: Vec<_> = roots.flow().uses().values().cloned().collect();
-            invocations
-                .iter_mut()
-                .find(|item| item.context.use_id == id)
-                .unwrap()
-                .arguments
-                .reverse();
-            let wrong_flow = ExpressionControlFlow::try_new(
-                roots.flow().domains().values().copied().collect(),
-                invocations,
-                fragment.expressions(),
-                PHASE,
-                &Control::default(),
-            )
-            .unwrap();
-            let wrong_children = pure_children(&wrong_flow);
+            // The original checked references, rather than a scalar flow,
+            // preserve static start/end order. A different actual call source
+            // cannot supply the original occurrence's preparation facts.
+            let mut reversed = source.clone();
+            reversed.frame.as_mut().unwrap().start = WindowBound::Preceding(references[1]);
+            reversed.frame.as_mut().unwrap().end = WindowBound::Preceding(references[0]);
+            assert!(matches!(
+                request(&reversed, &fragment, &pools, &Control::default()),
+                Err(PhysicalWindowRequestError::Function(
+                    super::super::expression_occurrences::ExpressionOccurrenceError::Function(
+                        novarocks_functions::FunctionSpecializationFailure::Kernel(
+                            novarocks_functions::KernelFailure::InvalidProgram(ref diagnostic)
+                        )
+                    )
+                )) if diagnostic.message() == "window frame start follows its end"
+            ));
+            request_prefixes(&reversed, &fragment, &pools, false);
+            // This distinct source has a lawful static frame. Preparation may
+            // succeed for it, but it is not the original call's source loan.
+            let mut changed = source.clone();
+            changed.frame.as_mut().unwrap().end = WindowBound::CurrentRow;
+            let changed_req = request(&changed, &fragment, &pools, &Control::default()).unwrap();
+            let children = pure_children(&fragment);
             let params = SemanticParameters::try_new([]).unwrap();
             assert!(matches!(
                 run(
-                    input(source, &req, &wrong_flow, id, &wrong_children, &params),
+                    input(source, &changed_req, &occurrences, site, &children, &params),
                     &catalog,
                     &Control::default()
                 ),
                 Err(PhysicalWindowOccurrenceError::InvalidSource(
-                    "window source child order differs from actual edge"
+                    "window occurrence has a different actual node or call slot"
                 ))
             ));
             prefixes(
                 |control| {
                     run(
-                        input(source, &req, &wrong_flow, id, &wrong_children, &params),
+                        input(source, &changed_req, &occurrences, site, &children, &params),
                         &catalog,
                         control,
                     )
@@ -941,41 +1123,36 @@ fn window_occurrences_frame_pool_offsets_are_ordered_children_not_function_chann
 fn window_occurrences_foreign_source_missing_ordered_effects_environment_and_proof_refuse() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let (mut builder, leaf, owner) = empty();
-    let offset = literal(
-        &mut builder,
-        owner,
-        ty(DataType::Int64, false),
-        LiteralValue::Int64(1),
-    );
-    let root = window(
+    // Missing runtime child facts apply to the original LEAD argument root.
+    // A checked static frame offset has no expression use to remove.
+    let argument_type = ty(DataType::Int64, false);
+    let argument = literal(&mut builder, owner, argument_type.clone(), checked::i64(1));
+    let site = window(
         &mut builder,
         leaf,
         owner,
-        window_binding(&catalog, "rank", &[]),
-        &[],
-        Some(WindowFrame {
-            units: WindowFrameUnits::Rows,
-            start: WindowBound::Preceding(offset),
-            end: WindowBound::CurrentRow,
-            exclusion: WindowFrameExclusion::NoOthers,
-        }),
+        window_binding(&catalog, "lead", &[argument_type]),
+        &[argument],
+        None,
         false,
         None,
         false,
     );
-    let fragment = finish(builder, owner);
-    let roots = uses(&fragment, &catalog);
-    let source = fragment.expressions().get(root).unwrap();
     let pools = ConstantPools::empty();
+    let fragment = finish(builder, owner, &pools);
+    let occurrences = uses(&fragment, &catalog);
+    let (node, source) = window_source(&fragment, site);
+    let unit = node.expressions.as_ref().unwrap();
+    let child = unit.root_use_ids()[source.arguments[0].get() as usize];
+    let context = unit.control_flow().uses()[&child].context;
     let req = request(source, &fragment, &pools, &Control::default()).unwrap();
     let foreign = source.clone();
     let foreign_req = request(&foreign, &fragment, &pools, &Control::default()).unwrap();
-    let id = root_use(&roots, root);
     let params = SemanticParameters::try_new([]).unwrap();
-    let children = pure_children(roots.flow());
+    let children = pure_children(&fragment);
     assert!(matches!(
         run(
-            input(source, &foreign_req, roots.flow(), id, &children, &params),
+            input(source, &foreign_req, &occurrences, site, &children, &params),
             &catalog,
             &Control::default()
         ),
@@ -984,7 +1161,7 @@ fn window_occurrences_foreign_source_missing_ordered_effects_environment_and_pro
     prefixes(
         |control| {
             run(
-                input(source, &foreign_req, roots.flow(), id, &children, &params),
+                input(source, &foreign_req, &occurrences, site, &children, &params),
                 &catalog,
                 control,
             )
@@ -992,16 +1169,20 @@ fn window_occurrences_foreign_source_missing_ordered_effects_environment_and_pro
         false,
         false,
     );
-    let child = roots.flow().uses()[&id].arguments[0];
-    let mut missing = children.clone();
-    missing.remove(&child);
+    let mut missing = pure_children(&fragment);
+    let mut missing_summaries = missing[&owner].summaries().clone();
+    missing_summaries.remove(&child);
+    missing.insert(
+        owner,
+        node_effects_with_test_summaries(unit.clone(), missing_summaries),
+    );
     assert!(
-        matches!(run(input(source,&req,roots.flow(),id,&missing,&params),&catalog,&Control::default()),Err(PhysicalWindowOccurrenceError::MissingChildEffects(actual)) if actual==child)
+        matches!(run(input(source, &req, &occurrences, site, &missing, &params), &catalog, &Control::default()), Err(PhysicalWindowOccurrenceError::MissingChildEffects(actual)) if actual == child)
     );
     prefixes(
         |control| {
             run(
-                input(source, &req, roots.flow(), id, &missing, &params),
+                input(source, &req, &occurrences, site, &missing, &params),
                 &catalog,
                 control,
             )
@@ -1009,19 +1190,38 @@ fn window_occurrences_foreign_source_missing_ordered_effects_environment_and_pro
         false,
         false,
     );
-    let mut forged = children.clone();
-    forged.insert(
+    let mut forged = pure_children(&fragment);
+    let mut forged_summaries = forged[&owner].summaries().clone();
+    forged_summaries.insert(
         child,
-        ScopedExpressionEffects::pure_value(roots.flow().uses()[&id].context),
+        ScopedExpressionEffects::pure_value(novarocks_type_contract::ExpressionEffectContext {
+            demand: EvaluationDemand::TruthOnly,
+            ..context
+        }),
+    );
+    forged.insert(
+        owner,
+        node_effects_with_test_summaries(unit.clone(), forged_summaries),
     );
     assert!(matches!(
         run(
-            input(source, &req, roots.flow(), id, &forged, &params),
+            input(source, &req, &occurrences, site, &forged, &params),
             &catalog,
             &Control::default()
         ),
         Err(PhysicalWindowOccurrenceError::Effects(_))
     ));
+    prefixes(
+        |control| {
+            run(
+                input(source, &req, &occurrences, site, &forged, &params),
+                &catalog,
+                control,
+            )
+        },
+        false,
+        false,
+    );
     let refs = [SemanticParameterRef {
         id: SemanticParameterId::new(7),
         expected_key: SemanticParameterKey::TimeZone,
@@ -1029,32 +1229,59 @@ fn window_occurrences_foreign_source_missing_ordered_effects_environment_and_pro
     let params =
         SemanticParameters::try_new([(refs[0].id, SemanticParameterValue::TimeZone("UTC".into()))])
             .unwrap();
-    let mut call = input(source, &req, roots.flow(), id, &children, &params);
+    let mut call = input(source, &req, &occurrences, site, &children, &params);
     call.environment = &refs;
-    assert!(matches!(
-        run(call, &catalog, &Control::default()),
-        Err(PhysicalWindowOccurrenceError::Function(_))
-    ));
-    let mut call = input(source, &req, roots.flow(), id, &children, &params);
-    call.proof_scope =
-        CallProofScope::Domain(novarocks_type_contract::EvaluationDomainId::new(u32::MAX));
     assert!(matches!(
         run(call, &catalog, &Control::default()),
         Err(PhysicalWindowOccurrenceError::Function(_))
     ));
     prefixes(
         |control| {
-            let mut call = input(source, &req, roots.flow(), id, &children, &params);
+            let mut call = input(source, &req, &occurrences, site, &children, &params);
             call.environment = &refs;
             run(call, &catalog, control)
         },
         false,
         false,
     );
-    let mut absent = input(source, &req, roots.flow(), id, &children, &params);
-    absent.use_id = ExpressionUseId::new(u32::MAX);
-    assert!(
-        matches!(run(absent,&catalog,&Control::default()),Err(PhysicalWindowOccurrenceError::MissingUse(actual)) if actual==ExpressionUseId::new(u32::MAX))
+    let mut call = input(source, &req, &occurrences, site, &children, &params);
+    call.proof_scope = CallProofScope::Region(context.region);
+    assert!(matches!(
+        run(call, &catalog, &Control::default()),
+        Err(PhysicalWindowOccurrenceError::Function(_))
+    ));
+    prefixes(
+        |control| {
+            let mut call = input(source, &req, &occurrences, site, &children, &params);
+            call.proof_scope = CallProofScope::Region(context.region);
+            run(call, &catalog, control)
+        },
+        false,
+        false,
+    );
+    let NodeKind::Window(spec) = &node.kind else {
+        unreachable!()
+    };
+    let absent_site = PhysicalCallSite::Window {
+        node: owner,
+        call: u32::try_from(spec.calls.len()).unwrap(),
+    };
+    let mut absent = input(source, &req, &occurrences, site, &children, &params);
+    absent.site = absent_site;
+    assert!(matches!(
+        run(absent, &catalog, &Control::default()),
+        Err(PhysicalWindowOccurrenceError::InvalidSource(
+            "window occurrence has a different actual node or call slot"
+        ))
+    ));
+    prefixes(
+        |control| {
+            let mut call = input(source, &req, &occurrences, site, &children, &params);
+            call.site = absent_site;
+            run(call, &catalog, control)
+        },
+        false,
+        false,
     );
 }
 
@@ -1084,16 +1311,16 @@ fn window_occurrences_actual_rank_success_and_invalid_option_callbacks_keep_thre
             None,
             false,
         );
-        let fragment = finish(builder, owner);
+        let fragment = finish(builder, owner, &pools);
         let roots = uses(&fragment, &catalog);
-        let source = fragment.expressions().get(root).unwrap();
+        let source = window_source(&fragment, root).1;
         let req = request(source, &fragment, &pools, &Control::default()).unwrap();
-        let children = pure_children(roots.flow());
-        let id = root_use(&roots, root);
+        let children = pure_children(&fragment);
+
         prefixes(
             |control| {
                 run(
-                    input(source, &req, roots.flow(), id, &children, &params),
+                    input(source, &req, &roots, root, &children, &params),
                     &catalog,
                     control,
                 )
@@ -1121,7 +1348,8 @@ fn window_occurrences_wide_complete_source_types_sample_actual_comparison_quantu
     let mut builder = FragmentBuilder::new(FragmentId::new(71));
     let leaf = NodeId::new(7);
     let owner = NodeId::new(901);
-    let initial = literal(&mut builder, leaf, source_type.clone(), LiteralValue::Null);
+    let initial = literal(&mut builder, leaf, source_type.clone(), checked::null());
+    let initial_root = root(&mut builder, leaf, initial, RootScope::AllPorts);
     let value = builder
         .add_value(
             source_type.clone(),
@@ -1132,7 +1360,11 @@ fn window_occurrences_wide_complete_source_types_sample_actual_comparison_quantu
         )
         .unwrap();
     builder
-        .add_values(leaf, Box::from([Box::from([initial])]), Box::from([value]))
+        .add_values(
+            leaf,
+            Box::from([Box::from([initial_root])]),
+            Box::from([value]),
+        )
         .unwrap();
     let arg = builder
         .add_expression(owner, source_type.clone(), ExprKind::Value(value))
@@ -1149,10 +1381,10 @@ fn window_occurrences_wide_complete_source_types_sample_actual_comparison_quantu
         false,
         &[value],
     );
-    let fragment = finish(builder, owner);
-    let roots = uses(&fragment, &catalog);
-    let source = fragment.expressions().get(root).unwrap();
     let pools = ConstantPools::empty();
+    let fragment = finish(builder, owner, &pools);
+    let roots = uses(&fragment, &catalog);
+    let source = window_source(&fragment, root).1;
     let req = request(source, &fragment, &pools, &Control::default()).unwrap();
     let FunctionArgument::Value {
         value_type,
@@ -1163,19 +1395,12 @@ fn window_occurrences_wide_complete_source_types_sample_actual_comparison_quantu
     };
     assert!(constant.is_none());
     assert_eq!(value_type, &source_type);
-    let children = pure_children(roots.flow());
+    let children = pure_children(&fragment);
     let params = SemanticParameters::try_new([]).unwrap();
     let trace = prefixes(
         |control| {
             run(
-                input(
-                    source,
-                    &req,
-                    roots.flow(),
-                    root_use(&roots, root),
-                    &children,
-                    &params,
-                ),
+                input(source, &req, &roots, root, &children, &params),
                 &catalog,
                 control,
             )

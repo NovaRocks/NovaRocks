@@ -108,15 +108,13 @@ impl CompiledPackage {
         )
     }
 
-    /// Required FE constants consume the same sealed products as BE packages.
+    /// Required FE constants use the same sealed function catalogue as the BE.
     /// Live Root capacity is supplied separately for each actual computation.
     pub(crate) fn frontend_required_constant_interpreter(
         &self,
     ) -> novarocks_frontend_application::RequiredConstantInterpreter {
         novarocks_frontend_application::RequiredConstantInterpreter::new(
             Arc::clone(&self.functions),
-            Arc::clone(&self.providers),
-            self.frontend_carrier(),
             self.constants,
         )
     }

@@ -16,7 +16,7 @@
 // under the License.
 
 //! Immutable program authors own static validation reasons and support limits.
-use crate::{ExpressionsCompileError, SinkCompileError, StaticExpressionError, StaticSinkError};
+use crate::{SinkCompileError, StaticSinkError};
 use novarocks_failure_contract::{
     FailureClass, FailureFact, FailureProjection, FailureReason, OuterFailureProjection,
     ResourceDimension, ResourceFacts, domain,
@@ -41,30 +41,7 @@ fn limit(code: u16, dimension: ResourceDimension, maximum: usize) -> FailureFact
         committed: None,
     })
 }
-impl FailureProjection for StaticExpressionError {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::RuntimeBoundArena => fact(FailureClass::Invariant, 1),
-            Self::TooManyNodes => limit(2, ResourceDimension::Items, crate::MAX_STATIC_EXPRESSIONS),
-            Self::InvalidReference => fact(FailureClass::Invariant, 3),
-            Self::TooDeep => limit(
-                4,
-                ResourceDimension::Items,
-                crate::MAX_STATIC_EXPRESSION_DEPTH,
-            ),
-            Self::TooManyBytes => limit(
-                5,
-                ResourceDimension::Bytes,
-                crate::MAX_STATIC_EXPRESSION_DYNAMIC_BYTES,
-            ),
-            Self::DuplicateLambdaSlot => fact(FailureClass::Invariant, 6),
-            Self::InvalidMetadataArity => fact(FailureClass::Invariant, 7),
-            Self::UnsupportedDecimalCastPolicy => fact(FailureClass::Invariant, 8),
-            Self::ConstantTypeMismatch => fact(FailureClass::Invariant, 9),
-            Self::InvalidRegexpCountSource => fact(FailureClass::Invariant, 10),
-        }
-    }
-}
+
 impl FailureProjection for StaticSinkError {
     fn failure_fact(&self) -> FailureFact {
         match self {
@@ -95,14 +72,7 @@ impl FailureProjection for StaticSinkError {
         }
     }
 }
-impl FailureProjection for ExpressionsCompileError {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::Expression(source) => source.failure_fact(),
-            Self::Control(source) => source.failure_fact(),
-        }
-    }
-}
+
 impl FailureProjection for SinkCompileError {
     fn failure_fact(&self) -> FailureFact {
         match self {
@@ -111,18 +81,17 @@ impl FailureProjection for SinkCompileError {
         }
     }
 }
-impl OuterFailureProjection for StaticExpressionError {}
+
 impl OuterFailureProjection for StaticSinkError {}
-impl OuterFailureProjection for ExpressionsCompileError {}
+
 impl OuterFailureProjection for SinkCompileError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ImmutableExpressions, StaticStreamBranch};
+    use crate::StaticStreamBranch;
     use novarocks_execution_contract::DataStreamPartitionType;
     use novarocks_types::SlotId;
-    use std::{collections::HashMap, sync::Arc};
 
     #[test]
     fn actual_sink_shape_and_support_limit_keep_distinct_facts() {
@@ -169,34 +138,6 @@ mod tests {
     }
 
     #[test]
-    fn actual_expression_budget_refusal_does_not_retain_its_input() {
-        let zone: Arc<str> = Arc::from("x".repeat(crate::MAX_STATIC_EXPRESSION_DYNAMIC_BYTES + 1));
-        let owner = Arc::downgrade(&zone);
-        let error = ImmutableExpressions::try_new(
-            vec![crate::StaticExprNode::new(
-                crate::StaticExprKind::Literal(crate::StaticLiteral::Int64(0)),
-                arrow_schema::DataType::Int64,
-                None,
-            )],
-            false,
-            HashMap::new(),
-            Some(zone),
-        )
-        .unwrap_err();
-        assert_eq!(error, StaticExpressionError::TooManyBytes);
-        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
-        assert_eq!(
-            error.failure_fact().resource().unwrap().dimension,
-            ResourceDimension::Bytes
-        );
-        assert!(owner.upgrade().is_none());
-        assert_eq!(
-            ExpressionsCompileError::Expression(error).failure_fact(),
-            error.failure_fact()
-        );
-    }
-
-    #[test]
     fn compile_wrappers_forward_original_control_without_a_static_reason() {
         for source in [
             novarocks_type_contract::CompileControlError::Cancelled,
@@ -217,15 +158,10 @@ mod tests {
                     Err(self.0.clone())
                 }
             }
-            let error = ImmutableExpressions::try_new_for_compile(
-                vec![],
-                false,
-                HashMap::new(),
-                None,
-                &Stop(source.clone()),
-            )
-            .unwrap_err();
-            assert_eq!(error, ExpressionsCompileError::Control(source.clone()));
+            let error = crate::StaticSinkProgram::Result
+                .validate_for_compile(&[], &Stop(source.clone()))
+                .unwrap_err();
+            assert_eq!(error, SinkCompileError::Control(source.clone()));
             assert_eq!(error.failure_fact(), source.failure_fact());
         }
     }
@@ -274,30 +210,13 @@ enum ProgramReason {
     LocalProgramInvalidRequirement = 251,
     LocalProgramInvalidSink = 252,
     LocalProgramUnsupportedKernelAbi = 253,
-    ProgramExpressionRootTooManyRoots = 260,
-    ProgramExpressionRootInvalidDefinition = 261,
-    ProgramExpressionRootInvalidArena = 262,
-    ProgramExpressionRootDuplicateSite = 263,
-    ProgramRootBindingTooManyItems = 270,
-    ProgramRootBindingInvalidArena = 271,
-    ProgramRootBindingInvalidDefinition = 272,
-    ProgramRootBindingWrongControl = 273,
-    ProgramRootBindingWrongArguments = 274,
-    ProgramRootBindingInvalidRoot = 275,
-    ProgramRootBindingDuplicateSite = 276,
-    ProgramRootBindingSharedRootUse = 277,
-    ProgramRootBindingIncompleteCoverage = 278,
     ProgramResolvedCallsTooManyItems = 280,
     ProgramResolvedCallsInvalidSite = 281,
     ProgramResolvedCallsDuplicateSite = 282,
     ProgramResolvedCallsMissingSite = 283,
     ProgramResolvedCallsWrongSource = 284,
     ProgramResolvedCallsWrongContext = 285,
-    ProgramResolvedCallsInvalidDomain = 286,
-    ProgramResolvedCallsSharedUse = 287,
-    ProgramResolvedCallsWrongControl = 288,
     ProgramResolvedCallsWrongArguments = 289,
-    ProgramResolvedCallsWrongBody = 290,
     ProgramResolvedCallsWrongLifecycle = 291,
     ProgramResolvedCallsWrongPhase = 292,
     ProgramResolvedCallsWrongOrder = 293,
@@ -305,12 +224,7 @@ enum ProgramReason {
     ProgramResolvedCallsWrongStateFormat = 295,
     ProgramResolvedCallsTypeMismatch = 296,
     ProgramResolvedCallsInvalidType = 297,
-    ProgramExpressionTypeTooManyDefinitions = 300,
-    ProgramExpressionTypeIncompleteCoverage = 301,
-    ProgramExpressionTypeWrongKind = 302,
-    ProgramExpressionTypeWrongLambda = 303,
-    ProgramExpressionTypeTypeMismatch = 304,
-    ProgramExpressionTypeWrongDemand = 305,
+    ProgramResolvedCallsDuplicateRelationCall = 298,
     ProgramChannelTypeTooManyChannels = 310,
     ProgramChannelTypeDuplicateSite = 311,
     ProgramChannelTypeMissingSite = 312,
@@ -318,18 +232,6 @@ enum ProgramReason {
     ProgramChannelTypeWrongShape = 314,
     ProgramChannelTypeWrongKind = 315,
     ProgramChannelTypeTypeMismatch = 316,
-    ProgramLexicalBindingTooManyItems = 320,
-    ProgramLexicalBindingDuplicateBinding = 321,
-    ProgramLexicalBindingIncompleteCoverage = 322,
-    ProgramLexicalBindingInvalidOccurrence = 323,
-    ProgramLexicalBindingInvalidLambda = 324,
-    ProgramLexicalBindingInvalidSource = 325,
-    ProgramLexicalBindingWrongScope = 326,
-    ProgramLexicalBindingForwardCommon = 327,
-    ProgramLexicalBindingShadowedSource = 328,
-    ProgramLexicalBindingWrongSlot = 329,
-    ProgramLexicalBindingTypeMismatch = 330,
-    ProgramLexicalBindingUnusedCapture = 331,
     ProvenanceEmpty = 340,
     ProvenanceDuplicateOperator = 341,
     ProvenanceInvalidLoweredNode = 342,
@@ -354,7 +256,6 @@ enum ProgramReason {
     ProviderLinkMissingChannel = 376,
     ProviderLinkTypeMismatch = 377,
     ProviderLinkOrdinalOverflow = 378,
-    ProgramPrimitiveInvalid = 380,
     LocalProgramCompileMissingSink = 390,
     LocalProgramCompileExchangeInputMismatch = 391,
     LocalProgramCompileDuplicateExchangeReceiver = 392,
@@ -524,75 +425,6 @@ impl FailureProjection for LocalProgramError {
     }
 }
 
-impl FailureProjection for ProgramExpressionRootError {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::Control(source) => source.failure_fact(),
-            Self::TooManyRoots => fact(
-                FailureClass::Resource,
-                ProgramReason::ProgramExpressionRootTooManyRoots as u16,
-            ),
-            Self::InvalidDefinition => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramExpressionRootInvalidDefinition as u16,
-            ),
-            Self::InvalidArena => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramExpressionRootInvalidArena as u16,
-            ),
-            Self::DuplicateSite => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramExpressionRootDuplicateSite as u16,
-            ),
-        }
-    }
-}
-
-impl FailureProjection for ProgramRootBindingError {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::Roots(source) => source.failure_fact(),
-            Self::Control(source) => source.failure_fact(),
-            Self::TooManyItems => fact(
-                FailureClass::Resource,
-                ProgramReason::ProgramRootBindingTooManyItems as u16,
-            ),
-            Self::InvalidArena => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramRootBindingInvalidArena as u16,
-            ),
-            Self::InvalidDefinition => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramRootBindingInvalidDefinition as u16,
-            ),
-            Self::WrongControl => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramRootBindingWrongControl as u16,
-            ),
-            Self::WrongArguments => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramRootBindingWrongArguments as u16,
-            ),
-            Self::InvalidRoot => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramRootBindingInvalidRoot as u16,
-            ),
-            Self::DuplicateSite => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramRootBindingDuplicateSite as u16,
-            ),
-            Self::SharedRootUse => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramRootBindingSharedRootUse as u16,
-            ),
-            Self::IncompleteCoverage => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramRootBindingIncompleteCoverage as u16,
-            ),
-        }
-    }
-}
-
 impl FailureProjection for ProgramResolvedCallsError {
     fn failure_fact(&self) -> FailureFact {
         match self {
@@ -621,25 +453,13 @@ impl FailureProjection for ProgramResolvedCallsError {
                 FailureClass::Invariant,
                 ProgramReason::ProgramResolvedCallsWrongContext as u16,
             ),
-            Self::InvalidDomain => fact(
+            Self::DuplicateRelationCall => fact(
                 FailureClass::Invariant,
-                ProgramReason::ProgramResolvedCallsInvalidDomain as u16,
-            ),
-            Self::SharedUse => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramResolvedCallsSharedUse as u16,
-            ),
-            Self::WrongControl => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramResolvedCallsWrongControl as u16,
+                ProgramReason::ProgramResolvedCallsDuplicateRelationCall as u16,
             ),
             Self::WrongArguments => fact(
                 FailureClass::Invariant,
                 ProgramReason::ProgramResolvedCallsWrongArguments as u16,
-            ),
-            Self::WrongBody => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramResolvedCallsWrongBody as u16,
             ),
             Self::WrongLifecycle => fact(
                 FailureClass::Invariant,
@@ -668,40 +488,6 @@ impl FailureProjection for ProgramResolvedCallsError {
             Self::InvalidType => fact(
                 FailureClass::Invariant,
                 ProgramReason::ProgramResolvedCallsInvalidType as u16,
-            ),
-        }
-    }
-}
-
-impl FailureProjection for ProgramExpressionTypeError {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::Control(source) => source.failure_fact(),
-            Self::ValueType(source) => source.failure_fact(),
-            Self::Kernel(source) => source.failure_fact(),
-            Self::TooManyDefinitions => fact(
-                FailureClass::Resource,
-                ProgramReason::ProgramExpressionTypeTooManyDefinitions as u16,
-            ),
-            Self::IncompleteCoverage => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramExpressionTypeIncompleteCoverage as u16,
-            ),
-            Self::WrongKind => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramExpressionTypeWrongKind as u16,
-            ),
-            Self::WrongLambda => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramExpressionTypeWrongLambda as u16,
-            ),
-            Self::TypeMismatch => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramExpressionTypeTypeMismatch as u16,
-            ),
-            Self::WrongDemand => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramExpressionTypeWrongDemand as u16,
             ),
         }
     }
@@ -741,63 +527,6 @@ impl FailureProjection for ProgramChannelTypeError {
             Self::TypeMismatch => fact(
                 FailureClass::Invariant,
                 ProgramReason::ProgramChannelTypeTypeMismatch as u16,
-            ),
-        }
-    }
-}
-
-impl FailureProjection for ProgramLexicalBindingError {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::Control(source) => source.failure_fact(),
-            Self::ValueType(source) => source.failure_fact(),
-            Self::TooManyItems => fact(
-                FailureClass::Resource,
-                ProgramReason::ProgramLexicalBindingTooManyItems as u16,
-            ),
-            Self::DuplicateBinding => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramLexicalBindingDuplicateBinding as u16,
-            ),
-            Self::IncompleteCoverage => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramLexicalBindingIncompleteCoverage as u16,
-            ),
-            Self::InvalidOccurrence => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramLexicalBindingInvalidOccurrence as u16,
-            ),
-            Self::InvalidLambda => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramLexicalBindingInvalidLambda as u16,
-            ),
-            Self::InvalidSource => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramLexicalBindingInvalidSource as u16,
-            ),
-            Self::WrongScope => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramLexicalBindingWrongScope as u16,
-            ),
-            Self::ForwardCommon => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramLexicalBindingForwardCommon as u16,
-            ),
-            Self::ShadowedSource => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramLexicalBindingShadowedSource as u16,
-            ),
-            Self::WrongSlot => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramLexicalBindingWrongSlot as u16,
-            ),
-            Self::TypeMismatch => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramLexicalBindingTypeMismatch as u16,
-            ),
-            Self::UnusedCapture => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramLexicalBindingUnusedCapture as u16,
             ),
         }
     }
@@ -925,28 +654,26 @@ impl FailureProjection for ProviderLinkError {
     }
 }
 
-impl FailureProjection for ProgramPrimitiveError {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::Control(source) => source.failure_fact(),
-            Self::Comparison(source) => source.failure_fact(),
-            Self::Arithmetic(source) => source.failure_fact(),
-            Self::Cast(source) => source.failure_fact(),
-            Self::Invalid(_) => fact(
-                FailureClass::Invariant,
-                ProgramReason::ProgramPrimitiveInvalid as u16,
-            ),
-        }
-    }
-}
-
 impl FailureProjection for LocalProgramCompileError {
     fn failure_fact(&self) -> FailureFact {
         match self {
             Self::Control(source) => source.failure_fact(),
             Self::Origins(source) => source.failure_fact(),
             Self::Provider(source) => source.failure_fact(),
-            Self::Primitive(source) => source.failure_fact(),
+            Self::Calls(source) => source.failure_fact(),
+            Self::Channels(source) => source.failure_fact(),
+            Self::Sink(source) => source.failure_fact(),
+            Self::TooManyDefinitions => limit(
+                300,
+                ResourceDimension::Items,
+                novarocks_expression::MAX_STATIC_EXPRESSIONS,
+            ),
+            Self::TooManyConstantBytes => limit(
+                5,
+                ResourceDimension::Bytes,
+                novarocks_expression::MAX_STATIC_EXPRESSION_DYNAMIC_BYTES,
+            ),
+            Self::InvalidExpression => LocalProgramError::InvalidExpression.failure_fact(),
             Self::MissingSink => fact(
                 FailureClass::Invariant,
                 ProgramReason::LocalProgramCompileMissingSink as u16,

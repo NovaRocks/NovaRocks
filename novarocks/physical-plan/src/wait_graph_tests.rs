@@ -20,16 +20,17 @@
 //! stated producer/input order, not from the graph implementation's output.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::{
     AggregateGrouping, DeliveryRequirement, Distribution, EdgeDestination, EdgeKind,
-    EdgePartitioning, EdgeSource, ExprKind, FragmentBuilder, FragmentOutputPort, FragmentSink,
-    HashJoinCondition, JoinDistribution, JoinKey, JoinKind, JoinSide, LiteralValue,
-    NestLoopJoinDistribution, OutputRole, PhysicalProperties, PipelineDopDomain, RequiredInputs,
-    RowMultiplicity, RuntimeFilterArtifactCapability, RuntimeFilterCompletion,
-    RuntimeFilterConsumer, RuntimeFilterContributionKind, RuntimeFilterCoverage,
-    RuntimeFilterCoverageNode, RuntimeFilterDomain, RuntimeFilterEndpoint,
-    RuntimeFilterEqualityWitnessId, RuntimeFilterKind, RuntimeFilterLifecycle,
-    RuntimeFilterNullSemantics, RuntimeFilterPolicy, RuntimeFilterProducer,
+    EdgePartitioning, EdgeSource, FragmentBuilder, FragmentOutputPort, FragmentSink,
+    HashJoinCondition, JoinDistribution, JoinKey, JoinKind, JoinSide, NestLoopJoinDistribution,
+    OutputRole, PhysicalProperties, PipelineDopDomain, RequiredInputs, RowMultiplicity,
+    RuntimeFilterArtifactCapability, RuntimeFilterCompletion, RuntimeFilterConsumer,
+    RuntimeFilterContributionKind, RuntimeFilterCoverage, RuntimeFilterCoverageNode,
+    RuntimeFilterDomain, RuntimeFilterEndpoint, RuntimeFilterEqualityWitnessId, RuntimeFilterKind,
+    RuntimeFilterLifecycle, RuntimeFilterNullSemantics, RuntimeFilterPolicy, RuntimeFilterProducer,
     RuntimeFilterProducerProgress, RuntimeFilterReduction, RuntimeFilterWitnessId,
     StagePlacementPolicy, ValueType,
 };
@@ -45,6 +46,7 @@ fn properties() -> PhysicalProperties {
 
 #[derive(Default)]
 struct Fixture {
+    constants: crate::tests::constant_fixture::ConstantFixture,
     builders: BTreeMap<FragmentId, FragmentBuilder>,
     roots: BTreeMap<FragmentId, NodeId>,
     edges: BTreeMap<EdgeId, Edge>,
@@ -110,14 +112,29 @@ impl Fixture {
     }
 
     fn hash_join(&mut self, fragment: u32, node: u32, left: u32, right: u32, build_side: JoinSide) {
+        let key_kind = self
+            .constants
+            .i64(1, &ValueType::new(DataType::Int64, false));
         let builder = self.builder(fragment, node);
         let key = builder
-            .add_expression(
+            .define(
                 NodeId::new(node),
                 ValueType::new(DataType::Int64, false),
-                ExprKind::Literal(LiteralValue::Int64(1)),
+                key_kind,
             )
             .unwrap();
+        let left_key = builder.root_definition(
+            NodeId::new(node),
+            key,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
+        let right_key = builder.root_definition(
+            NodeId::new(node),
+            key,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(1),
+        );
         builder
             .add_join(
                 NodeId::new(node),
@@ -129,8 +146,8 @@ impl Fixture {
                     kind: JoinKind::Inner,
                     condition: HashJoinCondition::Ordinary {
                         keys: Box::from([JoinKey {
-                            left: key,
-                            right: key,
+                            left: left_key,
+                            right: right_key,
                             null_safe: false,
                         }]),
                         residual: None,
@@ -231,7 +248,7 @@ impl Fixture {
                 },
             };
             let fragment = builder
-                .finish_definition(
+                .finish_fixture_definition(
                     self.roots[&id],
                     sink,
                     PipelineDopDomain {

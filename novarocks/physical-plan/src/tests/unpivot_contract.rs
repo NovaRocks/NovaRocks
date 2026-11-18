@@ -16,6 +16,9 @@
 // under the License.
 
 use super::*;
+use crate::tests::constant_fixture::ConstantFixture;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 
 #[derive(Clone, Copy)]
 enum UnpivotShape {
@@ -31,21 +34,22 @@ enum UnpivotShape {
     ConstantTypeDrift,
 }
 
-fn finish_unpivot(shape: UnpivotShape) -> Result<Fragment, ValidationErrors> {
+fn finish_unpivot(shape: UnpivotShape) -> Result<(Fragment, ConstantPools), ValidationErrors> {
+    let mut constants = ConstantFixture::new();
     let mut builder = FragmentBuilder::new(FragmentId::new(812));
     let source = builder.reserve_node_id().unwrap();
     let number_expr = builder
-        .add_expression(
+        .define(
             source,
             ty(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Int64(7)),
+            constants.i64(7, &ty(DataType::Int64, false)),
         )
         .unwrap();
     let text_expr = builder
-        .add_expression(
+        .define(
             source,
             ty(DataType::Utf8, false),
-            ExprKind::Literal(LiteralValue::Utf8("source".into())),
+            constants.utf8("source", &ty(DataType::Utf8, false)),
         )
         .unwrap();
     let number = builder
@@ -66,8 +70,21 @@ fn finish_unpivot(shape: UnpivotShape) -> Result<Fragment, ValidationErrors> {
             },
         )
         .unwrap();
+    let value_field_root_0 = builder.root_definition(
+        source,
+        number_expr,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
+    let value_field_root_1 = builder.root_definition(
+        source,
+        text_expr,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::AllPorts,
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -77,7 +94,7 @@ fn finish_unpivot(shape: UnpivotShape) -> Result<Fragment, ValidationErrors> {
                 columns: Box::from([number, text]),
             },
             kind: NodeKind::Values {
-                rows: Box::from([Box::from([number_expr, text_expr])]),
+                rows: Box::from([Box::from([value_field_root_0, value_field_root_1])]),
             },
         })
         .unwrap();
@@ -85,20 +102,26 @@ fn finish_unpivot(shape: UnpivotShape) -> Result<Fragment, ValidationErrors> {
     let unpivot = builder.reserve_node_id().unwrap();
     let constant = match shape {
         UnpivotShape::ConstantTypeDrift => builder
-            .add_expression(
+            .define(
                 unpivot,
                 ty(DataType::Int64, false),
-                ExprKind::Literal(LiteralValue::Int64(9)),
+                constants.i64(9, &ty(DataType::Int64, false)),
             )
             .unwrap(),
         _ => builder
-            .add_expression(
+            .define(
                 unpivot,
                 ty(DataType::Utf8, false),
-                ExprKind::Literal(LiteralValue::Utf8("label".into())),
+                constants.utf8("label", &ty(DataType::Utf8, false)),
             )
             .unwrap(),
     };
+    let constant = builder.root_definition(
+        unpivot,
+        constant,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let value_output = builder
         .add_value(
             ty(DataType::Int64, false),
@@ -137,6 +160,7 @@ fn finish_unpivot(shape: UnpivotShape) -> Result<Fragment, ValidationErrors> {
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: unpivot,
             inputs: Box::from([source]),
             required_inputs: Box::from([unconstrained()]),
@@ -179,12 +203,13 @@ fn finish_unpivot(shape: UnpivotShape) -> Result<Fragment, ValidationErrors> {
             },
         })
         .unwrap();
-    builder.finish_definition(
+    let fragment = builder.finish_fixture_definition(
         unpivot,
         FragmentSink::Noop,
         dop(),
         crate::StagePlacementPolicy::Singleton,
-    )
+    )?;
+    Ok((fragment, constants.into_pools()))
 }
 
 #[test]
@@ -227,7 +252,7 @@ fn ordinary_unpivot_rejects_literal_constant_type_drift() {
 
 #[test]
 fn ordinary_unpivot_preserves_the_explicit_port_order_of_distinct_roles() {
-    let fragment = finish_unpivot(UnpivotShape::Permuted)
+    let (fragment, _constants) = finish_unpivot(UnpivotShape::Permuted)
         .expect("Unpivot's explicit port may order its exact roles independently");
     let root = fragment.nodes().get(&fragment.root()).unwrap();
     let NodeKind::Unpivot { spec } = &root.kind else {

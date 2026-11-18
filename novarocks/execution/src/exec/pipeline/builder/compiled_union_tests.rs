@@ -21,12 +21,13 @@
 
 use std::sync::Arc;
 
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
-    ConstantPools, Distribution, ExprKind, FragmentBuilder, FragmentId, NodeId, NodeKind,
-    NullOrdering, RequiredInputs, SetOperationKind, SortDirection, SortExpr, SortMode, ValueId,
-    ValueOrigin,
+    ConstantPools, Distribution, FragmentId, NodeId, NodeKind, NullOrdering, RequiredInputs,
+    SetOperationKind, SortDirection, SortExpr, SortMode, ValueId, ValueOrigin,
 };
+use novarocks_type_contract::EvaluationDemand;
 use novarocks_type_contract::FunctionValueType;
 
 use super::family_fixture::{cell, compile, int64, int64_rows, package, run, values};
@@ -44,7 +45,13 @@ fn branch_rows(branch: usize) -> Vec<(i64, Option<i64>)> {
 /// `Values_k(a, b)` for each branch, `UnionAll(b, a)`, and optionally a
 /// downstream global sort by the union's second column.
 fn program(branches: usize, sorted: bool, dop: usize) -> (Arc<LocalProgram>, Vec<NodeId>) {
-    let mut builder = FragmentBuilder::new(FragmentId::new(41));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(41),
+            &fixture_sources,
+        );
     let union = NodeId::new(100);
     let mut inputs = Vec::new();
     let mut mappings = Vec::new();
@@ -92,7 +99,14 @@ fn program(branches: usize, sorted: bool, dop: usize) -> (Arc<LocalProgram>, Vec
     let root = if sorted {
         let sort = NodeId::new(200);
         let key = builder
-            .add_expression(sort, int64(false), ExprKind::Value(outputs[1]))
+            .unit(sort)
+            .unwrap()
+            .add(None, int64(false), ExprKind::Value(outputs[1]))
+            .unwrap();
+        let key = builder
+            .unit(sort)
+            .unwrap()
+            .root(key, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .add_sort(

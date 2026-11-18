@@ -397,8 +397,8 @@ struct WriterFixture {
     selected: Arc<novarocks_functions::FunctionBindingSelection>,
     arguments: [FunctionArgument; 1],
     value_type: FunctionValueType,
-    call: novarocks_type_contract::ExpressionEffectContext,
-    input: novarocks_type_contract::ExpressionEffectContext,
+    call: novarocks_type_contract::RelationEffectContext,
+    input: novarocks_type_contract::RelationEffectContext,
     parameters: novarocks_type_contract::SemanticParameters,
     frozen: novarocks_type_contract::CallEffects,
 }
@@ -406,8 +406,8 @@ impl WriterFixture {
     fn new(value_type: FunctionValueType) -> Self {
         use novarocks_functions::*;
         use novarocks_type_contract::{
-            CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-            ExpressionEffectContext, ExpressionUseId, SemanticParameters,
+            CallProofScope, DecimalOverflowPolicy, RelationCallId, RelationEffectContext,
+            SemanticParameters,
         };
         let catalog = catalog();
         let arguments = argument(value_type.clone());
@@ -421,23 +421,17 @@ impl WriterFixture {
             .unwrap();
         let function = bound.function_id;
         let selected = Arc::new(bound.selected);
-        let call = ExpressionEffectContext {
-            use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(17),
-            demand: EvaluationDemand::Value,
-        };
-        let input = ExpressionEffectContext {
-            use_id: ExpressionUseId::new(42),
-            domain: EvaluationDomainId::new(18),
-            demand: EvaluationDemand::Value,
-        };
+        let call = RelationEffectContext::call(RelationCallId::new(41));
+        let input = RelationEffectContext::materialized_input(call.identity.call);
         let parameters = SemanticParameters::try_new([]).unwrap();
-        let uses = [Some(input.use_id)];
         let authored = catalog
             .prepare_fresh_selected(
                 CallEffectInput {
-                    context: call,
-                    argument_uses: CallArgumentUses::SelectedChannels(&uses),
+                    context: call.into(),
+                    argument_uses: CallArgumentUses::MaterializedInput {
+                        context: input,
+                        input_type: &value_type,
+                    },
                     function_id: &function,
                     kind: FunctionKind::Aggregate,
                     selected: &selected,
@@ -445,13 +439,13 @@ impl WriterFixture {
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    proof_scope: CallProofScope::Domain(call.domain),
+                    proof_scope: CallProofScope::Relation(call.identity),
                 },
                 Arc::clone(&selected),
                 PureCallPreparation::Aggregate {
-                    arguments: ScopedExpressionEffects::primitive(
+                    arguments: ScopedRelationalEffects::primitive(
                         call,
-                        ScopedExpressionEffects::pure_value(input)
+                        ScopedRelationalEffects::pure_value(input)
                             .for_use(input)
                             .unwrap(),
                     ),
@@ -584,7 +578,10 @@ fn theta_created_writer_uses_original_full_uuid_phase_null_and_namespace_contrac
             panic!("actual Theta aggregate");
         };
         assert_eq!(handle.contract().phase(), phase);
-        assert_eq!(handle.contract().call().context(), source.call);
+        assert_eq!(
+            handle.contract().call().context(),
+            novarocks_type_contract::CallEffectContext::Relation(source.call)
+        );
         assert_eq!(handle.contract().call().effects(), &source.frozen);
         assert_eq!(
             handle.contract().final_type().data_type(),

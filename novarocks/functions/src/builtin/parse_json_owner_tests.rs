@@ -27,7 +27,7 @@ use crate::{
 use arrow_array::{Array, ArrayRef, StringArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     ExpressionUseId, SemanticParameters,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
@@ -48,7 +48,7 @@ fn owner() -> ParseJsonOwner {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     }
 }
@@ -79,7 +79,7 @@ fn prepare_with(
     specialize_scalar(
         &owner,
         CallEffectInput {
-            context: context(),
+            context: (context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
             function_id: owner.declaration.function_id(),
             kind: FunctionKind::Scalar,

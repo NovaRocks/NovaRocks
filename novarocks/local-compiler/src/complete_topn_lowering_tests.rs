@@ -111,12 +111,7 @@ fn complete_ordered_key_domains_keep_endpoint_nullability_and_global_bindings() 
                         .unwrap();
                     assert_eq!(actual, original.binding_id);
                 }
-                let definition = program
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .definition_type(ProgramExpressionArena::Main, consumer.expr_id)
-                    .unwrap();
+                let definition = crate::test_units::root_type(&program, consumer.expr_id);
                 assert_eq!(
                     definition,
                     &novarocks_functions::FunctionArgumentType::Value(ty)
@@ -162,14 +157,14 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         &[nullable_int64(false)],
     );
     let expression = scan_builder
-        .add_expression(PROJECT, nullable_int64(false), ExprKind::Value(keys[0]))
+        .fixture_value_root(PROJECT, nullable_int64(false), ExprKind::Value(keys[0]))
         .unwrap();
     let projected = scan_builder
         .add_value(
             nullable_int64(false),
             ValueOrigin::Expr {
                 node: PROJECT,
-                expr: expression,
+                root: expression,
             },
         )
         .unwrap();
@@ -183,7 +178,7 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         .unwrap();
     scan_builder.attach_runtime_filter(FILTER).unwrap();
     let scan_fragment = scan_builder
-        .finish_definition(
+        .finish_fixture_definition(
             PROJECT,
             FragmentSink::Stream { edge: EDGE },
             dop(),
@@ -202,7 +197,7 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         RowMultiplicity::SingleCopy,
     );
     let group_key = aggregate_builder
-        .add_expression(
+        .fixture_value_root(
             AGGREGATE,
             nullable_int64(false),
             ExprKind::Value(imports[0]),
@@ -223,7 +218,7 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         )
         .unwrap();
     let order_key = aggregate_builder
-        .add_expression(TOPN, nullable_int64(false), ExprKind::Value(imports[0]))
+        .fixture_value_root(TOPN, nullable_int64(false), ExprKind::Value(imports[0]))
         .unwrap();
     aggregate_builder
         .add_top_n(
@@ -241,7 +236,7 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         .unwrap();
     aggregate_builder.attach_runtime_filter(FILTER).unwrap();
     let aggregate_fragment = aggregate_builder
-        .finish_definition(
+        .finish_fixture_definition(
             TOPN,
             FragmentSink::Result,
             dop(),
@@ -277,7 +272,10 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
             },
         ]),
     };
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        options(None).constants,
+    );
     plan.add_fragment(scan_fragment).unwrap();
     plan.add_fragment(aggregate_fragment).unwrap();
     plan.add_edge(edge(
@@ -330,12 +328,7 @@ fn complete_ordered_foreign_producer_uses_validated_exchange_identity_lineage() 
     let [consumer] = runtime_filters.as_slice() else {
         panic!("one scan endpoint")
     };
-    let definition = consumer_program
-        .checked()
-        .channels()
-        .expressions()
-        .definition_type(ProgramExpressionArena::Main, consumer.expr_id)
-        .unwrap();
+    let definition = crate::test_units::root_type(&consumer_program, consumer.expr_id);
     assert_eq!(
         definition,
         &novarocks_functions::FunctionArgumentType::Value(nullable_int64(false))
@@ -419,7 +412,7 @@ fn complete_multi_scan_union(local_groups: bool) -> Arc<FragmentPackage> {
         .unwrap();
     let input = if local_groups {
         let key = builder
-            .add_expression(local, nullable_int64(true), ExprKind::Value(union_key))
+            .fixture_value_root(local, nullable_int64(true), ExprKind::Value(union_key))
             .unwrap();
         builder
             .add_row_consuming(
@@ -440,7 +433,7 @@ fn complete_multi_scan_union(local_groups: bool) -> Arc<FragmentPackage> {
         union
     };
     let key = builder
-        .add_expression(AGGREGATE, nullable_int64(true), ExprKind::Value(union_key))
+        .fixture_value_root(AGGREGATE, nullable_int64(true), ExprKind::Value(union_key))
         .unwrap();
     builder
         .add_row_consuming(
@@ -457,7 +450,7 @@ fn complete_multi_scan_union(local_groups: bool) -> Arc<FragmentPackage> {
         )
         .unwrap();
     let order = builder
-        .add_expression(TOPN, nullable_int64(true), ExprKind::Value(union_key))
+        .fixture_value_root(TOPN, nullable_int64(true), ExprKind::Value(union_key))
         .unwrap();
     builder
         .add_top_n(
@@ -475,7 +468,7 @@ fn complete_multi_scan_union(local_groups: bool) -> Arc<FragmentPackage> {
         .unwrap();
     builder.attach_runtime_filter(FILTER).unwrap();
     let fragment = builder
-        .finish_definition(
+        .finish_fixture_definition(
             TOPN,
             FragmentSink::Result,
             dop(),
@@ -522,7 +515,10 @@ fn complete_multi_scan_union(local_groups: bool) -> Arc<FragmentPackage> {
     filter.consumers = consumers.into_boxed_slice();
     let mut result = result_port(PROBE, TOPN, &[union_key]);
     result.fields[0].ty = nullable_int64(true);
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        options(None).constants,
+    );
     plan.add_fragment(fragment).unwrap();
     plan.add_runtime_filter(filter).unwrap();
     plan.set_result_port(result).unwrap();
@@ -595,16 +591,20 @@ fn complete_ordered_union_branches_and_local_group_lineage_keep_all_scan_endpoin
             assert_eq!(consumer.consumer.channel_id(), FILTER.get());
             ids.insert(original.binding_id);
             definitions.insert(consumer.expr_id);
-            assert!(
-                matches!(program.graph().expressions().node(consumer.expr_id).unwrap().kind(),
-                StaticExprKind::SlotId(slot) if *slot == node.output_layout().slots()[0])
+            assert!(matches!(
+                crate::test_units::kind(&program, consumer.expr_id),
+                StaticExprKind::Input
+            ));
+            assert_eq!(
+                crate::test_units::input_ordinal(&program, consumer.expr_id),
+                0
             );
-            let ty = program
-                .checked()
-                .channels()
-                .expressions()
-                .definition_type(ProgramExpressionArena::Main, consumer.expr_id)
-                .unwrap();
+            let (unit, root) = crate::test_units::compiled_root(&program, consumer.expr_id);
+            assert_eq!(
+                unit.scope(root.scope).unwrap().schema().as_ref(),
+                node.output_layout().schema().as_ref()
+            );
+            let ty = crate::test_units::root_type(&program, consumer.expr_id);
             let novarocks_functions::FunctionArgumentType::Value(ty) = ty else {
                 panic!("value root")
             };

@@ -22,21 +22,26 @@ use novarocks_physical_plan::{AggregatePhase, TableFunctionOutput};
 fn checked_window<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     fragment: &'a Fragment,
-    source: &'a novarocks_physical_plan::ExprNode,
-) -> CheckedExpressionLogicalSourceEntry<'a> {
-    let receipt = window_loan(owner, fragment, source, &Control::default()).unwrap();
-    let selected = receipt
-        .canonical_selection()
-        .expect("same-emission window selection");
+    unit_node: &'a novarocks_physical_plan::PhysicalNode,
+    window_site: novarocks_physical_plan::PhysicalCallSite,
+    source: &'a novarocks_physical_plan::WindowCallSpec,
+) -> CheckedWindowLogicalSourceEntry<'a> {
+    let receipt = window_loan(
+        owner,
+        fragment,
+        unit_node,
+        window_site,
+        source,
+        &Control::default(),
+    )
+    .unwrap();
+    let selected = receipt.canonical_selection();
     let original = receipt.captured().binding().resolved();
-    let ContractExprKind::WindowCall {
-        function,
+    let novarocks_physical_plan::WindowCallSpec {
+        binding: function,
         aggregate_binding,
         ..
-    } = &source.kind
-    else {
-        unreachable!()
-    };
+    } = source;
     assert_eq!(function.function_id, original.function_id);
     assert_eq!(function.kind, original.kind);
     assert_eq!(function.overload, original.selected.overload);
@@ -45,7 +50,7 @@ fn checked_window<'a>(
     let FunctionResultType::Scalar(result) = &selected.result_type else {
         panic!("window scalar result");
     };
-    assert_eq!(&source.ty, result);
+    assert_eq!(&source.binding.result_type, result);
     assert_eq!(&function.result_type, result);
     let projected = project(&Control::default(), |work| {
         receipt.operational_arguments_observed(owner.plan().constants(), work)
@@ -73,24 +78,30 @@ fn checked_window<'a>(
         (None, None) => assert_eq!(function.kind, FunctionKind::Window),
         _ => panic!("aggregate metadata must come from the same selection"),
     }
-    let node = fragment.nodes().get(&source.owner).unwrap();
+    let node = unit_node;
     let NodeKind::Window(spec) = &node.kind else {
         unreachable!()
     };
-    let output = spec
-        .expressions
-        .iter()
-        .find(|item| item.expression == source.id)
-        .unwrap()
-        .output;
+    let output = source.output;
+    assert!(spec.calls.iter().any(|call| std::ptr::eq(call, source)));
     let value = fragment.values().get(&output).unwrap();
     assert_eq!(&value.ty, result);
-    assert!(matches!(value.origin, ValueOrigin::Expr { node, expr }
-        if node == source.owner && expr == source.id));
+    assert!(
+        matches!(value.origin, ValueOrigin::NodeOutput { node: owner, output_ordinal }
+        if owner == unit_node.id && unit_node.output.columns[output_ordinal as usize] == output)
+    );
     let clone = owner.clone();
-    let copied = window_loan(&clone, fragment, source, &Control::default()).unwrap();
+    let copied = window_loan(
+        &clone,
+        fragment,
+        unit_node,
+        window_site,
+        source,
+        &Control::default(),
+    )
+    .unwrap();
     assert!(std::ptr::eq(receipt.captured(), copied.captured()));
-    assert!(Arc::ptr_eq(selected, copied.canonical_selection().unwrap()));
+    assert!(Arc::ptr_eq(selected, copied.canonical_selection()));
     receipt
 }
 
@@ -120,7 +131,10 @@ fn checked_table<'a>(
         panic!("whole relation");
     };
     assert_eq!(function.result_types.as_ref(), results.as_ref());
-    assert_eq!(receipt.arguments(), arguments.as_ref());
+    assert_eq!(
+        receipt.arguments(),
+        root_definitions(fragment, node.id, arguments).as_slice()
+    );
     assert!(receipt.captured().request().expected_result_type.is_none());
     assert!(receipt.captured().binding().result_constraint().is_none());
     let projected = project(&Control::default(), |work| {
@@ -218,14 +232,14 @@ fn canonical_window_real_row_number_and_min_over_use_one_emitted_selection() {
         ),
     ] {
         let owner = crate::compiler::compile_authored_aggregate_for_test(sql);
-        let (fragment, source) = window_source(&owner);
-        let receipt = checked_window(&owner, fragment, source);
+        let (fragment, unit_node, window_site, source) = window_source(&owner);
+        let receipt = checked_window(&owner, fragment, unit_node, window_site, source);
         assert_eq!(receipt.captured().binding().kind, kind);
         assert_eq!(receipt.captured().request().arguments.len(), args);
         assert!(receipt.captured().binding().result_constraint().is_none());
         // Both installed owners retain a nullable Int64 selected carrier.
         let expected = ValueType::new(DataType::Int64, true);
-        assert_eq!(source.ty, expected);
+        assert_eq!(source.binding.result_type, expected);
         assert_result(&owner);
         assert_eq!(owner.plan().result_port().unwrap().fields[0].ty, expected);
     }
@@ -286,61 +300,132 @@ fn canonical_window_cv_order_and_frame_remain_independent_ordered_channels() {
             nulls_first: true,
         }],
     );
-    let owner = finish(&plan);
-    let (fragment, source) = window_source(&owner);
-    let receipt = checked_window(&owner, fragment, source);
-    assert!(std::ptr::eq(
-        receipt.captured().binding().resolved(),
-        binding.resolved()
-    ));
-    let original = receipt.captured().request();
-    assert_eq!(original.logical_argument_count, 1);
-    assert_eq!(original.arguments.len(), 2);
-    let projected = project(&Control::default(), |work| {
-        receipt.operational_arguments_observed(owner.plan().constants(), work)
-    })
-    .unwrap();
-    for (index, (ordinal, expected)) in [(1, 7), (2, 41)].into_iter().enumerate() {
-        let cv = constant(&projected[index]).unwrap();
-        assert_eq!(cv.ordinal(), ordinal);
-        assert_eq!(cv.try_i64().unwrap(), Some(expected));
-        assert!(Arc::ptr_eq(cv.pool().field_ref(), &root));
-        assert!(Arc::ptr_eq(cv.pool().array(), pool.array()));
-        let actual = emitted(&owner, fragment, receipt.arguments()[index]);
-        assert_eq!(actual.ordinal(), ordinal);
-        assert!(Arc::ptr_eq(actual.pool().field_ref(), &root));
-    }
-    let ContractExprKind::WindowCall {
-        args,
-        function_order_by,
-        frame,
-        ..
-    } = &source.kind
-    else {
-        unreachable!()
-    };
-    assert_eq!(receipt.arguments(), &[args[0], function_order_by[0].expr]);
-    assert_eq!(function_order_by[0].direction, SortDirection::Descending);
-    assert_eq!(function_order_by[0].null_ordering, NullOrdering::First);
-    let Some(ContractWindowFrame {
-        start: ContractWindowBound::Preceding(offset),
-        end: ContractWindowBound::CurrentRow,
-        ..
-    }) = frame
-    else {
-        panic!("original ROWS frame");
-    };
-    assert!(!receipt.arguments().contains(offset));
-    assert_eq!(
-        emitted(&owner, fragment, *offset).try_i64().unwrap(),
-        Some(2)
-    );
-    let NodeKind::Window(spec) = &fragment.nodes().get(&source.owner).unwrap().kind else {
-        unreachable!()
-    };
-    assert!(!receipt.arguments().contains(&spec.partition_by[0].expr));
-    assert!(!receipt.arguments().contains(&spec.order_by[0].expr));
-    assert_result(&owner);
+    let control = Control::default();
+    let mut seen = 0;
+    let result = observe_window_emission(&plan, &control, |receipt, work| {
+        seen += 1;
+        let unit_node = receipt.node();
+        let source = receipt.source();
+        let selected = receipt.canonical().selected();
+        assert!(receipt.canonical().belongs_to(receipt.captured()));
+        let original_binding = receipt.captured().binding().resolved();
+        let function = &source.binding;
+        assert_eq!(function.function_id, original_binding.function_id);
+        assert_eq!(function.kind, original_binding.kind);
+        assert_eq!(function.overload, original_binding.selected.overload);
+        assert_eq!(function.overload, selected.overload);
+        assert_eq!(function.argument_types, selected.argument_types);
+        let FunctionResultType::Scalar(selected_result) = &selected.result_type else {
+            panic!("window scalar result");
+        };
+        assert_eq!(&function.result_type, selected_result);
+        let (Some(state), Some(aggregate)) = (&selected.aggregate, &source.aggregate_binding)
+        else {
+            panic!("same canonical aggregate state");
+        };
+        assert_eq!(aggregate.phase, AggregatePhase::Single);
+        assert_eq!(aggregate.function, *function);
+        assert_eq!(
+            aggregate.logical_argument_count as usize,
+            receipt.captured().request().logical_argument_count
+        );
+        assert_eq!(aggregate.intermediate_type, state.intermediate_type);
+        assert_eq!(aggregate.state_format, state.state_format);
+        let output = receipt.builder().value(source.output).unwrap();
+        assert_eq!(&output.ty, selected_result);
+        assert!(
+            matches!(output.origin, ValueOrigin::NodeOutput { node: owner, output_ordinal }
+        if owner == unit_node.id && unit_node.output.columns[output_ordinal as usize] == source.output)
+        );
+        assert!(std::ptr::eq(
+            receipt.captured().binding().resolved(),
+            binding.resolved()
+        ));
+        let original = receipt.captured().request();
+        assert_eq!(original.logical_argument_count, 1);
+        assert_eq!(original.arguments.len(), 2);
+        let projected = receipt.operational_arguments(&control)?;
+        assert_eq!(
+            selected.argument_types.as_ref(),
+            projected
+                .iter()
+                .map(FunctionArgument::argument_type)
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+        for (index, (ordinal, expected)) in [(1, 7), (2, 41)].into_iter().enumerate() {
+            let cv = constant(&projected[index]).unwrap();
+            assert_eq!(cv.ordinal(), ordinal);
+            assert_eq!(cv.value_type(), &ty);
+            assert_eq!(cv.try_i64().unwrap(), Some(expected));
+            assert!(Arc::ptr_eq(cv.pool().field_ref(), &root));
+            assert!(Arc::ptr_eq(cv.pool().array(), pool.array()));
+            let actual = receipt.emitted_constant(receipt.arguments()[index], work)?;
+            assert_eq!(actual.ordinal(), ordinal);
+            assert!(Arc::ptr_eq(actual.pool().field_ref(), &root));
+        }
+        let novarocks_physical_plan::WindowCallSpec {
+            arguments: args,
+            order_by: function_order_by,
+            frame,
+            ..
+        } = source;
+        assert_eq!(
+            receipt.arguments(),
+            &[
+                receipt.definitions().root_definition(args[0]).unwrap().id,
+                receipt
+                    .definitions()
+                    .root_definition(function_order_by[0].expr)
+                    .unwrap()
+                    .id
+            ]
+        );
+        assert_eq!(function_order_by[0].direction, SortDirection::Descending);
+        assert_eq!(function_order_by[0].null_ordering, NullOrdering::First);
+        let Some(ContractWindowFrame {
+            start: ContractWindowBound::Preceding(offset),
+            end: ContractWindowBound::CurrentRow,
+            ..
+        }) = frame
+        else {
+            panic!("original ROWS frame");
+        };
+        assert!(receipt.arguments().iter().all(|id| !matches!(receipt.definitions().definition(*id).unwrap().kind, ContractExprKind::Constant(reference) if reference == *offset)));
+        assert_eq!(
+            receipt
+                .reference_constant(*offset, work)?
+                .try_i64()
+                .unwrap(),
+            Some(2)
+        );
+        let NodeKind::Window(spec) = &unit_node.kind else {
+            unreachable!()
+        };
+        assert!(
+            !receipt.arguments().contains(
+                &receipt
+                    .definitions()
+                    .root_definition(spec.partition_by[0].expr)
+                    .unwrap()
+                    .id
+            )
+        );
+        assert!(
+            !receipt.arguments().contains(
+                &receipt
+                    .definitions()
+                    .root_definition(spec.order_by[0].expr)
+                    .unwrap()
+                    .id
+            )
+        );
+        Ok(())
+    });
+    assert_eq!(seen, 1);
+    assert_window_unavailable(result, &binding);
+    // Actual publication/result-port/owner-clone assertions remain with the
+    // supported ROW_NUMBER/MIN cases in the unchanged checked_window helper.
 }
 
 #[test]
@@ -359,8 +444,8 @@ fn canonical_window_table_none_and_null_keep_original_operational_presence() {
         };
         let (plan, _) = window_fixture(vec![input], vec![]);
         let owner = finish(&plan);
-        let (fragment, source) = window_source(&owner);
-        let receipt = checked_window(&owner, fragment, source);
+        let (fragment, unit_node, window_site, source) = window_source(&owner);
+        let receipt = checked_window(&owner, fragment, unit_node, window_site, source);
         assert!(constant(&receipt.captured().request().arguments[0]).is_none());
         let projected = project(&Control::default(), |work| {
             receipt.operational_arguments_observed(owner.plan().constants(), work)
@@ -368,7 +453,7 @@ fn canonical_window_table_none_and_null_keep_original_operational_presence() {
         .unwrap();
         assert!(constant(&projected[0]).is_none());
         assert_eq!(
-            emitted(&owner, fragment, receipt.arguments()[0])
+            emitted(&owner, unit_node, receipt.arguments()[0])
                 .try_i64()
                 .unwrap(),
             Some(7)
@@ -380,15 +465,15 @@ fn canonical_window_table_none_and_null_keep_original_operational_presence() {
     };
     let (plan, _) = window_fixture(vec![input], vec![]);
     let owner = finish(&plan);
-    let (fragment, source) = window_source(&owner);
-    let receipt = checked_window(&owner, fragment, source);
+    let (fragment, unit_node, window_site, source) = window_source(&owner);
+    let receipt = checked_window(&owner, fragment, unit_node, window_site, source);
     let original = receipt.captured().request();
     assert_eq!(
         constant(&original.arguments[0]).unwrap().try_i64().unwrap(),
         None
     );
     assert_eq!(
-        emitted(&owner, fragment, receipt.arguments()[0])
+        emitted(&owner, unit_node, receipt.arguments()[0])
             .try_i64()
             .unwrap(),
         None
@@ -404,6 +489,7 @@ fn canonical_window_table_none_and_null_keep_original_operational_presence() {
         let (plan, _) = table_fixture(vec![input], false);
         let owner = finish(&plan);
         let (fragment, node) = table_source(&owner);
+        let unit_node = node;
         let receipt = checked_table(&owner, fragment, node);
         let original = receipt.captured().request();
         let projected = project(&Control::default(), |work| {
@@ -412,7 +498,7 @@ fn canonical_window_table_none_and_null_keep_original_operational_presence() {
         .unwrap();
         assert_eq!(constant(&original.arguments[0]).is_none(), none);
         assert_eq!(constant(&projected[0]).is_none(), none);
-        let actual = emitted(&owner, fragment, receipt.arguments()[0]);
+        let actual = emitted(&owner, unit_node, receipt.arguments()[0]);
         if !none {
             assert!(Arc::ptr_eq(
                 actual.pool().array(),
@@ -437,6 +523,7 @@ fn canonical_table_real_unnest_and_left_cv_keep_whole_relation_and_ordinals() {
     let (plan, binding) = table_fixture(vec![list_value(1), list_value(2)], true);
     let owner = finish(&plan);
     let (fragment, node) = table_source(&owner);
+    let unit_node = node;
     let receipt = checked_table(&owner, fragment, node);
     assert!(std::ptr::eq(
         receipt.captured().binding().resolved(),
@@ -456,7 +543,7 @@ fn canonical_table_real_unnest_and_left_cv_keep_whole_relation_and_ordinals() {
     let original = receipt.captured().request();
     for (index, ordinal) in [1, 2].into_iter().enumerate() {
         let cv = constant(&original.arguments[index]).unwrap();
-        let actual = emitted(&owner, fragment, receipt.arguments()[index]);
+        let actual = emitted(&owner, unit_node, receipt.arguments()[index]);
         assert_eq!(actual.ordinal(), ordinal);
         assert!(Arc::ptr_eq(actual.pool().array(), cv.pool().array()));
         assert!(Arc::ptr_eq(
@@ -567,8 +654,8 @@ fn canonical_window_table_repeat_nullable_source_changes_selected_arguments_befo
         .with_nullable(true)
         .unwrap();
     let owner = finish(&plan);
-    let (fragment, source) = window_source(&owner);
-    let receipt = checked_window(&owner, fragment, source);
+    let (fragment, unit_node, window_site, source) = window_source(&owner);
+    let receipt = checked_window(&owner, fragment, unit_node, window_site, source);
     assert!(std::ptr::eq(
         receipt.captured().binding().resolved(),
         binding.resolved()
@@ -578,16 +665,17 @@ fn canonical_window_table_repeat_nullable_source_changes_selected_arguments_befo
         if value_type==&ValueType::new(DataType::Int64,false))
     );
     assert_eq!(
-        receipt
-            .canonical_selection()
-            .unwrap()
-            .argument_types
-            .as_ref(),
+        receipt.canonical_selection().argument_types.as_ref(),
         &[novarocks_functions::FunctionArgumentType::Value(
             ValueType::new(DataType::Int64, true)
         )]
     );
-    let child = fragment.expressions().get(receipt.arguments()[0]).unwrap();
+    let child = unit_node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .definition(receipt.arguments()[0])
+        .unwrap();
     let ContractExprKind::Value(value) = child.kind else {
         unreachable!()
     };
@@ -636,6 +724,7 @@ fn canonical_window_table_repeat_nullable_source_changes_selected_arguments_befo
     plan.output_columns[0] = input;
     let owner = finish(&plan);
     let (fragment, node) = table_source(&owner);
+    let unit_node = node;
     let receipt = checked_table(&owner, fragment, node);
     assert!(std::ptr::eq(
         receipt.captured().binding().resolved(),
@@ -653,7 +742,12 @@ fn canonical_window_table_repeat_nullable_source_changes_selected_arguments_befo
     let mut expected = ty;
     expected = expected.with_nullable(true).unwrap();
     assert_eq!(selected, &expected);
-    let child = fragment.expressions().get(receipt.arguments()[0]).unwrap();
+    let child = unit_node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .definition(receipt.arguments()[0])
+        .unwrap();
     let ContractExprKind::Value(value) = child.kind else {
         unreachable!()
     };

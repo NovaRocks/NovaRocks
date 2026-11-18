@@ -48,7 +48,7 @@ pub struct TableFunctionNodeProjectionLimits {
 }
 struct Physical<'a> {
     function: &'a p::BoundTableFunction,
-    arguments: &'a [p::ExprId],
+    arguments: &'a [novarocks_expression_contract::RootOrdinal],
     outputs: &'a [p::TableFunctionOutput],
     left_outer: bool,
 }
@@ -148,7 +148,7 @@ fn table_encode_root_model(source: &p::PhysicalNode, roots: bool) -> Result<(Mod
         ..Model::default()
     };
     let backing = add(
-        bytes::<p::ExprId>(body.arguments.len())?,
+        bytes::<novarocks_expression_contract::RootOrdinal>(body.arguments.len())?,
         bytes::<p::TableFunctionOutput>(body.outputs.len())?,
     )?;
     if roots {
@@ -293,7 +293,7 @@ fn prepare_encode_core<'parent>(
     work.step()?;
     for argument in body.arguments {
         let found = expressions
-            .expression_observed(argument.get(), work)?
+            .root_expression_observed(argument.get(), work)?
             .is_some();
         work.step()?;
         if !found {
@@ -335,18 +335,19 @@ fn table_decode_root_model(
         inputs: source.input_node_ids.len(),
         items: add(
             add(source.required_inputs.len(), port.value_ids.len())?,
-            add(body.argument_expr_ids.len(), body.outputs.len())?,
+            add(body.argument_roots.len(), body.outputs.len())?,
         )?,
         refs: add(port.value_ids.len(), body.outputs.len())?,
         ..Model::default()
     };
     let backing = add(
-        bytes::<u32>(body.argument_expr_ids.capacity())?,
+        bytes::<u32>(body.argument_roots.capacity())?,
         bytes::<wire::TableFunctionOutput>(body.outputs.capacity())?,
     )?;
     if roots {
         decode_header_requests(source, port, &mut model)?;
-        model.request::<p::ExprId>(body.argument_expr_ids.len(), 2)?;
+        model
+            .request::<novarocks_expression_contract::RootOrdinal>(body.argument_roots.len(), 2)?;
         model.request::<p::TableFunctionOutput>(body.outputs.len(), 2)?;
     }
     Ok((model, backing))
@@ -398,17 +399,14 @@ fn prepare_decode_core<'a, 'parent>(
         };
     if admit.is_some() && same {
         expressions.values().retained_floor_header_admitted()?;
-        add(
-            expressions.retained_floor_header_in()?,
-            functions.retained_output_floor()?,
-        )?;
+        expressions.owned_binding_floor(functions, None)?;
     }
     let mut early = if admit.is_some() && same && raw(source).is_ok() && source.output.is_some() {
         let (mut model, backing) = table_decode_root_model(source, true)?;
         let body = raw(source)?;
         model.delegated_work = add(
             mul(
-                body.argument_expr_ids.len(),
+                body.argument_roots.len(),
                 expressions.lookup_work_upper_bound()?,
             )?,
             add(functions.definitions().len(), 32)?,
@@ -468,7 +466,7 @@ fn prepare_decode_core<'a, 'parent>(
     )?;
     model.delegated_work = add(
         mul(
-            body.argument_expr_ids.len(),
+            body.argument_roots.len(),
             expressions.lookup_work_upper_bound()?,
         )?,
         add(functions.definitions().len(), 32)?,
@@ -483,10 +481,8 @@ fn prepare_decode_core<'a, 'parent>(
     )?;
     // The original namespace invoice is counted once. Only the newly owned
     // materialized signatures add a separate retained floor.
-    let known = add(
-        expressions.retained_floor_observed(work)?,
-        functions.retained_output_floor()?,
-    )?;
+    expressions.retained_floor_observed(work)?;
+    let known = expressions.owned_binding_floor(functions, None)?;
     floor(source_bytes, known, work)?;
     floor(
         source_bytes,
@@ -495,7 +491,8 @@ fn prepare_decode_core<'a, 'parent>(
     )?;
     if !roots_prepared {
         decode_header_requests(source, port, &mut model)?;
-        model.request::<p::ExprId>(body.argument_expr_ids.len(), 2)?;
+        model
+            .request::<novarocks_expression_contract::RootOrdinal>(body.argument_roots.len(), 2)?;
         model.request::<p::TableFunctionOutput>(body.outputs.len(), 2)?;
     }
     node_facts(
@@ -602,8 +599,10 @@ fn prepare_decode_core<'a, 'parent>(
             ));
         }
     };
-    for argument in &body.argument_expr_ids {
-        let found = expressions.definition_observed(*argument, work)?.is_some();
+    for argument in &body.argument_roots {
+        let found = expressions
+            .root_definition_observed(*argument, work)?
+            .is_some();
         work.step()?;
         if !found {
             return Err(invalid(
@@ -718,6 +717,7 @@ fn emit_encode(
         work.step()?;
     }
     let node = wire::PhysicalNode {
+        expressions: None,
         id: source.id.get(),
         input_node_ids: inputs,
         required_inputs,
@@ -726,7 +726,7 @@ fn emit_encode(
         kind: Some(wire::physical_node::Kind::TableFunction(
             wire::TableFunctionNode {
                 function_binding_id: Some(binding),
-                argument_expr_ids: arguments,
+                argument_roots: arguments,
                 outputs,
                 left_outer: body.left_outer,
             },
@@ -746,9 +746,9 @@ fn emit_decode(
     let function = copy_table_signature_observed(function, work)?;
     let (inputs, required_inputs, output_properties, output) =
         decode_header(source, source_bytes, limits, work)?;
-    let mut arguments = reserve(body.argument_expr_ids.len(), work)?;
-    for argument in &body.argument_expr_ids {
-        arguments.push(p::ExprId::new(*argument));
+    let mut arguments = reserve(body.argument_roots.len(), work)?;
+    for argument in &body.argument_roots {
+        arguments.push(novarocks_expression_contract::RootOrdinal::new(*argument));
         work.step()?;
     }
     let mut outputs = reserve(body.outputs.len(), work)?;
@@ -769,6 +769,7 @@ fn emit_decode(
         work.step()?;
     }
     let node = p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(source.id),
         inputs,
         required_inputs,

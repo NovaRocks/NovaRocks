@@ -297,6 +297,15 @@ fn descriptor_messages_oneofs_and_all_fields_have_exact_resource_manifests() {
         assert!(expected.insert(message.full_name().to_owned()));
         let object = layouts[message.full_name()];
         assert_eq!(object.kind, ObjectKind::Message);
+        assert_eq!(
+            object.reserved,
+            message
+                .reserved_ranges()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>(),
+            "{} reserved numbers differ from the descriptor",
+            message.full_name()
+        );
         check_object(object, message.fields(), &layouts);
         for oneof in message.oneofs() {
             if is_synthetic(&oneof) {
@@ -306,6 +315,10 @@ fn descriptor_messages_oneofs_and_all_fields_have_exact_resource_manifests() {
             assert!(expected.insert(oneof.full_name().to_owned()));
             let object = layouts[oneof.full_name()];
             assert_eq!(object.kind, ObjectKind::Oneof);
+            assert!(
+                object.reserved.is_empty(),
+                "oneof has no message-local reserved namespace"
+            );
             check_object(object, oneof.fields(), &layouts);
         }
     }

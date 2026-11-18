@@ -16,11 +16,10 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::*;
-use novarocks_type_contract::{
-    CompileControlError, CompilePhase, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEvaluationDomain, PureCompileControl,
-};
+use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::sync::Mutex;
 
 const SOURCE: usize = 4 * 1024 * 1024;
@@ -72,7 +71,7 @@ impl PureCompileControl for SetupControl {
     }
 }
 
-fn fixture() -> (Fragment, PhysicalRootUses, FrozenFragmentCalls) {
+fn fixture() -> Fragment {
     let mut builder = FragmentBuilder::new(FragmentId::new(0));
     let source = NodeId::new(u32::MAX);
     builder
@@ -85,8 +84,8 @@ fn fixture() -> (Fragment, PhysicalRootUses, FrozenFragmentCalls) {
             .unwrap();
         child = NodeId::new(id);
     }
-    let fragment = builder
-        .finish_definition(
+    builder
+        .finish_fixture_definition(
             child,
             FragmentSink::Noop,
             PipelineDopDomain {
@@ -96,39 +95,21 @@ fn fixture() -> (Fragment, PhysicalRootUses, FrozenFragmentCalls) {
             },
             crate::StagePlacementPolicy::Singleton,
         )
-        .unwrap();
-    let setup = SetupControl::default();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        vec![],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &setup,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, vec![], &setup).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &setup).unwrap();
-    (fragment, uses, calls)
+        .unwrap()
 }
 
 fn run(
-    fixture: &(Fragment, PhysicalRootUses, FrozenFragmentCalls),
+    fixture: &Fragment,
     derive: bool,
     control: &Control,
     admit: &mut PropertyResourceAdmission<'_>,
 ) -> Result<PropertyProofProjectionFacts, FragmentPropertyError> {
-    let (fragment, uses, calls) = fixture;
+    let fragment = fixture;
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = if derive {
         derive_fragment_output_properties_in(
             fragment,
             &FragmentCuts::default(),
-            uses,
-            calls,
             PlanLimits::FROZEN,
             SOURCE,
             PROJECTION,
@@ -145,8 +126,6 @@ fn run(
     } else {
         validate_fragment_output_properties_in(
             fragment,
-            uses,
-            calls,
             PlanLimits::FROZEN,
             SOURCE,
             PROJECTION,
@@ -164,12 +143,10 @@ fn run(
 #[test]
 fn caller_graph_composition_matches_original_formulas_and_cumulative_prefix() {
     let fixture = fixture();
-    let (fragment, uses, calls) = &fixture;
+    let fragment = &fixture;
     let setup = SetupControl::default();
     let original = validate_fragment_output_properties_observed(
         fragment,
-        uses,
-        calls,
         PlanLimits::FROZEN,
         SOURCE,
         PROJECTION,
@@ -179,8 +156,6 @@ fn caller_graph_composition_matches_original_formulas_and_cumulative_prefix() {
     let derived = derive_fragment_output_properties_observed(
         fragment,
         &FragmentCuts::default(),
-        uses,
-        calls,
         PlanLimits::FROZEN,
         SOURCE,
         PROJECTION,

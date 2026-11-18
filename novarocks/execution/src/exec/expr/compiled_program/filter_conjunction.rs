@@ -20,25 +20,55 @@ use super::boolean_region::BooleanRows;
 use super::input_source::CompiledInputLoan;
 use super::*;
 use crate::runtime::task::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
-use novarocks_local_program::{ProgramNodeExpressionRole, ProgramNodeKind};
 use novarocks_type_contract::EvaluationDemand;
 
 pub(crate) struct CompiledFilterConjunctionInstance {
     roots: Vec<CompiledExpressionInstance>,
     failed: bool,
 }
+fn same_input_scope(
+    left: &novarocks_expression::ScopeLayout,
+    right: &novarocks_expression::ScopeLayout,
+    work: &mut Work<'_, '_>,
+) -> Result<bool, KernelFailure> {
+    if std::ptr::eq(left, right) {
+        return Ok(true);
+    }
+    work.flush()?;
+    let same_metadata = left.schema().metadata() == right.schema().metadata();
+    work.flush()?;
+    if !same_metadata
+        || left.schema().fields().len() != right.schema().fields().len()
+        || left.ordinal_types().len() != right.ordinal_types().len()
+    {
+        return Ok(false);
+    }
+    if !Arc::ptr_eq(left.schema(), right.schema()) {
+        for (expected, actual) in left.schema().fields().iter().zip(right.schema().fields()) {
+            if !novarocks_type_contract::arrow_fields_exact_observed(expected, actual, || {
+                work.step()
+            })? {
+                return Ok(false);
+            }
+        }
+    }
+    for (expected, actual) in left.ordinal_types().iter().zip(right.ordinal_types()) {
+        if !expected.exactly_equals_checked_observed(actual, || work.step())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 impl CompiledFilterConjunctionInstance {
     #[cfg(test)]
     pub(crate) fn try_new(
-        program: Arc<LocalProgram>,
-        node: ProgramNodeId,
+        predicates: &[(Arc<CompiledExprSet>, RootOrdinal)],
         control: &dyn KernelEvaluationControl,
     ) -> Result<Self, KernelFailure> {
-        Self::try_new_with_allocator(program, node, control, None)
+        Self::try_new_with_allocator(predicates, control, None)
     }
     pub(crate) fn try_new_with_allocator(
-        program: Arc<LocalProgram>,
-        node: ProgramNodeId,
+        predicates: &[(Arc<CompiledExprSet>, RootOrdinal)],
         control: &dyn KernelEvaluationControl,
         allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<Self, KernelFailure> {
@@ -54,64 +84,22 @@ impl CompiledFilterConjunctionInstance {
         };
         let result = (|| {
             work.control.checkpoint(0)?;
-            let graph_node = program
-                .graph()
-                .nodes()
-                .get(node.index())
-                .ok_or_else(|| invalid("Filter conjunction node is absent"))?;
-            let (predicates, scan): (&[novarocks_local_program::ProgramExprId], bool) =
-                match graph_node.kind() {
-                    ProgramNodeKind::Filter { predicates, .. } => (predicates.as_ref(), false),
-                    ProgramNodeKind::Scan { residuals, .. } => (residuals.as_slice(), true),
-                    _ => {
-                        return Err(invalid(
-                            "Filter conjunction requires its actual Filter or Scan node",
-                        ));
-                    }
-                };
             if predicates.is_empty() {
                 return Err(invalid("Filter conjunction has no original predicate"));
             }
             let mut roots = Vec::with_capacity(predicates.len());
-            let mut actual_input = None;
-            for (ordinal, definition) in predicates.iter().enumerate() {
-                let ordinal = novarocks_local_program::checked_program_ordinal(ordinal)
-                    .map_err(KernelFailure::from_domain)?;
-                let site = ProgramExpressionRootSite::Node {
-                    node,
-                    role: if scan {
-                        ProgramNodeExpressionRole::ScanResidual { predicate: ordinal }
-                    } else {
-                        ProgramNodeExpressionRole::FilterPredicate { predicate: ordinal }
-                    },
-                };
-                let snapshot = program
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .resolved_calls()
-                    .snapshot();
-                let use_id = *snapshot
-                    .bindings()
-                    .get(&site)
+            let mut actual_input: Option<&novarocks_expression::ScopeLayout> = None;
+            for (program, site) in predicates {
+                let site = *site;
+                let root = program
+                    .root(site)
                     .ok_or_else(|| invalid("missing original Filter predicate root"))?;
-                let flow = &snapshot.flows()[&site.arena()];
-                let invocation = flow
-                    .uses()
-                    .get(&use_id)
-                    .ok_or_else(|| invalid("missing original Filter predicate use"))?;
-                if invocation.definition != *definition
-                    || invocation.context.demand != EvaluationDemand::TruthOnly
-                {
-                    return Err(invalid(
-                        "Filter predicate differs from its original definition or demand",
-                    ));
+                if root.demand != EvaluationDemand::TruthOnly {
+                    return Err(invalid("Filter predicate differs from its original demand"));
                 }
                 let FunctionArgumentType::Value(ty) = program
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .definition_type(site.arena(), *definition)
+                    .types()
+                    .get(root.definition.index())
                     .ok_or_else(|| invalid("missing Filter predicate full type"))?
                 else {
                     return Err(invalid("Filter predicate is not a value"));
@@ -124,22 +112,25 @@ impl CompiledFilterConjunctionInstance {
                     ));
                 }
                 let instance = CompiledExpressionInstance::try_new_with_allocator(
-                    Arc::clone(&program),
+                    Arc::clone(program),
                     site,
                     work.control,
                     allocator.clone(),
                 )?;
+                if program.scopes().is_empty() {
+                    return Err(invalid("Filter predicate has no original input port"));
+                }
+                let input = program
+                    .scope(instance.input)
+                    .ok_or_else(|| invalid("Filter input scope is absent"))?;
                 if let Some(previous) = actual_input {
-                    if instance.input != Some(previous) {
+                    if !same_input_scope(previous, input, &mut work)? {
                         return Err(invalid(
                             "Filter predicates read different original input ports",
                         ));
                     }
                 } else {
-                    actual_input = instance.input;
-                    if actual_input.is_none() {
-                        return Err(invalid("Filter predicate has no original input port"));
-                    }
+                    actual_input = Some(input);
                 }
                 roots.push(instance);
                 work.step()?;
@@ -156,24 +147,13 @@ impl CompiledFilterConjunctionInstance {
         self.roots[predicate].instances.len()
     }
     fn root_is_pure(root: &CompiledExpressionInstance) -> Result<bool, KernelFailure> {
-        let snapshot = root
+        let compiled_root = root
             .program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        let use_id = *snapshot
-            .bindings()
-            .get(&root.root)
+            .root(root.root)
             .ok_or_else(|| invalid("missing actual Filter root effects site"))?;
-        let flow = &snapshot.flows()[&root.root.arena()];
-        let invocation = &flow.uses()[&use_id];
+        let invocation = &root.program.control_flow().uses()[&compiled_root.use_id];
         root.effects
-            .get(&ProgramUseRef {
-                arena: root.root.arena(),
-                use_id,
-            })
+            .get(&compiled_root.use_id)
             .ok_or_else(|| invalid("missing actual Filter root effects"))?
             .for_use(invocation.context)
             .map(|effects| effects.permits_boolean_reordering())
@@ -184,7 +164,7 @@ impl CompiledFilterConjunctionInstance {
         input: CompiledInputLoan<'_>,
         selection: Selection<'a>,
         work: &mut Work<'_, '_>,
-    ) -> Result<(SelectedValues<'a>, Box<[ProgramExpressionRootSite]>), E> {
+    ) -> Result<(SelectedValues<'a>, Box<[RootOrdinal]>), E> {
         if input.num_rows() != selection.batch_rows() {
             return Err(invalid("Filter selection differs from its actual batch").into());
         }

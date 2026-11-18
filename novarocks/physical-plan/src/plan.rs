@@ -25,9 +25,9 @@ use novarocks_connector_contract::{
 };
 
 use crate::{
-    AggregateBinding, AggregateCallId, EdgeId, ExprArena, ExprId, FragmentId, NodeId, NullOrdering,
-    PLAN_CONTRACT_REVISION, PlanVersionId, ProviderColumnReference, Relation, RuntimeFilterId,
-    SortDirection, SortExpr, ValueId, ValueType,
+    AggregateBinding, AggregateCallId, EdgeId, FragmentId, NodeId, NullOrdering,
+    PLAN_CONTRACT_REVISION, PlanVersionId, ProviderColumnReference, Relation, RootOrdinal,
+    RuntimeFilterId, SortDirection, SortExpr, ValueId, ValueType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,7 +62,7 @@ pub enum ValueOrigin {
     },
     Expr {
         node: NodeId,
-        expr: ExprId,
+        root: RootOrdinal,
     },
     NullExtended {
         node: NodeId,
@@ -540,26 +540,30 @@ pub enum NestLoopJoinDistribution {
 pub struct AggregateCall {
     pub id: AggregateCallId,
     pub binding: AggregateBinding,
-    pub arguments: Box<[ExprId]>,
+    pub arguments: Box<[RootOrdinal]>,
     pub distinct: bool,
     pub order_by: Box<[SortExpr]>,
     pub output: ValueId,
 }
 
+/// One real relational window call. Its scalar parameters belong to this
+/// node's unit; frame offsets retain their original checked constant addresses.
 #[derive(Clone, Debug, PartialEq)]
-pub struct WindowExpression {
-    pub expression: ExprId,
+pub struct WindowCallSpec {
+    pub binding: novarocks_expression_contract::BoundFunction,
+    pub distinct: bool,
+    pub arguments: Box<[RootOrdinal]>,
+    pub order_by: Box<[SortExpr]>,
+    pub frame: Option<crate::WindowFrame>,
+    pub ignore_nulls: bool,
+    pub aggregate_binding: Option<Box<AggregateBinding>>,
     pub output: ValueId,
 }
-
-/// One node-owned window partition/order contract shared by every call in the
-/// node. Individual `ExprKind::WindowCall` values carry only function-specific
-/// arguments, ordering, frame and NULL treatment.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowSpec {
     pub partition_by: Box<[SortExpr]>,
     pub order_by: Box<[SortExpr]>,
-    pub expressions: Box<[WindowExpression]>,
+    pub calls: Box<[WindowCallSpec]>,
 }
 
 /// One ordered output occurrence of a table-function node.
@@ -645,7 +649,7 @@ pub struct WriterAggregateCall {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum UnpivotConstant {
-    Scalar(ExprId),
+    Scalar(RootOrdinal),
     /// Selected rows in the enclosing plan's original checked constant pools.
     /// These addresses do not authorize a logical domain or reconstruct data.
     Int32List(crate::ConstantReference),
@@ -710,8 +714,8 @@ pub struct WriterFinishSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct JoinKey {
-    pub left: ExprId,
-    pub right: ExprId,
+    pub left: RootOrdinal,
+    pub right: RootOrdinal,
     pub null_safe: bool,
 }
 
@@ -763,7 +767,7 @@ pub enum TopNReduction {
     /// Output states have new identities; no contribution is a passthrough.
     /// This guarantees task-local uniqueness, not global group completion.
     GroupedStates {
-        group_by: Box<[(ExprId, ValueId)]>,
+        group_by: Box<[(RootOrdinal, ValueId)]>,
         calls: Box<[AggregateCall]>,
         comparator: novarocks_type_contract::OrderedComparisonAlgorithm,
     },
@@ -807,12 +811,12 @@ pub struct GroupingOutput {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChangeAssignment {
     pub output: ValueId,
-    pub expression: Option<ExprId>,
+    pub expression: Option<RootOrdinal>,
     pub write_input: Option<novarocks_type_contract::WriteInputDeclaration>,
 }
 
 impl ChangeAssignment {
-    pub fn exact(output: ValueId, expression: Option<ExprId>) -> Self {
+    pub fn exact(output: ValueId, expression: Option<RootOrdinal>) -> Self {
         Self {
             output,
             expression,
@@ -823,7 +827,7 @@ impl ChangeAssignment {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChangeEventSpec {
-    pub predicate: Option<ExprId>,
+    pub predicate: Option<RootOrdinal>,
     pub effect: ConnectorRowMutationEffect,
     pub assignments: Box<[ChangeAssignment]>,
 }
@@ -908,7 +912,7 @@ pub enum NodeKind {
         /// Predicates that the engine must evaluate at the scan. This may also
         /// contain an `Exact` provider guarantee when deliberate rechecking is
         /// required, and may contain predicates that were never pushed down.
-        residuals: Box<[ExprId]>,
+        residuals: Box<[RootOrdinal]>,
         derived_values: Box<[ValueId]>,
     },
     /// Retains rows for which every predicate holds.
@@ -921,13 +925,13 @@ pub enum NodeKind {
     /// decides rejection. Scheduling must preserve the exact effect and
     /// conditional-domain responsibilities of each occurrence.
     Filter {
-        predicates: Box<[ExprId]>,
+        predicates: Box<[RootOrdinal]>,
     },
     Project {
-        expressions: Box<[(ExprId, ValueId)]>,
+        expressions: Box<[(RootOrdinal, ValueId)]>,
     },
     Aggregate {
-        group_by: Box<[(ExprId, ValueId)]>,
+        group_by: Box<[(RootOrdinal, ValueId)]>,
         calls: Box<[AggregateCall]>,
         /// Required grouping completion and task-wide output uniqueness.
         /// Call finalization is independent: Complete may emit intermediate
@@ -937,7 +941,7 @@ pub enum NodeKind {
     },
     HashJoin {
         kind: JoinKind,
-        condition: crate::HashJoinCondition<Box<[JoinKey]>, ExprId>,
+        condition: crate::HashJoinCondition<Box<[JoinKey]>, RootOrdinal>,
         build_side: JoinSide,
         distribution: JoinDistribution,
         null_extended: Box<[ValueId]>,
@@ -945,7 +949,7 @@ pub enum NodeKind {
     NestLoopJoin {
         kind: JoinKind,
         distribution: NestLoopJoinDistribution,
-        predicate: Option<ExprId>,
+        predicate: Option<RootOrdinal>,
         null_extended: Box<[ValueId]>,
     },
     Sort {
@@ -969,7 +973,7 @@ pub enum NodeKind {
         input_mappings: Box<[Box<[ValueId]>]>,
     },
     Values {
-        rows: Box<[Box<[ExprId]>]>,
+        rows: Box<[Box<[RootOrdinal]>]>,
     },
     SystemRelation {
         output_fields: std::sync::Arc<[arrow_schema::FieldRef]>,
@@ -992,13 +996,13 @@ pub enum NodeKind {
         spec: UnpivotSpec,
     },
     GenerateSeries {
-        start: ExprId,
-        stop: ExprId,
-        step: Option<ExprId>,
+        start: RootOrdinal,
+        stop: RootOrdinal,
+        step: Option<RootOrdinal>,
     },
     TableFunction {
         function: crate::BoundTableFunction,
-        arguments: Box<[ExprId]>,
+        arguments: Box<[RootOrdinal]>,
         outputs: Box<[TableFunctionOutput]>,
         left_outer: bool,
     },
@@ -1035,7 +1039,7 @@ pub struct ScanReadBudget {
 }
 
 /// Borrow of the common grouping and exact aggregate-call contract.
-pub type AggregateContractRef<'a> = (&'a [(ExprId, ValueId)], &'a [AggregateCall]);
+pub type AggregateContractRef<'a> = (&'a [(RootOrdinal, ValueId)], &'a [AggregateCall]);
 
 impl NodeKind {
     /// Authorship is a closed node-family fact, never inferred from values.
@@ -1061,7 +1065,10 @@ impl NodeKind {
             _ => None,
         }
     }
-    pub(crate) fn expression_references(&self, output: &mut Vec<ExprId>) {
+    /// Ordered root references stored directly in this node kind. Scan-derived
+    /// roots are separately carried by their exact ValueOrigin declarations.
+    /// Metadata guarantee references do not request another runtime evaluation.
+    pub fn root_references(&self, output: &mut Vec<RootOrdinal>) {
         match self {
             Self::Scan {
                 relation,
@@ -1130,7 +1137,10 @@ impl NodeKind {
             Self::Window(spec) => {
                 output.extend(spec.partition_by.iter().map(|item| item.expr));
                 output.extend(spec.order_by.iter().map(|item| item.expr));
-                output.extend(spec.expressions.iter().map(|item| item.expression));
+                for call in &spec.calls {
+                    output.extend(call.arguments.iter().copied());
+                    output.extend(call.order_by.iter().map(|item| item.expr));
+                }
             }
             Self::Values { rows } => {
                 for row in rows {
@@ -1194,6 +1204,7 @@ pub struct PhysicalNode {
     pub output_properties: PhysicalProperties,
     pub output: OutputPort,
     pub kind: NodeKind,
+    pub expressions: Option<std::sync::Arc<novarocks_expression_contract::BoundExprSet>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1225,7 +1236,6 @@ pub struct Fragment {
     id: FragmentId,
     root: NodeId,
     values: BTreeMap<ValueId, ValueDef>,
-    expressions: ExprArena,
     nodes: BTreeMap<NodeId, PhysicalNode>,
     sink: FragmentSink,
     summaries: Box<[crate::SummaryOutput]>,
@@ -1233,6 +1243,7 @@ pub struct Fragment {
     stage_placement: crate::StagePlacementPolicy,
     runtime_filters: Box<[RuntimeFilterId]>,
     pub(crate) call_requests: crate::FragmentCallRequests,
+    pub(crate) calls: crate::FrozenFragmentCalls,
 }
 
 impl Fragment {
@@ -1241,7 +1252,6 @@ impl Fragment {
             id: self.id,
             root: self.root,
             values: self.values,
-            expressions: self.expressions,
             nodes: self.nodes,
             sink: self.sink,
             summaries: self.summaries,
@@ -1249,6 +1259,7 @@ impl Fragment {
             stage_placement: self.stage_placement,
             runtime_filters: self.runtime_filters,
             call_requests: self.call_requests,
+            calls: self.calls,
         }
     }
 
@@ -1264,8 +1275,16 @@ impl Fragment {
         &self.values
     }
 
-    pub const fn expressions(&self) -> &ExprArena {
-        &self.expressions
+    pub fn unit(&self, node: NodeId) -> Option<&novarocks_expression_contract::BoundExprSet> {
+        self.nodes.get(&node)?.expressions.as_deref()
+    }
+    pub fn root_expression(
+        &self,
+        node: NodeId,
+        root: RootOrdinal,
+    ) -> Option<&novarocks_expression_contract::ExprNode> {
+        let unit = self.unit(node)?;
+        unit.definition(unit.root(root)?.definition)
     }
 
     pub fn nodes(&self) -> &BTreeMap<NodeId, PhysicalNode> {
@@ -1290,6 +1309,10 @@ impl Fragment {
 
     pub const fn call_requests(&self) -> &crate::FragmentCallRequests {
         &self.call_requests
+    }
+
+    pub const fn calls(&self) -> &crate::FrozenFragmentCalls {
+        &self.calls
     }
 
     pub fn runtime_filters(&self) -> &[RuntimeFilterId] {
@@ -1789,6 +1812,7 @@ pub enum AnnotationSubject {
 /// Complete immutable final physical plan.
 #[derive(Clone, Debug)]
 pub struct PhysicalPlan {
+    statement_constant_policy: crate::ConstantPolicy,
     constants: crate::ConstantPools,
     parameters: SemanticParameters,
     version: PlanVersionId,
@@ -1805,6 +1829,9 @@ pub struct PhysicalPlan {
 }
 
 impl PhysicalPlan {
+    pub const fn statement_constant_policy(&self) -> crate::ConstantPolicy {
+        self.statement_constant_policy
+    }
     pub fn constants(&self) -> &crate::ConstantPools {
         &self.constants
     }
@@ -1882,6 +1909,7 @@ impl PhysicalPlan {
 pub(crate) struct PhysicalPlanParts {
     pub constants: crate::ConstantPools,
     pub parameters: SemanticParameters,
+    pub statement_constant_policy: crate::ConstantPolicy,
     pub version: PlanVersionId,
     pub fragments: BTreeMap<FragmentId, Fragment>,
     pub edges: BTreeMap<EdgeId, Edge>,
@@ -1900,6 +1928,7 @@ impl From<PhysicalPlanParts> for PhysicalPlan {
         Self {
             constants: parts.constants,
             parameters: parts.parameters,
+            statement_constant_policy: parts.statement_constant_policy,
             version: parts.version,
             fragments: parts.fragments,
             edges: parts.edges,
@@ -1916,7 +1945,6 @@ pub(crate) struct FragmentParts {
     pub id: FragmentId,
     pub root: NodeId,
     pub values: BTreeMap<ValueId, ValueDef>,
-    pub expressions: ExprArena,
     pub nodes: BTreeMap<NodeId, PhysicalNode>,
     pub sink: FragmentSink,
     pub summaries: Box<[crate::SummaryOutput]>,
@@ -1924,6 +1952,7 @@ pub(crate) struct FragmentParts {
     pub stage_placement: crate::StagePlacementPolicy,
     pub runtime_filters: Box<[RuntimeFilterId]>,
     pub call_requests: crate::FragmentCallRequests,
+    pub calls: crate::FrozenFragmentCalls,
 }
 
 impl From<FragmentParts> for Fragment {
@@ -1932,7 +1961,6 @@ impl From<FragmentParts> for Fragment {
             id: parts.id,
             root: parts.root,
             values: parts.values,
-            expressions: parts.expressions,
             nodes: parts.nodes,
             sink: parts.sink,
             summaries: parts.summaries,
@@ -1940,6 +1968,7 @@ impl From<FragmentParts> for Fragment {
             stage_placement: parts.stage_placement,
             runtime_filters: parts.runtime_filters,
             call_requests: parts.call_requests,
+            calls: parts.calls,
         }
     }
 }

@@ -21,8 +21,9 @@
 
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
+use novarocks_expression_contract::ExprKind;
 use novarocks_local_program::{ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId};
-use novarocks_physical_plan::{ExprId, ExprKind, FragmentPackage, NodeId, NodeKind, ValueId};
+use novarocks_physical_plan::{FragmentPackage, NodeId, NodeKind, ValueId};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
     ValueTypeError,
@@ -36,7 +37,6 @@ use crate::repeat::{RepeatInputPort, RepeatLoweringError, plan_repeat_channels};
 
 pub(crate) struct PlannedChannels {
     pub nodes: BTreeMap<NodeId, NodeChannels>,
-    pub inputs: BTreeMap<ExprId, ResolvedInput>,
     pub unpivot_sources: BTreeMap<NodeId, BTreeMap<ValueId, SlotId>>,
     pub assertion_keys: BTreeMap<NodeId, Vec<SlotId>>,
     pub sink_projection: Option<SinkProjectionChannels>,
@@ -54,8 +54,6 @@ pub(crate) struct PlannedChannels {
     /// Each join's planned channels. A join whose physical output is not
     /// canonical also has one selection branch in `unions`.
     pub joins: BTreeMap<NodeId, crate::join::PlannedJoin>,
-    /// Join-owned value reads; their actual source is chosen per use.
-    pub join_values: BTreeMap<ExprId, crate::join::JoinValueSource>,
     /// Each table function's planned channels. Its argument Project's
     /// pass-through reads are its one branch in `unions`.
     pub table_functions: BTreeMap<NodeId, crate::table_function::PlannedTableFunction>,
@@ -262,9 +260,13 @@ fn resolve_core_with_creation<H>(
                         let expression = *row.get(ordinal).ok_or(ChannelLoweringError::Invalid(
                             "Values occurrence width differs",
                         ))?;
-                        let definition = fragment
-                            .expressions()
-                            .get(expression)
+                        let unit = node
+                            .expressions
+                            .as_ref()
+                            .ok_or(ChannelLoweringError::Invalid("missing Values unit"))?;
+                        let definition = unit
+                            .root(expression)
+                            .and_then(|root| unit.definition(root.definition))
                             .ok_or(ChannelLoweringError::Invalid("missing Values definition"))?;
                         work.step()?;
                         exact_type(&definition.ty, &output.ty, work)?;
@@ -482,20 +484,18 @@ fn resolve_core_with_creation<H>(
                         ))
                         .into());
                     }
-                    let definition = fragment
-                        .expressions()
-                        .get(expression)
+                    let unit = node
+                        .expressions
+                        .as_ref()
+                        .ok_or(ChannelLoweringError::Invalid("missing project unit"))?;
+                    let definition = unit
+                        .root(expression)
+                        .and_then(|root| unit.definition(root.definition))
                         .ok_or(ChannelLoweringError::Invalid("missing project definition"))?;
                     let output = fragment
                         .values()
                         .get(&value)
                         .ok_or(ChannelLoweringError::Invalid("missing project value"))?;
-                    if definition.owner != source {
-                        return Err((ChannelLoweringError::Invalid(
-                            "project expression has a foreign owner",
-                        ))
-                        .into());
-                    }
                     work.step()?;
                     exact_type(&definition.ty, &output.ty, work)?;
                     let input = match definition.kind {
@@ -558,7 +558,7 @@ fn resolve_core_with_creation<H>(
             NodeKind::Window(spec) => window_channels(
                 fragment,
                 node,
-                spec.expressions.len(),
+                spec.calls.len(),
                 &nodes,
                 &ports,
                 &mut next_slot,
@@ -846,62 +846,6 @@ fn resolve_core_with_creation<H>(
         ports.insert(source, port);
         work.step()?;
     }
-    let mut inputs = BTreeMap::new();
-    let mut join_values = BTreeMap::new();
-    for (&id, definition) in fragment.expressions().iter() {
-        if let ExprKind::Value(value) = definition.kind {
-            let owner =
-                fragment
-                    .nodes()
-                    .get(&definition.owner)
-                    .ok_or(ChannelLoweringError::Invalid(
-                        "missing value-reference owner",
-                    ))?;
-            // A join-owned read keeps its side's slot; whether a use reads
-            // its side or the join scope is decided per use by its root.
-            if let Some(planned) = joins.get(&definition.owner) {
-                let (input, source) = crate::join::resolve_join_value(planned, value, &ports)?;
-                let source_type = &fragment
-                    .values()
-                    .get(&value)
-                    .ok_or(ChannelLoweringError::Invalid("missing referenced value"))?
-                    .ty;
-                work.step()?;
-                exact_type(&definition.ty, source_type, work)?;
-                inputs.insert(id, input);
-                join_values.insert(id, source);
-                work.step()?;
-                continue;
-            }
-            // A scan-owned root reads the scan's own output port, exactly the
-            // input layout that root binding names; every other owner reads
-            // its one exact input.
-            let scope = if matches!(owner.kind, NodeKind::Scan { .. }) {
-                definition.owner
-            } else {
-                if owner.inputs.len() != 1 {
-                    return Err((ChannelLoweringError::Invalid(
-                        "value reference requires one exact input",
-                    ))
-                    .into());
-                }
-                owner.inputs[0]
-            };
-            let scope_channels = nodes.get(&scope).ok_or(ChannelLoweringError::Invalid(
-                "value input is outside the source tree",
-            ))?;
-            let input = resolve_input(value, scope_channels, &ports[&scope])?;
-            let source_type = &fragment
-                .values()
-                .get(&value)
-                .ok_or(ChannelLoweringError::Invalid("missing referenced value"))?
-                .ty;
-            work.step()?;
-            exact_type(&definition.ty, source_type, work)?;
-            inputs.insert(id, input);
-        }
-        work.step()?;
-    }
     let sink_projection =
         if let novarocks_physical_plan::FragmentSink::Router { routes, .. } = fragment.sink() {
             let root = fragment
@@ -1004,7 +948,6 @@ fn resolve_core_with_creation<H>(
     }
     Ok(PlannedChannels {
         nodes,
-        inputs,
         unpivot_sources,
         assertion_keys,
         sink_projection,
@@ -1014,7 +957,6 @@ fn resolve_core_with_creation<H>(
         writer_projections,
         finish_statistics,
         joins,
-        join_values,
         table_functions,
         series,
     })

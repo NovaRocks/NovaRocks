@@ -18,18 +18,24 @@
 use super::*;
 use arrow_array::{Array, ArrayRef, Int64Array, StructArray};
 use arrow_schema::{DataType, Field};
+use novarocks_expression::{EvaluationEnvironment, ScopeLayouts, StaticExprKind};
+use novarocks_expression_contract::{
+    BoundExprSetBuilder, ExprId, ExprKind, RootOrdinal, RootScope, UnitLimits,
+};
+use novarocks_functions::{ConstantPolicy, ConstantValue, FunctionKind, PureEngineFunctionCatalog};
 use novarocks_functions::{ConstantPool, EngineFunctionCatalogBuilder, InstalledPureKernel};
+use novarocks_local_program::ProgramRootRef;
 use novarocks_physical_plan::{
-    ConstantPoolId, ConstantPools, ConstantReference, FragmentBuilder, FragmentCuts, FragmentId,
-    FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, NodeId,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts,
-    ResultField, ResultPort, ValueOrigin,
+    ConstantPoolId, ConstantPools, ConstantReference, Fragment, FragmentBuilder, FragmentCuts,
+    FragmentId, FragmentPackage, FragmentPackageInput, FragmentSink, FrozenFragmentPruning, NodeId,
+    PipelineDopDomain, PlanLimits, PlanVersionId, RequiredContracts, ResultField, ResultPort,
+    StagePlacementPolicy, ValidationErrors, ValueOrigin,
 };
 use novarocks_type_contract::{
-    EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, FunctionValueType, SemanticParameters,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType,
+    PureCompileControl, SemanticParameters,
 };
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex};
 
 struct Control {
     trace: Mutex<Vec<(CompilePhase, u32)>>,
@@ -142,333 +148,228 @@ fn functions() -> PureEngineFunctionCatalog {
         .unwrap()
 }
 
-fn checked_package(pool: &ConstantPool, ordinals: &[u32]) -> FragmentPackage {
-    let mut constants = ConstantPools::empty();
-    constants
-        .insert(ConstantPoolId::new(u32::MAX), pool.clone())
-        .unwrap();
-    let mut builder = FragmentBuilder::new(FragmentId::new(91));
-    builder
-        .add_values(NodeId::new(99), Box::from([Box::default()]), Box::default())
-        .unwrap();
-    let mut assignments = Vec::new();
-    let mut output = Vec::new();
-    let mut fields = Vec::new();
-    for &ordinal in ordinals {
-        let ty = pool.value_type().clone();
-        let expr = builder
-            .add_expression(
-                NodeId::new(8),
-                ty.clone(),
-                ExprKind::Constant(ConstantReference {
-                    pool: ConstantPoolId::new(u32::MAX),
-                    ordinal,
-                }),
-            )
-            .unwrap();
-        let value = builder
-            .add_value(
-                ty.clone(),
-                ValueOrigin::Expr {
-                    node: NodeId::new(8),
-                    expr,
-                },
-            )
-            .unwrap();
-        assignments.push((expr, value));
-        output.push(value);
-        fields.push(ResultField {
-            domain: novarocks_physical_plan::ResultValueDomain::Plain,
-            name: format!("result-{ordinal}").into(),
-            alias: None,
-            value,
-            ty,
-        });
+trait UnitFixture {
+    fn define(
+        &mut self,
+        node: NodeId,
+        ty: FunctionValueType,
+        kind: ExprKind,
+    ) -> Result<ExprId, novarocks_expression_contract::UnitError>;
+    fn add_root(
+        &mut self,
+        node: NodeId,
+        ty: FunctionValueType,
+        kind: ExprKind,
+        scope: RootScope,
+        demand: EvaluationDemand,
+    ) -> Result<RootOrdinal, novarocks_expression_contract::UnitError>;
+    fn root_definition(
+        &mut self,
+        node: NodeId,
+        definition: ExprId,
+        scope: RootScope,
+        demand: EvaluationDemand,
+    ) -> RootOrdinal;
+    fn repeat_root(&mut self, node: NodeId, root: RootOrdinal) -> RootOrdinal;
+    fn finish_fixture(
+        self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop: PipelineDopDomain,
+        placement: StagePlacementPolicy,
+    ) -> Result<Fragment, ValidationErrors>;
+}
+impl UnitFixture for FragmentBuilder {
+    fn define(
+        &mut self,
+        node: NodeId,
+        ty: FunctionValueType,
+        kind: ExprKind,
+    ) -> Result<ExprId, novarocks_expression_contract::UnitError> {
+        self.unit(node)
+            .expect("fixture original draft")
+            .add(None, ty, kind)
     }
-    builder
-        .add_project(
-            NodeId::new(8),
-            NodeId::new(99),
-            assignments.into_boxed_slice(),
-            output.into_boxed_slice(),
-        )
-        .unwrap();
-    let fragment = builder
-        .finish_definition(
-            NodeId::new(8),
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();
-    let domain = EvaluationDomainId::new(17);
-    let mut invocations = vec![];
-    let bindings = roots
-        .sites()
-        .iter()
-        .enumerate()
-        .map(|(ordinal, (&site, root))| {
-            let use_id = ExpressionUseId::new(ordinal as u32 + 42);
-            invocations.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    domain,
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (site, use_id)
-        })
-        .collect();
-    let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::good(),
-    )
-    .unwrap();
-    let expression_uses =
-        PhysicalRootUses::try_new(&fragment, flow, bindings, &Control::good()).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &Control::good())
-        .unwrap();
-    let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control::good()).unwrap();
-    let result = ResultPort {
-        scalar_schema: None,
-        fragment: fragment.id(),
-        output: fragment.nodes()[&fragment.root()].output.clone(),
-        fields: fields.into_boxed_slice(),
-    };
-    FragmentPackage::try_new(
-        FragmentPackageInput {
-            version: PlanVersionId::try_new([91; 16]).unwrap(),
-            required: RequiredContracts::default(),
-            fragment,
-            expression_uses,
-            calls,
-            constants,
-            cuts: FragmentCuts::default(),
-            result: Some(result),
-            parameters: SemanticParameters::try_new([]).unwrap(),
-            scans: BTreeMap::new(),
-            writes: BTreeMap::new(),
-            annotations: Box::default(),
-            pruning,
-            layouts: Default::default(),
-        },
-        package_admission(),
-        &Control::good(),
-    )
-    .unwrap()
+    fn add_root(
+        &mut self,
+        node: NodeId,
+        ty: FunctionValueType,
+        kind: ExprKind,
+        scope: RootScope,
+        demand: EvaluationDemand,
+    ) -> Result<RootOrdinal, novarocks_expression_contract::UnitError> {
+        let d = self.define(node, ty, kind)?;
+        self.unit(node).unwrap().root(d, demand, scope)
+    }
+    fn root_definition(
+        &mut self,
+        node: NodeId,
+        definition: ExprId,
+        scope: RootScope,
+        demand: EvaluationDemand,
+    ) -> RootOrdinal {
+        self.unit(node)
+            .unwrap()
+            .root(definition, demand, scope)
+            .unwrap()
+    }
+    fn repeat_root(&mut self, node: NodeId, root: RootOrdinal) -> RootOrdinal {
+        let r = self.unit(node).unwrap().roots()[root.get() as usize];
+        self.unit(node)
+            .unwrap()
+            .root(r.definition, r.demand, r.scope)
+            .unwrap()
+    }
+    fn finish_fixture(
+        mut self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop: PipelineDopDomain,
+        placement: StagePlacementPolicy,
+    ) -> Result<Fragment, ValidationErrors> {
+        let nodes = self
+            .construction_nodes()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for node in nodes {
+            if self.construction_unit(node).is_some() {
+                let ports = self.node_ports(node).unwrap();
+                let d = self.take_unit_builder(node).unwrap();
+                let control = Control::good();
+                let mut work =
+                    CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+                let unit = d
+                    .seal(ports, &mut work)
+                    .unwrap()
+                    .finish(BTreeMap::new(), &mut work)
+                    .unwrap();
+                work.finish().unwrap();
+                self.install_unit(node, Arc::new(unit)).unwrap();
+            }
+        }
+        self.finish_definition(root, sink, dop, placement)
+    }
 }
 fn lower(
     package: &FragmentPackage,
     control: &dyn PureCompileControl,
-) -> Result<LoweredExpressions, ExpressionLoweringError> {
-    lower_expressions(package, policy(), &BTreeMap::new(), control)
+) -> Result<LoweredExpressions, crate::FragmentCreationError<std::convert::Infallible>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let mut lowered =
+        LoweredExpressions::new::<std::convert::Infallible>(package, None, &mut work)?;
+    for node in package.fragment().nodes().values() {
+        if let Some(unit) = &node.expressions {
+            assert!(
+                unit.ports().is_empty(),
+                "the direct Values component fixtures have no runtime input"
+            );
+            let compiled = novarocks_expression::compile_expr_set_pure(
+                unit,
+                EvaluationEnvironment {
+                    constants: package.constants(),
+                    parameters: package.parameters(),
+                },
+                ScopeLayouts {
+                    ports: &[],
+                    all_ports: None,
+                },
+                policy(),
+                &functions(),
+                &mut work,
+            )
+            .map_err(ExpressionLoweringError::from)?;
+            lowered.units[lowered.node_units[&node.id].index()] = Some(compiled);
+        }
+    }
+    work.finish()?;
+    Ok(lowered)
 }
-fn replace_constant(lowered: &mut LoweredExpressions, id: ProgramExprId, value: ConstantValue) {
-    let mut nodes = lowered.arena.nodes().to_vec();
-    nodes[id.index()] = StaticExprNode::new(
-        StaticExprKind::Constant(value.clone()),
-        value.value_type().data_type().clone(),
-        None,
-    );
-    lowered.arena = Arc::new(
-        ImmutableExpressions::try_new_for_compile(
-            nodes,
-            false,
-            HashMap::new(),
-            None,
-            &Control::good(),
-        )
-        .unwrap(),
-    );
-}
-
-#[test]
-fn checked_references_keep_multirow_backing_nonzero_ordinals_and_constant_arguments() {
-    let original = integer_pool();
-    let package = checked_package(&original, &[1, 2, 1]);
-    let lowered = lower(&package, &Control::good()).unwrap();
-    for (&id, source) in package.fragment().expressions().iter() {
-        let ExprKind::Constant(reference) = source.kind else {
-            panic!("reference source")
+/// The negative Values component receives another genuine immutable unit.
+/// It has a different actual typed CV, rather than mutating the published unit.
+fn replace_constant(
+    lowered: &mut LoweredExpressions,
+    reference: ProgramRootRef,
+    value: ConstantValue,
+) {
+    let original = lowered.units[reference.unit.index()].as_ref().unwrap();
+    let mut pools = ConstantPools::empty();
+    let mut builder = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: PlanLimits::FROZEN.expression_semantic_depth,
+    });
+    for (ordinal, root) in original.roots().iter().enumerate() {
+        let actual = if ordinal == reference.root.get() as usize {
+            value.clone()
+        } else {
+            let StaticExprKind::Constant(value) =
+                original.definitions().node(root.definition).unwrap().kind()
+            else {
+                panic!("constant Values fixture")
+            };
+            value.clone()
         };
-        let local = lowered.arena.node(lowered.ids[&id]).unwrap();
-        let StaticExprKind::Constant(value) = local.kind() else {
-            panic!("checked constant")
-        };
-        assert_eq!(value.ordinal(), reference.ordinal);
-        assert_eq!(value.pool().backing_identity(), original.backing_identity());
-        assert!(Arc::ptr_eq(value.pool().field_ref(), original.field_ref()));
-        assert_eq!(value.value_type(), &source.ty);
-        let argument = literal_argument(source, local, &Control::good())
-            .unwrap()
+        let pool = ConstantPoolId::new(ordinal as u32);
+        pools.insert(pool, actual.pool().clone()).unwrap();
+        let definition = builder
+            .add(
+                None,
+                actual.value_type().clone(),
+                ExprKind::Constant(ConstantReference {
+                    pool,
+                    ordinal: actual.ordinal(),
+                }),
+            )
             .unwrap();
-        assert_eq!(
-            argument.pool().backing_identity(),
-            original.backing_identity()
-        );
-        assert_eq!(argument.ordinal(), reference.ordinal);
-        assert_eq!(
-            argument.try_i64().unwrap(),
-            Some(if reference.ordinal == 1 { 42 } else { -7 })
-        );
+        builder
+            .root(definition, root.demand, RootScope::AllPorts)
+            .unwrap();
     }
-    assert!(
-        prepare_calls(&package, &lowered, &functions(), &Control::good())
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[test]
-fn checked_reference_preparation_rejects_swapped_equal_backing_or_ordinal() {
-    let original = integer_pool();
-    let package = checked_package(&original, &[1]);
-    let functions = functions();
-    for replacement in [integer_pool().value(1).unwrap(), original.value(0).unwrap()] {
-        let mut lowered = lower(&package, &Control::good()).unwrap();
-        let id = *lowered.ids.values().next().unwrap();
-        replace_constant(&mut lowered, id, replacement);
-        assert!(matches!(
-            prepare_calls(&package, &lowered, &functions, &Control::good()),
-            Err(ExpressionLoweringError::Reference(
-                ConstantReferenceError::InvalidConsumer(_)
-            ))
-        ));
-    }
-}
-
-#[test]
-fn checked_reference_preparation_rejects_payload_or_projection_full_type_mismatch() {
-    let original = integer_pool();
-    let package = checked_package(&original, &[1]);
-    let functions = functions();
-    let mut lowered = lower(&package, &Control::good()).unwrap();
-    let id = *lowered.ids.values().next().unwrap();
-    let ty = FunctionValueType::new(DataType::Int64, true);
-    let wrong = ConstantValue::from_i64(
-        Arc::new(ty.try_to_field("wrong").unwrap()),
-        ty.clone(),
-        42,
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+    let unit = builder
+        .seal(vec![], &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let compiled = novarocks_expression::compile_expr_set_pure(
+        &unit,
+        EvaluationEnvironment {
+            constants: &pools,
+            parameters: &parameters,
+        },
+        ScopeLayouts {
+            ports: &[],
+            all_ports: None,
+        },
         policy(),
-        CompilePhase::Validate,
-        &Control::good(),
+        &functions(),
+        &mut work,
     )
     .unwrap();
-    replace_constant(&mut lowered, id, wrong);
-    assert!(matches!(
-        prepare_calls(&package, &lowered, &functions, &Control::good()),
-        Err(ExpressionLoweringError::Reference(
-            ConstantReferenceError::InvalidConsumer(_)
-        ))
-    ));
-    // This pure negative fixture authors another immutable collection. The
-    // published checked slice remains read-only for every real consumer.
-    let mut declarations = lowered.types.to_vec();
-    declarations[id.index()] = FunctionArgumentType::Value(ty);
-    lowered.types = novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
-        declarations.into_boxed_slice(),
-    );
-    assert!(matches!(
-        prepare_calls(&package, &lowered, &functions, &Control::good()),
-        Err(ExpressionLoweringError::Invalid(
-            "lowered full type differs from source"
-        ))
-    ));
+    work.finish().unwrap();
+    lowered.units[reference.unit.index()] = Some(compiled);
 }
-
-#[test]
-fn checked_reference_loops_keep_each_original_control_prefix_and_ordinary_tail() {
-    // Physical fields have a 256-entry metadata cap. Wide actual fields,
-    // each with one metadata association, exercise a legal long traversal.
-    let array = StructArray::from(
-        (0..320)
-            .map(|i| {
-                let child = Arc::new(
-                    Field::new(format!("child-{i:04}"), DataType::Int64, false).with_metadata(
-                        HashMap::from([(format!("provider.key.{i:04}"), format!("value-{i:04}"))]),
-                    ),
-                );
-                (
-                    child,
-                    Arc::new(Int64Array::from(vec![9, 42, -7])) as ArrayRef,
-                )
-            })
-            .collect::<Vec<_>>(),
-    );
-    let original = pool(Arc::new(array));
-    let package = checked_package(&original, &[1, 2]);
-    let baseline = Control::good();
-    let lowered = lower(&package, &baseline).unwrap();
-    let lowering_trace = baseline.trace();
-    assert!(lowering_trace.iter().any(|(_, units)| *units == 256));
-    let baseline = Control::good();
-    let functions = functions();
-    assert!(
-        prepare_calls(&package, &lowered, &functions, &baseline)
-            .unwrap()
-            .is_empty()
-    );
-    let preparing_trace = baseline.trace();
-    assert!(preparing_trace.iter().any(|(_, units)| *units == 256));
-    for cause in [
-        CompileControlError::Cancelled,
-        CompileControlError::DeadlineExceeded,
-        CompileControlError::ResourceExhausted,
-    ] {
-        for at in 1..=lowering_trace.len() {
-            let control = Control::refusing(at, cause.clone());
-            assert!(
-                matches!(lower(&package, &control), Err(ExpressionLoweringError::Control(actual)) if actual == cause)
-            );
-            assert_eq!(control.trace(), lowering_trace[..at]);
-        }
-        for at in 1..=preparing_trace.len() {
-            let control = Control::refusing(at, cause.clone());
-            assert!(
-                matches!(prepare_calls(&package, &lowered, &functions, &control), Err(ExpressionLoweringError::Control(actual)) if actual == cause)
-            );
-            assert_eq!(control.trace(), preparing_trace[..at]);
-        }
-    }
-    let small = integer_pool();
-    let small_package = checked_package(&small, &[1]);
-    let mut wrong = lower(&small_package, &Control::good()).unwrap();
-    let id = *wrong.ids.values().next().unwrap();
-    replace_constant(&mut wrong, id, small.value(0).unwrap());
-    let baseline = Control::good();
-    assert!(matches!(
-        prepare_calls(&small_package, &wrong, &functions, &baseline),
-        Err(ExpressionLoweringError::Reference(_))
-    ));
-    let ordinary_trace = baseline.trace();
-    for cause in [
-        CompileControlError::Cancelled,
-        CompileControlError::DeadlineExceeded,
-        CompileControlError::ResourceExhausted,
-    ] {
-        for at in 1..=ordinary_trace.len() {
-            let control = Control::refusing(at, cause.clone());
-            assert!(
-                matches!(prepare_calls(&small_package, &wrong, &functions, &control), Err(ExpressionLoweringError::Control(actual)) if actual == cause)
-            );
-            assert_eq!(control.trace(), ordinary_trace[..at]);
-        }
-    }
+fn root_definition(
+    program: &novarocks_local_program::LocalProgram,
+    reference: ProgramRootRef,
+) -> novarocks_expression::CompiledExprId {
+    program
+        .unit(reference.unit)
+        .unwrap()
+        .root(reference.root)
+        .unwrap()
+        .definition
+}
+fn root_use(
+    program: &novarocks_local_program::LocalProgram,
+    reference: ProgramRootRef,
+) -> novarocks_type_contract::ExpressionUseId {
+    program
+        .unit(reference.unit)
+        .unwrap()
+        .root(reference.root)
+        .unwrap()
+        .use_id
 }
 
 // Conservative retained-source invoice and independent projection ceilings for

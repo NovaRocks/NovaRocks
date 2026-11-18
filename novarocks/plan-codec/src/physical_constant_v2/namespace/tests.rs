@@ -299,7 +299,7 @@ fn namespace_duplicate_rejection_uses_original_table_author_and_ordinary_tail() 
     assert!(
         matches!(decode_constant_namespace(&records, &types, SOURCE, policy(), decode_limits(),
         namespace_limits(), &verifier(), &Control::good(CompilePhase::Decode)),
-        Err(PhysicalConstantCodecError::Reference(ConstantReferenceError::DuplicatePool(id)))
+        Err(PhysicalConstantCodecError::Reference(ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::DuplicatePool(id))))
         if id == ConstantPoolId::new(u32::MAX))
     );
 }
