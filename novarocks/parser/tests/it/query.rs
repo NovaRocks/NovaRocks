@@ -69,6 +69,25 @@ fn match_can_name_a_projection_or_start_a_predicate() {
 }
 
 #[test]
+fn at_can_name_a_projection_or_start_a_time_zone_expression() {
+    let implicit = query("SELECT 1 AT FROM (VALUES 1) facts");
+    let explicit = query("SELECT 1 AS AT FROM (VALUES 1) facts");
+    assert!(implicit.syntax_eq(&explicit));
+    assert!(query("SELECT 1 AT").syntax_eq(&query("SELECT 1 AS AT")));
+    let at_local = query("SELECT value AT LOCAL AS at");
+    assert!(matches!(
+        expression(&select(&at_local).projection[0]),
+        Expr::AtLocal(_)
+    ));
+    let at_zone = query("SELECT value AT TIME ZONE 'UTC' AS at");
+    assert!(matches!(
+        expression(&select(&at_zone).projection[0]),
+        Expr::AtTimeZone(_)
+    ));
+    assert!(trino_parser::parse_query("SELECT 1 AT TIME").is_err());
+}
+
+#[test]
 fn trino_query_suffix_has_the_actual_query_body_owner() {
     let parsed = query("SELECT a FROM t ORDER BY a OFFSET 2 ROWS FETCH FIRST ROW ONLY");
     assert!(parsed.modifiers.is_empty());

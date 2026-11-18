@@ -240,7 +240,14 @@ impl Parser<'_> {
                 );
                 continue;
             }
-            if self.at_keyword(K::At) && minimum <= 90 && !left.predicate {
+            // AT is also a projection alias. Only LOCAL and TIME can
+            // follow it as part of a time-zone expression.
+            if self.at_keyword(K::At)
+                && minimum <= 90
+                && !left.predicate
+                && (!self.alias_follow
+                    || matches!(self.peek(1).kind, T::Keyword(K::Local | K::Time)))
+            {
                 self.bump();
                 let expression = if self.eat_keyword(K::Local).is_some() {
                     Expr::AtLocal(AstBox::new(AtLocal {

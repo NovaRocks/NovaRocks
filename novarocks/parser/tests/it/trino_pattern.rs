@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_parser::ast::*;
-use novarocks_parser::{trino_parser, trino_printer};
+use novarocks_parser::{Span, trino_parser, trino_printer};
 
 fn query(source: &str) -> Query {
     trino_parser::parse_query(source).expect(source)
@@ -97,15 +97,36 @@ fn trino_pattern_binary_contexts_and_grouping_are_preserved() {
 }
 
 #[test]
+fn permute_without_a_top_level_comma_uses_the_nonreserved_variable() {
+    for (source, canonical) in [
+        ("PERMUTE($)", "PERMUTE $"),
+        ("PERMUTE()", "PERMUTE ()"),
+        ("X PERMUTE(A)+", "(X PERMUTE) A+"),
+        ("PERMUTE(A{1,3})", "PERMUTE A{1,3}"),
+        ("PERMUTE(PERMUTE(A,B))", "PERMUTE PERMUTE(A,B)"),
+    ] {
+        let original = trino_parser::parse_row_pattern(source).unwrap();
+        let canonical = trino_parser::parse_row_pattern(canonical).unwrap();
+        assert!(original.syntax_eq(&canonical), "{source}");
+    }
+    let source = "PERMUTE(A{1,3},B)";
+    let permutation = trino_parser::parse_row_pattern(source).unwrap();
+    assert!(
+        matches!(&permutation, RowPattern::Permutation { patterns, .. } if patterns.len() == 2)
+    );
+    assert_eq!(permutation.span(), Span::new(0, source.len()));
+}
+
+#[test]
 fn trino_pattern_primary_forms_keep_actual_source_spans() {
     let empty = pattern_query("()");
     assert!(matches!(
         recognition(&empty).pattern,
         RowPattern::Empty { .. }
     ));
-    let permutation = pattern_query("PERMUTE(A)");
+    let permutation = pattern_query("PERMUTE(A, B)");
     assert!(
-        matches!(&recognition(&permutation).pattern, RowPattern::Permutation { patterns, .. } if patterns.len()==1)
+        matches!(&recognition(&permutation).pattern, RowPattern::Permutation { patterns, .. } if patterns.len()==2)
     );
     let anchors = pattern_query("^ {- A -} $");
     let RowPattern::Concatenation { patterns, .. } = &recognition(&anchors).pattern else {
@@ -374,7 +395,7 @@ fn trino_pattern_grammar_and_constructor_failures_remain_errors() {
     for pattern in [
         "",
         "A|",
-        "PERMUTE()",
+        "PERMUTE(, A)",
         "A{}",
         "A{1,,2}",
         "A***",

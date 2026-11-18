@@ -235,8 +235,8 @@ impl Writer {
                 self.character(')');
             }
             RowPattern::Permutation { patterns, .. } => {
-                if patterns.is_empty() {
-                    return Err(unsupported("an empty PERMUTE pattern"));
+                if patterns.len() < 2 {
+                    return Err(unsupported("a PERMUTE pattern with fewer than two terms"));
                 }
                 self.text("PERMUTE(");
                 for (index, pattern) in patterns.iter().enumerate() {

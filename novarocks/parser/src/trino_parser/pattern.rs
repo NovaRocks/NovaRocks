@@ -20,6 +20,16 @@ use crate::Span;
 use crate::ast::*;
 use crate::trino_token::{Keyword, Symbol, TokenKind};
 
+fn concatenate(left: Option<RowPattern>, right: RowPattern, span: Span) -> RowPattern {
+    match left {
+        Some(left) => RowPattern::Concatenation {
+            patterns: vec![left, right].into(),
+            span,
+        },
+        None => right,
+    }
+}
+
 impl Parser<'_> {
     #[recursive::recursive]
     pub(super) fn parse_row_pattern(&mut self) -> Result<RowPattern, ParserError> {
@@ -40,15 +50,19 @@ impl Parser<'_> {
     #[recursive::recursive]
     fn parse_pattern_concatenation(&mut self) -> Result<RowPattern, ParserError> {
         let start = self.current().span;
-        let mut left = self.parse_quantified_pattern()?;
-        while self.pattern_primary_ahead() {
-            let right = self.parse_quantified_pattern()?;
-            left = RowPattern::Concatenation {
-                patterns: vec![left, right].into(),
-                span: self.span_since(start),
-            };
+        let mut left = None;
+        loop {
+            let (prefix, right) = self.parse_quantified_pattern()?;
+            if let Some(prefix) = prefix {
+                let extent = Span::new(start.start(), prefix.span().end());
+                left = Some(concatenate(left, prefix, extent));
+            }
+            let result = concatenate(left, right, self.span_since(start));
+            if !self.pattern_primary_ahead() {
+                return Ok(result);
+            }
+            left = Some(result);
         }
-        Ok(left)
     }
 
     fn pattern_primary_ahead(&self) -> bool {
@@ -62,9 +76,17 @@ impl Parser<'_> {
     }
 
     #[recursive::recursive]
-    fn parse_quantified_pattern(&mut self) -> Result<RowPattern, ParserError> {
+    fn parse_quantified_pattern(
+        &mut self,
+    ) -> Result<(Option<RowPattern>, RowPattern), ParserError> {
         let start = self.current().span;
-        let primary = self.parse_pattern_primary()?;
+        let (prefix, primary, start) = if self.at_keyword(Keyword::Permute)
+            && self.peek(1).kind == TokenKind::Symbol(Symbol::LParen)
+        {
+            self.parse_permute_or_variable(start)?
+        } else {
+            (None, self.parse_pattern_primary()?, start)
+        };
         let token = self.current();
         let quantifier = if self.eat_symbol(Symbol::Star).is_some() {
             let greedy = self.eat_symbol(Symbol::Question).is_none();
@@ -123,34 +145,20 @@ impl Parser<'_> {
         } else {
             None
         };
-        Ok(match quantifier {
+        let result = match quantifier {
             Some(quantifier) => RowPattern::Quantified {
                 pattern: AstBox::new(primary),
                 quantifier,
                 span: self.span_since(start),
             },
             None => primary,
-        })
+        };
+        Ok((prefix, result))
     }
 
     #[recursive::recursive]
     fn parse_pattern_primary(&mut self) -> Result<RowPattern, ParserError> {
         let start = self.current().span;
-        if self.at_keyword(Keyword::Permute)
-            && self.peek(1).kind == TokenKind::Symbol(Symbol::LParen)
-        {
-            self.bump();
-            self.bump();
-            let mut patterns = vec![self.parse_row_pattern()?];
-            while self.eat_symbol(Symbol::Comma).is_some() {
-                patterns.push(self.parse_row_pattern()?);
-            }
-            self.expect_symbol(Symbol::RParen)?;
-            return Ok(RowPattern::Permutation {
-                patterns: patterns.into(),
-                span: self.span_since(start),
-            });
-        }
         if self.eat_symbol(Symbol::LParen).is_some() {
             if self.eat_symbol(Symbol::RParen).is_some() {
                 return Ok(RowPattern::Empty {
@@ -184,6 +192,46 @@ impl Parser<'_> {
         let name = self.ident()?;
         let span = name.span;
         Ok(RowPattern::Variable { name, span })
+    }
+
+    fn parse_permute_or_variable(
+        &mut self,
+        start: Span,
+    ) -> Result<(Option<RowPattern>, RowPattern, Span), ParserError> {
+        let name = self.ident()?;
+        let group = self.expect_symbol(Symbol::LParen)?;
+        let first = if self.eat_symbol(Symbol::RParen).is_some() {
+            RowPattern::Empty {
+                span: self.span_since(group),
+            }
+        } else {
+            let pattern = self.parse_row_pattern()?;
+            if self.eat_symbol(Symbol::Comma).is_some() {
+                let mut patterns = vec![pattern, self.parse_row_pattern()?];
+                while self.eat_symbol(Symbol::Comma).is_some() {
+                    patterns.push(self.parse_row_pattern()?);
+                }
+                self.expect_symbol(Symbol::RParen)?;
+                return Ok((
+                    None,
+                    RowPattern::Permutation {
+                        patterns: patterns.into(),
+                        span: self.span_since(start),
+                    },
+                    start,
+                ));
+            }
+            self.expect_symbol(Symbol::RParen)?;
+            pattern
+        };
+        // When the parenthesized pattern has no list separator, the reference
+        // chooses its earlier identifier alternative. The variable belongs to
+        // the outer concatenation; any quantifier attaches to the grouped term.
+        let variable = RowPattern::Variable {
+            span: name.span,
+            name,
+        };
+        Ok((Some(variable), first, group))
     }
 
     fn parse_pattern_integer(&mut self) -> Result<PatternInteger, ParserError> {
