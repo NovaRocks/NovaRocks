@@ -131,6 +131,7 @@ impl InternalResultRetention {
     }
     /// Return only this decoder's aggregate bytes after their actual backing
     /// has been destroyed. Other merged segment receipts remain unchanged.
+    #[cfg(test)]
     pub(crate) fn release_bytes_destroyed(&self, bytes: usize) -> Result<(), WorkError> {
         let bytes = u64::try_from(bytes).map_err(|_| WorkError::ArithmeticOverflow)?;
         self.bytes

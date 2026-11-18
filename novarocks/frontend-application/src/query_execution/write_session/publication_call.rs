@@ -106,7 +106,6 @@ pub(super) struct PublicationInput {
 struct AbortInput {
     context: ConnectorRequestContext,
     production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction,
-    received: Option<Arc<PublicationInput>>,
 }
 struct ReconciliationInput {
     evidence: ExternalMutationEvidence,
@@ -161,12 +160,10 @@ impl WritePublicationCall {
         session: Arc<ConnectorWriteSession>,
         context: ConnectorRequestContext,
         production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction,
-        received: Option<Arc<PublicationInput>>,
     ) -> Self {
         let input = Arc::new(AbortInput {
             context,
             production,
-            received,
         });
         let slot = Arc::new(CallReceiving::default());
         let future = Box::pin(abort_future((
@@ -651,7 +648,7 @@ async fn finish_future(
     let mut original = control.finish_write_with_needed_ready_async(
         novarocks_spi::connector::write_stack::ConnectorWriteFinishRequestRef {
             commit: session.plan.commit_session(),
-            prepared: &input.received.prepared,
+            row_count: input.received.row_count,
             statistics: &input.received.statistics,
             publication: &input.publication,
             context: &input.context,
@@ -720,10 +717,6 @@ async fn abort_future(
         commit: session.plan.commit_session(),
         context: input.context.clone(),
         production: input.production,
-        received: input
-            .received
-            .as_ref()
-            .map(|input| &input.received.prepared),
     });
     let outcome = std::future::poll_fn(|cx| original.as_mut().poll(cx)).await;
     slot.receive_completion(&session, CallCompletion::Abort(outcome), None);

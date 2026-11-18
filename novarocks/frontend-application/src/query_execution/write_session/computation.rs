@@ -18,30 +18,43 @@
 //! Pure generation decoding and the original session's bounded receiving side.
 
 use super::*;
-use crate::query_execution::write_result::RootWriteDecodeFailure;
+use crate::query_execution::write_result::{
+    DecodedPreparedWriteSet, RootWriteDecodeFailure, RootWriteResultDecoder,
+};
 use novarocks_proto_codec::connector_write::{ConnectorWriteCodecError, ValidatedCommitFragment};
 use novarocks_result_contract::DeleteVerificationCounts;
-use novarocks_spi::connector::ConnectorWriteFragmentWireDecoder;
+use novarocks_spi::connector::write_stack::{ConnectorCommitFragment, WriteStatisticsArtifact};
+use novarocks_spi::connector::{ConnectorPayloadRetentionGuard, ConnectorWriteFragmentWireDecoder};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Weak;
 
-/// This capability exposes the exact generation's decode direction only. The
-/// original stable session retains its non-cloneable catalog generation lease.
-#[derive(Clone)]
+/// Decode and receive complete root records against their original session.
 pub(crate) struct WriteComputationDecode {
     origin: Arc<()>,
     decoder: Arc<dyn ConnectorWriteFragmentWireDecoder>,
+    receiving: WriteReceivingPort,
+    #[cfg(test)]
     query_targets: Arc<[WriteTargetOrdinal]>,
+    #[cfg(test)]
+    local_query: Option<ConnectorWriteQueryIdentity>,
 }
 
-/// One actual graph after a single canonical-to-Provider conversion. No
-/// Provider publication predicate or terminal action has been invoked.
+/// Complete root facts ready for the original task and cancellation barrier.
 pub(crate) struct SessionDecodedWriteSegment {
     origin: Arc<()>,
     production_execution: Option<(
         novarocks_types::QueryExecutionId,
         novarocks_query_application::api::PlanSeal,
     )>,
-    prepared: ConnectorPreparedWriteSet,
+    query: Option<ConnectorWriteQueryIdentity>,
+    row_count: u64,
+    fragment_count: usize,
+    #[cfg(test)]
+    pending_fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
+    #[cfg(test)]
+    pending_author: Option<ConnectorPayloadRetentionGuard>,
+    #[cfg(test)]
+    local_targets: Arc<[WriteTargetOrdinal]>,
     delete_verification: Option<DeleteVerificationCounts>,
     statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
     retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
@@ -66,86 +79,168 @@ impl novarocks_failure_contract::FailureProjection for OriginalFragmentCodecFail
 }
 
 impl WriteComputationDecode {
+    pub(crate) fn apply_body(
+        &mut self,
+        root: &mut RootWriteResultDecoder,
+        body: &[u8],
+    ) -> Result<(), RootWriteDecodeFailure> {
+        root.apply_relay_body_with(body, |root, target, bytes| {
+            let query = self.query_for_arrival(root.relay_production_execution())?;
+            let author = root.fragment_decode_author()?;
+            let fragment = self.decode_fragment(bytes, &author)?;
+            self.receiving
+                .arrive(&query, target, fragment, &author)
+                .map_err(RootWriteDecodeFailure::source)
+        })
+    }
+
+    pub(crate) fn complete_root(
+        &self,
+        root: DecodedPreparedWriteSet,
+    ) -> Result<SessionDecodedWriteSegment, RootWriteDecodeFailure> {
+        let query = root
+            .production_execution
+            .map(|(execution, plan)| write_query_identity(execution, plan))
+            .transpose()
+            .map_err(RootWriteDecodeFailure::source)?;
+        #[cfg(test)]
+        let query = query.or(self.local_query);
+        Ok(SessionDecodedWriteSegment {
+            origin: Arc::clone(&self.origin),
+            production_execution: root.production_execution,
+            query,
+            row_count: root.row_count,
+            fragment_count: root.fragment_count,
+            delete_verification: root.delete_verification,
+            statistics: root.statistics,
+            retention: root.retention,
+            #[cfg(test)]
+            pending_fragments: Vec::new(),
+            #[cfg(test)]
+            pending_author: None,
+            #[cfg(test)]
+            local_targets: Arc::clone(&self.query_targets),
+        })
+    }
+
+    fn query_for_arrival(
+        &mut self,
+        production: Option<(
+            novarocks_types::QueryExecutionId,
+            novarocks_query_application::api::PlanSeal,
+        )>,
+    ) -> Result<ConnectorWriteQueryIdentity, RootWriteDecodeFailure> {
+        if let Some((execution, plan)) = production {
+            return write_query_identity(execution, plan).map_err(RootWriteDecodeFailure::source);
+        }
+        #[cfg(test)]
+        {
+            if let Some(query) = self.local_query {
+                return Ok(query);
+            }
+            let session = self
+                .receiving
+                .session()
+                .map_err(RootWriteDecodeFailure::source)?;
+            let query = session
+                .begin_local_query(&self.query_targets)
+                .map_err(RootWriteDecodeFailure::source)?;
+            self.local_query = Some(query);
+            Ok(query)
+        }
+        #[cfg(not(test))]
+        Err(RootWriteDecodeFailure::source(
+            production::production_error("write root record has no original production identity"),
+        ))
+    }
+
+    fn decode_fragment(
+        &self,
+        bytes: &[u8],
+        author: &ConnectorPayloadRetentionGuard,
+    ) -> Result<ConnectorCommitFragment, RootWriteDecodeFailure> {
+        use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
+        use prost::Message;
+        // The complete relay record stays borrowed during the copy. Reserve
+        // only Prost's actual outer carrier before decoding it.
+        let receipt = author
+            .reserve_owned_bytes(bytes.len())
+            .map_err(RootWriteDecodeFailure::source)?;
+        let path = FieldPath::root("prepared_write_fragment");
+        let raw = write_dto::ConnectorCommitFragment::decode(bytes).map_err(|error| {
+            RootWriteDecodeFailure::source(ProtocolError::new(
+                path.clone(),
+                ProtocolErrorKind::InvalidValue,
+                format!("invalid commit fragment protobuf: {error}"),
+            ))
+        })?;
+        let validated = ValidatedCommitFragment::parse(raw, path)
+            .map_err(RootWriteDecodeFailure::source)?
+            .retain_provider_payload(receipt);
+        self.decoder
+            .decode_commit_fragment(&validated, author)
+            .map_err(|error| RootWriteDecodeFailure::source(OriginalFragmentCodecFailure(error)))
+    }
+
+    /// Enter through the same decoder from explicit relation/packet fixtures.
+    #[cfg(test)]
     pub(crate) fn interpret(
         &self,
-        prepared: DecodedPreparedWriteSet,
+        mut root: DecodedPreparedWriteSet,
     ) -> Result<SessionDecodedWriteSegment, RootWriteDecodeFailure> {
-        let canonical_bytes = prepared
-            .fragments()
-            .iter()
-            .try_fold(0usize, |sum, (_, bytes)| {
-                sum.checked_add(bytes.len()).ok_or_else(|| {
-                    RootWriteDecodeFailure::source(
-                        novarocks_workload_control::WorkError::ArithmeticOverflow,
-                    )
-                })
-            })?;
-        // Decoding borrows the same original byte author while every canonical
-        // input remains live; each new outer buffer pays its coexistence first.
-        let decoded = self.interpret_borrowed(&prepared)?;
-        let (
-            _row_count,
-            delete_verification,
-            fragments,
-            statistics,
-            retention,
-            production_execution,
-        ) = prepared.into_parts();
-        drop(fragments);
-        if let Some(retention) = &retention {
+        let (pending_fragments, author) = self.interpret_borrowed_with_author(&root)?;
+        let canonical_bytes = root.fragments.iter().try_fold(0usize, |sum, (_, bytes)| {
+            sum.checked_add(bytes.len()).ok_or_else(|| {
+                RootWriteDecodeFailure::source(
+                    novarocks_workload_control::WorkError::ArithmeticOverflow,
+                )
+            })
+        })?;
+        drop(std::mem::take(&mut root.fragments));
+        if let Some(retention) = &root.retention {
             retention
                 .release_bytes_destroyed(canonical_bytes)
                 .map_err(RootWriteDecodeFailure::source)?;
         }
-        Ok(SessionDecodedWriteSegment {
-            origin: Arc::clone(&self.origin),
-            production_execution,
-            prepared: decoded,
-            delete_verification,
-            statistics,
-            retention,
-        })
+        let mut segment = self.complete_root(root)?;
+        segment.pending_fragments = pending_fragments;
+        segment.pending_author = Some(author);
+        Ok(segment)
     }
 
+    #[cfg(test)]
     pub(super) fn interpret_borrowed(
         &self,
-        prepared: &DecodedPreparedWriteSet,
-    ) -> Result<ConnectorPreparedWriteSet, RootWriteDecodeFailure> {
-        use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
-        use prost::Message;
-        let author = prepared.fragment_decode_author()?;
-        let mut decoded = Vec::with_capacity(prepared.fragments().len());
-        for (index, (target, bytes)) in prepared.fragments().iter().enumerate() {
-            // prost copies byte/string fields within the original encoded
-            // carrier. Its encoded length bounds those actual byte copies;
-            // this is not an invoice for the Provider's decoded SDK graph.
-            let receipt = author
-                .reserve_owned_bytes(bytes.len())
-                .map_err(RootWriteDecodeFailure::source)?;
-            let raw =
-                write_dto::ConnectorCommitFragment::decode(bytes.as_slice()).map_err(|error| {
-                    RootWriteDecodeFailure::source(ProtocolError::new(
-                        FieldPath::root("prepared_write_set").index(index),
-                        ProtocolErrorKind::InvalidValue,
-                        format!("invalid commit fragment protobuf: {error}"),
-                    ))
-                })?;
-            let validated = ValidatedCommitFragment::parse(
-                raw,
-                FieldPath::root("prepared_write_set").index(index),
-            )
-            .map_err(RootWriteDecodeFailure::source)?;
-            let validated = validated.retain_provider_payload(receipt);
-            let fragment = self
-                .decoder
-                .decode_commit_fragment(&validated, &author)
-                .map_err(|error| {
-                    RootWriteDecodeFailure::source(OriginalFragmentCodecFailure(error))
-                })?;
-            decoded.push((*target, fragment));
+        root: &DecodedPreparedWriteSet,
+    ) -> Result<Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>, RootWriteDecodeFailure> {
+        self.interpret_borrowed_with_author(root)
+            .map(|(fragments, _)| fragments)
+    }
+
+    #[cfg(test)]
+    fn interpret_borrowed_with_author(
+        &self,
+        root: &DecodedPreparedWriteSet,
+    ) -> Result<
+        (
+            Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
+            ConnectorPayloadRetentionGuard,
+        ),
+        RootWriteDecodeFailure,
+    > {
+        let author = root.fragment_decode_author()?;
+        let mut decoded = Vec::with_capacity(root.fragments.len());
+        for (target, bytes) in &root.fragments {
+            if !self.query_targets.contains(target) {
+                return Err(RootWriteDecodeFailure::source(
+                    production::production_error(
+                        "connector commit fragment names a write target outside the sealed set",
+                    ),
+                ));
+            }
+            decoded.push((*target, self.decode_fragment(bytes, &author)?));
         }
-        ConnectorPreparedWriteSet::try_new(prepared.row_count(), decoded, &self.query_targets)
-            .map_err(RootWriteDecodeFailure::source)
+        Ok((decoded, author))
     }
 }
 
@@ -187,17 +282,46 @@ pub(crate) struct WriteReceivingPort {
     session: Weak<ConnectorWriteSession>,
 }
 impl WriteReceivingPort {
-    pub(crate) fn accept(
-        &self,
-        segment: SessionDecodedWriteSegment,
-    ) -> Result<AcceptedWriteSegment, ConnectorError> {
-        let session = self.session.upgrade().ok_or_else(|| {
+    fn session(&self) -> Result<Arc<ConnectorWriteSession>, ConnectorError> {
+        self.session.upgrade().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "original write receiving session exited",
             )
-        })?;
-        session.accept_interpreted(segment)
+        })
+    }
+
+    fn arrive(
+        &self,
+        query: &ConnectorWriteQueryIdentity,
+        target: WriteTargetOrdinal,
+        fragment: ConnectorCommitFragment,
+        author: &ConnectorPayloadRetentionGuard,
+    ) -> Result<(), ConnectorError> {
+        let session = self.session()?;
+        // Exclude the FE terminal claim through the synchronous handoff.
+        // Leave the terminal lock usable if the original Provider unwinds.
+        let terminal = session.receiving_terminal_guard()?;
+        let arrival = catch_unwind(AssertUnwindSafe(|| {
+            session.write_stack_pin.session().arrive_write_fragments(
+                session.plan.commit_session(),
+                query,
+                vec![(target, fragment)],
+                author,
+            )
+        }));
+        drop(terminal);
+        match arrival {
+            Ok(outcome) => outcome,
+            Err(panic) => resume_unwind(panic),
+        }
+    }
+
+    pub(crate) fn accept(
+        &self,
+        segment: SessionDecodedWriteSegment,
+    ) -> Result<AcceptedWriteSegment, ConnectorError> {
+        self.session()?.accept_interpreted(segment)
     }
 }
 
@@ -236,7 +360,7 @@ impl ConnectorWriteSession {
         Ok(())
     }
     pub(crate) fn computation_decode(
-        &self,
+        self: &Arc<Self>,
         query_targets: &[WriteTargetOrdinal],
     ) -> Result<WriteComputationDecode, ConnectorError> {
         crate::query_execution::write_result::RootWriteDecodeContract::try_new(
@@ -248,9 +372,29 @@ impl ConnectorWriteSession {
         Ok(WriteComputationDecode {
             origin: Arc::clone(&self.decode_origin),
             decoder: self.write_stack_pin.fragment_decoder(),
+            receiving: self.receiving_port(),
+            #[cfg(test)]
             query_targets: Arc::from(query_targets),
+            #[cfg(test)]
+            local_query: None,
         })
     }
+    #[cfg(test)]
+    fn begin_local_query(
+        &self,
+        targets: &[WriteTargetOrdinal],
+    ) -> Result<ConnectorWriteQueryIdentity, ConnectorError> {
+        let key = *uuid::Uuid::now_v7().as_bytes();
+        let query = ConnectorWriteQueryIdentity::try_new(key, 1, key)?;
+        self.write_stack_pin.session().begin_write_query(
+            self.plan.commit_session(),
+            &query,
+            targets,
+            None,
+        )?;
+        Ok(query)
+    }
+
     pub(crate) fn receiving_port(self: &Arc<Self>) -> WriteReceivingPort {
         WriteReceivingPort {
             session: Arc::downgrade(self),
@@ -330,15 +474,21 @@ impl ConnectorWriteSession {
             }
         }
         let SessionDecodedWriteSegment {
-            prepared,
+            query,
+            row_count,
+            fragment_count,
             delete_verification,
             statistics,
             retention,
+            #[cfg(test)]
+            pending_fragments,
+            #[cfg(test)]
+            pending_author,
+            #[cfg(test)]
+            local_targets,
             ..
         } = segment;
-        let row_count = prepared.row_count();
-        let fragments = prepared.into_fragments();
-        let empty = fragments.is_empty();
+        let empty = fragment_count == 0;
         let mut accumulated = self.lock_accumulated()?;
         if let (Some(current), Some(incoming)) = (&accumulated.retention, &retention) {
             if !current.is_same_admission(incoming) {
@@ -350,7 +500,7 @@ impl ConnectorWriteSession {
         } else if accumulated.retention.is_some() && retention.is_none()
             || accumulated.retention.is_none()
                 && retention.is_some()
-                && (!accumulated.fragments.is_empty() || !accumulated.statistics.is_empty())
+                && (accumulated.has_fragments || !accumulated.statistics.is_empty())
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -395,18 +545,30 @@ impl ConnectorWriteSession {
                     )
                 })?;
         }
-        match (&mut accumulated.retention, retention) {
-            (Some(current), Some(incoming)) => current.merge_retention(&incoming),
-            (target @ None, incoming) => *target = incoming,
-            _ => {}
+        // All FE-side checks have passed. Provisional fragment arrivals
+        // remain insufficient for publication until this original barrier.
+        #[cfg(test)]
+        let query = match query {
+            Some(query) => Some(query),
+            None => Some(self.begin_local_query(&local_targets)?),
+        };
+        let query = query.ok_or_else(|| {
+            production::production_error(
+                "complete write End has no original receiving query identity",
+            )
+        })?;
+        let control = self.write_stack_pin.session();
+        #[cfg(test)]
+        if !pending_fragments.is_empty() {
+            control.arrive_write_fragments(
+                self.plan.commit_session(),
+                &query,
+                pending_fragments,
+                pending_author
+                    .as_ref()
+                    .expect("fixture's original byte author"),
+            )?;
         }
-        accumulated.rows = next_rows;
-        accumulated.fragments.extend(fragments);
-        accumulated.statistics_property_bytes = next_property_bytes;
-        accumulated.statistics_identities.extend(observed);
-        accumulated.statistics.extend(statistics);
-        // The original payload/retention union is already stable. No callback
-        // runs while the same production/terminal/union locks are held.
         let notification = if let Some(original) = production.current.as_ref() {
             Some(
                 original
@@ -419,6 +581,35 @@ impl ConnectorWriteSession {
         } else {
             None
         };
+        let confirmation = catch_unwind(AssertUnwindSafe(|| {
+            control.confirm_write_received(self.plan.commit_session(), &query)
+        }));
+        if !matches!(confirmation, Ok(Ok(()))) {
+            // Even when the Workload receipt has arrived, retain current
+            // production until the Provider confirms. Abort cannot infer
+            // complete inventory from the Workload's receipt alone.
+            drop(accumulated);
+            drop(production);
+            drop(_terminal);
+            if let Some(notification) = notification {
+                notification.notify();
+            }
+            return match confirmation {
+                Ok(Err(error)) => Err(error),
+                Err(panic) => resume_unwind(panic),
+                Ok(Ok(())) => unreachable!("successful confirmation continues receiving"),
+            };
+        }
+        match (&mut accumulated.retention, retention) {
+            (Some(current), Some(incoming)) => current.merge_retention(&incoming),
+            (target @ None, incoming) => *target = incoming,
+            _ => {}
+        }
+        accumulated.rows = next_rows;
+        accumulated.has_fragments |= !empty;
+        accumulated.statistics_property_bytes = next_property_bytes;
+        accumulated.statistics_identities.extend(observed);
+        accumulated.statistics.extend(statistics);
         let received = production.current.take();
         drop(accumulated);
         drop(production);

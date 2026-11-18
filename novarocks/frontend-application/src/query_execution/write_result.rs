@@ -72,18 +72,6 @@ use novarocks_spi::connector::{
     MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, StatisticsArtifactDraft, StatisticsArtifactIdentity,
 };
 
-pub(crate) type RootWriteResultParts = (
-    u64,
-    Option<DeleteVerificationCounts>,
-    Vec<(WriteTargetOrdinal, Vec<u8>)>,
-    Vec<WriteStatisticsArtifact>,
-    Option<InternalResultRetention>,
-    Option<(
-        novarocks_types::QueryExecutionId,
-        novarocks_query_application::api::PlanSeal,
-    )>,
-);
-
 /// Source-preserving rejection from the original write decoder.
 #[derive(Debug)]
 pub(crate) struct RootWriteDecodeFailure {
@@ -196,21 +184,20 @@ impl RootWriteDecodeFailure {
     }
 }
 
-/// A complete prepared write set, still in canonical carrier form.
-///
-/// The fragments stay encoded here on purpose: turning them into provider
-/// values requires the exact control binding that produced them, and this type
-/// exists to be handed to it.
+/// Root facts after EOF. The production decoder has already handed every
+/// fragment to the Provider. Test fixtures can also supply canonical fragments.
 #[derive(Debug)]
 pub(crate) struct DecodedPreparedWriteSet {
-    row_count: u64,
-    delete_verification: Option<DeleteVerificationCounts>,
-    fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
-    statistics: Vec<WriteStatisticsArtifact>,
+    pub(super) row_count: u64,
+    pub(super) delete_verification: Option<DeleteVerificationCounts>,
+    pub(super) fragment_count: usize,
+    #[cfg(test)]
+    pub(super) fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
+    pub(super) statistics: Vec<WriteStatisticsArtifact>,
     #[cfg(test)]
     local_decode: bool,
-    retention: Option<InternalResultRetention>,
-    production_execution: Option<(
+    pub(super) retention: Option<InternalResultRetention>,
+    pub(super) production_execution: Option<(
         novarocks_types::QueryExecutionId,
         novarocks_query_application::api::PlanSeal,
     )>,
@@ -228,6 +215,7 @@ impl DecodedPreparedWriteSet {
         Self {
             row_count,
             delete_verification: None,
+            fragment_count: fragments.len(),
             fragments,
             statistics: Vec::new(),
             retention: None,
@@ -245,6 +233,7 @@ impl DecodedPreparedWriteSet {
         Self {
             row_count,
             delete_verification: None,
+            fragment_count: fragments.len(),
             fragments,
             statistics,
             retention: None,
@@ -271,61 +260,58 @@ impl DecodedPreparedWriteSet {
         self
     }
 
+    #[cfg(test)]
     pub(crate) const fn row_count(&self) -> u64 {
         self.row_count
     }
 
+    #[cfg(test)]
     pub(crate) fn fragments(&self) -> &[(WriteTargetOrdinal, Vec<u8>)] {
         &self.fragments
     }
 
-    /// Borrow only this prepared result's actual byte author. A missing
-    /// production author is never converted into a local decode permission.
+    #[cfg(test)]
     pub(crate) fn fragment_decode_author(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorPayloadRetentionGuard, RootWriteDecodeFailure>
     {
-        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-        if let Some(retention) = &self.retention {
-            return retention
-                .try_spi_guard()
-                .map_err(RootWriteDecodeFailure::source);
-        }
-        #[cfg(test)]
-        if self.local_decode {
-            use novarocks_spi::connector::{
-                ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard,
-            };
+        fragment_decode_author(self.retention.as_ref(), self.local_decode)
+    }
+}
 
-            struct LocalAuthor;
-            impl ConnectorPayloadByteBudget for LocalAuthor {
-                fn reserve_bytes(
-                    &self,
-                    _bytes: usize,
-                ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
-                    Ok(ConnectorPayloadRetentionGuard::new(()))
-                }
+fn fragment_decode_author(
+    retention: Option<&InternalResultRetention>,
+    _explicit_local: bool,
+) -> Result<novarocks_spi::connector::ConnectorPayloadRetentionGuard, RootWriteDecodeFailure> {
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    if let Some(retention) = retention {
+        return retention
+            .try_spi_guard()
+            .map_err(RootWriteDecodeFailure::source);
+    }
+    #[cfg(test)]
+    if _explicit_local {
+        use novarocks_spi::connector::{
+            ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard,
+        };
+
+        struct LocalAuthor;
+        impl ConnectorPayloadByteBudget for LocalAuthor {
+            fn reserve_bytes(
+                &self,
+                _bytes: usize,
+            ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+                Ok(ConnectorPayloadRetentionGuard::new(()))
             }
-            return Ok(ConnectorPayloadRetentionGuard::from_byte_budget(
-                std::sync::Arc::new(LocalAuthor),
-            ));
         }
-        Err(RootWriteDecodeFailure::source(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "prepared write decoding requires its original byte-budget author",
-        )))
+        return Ok(ConnectorPayloadRetentionGuard::from_byte_budget(
+            std::sync::Arc::new(LocalAuthor),
+        ));
     }
-
-    pub(crate) fn into_parts(self) -> RootWriteResultParts {
-        (
-            self.row_count,
-            self.delete_verification,
-            self.fragments,
-            self.statistics,
-            self.retention,
-            self.production_execution,
-        )
-    }
+    Err(RootWriteDecodeFailure::source(ConnectorError::new(
+        ConnectorErrorKind::InvalidRequest,
+        "prepared write decoding requires its original byte-budget author",
+    )))
 }
 
 /// FE-only expectations frozen from this query's TableFinish and the exact
@@ -417,6 +403,8 @@ pub(crate) struct RootWriteResultDecoder {
     contract: RootWriteDecodeContract,
     rows: WriteRowCountAccumulator,
     delete_verification: Option<DeleteVerificationCounts>,
+    fragment_count: usize,
+    #[cfg(test)]
     fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
     statistics: BTreeMap<(WriteTargetOrdinal, StatisticsArtifactIdentity), WriteStatisticsArtifact>,
     membership: RootWriteResultMembershipValidator,
@@ -442,6 +430,8 @@ impl RootWriteResultDecoder {
             contract,
             rows: WriteRowCountAccumulator::new(),
             delete_verification: None,
+            fragment_count: 0,
+            #[cfg(test)]
             fragments: Vec::new(),
             statistics: BTreeMap::new(),
             membership: RootWriteResultMembershipValidator::default(),
@@ -582,7 +572,7 @@ impl RootWriteResultDecoder {
                     )
                 }
             };
-            self.apply_row(RootWriteRow {
+            if let Some((target, fragment)) = self.apply_row(RootWriteRow {
                 kind,
                 target: (!targets.is_null(row)).then(|| targets.value(row)),
                 count: (!counts.is_null(row)).then(|| counts.value(row)),
@@ -599,7 +589,10 @@ impl RootWriteResultDecoder {
                         .try_into()
                         .expect("validated fingerprint width")
                 }),
-            })?;
+            })? {
+                self.record_fragment_arrival()?;
+                self.retain_test_fragment(target, fragment)?;
+            }
         }
         Ok(())
     }
@@ -616,7 +609,15 @@ impl RootWriteResultDecoder {
 
     /// Reserve partial record backing against the original result byte budget.
     /// A complete borrowed record needs no assembly copy.
-    pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), RootWriteDecodeFailure> {
+    pub(crate) fn apply_relay_body_with(
+        &mut self,
+        body: &[u8],
+        mut arrive: impl FnMut(
+            &mut Self,
+            WriteTargetOrdinal,
+            &[u8],
+        ) -> Result<(), RootWriteDecodeFailure>,
+    ) -> Result<(), RootWriteDecodeFailure> {
         if self.root_eof {
             return Err("write Root emitted a trailing body after EOF".into());
         }
@@ -635,7 +636,10 @@ impl RootWriteResultDecoder {
             RootRecordAssembly::new(RootRecordDomain::WriteCommit, 32 * 1024 * 1024),
         );
         let consume = |record: &[u8]| {
-            self.apply_record(record)?;
+            if let Some((target, bytes)) = self.parse_record(record)? {
+                arrive(self, target, bytes)?;
+                self.record_fragment_arrival()?;
+            }
             self.relayed_record_count = self
                 .relayed_record_count
                 .checked_add(1)
@@ -667,9 +671,70 @@ impl RootWriteResultDecoder {
         result.map_err(Into::into)
     }
 
-    /// Apply one complete PreparedWriteCommitV1 record relayed from the
-    /// Backend. The same row rules apply as for the Arrow relation.
+    pub(super) fn relay_production_execution(
+        &self,
+    ) -> Option<(
+        novarocks_types::QueryExecutionId,
+        novarocks_query_application::api::PlanSeal,
+    )> {
+        self.production_execution
+    }
+
+    pub(super) fn fragment_decode_author(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorPayloadRetentionGuard, RootWriteDecodeFailure>
+    {
+        #[cfg(test)]
+        let explicit_local = self.local_assembly;
+        #[cfg(not(test))]
+        let explicit_local = false;
+        fragment_decode_author(self.retention.as_ref(), explicit_local)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), RootWriteDecodeFailure> {
+        self.apply_relay_body_with(body, Self::retain_test_fragment)
+    }
+
+    #[cfg(test)]
     pub(crate) fn apply_record(&mut self, record: &[u8]) -> Result<(), RootWriteDecodeFailure> {
+        if let Some((target, fragment)) = self.parse_record(record)? {
+            self.record_fragment_arrival()?;
+            self.retain_test_fragment(target, fragment)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn retain_test_fragment(
+        &mut self,
+        target: WriteTargetOrdinal,
+        fragment: &[u8],
+    ) -> Result<(), RootWriteDecodeFailure> {
+        if let Some(retention) = &self.retention {
+            retention.reserve_bytes(fragment.len()).map_err(|error| {
+                RootWriteDecodeFailure::source(error).context("prepared write retained bytes")
+            })?;
+        }
+        self.fragments.push((target, fragment.to_vec()));
+        Ok(())
+    }
+
+    fn record_fragment_arrival(&mut self) -> Result<(), RootWriteDecodeFailure> {
+        self.fragment_count = self.fragment_count.checked_add(1).ok_or_else(|| {
+            RootWriteDecodeFailure::source(
+                novarocks_workload_control::WorkError::ArithmeticOverflow,
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Parse a complete record. A fragment borrows its canonical bytes from the
+    /// relay reply or partial-record assembly until its synchronous handoff.
+    fn parse_record<'a>(
+        &mut self,
+        record: &'a [u8],
+    ) -> Result<Option<(WriteTargetOrdinal, &'a [u8])>, RootWriteDecodeFailure> {
         if self.root_eof {
             return Err("write Root emitted a trailing record after EOF".into());
         }
@@ -704,7 +769,10 @@ impl RootWriteResultDecoder {
         })
     }
 
-    fn apply_row(&mut self, row: RootWriteRow<'_>) -> Result<(), RootWriteDecodeFailure> {
+    fn apply_row<'a>(
+        &mut self,
+        row: RootWriteRow<'a>,
+    ) -> Result<Option<(WriteTargetOrdinal, &'a [u8])>, RootWriteDecodeFailure> {
         let RootWriteRow {
             kind,
             target,
@@ -789,14 +857,7 @@ impl RootWriteResultDecoder {
                     )
                     .into());
                 }
-                let fragment = fragment.expect("validated above");
-                if let Some(retention) = &self.retention {
-                    retention.reserve_bytes(fragment.len()).map_err(|error| {
-                        RootWriteDecodeFailure::source(error)
-                            .context("prepared write retained bytes")
-                    })?;
-                }
-                self.fragments.push((target, fragment.to_vec()));
+                return Ok(Some((target, fragment.expect("validated above"))));
             }
             RootRowKind::ArtifactDraft => {
                 let target = target_ordinal_from_wire(target.expect("validated above")).map_err(
@@ -901,7 +962,7 @@ impl RootWriteResultDecoder {
                     .insert(key, WriteStatisticsArtifact::new(target, draft));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     pub(crate) fn observe_root_eof(&mut self) -> Result<(), RootWriteDecodeFailure> {
@@ -943,6 +1004,8 @@ impl RootWriteResultDecoder {
         Ok(DecodedPreparedWriteSet {
             row_count: self.rows.get(),
             delete_verification: self.delete_verification,
+            fragment_count: self.fragment_count,
+            #[cfg(test)]
             fragments: self.fragments,
             statistics: self.statistics.into_values().collect(),
             retention: self.retention,

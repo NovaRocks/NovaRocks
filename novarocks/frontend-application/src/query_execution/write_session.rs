@@ -35,12 +35,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use novarocks_proto_codec::connector_write::{
-    ConnectorWriteFragmentDecoder, ConnectorWriteHandleEncoder,
-};
+use novarocks_proto_codec::connector_write::ConnectorWriteFragmentDecoder;
 use novarocks_proto_models::connector_write as write_dto;
 use novarocks_spi::connector::write_stack::{
-    ConnectorPreparedWriteSet, ConnectorWriteBeginRequest, ConnectorWriteFinishPublication,
+    ConnectorWriteBeginRequest, ConnectorWriteFinishPublication, ConnectorWriteQueryIdentity,
     ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
     ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, UniqueWriterHandleLedger,
     WriteRowCountAccumulator, WriteTargetOrdinal,
@@ -51,6 +49,7 @@ use novarocks_spi::connector::{
     ExternalMutationEvidence, KeyedPublicationIntent,
 };
 
+#[cfg(test)]
 use crate::query_execution::write_result::DecodedPreparedWriteSet;
 use novarocks_catalog_application::ConnectorWriteStackPin;
 use novarocks_plan_codec::SealedWriteTargets;
@@ -157,7 +156,7 @@ pub(crate) struct ConnectorWriteSession {
 /// One immutable received union, shared by pure projection and publication.
 /// Actual buffers and their receipts stay together until the last borrower exits.
 struct ReceivedWriteInput {
-    prepared: ConnectorPreparedWriteSet,
+    row_count: u64,
     statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
     _retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
 }
@@ -166,10 +165,7 @@ struct ReceivedWriteInput {
 struct AccumulatedWriteSet {
     received: Option<Arc<ReceivedWriteInput>>,
     rows: WriteRowCountAccumulator,
-    fragments: Vec<(
-        WriteTargetOrdinal,
-        novarocks_spi::connector::write_stack::ConnectorCommitFragment,
-    )>,
+    has_fragments: bool,
     statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
     statistics_identities: std::collections::BTreeSet<(
         WriteTargetOrdinal,
@@ -356,7 +352,7 @@ impl ConnectorWriteSession {
             )
         })?;
         Ok(union.rows.get() == 0
-            && union.fragments.is_empty()
+            && !union.has_fragments
             && union.statistics.is_empty()
             && union.statistics_identities.is_empty()
             && union.statistics_property_bytes == 0
@@ -385,7 +381,7 @@ impl ConnectorWriteSession {
         })?;
         Ok(
             if union.rows.get() == 0
-                && union.fragments.is_empty()
+                && !union.has_fragments
                 && union.statistics.is_empty()
                 && union.received.is_none()
                 && publication.is_none()
@@ -416,16 +412,11 @@ impl ConnectorWriteSession {
         let context = self.terminal_context(context)?;
         self.claim_terminal(TerminalDecision::Aborted)?;
         let production = self.abort_production()?;
-        let received = if production == novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::CompleteReceived {
-            Some(self.freeze_publication_input(
-                context.clone(), ConnectorWriteFinishPublication::None, production,
-            )?)
-        } else { None };
+
         Ok(WritePublicationCall::new_abort(
             Arc::clone(self),
             context,
             production,
-            received,
         ))
     }
 
@@ -706,22 +697,20 @@ impl ConnectorWriteSession {
                 "only a metadata-only publication may project an implicit empty write",
             ));
         }
-        let prepared = ConnectorPreparedWriteSet::try_new(0, Vec::new(), &self.expected_targets())?;
-        self.logical_rows_after_prepared(&prepared, previous, context)
+        self.logical_rows_after_provider_receiving(previous, context)
     }
 
-    fn logical_rows_after_prepared(
+    fn logical_rows_after_provider_receiving(
         &self,
-        prepared: &ConnectorPreparedWriteSet,
         previous: Option<u64>,
         context: &ConnectorRequestContext,
     ) -> Result<Option<u64>, ConnectorError> {
         ensure_finish_context_active(context)?;
-        match self.write_stack_pin.session().prepared_logical_row_change(
-            self.plan.commit_session(),
-            prepared,
-            context,
-        )? {
+        match self
+            .write_stack_pin
+            .session()
+            .received_logical_row_change(self.plan.commit_session(), context)?
+        {
             Some(change) => change.apply(previous),
             None => Ok(None),
         }
@@ -735,7 +724,7 @@ impl ConnectorWriteSession {
         context: &ConnectorRequestContext,
     ) -> Result<Option<u64>, ConnectorError> {
         ensure_finish_context_active(context)?;
-        let received = {
+        {
             let terminal = self.lock_terminal()?;
             if terminal.is_some() {
                 return Err(ConnectorError::new(
@@ -744,33 +733,20 @@ impl ConnectorWriteSession {
                 ));
             }
             self.require_received_productions()?;
-            self.freeze_received_input()?
-        };
-        // No terminal, production, accumulation or publication mutex crosses
-        // the Provider callback. A panic leaves the same packet in the session.
-        self.logical_rows_after_prepared(&received.prepared, previous, context)
+            self.freeze_received_input()?;
+        }
+        // The Provider owns the fragment payload. Keep its projection outside
+        // the FE terminal and statistics locks, including on unwind.
+        self.logical_rows_after_provider_receiving(previous, context)
     }
 
     fn freeze_received_input(&self) -> Result<Arc<ReceivedWriteInput>, ConnectorError> {
-        let production = self.received_creation_proof()?;
         let mut union = self.lock_accumulated()?;
         if let Some(received) = &union.received {
             return Ok(Arc::clone(received));
         }
-        // Validate while all payload/statistics/receipts still occupy their
-        // original slots. A typed refusal moves none of that inventory.
-        let rows = union.rows.get();
-        let prepared = ConnectorPreparedWriteSet::try_new_in(
-            rows,
-            &mut union.fragments,
-            &self.expected_targets(),
-        )?;
-        let prepared = match production {
-            Some(proof) => prepared.with_received_production(proof),
-            None => prepared,
-        };
         let received = Arc::new(ReceivedWriteInput {
-            prepared,
+            row_count: union.rows.get(),
             statistics: std::mem::take(&mut union.statistics),
             _retention: union.retention.take(),
         });
@@ -783,7 +759,7 @@ impl ConnectorWriteSession {
     /// same cached Arc. This neither copies payloads nor proves business success.
     pub(crate) fn freeze_received_row_count(&self) -> Result<u64, ConnectorError> {
         self.require_received_productions()?;
-        Ok(self.freeze_received_input()?.prepared.row_count())
+        Ok(self.freeze_received_input()?.row_count)
     }
 
     /// The rows accumulated so far. Report them to a client only after the
@@ -943,6 +919,22 @@ impl ConnectorWriteSession {
             )
         })
     }
+}
+
+pub(super) fn write_query_identity(
+    execution: novarocks_types::QueryExecutionId,
+    plan: novarocks_query_application::api::PlanSeal,
+) -> Result<ConnectorWriteQueryIdentity, ConnectorError> {
+    let query = execution.query_id();
+    let mut query_bytes = [0; 16];
+    query_bytes[..8].copy_from_slice(&query.high().to_be_bytes());
+    query_bytes[8..].copy_from_slice(&query.low().to_be_bytes());
+    let novarocks_query_application::api::PlanSeal::Version(plan) = plan;
+    ConnectorWriteQueryIdentity::try_new(
+        query_bytes,
+        execution.attempt_id().get(),
+        *plan.as_bytes(),
+    )
 }
 
 fn ensure_finish_context_active(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {

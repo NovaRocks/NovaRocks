@@ -27,26 +27,48 @@ use novarocks_spi::connector::document_storage::{
     ConnectorDocumentStorageManagement, KeyedPublicationIntent,
 };
 use novarocks_spi::connector::write_stack::{
-    ConnectorCommitFragment, ConnectorWriterHandle, MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES,
-    ProviderWriteRuntime, WriteRuntimeAdapter, WriteStatisticsArtifact,
+    ConnectorCommitFragment, ConnectorWriteCommitSession, ConnectorWriteProductionProof,
+    ConnectorWriterHandle, MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES, ProviderWriteRuntime,
+    WriteRuntimeAdapter, WriteStatisticsArtifact, validate_write_fragment_targets,
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorProviderId,
-    ConnectorWriteControl as LegacyWriteControl, ConnectorWriteFragmentWireDecoder,
-    ConnectorWriteHandleWireEncoder, CredentialLeaseId, ResolvedVendedS3Access,
-    StatisticsArtifactDraft, StatisticsArtifactIdentity, StatisticsRequiredAggregation,
-    StatisticsScanColumn, StorageAccessDomainId, StorageAccessRequest,
-    StorageCredentialScopePrefix,
+    ConnectorInstanceId, ConnectorPayloadRetentionGuard, ConnectorProviderBindingKey,
+    ConnectorProviderId, ConnectorWriteControl as LegacyWriteControl,
+    ConnectorWriteFragmentWireDecoder, ConnectorWriteHandleWireEncoder, CredentialLeaseId,
+    ResolvedVendedS3Access, StatisticsArtifactDraft, StatisticsArtifactIdentity,
+    StatisticsRequiredAggregation, StatisticsScanColumn, StorageAccessDomainId,
+    StorageAccessRequest, StorageCredentialScopePrefix,
 };
 
 use super::*;
 
 // ---- a minimal provider whose only job is to be recoverable -----------
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FakeCommit;
+#[derive(Debug, Default)]
+struct FakeCommit(Mutex<FakeReceiving>);
+
+#[derive(Debug, Default)]
+struct FakeReceiving {
+    queries:
+        std::collections::BTreeMap<ConnectorWriteQueryIdentity, (Vec<WriteTargetOrdinal>, bool)>,
+    fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
+    closed: bool,
+}
+
+impl FakeReceiving {
+    fn require_complete(&self) -> Result<(), ConnectorError> {
+        if self.queries.values().any(|(_, received)| !received) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "unconfirmed fixture write query",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FakeHandle(u32);
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,8 +175,17 @@ pub(crate) struct Recorded {
     )>,
     pub(crate) abort_production:
         Option<novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction>,
-    pub(crate) abort_received_rows: Option<u64>,
     pub(crate) abort_received_fragments: Option<usize>,
+    pub(crate) received_query_registrations: Vec<(
+        ConnectorWriteQueryIdentity,
+        Vec<WriteTargetOrdinal>,
+        Option<Arc<dyn ConnectorWriteProductionProof>>,
+    )>,
+    pub(crate) query_registration_failure: Option<ConnectorError>,
+    pub(crate) fragment_arrivals: usize,
+    pub(crate) write_confirmations: usize,
+    pub(crate) arrival_refusal: Option<ConnectorError>,
+    finish_fragments: usize,
     pub(crate) reconcile: usize,
     pub(crate) statistics: Vec<WriteStatisticsArtifact>,
     pub(crate) publication: Option<ConnectorWriteFinishPublication>,
@@ -163,8 +194,8 @@ pub(crate) struct Recorded {
     row_change_session: Option<std::sync::Weak<ConnectorWriteSession>>,
     row_change_failure: Option<ConnectorError>,
     panic_row_change: bool,
-    row_change_prepared_address: Option<usize>,
-    finish_prepared_address: Option<usize>,
+    row_change_receiving_address: Option<usize>,
+    finish_receiving_address: Option<usize>,
     retain_decoded_payload: bool,
     pub(crate) decoded_fragment_charge: Option<usize>,
     row_change_payload: Option<bytes::Bytes>,
@@ -310,17 +341,29 @@ impl FakeSession {
     }
     fn record_finish(
         &self,
-        prepared: &ConnectorPreparedWriteSet,
+        commit: &ConnectorWriteCommitSession,
+        row_count: u64,
         statistics: &[WriteStatisticsArtifact],
         publication: &ConnectorWriteFinishPublication,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        let state = &self.adapter.commit_session(commit)?.0;
+        let fragment_count = {
+            let mut receiving = state.lock().unwrap();
+            receiving.require_complete()?;
+            receiving.closed = true;
+            receiving.fragments.len()
+        };
         {
             let storage = probe_vended_storage(context);
             let mut recorded = self.recorded.lock().expect("recorded");
             recorded.finish += 1;
-            recorded.finish_rows = prepared.row_count();
-            recorded.finish_prepared_address = Some(prepared as *const _ as usize);
+            recorded.finish_rows = row_count;
+            for (_, _, proof) in &mut recorded.received_query_registrations {
+                *proof = None;
+            }
+            recorded.finish_fragments = fragment_count;
+            recorded.finish_receiving_address = Some(state as *const _ as usize);
             if let Some(capacity) = &recorded.expected_finish_capacity {
                 assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
             }
@@ -332,9 +375,7 @@ impl FakeSession {
             .lock()
             .expect("outcome")
             .take()
-            .ok_or_else(|| {
-                ConnectorError::new(ConnectorErrorKind::Internal, "no scripted outcome")
-            })
+            .ok_or_else(|| ConnectorError::new(ConnectorErrorKind::Internal, "no scripted outcome"))
     }
 }
 impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSession {
@@ -386,7 +427,8 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
         Box::pin(FakeFinishFuture {
             original: Box::pin(async move {
                 self.record_finish(
-                    request.prepared,
+                    request.commit,
+                    request.row_count,
                     request.statistics,
                     request.publication,
                     request.context,
@@ -400,7 +442,7 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
         &'a self,
         request: novarocks_spi::connector::write_stack::ConnectorWriteFinishRequestRef<'a>,
 
-        receiving:&'a novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
+        receiving: &'a novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -411,11 +453,12 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
                 > + Send
                 + 'a,
         >,
-    >{
+    > {
         Box::pin(FakeFinishFuture {
             original: Box::pin(async move {
                 let outcome = self.record_finish(
-                    request.prepared,
+                    request.commit,
+                    request.row_count,
                     request.statistics,
                     request.publication,
                     request.context,
@@ -448,9 +491,7 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
 
     fn reconcile_write_async<'a>(
         &'a self,
-        request: novarocks_spi::connector::write_stack::ConnectorWriteSessionReconcileRequest<
-            'a,
-        >,
+        request: novarocks_spi::connector::write_stack::ConnectorWriteSessionReconcileRequest<'a>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -469,11 +510,9 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
 
     fn reconcile_write_with_needed_ready_async<'a>(
         &'a self,
-        request: novarocks_spi::connector::write_stack::ConnectorWriteSessionReconcileRequest<
-            'a,
-        >,
+        request: novarocks_spi::connector::write_stack::ConnectorWriteSessionReconcileRequest<'a>,
 
-        receiving:&'a novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
+        receiving: &'a novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -484,7 +523,7 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
                 > + Send
                 + 'a,
         >,
-    >{
+    > {
         Box::pin(async move {
             let outcome = self.reconcile_write(request);
             self.finish_actual_needed_fixture(outcome, receiving).await
@@ -520,33 +559,107 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
                 ))
             )
         {
-            return Ok(
-                novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained,
-            );
+            return Ok(novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained);
         }
         Ok(novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Disposed)
     }
 
-    fn prepared_logical_row_change(
+    fn begin_write_query(
         &self,
-        commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitSession,
-        prepared: &ConnectorPreparedWriteSet,
+        commit: &ConnectorWriteCommitSession,
+        query: &ConnectorWriteQueryIdentity,
+        targets: &[WriteTargetOrdinal],
+        production: Option<Arc<dyn ConnectorWriteProductionProof>>,
+    ) -> Result<(), ConnectorError> {
+        let mut receiving = self.adapter.commit_session(commit)?.0.lock().unwrap();
+        if receiving.closed || receiving.queries.contains_key(query) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "fixture query registration is closed or duplicated",
+            ));
+        }
+        let mut recorded = self.recorded.lock().unwrap();
+        if let Some(error) = &recorded.query_registration_failure {
+            return Err(error.clone());
+        }
+        receiving.queries.insert(*query, (targets.to_vec(), false));
+        recorded
+            .received_query_registrations
+            .push((*query, targets.to_vec(), production));
+        Ok(())
+    }
+
+    fn arrive_write_fragments(
+        &self,
+        commit: &ConnectorWriteCommitSession,
+        query: &ConnectorWriteQueryIdentity,
+        fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
+        _: &ConnectorPayloadRetentionGuard,
+    ) -> Result<(), ConnectorError> {
+        let mut receiving = self.adapter.commit_session(commit)?.0.lock().unwrap();
+        let Some((targets, false)) = receiving.queries.get(query).filter(|_| !receiving.closed)
+        else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "fixture query does not accept fragments",
+            ));
+        };
+        let mut recorded = self.recorded.lock().unwrap();
+        if let Some(refusal) = recorded.arrival_refusal.take() {
+            return Err(refusal);
+        }
+        validate_write_fragment_targets(&fragments, targets)?;
+        recorded.fragment_arrivals += fragments.len();
+        receiving.fragments.extend(fragments);
+        Ok(())
+    }
+
+    fn confirm_write_received(
+        &self,
+        commit: &ConnectorWriteCommitSession,
+        query: &ConnectorWriteQueryIdentity,
+    ) -> Result<(), ConnectorError> {
+        let mut receiving = self.adapter.commit_session(commit)?.0.lock().unwrap();
+        if receiving.closed {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "fixture receiving is closed",
+            ));
+        }
+        let Some((_, received @ false)) = receiving.queries.get_mut(query) else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "fixture query could not be confirmed",
+            ));
+        };
+        *received = true;
+        self.recorded.lock().unwrap().write_confirmations += 1;
+        Ok(())
+    }
+
+    fn received_logical_row_change(
+        &self,
+        commit: &ConnectorWriteCommitSession,
         _: &ConnectorRequestContext,
     ) -> Result<
         Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>,
         ConnectorError,
     > {
-        self.adapter.commit_session(commit)?;
-        assert_eq!(prepared.row_count(), 1);
-        let mut original_payload = None;
-        for (_, fragment) in prepared.fragments() {
-            let original = self.adapter.commit_fragment(fragment)?;
-            original_payload = original.1.clone();
-        }
+        let state = &self.adapter.commit_session(commit)?.0;
+        let original_payload = {
+            let receiving = state.lock().unwrap();
+            receiving.require_complete()?;
+            let mut original_payload = None;
+            for (_, fragment) in &receiving.fragments {
+                let original = self.adapter.commit_fragment(fragment)?;
+                original_payload = original.1.clone();
+            }
+            original_payload
+        };
         let (session, panic, failure, change) = {
             let mut recorded = self.recorded.lock().unwrap();
             recorded.row_change_queries += 1;
-            recorded.row_change_prepared_address = Some(prepared as *const _ as usize);
+            recorded.row_change_receiving_address = Some(state as *const _ as usize);
             recorded.row_change_payload = original_payload;
             (
                 recorded.row_change_session.clone(),
@@ -586,8 +699,7 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
             let mut recorded = self.recorded.lock().expect("recorded");
             recorded.begin += 1;
             if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-                declaration,
-                ..
+                declaration, ..
             } = &request.flavor
             {
                 recorded.begin_declaration = Some(declaration.as_ref().clone());
@@ -597,19 +709,16 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
                 recorded.begin_catalog_session = request.catalog_session;
             }
         }
-        let commit = self.adapter.wrap_commit_session(FakeCommit);
+        let commit = self.adapter.wrap_commit_session(FakeCommit::default());
         let targets = (0..self.targets)
             .map(|index| {
-                let ordinal = WriteTargetOrdinal::try_new(
-                    u32::try_from(index).expect("bounded ordinal"),
-                )?;
+                let ordinal =
+                    WriteTargetOrdinal::try_new(u32::try_from(index).expect("bounded ordinal"))?;
                 let handle = self.adapter.wrap_writer_handle(FakeHandle(ordinal.get()));
                 let input = novarocks_spi::connector::ConnectorWriteInputShape::Data {
                     fields: vec![
                         novarocks_spi::connector::ConnectorWriteFieldBinding::try_new_typed(
-                            novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes(
-                                [1; 32],
-                            ),
+                            novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([1; 32]),
                             arrow::datatypes::Field::new(
                                 "v",
                                 arrow::datatypes::DataType::Int64,
@@ -657,7 +766,8 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
         request: ConnectorWriteFinishRequest<'_>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         self.record_finish(
-            &request.prepared,
+            request.commit,
+            request.row_count,
             &request.statistics,
             &request.publication,
             &request.context,
@@ -668,11 +778,29 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
         &self,
         request: ConnectorWriteSessionAbortRequest<'_>,
     ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+        use novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction;
+        let mut receiving = self
+            .adapter
+            .commit_session(request.commit)?
+            .0
+            .lock()
+            .unwrap();
+        receiving.closed = true;
+        let received = if request.production == ConnectorWriteAbortProduction::CompleteReceived {
+            receiving.require_complete()?;
+            Some(receiving.fragments.len())
+        } else {
+            None
+        };
         let mut recorded = self.recorded.lock().expect("recorded");
         recorded.abort += 1;
         recorded.abort_production = Some(request.production);
-        recorded.abort_received_rows = request.received.map(|set| set.row_count());
-        recorded.abort_received_fragments = request.received.map(|set| set.fragments().len());
+        recorded.abort_received_fragments = received;
+        if received.is_some() {
+            for (_, _, proof) in &mut recorded.received_query_registrations {
+                *proof = None;
+            }
+        }
         recorded.terminal_storage = Some(probe_vended_storage(&request.context));
         if let Some(outcome) = recorded.abort_outcome.take() {
             return Ok(outcome);
@@ -720,8 +848,7 @@ impl ConnectorWriteHandleWireEncoder for FakeEncoder {
     fn encode_writer_handle_payload(
         &self,
         _handle: &ConnectorWriterHandle,
-    ) -> Result<ConnectorEncodedPayload, novarocks_spi::connector::ConnectorCodecError>
-    {
+    ) -> Result<ConnectorEncodedPayload, novarocks_spi::connector::ConnectorCodecError> {
         Ok(encoded_payload(
             ConnectorCodecCategory::WriteHandle,
             bytes::Bytes::from(vec![b'u'; self.payload_bytes]),
@@ -743,8 +870,7 @@ impl ConnectorWriteFragmentWireDecoder for FakeDecoder {
         &self,
         _fragment: &ConnectorEncodedPayload,
         author: &novarocks_spi::connector::ConnectorPayloadRetentionGuard,
-    ) -> Result<ConnectorCommitFragment, novarocks_spi::connector::ConnectorCodecError>
-    {
+    ) -> Result<ConnectorCommitFragment, novarocks_spi::connector::ConnectorCodecError> {
         let (retain, charge) = {
             let mut recorded = self.recorded.lock().unwrap();
             recorded.decoded_fragments += 1;
@@ -830,9 +956,12 @@ impl ConnectorWriteSession {
         self: &Arc<Self>,
         prepared: DecodedPreparedWriteSet,
     ) -> Result<(), ConnectorError> {
-        let segment = self.computation_decode(&self.expected_targets())?
+        let segment = self
+            .computation_decode(&self.expected_targets())?
             .interpret(prepared)
-            .map_err(crate::query_execution::write_result::RootWriteDecodeFailure::into_connector_error)?;
+            .map_err(
+                crate::query_execution::write_result::RootWriteDecodeFailure::into_connector_error,
+            )?;
         self.receiving_port().accept(segment).map(|_| ())
     }
     pub(crate) fn publish_for_test(
@@ -874,16 +1003,51 @@ pub(crate) struct Fixture {
 }
 
 impl Fixture {
+    pub(super) fn with_received_fragments<R>(
+        &self,
+        inspect: impl FnOnce(&[(WriteTargetOrdinal, ConnectorCommitFragment)]) -> R,
+    ) -> R {
+        // Open the same provider generation for fixture-only custody assertions.
+        let adapter = WriteRuntimeAdapter::new(Arc::new(FakeProvider {
+            descriptor: self
+                .session
+                .plan
+                .commit_session()
+                .binding()
+                .descriptor()
+                .clone(),
+            catalog_handle: self
+                .session
+                .plan
+                .commit_session()
+                .binding()
+                .catalog_handle()
+                .clone(),
+        }));
+        let commit = adapter
+            .commit_session(self.session.plan.commit_session())
+            .unwrap();
+        let receiving = commit.0.lock().unwrap();
+        inspect(&receiving.fragments)
+    }
+
+    pub(crate) fn received_fragment_count(&self) -> usize {
+        self.with_received_fragments(<[_]>::len)
+    }
+
     pub(crate) async fn release_provider_direct(
         &self,
         context: ConnectorRequestContext,
     ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
         let control = self.session.write_stack_pin.session();
-        control.abort_write_async(ConnectorWriteSessionAbortRequest {
-            commit: self.session.plan.commit_session(), context,
-            production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::Unproven,
-            received: None,
-        }).await
+        control
+            .abort_write_async(ConnectorWriteSessionAbortRequest {
+                commit: self.session.plan.commit_session(),
+                context,
+                production:
+                    novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::Unproven,
+            })
+            .await
     }
 }
 
@@ -1027,11 +1191,7 @@ fn fixture_with_statistics(targets: usize) -> Fixture {
     Fixture { session, recorded }
 }
 
-fn statistics_artifact(
-    target: u32,
-    field_id: i32,
-    body: &'static [u8],
-) -> WriteStatisticsArtifact {
+fn statistics_artifact(target: u32, field_id: i32, body: &'static [u8]) -> WriteStatisticsArtifact {
     WriteStatisticsArtifact::new(
         WriteTargetOrdinal::try_new(target).expect("target"),
         StatisticsArtifactDraft::try_new(
@@ -1116,13 +1276,9 @@ fn application_document_publication_for(
         descriptor: descriptor.clone(),
         incarnation,
     });
-    let documents = ConnectorDocumentStorageBinding::try_new(
-        descriptor,
-        incarnation,
-        None,
-        Some(management),
-    )
-    .expect("document storage binding");
+    let documents =
+        ConnectorDocumentStorageBinding::try_new(descriptor, incarnation, None, Some(management))
+            .expect("document storage binding");
     let binding = novarocks_catalog_application::test_support::test_control_binding_for(
         instance_id.clone(),
         8,
@@ -1177,10 +1333,7 @@ fn application_document_publication_for(
     )
     .expect("publication declaration");
     let (catalog, view) =
-        novarocks_mv_application::persistence::keyed_documents::keyed_view_fixture(
-            Some(17),
-            true,
-        );
+        novarocks_mv_application::persistence::keyed_documents::keyed_view_fixture(Some(17), true);
     let observed =
         novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents(
             view, catalog,
@@ -1214,8 +1367,7 @@ fn application_document_begin_request(
         table: Arc::from("db.t"),
         target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
         intent: novarocks_spi::connector::ConnectorWriteIntent::Overwrite,
-        purpose:
-            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+        purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
         input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
             fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
                 arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
@@ -1224,8 +1376,7 @@ fn application_document_begin_request(
         base: Some(declaration.expected_base().clone()),
         flavor: ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
             declaration: Box::new(declaration),
-            shape:
-                novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
+            shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
         },
         context: request_context(),
     }
@@ -1284,9 +1435,7 @@ impl TerminalCredentialAccounting {
     }
 
     fn release_hold(&self) {
-        if self.holds.fetch_sub(1, Ordering::SeqCst) == 1
-            && self.finalized.load(Ordering::SeqCst)
-        {
+        if self.holds.fetch_sub(1, Ordering::SeqCst) == 1 && self.finalized.load(Ordering::SeqCst) {
             self.leases_cleared.store(true, Ordering::SeqCst);
         }
     }
@@ -1517,8 +1666,8 @@ fn received_row_projection_and_publication_borrow_one_original_packet() {
         .received
         .clone()
         .unwrap();
-    assert_eq!(received.prepared.row_count(), 1);
-    assert_eq!(received.prepared.fragments().len(), 1);
+    assert_eq!(received.row_count, 1);
+    assert_eq!(fixture.received_fragment_count(), 1);
     assert_eq!(
         received.statistics[0].draft().body().as_ref(),
         b"original-statistics"
@@ -1553,8 +1702,8 @@ fn received_row_projection_and_publication_borrow_one_original_packet() {
     assert_eq!(recorded.decoded_fragments, 1);
     assert_eq!(recorded.row_change_queries, 1);
     assert_eq!(
-        recorded.row_change_prepared_address,
-        recorded.finish_prepared_address
+        recorded.row_change_receiving_address,
+        recorded.finish_receiving_address
     );
     assert_eq!(
         recorded.statistics[0].draft().body().as_ref(),
@@ -1616,7 +1765,8 @@ fn received_projection_refusal_or_panic_keeps_original_payload_for_abort() {
             .received
             .clone()
             .unwrap();
-        assert_eq!(received.prepared.fragments().len(), 1);
+        assert_eq!(received.row_count, 1);
+        assert_eq!(fixture.received_fragment_count(), 1);
         assert!(fixture.session.lock_terminal().unwrap().is_none());
         let mut call = fixture
             .session
@@ -1626,7 +1776,7 @@ fn received_projection_refusal_or_panic_keeps_original_payload_for_abort() {
         assert!(call.poll_completed(&mut cx).is_ready());
         assert_eq!(fixture.recorded.lock().unwrap().row_change_queries, 1);
         assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
-        assert_eq!(received.prepared.fragments().len(), 1);
+        assert_eq!(fixture.received_fragment_count(), 1);
     }
 }
 
@@ -1647,29 +1797,29 @@ fn received_input_validation_refusal_moves_no_original_inventory() {
             .with_test_capacity(&binding),
         )
         .unwrap();
-    let original_address = {
-        let mut union = fixture.session.lock_accumulated().unwrap();
-        // Exercise the SPI receiving validator on the original unique Vec;
-        // a foreign target cannot make it consume the deletion inventory.
-        union.fragments[0].0 = WriteTargetOrdinal::try_new(1).unwrap();
-        union.fragments.as_ptr() as usize
-    };
+    let original_address = fixture.with_received_fragments(|fragments| fragments.as_ptr() as usize);
+    let foreign = WriteTargetOrdinal::try_new(1).unwrap();
     let failure = fixture
         .session
-        .logical_rows_after_received_write(Some(2), &request_context())
+        .receive_for_test(
+            DecodedPreparedWriteSet::for_test(5, vec![(foreign, commit_fragment_bytes())])
+                .with_test_capacity(&binding),
+        )
         .unwrap_err();
-    assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
-    let mut union = fixture.session.lock_accumulated().unwrap();
+    assert_eq!(failure.kind(), ConnectorErrorKind::CorruptData);
+    let union = fixture.session.lock_accumulated().unwrap();
     assert!(union.received.is_none());
-    assert_eq!(union.fragments.as_ptr() as usize, original_address);
-    assert_eq!(union.fragments.len(), 1);
+    assert_eq!(
+        fixture.with_received_fragments(|fragments| fragments.as_ptr() as usize),
+        original_address
+    );
+    assert_eq!(fixture.received_fragment_count(), 1);
     assert_eq!(
         union.statistics[0].draft().body().as_ref(),
         b"retained-statistics"
     );
     assert!(union.retention.is_some());
     assert_eq!(union.rows.get(), 1);
-    union.fragments[0].0 = target;
     assert_eq!(fixture.recorded.lock().unwrap().row_change_queries, 0);
 }
 
@@ -1717,7 +1867,7 @@ fn unknown_publication_retains_the_same_projected_packet() {
             .as_ref()
             .unwrap()
     ));
-    assert_eq!(original.prepared.fragments().len(), 1);
+    assert_eq!(fixture.received_fragment_count(), 1);
     assert_eq!(fixture.recorded.lock().unwrap().decoded_fragments, 1);
     assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
     assert!(
@@ -1898,15 +2048,14 @@ async fn pending_document_async_metadata_only_permission_comes_from_the_declarat
     let receiving = WriteBeginReceiving::new(Arc::clone(&original));
     let mut request = application_document_begin_request(declaration.clone());
     request.intent = novarocks_spi::connector::ConnectorWriteIntent::Append;
-    let session =
-        ConnectorWriteSession::begin_pending_application_document_publication_async_in(
-            write_stack_pin,
-            catalog_properties(),
-            request,
-            &receiving,
-        )
-        .await
-        .unwrap();
+    let session = ConnectorWriteSession::begin_pending_application_document_publication_async_in(
+        write_stack_pin,
+        catalog_properties(),
+        request,
+        &receiving,
+    )
+    .await
+    .unwrap();
     assert!(Arc::ptr_eq(
         &session,
         original.lock().unwrap().as_ref().unwrap()
@@ -1975,16 +2124,15 @@ fn pending_document_async_drop_panic_retains_plan_input_and_exact_declaration() 
 async fn async_document_and_ordinary_entries_reject_the_other_flavor_before_begin() {
     let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
     let receiving = WriteBeginReceiving::new(Arc::new(Mutex::new(None)));
-    let failure =
-        ConnectorWriteSession::begin_pending_application_document_publication_async_in(
-            write_stack_pin,
-            catalog_properties(),
-            begin_request(),
-            &receiving,
-        )
-        .await
-        .err()
-        .expect("ordinary request cannot acquire an application-document session");
+    let failure = ConnectorWriteSession::begin_pending_application_document_publication_async_in(
+        write_stack_pin,
+        catalog_properties(),
+        begin_request(),
+        &receiving,
+    )
+    .await
+    .err()
+    .expect("ordinary request cannot acquire an application-document session");
     assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
     assert_eq!(recorded.lock().unwrap().begin, 0);
     assert_eq!(recorded.lock().unwrap().begin_async, 0);
@@ -2225,8 +2373,7 @@ fn session_encoding_and_sealing_retain_the_original_codec_cause() {
         known_committed(),
         Arc::new(RefusingEncoder(original.clone())),
     );
-    let session =
-        begin_for_test(write_stack_pin, catalog_properties(), begin_request()).unwrap();
+    let session = begin_for_test(write_stack_pin, catalog_properties(), begin_request()).unwrap();
     let payload_error = session
         .encode_writer_handle_payload(session.targets()[0].handle())
         .expect_err("actual provider encoder refuses the payload");
@@ -2322,8 +2469,8 @@ fn computation_receiving_decodes_once_and_retains_original_window_until_commit()
     let target = WriteTargetOrdinal::try_new(0).unwrap();
     let encoded = commit_fragment_bytes();
     let encoded_bytes = encoded.len() as u64;
-    let prepared = DecodedPreparedWriteSet::for_test(7, vec![(target, encoded)])
-        .with_test_capacity(&binding);
+    let prepared =
+        DecodedPreparedWriteSet::for_test(7, vec![(target, encoded)]).with_test_capacity(&binding);
     let original_window = binding.window_alias();
     assert_eq!(original_window.retained_payload_bytes(), encoded_bytes);
     let decoded = fixture
@@ -2520,7 +2667,15 @@ fn a_session_commits_the_union_of_every_query_it_drove() {
     let _ = fixture.session.publish_for_test(request_context());
     // One commit for the whole statement, not one per query.
     assert_eq!(fixture.session.finish_invocations(), 1);
-    assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+    let recorded = fixture.recorded.lock().expect("recorded");
+    assert_eq!(recorded.finish, 1);
+    assert_eq!(recorded.finish_rows, 10);
+    assert_eq!(recorded.finish_fragments, 3);
+    assert_eq!(recorded.write_confirmations, 2);
+    assert_ne!(
+        recorded.received_query_registrations[0].0,
+        recorded.received_query_registrations[1].0
+    );
 }
 
 #[test]
@@ -2748,8 +2903,8 @@ fn an_implicit_empty_seal_reaches_an_invisible_staged_create() {
             )
             .expect("staged target handle"),
         );
-    let session = begin_for_test(write_stack_pin, catalog_properties(), request)
-        .expect("begin staged write");
+    let session =
+        begin_for_test(write_stack_pin, catalog_properties(), request).expect("begin staged write");
 
     let outcome = session
         .publish_for_test(request_context())
@@ -2890,24 +3045,10 @@ fn publication_call_preserves_real_input_and_transfers_only_after_child_drop() {
             .as_ref()
             .unwrap()
             .received
-            .prepared
-            .row_count(),
+            .row_count,
         7
     );
-    assert_eq!(
-        fixture
-            .session
-            .publication_input
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .received
-            .prepared
-            .fragments()
-            .len(),
-        1
-    );
+    assert_eq!(fixture.received_fragment_count(), 1);
     let mut result = None;
     assert!(call.take_outcome_in(&mut result).is_err());
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -3207,8 +3348,7 @@ fn committed_abort_receives_context_before_its_actual_child_drop_panics() {
     let fixture = publication_fixture();
     let context = request_context();
     struct OriginalAbortFinalizationScope;
-    let scope =
-        context.request_scope_extension_or_insert_with(|| OriginalAbortFinalizationScope);
+    let scope = context.request_scope_extension_or_insert_with(|| OriginalAbortFinalizationScope);
     let novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, cleanup } =
         novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome(known_committed())
     else { unreachable!() };
@@ -3414,9 +3554,12 @@ fn claimed_session_preparation_error_does_not_authorize_a_second_abort() {
         .unwrap();
     let mut refused_call = None;
     let mut refusal = None;
-    assert!(fixture.session.prepare_finish_or_abort_call_in(
-        request_context(), &mut refused_call, &mut refusal,
-    ).is_err());
+    assert!(
+        fixture
+            .session
+            .prepare_finish_or_abort_call_in(request_context(), &mut refused_call, &mut refusal,)
+            .is_err()
+    );
     assert!(refused_call.is_none());
     assert!(
         refusal.is_some(),

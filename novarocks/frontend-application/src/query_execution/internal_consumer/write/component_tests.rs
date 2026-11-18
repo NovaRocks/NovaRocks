@@ -539,6 +539,15 @@ impl ActualWriteRun {
                 CompletionEvent::RootRows => {
                     self.peer.as_ref().unwrap().release_encoded_root_data();
                     self.wait_receipt(OriginalWriteReceipt::Body).await;
+                    let recorded = self
+                        .session_fixture
+                        .as_ref()
+                        .unwrap()
+                        .recorded
+                        .lock()
+                        .unwrap();
+                    assert_eq!(recorded.fragment_arrivals, 1);
+                    assert_eq!(recorded.write_confirmations, 0);
                 }
                 CompletionEvent::RootEnd => {
                     self.peer.as_ref().unwrap().release_encoded_root_end();
@@ -788,6 +797,16 @@ impl ActualWriteRun {
                 assert_eq!(ready.accepted.row_count(), 3);
                 assert!(!ready.accepted.is_empty());
                 assert!(ready.accepted.belongs_to(self.session.as_ref().unwrap()));
+                assert_eq!(
+                    self.session_fixture
+                        .as_ref()
+                        .unwrap()
+                        .recorded
+                        .lock()
+                        .unwrap()
+                        .write_confirmations,
+                    1
+                );
                 assert!(Arc::ptr_eq(&ready.session, self.session.as_ref().unwrap()));
                 assert!(Arc::ptr_eq(
                     &ready._credentials,
@@ -884,7 +903,6 @@ impl ActualWriteRun {
                 assert_eq!(session.accumulated_row_count().unwrap(), 3);
                 assert_eq!(recorded.abort_production,
                     Some(novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::Unproven));
-                assert_eq!(recorded.abort_received_rows, None);
                 assert_eq!(recorded.abort_received_fragments, None);
                 assert_eq!(self.ready.as_ref().unwrap().accepted.row_count(), 3);
             }

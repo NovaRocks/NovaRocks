@@ -17,14 +17,14 @@
 
 use std::sync::Arc;
 
-use arrow::array::builder::{
-    Int32Builder, ListBuilder, MapBuilder, MapFieldNames, StringBuilder,
-};
+use arrow::array::builder::{Int32Builder, ListBuilder, MapBuilder, MapFieldNames, StringBuilder};
 use arrow::array::{ArrayRef, BinaryArray, Int8Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field};
 use novarocks_execution::exec::node::table_write_relation::RootWriteResultRelationSchema;
 
 use super::*;
+
+mod record_handoff;
 
 struct Row {
     kind: i8,
@@ -174,20 +174,26 @@ fn chunk(rows: Vec<Row>) -> Chunk {
 /// Backend record encoder with the original session's real outer envelope.
 #[cfg(novarocks_dev_controls)]
 pub(crate) fn component_write_body(fragment: Vec<u8>) -> Vec<u8> {
-    records(vec![
-        Row {
-            kind: RootRowKind::PREPARED_FRAGMENT,
-            target: Some(0),
-            row_count: None,
-            fragment: Some(fragment),
-            input_fields: None,
-            blob_type: None,
-            body: None,
-            properties: None,
-        },
-        summary(3),
-    ])
-    .concat()
+    [fragment_record(fragment), row_count_record(3)].concat()
+}
+
+pub(crate) fn row_count_record(rows: i64) -> Vec<u8> {
+    records(vec![summary(rows)]).pop().unwrap()
+}
+
+pub(crate) fn fragment_record(fragment: Vec<u8>) -> Vec<u8> {
+    records(vec![Row {
+        kind: RootRowKind::PREPARED_FRAGMENT,
+        target: Some(0),
+        row_count: None,
+        fragment: Some(fragment),
+        input_fields: None,
+        blob_type: None,
+        body: None,
+        properties: None,
+    }])
+    .pop()
+    .unwrap()
 }
 
 fn targets(count: u32) -> Vec<WriteTargetOrdinal> {
@@ -221,9 +227,7 @@ fn exact_decoder() -> RootWriteResultDecoder {
 
 /// Encode `rows` exactly as the Backend root producer does.
 fn records(rows: Vec<Row>) -> Vec<Vec<u8>> {
-    use novarocks_native_adapter::root_record_assembly::{
-        RootRecordAssembly, RootRecordDomain,
-    };
+    use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
     use novarocks_native_adapter::root_write_commit_codec::{
         WriteCommitEncoder, WriteCommitTotals,
     };
@@ -341,9 +345,12 @@ fn original_assembly_budget(
             ResultWindowClass::Internal,
         )
         .unwrap();
-    let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
-        &root.owner.scope(), window.retain_alias(),
-    ).unwrap();
+    let binding =
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            &root.owner.scope(),
+            window.retain_alias(),
+        )
+        .unwrap();
     (control, root, binding)
 }
 
@@ -758,9 +765,10 @@ fn the_frontend_receives_a_fragment_larger_than_one_mib() {
 #[test]
 fn query_local_membership_is_exact_not_max_ordinal_based() {
     let target_five = WriteTargetOrdinal::try_new(5).expect("target");
-    let mut decoder = RootWriteResultDecoder::for_test_local(
-        RootWriteDecodeContract::for_test([target_five], std::iter::empty()),
-    );
+    let mut decoder = RootWriteResultDecoder::for_test_local(RootWriteDecodeContract::for_test(
+        [target_five],
+        std::iter::empty(),
+    ));
     let error = decoder
         .apply_chunk(&chunk(vec![fragment(4, 4)]))
         .expect_err("target below the maximum is still foreign");
@@ -773,14 +781,13 @@ fn artifact_identity_includes_the_query_local_target() {
     let target_one = WriteTargetOrdinal::try_new(1).expect("target");
     let identity =
         StatisticsArtifactIdentity::try_new(vec![11], "theta-v1").expect("artifact identity");
-    let mut decoder =
-        RootWriteResultDecoder::for_test_local(RootWriteDecodeContract::for_test(
-            [target_zero, target_one],
-            [
-                (target_zero, identity.clone()),
-                (target_one, identity.clone()),
-            ],
-        ));
+    let mut decoder = RootWriteResultDecoder::for_test_local(RootWriteDecodeContract::for_test(
+        [target_zero, target_one],
+        [
+            (target_zero, identity.clone()),
+            (target_one, identity.clone()),
+        ],
+    ));
     decoder
         .apply_chunk(&chunk(vec![
             summary(2),
@@ -872,8 +879,7 @@ fn undeclared_deletion_verification_is_refused_in_arrow_and_record_forms() {
     let mut fingerprint = arrow::array::FixedSizeBinaryBuilder::with_capacity(1, 16);
     fingerprint.append_value([3; 16]).unwrap();
     columns[11] = Arc::new(fingerprint.finish());
-    let verification =
-        Chunk::try_new_with_columns(template.chunk_schema_ref(), columns).unwrap();
+    let verification = Chunk::try_new_with_columns(template.chunk_schema_ref(), columns).unwrap();
     let mut decoder = exact_decoder();
     assert!(
         decoder
@@ -948,7 +954,13 @@ fn declared_verification_is_exact_once_and_preserves_values_in_both_root_forms()
         decoder.observe_root_eof().unwrap();
         let prepared = decoder.finish().unwrap();
         assert_eq!(prepared.row_count(), 17);
-        let (rows, actual, fragments, statistics, _, _) = prepared.into_parts();
+        let DecodedPreparedWriteSet {
+            row_count: rows,
+            delete_verification: actual,
+            fragments,
+            statistics,
+            ..
+        } = prepared;
         assert_eq!((rows, actual), (17, Some(value)));
         assert!(fragments.is_empty());
         assert!(statistics.is_empty());
@@ -980,5 +992,5 @@ fn write_counts_declaration_still_uses_the_ordinary_row_count_record() {
     decoder.apply_chunk(&chunk(vec![summary(23)])).unwrap();
     let prepared = finish(decoder).unwrap();
     assert_eq!(prepared.row_count(), 23);
-    assert_eq!(prepared.into_parts().1, None);
+    assert_eq!(prepared.delete_verification, None);
 }
