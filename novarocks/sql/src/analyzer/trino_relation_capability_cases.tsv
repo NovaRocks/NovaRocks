@@ -1,0 +1,116 @@
+line	rule	alternative	label	clause	sql	gate
+282	corresponding	1		1	TABLE x UNION CORRESPONDING BY ( x ) TABLE x	corresponding
+283	corresponding	1		0	TABLE x UNION CORRESPONDING TABLE x	corresponding
+347	pivot	1		1	SELECT * FROM x PIVOT ( ? , ? FOR x IN ( ? ) )	pivot
+348	pivot	1		2	SELECT * FROM x PIVOT ( ? FOR x IN ( ? , ? ) )	pivot
+349	pivot	1		3	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) GROUP BY ? )	pivot
+350	pivot	1		4	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) ) AS x	pivot
+351	pivot	1		5	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) ) x ( x )	pivot
+352	pivot	1		6	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) ) x	pivot
+353	pivot	1		7	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) )	pivot
+354	pivot	1		0	SELECT * FROM x	feature_absent
+355	pivotAggregation	1		0	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) )	pivot
+356	pivotColumns	1		0	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) )	pivot
+357	pivotColumns	2		1	SELECT * FROM x PIVOT ( ? FOR ( x , x ) IN ( ? ) )	pivot
+358	pivotColumns	2		0	SELECT * FROM x PIVOT ( ? FOR ( x ) IN ( ? ) )	pivot
+359	pivotValueGroup	1		1	SELECT * FROM x PIVOT ( ? FOR x IN ( ( ? , ? ) AS x ) )	pivot
+360	pivotValueGroup	1		2	SELECT * FROM x PIVOT ( ? FOR x IN ( ( ? , ? ) x ) )	pivot
+361	pivotValueGroup	1		0	SELECT * FROM x PIVOT ( ? FOR x IN ( ( ? , ? ) ) )	pivot
+362	pivotValueGroup	2		0	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) )	pivot
+373	patternRecognition	1		1	SELECT * FROM x MATCH_RECOGNIZE ( PARTITION BY ? , ? PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+374	patternRecognition	1		2	SELECT * FROM x MATCH_RECOGNIZE ( PARTITION BY ? PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+375	patternRecognition	1		3	SELECT * FROM x MATCH_RECOGNIZE ( ORDER BY ? PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+376	patternRecognition	1		4	SELECT * FROM x MATCH_RECOGNIZE ( MEASURES ? AS x , ? AS x PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+377	patternRecognition	1		5	SELECT * FROM x MATCH_RECOGNIZE ( MEASURES ? AS x PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+378	patternRecognition	1		6	SELECT * FROM x MATCH_RECOGNIZE ( ONE ROW PER MATCH PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+379	patternRecognition	1		7	SELECT * FROM x MATCH_RECOGNIZE ( AFTER MATCH SKIP TO x PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+380	patternRecognition	1		8	SELECT * FROM x MATCH_RECOGNIZE ( SEEK PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+381	patternRecognition	1		9	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) SUBSET x = ( x ) , x = ( x ) DEFINE x AS ? )	match_recognize
+382	patternRecognition	1		10	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) SUBSET x = ( x ) DEFINE x AS ? )	match_recognize
+383	patternRecognition	1		11	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? , x AS ? )	match_recognize
+384	patternRecognition	1		12	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? ) AS x	match_recognize
+385	patternRecognition	1		13	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? ) x ( x )	match_recognize
+386	patternRecognition	1		14	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? ) x	match_recognize
+387	patternRecognition	1		15	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+388	patternRecognition	1		0	SELECT * FROM x	feature_absent
+390	rowsPerMatch	1		0	SELECT * FROM x MATCH_RECOGNIZE ( ONE ROW PER MATCH PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+391	rowsPerMatch	2		1	SELECT * FROM x MATCH_RECOGNIZE ( ALL ROWS PER MATCH OMIT EMPTY MATCHES PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+392	rowsPerMatch	2		0	SELECT * FROM x MATCH_RECOGNIZE ( ALL ROWS PER MATCH PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+393	emptyMatchHandling	1		0	SELECT * FROM x MATCH_RECOGNIZE ( ALL ROWS PER MATCH SHOW EMPTY MATCHES PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+394	emptyMatchHandling	2		0	SELECT * FROM x MATCH_RECOGNIZE ( ALL ROWS PER MATCH OMIT EMPTY MATCHES PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+395	emptyMatchHandling	3		0	SELECT * FROM x MATCH_RECOGNIZE ( ALL ROWS PER MATCH WITH UNMATCHED ROWS PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+417	relationPrimary	5	tableFunctionInvocation	0	SELECT * FROM TABLE ( x ( ) )	unknown_table_function
+424	relationPrimary	8	nearest	0	SELECT * FROM NEAREST ( FROM x MATCH ? )	nearest
+454	tableFunctionCall	1		1	SELECT * FROM TABLE ( x ( ? , ? ) )	unknown_table_function
+455	tableFunctionCall	1		2	SELECT * FROM TABLE ( x ( ? ) )	unknown_table_function
+456	tableFunctionCall	1		3	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) , ( x , x ) ) )	unknown_table_function
+457	tableFunctionCall	1		4	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) ) )	unknown_table_function
+458	tableFunctionCall	1		0	SELECT * FROM TABLE ( x ( ) )	unknown_table_function
+459	tableFunctionArgument	1		1	SELECT * FROM TABLE ( x ( x => ? ) )	unknown_table_function
+460	tableFunctionArgument	1		0	SELECT * FROM TABLE ( x ( ? ) )	unknown_table_function
+461	tableArgument	1		1	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ( a , b ) ) )	table_function_argument_profile
+462	tableArgument	1		2	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ( ? ) ) )	table_function_argument_profile
+463	tableArgument	1		3	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ? ) )	table_function_argument_profile
+464	tableArgument	1		4	SELECT * FROM TABLE ( x ( TABLE ( x ) KEEP WHEN EMPTY ) )	table_function_argument_profile
+465	tableArgument	1		5	SELECT * FROM TABLE ( x ( TABLE ( x ) ORDER BY ( a , b ) ) )	table_function_argument_profile
+466	tableArgument	1		6	SELECT * FROM TABLE ( x ( TABLE ( x ) ORDER BY ? ) )	table_function_argument_profile
+467	tableArgument	1		0	SELECT * FROM TABLE ( x ( TABLE ( x ) ) )	table_function_argument_profile
+468	tableArgumentRelation	1		1	SELECT * FROM TABLE ( x ( TABLE ( x ) AS x ) )	table_function_argument_profile
+469	tableArgumentRelation	1		2	SELECT * FROM TABLE ( x ( TABLE ( x ) x ( x ) ) )	table_function_argument_profile
+470	tableArgumentRelation	1		3	SELECT * FROM TABLE ( x ( TABLE ( x ) x ) )	table_function_argument_profile
+471	tableArgumentRelation	1	tableArgumentTable	0	SELECT * FROM TABLE ( x ( TABLE ( x ) ) )	table_function_argument_profile
+472	tableArgumentRelation	2		1	SELECT * FROM TABLE ( x ( TABLE ( TABLE x ) AS x ) )	table_function_argument_profile
+473	tableArgumentRelation	2		2	SELECT * FROM TABLE ( x ( TABLE ( TABLE x ) x ( x ) ) )	table_function_argument_profile
+474	tableArgumentRelation	2		3	SELECT * FROM TABLE ( x ( TABLE ( TABLE x ) x ) )	table_function_argument_profile
+475	tableArgumentRelation	2	tableArgumentQuery	0	SELECT * FROM TABLE ( x ( TABLE ( TABLE x ) ) )	table_function_argument_profile
+476	descriptorArgument	1		1	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x , x ) ) )	table_function_argument_profile
+477	descriptorArgument	1		0	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x ) ) )	table_function_argument_profile
+478	descriptorArgument	2		0	SELECT * FROM TABLE ( x ( CAST ( NULL AS DESCRIPTOR ) ) )	table_function_argument_profile
+479	descriptorField	1		1	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x x ) ) )	table_function_argument_profile
+480	descriptorField	1		0	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x ) ) )	table_function_argument_profile
+481	copartitionTables	1		1	SELECT * FROM TABLE ( x ( 1 COPARTITION ( x , x , x ) ) )	table_function_argument_profile
+482	copartitionTables	1		0	SELECT * FROM TABLE ( x ( 1 COPARTITION ( x , x ) ) )	table_function_argument_profile
+2031	corresponding	1		g1.b1	TABLE x UNION CORRESPONDING BY ( x ) TABLE x	corresponding
+2064	pivot	1		g1.b1.g1.b1	SELECT * FROM x PIVOT ( ? , ? FOR x IN ( ? ) )	pivot
+2065	pivot	1		g1.b1.g2.b1	SELECT * FROM x PIVOT ( ? FOR x IN ( ? , ? ) )	pivot
+2066	pivot	1		g1.b1.g3.b1	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) GROUP BY ? )	pivot
+2067	pivot	1		g1.b1.g4.b1	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) ) x	pivot
+2068	pivot	1		g1.b1	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) )	pivot
+2069	pivotColumns	2		g1.b1	SELECT * FROM x PIVOT ( ? FOR ( x , x ) IN ( ? ) )	pivot
+2070	pivotValueGroup	1		g1.b1	SELECT * FROM x PIVOT ( ? FOR x IN ( ( ? , ? ) ) )	pivot
+2071	pivotValueGroup	1		g2.b1	SELECT * FROM x PIVOT ( ? FOR x IN ( ( ? , ? ) x ) )	pivot
+2072	patternRecognition	1		g1.b1.g1.b1.g1.b1	SELECT * FROM x MATCH_RECOGNIZE ( PARTITION BY ? , ? PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+2073	patternRecognition	1		g1.b1.g1.b1	SELECT * FROM x MATCH_RECOGNIZE ( PARTITION BY ? PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+2074	patternRecognition	1		g1.b1.g2.b1.g1.b1	SELECT * FROM x MATCH_RECOGNIZE ( MEASURES ? AS x , ? AS x PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+2075	patternRecognition	1		g1.b1.g2.b1	SELECT * FROM x MATCH_RECOGNIZE ( MEASURES ? AS x PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+2076	patternRecognition	1		g1.b1.g3.b1	SELECT * FROM x MATCH_RECOGNIZE ( AFTER MATCH SKIP TO x PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+2077	patternRecognition	1		g1.b1.g4.b1	SELECT * FROM x MATCH_RECOGNIZE ( INITIAL PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+2078	patternRecognition	1		g1.b1.g4.b2	SELECT * FROM x MATCH_RECOGNIZE ( SEEK PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+2079	patternRecognition	1		g1.b1.g5.b1.g1.b1	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) SUBSET x = ( x ) , x = ( x ) DEFINE x AS ? )	match_recognize
+2080	patternRecognition	1		g1.b1.g5.b1	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) SUBSET x = ( x ) DEFINE x AS ? )	match_recognize
+2081	patternRecognition	1		g1.b1.g6.b1	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? , x AS ? )	match_recognize
+2082	patternRecognition	1		g1.b1.g7.b1	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? ) x	match_recognize
+2083	patternRecognition	1		g1.b1	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? )	match_recognize
+2123	tableFunctionCall	1		g1.b1.g1.b1	SELECT * FROM TABLE ( x ( ? , ? ) )	unknown_table_function
+2124	tableFunctionCall	1		g1.b1	SELECT * FROM TABLE ( x ( ? ) )	unknown_table_function
+2125	tableFunctionCall	1		g2.b1.g1.b1	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) , ( x , x ) ) )	unknown_table_function
+2126	tableFunctionCall	1		g2.b1	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) ) )	unknown_table_function
+2127	tableFunctionArgument	1		g1.b1	SELECT * FROM TABLE ( x ( x => ? ) )	unknown_table_function
+2128	tableFunctionArgument	1		g2.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) ) )	table_function_argument_profile
+2129	tableFunctionArgument	1		g2.b2	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x ) ) )	table_function_argument_profile
+2130	tableFunctionArgument	1		g2.b3	SELECT * FROM TABLE ( x ( ? ) )	unknown_table_function
+2131	tableArgument	1		g1.b1.g1.b1.g1.b1.g1.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ( a , b ) ) )	table_function_argument_profile
+2132	tableArgument	1		g1.b1.g1.b1.g1.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ( ? ) ) )	table_function_argument_profile
+2133	tableArgument	1		g1.b1.g1.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ( ) ) )	table_function_argument_profile
+2134	tableArgument	1		g1.b1.g1.b2	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ? ) )	table_function_argument_profile
+2135	tableArgument	1		g1.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ? ) )	table_function_argument_profile
+2136	tableArgument	1		g2.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) PRUNE WHEN EMPTY ) )	table_function_argument_profile
+2137	tableArgument	1		g2.b2	SELECT * FROM TABLE ( x ( TABLE ( x ) KEEP WHEN EMPTY ) )	table_function_argument_profile
+2138	tableArgument	1		g3.b1.g1.b1.g1.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) ORDER BY ( a , b ) ) )	table_function_argument_profile
+2139	tableArgument	1		g3.b1.g1.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) ORDER BY ( ? ) ) )	table_function_argument_profile
+2140	tableArgument	1		g3.b1.g1.b2	SELECT * FROM TABLE ( x ( TABLE ( x ) ORDER BY ? ) )	table_function_argument_profile
+2141	tableArgument	1		g3.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) ORDER BY ? ) )	table_function_argument_profile
+2142	tableArgumentRelation	1		g1.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) x ) )	table_function_argument_profile
+2143	tableArgumentRelation	2		g1.b1	SELECT * FROM TABLE ( x ( TABLE ( TABLE x ) x ) )	table_function_argument_profile
+2144	descriptorArgument	1		g1.b1	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x , x ) ) )	table_function_argument_profile
+2145	copartitionTables	1		g1.b1	SELECT * FROM TABLE ( x ( 1 COPARTITION ( x , x , x ) ) )	table_function_argument_profile

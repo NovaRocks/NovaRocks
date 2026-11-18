@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::analyze;
-use crate::analyze_error::AnalyzeErrorKind;
+use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
 use crate::catalog::{PlannerTableProvider, ResolvedAnalyzerTable, SqlViewDefinition};
 use arrow::datatypes::DataType;
-use novarocks_parser::ast::SyntaxEq;
+use novarocks_parser::Span;
+use novarocks_parser::ast::{Query, Relation, SetExpr, SyntaxEq, TableFunctionArgumentValue};
 use novarocks_parser::trino_parser::parse_query;
 use novarocks_type_contract::FunctionValueType;
 use novarocks_user_error::ErrorPhase;
@@ -31,21 +32,18 @@ impl PlannerTableProvider for NoCatalog {
     }
 }
 
-fn assert_analyzer_capability(source: &str, owner: &str, reason: &str) {
-    let query = parse_query(source).unwrap_or_else(|error| panic!("{owner}: {source}: {error:?}"));
-    let error = match analyze(&query, &NoCatalog, "default") {
-        Ok(_) => panic!("{owner}: unsupported query reached analysis success: {source}"),
+fn assert_analyzer_rejection(
+    query: &Query,
+    source: &str,
+    owner: &str,
+    kind: AnalyzeErrorKind,
+    descriptor: &str,
+) -> (AnalyzeError, Span) {
+    let error = match analyze(query, &NoCatalog, "default") {
+        Ok(_) => panic!("{owner}: query reached analysis success: {source}"),
         Err(error) => error,
     };
-    assert_eq!(
-        error.kind(),
-        AnalyzeErrorKind::UnsupportedExpression,
-        "{owner}: {source}: {error}",
-    );
-    assert!(
-        error.message().contains(reason),
-        "{owner}: {source}: expected {reason:?}, got {error}",
-    );
+    assert_eq!(error.kind(), kind, "{owner}: {source}: {error}");
 
     let span = error
         .span()
@@ -58,13 +56,26 @@ fn assert_analyzer_capability(source: &str, owner: &str, reason: &str) {
     );
     let user_error = error.to_user_error(Some(source));
     assert_eq!(user_error.phase(), ErrorPhase::Analyze);
-    assert_eq!(
-        user_error.code().as_str(),
-        "sql.analyze.unsupported_expression",
-    );
+    assert_eq!(user_error.code().as_str(), descriptor);
     assert_eq!(
         user_error.location(),
         Some(&span.to_user_error_location(source)),
+    );
+    (error, span)
+}
+
+fn assert_analyzer_capability(source: &str, owner: &str, reason: &str) {
+    let query = parse_query(source).unwrap_or_else(|error| panic!("{owner}: {source}: {error:?}"));
+    let (error, _) = assert_analyzer_rejection(
+        &query,
+        source,
+        owner,
+        AnalyzeErrorKind::UnsupportedExpression,
+        "sql.analyze.unsupported_expression",
+    );
+    assert!(
+        error.message().contains(reason),
+        "{owner}: {source}: expected {reason:?}, got {error}",
     );
 }
 
@@ -135,6 +146,180 @@ fn parsed_trino_queries_reach_their_declared_analyzer_capability_gate() {
         }
     }
     assert_eq!(covered.len(), 186);
+}
+
+fn unaliased_select_relation(query: &Query) -> &Relation {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("expected a query with a FROM relation");
+    };
+    let mut relation = select.from.as_ref().expect("a FROM relation");
+    while let Relation::Aliased(aliased) = relation {
+        relation = aliased.relation.as_ref();
+    }
+    relation
+}
+
+fn assert_relation_capability(source: &str, owner: &str, gate: &str) {
+    let query = parse_query(source).unwrap_or_else(|error| panic!("{owner}: {source}: {error:?}"));
+    let (reason, owner_span) = if gate == "corresponding" {
+        let SetExpr::SetOperation(operation) = query.body.as_ref() else {
+            panic!("{owner}: expected a set operation");
+        };
+        assert!(operation.corresponding.is_some(), "{owner}");
+        (
+            "CORRESPONDING set operations are not supported",
+            operation.span,
+        )
+    } else {
+        match (gate, unaliased_select_relation(&query)) {
+            ("pivot", Relation::Pivot(node)) => ("relation profile is not supported", node.span),
+            ("match_recognize", Relation::PatternRecognition(node)) => {
+                ("relation profile is not supported", node.span)
+            }
+            ("nearest", Relation::Nearest(node)) => {
+                ("relation profile is not supported", node.span)
+            }
+            ("table_function_argument_profile", Relation::TableFunction(node)) => {
+                assert!(
+                    !node.copartitioning.is_empty()
+                        || node.arguments.iter().any(|argument| {
+                            !matches!(argument.value, TableFunctionArgumentValue::Expression(_))
+                        }),
+                    "{owner}: expected table arguments, descriptors or copartitioning",
+                );
+                (
+                    "table function argument profile is not supported",
+                    node.span,
+                )
+            }
+            _ => panic!("{owner}: expected a {gate} syntax node"),
+        }
+    };
+    let (error, actual_span) = assert_analyzer_rejection(
+        &query,
+        source,
+        owner,
+        AnalyzeErrorKind::UnsupportedExpression,
+        "sql.analyze.unsupported_expression",
+    );
+    assert_eq!(error.message(), reason, "{owner}");
+    assert_eq!(actual_span, owner_span, "{owner}: {source}");
+}
+
+fn assert_unknown_table_function(source: &str, owner: &str) {
+    let query = parse_query(source).unwrap_or_else(|error| panic!("{owner}: {source}: {error:?}"));
+    let Relation::TableFunction(function) = unaliased_select_relation(&query) else {
+        panic!("{owner}: expected a table function");
+    };
+    assert!(function.copartitioning.is_empty(), "{owner}");
+    assert!(
+        function
+            .arguments
+            .iter()
+            .all(|argument| matches!(argument.value, TableFunctionArgumentValue::Expression(_))),
+        "{owner}"
+    );
+    let (error, actual_span) = assert_analyzer_rejection(
+        &query,
+        source,
+        owner,
+        AnalyzeErrorKind::UnsupportedQueryShape,
+        "sql.analyze.unsupported_query_shape",
+    );
+    assert_eq!(error.message(), "unsupported table function: x", "{owner}");
+    assert_eq!(actual_span, function.name.span, "{owner}");
+}
+
+fn assert_single_analyzed_type(source: &str, data_type: DataType, nullable: bool) {
+    let query = parse_query(source).unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    let (resolved, _, _) =
+        analyze(&query, &NoCatalog, "default").unwrap_or_else(|error| panic!("{source}: {error}"));
+    let [field] = resolved.output_columns.as_slice() else {
+        panic!("{source}: expected one resolved field");
+    };
+    assert_eq!(
+        field.value_type,
+        FunctionValueType::new(data_type, nullable),
+        "{source}"
+    );
+}
+
+#[test]
+fn relation_grammar_cases_use_the_first_actual_table_free_analyzer_owner() {
+    let parser_ledger: Vec<_> = include_str!("../../../parser/tests/it/grammar-coverage.tsv")
+        .lines()
+        .collect();
+    let mut covered = std::collections::BTreeSet::new();
+    let (mut capability, mut unknown, mut absent) = (0, 0, 0);
+    for line in include_str!("trino_relation_capability_cases.tsv")
+        .lines()
+        .skip(1)
+    {
+        let columns: Vec<_> = line.split('\t').collect();
+        let [row, rule, alternative, label, clause, authored, gate] = columns.as_slice() else {
+            panic!("invalid relation grammar coverage row: {line}");
+        };
+        let row: usize = row.parse().unwrap();
+        assert!(covered.insert(row), "duplicate grammar coverage row {row}");
+        let fields: Vec<_> = parser_ledger[row - 1].split('\t').collect();
+        assert_eq!(
+            &fields[1..6],
+            [*rule, *alternative, *label, *clause, *authored]
+        );
+        let source = format!("WITH x(x) AS (VALUES 1) {authored}");
+        let owner = format!("grammar row {row} ({rule})");
+        match *gate {
+            "unknown_table_function" => {
+                assert_unknown_table_function(&source, &owner);
+                unknown += 1;
+            }
+            "feature_absent" => {
+                assert_single_analyzed_type(&source, DataType::Int32, true);
+                absent += 1;
+            }
+            gate => {
+                assert_relation_capability(&source, &owner, gate);
+                capability += 1;
+            }
+        }
+    }
+    assert_eq!((capability, unknown, absent), (99, 14, 2));
+}
+
+#[test]
+fn admitted_table_function_distinguishes_argument_profiles_and_value_types() {
+    for source in [
+        "SELECT * FROM TABLE (generate_series(1, 2))",
+        "SELECT * FROM TABLE (generate_series(start => 1, \"end\" => 2))",
+    ] {
+        assert_single_analyzed_type(source, DataType::Int64, false);
+    }
+    for source in [
+        "WITH x(x) AS (VALUES 1) SELECT * FROM TABLE (generate_series(TABLE(x)))",
+        "SELECT * FROM TABLE (generate_series(DESCRIPTOR(x)))",
+        "SELECT * FROM TABLE (generate_series(1, 2 COPARTITION (x, x)))",
+    ] {
+        assert_relation_capability(
+            source,
+            "existing table function",
+            "table_function_argument_profile",
+        );
+    }
+    let source = "SELECT * FROM TABLE (generate_series('1', 2))";
+    let query = parse_query(source).unwrap();
+    let (error, span) = assert_analyzer_rejection(
+        &query,
+        source,
+        "integer constant requirement",
+        AnalyzeErrorKind::InvalidLiteral,
+        "sql.analyze.invalid_literal",
+    );
+    assert!(
+        error
+            .message()
+            .starts_with("expected constant integer expression")
+    );
+    assert_eq!(&source[span.start()..span.end()], "'1'");
 }
 
 #[test]
