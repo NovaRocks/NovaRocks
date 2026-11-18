@@ -55,7 +55,7 @@ select * from TABLE(generate_series(start=>2));
 
 -- query 10
 -- @expect_error=Unknown table function
-select * from TABLE(generate_series(end=>2));
+select * from TABLE(generate_series(`end`=>2));
 
 -- query 11
 -- @expect_error=Unknown table function
@@ -67,19 +67,19 @@ select * from TABLE(generate_series(start=>2, stop=>null));
 
 -- query 13
 -- @expect_error=table function not support null parameter
-select * from TABLE(generate_series(start=>2, end=>null));
+select * from TABLE(generate_series(start=>2, `end`=>null));
 
 -- query 14
 -- @expect_error=No viable statement for input
-select * from TABLE(generate_series(start=>2, end=>4,step->3));
+select * from TABLE(generate_series(start=>2, `end`=>4,step->3));
 
 -- query 15
 -- @expect_error=Unknown table function
-select * from TABLE(generate_series(start=>2, step=>2, end=>4,start=>3));
+select * from TABLE(generate_series(start=>2, step=>2, `end`=>4,start=>3));
 
 -- query 16
 -- @expect_error=Unknown table function
-select * from TABLE(generate_series(start=>2, step=>2, end=>4,end=>6));
+select * from TABLE(generate_series(start=>2, step=>2, `end`=>4,`end`=>6));
 
 -- query 17
 select * from TABLE(generate_series(1, 5));

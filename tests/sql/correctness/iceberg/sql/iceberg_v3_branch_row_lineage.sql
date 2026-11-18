@@ -69,7 +69,7 @@ DELETE FROM br_rl_${uuid0}.ns_${uuid0}.brlineage.branch_feat WHERE id = 3;
 -- query 4
 -- main is unchanged: still 3 rows with their original row-lineage triples.
 -- @db=br_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS n_main_rows, count(DISTINCT _row_id) AS n_main_unique
+SELECT count() AS n_main_rows, count(DISTINCT _row_id) AS n_main_unique
   FROM brlineage;
 
 -- query 5

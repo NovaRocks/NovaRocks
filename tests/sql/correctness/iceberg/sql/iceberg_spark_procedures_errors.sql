@@ -92,7 +92,7 @@ CALL proc_err_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0
 
 -- query 10
 -- @db=proc_err_${uuid0}.ns_${uuid0}
-SELECT COUNT(*) AS n FROM v2_orders;
+SELECT COUNT() AS n FROM v2_orders;
 
 -- query 11
 -- @skip_result_check=true

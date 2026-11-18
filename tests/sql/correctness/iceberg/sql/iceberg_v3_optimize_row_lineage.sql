@@ -85,14 +85,14 @@ SELECT id, v FROM olineage ORDER BY id;
 SELECT
   sum(CASE WHEN content = 0 THEN 1 ELSE 0 END) > 1 AS multiple_data_files,
   sum(CASE WHEN content <> 0 THEN 1 ELSE 0 END) > 0 AS has_active_delete_files
-  FROM olineage$files;
+  FROM "olineage$files";
 
 -- query 6
 -- The saved tag is the current baseline immediately before OPTIMIZE.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS main_matches_pre_opt
-  FROM olineage$refs AS current_ref
-  JOIN olineage$refs AS baseline_ref
+SELECT count() AS main_matches_pre_opt
+  FROM "olineage$refs" AS current_ref
+  JOIN "olineage$refs" AS baseline_ref
     ON current_ref.snapshot_id = baseline_ref.snapshot_id
   WHERE current_ref.name = 'main' AND baseline_ref.name = 'pre_opt';
 

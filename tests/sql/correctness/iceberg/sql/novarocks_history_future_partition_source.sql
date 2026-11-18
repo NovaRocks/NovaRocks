@@ -93,7 +93,7 @@ SELECT * FROM future_partition_source FOR SYSTEM_TIME AS OF '2999-12-31 00:00:00
 SELECT id, future FROM future_partition_source ORDER BY id;
 
 -- query 7
-SELECT count(*) AS snapshot_count FROM future_partition_source$snapshots;
+SELECT count() AS snapshot_count FROM "future_partition_source$snapshots";
 
 -- query 8
 -- @skip_result_check=true
@@ -107,7 +107,7 @@ ON t.id = s.id
 WHEN MATCHED THEN UPDATE SET future = s.future;
 
 -- query 10
-SELECT count(*) AS snapshot_count FROM future_partition_source$snapshots;
+SELECT count() AS snapshot_count FROM "future_partition_source$snapshots";
 
 -- query 11
 SELECT id, future FROM future_partition_source ORDER BY id;
