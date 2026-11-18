@@ -53,7 +53,7 @@ fn between_count(source: &SqlAuthoredPhysicalPlan) -> usize {
         .plan()
         .fragments()
         .values()
-        .flat_map(|f| super::sql_test_source::unit_definitions(f))
+        .flat_map(super::sql_test_source::unit_definitions)
         .filter(|(_, _, _, e)| matches!(e.kind, ExprKind::Between { .. }))
         .count()
 }

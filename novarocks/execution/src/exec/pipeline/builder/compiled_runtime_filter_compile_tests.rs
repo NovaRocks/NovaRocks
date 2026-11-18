@@ -516,7 +516,7 @@ fn compile(dop: usize) -> Arc<LocalProgram> {
     let (plan, read) = plan();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, _fragment) in plan.fragments() {
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),

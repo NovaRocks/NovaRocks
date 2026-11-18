@@ -150,10 +150,10 @@ fn root_recipe(
     &novarocks_functions::PreparedCastRecipe,
     ExpressionEffectContext,
 ) {
-    let occurrence = cast_root_use(&program);
+    let occurrence = cast_root_use(program);
     (
-        root_unit(&program).recipes().cast(occurrence).unwrap(),
-        root_unit(&program).control_flow().uses()[&occurrence].context,
+        root_unit(program).recipes().cast(occurrence).unwrap(),
+        root_unit(program).control_flow().uses()[&occurrence].context,
     )
 }
 

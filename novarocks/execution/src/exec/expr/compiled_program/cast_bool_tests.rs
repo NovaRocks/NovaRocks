@@ -163,10 +163,10 @@ fn assert_zero_one(
     }
 }
 fn root_context(program: &LocalProgram) -> (ExpressionUseId, ExpressionEffectContext) {
-    let occurrence = cast_root_use(&program);
+    let occurrence = cast_root_use(program);
     (
         occurrence,
-        root_unit(&program).control_flow().uses()[&occurrence].context,
+        root_unit(program).control_flow().uses()[&occurrence].context,
     )
 }
 

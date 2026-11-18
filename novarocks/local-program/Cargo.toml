@@ -17,7 +17,6 @@ novarocks-failure-contract.workspace = true
 novarocks-result-contract.workspace = true
 novarocks-type-contract.workspace = true
 arrow-array.workspace = true
-arrow-buffer.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
 novarocks-connector-contract.workspace = true
 novarocks-execution-contract.workspace = true

@@ -236,12 +236,11 @@ fn assert_writer_selections(
         .plan()
         .fragments()
         .values()
-        .map(|fragment| {
+        .inspect(|fragment| {
             fragment
                 .calls()
                 .validate_fragment(fragment, &control)
                 .unwrap();
-            fragment
         })
         .collect::<Vec<_>>();
     assert_eq!(authored.len(), source.plan().fragments().len());
@@ -605,12 +604,11 @@ fn wide_collect_true_actual_theta_plan_freezes_with_production_limits() {
         .plan()
         .fragments()
         .values()
-        .map(|fragment| {
+        .inspect(|fragment| {
             fragment
                 .calls()
                 .validate_fragment(fragment, &control)
                 .unwrap();
-            fragment
         })
         .collect::<Vec<_>>();
     assert_eq!(authored.len(), owner.plan().fragments().len());

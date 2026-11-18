@@ -198,8 +198,8 @@ fn input_array(
     .unwrap()
 }
 fn context(program: &LocalProgram) -> (ExpressionUseId, ExpressionEffectContext) {
-    let u = cast_root_use(&program);
-    (u, root_unit(&program).control_flow().uses()[&u].context)
+    let u = cast_root_use(program);
+    (u, root_unit(program).control_flow().uses()[&u].context)
 }
 #[test]
 fn actual_compiled_unsigned_cast_all_seventy_two_profiles_preserve_sparse_slice_nulls_and_policies()

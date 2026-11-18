@@ -554,7 +554,7 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
 
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, _fragment) in plan.fragments() {
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),

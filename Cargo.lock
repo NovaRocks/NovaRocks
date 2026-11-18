@@ -3421,7 +3421,6 @@ dependencies = [
  "novarocks-connector-iceberg-functions",
  "novarocks-control-runtime",
  "novarocks-control-runtime-core",
- "novarocks-coordination-contract",
  "novarocks-execution-contract",
  "novarocks-expression",
  "novarocks-expression-contract",
@@ -3704,7 +3703,6 @@ name = "novarocks-local-program"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
- "arrow-buffer",
  "arrow-schema",
  "bytes",
  "novarocks-connector-contract",
@@ -4538,7 +4536,6 @@ dependencies = [
  "novarocks-local-compiler",
  "novarocks-local-program",
  "novarocks-memory",
- "novarocks-memory-failure",
  "novarocks-physical-plan",
  "novarocks-result-contract",
  "novarocks-spi",
