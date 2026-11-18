@@ -2993,9 +2993,7 @@ fn a_session_that_never_decides_releases_its_hold_when_dropped() {
     assert_eq!(accounting.holds(), 0);
     assert!(accounting.leases_cleared());
 }
-mod begin_context_tests {
-    include!("write_session_begin_context_tests.rs");
-}
+mod begin_context_tests;
 
 #[tokio::test]
 async fn async_begin_uses_the_original_session_plan_and_context() {
