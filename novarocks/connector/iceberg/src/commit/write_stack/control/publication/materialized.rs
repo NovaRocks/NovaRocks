@@ -20,13 +20,19 @@ use std::sync::Arc;
 
 use crate::commit::helpers::{snapshot_total_records, target_ref_snapshot_id};
 use crate::commit::manifest_sources::{LocatedEntry, SnapshotSources};
-use crate::commit::model::{ArtifactWriter, EntryIdentity, FrozenEntry, OperationIntent, SeqField};
+use crate::commit::model::{ArtifactWriter, EntryIdentity, FrozenEntry, OperationIntent};
+use crate::commit::operation::IcebergCommitOperation;
 use crate::commit::row_delta_dv_metadata::{
     logical_file_size, write_added_entry_groups_with_partitions,
 };
 use crate::commit::staging::{PreparedChange, Preparer, StagedView};
 use crate::commit::write_stack::domain::{
-    IcebergArtifactPartition, IcebergFinalDeleteEffect, IcebergFinalDeleteKind,
+    IcebergArtifactPartition, IcebergDeleteTargetLocator, IcebergFinalDeleteEffect,
+    IcebergFinalDeleteKind,
+};
+use crate::commit::write_stack::receiving::ReceivedCompactFiles;
+use crate::commit::write_stack::receiving::compact::{
+    AddedCounters, CompactDeleteKind, PhysicalAdditionCounts,
 };
 use crate::delete_semantics::{DeleteKind, TypedPartition};
 use crate::iceberg::spec::{DataContentType, Operation, TableMetadata};
@@ -34,9 +40,47 @@ use crate::iceberg::{Error, ErrorKind, Result};
 use crate::manifest::target_query::{ManifestReadScope, TargetFacts};
 use crate::write_descriptor::decode_partition_descriptor_with_type;
 
-pub(super) struct MaterializedDeleteStep {
+pub(in crate::commit::write_stack) struct MaterializedDeleteStep {
     targets: BTreeMap<String, Target>,
     observed: tokio::sync::OnceCell<CompletedStep>,
+    compact: Option<CompactStage>,
+}
+
+struct CompactStage {
+    operation: IcebergCommitOperation,
+    stage: usize,
+    counts: AddedCounters,
+}
+
+struct ObservedTarget<'a> {
+    path: &'a str,
+    partition: &'a IcebergArtifactPartition,
+    effect: Option<EffectRef<'a>>,
+}
+
+struct EffectRef<'a> {
+    locator: &'a IcebergDeleteTargetLocator,
+    old_references: &'a [EntryIdentity],
+    removes_data: bool,
+}
+
+impl<'a> EffectRef<'a> {
+    fn from_whole(effect: &'a IcebergFinalDeleteEffect) -> Self {
+        let (old_references, removes_data) = match effect.kind() {
+            IcebergFinalDeleteKind::RemoveDataFile {
+                old_exclusive_deletes,
+                ..
+            } => (old_exclusive_deletes.as_ref(), true),
+            IcebergFinalDeleteKind::ReplacePositions(vector) => {
+                (vector.merged_old_references(), false)
+            }
+        };
+        Self {
+            locator: effect.target(),
+            old_references,
+            removes_data,
+        }
+    }
 }
 
 pub(super) struct Target {
@@ -54,10 +98,72 @@ impl MaterializedDeleteStep {
         Self {
             targets,
             observed: tokio::sync::OnceCell::new(),
+            compact: None,
         }
     }
 
-    pub(super) async fn observe(
+    pub(in crate::commit::write_stack) fn compact(
+        operation: IcebergCommitOperation,
+        stage: usize,
+        counts: AddedCounters,
+    ) -> Self {
+        Self {
+            targets: BTreeMap::new(),
+            observed: tokio::sync::OnceCell::new(),
+            compact: Some(CompactStage {
+                operation,
+                stage,
+                counts,
+            }),
+        }
+    }
+
+    fn observed_targets<'a>(
+        &'a self,
+        compact: Option<&'a ReceivedCompactFiles>,
+    ) -> impl Iterator<Item = ObservedTarget<'a>> {
+        self.targets
+            .iter()
+            .map(|(path, target)| ObservedTarget {
+                path,
+                partition: &target.partition,
+                effect: target.final_effect.as_ref().map(EffectRef::from_whole),
+            })
+            .chain(compact.into_iter().flat_map(|files| {
+                files
+                    .v2_targets
+                    .iter()
+                    .map(|(path, partition)| ObservedTarget {
+                        path,
+                        partition,
+                        effect: None,
+                    })
+                    .chain(files.entries().filter_map(|entry| {
+                        let effect = entry.delete_effect.as_ref()?;
+                        let (partition, old_references, removes_data) = match &effect.kind {
+                            CompactDeleteKind::RemoveDataFile {
+                                partition,
+                                old_exclusive_deletes,
+                            } => (partition, old_exclusive_deletes.as_ref(), true),
+                            CompactDeleteKind::ReplacePositions {
+                                partition,
+                                merged_old_references,
+                            } => (partition.as_ref(), merged_old_references.as_slice(), false),
+                        };
+                        Some(ObservedTarget {
+                            path: effect.target.data_file_path(),
+                            partition,
+                            effect: Some(EffectRef {
+                                locator: &effect.target,
+                                old_references,
+                                removes_data,
+                            }),
+                        })
+                    }))
+            }))
+    }
+
+    pub(in crate::commit::write_stack) async fn observe(
         &self,
         source: Arc<TableMetadata>,
         snapshot_id: i64,
@@ -69,35 +175,26 @@ impl MaterializedDeleteStep {
             .get_or_try_init(|| async {
                 let mut scope =
                     ManifestReadScope::new(source, snapshot_id)?.with_owned_request(request);
+                let pending = self
+                    .compact
+                    .as_ref()
+                    .map(|compact| compact.operation.pending_stage_new_files(compact.stage))
+                    .transpose()?;
+                let compact_files = pending.as_ref().map(|pending| &pending.received);
                 let target_bytes =
-                    self.targets
-                        .iter()
-                        .try_fold(0u64, |total, (path, target)| {
-                            let descriptor = target.partition.descriptor();
-                            let fixed = std::mem::size_of::<(String, Target, TypedPartition)>();
-                            let values =
-                                descriptor.values.iter().try_fold(fixed, |bytes, value| {
-                                    bytes
-                                        .checked_add(std::mem::size_of_val(value))
-                                        .and_then(|bytes| {
-                                            bytes.checked_add(
-                                                value.datum_bytes.as_ref().map_or(0, Vec::capacity),
-                                            )
-                                        })
-                                        .ok_or_else(|| {
-                                            invalid(
-                                                "materialized target partition backing overflow",
-                                            )
-                                        })
-                                })?;
+                    self.observed_targets(compact_files)
+                        .try_fold(0u64, |total, target| {
                             total
-                                .checked_add(values as u64)
-                                .and_then(|total| total.checked_add(path.capacity() as u64))
+                                .checked_add(observation_target_bytes(
+                                    target.path,
+                                    target.partition,
+                                    compact_files.is_some(),
+                                )?)
                                 .ok_or_else(|| invalid("materialized target backing overflow"))
                         })?;
                 scope.reserve_owned(target_bytes).await?;
                 let mut typed = BTreeMap::new();
-                for (path, target) in &self.targets {
+                for target in self.observed_targets(compact_files) {
                     io.check_active()?;
                     let spec_id = target.partition.partition_spec_id();
                     let spec = scope
@@ -118,7 +215,7 @@ impl MaterializedDeleteStep {
                     .map_err(|error| invalid(error.detail_message()))?;
                     let value = TypedPartition::bind_type(spec, &partition_type, &tuple)
                         .map_err(|error| invalid(error.to_string()))?;
-                    typed.insert(path.clone(), value);
+                    typed.insert(target.path.to_owned(), value);
                 }
                 let observation = scope
                     .observe(typed, io.file_io(), || io.check_active())
@@ -126,31 +223,23 @@ impl MaterializedDeleteStep {
                 let mut removed = Vec::new();
                 let mut removed_ids = BTreeSet::new();
                 let sources = scope.snapshot_sources()?;
-                for (path, target) in &self.targets {
-                    let data = observation.files.get(path).ok_or_else(|| {
+                for target in self.observed_targets(compact_files) {
+                    let data = observation.files.get(target.path).ok_or_else(|| {
                         invalid("materialized target is absent from the completed observation")
                     })?;
-                    let Some(effect) = &target.final_effect else {
+                    let Some(effect) = target.effect else {
                         continue;
                     };
-                    if effect.target() != &data.data_locator(&observation.completion)? {
+                    if !data.matches_data_locator(&observation.completion, effect.locator)? {
                         return Err(invalid(
                             "materialized delete differs from its exact source locator",
                         ));
                     }
                     let old = exclusive_positions(data)?;
-                    let reported = match effect.kind() {
-                        IcebergFinalDeleteKind::RemoveDataFile {
-                            old_exclusive_deletes,
-                            ..
-                        } => {
-                            push_removal(&mut removed, &mut removed_ids, &sources, &data.data)?;
-                            old_exclusive_deletes.as_ref()
-                        }
-                        IcebergFinalDeleteKind::ReplacePositions(vector) => {
-                            vector.merged_old_references()
-                        }
-                    };
+                    if effect.removes_data {
+                        push_removal(&mut removed, &mut removed_ids, &sources, &data.data)?;
+                    }
+                    let reported = effect.old_references;
                     if !reported.iter().eq(old.keys().copied()) {
                         return Err(invalid(
                             "materialized delete differs from its exact exclusive old positions",
@@ -170,6 +259,58 @@ impl MaterializedDeleteStep {
             .map(|entry| entry.frozen.clone())
             .collect())
     }
+}
+
+pub(in crate::commit::write_stack) fn observation_target_bytes(
+    path: &str,
+    partition: &IcebergArtifactPartition,
+    compact: bool,
+) -> Result<u64> {
+    // Compact target input is already covered by the original receipt.
+    // Reserve the newly created typed-map slot, decoding scratch and output.
+    use crate::delete_semantics::CanonicalScalar;
+    use crate::iceberg::spec::{Literal, PrimitiveType};
+
+    let (fixed, field_bytes) = if compact {
+        let arc_headers = 4 * std::mem::size_of::<std::sync::atomic::AtomicUsize>();
+        let fields = 2 * std::mem::size_of::<(i32, PrimitiveType)>()
+            + 2 * std::mem::size_of::<Option<CanonicalScalar>>();
+        (
+            std::mem::size_of::<(String, TypedPartition)>() + arc_headers,
+            std::mem::size_of::<Option<Literal>>() + fields,
+        )
+    } else {
+        (
+            std::mem::size_of::<(String, Target, TypedPartition)>(),
+            std::mem::size_of::<crate::write_descriptor::IcebergPartitionValueDescriptor>(),
+        )
+    };
+    let bytes = partition
+        .descriptor()
+        .values
+        .iter()
+        .try_fold(fixed, |total, field| {
+            let value_bytes = field.datum_bytes.as_ref().map_or(0, |bytes| {
+                if compact {
+                    bytes.len()
+                } else {
+                    bytes.capacity()
+                }
+            });
+            let peak_value = if compact {
+                value_bytes.checked_mul(2)
+            } else {
+                Some(value_bytes)
+            };
+            peak_value
+                .and_then(|bytes| total.checked_add(bytes))
+                .and_then(|total| total.checked_add(field_bytes))
+                .ok_or_else(|| invalid("materialized target partition backing overflow"))
+        })?;
+    bytes
+        .checked_add(path.len())
+        .and_then(|total| u64::try_from(total).ok())
+        .ok_or_else(|| invalid("materialized target backing overflow"))
 }
 
 fn exclusive_positions(facts: &TargetFacts) -> Result<BTreeMap<&EntryIdentity, &LocatedEntry>> {
@@ -318,38 +459,14 @@ impl Preparer for Arc<MaterializedDeleteStep> {
             return Err(invalid("materialized delete source changed before staging"));
         }
         let removed = observed.removed.iter().collect::<Vec<_>>();
-        let mut summary = Summary::default();
-        let mut output_ids = BTreeSet::new();
-        for added in &intent.changes().added {
-            view.artifacts().check_active()?;
-            let file = added.file();
-            if added.data_sequence() != SeqField::Inherit
-                || !output_ids.insert(EntryIdentity::try_from(file)?)
-            {
-                return Err(invalid(
-                    "materialized write has a repeated or non-inheriting addition",
-                ));
-            }
-            match file.content_type() {
-                DataContentType::Data if file.first_row_id().is_none() => {
-                    summary
-                        .data
-                        .add(file.record_count(), logical_file_size(file)?)?;
-                }
-                DataContentType::PositionDeletes => {
-                    let referenced = file
-                        .referenced_data_file()
-                        .ok_or_else(|| invalid("materialized delete file has no exact target"))?;
-                    if !self.targets.contains_key(referenced.as_str()) {
-                        return Err(invalid("materialized output references a different target"));
-                    }
-                    summary
-                        .position
-                        .add(file.record_count(), logical_file_size(file)?)?;
-                }
-                _ => return Err(invalid("unsupported materialized row-delta addition")),
-            }
-        }
+        let mut summary = match &self.compact {
+            Some(compact) => Summary {
+                data: compact.counts.data.into(),
+                position: compact.counts.position_deletes.into(),
+                ..Summary::default()
+            },
+            None => legacy_addition_summary(view, intent, &self.targets)?,
+        };
         for entry in &removed {
             let count = entry.frozen.facts().record_count;
             match entry.content_type {
@@ -383,13 +500,25 @@ impl Preparer for Arc<MaterializedDeleteStep> {
             observed.scope.schema(),
         )
         .map_err(invalid)?;
-        let added = write_added_entry_groups_with_partitions(
-            view,
-            snapshot,
-            intent.changes().added.clone(),
-            Some(&historical),
-        )
-        .await?;
+        let added = if let Some(compact) = &self.compact {
+            let (added, _) = crate::commit::new_manifests::prepare_added_manifests(
+                &compact.operation,
+                view,
+                compact.stage,
+                snapshot,
+                Some(&historical),
+            )
+            .await?;
+            added
+        } else {
+            write_added_entry_groups_with_partitions(
+                view,
+                snapshot,
+                intent.changes().added.clone(),
+                Some(&historical),
+            )
+            .await?
+        };
         let manifests = crate::commit::manifest_transform::ordinary_manifests_scoped(
             view,
             snapshot,
@@ -406,11 +535,56 @@ impl Preparer for Arc<MaterializedDeleteStep> {
     }
 }
 
+fn legacy_addition_summary(
+    view: &StagedView<'_>,
+    intent: &OperationIntent,
+    targets: &BTreeMap<String, Target>,
+) -> Result<Summary> {
+    let mut summary = Summary::default();
+    let mut output_ids = BTreeSet::new();
+    for added in &intent.changes().added {
+        view.artifacts().check_active()?;
+        let file = added.file();
+        let identity = EntryIdentity::try_from(file)?;
+        if !output_ids.insert(identity.clone()) {
+            return Err(invalid(
+                "materialized write has a repeated or non-inheriting addition",
+            ));
+        }
+        let declared_target = file
+            .referenced_data_file()
+            .filter(|path| targets.contains_key(path));
+        crate::commit::write_stack::receiving::validation::validate_materialized_addition(
+            &identity,
+            declared_target.as_deref(),
+            added,
+        )
+        .map_err(|error| invalid(error.message()))?;
+        let counters = match file.content_type() {
+            DataContentType::Data => &mut summary.data,
+            DataContentType::PositionDeletes => &mut summary.position,
+            _ => unreachable!("validated materialized addition content"),
+        };
+        counters.add(file.record_count(), logical_file_size(file)?)?;
+    }
+    Ok(summary)
+}
+
 #[derive(Default)]
 struct Counts {
     files: u64,
     rows: u64,
     size: u64,
+}
+
+impl From<PhysicalAdditionCounts> for Counts {
+    fn from(counts: PhysicalAdditionCounts) -> Self {
+        Self {
+            files: counts.files,
+            rows: counts.rows,
+            size: counts.bytes,
+        }
+    }
 }
 
 impl Counts {

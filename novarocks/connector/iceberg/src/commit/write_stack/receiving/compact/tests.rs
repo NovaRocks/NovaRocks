@@ -428,6 +428,7 @@ fn final_delete_keeps_only_the_unshared_effect_and_the_admitted_addition() {
     assert_eq!(effect.newly_deleted_rows, 3);
     let CompactDeleteKind::ReplacePositions {
         merged_old_references,
+        ..
     } = &effect.kind
     else {
         panic!("the compact replacement must preserve its logical delete effect");

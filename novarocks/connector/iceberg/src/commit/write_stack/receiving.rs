@@ -32,16 +32,13 @@ use novarocks_spi::connector::{
 };
 
 use super::domain::{
-    IcebergSealedWriteTarget, IcebergWriteCommitSession, IcebergWriteFlavor, invalid,
+    IcebergArtifactPartition, IcebergCommitArtifact, IcebergSealedWriteTarget,
+    IcebergWriteCommitSession, IcebergWriteFlavor, invalid,
 };
 use super::runtime::IcebergWriteAdapter;
 use compact::{AddedCounters, CompactEntry};
 use validation::{FragmentAdmission, StatementIndexes};
 
-#[allow(
-    dead_code,
-    reason = "Later compact flavors consume the retained delete effects in RWM-16 P09"
-)]
 pub(crate) mod compact;
 
 type WriteFragment = (WriteTargetOrdinal, ConnectorCommitFragment);
@@ -62,6 +59,9 @@ struct CompactReceiving {
 
 #[derive(Default)]
 pub(crate) struct ReceivedCompactFiles {
+    // One exact partition witness per V2 target. Its backing is prepaid by
+    // the first compact fragment for that target.
+    pub(crate) v2_targets: BTreeMap<String, IcebergArtifactPartition>,
     // Each node owns one paid entry and can release its allocation immediately
     // after the manifest write. Grouping happens once, during receiving.
     pub(crate) groups: BTreeMap<AdditionGroup, LinkedList<CompactEntry>>,
@@ -76,6 +76,16 @@ pub(crate) enum AdditionGroup {
 }
 
 impl ReceivedCompactFiles {
+    pub(crate) fn has_delete_effects(&self) -> bool {
+        !self.v2_targets.is_empty()
+            || self.groups.keys().any(|group| {
+                matches!(
+                    group,
+                    AdditionGroup::Removals | AdditionGroup::Additions { deletes: true, .. }
+                )
+            })
+    }
+
     pub(crate) fn entries(&self) -> impl Iterator<Item = &CompactEntry> {
         self.groups.values().flatten()
     }
@@ -167,6 +177,20 @@ impl IcebergReceiving {
         }
     }
 
+    pub(super) fn enable_fixed_mutation(&mut self, flavor: IcebergWriteFlavor) {
+        if matches!(
+            flavor,
+            IcebergWriteFlavor::RowMutationPositionDelete
+                | IcebergWriteFlavor::RowMutationDeletionVector
+        ) {
+            assert!(
+                self.is_unstarted(),
+                "fixed mutation must be bound before receiving"
+            );
+            self.compact = Some(CompactReceiving::default());
+        }
+    }
+
     pub(crate) fn compact_files(&self) -> Option<&ReceivedCompactFiles> {
         self.compact.as_ref().map(|compact| &compact.files)
     }
@@ -197,8 +221,24 @@ impl IcebergReceiving {
         let mut admission = FragmentAdmission::for_record(handle, &compact.indexes);
         let mut counts = compact.files.counts;
         let mut prepared = Vec::with_capacity(fragments.len());
+        let mut v2_targets = BTreeMap::<&str, &IcebergArtifactPartition>::new();
         for (target, fragment) in &fragments {
             let typed = adapter.commit_fragment(fragment)?;
+            let position_target = match typed.artifact() {
+                IcebergCommitArtifact::PositionDeleteFile(file)
+                    if handle.mutation_read().is_some() =>
+                {
+                    Some(file)
+                }
+                _ => None,
+            };
+            let previous_partition = position_target.and_then(|file| {
+                compact
+                    .files
+                    .v2_targets
+                    .get(file.referenced_data_file())
+                    .or_else(|| v2_targets.get(file.referenced_data_file()).copied())
+            });
             let index_bytes = admission.admit_record_fragment(
                 *target,
                 typed,
@@ -206,8 +246,22 @@ impl IcebergReceiving {
                     Some(production) => production.admits(*target, physical),
                     None => Ok(false),
                 },
-                None,
+                previous_partition,
             )?;
+            let witness_bytes = if let Some(file) = position_target
+                && previous_partition.is_none()
+            {
+                v2_targets.insert(file.referenced_data_file(), file.partition());
+                compact::position_target_index_bytes(file.referenced_data_file(), file.partition())?
+            } else {
+                0
+            };
+            let index_bytes = index_bytes.checked_add(witness_bytes).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "Iceberg compact receiving index size overflow",
+                )
+            })?;
             let entry = CompactEntry::prepare(adapter, fragment, index_bytes, author)?;
             counts = counts.checked_add(entry.counts())?;
             prepared.push(entry);
@@ -221,18 +275,23 @@ impl IcebergReceiving {
         };
         let mut entries = Vec::with_capacity(prepared.len());
         let delta = admission.finish_record().into_owned();
+        let new_targets: BTreeMap<_, _> = v2_targets
+            .into_iter()
+            .map(|(path, partition)| (path.to_owned(), partition.clone()))
+            .collect();
         for (preflight, (_, fragment)) in prepared.iter_mut().zip(fragments) {
             match preflight.finish(adapter, &mut Some(fragment)) {
                 Ok(entry) => entries.push(entry),
                 Err(error) => {
                     // The failed preflight and the entries already moved still
                     // pay for the pending keys until that backing is destroyed.
-                    drop(delta);
+                    drop((delta, new_targets));
                     return Err(error);
                 }
             }
         }
         compact.indexes.apply(delta);
+        compact.files.v2_targets.extend(new_targets);
         for entry in entries {
             compact.files.push(entry);
         }

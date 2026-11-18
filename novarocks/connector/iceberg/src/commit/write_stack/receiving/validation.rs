@@ -489,13 +489,6 @@ fn check_position_rewrite(
 /// Validate the actual projected addition of an already admitted materialized
 /// fragment. The fragment's exact declared target remains the authority; the
 /// source snapshot still has to be observed during publication.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Compact row mutations validate projected additions in P09"
-    )
-)]
 pub(crate) fn validate_materialized_addition(
     expected_identity: &EntryIdentity,
     declared_target: Option<&str>,

@@ -242,10 +242,28 @@ impl IcebergCommitOperation {
                 "Iceberg compact files can only be installed once before preparation",
             ));
         }
-        artifacts
-            .new_files
-            .insert(stage, super::new_manifests::StageNewFiles::Pending(files));
+        artifacts.new_files.insert(
+            stage,
+            super::new_manifests::StageNewFiles::Pending(Arc::new(files)),
+        );
         Ok(())
+    }
+
+    pub(crate) fn pending_stage_new_files(
+        &self,
+        stage: usize,
+    ) -> Result<Arc<super::new_manifests::PendingNewFiles>> {
+        let artifacts = self
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg operation artifacts poisoned"))?;
+        match artifacts.new_files.get(&stage) {
+            Some(super::new_manifests::StageNewFiles::Pending(files)) => Ok(Arc::clone(files)),
+            _ => Err(internal(
+                "Iceberg materialized stage has no pending source files",
+            )),
+        }
     }
 
     pub(crate) fn take_stage_new_files(

@@ -17,6 +17,7 @@
 
 //! Exercises the one-stage manifest writer and observes actual receipt releases.
 
+mod delete_encoding;
 mod lower_bound;
 mod rolling;
 

@@ -17,6 +17,7 @@
 
 //! Operation-owned additions and their reusable manifest descriptors.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
@@ -29,16 +30,19 @@ use crate::iceberg::spec::{
 use crate::iceberg::{Error, ErrorKind, Result};
 use crate::manifest::source::ManifestSource;
 
+use super::manifest_encoding::{ManifestWriteSource, SourcedManifestEntry};
 use super::model::AddedContent;
 use super::operation::IcebergCommitOperation;
-use super::staging::{ManifestEntryWrite, StagedView, write_manifest_with_sources};
+use super::staging::{
+    ManifestEntryWrite, StagedView, write_manifest_with_sources, write_sourced_manifest,
+};
 use super::write_stack::codec::CompactFragmentCodec;
 use super::write_stack::control::publication::written_file_with_historical_partition;
 use super::write_stack::receiving::compact::{AddedCounters, CompactEntry};
 use super::write_stack::receiving::{AdditionGroup, ReceivedCompactFiles};
 
 pub(crate) enum StageNewFiles {
-    Pending(PendingNewFiles),
+    Pending(Arc<PendingNewFiles>),
     Writing,
     Written(WrittenNewManifests),
 }
@@ -111,6 +115,7 @@ pub(crate) async fn prepare_added_manifests(
     view: &StagedView<'_>,
     stage: usize,
     snapshot_id: i64,
+    historical: Option<&BTreeMap<i32, crate::iceberg::spec::StructType>>,
 ) -> Result<(Vec<ManifestFile>, AddedCounters)> {
     if view.stage_key() != stage
         || view.artifacts().attempt_token().operation() != operation.token()
@@ -121,7 +126,14 @@ pub(crate) async fn prepare_added_manifests(
     }
     let version = view.metadata().format_version();
     let (written, verify_coverage) = match operation.take_stage_new_files(stage)? {
-        StageNewFiles::Pending(pending) => (write_pending(view, snapshot_id, pending).await?, true),
+        StageNewFiles::Pending(pending) => {
+            let pending = Arc::try_unwrap(pending)
+                .map_err(|_| invariant("Iceberg compact stage still has an observer"))?;
+            (
+                write_pending(view, snapshot_id, pending, historical).await?,
+                true,
+            )
+        }
         StageNewFiles::Written(written)
             if written.version == FormatVersion::V1 && version != FormatVersion::V1 =>
         {
@@ -148,6 +160,7 @@ async fn write_pending(
     view: &StagedView<'_>,
     snapshot: i64,
     pending: PendingNewFiles,
+    historical: Option<&BTreeMap<i32, crate::iceberg::spec::StructType>>,
 ) -> Result<WrittenNewManifests> {
     let version = view.metadata().format_version();
     let policy = view
@@ -158,17 +171,43 @@ async fn write_pending(
         groups,
         author,
         counts,
+        v2_targets,
     } = pending.received;
-    let total = usize::try_from(counts.data.files)
-        .map_err(|_| invariant("Compact manifest entry count overflow"))?;
+    drop(v2_targets);
+    let total = counts
+        .data
+        .files
+        .checked_add(counts.position_deletes.files)
+        .and_then(|files| usize::try_from(files).ok())
+        .ok_or_else(|| invariant("Compact manifest entry count overflow"))?;
     let mut manifests = Vec::new();
     for (group, mut entries) in groups {
         let AdditionGroup::Additions {
             spec: spec_id,
-            deletes: false,
+            deletes,
         } = group
         else {
-            return Err(invariant("Compact append received a delete artifact"));
+            if historical.is_none() {
+                return Err(invariant("Compact append received a delete effect"));
+            }
+            continue;
+        };
+        let partition_type = if deletes {
+            if version == FormatVersion::V3 && pending.source.format_version() == FormatVersion::V2
+            {
+                return Err(invariant(
+                    "A new V3 delete manifest cannot add V2 position-delete files",
+                ));
+            }
+            Some(
+                historical
+                    .and_then(|partitions| partitions.get(&spec_id))
+                    .ok_or_else(|| {
+                        invariant("Compact position output lacks its historical partition type")
+                    })?,
+            )
+        } else {
+            None
         };
         let author = author
             .as_ref()
@@ -195,24 +234,58 @@ async fn write_pending(
             }
             let remaining = entries.split_off(count);
             let batch = std::mem::replace(&mut entries, remaining);
-            let encoding = (
-                version,
-                snapshot,
-                pending.source.current_schema().clone(),
-                spec.as_ref().clone(),
-                ManifestContentType::Data,
-            );
             let values = batch
                 .iter()
                 .map(|entry| {
                     view.artifacts().check_active()?;
-                    decode_append(&pending.source, &pending.codec, author, entry)
+                    decode_addition(
+                        &pending.source,
+                        &pending.codec,
+                        author,
+                        entry,
+                        partition_type,
+                    )
                 })
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .map(Ok);
-            let descriptor =
-                write_manifest_with_sources(view.artifacts(), encoding, values, &[]).await?;
+                .collect::<Result<Vec<_>>>()?;
+            let descriptor = if let Some(partition_type) = partition_type {
+                let source = Arc::new(ManifestWriteSource::for_position_output(
+                    pending.source.current_schema().clone(),
+                    spec.as_ref().clone(),
+                    partition_type.clone(),
+                ));
+                let sourced = values
+                    .into_iter()
+                    .map(|entry| SourcedManifestEntry {
+                        source: Arc::clone(&source),
+                        entry,
+                    })
+                    .collect();
+                write_sourced_manifest(
+                    view.artifacts(),
+                    view.metadata(),
+                    snapshot,
+                    spec,
+                    ManifestContentType::Deletes,
+                    sourced,
+                    &[],
+                )
+                .await?
+            } else {
+                let encoding = (
+                    version,
+                    snapshot,
+                    pending.source.current_schema().clone(),
+                    spec.as_ref().clone(),
+                    ManifestContentType::Data,
+                );
+                write_manifest_with_sources(
+                    view.artifacts(),
+                    encoding,
+                    values.into_iter().map(Ok),
+                    &[],
+                )
+                .await?
+            };
             let actual = u64::try_from(descriptor.manifest_length)
                 .map_err(|_| invariant("Negative written manifest length"))?;
             calibration.observe(actual, lower)?;
@@ -232,11 +305,12 @@ async fn write_pending(
     })
 }
 
-fn decode_append(
+fn decode_addition(
     source: &TableMetadata,
     codec: &CompactFragmentCodec,
     author: &ConnectorPayloadRetentionGuard,
     entry: &CompactEntry,
+    historical: Option<&crate::iceberg::spec::StructType>,
 ) -> Result<ManifestEntryWrite> {
     let addition = entry.addition.as_ref().expect("grouped data addition");
     let (fragment, _decoded) = codec.decode(&addition.payload, author).map_err(|error| {
@@ -246,13 +320,23 @@ fn decode_append(
         )
         .with_source(error)
     })?;
-    let written = written_file_with_historical_partition(&fragment, source, None)
+    let written = written_file_with_historical_partition(&fragment, source, historical)
         .map_err(|error| Error::new(ErrorKind::DataInvalid, error.message()).with_source(error))?;
     if written.path != addition.object_path.as_ref()
         || written.partition_spec_id != addition.partition_spec_id
     {
         return Err(invariant(
             "Decoded compact addition differs from its admitted identity",
+        ));
+    }
+    if historical.is_some()
+        && (written.content != crate::iceberg::spec::DataContentType::PositionDeletes
+            || !written.lower_bounds.is_empty()
+            || !written.upper_bounds.is_empty())
+    {
+        return Err(Error::new(
+            ErrorKind::Unexpected,
+            "Historical position output cannot carry table-column bounds",
         ));
     }
     drop(fragment);

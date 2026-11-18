@@ -822,10 +822,16 @@ impl IcebergWriteSessionControl {
             phase_started,
         );
         validate_context(context)?;
-        let validated = if received.compact_files().is_none() {
-            Some(self.validate_received_commit(handle, received, request.row_count, context)?)
-        } else {
+        let validated = if let Some(compact) = received.compact_files() {
+            if compact.is_empty()
+                && handle.flavor().is_artifact_row_delta()
+                && request.row_count != 0
+            {
+                return Err(corrupt("nonzero logical row delta produced no artifact"));
+            }
             None
+        } else {
+            Some(self.validate_received_commit(handle, received, request.row_count, context)?)
         };
 
         #[cfg(novarocks_dev_controls)]

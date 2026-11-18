@@ -21,6 +21,10 @@ mod lineage;
 mod materialized;
 #[cfg(test)]
 pub(crate) use materialized::observed_materialized_staging_fixture;
+#[cfg(test)]
+pub(in crate::commit::write_stack) use materialized::{
+    MaterializedDeleteStep, observation_target_bytes,
+};
 
 use super::*;
 #[cfg(test)]
@@ -515,13 +519,13 @@ impl WriteRecipe {
         &self,
         operation: &IcebergCommitOperation,
     ) -> Result<Box<dyn Preparer>, ConnectorError> {
+        if let Some(step) = &self.materialized {
+            return Ok(Box::new(Arc::clone(step)));
+        }
         if self.compact_stage.is_some() {
             return Ok(Box::new(
                 crate::commit::fast_append::CompactFastAppendPreparer(operation.clone()),
             ));
-        }
-        if let Some(step) = &self.materialized {
-            return Ok(Box::new(Arc::clone(step)));
         }
         // A managed publication admitted as CommitEmptyWrite still needs its
         // snapshot marker even when no row delta was materialized.
@@ -755,6 +759,24 @@ impl IcebergWriteSessionControl {
             recipe.compact_stage = Some(stage);
             recipe.output_facts.data_files = files.counts.data.files;
             recipe.output_facts.data_rows = files.counts.data.rows;
+            if files.has_delete_effects() {
+                if !recipe.fixed_mutation {
+                    return Err(internal(
+                        "Iceberg compact delete lost its fixed write endpoint",
+                    ));
+                }
+                recipe.materialized =
+                    Some(Arc::new(materialized::MaterializedDeleteStep::compact(
+                        operation.clone(),
+                        stage,
+                        files.counts,
+                    )));
+                if recipe.source.format_version() == crate::iceberg::spec::FormatVersion::V2 {
+                    recipe.output_facts.position_delete_files = files.counts.position_deletes.files;
+                } else {
+                    recipe.output_facts.deletion_vectors = files.counts.position_deletes.files;
+                }
+            }
             operation
                 .install_stage_new_files(
                     stage,

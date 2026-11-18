@@ -64,9 +64,14 @@ async fn prepare_append(
                 "Compact append is missing its stage source",
             )
         })?;
-        let (manifests, counters) =
-            super::new_manifests::prepare_added_manifests(operation, view, stage, snapshot_id)
-                .await?;
+        let (manifests, counters) = super::new_manifests::prepare_added_manifests(
+            operation,
+            view,
+            stage,
+            snapshot_id,
+            None,
+        )
+        .await?;
         (
             manifests,
             super::overwrite::compact_append_summary(counters),

@@ -2556,6 +2556,11 @@ pub enum IcebergWriteSessionState {
 impl IcebergWriteCommitSession {
     pub(crate) fn with_mutation_read(mut self, recipe: IcebergMutationReadRecipe) -> Self {
         self.mutation_read = Some(recipe);
+        self.progress
+            .get_mut()
+            .expect("new write session progress")
+            .receiving
+            .enable_fixed_mutation(self.flavor);
         self
     }
 

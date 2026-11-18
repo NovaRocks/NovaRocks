@@ -38,13 +38,34 @@ use super::super::runtime::IcebergWriteAdapter;
 pub(crate) struct CompactEntry {
     pub(crate) addition: Option<CompactAddition>,
     pub(crate) delete_effect: Option<CompactDeleteEffect>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Stores the arrival counters alongside the paid input for custody assertions."
+        )
+    )]
     pub(crate) counts: AddedCounters,
     // Field order returns the original payment after the retained backing.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "The receipt is returned by dropping the entry after actual write exit."
+        )
+    )]
     pub(crate) receipt: CompactEntryReceipt,
 }
 
 pub(crate) struct CompactAddition {
     pub(crate) object_path: std::sync::Arc<str>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retains the proven original writer identity through publication."
+        )
+    )]
     pub(crate) writer: Option<ConnectorWriterPhysicalContext>,
     pub(crate) partition_spec_id: i32,
     pub(crate) content: ManifestContentType,
@@ -54,6 +75,13 @@ pub(crate) struct CompactAddition {
 
 pub(crate) struct CompactDeleteEffect {
     pub(crate) target: IcebergDeleteTargetLocator,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Preserves the exact logical effect alongside the physical artifact."
+        )
+    )]
     pub(crate) newly_deleted_rows: u64,
     pub(crate) kind: CompactDeleteKind,
 }
@@ -64,12 +92,27 @@ pub(crate) enum CompactDeleteKind {
         old_exclusive_deletes: Box<[EntryIdentity]>,
     },
     ReplacePositions {
+        partition: Box<IcebergArtifactPartition>,
         merged_old_references: Vec<EntryIdentity>,
     },
 }
 
 pub(crate) struct CompactEntryReceipt {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "The carried original decode quote is observable at custody tests."
+        )
+    )]
     pub(crate) original_bytes: usize,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "The distinct top-up amount is observable at custody tests."
+        )
+    )]
     pub(crate) additional_bytes: usize,
     _original: ConnectorPayloadRetentionGuard,
     _additional: Option<ConnectorPayloadRetentionGuard>,
@@ -155,6 +198,16 @@ impl CompactEntry {
             invalid("Iceberg artifact has no admitted compact addition projection")
         })?;
         let counts = addition_counts(fragment)?;
+        let replacement_partition = match fragment.artifact() {
+            IcebergCommitArtifact::FinalDelete(effect) => match effect.kind() {
+                IcebergFinalDeleteKind::ReplacePositions(vector) => sum_bytes([
+                    std::mem::size_of::<IcebergArtifactPartition>(),
+                    partition_copy_bytes(vector.partition())?,
+                ])?,
+                IcebergFinalDeleteKind::RemoveDataFile { .. } => 0,
+            },
+            _ => 0,
+        };
         let effect_bytes = match fragment.artifact() {
             IcebergCommitArtifact::FinalDelete(effect) => effect_backing_bytes(effect)?,
             _ => 0,
@@ -169,6 +222,7 @@ impl CompactEntry {
             payload_bytes,
             object_bytes,
             effect_bytes,
+            replacement_partition,
             index_bytes,
         ])?;
         let scratch_bytes = if payload_bytes == 0 {
@@ -189,8 +243,14 @@ impl CompactEntry {
         };
         let additional_bytes = retained_bytes.saturating_sub(original_bytes);
         let additional = reserve_if_occupied(author, additional_bytes)?;
-        let overlap = sum_bytes([payload_bytes, object_bytes, index_bytes, scratch_bytes])?
-            .saturating_sub(additional_bytes);
+        let overlap = sum_bytes([
+            payload_bytes,
+            object_bytes,
+            index_bytes,
+            replacement_partition,
+            scratch_bytes,
+        ])?
+        .saturating_sub(additional_bytes);
         let overlap = reserve_if_occupied(author, overlap)?;
         Ok(PreparedCompactEntry {
             original: std::ptr::from_ref(fragment),
@@ -391,6 +451,42 @@ fn addition_counts(fragment: &IcebergCommitFragment) -> Result<AddedCounters, Co
     Ok(counts)
 }
 
+pub(super) fn partition_copy_bytes(
+    partition: &IcebergArtifactPartition,
+) -> Result<usize, ConnectorError> {
+    let values = &partition.descriptor().values;
+    let slots = values
+        .len()
+        .checked_mul(std::mem::size_of::<
+            crate::write_descriptor::IcebergPartitionValueDescriptor,
+        >())
+        .ok_or_else(|| corrupt("Iceberg compact partition geometry overflow"))?;
+    sum_bytes(
+        [
+            partition.partition_path().len(),
+            partition.null_fingerprint().len(),
+            slots,
+        ]
+        .into_iter()
+        .chain(
+            values
+                .iter()
+                .map(|value| value.datum_bytes.as_ref().map_or(0, Vec::len)),
+        ),
+    )
+}
+
+pub(super) fn position_target_index_bytes(
+    path: &str,
+    partition: &IcebergArtifactPartition,
+) -> Result<usize, ConnectorError> {
+    sum_bytes([
+        std::mem::size_of::<(String, IcebergArtifactPartition)>(),
+        path.len(),
+        partition_copy_bytes(partition)?,
+    ])
+}
+
 fn effect_backing_bytes(effect: &IcebergFinalDeleteEffect) -> Result<usize, ConnectorError> {
     let extra = match effect.kind() {
         IcebergFinalDeleteKind::RemoveDataFile {
@@ -475,9 +571,11 @@ fn split_effect(
         IcebergFinalDeleteKind::ReplacePositions(vector) => {
             let mut vector = *vector;
             let merged_old_references = std::mem::take(&mut vector.merged_old_references);
+            let partition = Box::new(vector.partition().clone());
             (
                 Some(IcebergCommitArtifact::DeletionVector(vector)),
                 CompactDeleteKind::ReplacePositions {
+                    partition,
                     merged_old_references,
                 },
             )

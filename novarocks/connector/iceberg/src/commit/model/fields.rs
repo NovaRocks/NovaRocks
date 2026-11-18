@@ -78,6 +78,9 @@ impl AddedContent {
     pub fn file(&self) -> &DataFile {
         &self.file
     }
+    pub(in crate::commit) fn into_file(self) -> DataFile {
+        self.file
+    }
     pub const fn partition_spec_id(&self) -> i32 {
         self.partition_spec_id
     }
