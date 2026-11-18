@@ -623,5 +623,4 @@ async fn wait_write(
 }
 
 #[cfg(all(test, novarocks_dev_controls))]
-#[path = "write_component_tests.rs"]
 mod component_tests;
