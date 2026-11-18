@@ -17,7 +17,7 @@
 
 select
     c_count,
-    count(*) as custdist
+    count() as custdist
 from
     (
         select
