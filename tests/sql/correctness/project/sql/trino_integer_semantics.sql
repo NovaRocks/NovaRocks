@@ -31,7 +31,7 @@ SELECT 9223372036854775807, -9223372036854775808, 9007199254740993, -90071992547
 
 -- query 3
 -- Reference: L03_signed_vs_unary
-SELECT -2147483648, -(2147483648), +2147483648, +(-2147483648), -(-2147483647);
+SELECT -2147483648, -CAST(2147483648 AS BIGINT), +2147483648, +CAST(-2147483648 AS INTEGER), -CAST(-2147483647 AS INTEGER);
 
 -- query 4
 -- Reference: L05_positive_i64_out
@@ -51,16 +51,16 @@ SELECT -(9223372036854775808);
 -- query 7
 -- Reference: L08_integer_negate_min
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
-SELECT -(-2147483648);
+SELECT -CAST(-2147483648 AS INTEGER);
 
 -- query 8
 -- Reference: L09_bigint_negate_min
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
-SELECT -(-9223372036854775808);
+SELECT -CAST(-9223372036854775808 AS BIGINT);
 
 -- query 9
 -- Reference: A01_integer_operators
-SELECT 1+2, 1-2, 3*2, 5/2, -5/2, 5/-2, -5/-2, -5%2, 5%-2, -5%-2, +1, -(1);
+SELECT 1+2, 1-2, 3*2, 5/2, -5/2, 5/-2, -5/-2, -5%2, 5%-2, -5%-2, +1, -CAST(1 AS INTEGER);
 
 -- query 10
 -- Reference: A02_values_integer_operators
@@ -68,7 +68,7 @@ SELECT a,b,a+b,a-b,a*b,a/b,a%b,+a,-a FROM (VALUES (CAST(5 AS integer),CAST(2 AS 
 
 -- query 11
 -- Reference: A03_same_widths
-SELECT CAST(-5 AS tinyint)+CAST(2 AS tinyint), CAST(-5 AS tinyint)-CAST(2 AS tinyint), CAST(-5 AS tinyint)*CAST(2 AS tinyint), CAST(-5 AS tinyint)/CAST(2 AS tinyint), CAST(-5 AS tinyint)%CAST(2 AS tinyint), +(CAST(-5 AS tinyint)), -(CAST(-5 AS tinyint)), CAST(-5 AS smallint)+CAST(2 AS smallint), CAST(-5 AS smallint)-CAST(2 AS smallint), CAST(-5 AS smallint)*CAST(2 AS smallint), CAST(-5 AS smallint)/CAST(2 AS smallint), CAST(-5 AS smallint)%CAST(2 AS smallint), +(CAST(-5 AS smallint)), -(CAST(-5 AS smallint)), CAST(-5 AS integer)+CAST(2 AS integer), CAST(-5 AS integer)-CAST(2 AS integer), CAST(-5 AS integer)*CAST(2 AS integer), CAST(-5 AS integer)/CAST(2 AS integer), CAST(-5 AS integer)%CAST(2 AS integer), +(CAST(-5 AS integer)), -(CAST(-5 AS integer)), CAST(-5 AS bigint)+CAST(2 AS bigint), CAST(-5 AS bigint)-CAST(2 AS bigint), CAST(-5 AS bigint)*CAST(2 AS bigint), CAST(-5 AS bigint)/CAST(2 AS bigint), CAST(-5 AS bigint)%CAST(2 AS bigint), +(CAST(-5 AS bigint)), -(CAST(-5 AS bigint));
+SELECT CAST(-5 AS tinyint)+CAST(2 AS tinyint), CAST(-5 AS tinyint)-CAST(2 AS tinyint), CAST(-5 AS tinyint)*CAST(2 AS tinyint), CAST(-5 AS tinyint)/CAST(2 AS tinyint), CAST(-5 AS tinyint)%CAST(2 AS tinyint), +CAST(-5 AS tinyint), -CAST(-5 AS tinyint), CAST(-5 AS smallint)+CAST(2 AS smallint), CAST(-5 AS smallint)-CAST(2 AS smallint), CAST(-5 AS smallint)*CAST(2 AS smallint), CAST(-5 AS smallint)/CAST(2 AS smallint), CAST(-5 AS smallint)%CAST(2 AS smallint), +CAST(-5 AS smallint), -CAST(-5 AS smallint), CAST(-5 AS integer)+CAST(2 AS integer), CAST(-5 AS integer)-CAST(2 AS integer), CAST(-5 AS integer)*CAST(2 AS integer), CAST(-5 AS integer)/CAST(2 AS integer), CAST(-5 AS integer)%CAST(2 AS integer), +CAST(-5 AS integer), -CAST(-5 AS integer), CAST(-5 AS bigint)+CAST(2 AS bigint), CAST(-5 AS bigint)-CAST(2 AS bigint), CAST(-5 AS bigint)*CAST(2 AS bigint), CAST(-5 AS bigint)/CAST(2 AS bigint), CAST(-5 AS bigint)%CAST(2 AS bigint), +CAST(-5 AS bigint), -CAST(-5 AS bigint);
 
 -- query 12
 -- Reference: A04_mixed_widths
@@ -105,22 +105,22 @@ SELECT CAST(9223372036854775807 AS bigint)+CAST(1 AS bigint);
 -- query 19
 -- Reference: E_negate_min_tinyint
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
-SELECT -(CAST(-128 AS tinyint));
+SELECT -CAST(-128 AS tinyint);
 
 -- query 20
 -- Reference: E_negate_min_smallint
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
-SELECT -(CAST(-32768 AS smallint));
+SELECT -CAST(-32768 AS smallint);
 
 -- query 21
 -- Reference: E_negate_min_integer
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
-SELECT -(CAST(-2147483648 AS integer));
+SELECT -CAST(-2147483648 AS integer);
 
 -- query 22
 -- Reference: E_negate_min_bigint
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
-SELECT -(CAST(-9223372036854775808 AS bigint));
+SELECT -CAST(-9223372036854775808 AS bigint);
 
 -- query 23
 -- Reference: E_subtract_overflow_integer

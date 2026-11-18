@@ -23,23 +23,23 @@
 -- 4. Validate positional arguments still work correctly.
 
 -- query 1
-select * from TABLE(generate_series(start=>2, end=>5));
+select * from TABLE(generate_series(start=>2, `end`=>5));
 
 -- query 2
-select * from TABLE(generate_series(end=>5, start=>2));
+select * from TABLE(generate_series(`end`=>5, start=>2));
 
 -- query 3
-select * from TABLE(generate_series(start=>2, end=>5, step=>2));
+select * from TABLE(generate_series(start=>2, `end`=>5, step=>2));
 
 -- query 4
-select * from TABLE(generate_series(step=>2, start=>2, end=>5));
+select * from TABLE(generate_series(step=>2, start=>2, `end`=>5));
 
 -- query 5
 -- @expect_error=Unknown table function
 select * from TABLE(generate_series(start=>2, stop=>5));
 
 -- query 6
-select * from TABLE(generate_series(end=>5,start=>2, step = 2));
+select * from TABLE(generate_series(`end`=>5,start=>2, step => 2));
 
 -- query 7
 -- @expect_error=expected expression, found `=>`
