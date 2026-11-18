@@ -24,8 +24,8 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use novarocks_parser::{
-    ast::{Query, Visit},
-    parse,
+    ast::{Query, SyntaxEq, Visit},
+    parse, trino_parser,
 };
 use serde_json::{Value, json};
 use std::{
@@ -276,23 +276,46 @@ fn inspect(sql: &str) -> Value {
     };
     let mut queries = Vec::new();
     for (index, statement) in statements.iter().enumerate() {
-        let mut visitor = QuerySpans(Vec::new());
+        let mut visitor = PreparedQueries {
+            sql,
+            statement: index + 1,
+            ordinal: 0,
+            queries: &mut queries,
+        };
         visitor.visit_statement(statement);
-        for (query, span) in visitor.0.into_iter().enumerate() {
-            queries.push(json!({
-                "statement": index + 1, "query": query + 1, "prepared_sql_range": span,
-                "query_sha256": sql.get(span[0]..span[1]).map(|query| digest(query.as_bytes())),
-            }));
-        }
     }
     json!({"status": "accepted", "statements": statements.len(), "queries": queries})
 }
 
-struct QuerySpans(Vec<[usize; 2]>);
+struct PreparedQueries<'a> {
+    sql: &'a str,
+    statement: usize,
+    ordinal: usize,
+    queries: &'a mut Vec<Value>,
+}
 
-impl Visit for QuerySpans {
+impl Visit for PreparedQueries<'_> {
     fn visit_query(&mut self, query: &Query) {
-        self.0.push([query.span.start(), query.span.end()]);
+        self.ordinal += 1;
+        let start = query.span.start();
+        let end = query.span.end();
+        let source = self.sql.get(start..end);
+        let trino = match source {
+            None => json!({"status": "source_range_unavailable"}),
+            Some(source) => match trino_parser::parse_query(source) {
+                Ok(parsed) => json!({
+                    "status": if query.syntax_eq(&parsed) { "strict_equal" } else { "different" },
+                }),
+                Err(error) => json!({
+                    "status": "rejected", "code": error.to_user_error(source).code().as_str(),
+                }),
+            },
+        };
+        self.queries.push(json!({
+            "statement": self.statement, "query": self.ordinal, "prepared_sql_range": [start, end],
+            "query_sha256": source.map(|source| digest(source.as_bytes())),
+            "trino_same_source": trino,
+        }));
     }
 }
 
@@ -305,6 +328,22 @@ mod tests {
     use novarocks_cluster_harness::fixture_run::{FixturePolicy, RunBudget, ScratchIdentity};
     use regex::Regex;
     use std::{collections::BTreeMap, sync::Arc};
+
+    #[test]
+    fn prepared_query_compares_actual_bytes_without_disclosing_them() {
+        for (sql, expected) in [
+            ("SELECT COUNT()", "strict_equal"),
+            ("SELECT COUNT(*)", "different"),
+            ("SELECT `private_name`", "rejected"),
+        ] {
+            let report = inspect(sql);
+            assert_eq!(report["status"], "accepted");
+            let query = &report["queries"][0];
+            assert_eq!(query["query_sha256"], digest(sql.as_bytes()));
+            assert_eq!(query["trino_same_source"]["status"], expected);
+            assert!(!report.to_string().contains(sql));
+        }
+    }
 
     #[test]
     fn paired_case_keeps_original_naming_and_independent_source_and_oracle_facts() {
