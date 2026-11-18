@@ -170,9 +170,9 @@ impl ReceivedFragment<'_> {
 }
 
 impl IcebergReceiving {
-    pub(crate) fn for_flavor(flavor: IcebergWriteFlavor) -> Self {
+    pub(super) fn with_compact_mode(compact: bool) -> Self {
         Self {
-            compact: (flavor == IcebergWriteFlavor::Append).then(CompactReceiving::default),
+            compact: compact.then(CompactReceiving::default),
             ..Self::default()
         }
     }

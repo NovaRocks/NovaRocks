@@ -3441,8 +3441,12 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         let handle = self.adapter.commit_session(commit)?;
         let result = handle.with_active_receiving(|receiving| {
             receiving.require_complete()?;
-            let validated = validate_received_set(handle, &self.adapter, receiving)?;
-            logical_rows::project(handle, &validated)
+            if let Some(compact) = receiving.compact_files() {
+                logical_rows::project_compact(handle, compact.counts)
+            } else {
+                let validated = validate_received_set(handle, &self.adapter, receiving)?;
+                logical_rows::project(handle, &validated)
+            }
         })?;
         validate_context(context)?;
         Ok(result)

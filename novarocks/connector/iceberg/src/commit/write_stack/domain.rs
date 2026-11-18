@@ -2727,6 +2727,15 @@ impl IcebergWriteCommitSession {
                 flavor.as_str()
             )));
         }
+        let compact_receiving = flavor == IcebergWriteFlavor::Append
+            || (repartition.is_none()
+                && document_publication.as_ref().is_some_and(|publication| {
+                    matches!(
+                        publication.technique(),
+                        ConnectorManagedPublicationTechnique::MetadataOnly
+                            | ConnectorManagedPublicationTechnique::Incremental
+                    )
+                }));
         Ok(Self {
             session_id,
             creation_scope: None,
@@ -2754,7 +2763,7 @@ impl IcebergWriteCommitSession {
             empty_cleanup_disposed: std::sync::atomic::AtomicBool::new(false),
             progress: Mutex::new(IcebergWriteSessionProgress {
                 state: IcebergWriteSessionState::Active,
-                receiving: IcebergReceiving::for_flavor(flavor),
+                receiving: IcebergReceiving::with_compact_mode(compact_receiving),
             }),
         })
     }

@@ -4197,6 +4197,21 @@ fn project_prepared_managed_rows(
     entries: Vec<(WriteTargetOrdinal, IcebergCommitFragment)>,
 ) -> Result<Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>, ConnectorError>
 {
+    project_managed_rows_fixture(technique, shape, entries, false).map(|(_, rows)| rows)
+}
+
+pub(super) fn project_managed_rows_fixture(
+    technique: ConnectorManagedPublicationTechnique,
+    shape: ConnectorManagedPublicationShape,
+    entries: Vec<(WriteTargetOrdinal, IcebergCommitFragment)>,
+    use_legacy_receiver: bool,
+) -> Result<
+    (
+        bool,
+        Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>,
+    ),
+    ConnectorError,
+> {
     let material = session_material(if shape == ConnectorManagedPublicationShape::RowMutation {
         merge_on_read_input_shape()
     } else {
@@ -4228,14 +4243,23 @@ fn project_prepared_managed_rows(
     } else {
         handle
     };
+    let chooses_compact = handle.with_active_receiving(|receiving| {
+        let compact = receiving.compact_files().is_some();
+        if use_legacy_receiver {
+            *receiving = IcebergReceiving::default();
+        }
+        Ok(compact)
+    })?;
     let expected = handle.expected_targets();
     let adapter = adapter("unit", 1);
     let commit = adapter.wrap_commit_session(handle);
-    // A logical row projection has no affected-row input.
-    let fragments = entries
+    // A logical row projection has no affected-row input. Exercise the same
+    // measured decoder used by the original writer output.
+    let (ordinals, fragments): (Vec<_>, Vec<_>) = entries
         .into_iter()
         .map(|(ordinal, fragment)| (ordinal, adapter.wrap_commit_fragment(fragment)))
-        .collect();
+        .unzip();
+    let (fragments, author) = super::test_support::paid_fragments(&adapter, fragments);
     let (_executor, runtime) = unreachable_rest_runtime();
     let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
         descriptor("unit"),
@@ -4246,13 +4270,21 @@ fn project_prepared_managed_rows(
         ),
         runtime,
     );
-    receive_write_query(&control, &commit, &expected, fragments)?;
+    let query = super::test_support::write_query_identity();
+    control.begin_write_query(&commit, &query, &expected, None)?;
+    control.arrive_write_fragments(
+        &commit,
+        &query,
+        ordinals.into_iter().zip(fragments).collect(),
+        &author,
+    )?;
+    control.confirm_write_received(&commit, &query)?;
     let result = control.received_logical_row_change(&commit, &request_context());
     assert!(matches!(
         adapter.commit_session(&commit)?.state()?,
         IcebergWriteSessionState::Active
     ));
-    result
+    result.map(|rows| (chooses_compact, rows))
 }
 
 fn logical_data_fragment(path: &str, rows: u64) -> IcebergCommitFragment {
@@ -4268,7 +4300,7 @@ fn logical_data_fragment(path: &str, rows: u64) -> IcebergCommitFragment {
     )
 }
 
-fn logical_final_delete(
+pub(super) fn logical_final_delete(
     data: &str,
     new_rows: u64,
     total_rows: u64,
@@ -4278,6 +4310,7 @@ fn logical_final_delete(
         IcebergContentRange, IcebergDeleteTargetLocator, IcebergDeletionVectorArtifact,
         IcebergFinalDeleteEffect, IcebergFinalDeleteKind,
     };
+    use novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext;
     let target = IcebergDeleteTargetLocator::try_new(
         "s3://b/list.avro".into(),
         "s3://b/source.avro".into(),
@@ -4304,9 +4337,19 @@ fn logical_final_delete(
             )?,
         )),
     };
-    Ok(IcebergCommitFragment::final_delete(
-        IcebergFinalDeleteEffect::try_new(target, new_rows, kind)?,
-    ))
+    let fragment = IcebergCommitFragment::final_delete(IcebergFinalDeleteEffect::try_new(
+        target, new_rows, kind,
+    )?);
+    if replace.is_some() {
+        // This fixture has no managed creation scope. The wire representation
+        // still requires structurally complete creation evidence.
+        let physical = ConnectorWriterPhysicalContext::new([1; 16], 1, [2; 16], 0, 1);
+        fragment.try_with_creation(super::domain::IcebergCreationReceipt::try_new(
+            physical, [3; 16], [4; 32], 4096, [5; 32],
+        )?)
+    } else {
+        Ok(fragment)
+    }
 }
 
 #[test]

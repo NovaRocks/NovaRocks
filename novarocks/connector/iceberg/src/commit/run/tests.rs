@@ -401,7 +401,6 @@ async fn keyed_data_finish<'a>(
 ) -> (ConnectorWriteFinishRequest<'a>, String) {
     use crate::commit::write_stack::execution::IcebergWriteStackExecution;
     use crate::commit::write_stack::test_support::{received_write_proof, write_query_identity};
-    use novarocks_spi::connector::ConnectorPayloadRetentionGuard;
     use novarocks_spi::connector::write_stack::{
         ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterPhysicalContext,
     };
@@ -465,6 +464,7 @@ async fn keyed_data_finish<'a>(
         .unwrap();
     writer.append(batch).await.unwrap();
     let fragments = writer.finish().await.unwrap();
+    let (fragments, author) = crate::commit::write_stack::test_support::paid_fragments(&adapter, fragments);
     let [fragment] = fragments.as_slice() else {
         panic!("one keyed data row must produce one commit fragment");
     };
@@ -482,7 +482,7 @@ async fn keyed_data_finish<'a>(
                 .into_iter()
                 .map(|fragment| (target.ordinal(), fragment))
                 .collect(),
-            &ConnectorPayloadRetentionGuard::new(()),
+            &author,
         )
         .unwrap();
     control
