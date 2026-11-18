@@ -29,6 +29,7 @@ use novarocks_workload_control::joint_admission::{
 };
 use novarocks_workload_control::{WorkError, WorkScope, WorkloadProgressNotification};
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 // Creation membership prefix: query16, attempt8, task key16, target4,
 // writer ordinal4. Original plan, stage, task, backend, fragment and node
@@ -173,7 +174,7 @@ impl ConnectorWriteSession {
         // installation and the synchronous, effect-free provider registration
         // against that decision. No production or workload lock crosses the
         // provider call, and nothing can dispatch until this method returns.
-        let _terminal = self.receiving_terminal_guard()?;
+        let terminal = self.receiving_terminal_guard()?;
         let notification = {
             let mut production = self
                 .productions
@@ -205,12 +206,23 @@ impl ConnectorWriteSession {
             notification
         };
 
-        let result = self.write_stack_pin.session().begin_write_query(
-            self.plan.commit_session(),
-            &query,
-            targets,
-            Some(proof),
-        );
+        let result = match catch_unwind(AssertUnwindSafe(|| {
+            self.write_stack_pin.session().begin_write_query(
+                self.plan.commit_session(),
+                &query,
+                targets,
+                Some(proof),
+            )
+        })) {
+            Ok(result) => result,
+            Err(panic) => {
+                // A panic cannot attest that the provider refused this
+                // registration. Keep the paid original and leave the FE
+                // terminal guard usable by its actual failure owner.
+                drop(terminal);
+                resume_unwind(panic)
+            }
+        };
         let mut production = self
             .productions
             .lock()

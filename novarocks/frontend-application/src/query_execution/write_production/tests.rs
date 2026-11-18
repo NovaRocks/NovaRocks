@@ -320,6 +320,61 @@ fn provider_registration_refusal_withdraws_only_its_undispatched_production() {
     assert_eq!(control.snapshot().root_responsibilities, 0);
 }
 
+/// A provider registration unwind preserves the original unknown claim and
+/// leaves its frontend terminal owner able to drive the original abort.
+#[test]
+fn provider_registration_panic_preserves_unproven_production_and_abort_access() {
+    let (control, mut driver) = original_runtime();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = work.owner.scope();
+    bind(&scope, &mut driver);
+    let fixture = fixture_with_outcome(1, 1, known_committed());
+    let session = &fixture.session;
+    fixture.recorded.lock().unwrap().panic_query_registration = true;
+    let (execution, plan, mut ready, mut facts) =
+        allocate_paid_cohorts(session, &scope, &mut driver);
+    let expected = facts.as_ref().unwrap().to_vec();
+
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        session.register_production_ready_in(
+            execution,
+            plan,
+            &[WriteTargetOrdinal::try_new(0).unwrap()],
+            &mut ready,
+            &mut facts,
+        )
+    }));
+    assert!(unwound.is_err());
+    assert!(facts.is_none(), "the paid cohort was already registered");
+    drop(ready);
+    let owner = session
+        .productions
+        .lock()
+        .unwrap()
+        .current
+        .as_ref()
+        .unwrap()
+        .grant
+        .as_ref()
+        .unwrap()
+        .owner();
+    assert_eq!(owner.pending_records().unwrap(), 2);
+    assert!(owner.retains_facts(&expected).unwrap());
+    session.abort_for_test(request_context()).unwrap();
+    assert_eq!(
+        fixture.recorded.lock().unwrap().abort_production,
+        Some(novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::Unproven),
+    );
+    let retirement = work.owner.retirement_observer().unwrap();
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+    assert!(owner.retains_facts(&expected).unwrap());
+    assert!(!retirement.is_reclaimed().unwrap());
+}
+
 #[test]
 fn checked_writer_prefix_without_end_keeps_actual_record_and_refuses_cleanup_complete() {
     for targets in [1, 2] {
