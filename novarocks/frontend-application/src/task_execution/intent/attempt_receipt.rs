@@ -97,7 +97,7 @@ impl OperationAcknowledgement {
                 dispatch,
                 payload: AckPayload::None,
                 detail,
-                local_failure,
+                ..
             } => {
                 let result = match dispatch {
                     OperationDispatchResult::IngressRejected(rejection) => {
@@ -130,7 +130,7 @@ impl OperationAcknowledgement {
                         site: failure_site(typed.site()),
                     }
                 });
-                let protocol_failure = local_failure.as_ref().map(|typed| ProtocolFailure {
+                let protocol_failure = self.local_failure().map(|typed| ProtocolFailure {
                     fact: typed.fact(),
                     detail: typed.detail().clone(),
                     site: failure_site(typed.site()),
@@ -279,6 +279,30 @@ mod tests {
             ),
             Err(AttemptReceiptError::WrongReleaseContribution)
         ));
+    }
+
+    #[test]
+    fn original_local_governance_refusal_maps_to_its_retained_host_error() {
+        let operation = TaskOperationId::new_v7();
+        let kind = OperationKind::AcquireParticipationAdmissionTicket;
+        let original = novarocks_workload_control::WorkError::Cancelled(
+            novarocks_workload_control::CancellationReason::Requested,
+        );
+        let refusal =
+            OperationAcknowledgement::local_governance_refusal(operation, kind, original.clone());
+        assert_eq!(refusal.governance_failure(), Some(&original));
+        assert!(refusal.local_failure().is_none());
+        assert!(matches!(
+            refusal.attempt_observation(operation, generation(2), None, None),
+            Err(AttemptReceiptError::WrongWorkloadFailure),
+        ));
+        let retained = HostFailureRef(NonZeroU64::MIN);
+        let observation = refusal
+            .attempt_observation(operation, generation(2), None, Some(retained))
+            .unwrap();
+        assert_eq!(observation.reply.worker_outcome(), None);
+        assert_eq!(observation.reply.local_failure(), None);
+        assert_eq!(observation.reply.host_failure().unwrap().original, retained);
     }
 
     #[test]

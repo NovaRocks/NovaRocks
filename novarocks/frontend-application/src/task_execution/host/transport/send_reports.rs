@@ -282,8 +282,8 @@ impl SendReports {
     ) -> BodyOutcome {
         assert_eq!(operations.len(), keys.len());
         // A SAME WC cancellation is an ordinary local preparation refusal.
-        // Keep its exact producer fact/detail on every original operation;
-        // it is neither a Worker receipt nor an unused/unsent certificate.
+        // Preserve its original WorkError in each receipt position so Core
+        // can refer to the Source-held cause through acknowledgement retirement.
         let cancelled = match (self, &failure) {
             (
                 Self::Actor(_),
@@ -303,10 +303,10 @@ impl SendReports {
         };
         for (intent, &key) in operations.iter().zip(keys) {
             let acknowledgement = match cancelled {
-                Some(original) => OperationAcknowledgement::local_refusal(
+                Some(original) => OperationAcknowledgement::local_governance_refusal(
                     intent.operation_id(),
                     intent.kind(),
-                    TaskExecutionError::Workload(original.clone()).preparation_input(),
+                    original.clone(),
                 ),
                 None => OperationAcknowledgement::from_dispatch_result(
                     intent.operation_id(),

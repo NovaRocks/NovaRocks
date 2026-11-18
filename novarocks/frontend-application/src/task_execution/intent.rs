@@ -585,8 +585,13 @@ enum OperationAcknowledgementResult {
         dispatch: OperationDispatchResult,
         payload: AckPayload,
         detail: Option<SafeDetail>,
-        local_failure: Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
+        local_failure: Option<LocalAcknowledgementFailure>,
     },
+}
+#[derive(Clone, Debug, PartialEq)]
+enum LocalAcknowledgementFailure {
+    Protocol(novarocks_query_application::execution_error::ExecutionFailureInput),
+    Governance(novarocks_workload_control::WorkError),
 }
 static NO_ACK_PAYLOAD: AckPayload = AckPayload::None;
 impl Clone for OperationAcknowledgement {
@@ -620,10 +625,18 @@ impl PartialEq for OperationAcknowledgement {
     }
 }
 impl OperationAcknowledgement {
-    /// Borrow the original batch's local dispatch refusal. A canonical cell
-    /// retains this same cause through its actual backing's final exit.
+    /// Borrow the original local dispatch refusal from its receipt owner.
     pub fn governance_failure(&self) -> Option<&novarocks_workload_control::WorkError> {
-        self.canonical.as_ref()?.governance_failure()
+        if let Some(canonical) = &self.canonical {
+            return canonical.governance_failure();
+        }
+        match &self.result {
+            OperationAcknowledgementResult::NonWorker {
+                local_failure: Some(LocalAcknowledgementFailure::Governance(error)),
+                ..
+            } => Some(error),
+            _ => None,
+        }
     }
     #[cfg(test)]
     pub(crate) fn shares_original_canonical_with(&self, other: &Self) -> bool {
@@ -698,6 +711,30 @@ impl OperationAcknowledgement {
         kind: OperationKind,
         failure: novarocks_query_application::execution_error::ExecutionFailureInput,
     ) -> Self {
+        Self::local_rejection(
+            operation_id,
+            kind,
+            LocalAcknowledgementFailure::Protocol(failure),
+        )
+    }
+
+    pub(crate) fn local_governance_refusal(
+        operation_id: TaskOperationId,
+        kind: OperationKind,
+        error: novarocks_workload_control::WorkError,
+    ) -> Self {
+        Self::local_rejection(
+            operation_id,
+            kind,
+            LocalAcknowledgementFailure::Governance(error),
+        )
+    }
+
+    fn local_rejection(
+        operation_id: TaskOperationId,
+        kind: OperationKind,
+        failure: LocalAcknowledgementFailure,
+    ) -> Self {
         Self {
             operation_id,
             kind,
@@ -715,9 +752,10 @@ impl OperationAcknowledgement {
         &self,
     ) -> Option<&novarocks_query_application::execution_error::ExecutionFailureInput> {
         match self.original_result() {
-            OperationAcknowledgementResult::NonWorker { local_failure, .. } => {
-                local_failure.as_ref()
-            }
+            OperationAcknowledgementResult::NonWorker {
+                local_failure: Some(LocalAcknowledgementFailure::Protocol(failure)),
+                ..
+            } => Some(failure),
             _ => None,
         }
     }

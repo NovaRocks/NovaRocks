@@ -627,6 +627,44 @@ mod tests {
     }
 
     #[test]
+    fn original_local_admission_refusal_preserves_unestablished_participation() {
+        use crate::{
+            execution::ack_phase::{admission_intent, dispatch_admission},
+            failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+        };
+        let mut execution = crate::test_support::execution_with_strict_input();
+        let participation = *execution.graph().participations().next().unwrap();
+        let admission = admission_intent(&mut execution, participation);
+        let mut refusal =
+            dispatch_admission(&mut execution, admission, 1, OperationOutcome::Accepted);
+        let original = HostProjectedFailure {
+            original: HostFailureRef(id(1)),
+            kind: HostFailureKind::Workload,
+            class: novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure,
+            site: AttemptFailureSite::Attempt,
+        };
+        refusal.reply.result = OperationReplyResult::Local {
+            result: LocalDispatchResult::NonWorkerRejected,
+            failure: Some(original),
+            protocol_failure: None,
+            detail: None,
+        };
+
+        assert!(matches!(
+            execution.apply_dispatched_reply(&refusal).1,
+            Err(TaskExecutionError::Workload(failure)) if failure == original
+        ));
+        assert!(execution.participation_never_established(participation));
+        assert!(
+            !execution
+                .owner(participation)
+                .unwrap()
+                .needs_admission_ticket()
+        );
+        assert!(!Aborts::still_requires_abort(&execution, participation));
+    }
+
+    #[test]
     fn a_ticket_received_after_production_stops_still_requires_abort() {
         use crate::execution::ack_phase::{admission_intent, dispatch_admission};
         let mut execution = crate::test_support::execution_with_strict_input();

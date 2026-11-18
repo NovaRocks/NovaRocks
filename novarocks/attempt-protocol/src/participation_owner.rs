@@ -956,6 +956,19 @@ impl ParticipationOwner {
                 self.admission_cleanup_required = true;
                 return Err(self.owner_failure_error(ack));
             }
+            if ack.dispatch_result() == OperationDispatchResult::NonWorkerRejected
+                && let Some(original) = ack
+                    .host_failure()
+                    .filter(|failure| failure.kind == crate::failure::HostFailureKind::Workload)
+            {
+                // This preparation never reached a Worker. Stop issuing
+                // admission while preserving any earlier remote uncertainty
+                // and the exact absence of an Establish on a fresh owner.
+                self.admission = None;
+                self.admission_reissue_at = None;
+                self.admission_qualified = false;
+                return Err(TaskExecutionError::Workload(*original));
+            }
             self.fail_admission();
             let Some(_outcome) = ack.worker_outcome() else {
                 return Err(crate::error::dispatch_rejection(
