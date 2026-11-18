@@ -1011,27 +1011,20 @@ impl Fixture {
         inspect: impl FnOnce(&[(WriteTargetOrdinal, ConnectorCommitFragment)]) -> R,
     ) -> R {
         // Open the same provider generation for fixture-only custody assertions.
-        let adapter = WriteRuntimeAdapter::new(Arc::new(FakeProvider {
-            descriptor: self
-                .session
-                .plan
-                .commit_session()
-                .binding()
-                .descriptor()
-                .clone(),
-            catalog_handle: self
-                .session
-                .plan
-                .commit_session()
-                .binding()
-                .catalog_handle()
-                .clone(),
-        }));
+        let adapter = self.fake_adapter();
         let commit = adapter
             .commit_session(self.session.plan.commit_session())
             .unwrap();
         let receiving = commit.0.lock().unwrap();
         inspect(&receiving.fragments)
+    }
+
+    fn fake_adapter(&self) -> WriteRuntimeAdapter<FakeProvider> {
+        let binding = self.session.plan.commit_session().binding();
+        WriteRuntimeAdapter::new(Arc::new(FakeProvider {
+            descriptor: binding.descriptor().clone(),
+            catalog_handle: binding.catalog_handle().clone(),
+        }))
     }
 
     pub(crate) fn received_fragment_count(&self) -> usize {
@@ -1802,14 +1795,25 @@ fn received_input_validation_refusal_moves_no_original_inventory() {
         .unwrap();
     let original_address = fixture.with_received_fragments(|fragments| fragments.as_ptr() as usize);
     let foreign = WriteTargetOrdinal::try_new(1).unwrap();
-    let failure = fixture
-        .session
-        .receive_for_test(
-            DecodedPreparedWriteSet::for_test(5, vec![(foreign, commit_fragment_bytes())])
-                .with_test_capacity(&binding),
-        )
+    let key = *uuid::Uuid::now_v7().as_bytes();
+    let query = ConnectorWriteQueryIdentity::try_new(key, 1, key).unwrap();
+    let control = fixture.session.write_stack_pin.session();
+    let commit = fixture.session.plan.commit_session();
+    control
+        .begin_write_query(commit, &query, &[target], None)
+        .unwrap();
+    let fragment = fixture
+        .fake_adapter()
+        .wrap_commit_fragment(FakeFragment(0, None));
+    let author =
+        crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(&binding)
+            .unwrap()
+            .try_spi_guard()
+            .unwrap();
+    let failure = control
+        .arrive_write_fragments(commit, &query, vec![(foreign, fragment)], &author)
         .unwrap_err();
-    assert_eq!(failure.kind(), ConnectorErrorKind::CorruptData);
+    assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
     let union = fixture.session.lock_accumulated().unwrap();
     assert!(union.received.is_none());
     assert_eq!(
