@@ -882,16 +882,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-ddl/default_complex",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/map/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 7; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B7a",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg-dml/insert_exact_numeric_input",
       "failure": {
         "class": "error_code",
