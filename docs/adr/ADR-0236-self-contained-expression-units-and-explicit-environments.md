@@ -17,6 +17,11 @@ code-anchors:
   - "novarocks/constant-contract/src/pool_table.rs (ConstantPools)"
   - "novarocks/type-contract/src/control_flow.rs (ExpressionControlFlow)"
   - "novarocks/type-contract/src/effects.rs (EvaluationRegionId)"
+  - "novarocks/physical-plan/src/node_roots.rs (node root roles and ports)"
+  - "idl/novarocks/physical_package_v2.proto (PhysicalNode.expressions, ExpressionUnit)"
+  - "novarocks/expression/src/compiled.rs (CompiledExprSet, EvaluationEnvironment, compile_expr_set)"
+  - "novarocks/local-program/src/unit_refs.rs (ProgramRootRef)"
+  - "novarocks/frontend-application/src/query_execution/required_constant_eval.rs (RequiredConstantInterpreter)"
   - "novarocks/expression/Cargo.toml (production dependency closure)"
 ---
 
@@ -26,7 +31,7 @@ code-anchors:
 
 ## 背景与执行事实
 
-本文记录已接受的终态契约，实施仍在进行。当前已实现单元契约构造、封存与中立 parts 校验，编译 crate 已建立依赖边界；节点持有单元、单元 wire、`CompiledExprSet` 以及必需常量调用方尚待接入。下列终态规则不表示这些调用面已经落地，也不表示原生或最终组合验证完成。
+计划节点、wire 修订号 27、LocalProgram 和 FE 必需常量均已接入单元。当前实施状态标为 partial，等待既有运行行为和原生组合验证完成。
 
 | 词汇 | 准确含义与身份范围 |
 | --- | --- |
@@ -35,12 +40,12 @@ code-anchors:
 | `ExprRoot` / `RootOrdinal` | 单元的一次有序根出现，保存定义、Value/TruthOnly 需求和读列作用域；相同定义的不同出现仍有独立 use |
 | `ExprId` | 单元内连续定义身份；依赖无环，编号不必是拓扑序，lambda 可以先预留 |
 | `EvaluationRegionId` | 单元局部求值区域身份，保留 guard/父区域语义；不是协议共享状态的 domain |
-| `CompiledExprSet` | 终态的单元编译结果；输入按作用域内序号绑定，不使用 SlotId 或 fragment 全局 arena |
+| `CompiledExprSet` | 单元编译结果，输入绑定按作用域内物理序号定位 |
 | 求值环境 | 调用者显式交付的常量池、语义参数、常量策略及编译控制；持有来源不授予资源容量 |
 
 生产依赖闭包分成两层。`novarocks-expression-contract` 仅依赖 type、constant、function、failure contract 和 Arrow schema，拥有中立身份、定义、声明、请求、构造器与单元内校验。`novarocks-expression` 消费该契约和 Functions 及中立契约/Arrow，负责纯编译；两者都不依赖 physical-plan、local-program、local-compiler、SQL、Execution 或 live Task 能力。
 
-终态计划节点持有单元，physical-plan 另校验端口与实际节点输入相等、字段根的需求/作用域及关系调用。常量池和语义参数是共享环境，不随节点复制。函数绑定在内存中随调用定义保留，wire 只引用 package 级唯一绑定表。聚合、窗口、表函数和 writer 调用由真实关系站点保管；关系上下文及 writer 物化输入不引用单元 use/region。
+计划节点持有单元，physical-plan 校验端口与实际节点输入相等、字段根的需求和作用域，以及关系调用。常量池和语义参数由调用者共享。函数绑定在内存中随调用定义保留，wire 引用 package 级唯一绑定表。聚合、窗口、表函数和 writer 调用各自沿关系站点和关系上下文绑定。
 
 ## 考虑过的选项
 

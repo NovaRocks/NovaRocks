@@ -47,11 +47,10 @@ is the NIDL-0 baseline; later NIDL tasks add the staged packages below.
   不表示存在旧计划树 decoder。`expr.proto`、`plan.proto` 已不在本目录。
 - `novarocks.common`、`novarocks.filter` 等其余专属 package 保持各自原事实 owner。
 
-自包含表达式单元的已接受终态是 PhysicalNode 信封上的单一可选字段，单元保存定义、根、
-控制、标量声明与请求；package 的类型、常量、函数绑定表仍是唯一共享 namespace。
-窗口为关系调用，frame offset直接引用常量。此处说明的是迁移目标：当前单元 wire 与修订号27
-尚待落地；退役的 fragment 表达式表、package控制与旧字段号须 reserved，并按原codec边界
-拒绝退役载荷。epoch15不变，不增加新旧互通路径。详见
+计划修订号 27 在 `PhysicalNode.expressions`（字段 30）承载单元，保存端口、定义、根、
+控制、标量声明与请求。类型、常量与函数绑定表由 package 共享。窗口使用关系调用，
+帧偏移直接引用常量。退役的 fragment 表达式表和 package 控制字段的名称及编号均保留，
+原 codec 边界拒绝退役载荷。原生兼容身份使用修订号 27 与当前描述符摘要，epoch 为 15。详见
 [ADR-0236](../../docs/adr/ADR-0236-self-contained-expression-units-and-explicit-environments.md)。
 
 ## Tag discipline

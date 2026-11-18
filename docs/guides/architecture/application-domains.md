@@ -122,11 +122,11 @@ effect 后的验证伪装成同一次观察。
 表达式的独立契约在 `novarocks/expression-contract/src/**`：`BoundExprSet` 保存端口、定义、
 根、局部控制流、按 use 的声明和按定义的原始请求；`BoundExprSetBuilder` 负责封存与校验。
 常量池保留在 constant-contract，语义参数在 type-contract，调用者显式交付环境与控制。
-纯编译 crate `novarocks/expression` 已建立依赖闭包，单元编译入口与 `CompiledExprSet` 尚待实现；
-终态由 LocalProgram 持有编译单元表，节点/sink按（单元、根）消费。两个表达式 crate 都不反向
-依赖计划、SQL 或运行时 owner。关系调用及 writer 物化输入使用真实关系上下文，不借用单元
-use/region；函数绑定在 wire 上仍只有 package 级表。节点单元、wire27、逐单元编译与必需常量
-接入仍在迁移，不能从契约源码推定这些路径或最终原生验证已完成。见
+纯编译 crate `novarocks/expression` 从单元、环境、完整输入布局与安装函数目录产生
+`CompiledExprSet`。LocalProgram 持有编译单元表，节点与 sink 按 `ProgramRootRef` 消费。
+两个表达式 crate 的生产依赖止于 Functions、中立契约和 Arrow。关系调用及 writer 物化输入
+使用原关系上下文，函数绑定由 wire 修订号 27 的 package 表共享。FE 的必需常量经同一纯编译
+入口接受零端口单根单元，并沿原语句工作范围调用 Execution 的求值器。见
 [ADR-0236](../../adr/ADR-0236-self-contained-expression-units-and-explicit-environments.md)。
 
 `novarocks/local-program/src/**` 定义纯 `LocalProgram`：节点、表达式、布局、sink
