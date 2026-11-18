@@ -48,8 +48,10 @@ use std::time::{Duration, Instant};
 const CATALOG: &str = "exchange_flow";
 const DATABASE: &str = "native_flow";
 const TABLE: &str = "exchange_flow.native_flow.rows";
+const BROADCAST_BUILD: &str = "exchange_flow.native_flow.broadcast_build";
 const FILES: i64 = 6;
 const ROWS_PER_FILE: i64 = 4096;
+const BROADCAST_BUILD_ROWS_PER_FILE: i64 = 2048;
 const ROWS: i64 = FILES * ROWS_PER_FILE;
 const TRANSPORT_MILLIS: u64 = 1000;
 const HOLD: Duration = Duration::from_millis(2500);
@@ -570,42 +572,61 @@ fn plan_text(result: &StatementResult) -> Result<String> {
         .map(|lines| lines.join("\n"))
 }
 
-fn seed(context: &mut ScenarioContext) -> Result<()> {
+fn seed(context: &mut ScenarioContext, include_broadcast_build: bool) -> Result<()> {
     let warehouse = create_warehouse(context, "exchange-flow")?;
     let mut control =
         SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
     create_catalog(&mut control, CATALOG, &warehouse)?;
     control.execute(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))?;
-    control.execute(format!("CREATE TABLE {TABLE} (k BIGINT NOT NULL)"))?;
+    // With six minimum-weight splits, the initial assignment gives each
+    // of the three BE Tasks two files. A Parquet page belongs to one split.
+    let files = seed_files(&mut control, TABLE, ROWS_PER_FILE)?;
+    retain(context, "exchange-seed-file-geometry.json", &files)?;
+    if include_broadcast_build {
+        // Give each build sender multiple file batches while keeping the
+        // build smaller than the probe so the optimizer can choose broadcast.
+        let files = seed_files(&mut control, BROADCAST_BUILD, BROADCAST_BUILD_ROWS_PER_FILE)?;
+        retain(
+            context,
+            "exchange-broadcast-build-file-geometry.json",
+            &files,
+        )?;
+    }
+    Ok(())
+}
+
+fn seed_files(
+    control: &mut SqlSession,
+    table: &str,
+    rows_per_file: i64,
+) -> Result<Vec<FileGeometryRow>> {
+    control.execute(format!("CREATE TABLE {table} (k BIGINT NOT NULL)"))?;
     // Independent committed files make the scan eligible on the live BE
     // roster. Actual selected participants are checked, never guessed.
     for file in 0..FILES {
-        let first = file * ROWS_PER_FILE + 1;
-        let last = first + ROWS_PER_FILE - 1;
+        let first = file * rows_per_file + 1;
+        let last = first + rows_per_file - 1;
         control.execute(format!(
-            "INSERT INTO {TABLE} SELECT generate_series FROM TABLE(generate_series({first},{last}))"
+            "INSERT INTO {table} SELECT generate_series FROM TABLE(generate_series({first},{last}))"
         ))?;
     }
     let files = file_geometry(&control.execute(format!(
-        "SELECT content,file_path,file_format,record_count,file_size_in_bytes FROM {TABLE}$files ORDER BY file_path"
+        "SELECT content,file_path,file_format,record_count,file_size_in_bytes FROM {table}$files ORDER BY file_path"
     )).context("read original Exchange fixture file geometry")?)?;
-    retain(context, "exchange-seed-file-geometry.json", &files)?;
-    // All six original files share Iceberg's minimum split weight (0.05 of
-    // its 128 MiB target). The initial 256-split pump and least-total-weight
-    // assignment therefore give each of the three original scan Tasks two
-    // files. A Parquet page belongs to one split and never joins two files.
+    // Each file must receive Iceberg's minimum split weight, 0.05 of its
+    // 128 MiB target.
     ensure!(
         files.len() == FILES as usize
             && files
                 .iter()
                 .all(|(content, _, format, rows, bytes)| *content == 0
                     && format == "PARQUET"
-                    && *rows == ROWS_PER_FILE
+                    && *rows == rows_per_file
                     && *bytes > 0
                     && *bytes <= 128 * 1024 * 1024 / 20),
-        "Exchange fixture requires six original 4096-row, minimum-weight Parquet files: {files:?}"
+        "Exchange fixture {table} requires {FILES} {rows_per_file}-row, minimum-weight Parquet files: {files:?}"
     );
-    Ok(())
+    Ok(files)
 }
 
 fn gather_sql() -> String {
@@ -616,6 +637,12 @@ fn gather_sql() -> String {
 
 fn join_sql() -> String {
     format!("SELECT p.k FROM {TABLE} p JOIN {TABLE} b ON p.k=b.k")
+}
+
+fn broadcast_join_sql() -> String {
+    // Keep the full probe result and a smaller build with enough data to
+    // fill the original Exchange slots.
+    format!("SELECT p.k FROM {TABLE} p LEFT JOIN {BROADCAST_BUILD} b ON p.k=b.k")
 }
 
 fn settings(partitioned: bool, seconds: u64) -> Vec<String> {
@@ -670,7 +697,7 @@ impl ExchangeFlow {
         match self.case {
             Case::Bounded => vec![
                 gather_sql(),
-                join_sql(),
+                broadcast_join_sql(),
                 join_sql(),
                 gather_sql(),
                 gather_sql(),
@@ -776,7 +803,7 @@ impl Scenario for ExchangeFlow {
         // open long-lived grant subscriptions. No fault is captured here.
         let fault = context.handle().native_exchange_fault(0)?;
         let baseline = resource_baseline(context)?;
-        seed(context)?;
+        seed(context, matches!(self.case, Case::Bounded))?;
         await_resource_convergence(context, &baseline, "ordinary private Exchange seed SQL")?;
         let idle = await_flow_idle(context)?;
         ensure!(
