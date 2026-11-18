@@ -25,7 +25,7 @@ select
     avg(l_quantity) as avg_qty,
     avg(l_extendedprice) as avg_price,
     avg(l_discount) as avg_disc,
-    count(*) as count_order
+    count() as count_order
 from
     lineitem
 where

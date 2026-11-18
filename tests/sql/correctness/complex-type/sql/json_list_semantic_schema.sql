@@ -16,16 +16,16 @@
 -- under the License.
 
 -- query 1
-SELECT [json_object('2:3')] AS json_values,
-       [CAST(json_object('2:3') AS VARCHAR)] AS string_values;
+SELECT [JSON '{"2:3": null}'] AS json_values,
+       [CAST(JSON '{"2:3": null}' AS VARCHAR)] AS string_values;
 
 -- query 2
-SELECT array_sortby([json_object('k',1), json_object('k',2)], [2,1]) AS json_values,
-       array_sortby([CAST(json_object('k',1) AS VARCHAR), CAST(json_object('k',2) AS VARCHAR)], [2,1]) AS string_values;
+SELECT array_sortby([JSON '{"k": 1}', JSON '{"k": 2}'], [2,1]) AS json_values,
+       array_sortby([CAST(JSON '{"k": 1}' AS VARCHAR), CAST(JSON '{"k": 2}' AS VARCHAR)], [2,1]) AS string_values;
 
 -- query 3
 -- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
-WITH q AS (SELECT [json_object('key','value1'), json_object('key','value2')] AS j)
+WITH q AS (SELECT [JSON '{"key": "value1"}', JSON '{"key": "value2"}'] AS j)
 SELECT array_sortby(j,[2,1]) AS json_values,
        array_sortby(CAST(j AS ARRAY<VARCHAR>),[2,1]) AS string_values FROM q;
 
@@ -34,7 +34,7 @@ SELECT CAST([] AS ARRAY<JSON>) AS json_values, CAST([] AS ARRAY<VARCHAR>) AS str
 
 -- query 5
 -- Preserve the original first projection independently of the retired object-to-text conversion.
-WITH q AS (SELECT [json_object('key','value1'), json_object('key','value2')] AS j)
+WITH q AS (SELECT [JSON '{"key": "value1"}', JSON '{"key": "value2"}'] AS j)
 SELECT array_sortby(j,[2,1]) AS json_values FROM q;
 
 -- query 6

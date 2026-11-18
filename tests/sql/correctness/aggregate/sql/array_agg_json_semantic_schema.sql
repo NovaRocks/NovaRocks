@@ -16,19 +16,19 @@
 -- under the License.
 
 -- JSON and STRING have the same Utf8 text and different frozen child domains.
-SELECT array_agg(json_object('2:3')) AS json_values,
-       array_agg(CAST(json_object('2:3') AS VARCHAR)) AS string_values;
+SELECT array_agg(JSON '{"2:3": null}') AS json_values,
+       array_agg(CAST(JSON '{"2:3": null}' AS VARCHAR)) AS string_values;
 
-WITH q AS (SELECT json_object('k',1) AS j)
+WITH q AS (SELECT JSON '{"k": 1}' AS j)
 SELECT array_agg(j) AS json_values, array_agg(CAST(j AS VARCHAR)) AS string_values FROM q;
 
 WITH q AS (
-  SELECT 1 AS n, json_object('k',1) AS j
-  UNION ALL SELECT 2, json_object('k',2)
+  SELECT 1 AS n, JSON '{"k": 1}' AS j
+  UNION ALL SELECT 2, JSON '{"k": 2}'
   UNION ALL SELECT 3, NULL
 )
 SELECT array_agg(j ORDER BY n) AS json_values,
        array_agg(CAST(j AS VARCHAR) ORDER BY n) AS string_values FROM q;
 
-SELECT array_agg(json_object('k', 'a''b')) AS json_values,
-       array_agg(CAST(json_object('k', 'a''b') AS VARCHAR)) AS string_values;
+SELECT array_agg(JSON '{"k": "a''b"}') AS json_values,
+       array_agg(CAST(JSON '{"k": "a''b"}' AS VARCHAR)) AS string_values;
