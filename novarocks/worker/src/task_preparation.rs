@@ -144,12 +144,11 @@ struct HostWork {
 }
 impl HostWork {
     fn reserve(parent: &PreparationParent, step: Step) -> Result<Self, RuntimeError> {
-        let kind = match step {
-            Step::Adopt | Step::Publication => WorkKind::Business,
-            _ => WorkKind::Cleanup,
-        };
+        // Adoption and publication transfer custody of a prepared runtime.
+        // The original TaskStartPermit independently gates business work, so
+        // this handoff can still drain a dormant runtime after Task stop.
         let original = parent.reserve_host_work(
-            kind,
+            WorkKind::Cleanup,
             HOST_WORK_STORAGE
                 .resources()
                 .expect("fixed host work storage"),
@@ -1429,7 +1428,7 @@ mod host_handoff_tests {
         }
     }
     #[test]
-    fn stopped_scope_refuses_adoption_and_publication_but_runs_original_cleanup() {
+    fn stopped_scope_can_handoff_an_already_prepared_runtime_for_cleanup() {
         for before_adoption in [true, false] {
             let scope = scope();
             scope.register(Arc::new(Child { adoption: None })).unwrap();
@@ -1439,24 +1438,22 @@ mod host_handoff_tests {
             }
             scope.financial_scope.request_stop().unwrap();
             if before_adoption {
-                assert!(!scope.adopt_runtime());
-            } else {
-                let drops = Arc::new(AtomicUsize::new(0));
-                let refused = scope.start_runtime(captured(&drops));
-                assert!(refused.is_err());
-                assert_eq!(drops.load(Ordering::SeqCst), 0);
-                drop(refused);
-                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                assert!(scope.adopt_runtime());
             }
             let calls = AtomicUsize::new(0);
-            scope.cleanup(PreparationCleanup::Inbound, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-            });
-            scope.cleanup(PreparationCleanup::Receiver, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-            });
-            assert_eq!(calls.load(Ordering::SeqCst), 2);
-            assert!(scope.rollback_exited());
+            assert!(
+                scope
+                    .start_runtime(|| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .unwrap_or_else(|_| panic!("the stopped runtime still owes its cleanup"))
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                scope
+                    .start_runtime(|| panic!("the same runtime starts once"))
+                    .is_err()
+            );
             assert!(scope.host_captures_exited());
             assert!(scope.health.is_healthy());
         }
