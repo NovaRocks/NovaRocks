@@ -589,6 +589,10 @@ enum OperationAcknowledgementResult {
     },
 }
 #[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The existing paid acknowledgement slot already retains the protocol failure inline; boxing would add a separate allocation on that path."
+)]
 enum LocalAcknowledgementFailure {
     Protocol(novarocks_query_application::execution_error::ExecutionFailureInput),
     Governance(novarocks_workload_control::WorkError),
