@@ -80,7 +80,10 @@ pub(in crate::commit) fn install_appends_with_adoption(
     let decoder = IcebergWriteFragmentDecoder::new(adapter.clone());
     let mut received = ReceivedCompactFiles::default();
     for ordinal in 0..count {
-        let path = format!("{}/data/compact-{ordinal:04}.parquet", metadata.location());
+        let path = format!(
+            "file://{}/data/compact-{ordinal:04}.parquet",
+            fixture.directory.path().display(),
+        );
         let fragment = adapter.wrap_commit_fragment(data_fragment(&path));
         let encoded = encoder.encode_commit_fragment_payload(&fragment).unwrap();
         let mut original = Some(

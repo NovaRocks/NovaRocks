@@ -399,6 +399,15 @@ async fn keyed_data_finish<'a>(
     plan: &'a novarocks_spi::connector::write_stack::session::ConnectorWriteSessionPlan,
     prepared: &PreparedKeyed,
 ) -> (ConnectorWriteFinishRequest<'a>, String) {
+    let (request, path, _) = keyed_data_finish_observed(fixture, plan, prepared).await;
+    (request, path)
+}
+
+async fn keyed_data_finish_observed<'a>(
+    fixture: &Fixture,
+    plan: &'a novarocks_spi::connector::write_stack::session::ConnectorWriteSessionPlan,
+    prepared: &PreparedKeyed,
+) -> (ConnectorWriteFinishRequest<'a>, String, Arc<std::sync::atomic::AtomicUsize>) {
     use crate::commit::write_stack::execution::IcebergWriteStackExecution;
     use crate::commit::write_stack::test_support::{received_write_proof, write_query_identity};
     use novarocks_spi::connector::write_stack::{
@@ -464,7 +473,7 @@ async fn keyed_data_finish<'a>(
         .unwrap();
     writer.append(batch).await.unwrap();
     let fragments = writer.finish().await.unwrap();
-    let (fragments, author) = crate::commit::write_stack::test_support::paid_fragments(&adapter, fragments);
+    let (fragments, author, live) = crate::commit::write_stack::test_support::paid_fragments_counted(&adapter, fragments);
     let [fragment] = fragments.as_slice() else {
         panic!("one keyed data row must produce one commit fragment");
     };
@@ -497,6 +506,7 @@ async fn keyed_data_finish<'a>(
             context: context(),
         },
         path,
+        live,
     )
 }
 
@@ -504,9 +514,34 @@ async fn keyed_data_finish<'a>(
 async fn keyed_unknown_retains_session_data_and_manifest_without_redispatch() {
     let fixture = keyed_fixture().await;
     let prepared = prepare_keyed(&fixture, b"result").await;
+    assert_keyed_unknown_retains_artifacts(fixture, prepared, false).await;
+}
+
+pub(in crate::commit) async fn assert_compact_keyed_unknown_retains_artifacts() {
+    let fixture = keyed_fixture().await;
+    let prepared = prepare_keyed_variant(&fixture, ConnectorManagedPublicationTechnique::Incremental, false).await;
+    assert_keyed_unknown_retains_artifacts(fixture, prepared, true).await;
+}
+
+async fn assert_keyed_unknown_retains_artifacts(
+    fixture: Fixture,
+    prepared: PreparedKeyed,
+    compact: bool,
+) {
+    use std::sync::atomic::Ordering;
     let control = write_control(&fixture);
-    let plan = control.begin_write(keyed_begin(&prepared)).unwrap();
-    let (request, data) = keyed_data_finish(&fixture, &plan, &prepared).await;
+    let shape = if compact {
+        ConnectorManagedPublicationShape::InsertOnlyChangeStream
+    } else {
+        ConnectorManagedPublicationShape::Data
+    };
+    let plan = control.begin_write(keyed_begin_shape(&prepared, shape)).unwrap();
+    iceberg_handle(&fixture, &plan).with_active_receiving(|receiving| {
+        assert_eq!(receiving.compact_files().is_some(), compact);
+        Ok(())
+    }).unwrap();
+    let (request, data, live) = keyed_data_finish_observed(&fixture, &plan, &prepared).await;
+    assert!(live.load(Ordering::SeqCst) > 0);
     fixture.catalog.clear();
     fixture
         .catalog
@@ -516,6 +551,7 @@ async fn keyed_unknown_retains_session_data_and_manifest_without_redispatch() {
     else {
         panic!("ambiguous dispatch must stay unknown")
     };
+    assert_eq!(live.load(Ordering::SeqCst), 0);
     let payload = assert_keyed_evidence(&fixture, &plan, &prepared);
     let (operation, _) = iceberg_handle(&fixture, &plan)
         .retained_publication()

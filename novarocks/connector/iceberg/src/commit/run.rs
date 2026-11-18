@@ -806,8 +806,11 @@ mod keyed_publication_trace_tests {
         );
     }
 
-    mod keyed_session_tests {
+    pub(super) mod keyed_session_tests {
         use super::*;
         include!("run/tests.rs");
     }
 }
+
+#[cfg(test)]
+pub(in crate::commit) use keyed_publication_trace_tests::keyed_session_tests::assert_compact_keyed_unknown_retains_artifacts;

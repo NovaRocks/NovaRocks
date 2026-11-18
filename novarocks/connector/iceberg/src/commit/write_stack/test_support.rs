@@ -78,20 +78,47 @@ pub(crate) fn paid_fragments(
     Vec<ConnectorCommitFragment>,
     novarocks_spi::connector::ConnectorPayloadRetentionGuard,
 ) {
+    let (paid, author, _) = paid_fragments_counted(adapter, fragments);
+    (paid, author)
+}
+
+pub(crate) fn paid_fragments_counted(
+    adapter: &super::runtime::IcebergWriteAdapter,
+    fragments: Vec<ConnectorCommitFragment>,
+) -> (
+    Vec<ConnectorCommitFragment>,
+    novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
     use novarocks_spi::connector::{
         ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard,
         ConnectorWriteFragmentWireDecoder, ConnectorWriteFragmentWireEncoder,
     };
-    struct FixtureByteAuthor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FixtureByteAuthor(Arc<AtomicUsize>);
+    struct FixtureByteReceipt(Arc<AtomicUsize>, usize);
+    impl Drop for FixtureByteReceipt {
+        fn drop(&mut self) {
+            self.0.fetch_sub(self.1, Ordering::SeqCst);
+        }
+    }
     impl ConnectorPayloadByteBudget for FixtureByteAuthor {
         fn reserve_bytes(
             &self,
             bytes: usize,
         ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
-            Ok(ConnectorPayloadRetentionGuard::new(bytes))
+            self.0.fetch_add(bytes, Ordering::SeqCst);
+            Ok(ConnectorPayloadRetentionGuard::new(FixtureByteReceipt(
+                Arc::clone(&self.0),
+                bytes,
+            )))
         }
     }
-    let author = ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(FixtureByteAuthor));
+    let live = Arc::new(AtomicUsize::new(0));
+    let author = ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(FixtureByteAuthor(
+        Arc::clone(&live),
+    )));
     let encoder = super::codec::IcebergWriteFragmentEncoder::new(adapter.clone());
     let decoder = super::codec::IcebergWriteFragmentDecoder::new(adapter.clone());
     let paid = fragments
@@ -103,7 +130,7 @@ pub(crate) fn paid_fragments(
                 .unwrap()
         })
         .collect();
-    (paid, author)
+    (paid, author, live)
 }
 
 pub(crate) fn receive_write_query(

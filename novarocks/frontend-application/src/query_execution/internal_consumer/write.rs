@@ -147,7 +147,7 @@ enum Receiving {
 }
 struct Holder {
     #[cfg(all(test, novarocks_dev_controls))]
-    pre_union_gate: Mutex<Option<Arc<component_tests::OriginalPreUnionGate>>>,
+    pre_union_gate: Mutex<Option<Arc<tests::OriginalPreUnionGate>>>,
     #[cfg(all(test, novarocks_dev_controls))]
     body_applied: std::sync::OnceLock<()>,
     #[cfg(all(test, novarocks_dev_controls))]
@@ -623,4 +623,4 @@ async fn wait_write(
 }
 
 #[cfg(all(test, novarocks_dev_controls))]
-mod component_tests;
+mod tests;

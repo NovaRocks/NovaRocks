@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Child of write.rs: production has no test-only seed construction port.
+//! Observes confirmation, publication and actual exit through the original Internal Write consumer.
 
 use super::*;
 use crate::{
@@ -76,6 +76,7 @@ fn original_failure() -> TaskFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompletionEvent {
     RootRows,
+    ArrivalRefusal,
     RootEnd,
     WriterSuccess,
     SummarySuccess,
@@ -549,6 +550,24 @@ impl ActualWriteRun {
                     assert_eq!(recorded.fragment_arrivals, 1);
                     assert_eq!(recorded.write_confirmations, 0);
                 }
+                CompletionEvent::ArrivalRefusal => {
+                    self.peer.as_ref().unwrap().release_encoded_root_data();
+                    self.wait_receipt(OriginalWriteReceipt::Result).await;
+                    expected = Some(
+                        super::super::domain_state::InternalDomainFailure::from(arrival_refusal())
+                            .execution_input()
+                            .unwrap(),
+                    );
+                    let recorded = self
+                        .session_fixture
+                        .as_ref()
+                        .unwrap()
+                        .recorded
+                        .lock()
+                        .unwrap();
+                    assert!(recorded.arrival_refusal.is_none());
+                    assert_eq!(recorded.fragment_arrivals, 0);
+                }
                 CompletionEvent::RootEnd => {
                     self.peer.as_ref().unwrap().release_encoded_root_end();
                     self.wait_receipt(OriginalWriteReceipt::End(end)).await;
@@ -722,6 +741,17 @@ impl ActualWriteRun {
         }
         self.wait_receipt(OriginalWriteReceipt::Result).await;
         let result = self.result.take().unwrap();
+        if result.is_err() {
+            let recorded = self
+                .session_fixture
+                .as_ref()
+                .unwrap()
+                .recorded
+                .lock()
+                .unwrap();
+            assert_eq!(recorded.write_confirmations, 0);
+            assert_eq!(recorded.finish, 0);
+        }
         match (expected, result) {
             (Some(expected), Err(error)) => {
                 assert_eq!(error.execution_failure(), Some(&expected));
@@ -747,7 +777,7 @@ impl ActualWriteRun {
             }
             (Some(_), Ok(original)) => {
                 self.receiving = Some(original);
-                panic!("original Task failure cannot publish Ready");
+                panic!("original failure cannot publish Ready");
             }
             (None, Err(error)) => {
                 let kind = match control.expect("only original control stops this case") {
@@ -910,7 +940,9 @@ impl ActualWriteRun {
             && !order.iter().any(|event| {
                 matches!(
                     event,
-                    CompletionEvent::TaskFailure | CompletionEvent::SummaryFailure
+                    CompletionEvent::TaskFailure
+                        | CompletionEvent::SummaryFailure
+                        | CompletionEvent::ArrivalRefusal
                 )
             })
         {
@@ -1213,6 +1245,14 @@ impl ActualWriteRun {
     }
 }
 
+fn arrival_refusal() -> novarocks_spi::connector::ConnectorError {
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    ConnectorError::from_domain(
+        ConnectorErrorKind::ResourceExhausted,
+        novarocks_workload_control::WorkError::Capacity("original Provider arrival refusal"),
+    )
+}
+
 async fn run_arrival_order_with_summary_source(
     order: &[CompletionEvent],
     publish: bool,
@@ -1285,6 +1325,9 @@ async fn run_arrival_order_with_summary_source(
     credentials.verify_native_storage(&native_storage).unwrap();
     assert!(credentials.take_source(credentials.execution()).is_err());
     let session_fixture = fixture_with_outcome(1, 1, known_committed());
+    if order.contains(&CompletionEvent::ArrivalRefusal) {
+        session_fixture.recorded.lock().unwrap().arrival_refusal = Some(arrival_refusal());
+    }
     let session = Arc::clone(&session_fixture.session);
     credentials.bind_write_production_session(&session).unwrap();
     session
@@ -1881,3 +1924,6 @@ async fn distinct_stage_credentials_keep_one_write_union_through_terminal_contex
         .unwrap();
     }
 }
+
+mod receipt_failures;
+mod receipt_order;

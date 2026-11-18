@@ -2789,3 +2789,4 @@ async fn rewrite_policy_reuses_its_previous_group_before_considering_concurrent_
 }
 
 mod new_manifest_reuse;
+mod terminal_cleanup;

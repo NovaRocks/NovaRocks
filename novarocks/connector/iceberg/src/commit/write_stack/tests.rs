@@ -76,7 +76,7 @@ use crate::commit::write_stack::test_support::{receive_write_query, write_query_
 use crate::delete_file::IcebergFileFormat;
 use crate::manifest::DataFileWithStats;
 
-pub(super) fn request_context() -> ConnectorRequestContext {
+pub(in crate::commit) fn request_context() -> ConnectorRequestContext {
     ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(30),
         novarocks_spi::connector::ConnectorStopOwner::new().view(),
@@ -204,7 +204,7 @@ pub(super) fn fixed_delete_recipe(
     .unwrap()
 }
 
-pub(super) fn dv_session() -> (IcebergWriteCommitSession, IcebergWriteAdapter) {
+pub(in crate::commit) fn dv_session() -> (IcebergWriteCommitSession, IcebergWriteAdapter) {
     let (handle, _plans) = plan_write_session(
         IcebergWriteSessionId::new(),
         IcebergWriteSessionPlanInput {
@@ -288,7 +288,7 @@ pub(super) fn final_vector(
     )
 }
 
-pub(super) fn fixed_dv_fragment(
+pub(in crate::commit) fn fixed_dv_fragment(
     path: &str,
     referenced: &str,
     merged: Vec<EntryIdentity>,
@@ -3125,16 +3125,16 @@ fn test_rewrite_payload() -> novarocks_spi::connector::ConnectorProcessLocalPayl
 // Real local FileIO protects the attempt-input contract without an object-store
 // test double. This owner runs with the ordinary Iceberg unit-test chain; SQL
 // owns native FE/BE execution. TempDir and Runtime own isolation and real exit.
-pub(super) struct FrozenRewriteLake {
+pub(in crate::commit) struct FrozenRewriteLake {
     executor: tokio::runtime::Runtime,
     _warehouse: tempfile::TempDir,
     runtime: Arc<crate::metadata_context::IcebergMetadataContext>,
     rewrite: crate::distributed_rewrite::IcebergDistributedRewriteControl,
-    pub(super) control: crate::commit::write_stack::control::IcebergWriteSessionControl,
-    pub(super) adapter: IcebergWriteAdapter,
+    pub(in crate::commit) control: crate::commit::write_stack::control::IcebergWriteSessionControl,
+    pub(in crate::commit) adapter: IcebergWriteAdapter,
 }
 impl FrozenRewriteLake {
-    pub(super) fn new() -> Self {
+    pub(in crate::commit) fn new() -> Self {
         Self::new_version(crate::iceberg::spec::FormatVersion::V2)
     }
     fn new_version(version: crate::iceberg::spec::FormatVersion) -> Self {
