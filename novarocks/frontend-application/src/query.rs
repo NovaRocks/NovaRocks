@@ -1622,6 +1622,7 @@ impl FrontendQuerySession {
             execution_settings,
             mut optimizer_settings,
             sql_semantics,
+            property_inputs,
         ) = state.into_query_attempt_inputs();
         let sql_semantics =
             novarocks_sql::sql_mode::statement_sql_semantics(&sql_semantics, &parsed_statement)
@@ -1634,17 +1635,20 @@ impl FrontendQuerySession {
             optimizer_settings.optimizer_query_mem_limit_bytes =
                 Some(self.service.optimizer_query_mem_limit_bytes as f64);
         }
-        let context = RequestContext::admit(RequestAdmission::new(
-            current_catalog,
-            current_database,
-            self.service.role,
-            topology,
-            deadline,
-            cancellation.clone(),
-            optimizer_settings,
-            sql_semantics.clone(),
-            presentation,
-        ));
+        let context = RequestContext::admit(
+            RequestAdmission::new(
+                current_catalog,
+                current_database,
+                self.service.role,
+                topology,
+                deadline,
+                cancellation.clone(),
+                optimizer_settings,
+                sql_semantics.clone(),
+                presentation,
+            )
+            .with_session_property_inputs(property_inputs),
+        );
         let command_executor = Arc::clone(&self.service.command_executor);
         let product_command_router = self.service.product_command_router.clone();
         let dml = Arc::clone(&self.service.dml);

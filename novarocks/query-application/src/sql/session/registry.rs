@@ -23,6 +23,7 @@
 
 use super::{SessionSettingError, SessionSqlState};
 use crate::session_error::QueryServiceError;
+use novarocks_spi::connector::ConnectorProviderId;
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 mod catalog;
@@ -308,7 +309,12 @@ impl ValidatedSessionProperty {
 // Design: ADR-0222 (docs/adr/ADR-0222-session-property-declarations-and-required-constant-evaluation.md)
 pub struct SessionPropertyRegistry {
     system: BTreeMap<String, Arc<PropertyDeclaration>>,
-    factories: BTreeMap<String, Arc<dyn CatalogPropertyDeclarationFactory>>,
+    catalog_sources: BTreeMap<String, CatalogPropertySources>,
+}
+
+struct CatalogPropertySources {
+    provider: Arc<dyn CatalogPropertyDeclarationFactory>,
+    application: BTreeMap<String, Arc<PropertyDeclaration>>,
 }
 impl SessionPropertyRegistry {
     pub fn new() -> Result<Self, SessionPropertyError> {
@@ -324,17 +330,43 @@ impl SessionPropertyRegistry {
         factories: Vec<Arc<dyn CatalogPropertyDeclarationFactory>>,
     ) -> Result<Self, SessionPropertyError> {
         let system = compose_declarations(system)?;
-        let mut factory_map = BTreeMap::new();
+        let mut catalog_sources = BTreeMap::new();
         for factory in factories {
             let provider = factory.provider_id().as_str().to_owned();
-            if factory_map.insert(provider.clone(), factory).is_some() {
+            let sources = CatalogPropertySources {
+                provider: factory,
+                application: BTreeMap::new(),
+            };
+            if catalog_sources.insert(provider.clone(), sources).is_some() {
                 return Err(SessionPropertyError::DuplicateProvider { provider });
             }
         }
         Ok(Self {
             system,
-            factories: factory_map,
+            catalog_sources,
         })
+    }
+
+    /// Add declarations from applications for already registered providers.
+    /// Providers still supply the declarations for each admitted catalog
+    /// instance. Their names are checked against these declarations at binding.
+    pub fn with_catalog_application_declarations(
+        mut self,
+        declarations: impl IntoIterator<Item = (ConnectorProviderId, PropertyDeclaration)>,
+    ) -> Result<Self, SessionPropertyError> {
+        for (provider, declaration) in declarations {
+            let sources = self.catalog_sources.get_mut(provider.as_str()).ok_or(
+                SessionPropertyError::InvalidDeclaration {
+                    detail: "Catalog application declarations require a provider declaration factory",
+                },
+            )?;
+            if declaration.project.is_some() {
+                return Err(SessionPropertyError::ProjectionInvariant);
+            }
+            declaration.check_declaration()?;
+            insert_declaration(&mut sources.application, Arc::new(declaration))?;
+        }
+        Ok(self)
     }
     pub fn system_declarations(&self) -> impl Iterator<Item = &PropertyDeclaration> {
         self.system.values().map(Arc::as_ref)
@@ -432,12 +464,19 @@ fn compose_declarations(
     let mut map = BTreeMap::new();
     for value in values {
         value.check_declaration()?;
-        let name = value.name.clone();
-        if map.insert(name.clone(), Arc::new(value)).is_some() {
-            return Err(SessionPropertyError::DuplicateProperty { name });
-        }
+        insert_declaration(&mut map, Arc::new(value))?;
     }
     Ok(map)
+}
+fn insert_declaration(
+    declarations: &mut BTreeMap<String, Arc<PropertyDeclaration>>,
+    declaration: Arc<PropertyDeclaration>,
+) -> Result<(), SessionPropertyError> {
+    let name = declaration.name.clone();
+    if declarations.insert(name.clone(), declaration).is_some() {
+        return Err(SessionPropertyError::DuplicateProperty { name });
+    }
+    Ok(())
 }
 fn decode_header(
     declaration: &PropertyDeclaration,

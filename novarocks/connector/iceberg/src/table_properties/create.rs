@@ -101,6 +101,35 @@ pub(crate) fn prepare_create_table_properties(
         .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
 }
 
+/// Validate evaluated user properties for the existing document-managed staged
+/// path. The caller keeps application markers separate and binds partitioning
+/// against the admitted materialized-view output.
+pub(crate) fn prepare_mv_staged_storage(
+    properties: &[(Arc<str>, DdlPropertyValue)],
+    control: &dyn ConnectorOperationControl,
+) -> Result<PreparedCreateTableProperties, ConnectorError> {
+    let storage = prepare_create_table_properties(properties, None, control)?;
+    if storage.format_version != FormatVersion::V3 {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg materialized-view storage requires format_version = 3",
+        ));
+    }
+    if storage.location.is_some() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "A custom location is unsupported for staged materialized-view storage",
+        ));
+    }
+    if storage.raw_properties.contains_key("write.metadata.path") {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "A custom write.metadata.path is unsupported for staged materialized-view storage",
+        ));
+    }
+    Ok(storage)
+}
+
 fn prepare_create_table_properties_inner(
     properties: &[(Arc<str>, DdlPropertyValue)],
     comment: Option<&str>,

@@ -265,11 +265,11 @@ async fn same_nonclone_drop_guard_uses_only_applied_finite_requests_after_root_c
 #[test]
 fn shared_configuration_transition_preserves_policy_pause_and_duration_rules() {
     use crate::mv::domain::{
-        application::{MvAlterAction, MvCreateRefreshPolicy},
-        flow::configuration_after_alter,
-        iceberg_refresh::configuration_document,
+        flow::configuration_after_alter, iceberg_refresh::configuration_document,
     };
+    use novarocks_mv_application::engine_properties::MvRefreshPropertyChanges;
     use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
+    use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
     let initial = ConfigurationDocument {
         refresh_policy: RefreshPolicy::AsyncInterval,
         paused: false,
@@ -277,21 +277,21 @@ fn shared_configuration_transition_preserves_policy_pause_and_duration_rules() {
         max_staleness_ms: Some(7000),
     };
     let paused = configuration_document(
-        configuration_after_alter(&initial, &MvAlterAction::PauseRefresh).unwrap(),
+        configuration_after_alter(&initial, &MvRefreshPropertyChanges::set_paused(true)).unwrap(),
     )
     .unwrap();
     assert!(paused.paused);
     assert_eq!(paused.refresh_interval_ms, Some(5000));
     assert_eq!(paused.max_staleness_ms, Some(7000));
     let resumed = configuration_document(
-        configuration_after_alter(&paused, &MvAlterAction::ResumeRefresh).unwrap(),
+        configuration_after_alter(&paused, &MvRefreshPropertyChanges::set_paused(false)).unwrap(),
     )
     .unwrap();
     assert!(!resumed.paused);
     let manual = configuration_document(
         configuration_after_alter(
             &paused,
-            &MvAlterAction::SetRefresh(MvCreateRefreshPolicy::Manual),
+            &MvRefreshPropertyChanges::replace_policy(MvDesiredRefreshPolicy::Manual, None),
         )
         .unwrap(),
     )
@@ -302,7 +302,10 @@ fn shared_configuration_transition_preserves_policy_pause_and_duration_rules() {
     assert!(
         configuration_after_alter(
             &initial,
-            &MvAlterAction::SetRefresh(MvCreateRefreshPolicy::AsyncInterval { interval_ms: -1 })
+            &MvRefreshPropertyChanges::replace_policy(
+                MvDesiredRefreshPolicy::AsyncInterval,
+                Some(-1)
+            )
         )
         .is_err()
     );

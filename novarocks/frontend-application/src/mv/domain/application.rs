@@ -17,14 +17,16 @@
 
 //! Materialized-view application and engine ports.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
+use novarocks_mv_application::engine_properties::MvRefreshPropertyChanges;
 use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
 use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
 use novarocks_mv_application::repository::InitialMvRefreshConfiguration;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
 };
+use novarocks_spi::connector::DdlPropertyValue;
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,22 +181,6 @@ fn partition_u32_argument(arguments: &[MaterializedViewPartitionArgument], trans
     value
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MvCreateDistribution {
-    pub hash_columns: Vec<String>,
-    pub bucket_count: Option<u32>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum MvCreateRefreshPolicy {
-    #[default]
-    Manual,
-    AsyncOnChange,
-    AsyncInterval {
-        interval_ms: i64,
-    },
-}
-
 /// Frontend-owned request for dropping one admitted materialized view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvDropStatement {
@@ -205,10 +191,8 @@ pub struct MvDropStatement {
 /// Frontend-owned admitted materialized-view alteration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MvAlterAction {
-    SetRefresh(MvCreateRefreshPolicy),
-    SetProperties(Vec<(String, String)>),
-    PauseRefresh,
-    ResumeRefresh,
+    RefreshProperties(MvRefreshPropertyChanges),
+    LegacyStorageProperties(Vec<(String, String)>),
     Repartition(Vec<MvCreatePartitionField>),
 }
 
@@ -238,15 +222,26 @@ impl MvRefreshRequest {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum MvCreateStorage {
+    Legacy {
+        name_parts: Vec<String>,
+        partition_by: Option<Vec<MvCreatePartitionField>>,
+        properties: Vec<(String, String)>,
+    },
+    Evaluated {
+        target: crate::mv::domain::refresh::target::IcebergMvTarget,
+        binding: novarocks_spi::connector::ConnectorProviderBindingKey,
+        properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MvCreateStatement {
-    pub name_parts: Vec<String>,
     pub if_not_exists: bool,
-    pub partition_by: Option<Vec<MvCreatePartitionField>>,
-    pub distribution: Option<MvCreateDistribution>,
-    pub refresh_policy: MvCreateRefreshPolicy,
+    pub refresh: InitialMvRefreshConfiguration,
     pub select_sql: String,
     pub select_query: Query,
-    pub properties: Vec<(String, String)>,
+    pub storage: MvCreateStorage,
     pub primary_key: Option<Vec<String>>,
 }
 

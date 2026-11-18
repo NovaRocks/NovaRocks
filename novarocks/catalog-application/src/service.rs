@@ -434,6 +434,7 @@ impl CatalogApplicationService {
                                 generation,
                             },
                             configuration,
+                            binding_key,
                         })
                     }
                     Ok(_) => CatalogConfigurationAdmission::Unavailable {
@@ -3687,6 +3688,16 @@ mod tests {
             assert_eq!(second_snapshot.configuration.as_ref(), second.config());
             let repeated = ready(&service, first.config().instance_id());
             assert_eq!(repeated.runtime, first_snapshot.runtime);
+            assert_eq!(repeated.binding_key, first_snapshot.binding_key);
+            for snapshot in [&first_snapshot, &second_snapshot] {
+                assert_eq!(
+                    snapshot.binding_key,
+                    service
+                        .control
+                        .observe_current_binding(&snapshot.runtime.instance_id)
+                        .unwrap()
+                );
+            }
             assert!(Arc::ptr_eq(
                 &repeated.configuration,
                 &first_snapshot.configuration
@@ -3728,6 +3739,7 @@ mod tests {
             assert_eq!(current.runtime.provider_id, old.runtime.provider_id);
             assert_ne!(current.runtime.attachment_id, old.runtime.attachment_id);
             assert_ne!(current.runtime.generation, old.runtime.generation);
+            assert_ne!(current.binding_key, old.binding_key);
             assert_eq!(old.configuration.as_ref(), first.config());
             assert_eq!(current.configuration.as_ref(), next.config());
             assert!(!Arc::ptr_eq(&old.configuration, &current.configuration));

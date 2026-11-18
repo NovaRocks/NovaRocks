@@ -19,7 +19,9 @@
 
 use std::{fmt, sync::Arc};
 
-use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
+use novarocks_spi::connector::{
+    ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorProviderId,
+};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +54,8 @@ pub struct CatalogRuntimeObservation {
 pub struct CatalogConfigurationObservation {
     pub runtime: CatalogRuntimeObservation,
     pub configuration: Arc<crate::CatalogLogicalConfig>,
+    /// The locally installed provider binding verified in this observation.
+    pub binding_key: ConnectorProviderBindingKey,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

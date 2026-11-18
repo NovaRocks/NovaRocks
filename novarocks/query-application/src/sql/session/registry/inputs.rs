@@ -17,6 +17,7 @@
 
 //! Inputs and their derived overrides share one session owner.
 use super::*;
+use novarocks_spi::connector::ConnectorProviderBindingKey;
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionPropertyInputs {
@@ -80,6 +81,23 @@ impl SessionPropertyInputs {
             _ => None,
         }
     }
+    /// Borrow an admitted override using the key of an already selected
+    /// Provider binding. A same-name replacement cannot inherit the value.
+    pub fn read_catalog_override_for_binding(
+        &self,
+        binding: &ConnectorProviderBindingKey,
+        property: &str,
+    ) -> Option<&SessionPropertyValue> {
+        let value = self.catalogs.get(binding.instance_id())?.get(property)?;
+        match &value.scope {
+            SessionPropertyScope::Catalog {
+                identity: Some(identity),
+                ..
+            } if &identity.binding_key == binding => Some(value.value()),
+            _ => None,
+        }
+    }
+
     pub fn system_overrides(&self) -> impl Iterator<Item = &ValidatedSessionProperty> {
         self.system.values()
     }

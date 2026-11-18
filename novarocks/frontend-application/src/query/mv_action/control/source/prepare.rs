@@ -216,7 +216,7 @@ impl ControlSource {
                         "ALTER MATERIALIZED VIEW REPARTITION requires its original data-producing step",
                     ));
                 }
-                MvAlterAction::SetProperties(properties) => {
+                MvAlterAction::LegacyStorageProperties(properties) => {
                     body.operation = Some(ConnectorCatalogMutationOperation::AlterProperties {
                         table,
                         changes: properties
@@ -233,7 +233,7 @@ impl ControlSource {
                         expected_committed_partitioning: None,
                     });
                 }
-                action => {
+                MvAlterAction::RefreshProperties(changes) => {
                     ready
                         .candidate_reader()
                         .observe_current_application_async(&documents, request.clone())
@@ -292,7 +292,7 @@ impl ControlSource {
                     }
                     let desired = crate::mv::domain::flow::configuration_after_alter(
                         &observed.configuration,
-                        action,
+                        changes,
                     )
                     .map_err(invalid)?;
                     let configuration =

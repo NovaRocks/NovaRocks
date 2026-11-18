@@ -17,7 +17,9 @@
 
 //! Session-derived facts frozen at the query application request boundary.
 
+use crate::sql::session::registry::SessionPropertyInputs;
 use novarocks_sql::compiler::SessionOptimizerSettings;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct RequestSessionContext {
@@ -26,6 +28,7 @@ pub struct RequestSessionContext {
     optimizer_settings: SessionOptimizerSettings,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     presentation: Option<novarocks_result_contract::ClientPresentationFamily>,
+    property_inputs: Arc<SessionPropertyInputs>,
 }
 
 impl RequestSessionContext {
@@ -42,7 +45,17 @@ impl RequestSessionContext {
             optimizer_settings,
             sql_semantics,
             presentation,
+            property_inputs: Arc::default(),
         }
+    }
+
+    pub(crate) fn with_property_inputs(mut self, inputs: SessionPropertyInputs) -> Self {
+        self.property_inputs = Arc::new(inputs);
+        self
+    }
+
+    pub fn property_inputs(&self) -> &Arc<SessionPropertyInputs> {
+        &self.property_inputs
     }
 
     pub fn presentation(&self) -> Option<&novarocks_result_contract::ClientPresentationFamily> {

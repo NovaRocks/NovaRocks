@@ -106,10 +106,18 @@ struct FixtureCatalogs {
 }
 impl FixtureCatalogs {
     fn new(registry: &SessionPropertyRegistry) -> Self {
-        use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
+        use novarocks_spi::connector::{
+            ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorProviderId,
+            ProviderBindingEpoch,
+        };
+        let instance_id = ConnectorInstanceId::parse("input_lake").unwrap();
         let identity = CatalogPropertyIdentity {
             attachment_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
-            instance_id: ConnectorInstanceId::parse("input_lake").unwrap(),
+            binding_key: ConnectorProviderBindingKey {
+                instance_id: instance_id.clone(),
+                incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+            },
+            instance_id,
             provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
             generation: 7,
         };

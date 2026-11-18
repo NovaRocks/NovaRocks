@@ -72,7 +72,7 @@ pub(super) async fn prepare_read(
             wait_for_initial_query_topology(&input.topology, &input.cancellation, input.deadline)
                 .await?;
         let presentation = input.state.presentation().copied();
-        let (catalog, database, execution, mut optimizer, semantics) =
+        let (catalog, database, execution, mut optimizer, semantics, property_inputs) =
             input.state.into_query_attempt_inputs();
         let semantics = novarocks_sql::sql_mode::statement_sql_semantics(&semantics, &parsed)
             .map_err(|e| QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql))))?;
@@ -89,17 +89,20 @@ pub(super) async fn prepare_read(
         );
         let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
             .map_err(statement_work_error)?;
-        let context = RequestContext::admit(RequestAdmission::new(
-            catalog,
-            database,
-            input.role,
-            topology,
-            input.deadline,
-            input.cancellation,
-            optimizer,
-            semantics,
-            presentation,
-        ))
+        let context = RequestContext::admit(
+            RequestAdmission::new(
+                catalog,
+                database,
+                input.role,
+                topology,
+                input.deadline,
+                input.cancellation,
+                optimizer,
+                semantics,
+                presentation,
+            )
+            .with_session_property_inputs(property_inputs),
+        )
         .with_result_capacity(capacity)
         .map_err(statement_work_error)?;
         #[cfg(novarocks_dev_controls)]

@@ -381,11 +381,8 @@ mod tests {
         };
         let sql = "SELECT 1 AS id FROM ice.db.orders";
         let statement = MvCreateStatement {
-            name_parts: vec!["mv".into()],
             if_not_exists: false,
-            partition_by: None,
-            distribution: None,
-            refresh_policy: crate::mv::domain::application::MvCreateRefreshPolicy::Manual,
+            refresh: Default::default(),
             select_sql: sql.into(),
             select_query: crate::mv::domain::refresh::definition::read_stored_mv_query(
                 sql,
@@ -396,7 +393,11 @@ mod tests {
                 },
             )
             .unwrap(),
-            properties: Vec::new(),
+            storage: crate::mv::domain::application::MvCreateStorage::Legacy {
+                name_parts: vec!["mv".into()],
+                partition_by: None,
+                properties: Vec::new(),
+            },
             primary_key: None,
         };
         let source = MvRefreshPreparationOriginal::for_create(

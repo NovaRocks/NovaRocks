@@ -17,7 +17,9 @@
 
 //! Stable original custody for one MV step's concrete borrowed phases.
 
-use super::super::{CommandInput, MvPhaseFailure, MvWake, StepRequest, original_error, service};
+use super::super::{
+    CommandInput, MvCommandRequest, MvPhaseFailure, MvWake, StepRequest, original_error, service,
+};
 use crate::mv::domain::{
     application::{MvApplicationError, MvApplicationErrorKind},
     refresh::target_binding::MvTargetBinding,
@@ -243,8 +245,15 @@ impl StepSource {
             target,
             attempt: attempt.clone(),
         };
+        let session_properties = match &input.request {
+            MvCommandRequest::Refresh {
+                session_properties, ..
+            } => Some(Arc::clone(session_properties)),
+            _ => None,
+        };
         let preparation_input = Arc::new(MvRefreshPreparationInput {
             source: input.ports.clone(),
+            session_properties,
             current_catalog: input.current_catalog.clone(),
             current_database: input.current_database.clone(),
             statement,

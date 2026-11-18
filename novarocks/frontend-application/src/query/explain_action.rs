@@ -105,7 +105,7 @@ async fn make_explain_preparation(
             topology
         };
         let presentation = input.state.presentation().copied();
-        let (catalog, database, execution, mut optimizer, semantics) =
+        let (catalog, database, execution, mut optimizer, semantics, property_inputs) =
             input.state.into_query_attempt_inputs();
         let semantics = novarocks_sql::sql_mode::statement_sql_semantics(
             &semantics,
@@ -122,17 +122,20 @@ async fn make_explain_preparation(
         );
         let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
             .map_err(|e| internal_error(e.to_string()))?;
-        let context = RequestContext::admit(RequestAdmission::new(
-            catalog,
-            database,
-            input.role,
-            topology,
-            input.deadline,
-            input.cancellation,
-            optimizer,
-            semantics,
-            presentation,
-        ))
+        let context = RequestContext::admit(
+            RequestAdmission::new(
+                catalog,
+                database,
+                input.role,
+                topology,
+                input.deadline,
+                input.cancellation,
+                optimizer,
+                semantics,
+                presentation,
+            )
+            .with_session_property_inputs(property_inputs),
+        )
         .with_result_capacity(capacity.clone())
         .map_err(|e| internal_error(e.to_string()))?;
         #[cfg(novarocks_dev_controls)]

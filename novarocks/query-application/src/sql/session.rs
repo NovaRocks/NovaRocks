@@ -152,6 +152,7 @@ impl SessionSqlState {
         SessionExecutionSettings,
         SessionOptimizerSettings,
         novarocks_sql::sql_mode::SqlSemanticSettings,
+        SessionPropertyInputs,
     ) {
         let group_concat_max_len = self.execution_settings.group_concat_max_len();
         (
@@ -161,6 +162,7 @@ impl SessionSqlState {
             self.optimizer_settings,
             self.sql_semantics
                 .with_group_concat_max_len(group_concat_max_len),
+            self.property_inputs,
         )
     }
 }

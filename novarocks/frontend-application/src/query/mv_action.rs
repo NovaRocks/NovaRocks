@@ -129,6 +129,8 @@ pub(crate) enum MvCommandRequest {
     Refresh {
         statement: MvRefreshRequest,
         requested: SqlMvTarget,
+        session_properties:
+            Arc<novarocks_query_application::sql::session::registry::SessionPropertyInputs>,
     },
     ScheduledRefresh {
         statement: MvRefreshRequest,

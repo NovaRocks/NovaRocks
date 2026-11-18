@@ -18,10 +18,15 @@
 //! Closed typed executor for Iceberg MV statements.
 
 use crate::mv::domain::application::{
-    MvAlterAction, MvAlterStatement, MvCreateDistribution, MvCreatePartitionField,
-    MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvRefreshRequest,
+    MvAlterAction, MvAlterStatement, MvCreatePartitionField, MvCreateStatement, MvCreateStorage,
+    MvDropStatement, MvRefreshRequest,
 };
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
+use novarocks_mv_application::engine_properties::{
+    MvRefreshPropertyChanges, legacy_refresh_interval_millis,
+    prepare_legacy_create_refresh_configuration, validate_legacy_primary_key,
+};
+use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
 use novarocks_parser::ast::{
     CallStatement, Literal, LiteralKind, MaterializedViewAlterAction as TypedAlterAction,
     MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
@@ -134,6 +139,7 @@ impl MvCommandExecutor {
                 MvCommandRequest::Refresh {
                     statement,
                     requested,
+                    session_properties: Arc::clone(context.session().property_inputs()),
                 }
             }
             MaterializedViewStatement::Alter(alter)
@@ -155,7 +161,18 @@ impl MvCommandExecutor {
             }
             MaterializedViewStatement::Create(create) => {
                 let statement = lower_typed_create(create)?;
-                let target = resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
+                let target = match &statement.storage {
+                    MvCreateStorage::Legacy { name_parts, .. } => {
+                        resolve_refresh_mv_target(catalog, database, name_parts)?
+                    }
+                    MvCreateStorage::Evaluated { target, .. } => {
+                        novarocks_sql::planning::mv::SqlMvTarget {
+                            catalog: Some(target.catalog.clone()),
+                            database: target.namespace.clone(),
+                            name: target.table.clone(),
+                        }
+                    }
+                };
                 MvCommandRequest::Create(Box::new(CreateRequest { target, statement }))
             }
             MaterializedViewStatement::Drop(drop) => {
@@ -388,7 +405,7 @@ fn lower_typed_create(
     let distribution = statement.distribution.as_ref().ok_or_else(|| {
         "CREATE MATERIALIZED VIEW requires a DISTRIBUTED BY HASH(...) BUCKETS n clause".to_string()
     })?;
-    let bucket_count = distribution
+    distribution
         .buckets
         .as_ref()
         .ok_or_else(|| {
@@ -400,18 +417,9 @@ fn lower_typed_create(
         .primary_key
         .as_ref()
         .map(|columns| {
-            let mut seen = std::collections::BTreeSet::new();
-            let mut lowered = Vec::with_capacity(columns.len());
-            for column in columns {
-                if !seen.insert(column.value.to_ascii_lowercase()) {
-                    return Err(format!(
-                        "duplicate column `{}` in PRIMARY KEY clause",
-                        column.value
-                    ));
-                }
-                lowered.push(column.value.clone());
-            }
-            Ok(lowered)
+            validate_legacy_primary_key(columns.iter().map(|column| column.value.as_str()))
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(columns.iter().map(|column| column.value.clone()).collect())
         })
         .transpose()?;
     let select_query = statement.query.clone();
@@ -425,27 +433,30 @@ fn lower_typed_create(
         })
         .transpose()?;
 
+    let name_parts = lower_typed_name_parts(&statement.name)?;
+    for column in &distribution.hash_columns {
+        normalize_identifier(&column.value)?;
+    }
+
+    let (policy, interval_ms) = lower_typed_refresh_policy(
+        statement
+            .refresh
+            .as_ref()
+            .unwrap_or(&TypedRefreshPolicy::Manual { deferred: false }),
+    )?;
+    let refresh = prepare_legacy_create_refresh_configuration(policy, interval_ms)
+        .map_err(|error| error.to_string())?;
+
     Ok(MvCreateStatement {
-        name_parts: lower_typed_name_parts(&statement.name)?,
         if_not_exists: statement.if_not_exists,
-        partition_by,
-        distribution: Some(MvCreateDistribution {
-            hash_columns: distribution
-                .hash_columns
-                .iter()
-                .map(|column| normalize_identifier(&column.value))
-                .collect::<Result<Vec<_>, _>>()?,
-            bucket_count: Some(bucket_count),
-        }),
-        refresh_policy: lower_typed_refresh_policy(
-            statement
-                .refresh
-                .as_ref()
-                .unwrap_or(&TypedRefreshPolicy::Manual { deferred: false }),
-        )?,
+        refresh,
         select_sql: statement.raw_query_source.clone(),
         select_query,
-        properties: lower_typed_properties(&statement.properties)?,
+        storage: MvCreateStorage::Legacy {
+            name_parts,
+            partition_by,
+            properties: lower_typed_properties(&statement.properties)?,
+        },
         primary_key,
     })
 }
@@ -462,7 +473,11 @@ fn lower_typed_alter(
 ) -> Result<MvAlterStatement, String> {
     let action = match &statement.action {
         TypedAlterAction::SetRefresh(policy) => {
-            MvAlterAction::SetRefresh(lower_typed_refresh_policy(policy)?)
+            let (policy, interval_ms) = lower_typed_refresh_policy(policy)?;
+            MvAlterAction::RefreshProperties(MvRefreshPropertyChanges::replace_policy(
+                policy,
+                interval_ms,
+            ))
         }
         TypedAlterAction::SetProperties(properties) => {
             let properties = lower_typed_properties(properties)?;
@@ -480,10 +495,14 @@ fn lower_typed_alter(
                     ));
                 }
             }
-            MvAlterAction::SetProperties(properties)
+            MvAlterAction::LegacyStorageProperties(properties)
         }
-        TypedAlterAction::PauseRefresh => MvAlterAction::PauseRefresh,
-        TypedAlterAction::ResumeRefresh => MvAlterAction::ResumeRefresh,
+        TypedAlterAction::PauseRefresh => {
+            MvAlterAction::RefreshProperties(MvRefreshPropertyChanges::set_paused(true))
+        }
+        TypedAlterAction::ResumeRefresh => {
+            MvAlterAction::RefreshProperties(MvRefreshPropertyChanges::set_paused(false))
+        }
         TypedAlterAction::Repartition(fields) => {
             MvAlterAction::Repartition(fields.iter().map(MvCreatePartitionField::from).collect())
         }
@@ -520,34 +539,18 @@ fn lower_typed_explain_level(
 
 fn lower_typed_refresh_policy(
     policy: &TypedRefreshPolicy,
-) -> Result<MvCreateRefreshPolicy, String> {
+) -> Result<(MvDesiredRefreshPolicy, Option<i64>), String> {
     match policy {
         TypedRefreshPolicy::Immediate => Err("REFRESH IMMEDIATE is not supported yet".to_string()),
-        TypedRefreshPolicy::Manual { .. } => Ok(MvCreateRefreshPolicy::Manual),
-        TypedRefreshPolicy::AsyncOnChange { .. } => Ok(MvCreateRefreshPolicy::AsyncOnChange),
+        TypedRefreshPolicy::Manual { .. } => Ok((MvDesiredRefreshPolicy::Manual, None)),
+        TypedRefreshPolicy::AsyncOnChange { .. } => {
+            Ok((MvDesiredRefreshPolicy::AsyncOnChange, None))
+        }
         TypedRefreshPolicy::AsyncEvery { interval, unit, .. } => {
             let interval = lower_typed_u64(interval, "REFRESH ASYNC interval")?;
-            if interval == 0 {
-                return Err("REFRESH ASYNC interval must be positive".to_string());
-            }
-            let multiplier = match unit.value.to_ascii_uppercase().as_str() {
-                "SECOND" | "SECONDS" => 1_000_u64,
-                "MINUTE" | "MINUTES" => 60_000_u64,
-                "HOUR" | "HOURS" => 3_600_000_u64,
-                "DAY" | "DAYS" => 86_400_000_u64,
-                _ => {
-                    return Err(format!(
-                        "unsupported REFRESH ASYNC interval unit `{}`; expected SECOND, MINUTE, HOUR, or DAY",
-                        unit.value
-                    ));
-                }
-            };
-            let interval_ms = interval
-                .checked_mul(multiplier)
-                .ok_or_else(|| "REFRESH ASYNC interval is too large".to_string())?
-                .try_into()
-                .map_err(|_| "REFRESH ASYNC interval is too large".to_string())?;
-            Ok(MvCreateRefreshPolicy::AsyncInterval { interval_ms })
+            let interval_ms = legacy_refresh_interval_millis(interval, &unit.value)
+                .map_err(|error| error.to_string())?;
+            Ok((MvDesiredRefreshPolicy::AsyncInterval, Some(interval_ms)))
         }
     }
 }
@@ -836,18 +839,50 @@ mod tests {
         };
 
         let lowered = lower_typed_create(&create).expect("typed create should lower");
-        assert_eq!(lowered.name_parts, vec!["analytics", "orders_mv"]);
+        let MvCreateStorage::Legacy {
+            name_parts,
+            partition_by,
+            ..
+        } = &lowered.storage
+        else {
+            panic!("expected legacy storage");
+        };
+        assert_eq!(name_parts, &["analytics", "orders_mv"]);
         assert_eq!(
-            lowered.refresh_policy,
-            MvCreateRefreshPolicy::AsyncInterval {
-                interval_ms: 7_200_000
-            }
+            lowered.refresh,
+            novarocks_mv_application::repository::InitialMvRefreshConfiguration {
+                policy: novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy::AsyncInterval,
+                paused: false,
+                interval_ms: Some(7_200_000),
+                max_staleness_ms: None,
+            },
         );
         assert!(matches!(
-            lowered.partition_by.as_deref(),
+            partition_by.as_deref(),
             Some([MvCreatePartitionField::Month { column }]) if column == "order_date"
         ));
         assert_eq!(create.raw_query_source, lowered.select_sql);
+    }
+
+    #[test]
+    fn create_engine_facts_preserve_legacy_first_error_order() {
+        for (key, expected) in [
+            (
+                "PRIMARY KEY (id, `ID`)",
+                "duplicate column `ID` in PRIMARY KEY clause",
+            ),
+            ("", "REFRESH ASYNC interval must be positive"),
+        ] {
+            let source = format!(
+                "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH(id) BUCKETS 1 {key} \
+                 REFRESH ASYNC EVERY INTERVAL 0 WEEKS \
+                 PROPERTIES ('storage_engine' = 1) AS SELECT id FROM ice.db.source"
+            );
+            let MaterializedViewStatement::Create(create) = typed_mv(&source) else {
+                panic!("original CREATE syntax");
+            };
+            assert_eq!(lower_typed_create(&create).unwrap_err(), expected);
+        }
     }
 
     #[test]
@@ -863,11 +898,40 @@ mod tests {
             lower_typed_alter(&alter)
                 .expect("typed alter should lower")
                 .action,
-            MvAlterAction::SetProperties(vec![(
+            MvAlterAction::LegacyStorageProperties(vec![(
                 "refresh_priority".to_string(),
                 "high".to_string(),
             )])
         );
+    }
+
+    #[test]
+    fn lowers_legacy_refresh_actions_to_engine_properties() {
+        for (sql, expected) in [
+            (
+                "ALTER MATERIALIZED VIEW mv SET REFRESH ASYNC EVERY INTERVAL 2 MINUTE",
+                MvRefreshPropertyChanges::replace_policy(
+                    MvDesiredRefreshPolicy::AsyncInterval,
+                    Some(120_000),
+                ),
+            ),
+            (
+                "ALTER MATERIALIZED VIEW mv PAUSE REFRESH",
+                MvRefreshPropertyChanges::set_paused(true),
+            ),
+            (
+                "ALTER MATERIALIZED VIEW mv RESUME REFRESH",
+                MvRefreshPropertyChanges::set_paused(false),
+            ),
+        ] {
+            let MaterializedViewStatement::Alter(alter) = typed_mv(sql) else {
+                panic!("expected ALTER MATERIALIZED VIEW");
+            };
+            assert_eq!(
+                lower_typed_alter(&alter).unwrap().action,
+                MvAlterAction::RefreshProperties(expected),
+            );
+        }
     }
 
     #[test]

@@ -179,3 +179,135 @@ fn property_control_capability_and_internal_paths_are_not_reclassified() {
     assert_eq!(error.kind(), ConnectorErrorKind::Internal);
     assert!(InvalidTableProperty::from_connector_error(&error).is_none());
 }
+
+#[test]
+fn staged_mv_storage_uses_v3_default_and_original_create_projection() {
+    let defaults = |declarations: Vec<DdlPropertyDeclaration>| {
+        declarations
+            .into_iter()
+            .filter(|declaration| declaration.default_value() != &DdlPropertyValue::Null)
+            .map(|declaration| {
+                (
+                    declaration.name().into(),
+                    declaration.default_value().clone(),
+                )
+            })
+            .collect::<Vec<(Arc<str>, DdlPropertyValue)>>()
+    };
+    let ordinary = defaults(table_property_declarations().unwrap());
+    let ordinary = prepare_create_table_properties(&ordinary, None, &Active).unwrap();
+    assert_eq!(ordinary.format_version, FormatVersion::V2);
+
+    let mut managed = defaults(mv_storage_property_declarations().unwrap());
+    managed.push((
+        "extra_properties".into(),
+        DdlPropertyValue::MapVarcharVarchar(vec![(
+            "READ.SPLIT.TARGET-SIZE".into(),
+            Some("16777216".into()),
+        )]),
+    ));
+    let prepared = prepare_mv_staged_storage(&managed, &Active).unwrap();
+    assert_eq!(prepared.format_version, FormatVersion::V3);
+    assert!(prepared.location.is_none());
+    assert!(prepared.partitioning.is_empty());
+    assert_eq!(
+        prepared
+            .raw_properties
+            .get("read.split.target-size")
+            .map(String::as_str),
+        Some("16777216"),
+    );
+    assert_eq!(
+        prepared
+            .raw_properties
+            .get("write.format.default")
+            .map(String::as_str),
+        Some("parquet"),
+    );
+}
+
+#[test]
+fn staged_mv_storage_keeps_data_location_but_requires_managed_metadata_root() {
+    let mut input = properties();
+    input[1].1 = DdlPropertyValue::Integer(3);
+    input.push((
+        "data_location".into(),
+        DdlPropertyValue::Varchar("s3://storage/data".into()),
+    ));
+    let prepared = prepare_mv_staged_storage(&input, &Active).unwrap();
+    assert_eq!(
+        prepared
+            .raw_properties
+            .get("write.data.path")
+            .map(String::as_str),
+        Some("s3://storage/data"),
+    );
+
+    input.push((
+        "location".into(),
+        DdlPropertyValue::Varchar("s3://storage/table".into()),
+    ));
+    let ordinary = prepare_create_table_properties(&input, None, &Active).unwrap();
+    assert_eq!(ordinary.location.as_deref(), Some("s3://storage/table"));
+    let error = prepare_mv_staged_storage(&input, &Active)
+        .err()
+        .expect("custom staged metadata location");
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    assert!(error.message().contains("location"));
+
+    for version in [1, 2] {
+        let mut input = properties();
+        input[1].1 = DdlPropertyValue::Integer(version);
+        let error = prepare_mv_staged_storage(&input, &Active)
+            .err()
+            .expect("materialized-view storage requires row lineage");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    }
+}
+
+#[test]
+fn staged_mv_disallows_metadata_paths_through_extra_properties() {
+    let mut input = properties();
+    input[1].1 = DdlPropertyValue::Integer(3);
+    input.push((
+        "extra_properties".into(),
+        DdlPropertyValue::MapVarcharVarchar(vec![(
+            "WRITE.METADATA.PATH".into(),
+            Some("s3://storage/metadata".into()),
+        )]),
+    ));
+    let ordinary = prepare_create_table_properties(&input, None, &Active).unwrap();
+    assert_eq!(
+        ordinary.raw_properties["write.metadata.path"],
+        "s3://storage/metadata"
+    );
+    let error = prepare_mv_staged_storage(&input, &Active)
+        .err()
+        .expect("custom staged metadata location");
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    assert!(error.message().contains("write.metadata.path"));
+}
+
+#[test]
+fn staged_mv_preserves_original_property_data_and_control_failures() {
+    let mut input = properties();
+    input[1].1 = DdlPropertyValue::Integer(4);
+    let error = prepare_mv_staged_storage(&input, &Active)
+        .err()
+        .expect("invalid format version");
+    assert!(
+        marker(&error)
+            .source_error()
+            .message()
+            .contains("1, 2, or 3")
+    );
+
+    let control_error = ConnectorError::compile_interruption(
+        novarocks_type_contract::CompileControlError::Cancelled,
+    );
+    let error = prepare_mv_staged_storage(&input, &Stopped(control_error.clone()))
+        .err()
+        .expect("actual connector control is stopped");
+    assert_eq!(error.failure_fact(), control_error.failure_fact());
+    assert_eq!(error.message(), control_error.message());
+}

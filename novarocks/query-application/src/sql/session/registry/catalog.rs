@@ -17,10 +17,10 @@
 
 //! Catalog declarations describe the original admitted instance, not a provider-wide default.
 use super::*;
-use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
+use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderBindingKey};
 use uuid::Uuid;
 
-/// A neutral projection of CatalogRuntimeObservation. This is metadata, not a
+/// A neutral projection of CatalogConfigurationObservation. This is metadata, not a
 /// lease, permission or Provider I/O capability. FE supplies the original fact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogPropertyIdentity {
@@ -28,6 +28,7 @@ pub struct CatalogPropertyIdentity {
     pub instance_id: ConnectorInstanceId,
     pub provider_id: ConnectorProviderId,
     pub generation: u64,
+    pub binding_key: ConnectorProviderBindingKey,
 }
 
 /// The current sealed providers explicitly declare an empty set. Adding a
@@ -135,24 +136,29 @@ impl SessionPropertyRegistry {
         identity: CatalogPropertyIdentity,
         configuration: &[(String, String)],
     ) -> Result<CatalogPropertyMetadata, SessionPropertyError> {
-        if identity.instance_id.as_str() != catalog {
+        if identity.instance_id.as_str() != catalog
+            || identity.binding_key.instance_id != identity.instance_id
+        {
             return Err(SessionPropertyError::CatalogIdentityMismatch);
         }
-        let values = match self.factories.get(identity.provider_id.as_str()) {
-            Some(factory) => factory.declarations(&identity, configuration)?,
-            None => {
-                return Err(SessionPropertyError::InvalidDeclaration {
-                    detail: "Catalog provider has no session property declaration factory",
-                });
-            }
-        };
+        let sources = self
+            .catalog_sources
+            .get(identity.provider_id.as_str())
+            .ok_or(SessionPropertyError::InvalidDeclaration {
+                detail: "Catalog provider has no session property declaration factory",
+            })?;
+        let values = sources.provider.declarations(&identity, configuration)?;
         if values.iter().any(|value| value.project.is_some()) {
             return Err(SessionPropertyError::ProjectionInvariant);
+        }
+        let mut declarations = compose_declarations(values)?;
+        for declaration in sources.application.values() {
+            insert_declaration(&mut declarations, Arc::clone(declaration))?;
         }
         Ok(CatalogPropertyMetadata {
             catalog: catalog.to_owned(),
             identity: Some(identity),
-            declarations: compose_declarations(values)?,
+            declarations,
         })
     }
 }

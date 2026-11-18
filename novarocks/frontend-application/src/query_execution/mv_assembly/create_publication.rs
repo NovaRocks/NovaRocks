@@ -19,7 +19,9 @@
 
 use crate::mv::domain::{
     application::{MvApplicationError, MvApplicationErrorKind, MvCreateProjectionSeed},
-    iceberg_refresh::{IcebergMvCreatePlan, build_create_documents_for_prepared_target},
+    iceberg_refresh::{
+        IcebergMvCreatePlan, MvStagedStorage, build_create_documents_for_prepared_target,
+    },
 };
 use crate::query_execution::write_session::{
     ConnectorWriteSession, WriteBeginReceiving, WritePublicationCall,
@@ -39,7 +41,7 @@ use novarocks_spi::connector::{
     ConnectorPartitionTransform, ConnectorRequestContext, ConnectorStagedCreateSession,
     ConnectorStagedTableHandle, ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof,
     ConnectorWriteAdmissionPurpose, ConnectorWriteInputRequest, ConnectorWriteIntent,
-    ConnectorWriteTargetRef, ExternalMutationFinalization,
+    ConnectorWriteTargetRef, DdlPropertyValue, ExternalMutationFinalization,
 };
 use std::{
     collections::BTreeMap,
@@ -68,6 +70,14 @@ pub(crate) enum CreatePublicationInput {
         context: ConnectorRequestContext,
     },
 }
+pub(crate) enum CreateStorageDeclarations {
+    Legacy(Vec<ConnectorPartitionTransform>),
+    Evaluated {
+        visible_partition_sources: Vec<Arc<str>>,
+        properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+    },
+}
+
 #[expect(
     clippy::large_enum_variant,
     reason = "The complete CREATE output moves from the original Arc-backed activation Body into the existing stable CREATE Body; inline variants avoid an additional variant allocation."
@@ -75,8 +85,8 @@ pub(crate) enum CreatePublicationInput {
 pub(crate) enum CreatePublicationOutput {
     StageDeclarations {
         columns: Vec<ConnectorColumnDefinition>,
-        partitioning: Vec<ConnectorPartitionTransform>,
-        properties: BTreeMap<Arc<str>, Arc<str>>,
+        storage: CreateStorageDeclarations,
+        application_properties: BTreeMap<Arc<str>, Arc<str>>,
     },
     Publication {
         begin: ConnectorWriteBeginRequest,
@@ -95,13 +105,24 @@ impl CreatePublicationInput {
                     .map(crate::catalog_application::statement::connector_column)
                     .collect::<Result<_, _>>()
                     .map_err(invalid)?,
-                partitioning: plan
-                    .partition_fields
-                    .iter()
-                    .map(novarocks_query_application::sql::connector_partition_transform)
-                    .collect(),
-                properties: plan
-                    .target_properties
+                storage: match &plan.storage {
+                    MvStagedStorage::Legacy(partitioning) => CreateStorageDeclarations::Legacy(
+                        partitioning
+                            .iter()
+                            .map(novarocks_query_application::sql::connector_partition_transform)
+                            .collect(),
+                    ),
+                    MvStagedStorage::Evaluated {
+                        visible_partition_sources,
+                        properties,
+                        ..
+                    } => CreateStorageDeclarations::Evaluated {
+                        visible_partition_sources: visible_partition_sources.clone(),
+                        properties: properties.clone(),
+                    },
+                },
+                application_properties: plan
+                    .application_properties
                     .iter()
                     .map(|(key, value)| (Arc::from(key.as_str()), Arc::from(value.as_str())))
                     .collect(),

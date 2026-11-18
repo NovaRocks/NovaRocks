@@ -32,7 +32,8 @@ pub use legacy::{
 
 mod create;
 pub(crate) use create::{
-    PreparedCreateTableProperties, prepare_create_table_properties, typed_format_version,
+    PreparedCreateTableProperties, prepare_create_table_properties, prepare_mv_staged_storage,
+    typed_format_version,
 };
 
 mod projection;
@@ -43,7 +44,9 @@ mod partitioning_evolution;
 pub(crate) use partitioning_evolution::prepare_full_partitioning_change;
 
 mod partitioning_binding;
-pub(crate) use partitioning_binding::bind_create_table_partitioning;
+pub(crate) use partitioning_binding::{
+    bind_create_table_partitioning, bind_mv_create_table_partitioning,
+};
 
 mod partitioning;
 pub use partitioning::{parse_table_partitioning_element, parse_table_partitioning_property};
@@ -86,9 +89,21 @@ pub const UNSUPPORTED_TABLE_PROPERTY_NAMES: &[&str] = &[
 /// raw key. The application keeps DEFAULT distinct from an explicit SQL NULL.
 pub fn table_property_declarations()
 -> Result<Vec<DdlPropertyDeclaration>, DdlPropertyDeclarationError> {
+    table_property_declarations_for_version(default_create_format_version())
+}
+
+/// Document-managed materialized-view storage starts with v3 row lineage.
+pub(crate) fn mv_storage_property_declarations()
+-> Result<Vec<DdlPropertyDeclaration>, DdlPropertyDeclarationError> {
+    table_property_declarations_for_version(FormatVersion::V3)
+}
+
+fn table_property_declarations_for_version(
+    version: FormatVersion,
+) -> Result<Vec<DdlPropertyDeclaration>, DdlPropertyDeclarationError> {
     use DdlPropertyType as T;
     use DdlPropertyValue as V;
-    let format_version = match default_create_format_version() {
+    let format_version = match version {
         FormatVersion::V1 => 1,
         FormatVersion::V2 => 2,
         FormatVersion::V3 => 3,

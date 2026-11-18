@@ -28,6 +28,8 @@ use crate::mv::domain::rewrite::context::IcebergMvRewriteContext;
 
 pub(crate) struct MvRefreshPreparationInput {
     pub(crate) source: IcebergMvCorePorts,
+    pub(crate) session_properties:
+        Option<Arc<novarocks_query_application::sql::session::registry::SessionPropertyInputs>>,
     pub(crate) current_catalog: Option<String>,
     pub(crate) current_database: String,
     pub(crate) statement: MvRefreshRequest,
@@ -76,7 +78,7 @@ async fn prepare_refresh_inner(
             "MV refresh preparation statement does not match the admitted SQL request",
         ));
     }
-    let mut plan = crate::mv::domain::iceberg_refresh::async_preparation::plan_iceberg_mv_refresh_with_connector_context(
+    let refresh = crate::mv::domain::iceberg_refresh::async_preparation::plan_iceberg_mv_refresh_with_connector_context(
             io,
             source,
             current_catalog,
@@ -84,8 +86,10 @@ async fn prepare_refresh_inner(
             statement,
             request.target.clone(),
             repartition_fields.is_some(),
+            input.session_properties.as_deref(),
             connector_context,
         ).await?;
+    let mut plan = refresh.plan;
     let retained_repartition_target = if repartition_fields.is_some() {
         Some(retain_exact_repartition_target(io, source, &plan.contract, connector_context).await?)
     } else {
@@ -128,6 +132,12 @@ async fn prepare_refresh_inner(
             .observe_current_binding(&instance_id)
             .map_err(PreparationError::from)?,
     };
+    if input.session_properties.is_some() && observed_binding != refresh.target_binding {
+        return Err(PreparationError(MvApplicationError::new(
+            crate::mv::domain::application::MvApplicationErrorKind::BindingInvalidated,
+            "MV refresh target binding changed after session settings were resolved",
+        )));
+    }
     let mut base_table_object_ids = BTreeMap::new();
     for base in &plan.contract.base_refs {
         let observed = io.schema(source, &base.table, connector_context).await?;
@@ -143,7 +153,7 @@ async fn prepare_refresh_inner(
             target_table_uuid, ..
         } => target_table_uuid.clone(),
     };
-    let full_overwrite = statement.full;
+    let full_overwrite = refresh.full_overwrite;
     let work = match plan.contract.decision {
         ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
         ExecutableRefreshDecision::MetadataOnly => {

@@ -17,7 +17,9 @@
 
 use super::*;
 use crate::session_error::QueryServiceErrorKind;
-use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
+use novarocks_spi::connector::{
+    ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorProviderId, ProviderBindingEpoch,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn registry() -> SessionPropertyRegistry {
@@ -335,9 +337,14 @@ fn declaration_defaults_use_original_consumers_and_projection_keeps_other_settin
 }
 
 fn identity(catalog: &str, generation: u64) -> CatalogPropertyIdentity {
+    let instance_id = ConnectorInstanceId::parse(catalog).unwrap();
     CatalogPropertyIdentity {
         attachment_id: uuid::Uuid::from_u128(u128::from(generation)),
-        instance_id: ConnectorInstanceId::parse(catalog).unwrap(),
+        binding_key: ConnectorProviderBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: ProviderBindingEpoch::from_bytes(u128::from(generation).to_be_bytes()),
+        },
+        instance_id,
         provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
         generation,
     }
@@ -451,6 +458,38 @@ fn same_provider_catalog_defaults_and_overrides_are_instance_bound() {
         .unwrap();
     assert_eq!(first.value.as_deref(), Some("11"));
     assert_eq!(first.default.as_deref(), Some("11"));
+}
+
+#[test]
+fn catalog_override_requires_the_admitted_opaque_binding_key() {
+    let registry = catalog_registry();
+    let first = identity("first", 1);
+    let mut replacement = first.clone();
+    replacement.binding_key.incarnation = ProviderBindingEpoch::from_bytes([41; 16]);
+    let config = [("default".into(), "4".into())];
+    let metadata = registry
+        .bind_catalog("first", first.clone(), &config)
+        .unwrap();
+    let mut inputs = SessionPropertyInputs::default();
+    inputs.insert(metadata.prepare_header("first", "limit", "7").unwrap());
+    assert_eq!(
+        inputs.read_catalog_override_for_binding(&first.binding_key, "limit"),
+        Some(&SessionPropertyValue::Integer(7))
+    );
+    assert_eq!(
+        inputs.read_catalog_override_for_binding(&replacement.binding_key, "limit"),
+        None
+    );
+
+    let metadata = registry
+        .bind_catalog("first", replacement.clone(), &config)
+        .unwrap();
+    assert_eq!(inputs.read_catalog_override(&metadata, "limit"), None);
+    replacement.binding_key.instance_id = ConnectorInstanceId::parse("other").unwrap();
+    assert!(matches!(
+        registry.bind_catalog("first", replacement, &config),
+        Err(SessionPropertyError::CatalogIdentityMismatch)
+    ));
 }
 
 #[test]
@@ -848,4 +887,134 @@ fn catalog_composition_rejects_instance_duplicates_and_requires_provider_factory
     assert!(
         matches!(metadata.prepare_header("lake", "limit", "1"), Err(SessionPropertyError::UnknownProperty { name }) if name == "lake.limit")
     );
+}
+
+fn application_declaration(name: &str) -> PropertyDeclaration {
+    PropertyDeclaration::catalog(
+        name,
+        SessionPropertyType::Boolean,
+        Some(SessionPropertyValue::Boolean(true)),
+        "Application declaration",
+        false,
+        |_| Ok(()),
+    )
+    .unwrap()
+}
+
+#[test]
+fn catalog_application_declarations_keep_instance_identity_and_provider_defaults() {
+    let iceberg = ConnectorProviderId::parse("iceberg").unwrap();
+    let paimon = ConnectorProviderId::parse("paimon").unwrap();
+    let registry = SessionPropertyRegistry::with_catalog_factories(vec![
+        Arc::new(Factory {
+            provider: iceberg.clone(),
+        }),
+        Arc::new(EmptyCatalogPropertyDeclarationFactory::new(paimon.clone())),
+    ])
+    .unwrap()
+    .with_catalog_application_declarations([
+        (iceberg.clone(), application_declaration("app_enabled")),
+        (iceberg, application_declaration("another_app_property")),
+    ])
+    .unwrap();
+
+    let first = registry
+        .bind_catalog(
+            "first",
+            identity("first", 1),
+            &[("default".into(), "4".into())],
+        )
+        .unwrap();
+    let second = registry
+        .bind_catalog(
+            "second",
+            identity("second", 2),
+            &[("default".into(), "9".into())],
+        )
+        .unwrap();
+    let mut inputs = SessionPropertyInputs::default();
+    inputs.insert(
+        first
+            .prepare_header("first", "app_enabled", "false")
+            .unwrap(),
+    );
+    assert_eq!(
+        inputs.read_catalog_override(&first, "app_enabled"),
+        Some(&SessionPropertyValue::Boolean(false))
+    );
+    assert_eq!(inputs.read_catalog_override(&second, "app_enabled"), None);
+    for (metadata, expected) in [(&first, 4), (&second, 9)] {
+        assert_eq!(
+            metadata.lookup("limit").unwrap().default_value(),
+            Some(&SessionPropertyValue::Integer(expected))
+        );
+        for name in ["app_enabled", "another_app_property"] {
+            assert_eq!(
+                metadata.lookup(name).unwrap().default_value(),
+                Some(&SessionPropertyValue::Boolean(true))
+            );
+        }
+    }
+    let recreated = registry
+        .bind_catalog(
+            "first",
+            identity("first", 3),
+            &[("default".into(), "5".into())],
+        )
+        .unwrap();
+    assert_eq!(
+        inputs.read_catalog_override(&recreated, "app_enabled"),
+        None
+    );
+
+    let metadata = registry
+        .bind_catalog(
+            "other",
+            CatalogPropertyIdentity {
+                provider_id: paimon,
+                ..identity("other", 4)
+            },
+            &[],
+        )
+        .unwrap();
+    assert_eq!(metadata.declarations().count(), 0);
+    assert!(matches!(
+        metadata.lookup("app_enabled"),
+        Err(SessionPropertyError::UnknownProperty { name }) if name == "other.app_enabled"
+    ));
+    assert!(matches!(
+        registry.prepare_header_inputs(
+            &[("absent.app_enabled".into(), "true".into())],
+            &NoCatalog { calls: AtomicUsize::new(0) },
+        ),
+        Err(SessionPropertyError::CatalogNotFound { catalog }) if catalog == "absent"
+    ));
+}
+
+#[test]
+fn catalog_composition_rejects_cross_source_names_and_requires_its_primary_provider() {
+    let provider = ConnectorProviderId::parse("iceberg").unwrap();
+    let app = |name| (provider.clone(), application_declaration(name));
+    assert!(matches!(
+        registry().with_catalog_application_declarations([app("app_enabled")]),
+        Err(SessionPropertyError::InvalidDeclaration { .. })
+    ));
+    assert!(matches!(
+        catalog_registry().with_catalog_application_declarations([app("app_enabled"), app("app_enabled")]),
+        Err(SessionPropertyError::DuplicateProperty { name }) if name == "app_enabled"
+    ));
+
+    let registry = catalog_registry()
+        .with_catalog_application_declarations([app("limit")])
+        .unwrap();
+    assert!(matches!(
+        registry.bind_catalog("lake", identity("lake", 1), &[]),
+        Err(SessionPropertyError::InvalidDeclaration {
+            detail: "Test instance default missing"
+        })
+    ));
+    assert!(matches!(
+        registry.bind_catalog("lake", identity("lake", 1), &[("default".into(), "4".into())]),
+        Err(SessionPropertyError::DuplicateProperty { name }) if name == "limit"
+    ));
 }

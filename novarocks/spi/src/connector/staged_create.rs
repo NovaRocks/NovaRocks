@@ -35,9 +35,10 @@ use super::{
     ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationOperationId,
     ConnectorPartitionTransform, ConnectorProviderBindingKey, ConnectorRequestContext,
     ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableObjectId, ConnectorWrite,
-    ConnectorWriteReceipt, CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MvExactPartitionField, MvExactPartitionTransform, ProviderBindingEpoch,
+    ConnectorWriteReceipt, CreatePolicy, DdlPropertyDeclaration, DdlPropertyValue,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MvExactPartitionField,
+    MvExactPartitionTransform, ProviderBindingEpoch,
 };
 
 pub const CONNECTOR_STAGED_CREATE_CONTRACT_VERSION: u32 = 1;
@@ -599,7 +600,24 @@ pub enum ConnectorStagedCreateMode {
     Ordinary,
     ApplicationDocumentManaged {
         admission: ConnectorDocumentManagementAdmission,
+        storage: Option<Arc<ConnectorStagedMvStorageProperties>>,
     },
+}
+
+/// Immutable evaluated storage retained through all aliases of one prepare request.
+pub struct ConnectorStagedMvStorageProperties {
+    visible_partition_sources: Vec<Arc<str>>,
+    properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+}
+
+impl ConnectorStagedMvStorageProperties {
+    pub fn visible_partition_sources(&self) -> &[Arc<str>] {
+        &self.visible_partition_sources
+    }
+
+    pub fn properties(&self) -> &[(Arc<str>, DdlPropertyValue)] {
+        &self.properties
+    }
 }
 
 impl ConnectorStagedCreateMode {
@@ -609,7 +627,7 @@ impl ConnectorStagedCreateMode {
         operation_id: ConnectorStagedCreateOperationId,
         table: &ConnectorTableIdentity,
     ) -> Result<(), ConnectorError> {
-        if let Self::ApplicationDocumentManaged { admission } = self {
+        if let Self::ApplicationDocumentManaged { admission, .. } = self {
             admission.validate()?;
             if admission.owner() != owner
                 || admission.operation_id() != operation_id
@@ -1264,6 +1282,16 @@ impl ConnectorStagedCreatePublication {
 }
 
 pub trait ConnectorStagedCreate: Send + Sync {
+    /// Provider declarations exposed by this exact retained generation.
+    fn mv_storage_property_declarations(
+        &self,
+    ) -> Result<Vec<DdlPropertyDeclaration>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not declare materialized-view storage properties",
+        ))
+    }
+
     /// Pure construction only. Unsupported does not invoke the legacy method.
     fn begin_publish_original(
         &self,
@@ -1868,6 +1896,12 @@ struct StagedCreateReleaseGuard {
 }
 
 impl ConnectorStagedCreateSession {
+    pub fn mv_storage_property_declarations(
+        &self,
+    ) -> Result<Vec<DdlPropertyDeclaration>, ConnectorError> {
+        self.capability.mv_storage_property_declarations()
+    }
+
     /// The immutable generation owner already pinned by this exact lease.
     pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.provider_binding_key
@@ -2478,7 +2512,47 @@ impl ConnectorStagedCreateSession {
             partitioning,
             properties,
             policy,
-            mode: ConnectorStagedCreateMode::ApplicationDocumentManaged { admission },
+            mode: ConnectorStagedCreateMode::ApplicationDocumentManaged {
+                admission,
+                storage: None,
+            },
+            context,
+        };
+        request
+            .mode
+            .validate_for(&request.owner, request.operation_id, &request.table)?;
+        Ok(request)
+    }
+
+    pub fn prepare_document_managed_typed_request(
+        &self,
+        publication_id: LakePublicationId,
+        operation_id: ConnectorStagedCreateOperationId,
+        table: ConnectorTableIdentity,
+        columns: Vec<ConnectorColumnDefinition>,
+        visible_partition_sources: Vec<Arc<str>>,
+        storage_properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+        application_properties: BTreeMap<Arc<str>, Arc<str>>,
+        policy: CreatePolicy,
+        admission: ConnectorDocumentManagementAdmission,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorStagedCreatePrepareRequest, ConnectorError> {
+        let request = ConnectorStagedCreatePrepareRequest {
+            owner: self.provider_binding_key.clone(),
+            publication_id,
+            operation_id,
+            table,
+            columns,
+            partitioning: Vec::new(),
+            properties: application_properties,
+            policy,
+            mode: ConnectorStagedCreateMode::ApplicationDocumentManaged {
+                admission,
+                storage: Some(Arc::new(ConnectorStagedMvStorageProperties {
+                    visible_partition_sources,
+                    properties: storage_properties,
+                })),
+            },
             context,
         };
         request
@@ -3089,7 +3163,7 @@ impl ConnectorStagedCreateSession {
                 match (&request.mode, handle.document_target()) {
                     (ConnectorStagedCreateMode::Ordinary, None) => {}
                     (
-                        ConnectorStagedCreateMode::ApplicationDocumentManaged { admission },
+                        ConnectorStagedCreateMode::ApplicationDocumentManaged { admission, .. },
                         Some(target),
                     ) if target.owner() == &request.owner
                         && target.catalog_handle() == admission.catalog_handle()

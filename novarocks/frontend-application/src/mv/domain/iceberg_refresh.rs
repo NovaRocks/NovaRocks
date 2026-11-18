@@ -38,7 +38,7 @@ use crate::mv::domain::analysis_adapter::{
 };
 use crate::mv::domain::application::MvCreateProjectionSeed;
 use crate::mv::domain::application::{
-    MvApplicationError, MvApplicationErrorKind, MvCreateRefreshPolicy, MvCreateStatement,
+    MvApplicationError, MvApplicationErrorKind, MvCreateStatement, MvCreateStorage,
     MvRefreshRequest,
 };
 use crate::mv::domain::lifecycle::RefreshPlan;
@@ -99,7 +99,7 @@ use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY as APPLY_KEY_COLUMN_PROPERTY,
     CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY as HIDDEN_COLUMNS_PROPERTY, ConnectorControlRegistry,
-    ConnectorInstanceId, ConnectorTableObjectId,
+    ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorTableObjectId, DdlPropertyValue,
 };
 #[cfg(test)]
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
@@ -236,6 +236,15 @@ impl crate::catalog_application::query_catalog::CatalogServiceSource for Iceberg
     }
 }
 
+pub(crate) enum MvStagedStorage {
+    Legacy(Vec<IcebergPartitionFieldExpr>),
+    Evaluated {
+        binding: ConnectorProviderBindingKey,
+        visible_partition_sources: Vec<Arc<str>>,
+        properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+    },
+}
+
 pub(crate) struct IcebergMvCreatePlan {
     pub(crate) target: IcebergMvTarget,
     pub(crate) refresh_contract: ImvRefreshContract,
@@ -259,8 +268,8 @@ pub(crate) struct IcebergMvCreatePlan {
     pub(crate) aggregate_runtime_layout:
         novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout,
     pub(crate) columns: Vec<TableColumnDef>,
-    pub(crate) partition_fields: Vec<IcebergPartitionFieldExpr>,
-    pub(crate) target_properties: Vec<(String, String)>,
+    pub(crate) storage: MvStagedStorage,
+    pub(crate) application_properties: Vec<(String, String)>,
 }
 impl IcebergMvCreatePlan {
     pub(crate) fn staged_write_fields(
@@ -295,31 +304,9 @@ impl IcebergMvCreatePlan {
                 target_table: Some(self.target.table.clone()),
                 created_at_ms: self.created_at_ms,
             },
-            refresh: initial_refresh_configuration_for_create(&statement.refresh_policy),
+            refresh: statement.refresh.clone(),
             dependencies: self.dependencies.clone(),
         })
-    }
-}
-
-fn initial_refresh_configuration_for_create(
-    policy: &crate::mv::domain::application::MvCreateRefreshPolicy,
-) -> novarocks_mv_application::repository::InitialMvRefreshConfiguration {
-    let (policy, interval_ms) = match policy {
-        crate::mv::domain::application::MvCreateRefreshPolicy::Manual => {
-            (MvDesiredRefreshPolicy::Manual, None)
-        }
-        crate::mv::domain::application::MvCreateRefreshPolicy::AsyncOnChange => {
-            (MvDesiredRefreshPolicy::AsyncOnChange, None)
-        }
-        crate::mv::domain::application::MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
-            (MvDesiredRefreshPolicy::AsyncInterval, Some(*interval_ms))
-        }
-    };
-    novarocks_mv_application::repository::InitialMvRefreshConfiguration {
-        policy,
-        paused: false,
-        interval_ms,
-        max_staleness_ms: None,
     }
 }
 
@@ -401,8 +388,15 @@ pub(crate) fn prepare_mv_create_target(
     current_database: &str,
     stmt: &MvCreateStatement,
 ) -> Result<IcebergMvTarget, novarocks_sql::compiler::SqlCompileError> {
-    let storage_engine = stmt
-        .properties
+    let (name_parts, properties) = match &stmt.storage {
+        MvCreateStorage::Evaluated { target, .. } => return Ok(target.clone()),
+        MvCreateStorage::Legacy {
+            name_parts,
+            properties,
+            ..
+        } => (name_parts, properties),
+    };
+    let storage_engine = properties
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("storage_engine"))
         .map(|(_, value)| value.trim().to_ascii_lowercase())
@@ -415,7 +409,7 @@ pub(crate) fn prepare_mv_create_target(
     let current_catalog = current_catalog.ok_or_else(|| {
         "storage_engine='iceberg' requires current catalog to be an Iceberg catalog".to_string()
     })?;
-    let (namespace, table) = match stmt.name_parts.as_slice() {
+    let (namespace, table) = match name_parts.as_slice() {
         [table] => (
             normalize_identifier(current_database)?,
             normalize_identifier(table)?,
@@ -457,8 +451,14 @@ pub(crate) fn prepare_mv_create_shape(
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<MvCreateShape, novarocks_sql::compiler::SqlCompileError> {
     let refresh_contract = derive_imv_refresh_contract(&analysis, completion_control)?;
-    let partition_fields = partition_fields_for_create(stmt.partition_by.as_ref());
-    validate_mv_partition_columns(Some(&partition_fields), &analysis.output_columns)?;
+    let partition_fields = match &stmt.storage {
+        MvCreateStorage::Legacy { partition_by, .. } => {
+            let fields = partition_fields_for_create(partition_by.as_ref());
+            validate_mv_partition_columns(Some(&fields), &analysis.output_columns)?;
+            fields
+        }
+        MvCreateStorage::Evaluated { .. } => Vec::new(),
+    };
     let created_at_ms = now_ms();
     let resolved_dependencies =
         crate::mv::domain::dependency_resolver::resolve_create_mv_dependencies(
@@ -537,7 +537,14 @@ pub(crate) fn finish_mv_create_preparation(
             TargetIdentity::GroupRowId(_) => return Err(("iceberg-backed aggregate materialized views do not support PRIMARY KEY".to_string()).into()),
         }
     }
-    if !partition_fields.is_empty() && property.is_composed_aggregate_schema_contract_fallback() {
+    let has_partitioning = match &stmt.storage {
+        MvCreateStorage::Legacy { .. } => !partition_fields.is_empty(),
+        MvCreateStorage::Evaluated { properties, .. } => properties.iter().any(|(name, value)| {
+            name.as_ref() == "partitioning"
+                && matches!(value, DdlPropertyValue::ArrayVarchar(fields) if !fields.is_empty())
+        }),
+    };
+    if has_partitioning && property.is_composed_aggregate_schema_contract_fallback() {
         return Err(
             ("partitioned composed aggregate Iceberg MV is not supported".to_string()).into(),
         );
@@ -598,8 +605,7 @@ pub(crate) fn finish_mv_create_preparation(
                 )
                 .expect("empty aggregate layout is a valid stateless CREATE carrier")
             });
-    let mut target_properties = vec![
-        ("format-version".to_string(), "3".to_string()),
+    let mut application_properties = vec![
         (
             APPLY_KEY_COLUMN_PROPERTY.to_string(),
             apply_key_column_name.to_string(),
@@ -614,11 +620,30 @@ pub(crate) fn finish_mv_create_preparation(
         ),
     ];
     if !aggregate_state_hidden_columns.is_empty() {
-        target_properties.push((
+        application_properties.push((
             HIDDEN_COLUMNS_PROPERTY.to_string(),
             aggregate_state_hidden_columns.join(","),
         ));
     }
+    let storage = match &stmt.storage {
+        MvCreateStorage::Legacy { .. } => {
+            application_properties.insert(0, ("format-version".to_string(), "3".to_string()));
+            MvStagedStorage::Legacy(partition_fields)
+        }
+        MvCreateStorage::Evaluated {
+            binding,
+            properties,
+            ..
+        } => MvStagedStorage::Evaluated {
+            binding: binding.clone(),
+            visible_partition_sources: analysis
+                .output_columns
+                .iter()
+                .map(|column| Arc::from(column.name.as_str()))
+                .collect(),
+            properties: properties.clone(),
+        },
+    };
     Ok(Arc::new(IcebergMvCreatePlan {
         target,
         refresh_contract,
@@ -631,8 +656,8 @@ pub(crate) fn finish_mv_create_preparation(
         binding_document,
         columns,
         aggregate_runtime_layout,
-        partition_fields,
-        target_properties,
+        storage,
+        application_properties,
         created_at_ms,
     }))
 }
@@ -982,37 +1007,6 @@ fn create_apply_key_source_property(apply_key: &ApplyKeyContract) -> &'static st
     mv_apply_key_source_from_column_name(apply_key.column_name)
         .expect("known Iceberg MV apply-key column")
         .table_property_value()
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-fn refresh_policy_descriptor_json(
-    policy: &MvCreateRefreshPolicy,
-    paused: bool,
-) -> serde_json::Value {
-    match policy {
-        MvCreateRefreshPolicy::Manual => serde_json::json!({
-            "policy": "DEFERRED_MANUAL",
-            "interval_ms": null,
-            "paused": paused,
-        }),
-        MvCreateRefreshPolicy::AsyncOnChange => {
-            serde_json::json!({
-                "policy": "ASYNC_ON_CHANGE",
-                "interval_ms": null,
-                "paused": paused,
-            })
-        }
-        MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
-            serde_json::json!({
-                "policy": "ASYNC_INTERVAL",
-                "interval_ms": interval_ms,
-                "paused": paused,
-            })
-        }
-    }
 }
 
 pub(crate) fn configuration_document(

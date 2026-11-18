@@ -1501,7 +1501,7 @@ pub(crate) fn table_properties(
     Ok((format_version, properties))
 }
 
-fn validate_create_column_names(
+pub(crate) fn validate_create_column_names(
     columns: &[ConnectorColumnDefinition],
 ) -> Result<(), ConnectorError> {
     for column in columns {

@@ -582,6 +582,10 @@ mod tests {
         let facts = CatalogConfigurationObservation {
             runtime: current.clone(),
             configuration: Arc::clone(&configuration),
+            binding_key: novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: current.instance_id.clone(),
+                incarnation: novarocks_spi::connector::ProviderBindingEpoch::from_bytes([7; 16]),
+            },
         };
         let application = Arc::new(FixedApplication {
             admission: Mutex::new(CatalogAdmission::Ready(current.clone())),
@@ -600,6 +604,7 @@ mod tests {
             .require_ready(&current.instance_id)
             .expect("forward the exact published configuration");
         assert_eq!(observed.runtime, current);
+        assert_eq!(observed.binding_key, facts.binding_key);
         assert!(Arc::ptr_eq(&observed.configuration, &configuration));
 
         let mut another_generation = facts.clone();

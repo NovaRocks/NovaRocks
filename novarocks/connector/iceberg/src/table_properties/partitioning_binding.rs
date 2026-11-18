@@ -34,13 +34,24 @@ pub(crate) fn bind_create_table_partitioning(
     fields: &[Option<String>],
     control: &dyn ConnectorOperationControl,
 ) -> Result<PartitionSpec, ConnectorError> {
-    bind_create_table_partitioning_inner(schema, fields, control)
+    bind_create_table_partitioning_inner(schema, fields, None, control)
+        .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
+}
+
+pub(crate) fn bind_mv_create_table_partitioning(
+    schema: SchemaRef,
+    fields: &[Option<String>],
+    visible_sources: &HashSet<String>,
+    control: &dyn ConnectorOperationControl,
+) -> Result<PartitionSpec, ConnectorError> {
+    bind_create_table_partitioning_inner(schema, fields, Some(visible_sources), control)
         .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
 }
 
 fn bind_create_table_partitioning_inner(
     schema: SchemaRef,
     fields: &[Option<String>],
+    visible_sources: Option<&HashSet<String>>,
     control: &dyn ConnectorOperationControl,
 ) -> Result<PartitionSpec, ConnectorError> {
     control.check_active()?;
@@ -51,6 +62,12 @@ fn bind_create_table_partitioning_inner(
         control.check_active()?;
         let (source_id, field) =
             resolve_property_partition_source(&schema, field.as_deref(), index, "CREATE", control)?;
+        let source = partition_source(&field);
+        if visible_sources.is_some_and(|visible| !visible.contains(source)) {
+            return Err(invalid(format!(
+                "materialized view partition source column `{source}` must be an output column"
+            )));
+        }
         domain.admit(&schema, source_id, &field, false, control)?;
         let unbound = initial_partition_field(&field, source_id, index).map_err(invalid)?;
         builder = builder

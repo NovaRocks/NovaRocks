@@ -309,6 +309,15 @@ impl CreateOriginal {
             .planning
             .derive_staged_create_lease()
             .map_err(provider)?;
+        if let crate::mv::domain::iceberg_refresh::MvStagedStorage::Evaluated { binding, .. } =
+            &input.plan.storage
+            && staged_session.owner() != binding
+        {
+            return Err(MvApplicationError::new(
+                MvApplicationErrorKind::BindingInvalidated,
+                "MV storage property declarations belong to a replaced catalog binding",
+            ));
+        }
         input.context = input.context.with_io_admission(input.io.clone());
         // All rejection above precedes installing any management or Provider work.
         Ok(Arc::new(Self {
@@ -832,31 +841,52 @@ impl Body {
         }
         let Some(Ok(MvWriteActivationOutput::Create(CreatePublicationOutput::StageDeclarations {
             columns,
-            partitioning,
-            properties,
+            storage,
+            application_properties,
         }))) = self.cpu_result.take()
         else {
             unreachable!()
         };
-        self.request = Some(
-            self.staged_session
-                .prepare_document_managed_request(
-                    LakePublicationId::try_from_uuid(self.input.operation_id)
-                        .map_err(|e| invalid(e.to_string()))?,
+        let publication = LakePublicationId::try_from_uuid(self.input.operation_id)
+            .map_err(|error| invalid(error.to_string()))?;
+        let admission = self
+            .admission
+            .as_ref()
+            .ok_or_else(|| invalid("CREATE management admission is absent"))?
+            .clone();
+        use crate::query_execution::mv_assembly::create_publication::CreateStorageDeclarations;
+        let request = match storage {
+            CreateStorageDeclarations::Legacy(partitioning) => {
+                self.staged_session.prepare_document_managed_request(
+                    publication,
                     self.operation,
                     self.table.clone(),
                     columns,
                     partitioning,
-                    properties,
+                    application_properties,
                     CreatePolicy::FailIfExists,
-                    self.admission
-                        .as_ref()
-                        .ok_or_else(|| invalid("CREATE management admission is absent"))?
-                        .clone(),
+                    admission,
                     self.input.context.clone(),
                 )
-                .map_err(provider)?,
-        );
+            }
+            CreateStorageDeclarations::Evaluated {
+                visible_partition_sources,
+                properties,
+            } => self.staged_session.prepare_document_managed_typed_request(
+                publication,
+                self.operation,
+                self.table.clone(),
+                columns,
+                visible_partition_sources,
+                properties,
+                application_properties,
+                CreatePolicy::FailIfExists,
+                admission,
+                self.input.context.clone(),
+            ),
+        }
+        .map_err(provider)?;
+        self.request = Some(request);
         self.management_mut()?
             .mark_create_intent_dispatched(super::now_management_timestamp().map_err(invalid)?)
             .map_err(|e| invalid(format!("record CREATE intent: {e:?}")))?;
@@ -1544,14 +1574,15 @@ mod original_stage_tests {
             panic!("query fixture");
         };
         let statement = crate::mv::domain::application::MvCreateStatement {
-            name_parts: vec!["new_mv".into()],
             if_not_exists: false,
-            partition_by: None,
-            distribution: None,
-            refresh_policy: crate::mv::domain::application::MvCreateRefreshPolicy::Manual,
+            refresh: novarocks_mv_application::repository::InitialMvRefreshConfiguration::default(),
             select_sql: sql.into(),
             select_query: query.clone(),
-            properties: Vec::new(),
+            storage: crate::mv::domain::application::MvCreateStorage::Legacy {
+                name_parts: vec!["new_mv".into()],
+                partition_by: None,
+                properties: Vec::new(),
+            },
             primary_key: None,
         };
         plan_from_statement(context, &statement, "iceberg", "db")
@@ -1700,9 +1731,86 @@ mod original_stage_tests {
     }
 
     #[test]
+    fn typed_storage_declarations_use_the_original_mv_analysis_and_keep_the_input() {
+        use crate::mv::domain::application::{MvCreateStatement, MvCreateStorage};
+        use crate::mv::domain::refresh::target::IcebergMvTarget;
+        use crate::query_execution::mv_assembly::create_publication::CreateStorageDeclarations;
+        use novarocks_spi::connector::DdlPropertyValue;
+
+        let stop = ConnectorStopOwner::new();
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(5),
+            stop.view(),
+            4096,
+            64 * 1024,
+        )
+        .unwrap();
+        let sql = "SELECT id, count(*) AS n FROM iceberg.db.orders GROUP BY id";
+        let statements = novarocks_parser::parse(sql).unwrap();
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query fixture");
+        };
+        let properties: Arc<[(Arc<str>, DdlPropertyValue)]> = vec![
+            ("format_version".into(), DdlPropertyValue::Integer(3)),
+            (
+                "partitioning".into(),
+                DdlPropertyValue::ArrayVarchar(vec![Some("bucket(id, 4)".into())]),
+            ),
+        ]
+        .into();
+        let statement = MvCreateStatement {
+            if_not_exists: false,
+            refresh: Default::default(),
+            select_sql: sql.into(),
+            select_query: query.clone(),
+            storage: MvCreateStorage::Evaluated {
+                target: IcebergMvTarget {
+                    catalog: "iceberg".into(),
+                    namespace: "db".into(),
+                    table: "new_mv".into(),
+                },
+                binding: ConnectorProviderBindingKey {
+                    instance_id: ConnectorInstanceId::parse("iceberg").unwrap(),
+                    incarnation: ProviderBindingEpoch::new(),
+                },
+                properties: Arc::clone(&properties),
+            },
+            primary_key: None,
+        };
+        let (plan, _) = plan_from_statement(&context, &statement, "iceberg", "db");
+        let CreatePublicationOutput::StageDeclarations {
+            columns,
+            storage:
+                CreateStorageDeclarations::Evaluated {
+                    visible_partition_sources,
+                    properties: staged_properties,
+                },
+            application_properties,
+        } = (CreatePublicationInput::StageDeclarations { plan })
+            .run()
+            .unwrap()
+        else {
+            panic!("typed stage declarations");
+        };
+        assert!(Arc::ptr_eq(&properties, &staged_properties));
+        let visible = visible_partition_sources
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["id", "n"]);
+        assert!(
+            columns
+                .iter()
+                .any(|column| !visible.contains(&column.name.as_ref()))
+        );
+        assert!(!application_properties.contains_key("format-version"));
+    }
+
+    #[test]
     fn create_definition_retains_source_and_session_resolution_through_persistence() {
         use novarocks_mv_application::persistence::codec::{
-            QueryDialect, decode_definition, encode_definition,
+            ConfigurationDocument, QueryDialect, RefreshPolicy, decode_configuration,
+            decode_definition, encode_configuration, encode_definition,
         };
         use novarocks_parser::ast::SyntaxEq;
         let expected_source = "select id /* 保留原文：多字节注释 */ ,\n\tcount(*) AS n -- 保留排版\n  from orders\n group by id";
@@ -1789,6 +1897,18 @@ mod original_stage_tests {
         assert_eq!(
             documents.definition.query.effective_sql.as_bytes(),
             expected_source.as_bytes()
+        );
+        let expected_configuration = ConfigurationDocument {
+            refresh_policy: RefreshPolicy::Manual,
+            paused: false,
+            refresh_interval_ms: None,
+            max_staleness_ms: None,
+        };
+        assert_eq!(documents.configuration, expected_configuration);
+        let configuration = encode_configuration(&documents.configuration).unwrap();
+        assert_eq!(
+            decode_configuration(configuration.as_bytes()).unwrap(),
+            expected_configuration,
         );
         let encoded = encode_definition(&documents.definition).unwrap();
         let reloaded = decode_definition(encoded.as_bytes()).unwrap();

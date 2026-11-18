@@ -23,6 +23,7 @@ use std::{sync::Arc, time::Instant};
 use crate::api::BackendTopologySnapshot;
 use crate::cancellation::QueryCancellationView;
 use crate::request_session::RequestSessionContext;
+use crate::sql::session::registry::SessionPropertyInputs;
 use novarocks_sql::compiler::{SessionOptimizerSettings, SqlFoldDependencyObserver};
 use novarocks_types::ClusterRole;
 use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkError, WorkScope};
@@ -41,6 +42,7 @@ pub struct RequestAdmission {
     optimizer_settings: SessionOptimizerSettings,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     presentation: Option<novarocks_result_contract::ClientPresentationFamily>,
+    property_inputs: SessionPropertyInputs,
 }
 
 impl RequestAdmission {
@@ -65,7 +67,13 @@ impl RequestAdmission {
             optimizer_settings,
             sql_semantics,
             presentation,
+            property_inputs: SessionPropertyInputs::default(),
         }
+    }
+
+    pub fn with_session_property_inputs(mut self, inputs: SessionPropertyInputs) -> Self {
+        self.property_inputs = inputs;
+        self
     }
 }
 
@@ -912,7 +920,7 @@ impl RequestContext {
     /// A settings value of `None` means "no budget", which leaves optimizer
     /// costing on its profile default.
     pub fn admit(admission: RequestAdmission) -> Self {
-        let statement = StatementAdmissionContext::new(
+        let mut statement = StatementAdmissionContext::new(
             admission.current_catalog,
             admission.current_database,
             admission.role,
@@ -922,6 +930,9 @@ impl RequestContext {
             admission.sql_semantics,
             admission.presentation,
         );
+        statement.session = statement
+            .session
+            .with_property_inputs(admission.property_inputs);
         statement.for_topology(admission.topology)
     }
 

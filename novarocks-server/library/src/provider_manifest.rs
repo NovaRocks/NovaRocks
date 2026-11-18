@@ -299,8 +299,8 @@ impl ServerProviderManifest {
             .collect()
     }
 
-    /// Every sealed provider explicitly declares the current empty property
-    /// capability. Instance defaults are bound later from admitted config facts.
+    /// Compose the FE registry from sealed providers and application owners.
+    /// Provider instance defaults are bound later from admitted config facts.
     pub fn compose_session_property_registry(
         &self,
     ) -> anyhow::Result<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>
@@ -318,8 +318,21 @@ impl ServerProviderManifest {
                 )) as Arc<dyn CatalogPropertyDeclarationFactory>
             })
             .collect();
-        SessionPropertyRegistry::with_catalog_factories(factories)
-            .context("compose sealed provider session property declarations")
+        let mut registry = SessionPropertyRegistry::with_catalog_factories(factories)
+            .context("compose sealed provider session property declarations")?;
+        if let Some(iceberg) = self
+            .builders
+            .iter()
+            .find(|builder| builder.provider_id.as_str() == "iceberg")
+        {
+            let declaration =
+                novarocks_mv_application::session_properties::incremental_refresh_enabled_declaration()
+                    .context("declare the MV refresh session property")?;
+            registry = registry
+                .with_catalog_application_declarations([(iceberg.provider_id.clone(), declaration)])
+                .context("compose MV session property declarations for Iceberg")?;
+        }
+        Ok(registry)
     }
 
     /// Composes the installed pure provider program catalogue.
@@ -493,6 +506,58 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn sealed_fe_catalog_registry_installs_the_mv_property_only_for_iceberg() {
+        use novarocks_mv_application::session_properties::INCREMENTAL_REFRESH_ENABLED;
+        use novarocks_query_application::sql::session::registry::{
+            CatalogPropertyIdentity, SessionPropertyError, SessionPropertyType,
+            SessionPropertyValue,
+        };
+        use novarocks_spi::connector::{
+            ConnectorInstanceId, ConnectorProviderBindingKey, ProviderBindingEpoch,
+        };
+
+        let registry = ServerProviderManifest::seal()
+            .unwrap()
+            .compose_session_property_registry()
+            .unwrap();
+        let identity = |catalog, provider| {
+            let instance_id = ConnectorInstanceId::parse(catalog).unwrap();
+            CatalogPropertyIdentity {
+                attachment_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                binding_key: ConnectorProviderBindingKey {
+                    instance_id: instance_id.clone(),
+                    incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
+                },
+                instance_id,
+                provider_id: ConnectorProviderId::parse(provider).unwrap(),
+                generation: 1,
+            }
+        };
+        let iceberg = registry
+            .bind_catalog("lake", identity("lake", "iceberg"), &[])
+            .unwrap();
+        let property = iceberg.lookup(INCREMENTAL_REFRESH_ENABLED).unwrap();
+        assert_eq!(property.value_type(), SessionPropertyType::Boolean);
+        assert_eq!(
+            property.default_value(),
+            Some(&SessionPropertyValue::Boolean(true))
+        );
+        assert!(!property.hidden());
+        let header = iceberg
+            .prepare_header("lake", INCREMENTAL_REFRESH_ENABLED, "false")
+            .unwrap();
+        assert_eq!(header.value(), &SessionPropertyValue::Boolean(false));
+
+        let paimon = registry
+            .bind_catalog("other", identity("other", "paimon"), &[])
+            .unwrap();
+        assert!(matches!(
+            paimon.lookup(INCREMENTAL_REFRESH_ENABLED),
+            Err(SessionPropertyError::UnknownProperty { name }) if name == "other.incremental_refresh_enabled"
+        ));
+    }
 
     static CONTROL_BUILDS: AtomicUsize = AtomicUsize::new(0);
     static EXECUTION_BUILDS: AtomicUsize = AtomicUsize::new(0);
