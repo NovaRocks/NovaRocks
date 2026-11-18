@@ -17,6 +17,8 @@
 
 //! Operation-owned additions and their reusable manifest descriptors.
 
+// Design: ADR-0239 (docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

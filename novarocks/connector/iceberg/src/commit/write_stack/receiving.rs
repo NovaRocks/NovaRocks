@@ -17,6 +17,8 @@
 
 //! Provider custody of root write records before the publication handoff.
 
+// Design: ADR-0239 (docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)
+
 pub(crate) mod validation;
 
 use std::collections::{BTreeMap, LinkedList};

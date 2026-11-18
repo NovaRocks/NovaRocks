@@ -5,6 +5,10 @@ domain: [provider-spi]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0239
+    scope: "Rules 3 and 5 for reuse and coverage of compact additions; the physical object ledger, retirement, outcome and cleanup rules remain active"
+    link: "ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md"
 partially-supersedes:
   - id: ADR-0171
     scope: "Artifact lifetime classes, blanket per-attempt retention, conflict-time deletion, the prohibition on manifest reuse, complete-ledger recovery payloads and object-count cleanup budgets; immutable intent, dependency validation, field inheritance, one-dispatch outcomes, path uniqueness and actual-exit ownership remain active"
@@ -68,6 +72,8 @@ Iceberg 提交的业务意图冻结一次，attempt 每轮加载基准并在同�
 对照的 Iceberg Java `SnapshotProducer` 在 producer 内保留 snapshot ID，并在提交结束时统一清理未选 manifest/list；`ManifestMergeManager` 按有序输入箱缓存合并结果。这里沿用这些机制。NovaRocks 按完整来源 descriptor 与编码依据比较，并在构造时取得自有发布引用；不照搬成功后读回 manifest 求引用的路径。稳定 ID 已在基准中时，也不把它直接当作成功证明。
 
 ## 裁决
+
+> 紧凑接收的新增 manifest 沿用与覆盖由 [ADR-0239](ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md) 更新裁决 3、5。operation 首次滚动写出并按 ADDED 条目计数完整核对，允许重试时沿用新增 manifest 和计数。各轮只核对 manifest-list 的成员、替代关系及合并后的新增条目数。整份保留的提交继续沿以下覆盖与复用规则。
 
 1. **唯一持续责任。** 一个 operation 只进入一次提交循环。它对创建和完整接收的全部对象负责到终态，保留路径只写一次与实际退出事实；attempt 不是对象 owner。外部文件不登记，退休、沿用选择和写入准入由同一作者串行化。
 2. **稳定 stage 身份。** 每个产生快照的 stage 首次向 operation 取得一个 snapshot ID，各轮沿用；同一 operation 内不同 stage 的 ID 不同。刷新基准后先核对已经分配的 ID；命中即派发前以 Internal 结束、不换号、不重试，并让该 operation 的所有后续清理只报告未执行及原因。核对不扩大原 metadata 加载范围，也不重判先前 journal 条目。

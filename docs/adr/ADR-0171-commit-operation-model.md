@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0239
+    scope: "Section 1 addition representation for compact receiving; WholeSet intents, dependencies, inheritance and publication authority remain active"
+    link: "ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md"
   - id: ADR-0234
     scope: "Artifact lifetime classes, blanket per-attempt retention, conflict-time deletion, the prohibition on manifest reuse, complete-ledger recovery payloads and object-count cleanup budgets; immutable intent, dependency validation, field inheritance, one-dispatch outcomes, path uniqueness and actual-exit ownership remain active"
     link: "ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md"
@@ -100,6 +103,8 @@ staging 和 attempt 循环由 NovaRocks 拥有。正确性依据是规范语义�
 ## 裁决
 
 ### 1. 操作语义与三类验证输入
+
+> 紧凑接收的新增文件表示由 [ADR-0239](ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md) 更新。意图引用同一 operation 持有的新增文件 stage，写出前对应紧凑条目，写出后对应新增 manifest 与计数。整份保留的意图继续使用本节的完整新增文件事实。
 
 意图冻结新增文件的完整数据事实和实际 spec ID；被移除条目冻结 S0 中的 data/file sequence、
 spec、分区、first-row-id 等事实。不可在重试时重新解释源输出。操作令牌来自原签发 owner；
