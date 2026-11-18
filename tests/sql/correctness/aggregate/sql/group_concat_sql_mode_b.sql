@@ -38,7 +38,7 @@ SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat(v,'-' ORDER B
 SELECT group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 6
-SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ /*+ SET_VAR('sql_mode'=32) */  group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
+SELECT /*  SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ /*+ SET_VAR('sql_mode'=32) */  group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 7
 SELECT group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
