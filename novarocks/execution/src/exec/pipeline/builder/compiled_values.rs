@@ -45,7 +45,6 @@ use novarocks_type_contract::{
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -53,6 +52,7 @@ use crate::exec::pipeline::shape::{Source, SourceKernel, SourceStart};
 use crate::exec::pipeline::step::{NextStep, StepResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
 
 fn invalid(message: &str) -> ExecutionFailure {
     KernelFailure::InvalidProgram(KernelDiagnostic::new(message)).into()

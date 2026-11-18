@@ -28,6 +28,8 @@ use std::{
 pub struct CountingAllocator {
     inner: UnaccountedAggregateStateAllocator,
     outstanding: AtomicUsize,
+    reserved: AtomicUsize,
+    refunded: AtomicUsize,
     limit: usize,
     capacity_reason: Option<novarocks_failure_contract::FailureReason>,
 }
@@ -36,6 +38,8 @@ impl CountingAllocator {
         Self {
             inner: UnaccountedAggregateStateAllocator,
             outstanding: AtomicUsize::new(0),
+            reserved: AtomicUsize::new(0),
+            refunded: AtomicUsize::new(0),
             limit,
             capacity_reason: None,
         }
@@ -52,6 +56,12 @@ impl CountingAllocator {
     pub fn outstanding(&self) -> usize {
         self.outstanding.load(Ordering::SeqCst)
     }
+    pub fn reservation_totals(&self) -> (usize, usize) {
+        (
+            self.reserved.load(Ordering::SeqCst),
+            self.refunded.load(Ordering::SeqCst),
+        )
+    }
     fn reserve(&self, bytes: usize) -> Result<(), KernelFailure> {
         self.outstanding
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
@@ -59,7 +69,9 @@ impl CountingAllocator {
                     .checked_add(bytes)
                     .filter(|&total| total <= self.limit)
             })
-            .map(|_| ())
+            .map(|_| {
+                self.reserved.fetch_add(bytes, Ordering::SeqCst);
+            })
             .map_err(|current| {
                 let refusal = self.capacity_reason.and_then(|reason| {
                     Some(novarocks_functions::KernelCapacityRefusal::new(
@@ -74,6 +86,7 @@ impl CountingAllocator {
     }
     fn refund(&self, bytes: usize) {
         let previous = self.outstanding.fetch_sub(bytes, Ordering::SeqCst);
+        self.refunded.fetch_add(bytes, Ordering::SeqCst);
         assert!(
             previous >= bytes,
             "only an outstanding allocation can be released"

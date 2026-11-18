@@ -177,11 +177,7 @@ fn approx_sql_source_with_semantics(
                 needs
                     .iter()
                     .map(|need| {
-                        ProviderReadFact::negotiated(
-                            need,
-                            crate::provider_contract(need),
-                        )
-                        .unwrap()
+                        ProviderReadFact::negotiated(need, crate::provider_contract(need)).unwrap()
                     })
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),

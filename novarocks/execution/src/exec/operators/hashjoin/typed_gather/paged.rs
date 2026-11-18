@@ -19,7 +19,6 @@
 //! sources; all value copying stays with the existing selected-copy author.
 
 use super::*;
-use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::{
     chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema},
     operators::hashjoin::{
@@ -27,6 +26,7 @@ use crate::exec::{
         join_completion::{funded_shared, funded_vec},
     },
 };
+use novarocks_expression::CompiledExpressionInstance;
 use novarocks_expression::InputColumnProjection;
 use novarocks_functions::{KernelEvaluationControl, selected_copy};
 use novarocks_type_contract::ValueSchemaCreation;

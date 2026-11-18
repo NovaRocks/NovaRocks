@@ -3214,3 +3214,6 @@ fn complete_undemanded_leaf(
     work.flush()?;
     Ok(OwnedValue::Selected(array, Box::default()))
 }
+
+#[cfg(test)]
+mod tests;

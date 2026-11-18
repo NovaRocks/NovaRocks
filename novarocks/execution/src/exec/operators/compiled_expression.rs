@@ -40,7 +40,6 @@ use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailu
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef};
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
@@ -49,6 +48,7 @@ use crate::exec::pipeline::{
 };
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
 use novarocks_expression::{EvaluationInput, InputColumnProjection, RequiredExpressionRowError};
 use novarocks_functions::ScalarInvocationScope;
 
@@ -1074,9 +1074,14 @@ impl CompiledFilterBody {
         control: &RuntimeKernelControl,
     ) -> ExecutionResult<BooleanArray> {
         if self.instance.is_none() {
-            self.instance = Some(novarocks_expression::CompiledFilterConjunctionInstance::try_new_with_allocator(
-                &self.roots, control, control.allocator(),
-            ).map_err(|cause| control.project_required_failure(cause.into()))?);
+            self.instance = Some(
+                novarocks_expression::CompiledFilterConjunctionInstance::try_new_with_allocator(
+                    &self.roots,
+                    control,
+                    control.allocator(),
+                )
+                .map_err(|cause| control.project_required_failure(cause.into()))?,
+            );
         }
         let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
         let mut scope =

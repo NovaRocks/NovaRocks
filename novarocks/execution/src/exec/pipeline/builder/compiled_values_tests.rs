@@ -43,7 +43,6 @@ use novarocks_type_contract::{
 };
 
 use super::family_fixture::{FixtureControl, compile, constant_policy, int64_rows, run};
-use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::ExchangeBindings;
@@ -51,6 +50,7 @@ use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::io::NoopTaskEventSink;
 use crate::runtime::task::{ExecutionFailure, ExecutionFailureCause};
+use novarocks_expression::CompiledExpressionInstance;
 
 const ALLOW: SemanticParameterRef = SemanticParameterRef {
     id: SemanticParameterId::new(3),

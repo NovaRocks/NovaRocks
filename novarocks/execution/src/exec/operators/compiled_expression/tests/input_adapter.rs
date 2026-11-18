@@ -881,3 +881,5 @@ fn identity_slot_preserves_required_binding_and_null_parent_carrier() {
     drop(chunk);
     assert_eq!(source_tracker.current(), 0);
 }
+
+mod cast;

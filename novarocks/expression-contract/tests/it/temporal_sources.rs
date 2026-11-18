@@ -498,3 +498,227 @@ fn unsealed_base64_source_keeps_actual_immediate_identity_and_original_control()
         ))
     ));
 }
+
+#[test]
+fn regexp_count_shared_native_projection_distinguishes_constant_from_value_without_cv() {
+    let constant = ExprKind::Constant(novarocks_constant_contract::ConstantReference {
+        pool: novarocks_constant_contract::ConstantPoolId::new(71),
+        ordinal: 2,
+    });
+    assert_eq!(
+        novarocks_expression_contract::native_v1_emitted_constant_reference(&constant),
+        Some(novarocks_constant_contract::ConstantReference {
+            pool: novarocks_constant_contract::ConstantPoolId::new(71),
+            ordinal: 2
+        })
+    );
+
+    assert_eq!(
+        novarocks_expression_contract::native_v1_emitted_constant_reference(&ExprKind::Value(
+            ValueId::new(91)
+        )),
+        None
+    );
+    use novarocks_type_contract::RegexpCountPatternSource;
+    assert_ne!(
+        RegexpCountPatternSource::Dynamic,
+        RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent,
+    );
+}
+
+#[test]
+fn to_base64_actual_native_identity_projection_matches_independent_source_table() {
+    use novarocks_type_contract::ToBase64ByteSource as Source;
+
+    // The frozen native-v1 source contract canonicalizes wire names and
+    // aliases case-insensitively before testing three exact encryption tags.
+    // Expected facts are pinned independently; do not call a registry lookup
+    // (or the classifier being tested) to calculate their own expected value.
+    for (name, expected) in [
+        ("aes_encrypt", Source::NativeV1EncryptionLatin1),
+        ("AES_ENCRYPT", Source::NativeV1EncryptionLatin1),
+        ("from_base64", Source::NativeV1EncryptionLatin1),
+        ("FROM_BASE64", Source::NativeV1EncryptionLatin1),
+        ("base64_decode_binary", Source::NativeV1EncryptionLatin1),
+        ("BASE64_DECODE_STRING", Source::NativeV1EncryptionLatin1),
+        ("to_binary", Source::NativeV1EncryptionLatin1),
+        ("TO_BINARY", Source::NativeV1EncryptionLatin1),
+        ("concat", Source::Ordinary),
+        ("md5", Source::Ordinary),
+        ("upper", Source::Ordinary),
+    ] {
+        let id = FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap();
+        let emitted = novarocks_expression_contract::native_v1_function_name(&id).unwrap();
+        assert_eq!(emitted, name);
+        assert_eq!(
+            Source::from_immediate_native_function_name(Some(emitted)),
+            expected,
+            "the complete source fact follows the actual emitted native name"
+        );
+        assert_eq!(
+            Source::from_immediate_native_function_name(Some(emitted)).prefers_latin1(),
+            matches!(expected, Source::NativeV1EncryptionLatin1),
+            "the source fact also retains its byte interpretation"
+        );
+    }
+    for raw_tag in [
+        "AES_ENCRYPT",
+        "base64_decode_binary",
+        "base64_decode_string",
+    ] {
+        assert_eq!(
+            Source::from_immediate_encryption_identity(Some(raw_tag)),
+            Source::Ordinary,
+            "a raw encryption identity does not resolve a wire alias"
+        );
+    }
+}
+
+/// Exercise native-v1 immediate-source projection from already emitted definitions.
+#[test]
+fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions() {
+    use novarocks_type_contract::{FunctionArgumentType, ToBase64ByteSource as Source};
+
+    let utf8 = ValueType::new(DataType::Utf8, true);
+    let leaf = |id, kind, ty| novarocks_expression_contract::ExprNode {
+        id: ExprId::new(id),
+        lambda_scope: None,
+        ty,
+        kind,
+    };
+    let classify = |nodes: Vec<novarocks_expression_contract::ExprNode>, args: &[ExprId]| {
+        let mut draft =
+            novarocks_expression_contract::BoundExprSetBuilder::new(super::support::limits());
+        for node in nodes {
+            let id = draft.add(node.lambda_scope, node.ty, node.kind).unwrap();
+            assert_eq!(id, node.id);
+        }
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let result = novarocks_expression_contract::to_base64_byte_source_from_lookup_observed(
+            |id| draft.definition(id),
+            args,
+            &mut work,
+        );
+        work.finish().unwrap();
+        result
+    };
+    for kind in [
+        ExprKind::Value(ValueId::new(91)),
+        ExprKind::Constant(novarocks_constant_contract::ConstantReference {
+            pool: novarocks_constant_contract::ConstantPoolId::new(2),
+            ordinal: 7,
+        }),
+    ] {
+        assert_eq!(
+            classify(vec![leaf(0, kind, utf8.clone())], &[ExprId::new(0)]).unwrap(),
+            Source::Ordinary
+        );
+    }
+
+    assert!(matches!(
+        classify(
+            vec![leaf(0, ExprKind::Value(ValueId::new(91)), utf8.clone())],
+            &[]
+        ),
+        Err(
+            novarocks_expression_contract::TemporalSourceProjectionError::Invalid(
+                "to_base64 source requires one argument"
+            )
+        )
+    ));
+    assert!(matches!(
+        classify(
+            vec![leaf(0, ExprKind::Value(ValueId::new(91)), utf8.clone())],
+            &[ExprId::new(8)]
+        ),
+        Err(
+            novarocks_expression_contract::TemporalSourceProjectionError::Invalid(
+                "to_base64 source definition is absent"
+            )
+        )
+    ));
+    // Pin the emitted carrier and exact native owner ID for each source.
+    // The immediate-source projection consumes these facts from the emitted nodes.
+    for (name, count, dtype, expected) in [
+        (
+            "aes_encrypt",
+            2,
+            DataType::Utf8,
+            Source::NativeV1EncryptionLatin1,
+        ),
+        (
+            "from_base64",
+            1,
+            DataType::Utf8,
+            Source::NativeV1EncryptionLatin1,
+        ),
+        (
+            "to_binary",
+            1,
+            DataType::Binary,
+            Source::NativeV1EncryptionLatin1,
+        ),
+        ("concat", 1, DataType::Utf8, Source::Ordinary),
+    ] {
+        let result = ValueType::new(dtype, true);
+        let function = super::support::function(
+            &format!("builtin.scalar/{name}/v1"),
+            vec![FunctionArgumentType::Value(utf8.clone()); count],
+            result.clone(),
+        );
+        let mut nodes: Vec<_> = (0..count)
+            .map(|id| {
+                leaf(
+                    id as u32,
+                    ExprKind::Value(ValueId::new(91 + id as u32)),
+                    utf8.clone(),
+                )
+            })
+            .collect();
+        let call = ExprId::new(count as u32);
+        nodes.push(leaf(
+            call.get(),
+            ExprKind::FunctionCall {
+                function,
+                args: (0..count).map(|i| ExprId::new(i as u32)).collect(),
+            },
+            result.clone(),
+        ));
+        let direct = classify(nodes.clone(), &[call]);
+        if name == "to_binary" {
+            assert!(
+                matches!(
+                    direct,
+                    Err(
+                        novarocks_expression_contract::TemporalSourceProjectionError::Invalid(
+                            "to_base64 emitted source is not exact Physical Utf8"
+                        )
+                    )
+                ),
+                "the actual Binary declaration is rejected before runtime NULL handling"
+            );
+        } else {
+            assert_eq!(direct.unwrap(), expected);
+        }
+        let cast = ExprId::new(count as u32 + 1);
+        nodes.push(leaf(
+            cast.get(),
+            ExprKind::Cast {
+                expr: call,
+                target: DataType::Utf8,
+                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                allow_throw_exception: SemanticParameterRef {
+                    id: SemanticParameterId::new(0),
+                    expected_key: SemanticParameterKey::AllowThrowException,
+                },
+            },
+            utf8.clone(),
+        ));
+        assert_eq!(
+            classify(nodes, &[cast]).unwrap(),
+            Source::Ordinary,
+            "CAST is the immediate emitted node, regardless of child identity"
+        );
+    }
+}

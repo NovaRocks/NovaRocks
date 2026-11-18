@@ -59,9 +59,6 @@ mod cast_decimal_float32_oracle_tests;
 mod numeric_unary_writer_dml_source_tests;
 
 #[cfg(test)]
-mod decimal_float32_sql_own_null_tests;
-
-#[cfg(test)]
 mod numeric_unary_state_union_sql_source_tests;
 
 #[cfg(test)]
@@ -144,9 +141,6 @@ mod percentile_hash_corpus_sql_source_tests;
 
 #[cfg(test)]
 mod between_actual_sql_compiler_tests;
-
-#[cfg(test)]
-mod percentile_hash_native_n1_frame_tests;
 
 #[cfg(test)]
 mod percentile_hash_native_n1_availability_tests;

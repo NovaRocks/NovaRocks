@@ -24,12 +24,12 @@
 
 use input_source::FrameInput;
 
+use crate::{ComparisonSite, CompiledExprSet, StaticExprKind};
 use arrow::{
     array::{ArrayRef, UInt64Array, new_empty_array, new_null_array},
     compute::{TakeOptions, take},
     datatypes::DataType,
 };
-use crate::{ComparisonSite, CompiledExprSet, StaticExprKind};
 use novarocks_expression_contract::{RootOrdinal, RootScope};
 use novarocks_functions::{
     EvaluatedArgument, FunctionArgumentType, KernelDiagnostic, KernelEvaluationControl,
@@ -1116,17 +1116,13 @@ fn admit_call_protocol(
     }
 }
 
-
 mod failure;
 mod host;
 mod input;
 
 pub use failure::{ExprEvaluationFailure, RequiredExpressionRowError, ScalarCallFailure};
 pub use host::{ScalarCallHost, ScalarCallPhase, ScalarCallRequestFacts};
-pub use input::{
-    EvaluationInput, InputColumnProjection, InputSourceStorage, InputStorageFailure,
-};
-
+pub use input::{EvaluationInput, InputColumnProjection, InputSourceStorage, InputStorageFailure};
 
 mod boolean_region;
 pub mod constant_node;
@@ -1140,3 +1136,6 @@ mod unary;
 mod utf8_inlist;
 
 pub use filter_conjunction::CompiledFilterConjunctionInstance;
+
+#[cfg(test)]
+mod tests;

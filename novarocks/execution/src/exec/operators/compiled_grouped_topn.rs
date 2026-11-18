@@ -54,7 +54,6 @@ use super::compiled_grouped_topn_resources::{
 };
 use super::sort::creation::SortCreation;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef, OutputColumnMetadata};
-use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -67,6 +66,7 @@ use crate::exec::pipeline::{
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
 
 fn internal(detail: &str) -> ExecutionFailure {
     KernelFailure::Internal(KernelDiagnostic::new(detail)).into()

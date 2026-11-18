@@ -47,7 +47,6 @@ use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, Prog
 
 use super::compiled_writer_failure as failure;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_write_relation::{
     RootWriteResultRelationTemplate, WriterMultiplexRelationTemplate,
@@ -64,6 +63,7 @@ use crate::exec::operators::{TableFinishOperatorFactory, TableWriterOperatorFact
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeErrorState;
 use crate::runtime::task::ExecutionResult;
+use novarocks_expression::CompiledExpressionInstance;
 
 /// Build the compiled writer of local node `id` over the Task's exact write
 /// capability.

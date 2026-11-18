@@ -31,7 +31,6 @@ use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramRootRef};
 
 use super::{RuntimeFilterApplication, RuntimeFilterConsumerState, RuntimeFilterKeyProvider};
 use crate::exec::chunk::Chunk;
-use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::operators::compiled_expression::{
     RuntimeKernelControl, evaluate_all, evaluate_chunk_all, instances, root_value_type,
 };
@@ -39,6 +38,7 @@ use crate::runtime::runtime_state::RuntimeErrorState;
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter as execution;
 use crate::runtime_filter::RuntimeFilterExecutionContract;
+use novarocks_expression::CompiledExpressionInstance;
 
 /// The runtime-filter consumers of one compiled node, shared by its drivers:
 /// the consumer state and the key root of every binding, in binding order.

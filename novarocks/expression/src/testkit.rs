@@ -196,7 +196,13 @@ pub fn compile_fixture_unit(
 mod control;
 pub use control::{CallbackControl, callback_causes};
 
-pub use crate::evaluator::scalar_invocation::{call_invocation, call_scalar, call_scoped_invocation};
+pub use crate::evaluator::scalar_invocation::{
+    call_invocation, call_scalar, call_scoped_invocation,
+};
 
-pub mod row_errors;
+pub mod filter_conjunction_fixture;
 pub mod frame_fixtures;
+pub mod guarded_fixtures;
+pub mod numeric_fixtures;
+pub mod rng_fixture;
+pub mod row_errors;

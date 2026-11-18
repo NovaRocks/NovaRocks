@@ -22,3 +22,6 @@ mod native_between;
 mod native_bitnot;
 mod native_negate;
 mod time_text_cast;
+
+#[cfg(novarocks_dev_controls)]
+mod scalar_invocation;

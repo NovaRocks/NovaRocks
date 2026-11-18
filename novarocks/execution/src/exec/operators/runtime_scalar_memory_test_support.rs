@@ -19,8 +19,6 @@
 //! The Frame entry and the complete-wrapper contract are distinct witnesses.
 
 use super::{RuntimeKernelControl, evaluate_all};
-use novarocks_expression::CompiledExpressionInstance;
-use novarocks_expression::testkit::{call_invocation, call_scalar};
 use crate::runtime::{
     execution_runtime::ExecutionRuntime,
     kernel_memory::KernelMemoryJournal,
@@ -36,8 +34,10 @@ use crate::runtime::{
 };
 use arrow::{array::ArrayRef, record_batch::RecordBatch};
 use novarocks_execution_contract::TaskIdentity;
+use novarocks_expression::CompiledExpressionInstance;
 use novarocks_expression::ScalarCallFailure;
 use novarocks_expression::evaluator_view::{UnitStateTemplate, state_template};
+use novarocks_expression::testkit::{call_invocation, call_scalar};
 use novarocks_functions::{
     AggregateStateAllocator, EvaluatedArgument, InvocationScalarEvaluationInstance,
     ScalarEvaluationInstance, ScalarInvocationActivation, SelectedValues, Selection,

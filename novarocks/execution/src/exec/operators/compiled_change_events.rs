@@ -46,7 +46,6 @@ use super::compiled_expression::{
     RuntimeKernelControl, evaluate_all, evaluate_selected, instances,
 };
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
-use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };
@@ -59,6 +58,7 @@ use crate::exec::pipeline::{
 };
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
 
 /// One event's frozen facts, resolved to root indices and output ordinals.
 #[derive(Clone)]

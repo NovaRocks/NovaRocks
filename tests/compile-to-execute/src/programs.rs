@@ -455,6 +455,28 @@ pub fn compiled_roots(
         })
 }
 
+/// Find the original signed membership root in the checked compiler output.
+pub fn compiled_signed_inlist_root(
+    source: &SqlAuthoredPhysicalPlan,
+    functions: &PureEngineFunctionCatalog,
+) -> (Arc<LocalProgram>, ProgramRootRef) {
+    let programs = programs_with_catalogue_and_original_inlist_source(source, functions);
+    let mut found = None;
+    for program in programs.values() {
+        for (site, unit, root) in compiled_roots(program) {
+            let definition = unit.definitions().node(root.definition).unwrap();
+            if matches!(
+                definition.kind(),
+                novarocks_expression::StaticExprKind::PreparedInList { .. }
+            ) {
+                assert!(found.is_none(), "one actual IN root");
+                found = Some((program.clone(), site));
+            }
+        }
+    }
+    found.expect("actual SQL IN root survived original lowering")
+}
+
 /// Resolve a real Input use through its root's actual Project input layout.
 pub fn project_input_slot_for_use(
     program: &novarocks_local_program::LocalProgram,

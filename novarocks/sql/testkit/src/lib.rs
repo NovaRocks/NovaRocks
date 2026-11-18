@@ -33,5 +33,8 @@ mod approx_source;
 mod expression_sources;
 mod ndv_source;
 pub use approx_source::approx_sql_source;
-pub use expression_sources::unit_definitions;
+pub use expression_sources::{
+    inspect_inlist_source, inspect_like_source, inspect_ordered_scan_source, ordered_scan_source,
+    signed_inlist_source, unit_definitions,
+};
 pub use ndv_source::{ndv_sql_source, provider_contract, sql_source_with_columns};

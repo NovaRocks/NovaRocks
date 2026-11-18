@@ -16,8 +16,8 @@
 // under the License.
 
 use super::*;
-use novarocks_expression::testkit::{call_invocation, call_scalar};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use novarocks_expression::testkit::{call_invocation, call_scalar};
 use novarocks_functions::{
     AggregateStateAllocator, EvaluatedArgument, InvocationScalarEvaluationInstance,
     KernelEvaluationControl, KernelFailure, ScalarEvaluationInstance, ScalarInvocationActivation,

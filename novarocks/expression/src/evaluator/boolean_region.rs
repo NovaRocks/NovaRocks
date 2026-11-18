@@ -155,3 +155,6 @@ impl BooleanRows {
         Ok((array, errors.into_boxed_slice()))
     }
 }
+
+#[cfg(test)]
+mod tests;

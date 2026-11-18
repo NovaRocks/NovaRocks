@@ -146,3 +146,6 @@ pub(crate) fn utf8_equality_observed<E>(
         _reservation: reservation,
     })
 }
+
+#[cfg(test)]
+mod tests;

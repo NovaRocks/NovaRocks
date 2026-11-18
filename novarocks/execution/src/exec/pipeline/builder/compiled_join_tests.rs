@@ -2974,9 +2974,8 @@ fn b3_input_and_finalize_operators_preserve_the_first_prepare_refusal() {
 
 #[test]
 fn b3_residual_gathers_only_original_referenced_columns_from_published_pages() {
-    use novarocks_expression::CompiledExpressionInstance;
     use crate::exec::{
-            operators::{
+        operators::{
             compiled_expression::{RuntimeKernelControl, evaluate_projected_chunk_all},
             hashjoin::{
                 JoinPairRow, JoinParticipants, ProjectedJoinGather,
@@ -2990,6 +2989,7 @@ fn b3_residual_gathers_only_original_referenced_columns_from_published_pages() {
     };
     use crate::runtime::mem_tracker::MemTracker;
     use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
+    use novarocks_expression::CompiledExpressionInstance;
     let mut packages = packages(&single_plan_with_dop(
         Spec::hash(JoinKind::Inner, true),
         &LEFT_ROWS,

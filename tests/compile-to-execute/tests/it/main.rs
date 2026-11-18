@@ -23,3 +23,16 @@ mod signed_cast_nullability;
 mod write_layout;
 
 mod partition_topn;
+
+mod bitnot;
+mod constant_entry_parity;
+mod decimal_float_cast;
+mod filter_conjunction;
+mod inlist;
+mod json_object;
+mod like;
+mod percentile_hash;
+mod scan_residual_conjunction;
+
+mod fixed_binary_case;
+mod substring_index;

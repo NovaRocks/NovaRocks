@@ -16,8 +16,8 @@
 // under the License.
 //! Public SQL completion inputs for owner and compile-to-execute tests.
 use arrow::datatypes::{DataType, Field};
-use std::sync::Arc;
 pub(super) use novarocks_sql_testkit::approx_sql_source;
+use std::sync::Arc;
 fn check_actual_approx() {
     use novarocks_physical_plan::{
         FunctionArgumentType, NodeKind, PhysicalCallSite, StaticFunctionArgument,

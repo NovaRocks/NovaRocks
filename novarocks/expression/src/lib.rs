@@ -43,9 +43,9 @@ mod evaluator;
 pub use evaluator::constant_node;
 pub use evaluator::{
     CompiledExpressionInstance, CompiledFilterConjunctionInstance, EvaluationInput,
-    ExprEvaluationFailure, InputColumnProjection, InputSourceStorage,
-    InputStorageFailure, RequiredExpressionRowError, ScalarCallFailure, ScalarCallHost,
-    ScalarCallPhase, ScalarCallRequestFacts,
+    ExprEvaluationFailure, InputColumnProjection, InputSourceStorage, InputStorageFailure,
+    RequiredExpressionRowError, ScalarCallFailure, ScalarCallHost, ScalarCallPhase,
+    ScalarCallRequestFacts,
 };
 
 #[cfg(any(test, novarocks_dev_controls))]

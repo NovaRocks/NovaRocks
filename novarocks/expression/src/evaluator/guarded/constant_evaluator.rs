@@ -18,11 +18,11 @@
 //! A depth-one driver over the same Frame and completion owner as program uses.
 use super::super::constant_node::*;
 use super::*;
-use arrow::record_batch::RecordBatch;
 use crate::{
     PrimitiveError as ProgramPrimitiveError, prepare_arithmetic_node, prepare_cast_node,
     prepare_comparison_node, prepare_null_safe_comparison_node,
 };
+use arrow::record_batch::RecordBatch;
 use novarocks_functions::{CastOperation, ConstantValue, FunctionResultType, FunctionValueType};
 use novarocks_type_contract::{
     ArgumentControl, CompilePhase, FunctionInstanceState, FunctionVolatility, PureCompileControl,
@@ -644,3 +644,6 @@ fn evaluate_inner(
         Ok(ConstantNodeOutcome::Value(output.values().clone()))
     }
 }
+
+#[cfg(test)]
+mod tests;

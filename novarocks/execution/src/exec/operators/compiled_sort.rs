@@ -63,7 +63,6 @@ use super::compiled_expression::{
 };
 use super::sort::creation::{CreatedSortColumns, SortCreation};
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
-use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{ConstructionFailure, InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
@@ -74,6 +73,7 @@ use crate::exec::pipeline::{
 };
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::ExecutionResult;
+use novarocks_expression::CompiledExpressionInstance;
 
 #[derive(Clone, Copy)]
 struct RankRetention {

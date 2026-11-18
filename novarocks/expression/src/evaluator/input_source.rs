@@ -18,9 +18,7 @@
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 
-use crate::{
-    EvaluationInput, InputColumnProjection, InputSourceStorage, InputStorageFailure,
-};
+use crate::{EvaluationInput, InputColumnProjection, InputSourceStorage, InputStorageFailure};
 
 /// The evaluator's borrowed input plus its private Slot-read observation.
 #[derive(Clone, Copy)]
@@ -583,3 +581,6 @@ pub(super) fn retain_result_type_with_creator(
     work.finish()?;
     Ok((array, Some(creator)))
 }
+
+#[cfg(test)]
+mod tests;

@@ -16,7 +16,9 @@
 // under the License.
 //! Public SQL completion inputs for owner and compile-to-execute tests.
 use arrow::datatypes::DataType;
-pub(super) use novarocks_sql_testkit::{ndv_sql_source, provider_contract, sql_source_with_columns};
+pub(super) use novarocks_sql_testkit::{
+    ndv_sql_source, provider_contract, sql_source_with_columns,
+};
 const HAVING: &str = "SELECT k FROM fixture.ndv_null_contract GROUP BY k\nHAVING ndv(v) = 0 AND approx_count_distinct(v) = 0 ORDER BY k;";
 const EMPTY_WHERE: &str = "SELECT ndv(v) AS ndv_empty, approx_count_distinct(v) AS approx_empty,\n       count(DISTINCT v) AS exact_empty\nFROM fixture.ndv_null_contract WHERE k = 999;";
 const NULL_WHERE: &str = "SELECT ndv(v) AS ndv_null, approx_count_distinct(v) AS approx_null,\n       count(DISTINCT v) AS exact_null\nFROM fixture.ndv_null_contract WHERE k = 1;";

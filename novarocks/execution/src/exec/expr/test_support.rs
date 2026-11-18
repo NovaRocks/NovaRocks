@@ -16,7 +16,5 @@
 // under the License.
 
 //! Shared support for the remaining Execution tests.
-pub(crate) use novarocks_expression::testkit::{
-    HarnessControl, constant_policy, register_constant,
-};
+pub(crate) use novarocks_expression::testkit::{HarnessControl, constant_policy};
 pub(crate) use novarocks_sql_testkit::parse_query;

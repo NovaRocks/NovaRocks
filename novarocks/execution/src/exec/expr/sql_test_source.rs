@@ -23,6 +23,3 @@ pub(super) use novarocks_sql_testkit::{
 };
 
 pub(super) use novarocks_sql_testkit::unit_definitions;
-pub(super) use novarocks_test_compile_to_execute::programs::{
-    compiled_roots, project_input_slot_for_use,
-};

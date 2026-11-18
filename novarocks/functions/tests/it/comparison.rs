@@ -1386,3 +1386,97 @@ fn every_ordering_operator_preserves_exact_addresses_and_long_prefix_primary_con
         }
     }
 }
+
+mod control_observation {
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::DataType;
+    use novarocks_functions::{EvaluatedArgument, KernelEvaluationControl, KernelFailure};
+    use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    struct Compile;
+    impl PureCompileControl for Compile {
+        fn checkpoint(&self, _: CompilePhase, n: u32) -> Result<(), CompileControlError> {
+            assert!(n <= 256);
+            Ok(())
+        }
+    }
+    struct Control {
+        trace: Mutex<Vec<u32>>,
+        stop: usize,
+        cause: KernelFailure,
+    }
+    impl Control {
+        fn new(stop: usize, cause: KernelFailure) -> Self {
+            Self {
+                trace: Mutex::new(vec![]),
+                stop,
+                cause,
+            }
+        }
+    }
+    impl KernelEvaluationControl for Control {
+        fn checkpoint(&self, n: u32) -> Result<(), KernelFailure> {
+            assert!(n <= 256);
+            let mut t = self.trace.lock().unwrap();
+            assert!(
+                t.len() < self.stop,
+                "no callback after first originating refusal"
+            );
+            t.push(n);
+            if t.len() == self.stop {
+                Err(self.cause.clone())
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("comparison never waits")
+        }
+    }
+    #[test]
+    fn between_comparison_control_success_trace_matches_original_author_without_extra_callbacks() {
+        let ty = novarocks_functions::FunctionValueType::new(DataType::Int64, true);
+        let recipe = novarocks_functions::PreparedComparisonRecipe::try_new(
+            novarocks_functions::ComparisonOperator::Le,
+            &ty,
+            &ty,
+            &Compile,
+        )
+        .unwrap();
+        let l: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(9)]));
+        let r: ArrayRef = Arc::new(Int64Array::from(vec![Some(5), Some(5), Some(5)]));
+        for row in 0..3 {
+            let old = Control::new(usize::MAX, KernelFailure::Cancelled);
+            let before = recipe
+                .compare_rows(
+                    EvaluatedArgument::Column(&l),
+                    row,
+                    row,
+                    EvaluatedArgument::Column(&r),
+                    row,
+                    row,
+                    &old,
+                )
+                .unwrap();
+            let new = Control::new(usize::MAX, KernelFailure::Cancelled);
+            let observation = novarocks_functions::KernelControlObservation::new(&new);
+            let after = recipe
+                .compare_rows(
+                    EvaluatedArgument::Column(&l),
+                    row,
+                    row,
+                    EvaluatedArgument::Column(&r),
+                    row,
+                    row,
+                    &observation,
+                )
+                .unwrap();
+            assert_eq!(before, after);
+            assert_eq!(*old.trace.lock().unwrap(), *new.trace.lock().unwrap());
+        }
+    }
+}

@@ -59,7 +59,6 @@ use super::unpivot_processor::{
 };
 use super::unpivot_processor::{unpivot_arrow, unpivot_contract};
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
-use novarocks_expression::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputConstructionOwner, InputEncodingPolicy,
     Operator,
@@ -74,6 +73,7 @@ use crate::exec::pipeline::{
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
 use novarocks_functions::array_projection::ArrayNormalizationStep;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure};
 use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};

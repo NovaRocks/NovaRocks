@@ -23,6 +23,8 @@ use std::{sync::Mutex, time::Duration};
 pub struct CallbackControl {
     cause: KernelFailure,
     stop_at: usize,
+    max_units: u32,
+    wait_diagnostic: &'static str,
     trace: Mutex<Vec<u32>>,
 }
 
@@ -31,7 +33,18 @@ impl CallbackControl {
         Self {
             cause,
             stop_at,
+            max_units: u32::MAX,
+            wait_diagnostic: "synchronous expression fixture must not wait",
             trace: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Observe a caller's independent 256-unit checkpoint budget.
+    pub fn bounded(cause: KernelFailure, stop_at: usize, wait_diagnostic: &'static str) -> Self {
+        Self {
+            max_units: 256,
+            wait_diagnostic,
+            ..Self::new(cause, stop_at)
         }
     }
 
@@ -42,6 +55,7 @@ impl CallbackControl {
 
 impl KernelEvaluationControl for CallbackControl {
     fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+        assert!(units <= self.max_units);
         let mut trace = self.trace.lock().unwrap();
         assert!(
             self.stop_at == 0 || trace.len() < self.stop_at,
@@ -56,7 +70,7 @@ impl KernelEvaluationControl for CallbackControl {
     }
 
     fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
-        panic!("synchronous expression fixture must not wait")
+        panic!("{}", self.wait_diagnostic)
     }
 }
 

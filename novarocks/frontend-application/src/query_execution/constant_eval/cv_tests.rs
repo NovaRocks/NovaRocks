@@ -945,12 +945,17 @@ fn newly_materialized_unsigned_negative_scale_and_nested_metadata_outputs_are_cv
                     target: &target,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     allow_throw_exception: false,
-                }
-            )
+                },
+            ),
         ),
-        &[source.value], &target, &TestControl, CompilePhase::FunctionSpecialization,
-    ).unwrap();
-    let novarocks_expression::constant_node::ConstantNodeOutcome::Value(converted) = converted else {
+        &[source.value],
+        &target,
+        &TestControl,
+        CompilePhase::FunctionSpecialization,
+    )
+    .unwrap();
+    let novarocks_expression::constant_node::ConstantNodeOutcome::Value(converted) = converted
+    else {
         panic!("the existing Int32-to-UInt32 cast must produce a value");
     };
     let output = evaluate(&identity(typed_arg(converted, target)));

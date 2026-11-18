@@ -522,3 +522,54 @@ fn decimal256_selected_and_scalar_casts_keep_independent_midpoint_bits() {
         assert_eq!(value.to_bits(), expected);
     }
 }
+
+#[test]
+fn decimal_float_actual_constant_source_rejects_out_of_precision_payload() {
+    let policy = ConstantPolicy {
+        max_rows: 16,
+        max_array_nodes: 128,
+        max_logical_elements: 1024,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    };
+    for wide in [false, true] {
+        let ty = FunctionValueType::new(
+            if wide {
+                DataType::Decimal256(1, 0)
+            } else {
+                DataType::Decimal128(1, 0)
+            },
+            false,
+        );
+        let field = Arc::new(ty.try_to_field("original-decimal-constant").unwrap());
+        let result = if wide {
+            novarocks_functions::ConstantValue::from_decimal256_be(
+                field,
+                ty,
+                i256::from_i128(71).to_be_bytes(),
+                policy,
+                CompilePhase::FunctionSpecialization,
+                &Control::default(),
+            )
+        } else {
+            novarocks_functions::ConstantValue::from_decimal128(
+                field,
+                ty,
+                71,
+                policy,
+                CompilePhase::FunctionSpecialization,
+                &Control::default(),
+            )
+        };
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("precision 1") && message.contains("too large"),
+            "{message}"
+        );
+    }
+}
