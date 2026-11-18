@@ -151,7 +151,27 @@ mod tests {
             COMPILED,
         )
         .unwrap();
-        assert_eq!(current.plan_contract_revision(), 26);
+        assert_eq!(current.plan_contract_revision(), 27);
+        assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+        assert_ne!(current.id(), prior.id());
+        assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+    }
+
+    #[test]
+    fn peer_with_fragment_expression_arenas_has_a_distinct_compatibility_island() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
+        let prior = novarocks_version::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            26,
+            COMPILED,
+        )
+        .unwrap();
+        assert_eq!(current.plan_contract_revision(), 27);
+        assert_eq!(prior.plan_contract_revision(), 26);
         assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
         assert_ne!(current.id(), prior.id());
         assert_eq!(current.descriptor_digest(), prior.descriptor_digest());

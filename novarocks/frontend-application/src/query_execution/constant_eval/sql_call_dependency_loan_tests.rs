@@ -62,33 +62,22 @@ fn exact(sql: &str) -> SqlAuthoredPhysicalPlan {
         SqlCompileProgress::Incomplete(_) => panic!("table-free actual source must complete"),
     }
 }
-fn function_site(
-    owner: &SqlAuthoredPhysicalPlan,
-) -> (
-    &novarocks_physical_plan::Fragment,
-    &novarocks_physical_plan::ExprNode,
-) {
-    owner
-        .plan()
-        .fragments()
-        .values()
-        .find_map(|fragment| {
-            fragment.expressions().iter().find_map(|(_, source)| {
-                matches!(&source.kind, ExprKind::FunctionCall { .. }).then_some((fragment, source))
-            })
-        })
+fn function_site(owner: &SqlAuthoredPhysicalPlan) -> (&Fragment, &PhysicalNode, &ExprNode) {
+    expression_sources(owner)
+        .find(|(_, _, source)| matches!(&source.kind, ExprKind::FunctionCall { .. }))
         .expect("actual SQL fixture retains a call")
 }
 #[test]
 fn sql_call_dependency_loan_real_upper_keeps_original_unconstrained_and_constants() {
     let owner = exact("SELECT upper('kept') AS source_call");
-    let (fragment, expression) = function_site(&owner);
+    let (fragment, node, expression) = function_site(&owner);
     let control = SqlCompileControl::unbounded();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let loan = owner
         .borrow_call_dependency_observed(
             SqlCallDependencySite::Expression {
                 fragment,
+                node,
                 source: expression,
             },
             &mut work,
@@ -126,11 +115,14 @@ fn sql_call_dependency_loan_real_upper_keeps_original_unconstrained_and_constant
     );
     match loan.provenance() {
         SqlCallDependencyProvenance::Expression {
+            fragment: actual_fragment,
+            node: actual_node,
             source,
             kind,
             channels,
-            ..
         } => {
+            assert!(std::ptr::eq(actual_fragment, fragment));
+            assert!(std::ptr::eq(actual_node, node));
             assert!(std::ptr::eq(source, expression));
             assert_eq!(kind, SqlExpressionCallKind::Scalar);
             let ExprKind::FunctionCall { args, .. } = &expression.kind else {
@@ -140,18 +132,45 @@ fn sql_call_dependency_loan_real_upper_keeps_original_unconstrained_and_constant
         }
         _ => panic!("expression provenance must not become relation provenance"),
     }
+    let unit = node.expressions.as_deref().unwrap();
+    let request = &unit.requests()[&expression.id];
+    assert_eq!(request.constant_policy, loan.original_constant_policy());
+    assert_eq!(
+        request.logical_argument_count,
+        loan.original_logical_argument_count()
+    );
+    assert!(request.expected_result_type.is_none());
+    let [
+        novarocks_physical_plan::StaticFunctionArgument::Value {
+            constant: Some(reference),
+            value_type: retained_type,
+        },
+    ] = request.arguments.as_ref()
+    else {
+        panic!("the published unit must keep the original constant request");
+    };
+    let retained = owner
+        .plan()
+        .constants()
+        .resolve_source_observed(*reference, &mut work)
+        .unwrap();
+    assert_eq!(retained_type, value_type);
+    assert_eq!(retained.value_type(), value.value_type());
+    assert_eq!(retained.ordinal(), value.ordinal());
+    assert!(Arc::ptr_eq(retained.pool().array(), value.pool().array()));
     work.finish().unwrap();
 }
 #[test]
 fn sql_call_dependency_loan_real_typed_empty_array_has_original_constraint() {
     let owner = exact("SELECT ARRAY<JSON>[] AS source_array");
-    let (fragment, expression) = function_site(&owner);
+    let (fragment, node, expression) = function_site(&owner);
     let control = SqlCompileControl::unbounded();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let loan = owner
         .borrow_call_dependency_observed(
             SqlCallDependencySite::Expression {
                 fragment,
+                node,
                 source: expression,
             },
             &mut work,
@@ -198,30 +217,50 @@ fn sql_call_dependency_loan_real_typed_empty_array_has_original_constraint() {
 fn sql_call_dependency_loan_original_foreign_and_missing_source_refusals_stay_typed() {
     let owner = compile("SELECT upper('kept')", &DECLINE, None).unwrap();
     let foreign = compile("SELECT upper('kept')", &DECLINE, None).unwrap();
-    let (fragment, source) = function_site(&foreign);
+    let (foreign_fragment, foreign_node, foreign_source) = function_site(&foreign);
     let control = SqlCompileControl::unbounded();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     assert!(matches!(
         owner.borrow_call_dependency_observed(
-            SqlCallDependencySite::Expression { fragment, source },
+            SqlCallDependencySite::Expression {
+                fragment: foreign_fragment,
+                node: foreign_node,
+                source: foreign_source,
+            },
             &mut work
         ),
         Err(SqlSourceJournalError::InvalidSource(
-            "expression journal loans a foreign plan or expression"
+            "expression journal loans a foreign plan or node"
         ))
     ));
-    let (fragment, _) = function_site(&owner);
-    let literal = fragment
-        .expressions()
+    let (fragment, node, source) = function_site(&owner);
+    assert_eq!(source.id, foreign_source.id);
+    assert!(matches!(
+        owner.borrow_call_dependency_observed(
+            SqlCallDependencySite::Expression {
+                fragment,
+                node,
+                source: foreign_source
+            },
+            &mut work
+        ),
+        Err(SqlSourceJournalError::InvalidSource(
+            "expression journal loans a foreign unit definition"
+        ))
+    ));
+    let literal = node
+        .expressions
+        .as_deref()
+        .unwrap()
+        .definitions()
         .iter()
-        .find_map(|(_, expression)| {
-            matches!(expression.kind, ExprKind::Constant(_)).then_some(expression)
-        })
+        .find(|expression| matches!(expression.kind, ExprKind::Constant(_)))
         .expect("original argument expression");
     assert!(matches!(
         owner.borrow_call_dependency_observed(
             SqlCallDependencySite::Expression {
                 fragment,
+                node,
                 source: literal
             },
             &mut work
@@ -253,18 +292,22 @@ impl PureCompileControl for JournalMeter {
 #[test]
 fn sql_call_dependency_loan_does_not_add_scope_step_or_success_footer_and_latches_control() {
     let owner = compile("SELECT upper('kept')", &DECLINE, None).unwrap();
-    let (fragment, source) = function_site(&owner);
+    let (fragment, node, source) = function_site(&owner);
     let success = JournalMeter::default();
     let mut work = CompileCheckpoints::try_new(&success, CompilePhase::Validate).unwrap();
     let _loan = owner
         .borrow_call_dependency_observed(
-            SqlCallDependencySite::Expression { fragment, source },
+            SqlCallDependencySite::Expression {
+                fragment,
+                node,
+                source,
+            },
             &mut work,
         )
         .unwrap();
-    // Original checked_expression_source: entry flush, four owner/kind steps,
-    // one captured-origin step, scope/count two steps, one channel step, final flush.
-    assert_eq!(&*success.events.lock().unwrap(), &[0, 0, 8]);
+    // Entry and loan flushes, then two owner, three unit/entry/kind, three
+    // origin/scope/count, and one original channel check. The caller owns finish.
+    assert_eq!(&*success.events.lock().unwrap(), &[0, 0, 9]);
     work.finish().unwrap();
     for cause in [
         CompileControlError::Cancelled,
@@ -278,11 +321,11 @@ fn sql_call_dependency_loan_does_not_add_scope_step_or_success_footer_and_latche
             };
             let mut work = CompileCheckpoints::try_new(&meter, CompilePhase::Validate).unwrap();
             assert!(
-                matches!(owner.borrow_call_dependency_observed(SqlCallDependencySite::Expression { fragment, source }, &mut work), Err(SqlSourceJournalError::Control(actual)) if actual == cause)
+                matches!(owner.borrow_call_dependency_observed(SqlCallDependencySite::Expression { fragment, node, source }, &mut work), Err(SqlSourceJournalError::Control(actual)) if actual == cause)
             );
             let events = meter.events.lock().unwrap().clone();
             assert!(
-                matches!(owner.borrow_call_dependency_observed(SqlCallDependencySite::Expression { fragment, source }, &mut work), Err(SqlSourceJournalError::Control(actual)) if actual == cause)
+                matches!(owner.borrow_call_dependency_observed(SqlCallDependencySite::Expression { fragment, node, source }, &mut work), Err(SqlSourceJournalError::Control(actual)) if actual == cause)
             );
             assert_eq!(*meter.events.lock().unwrap(), events);
         }
@@ -322,7 +365,11 @@ fn sql_call_dependency_loan_real_table_unnest_retains_relation_and_channels() {
                     source, channels, ..
                 } => {
                     assert!(std::ptr::eq(source, node));
-                    assert_eq!(channels, arguments.as_ref());
+                    let unit = node.expressions.as_deref().unwrap();
+                    assert_eq!(channels.len(), arguments.len());
+                    for (&channel, &root) in channels.iter().zip(arguments.iter()) {
+                        assert_eq!(channel, unit.root(root).unwrap().definition);
+                    }
                 }
                 _ => panic!("table loan must keep original relation"),
             }
@@ -376,7 +423,11 @@ fn sql_call_dependency_loan_original_aggregate_all_phases_keep_source_and_state_
                         match runtime {
                             AggregateRuntimeDemand::Update => updates += 1,
                             AggregateRuntimeDemand::ExpressionState(id) => {
-                                assert_eq!(source.arguments.as_ref(), &[id]);
+                                let [root] = source.arguments.as_ref() else {
+                                    panic!("the merge consumes exactly its original state");
+                                };
+                                let unit = node.expressions.as_deref().unwrap();
+                                assert_eq!(unit.root(*root).unwrap().definition, id);
                                 merges += 1;
                             }
                             _ => panic!("aggregate is not writer"),

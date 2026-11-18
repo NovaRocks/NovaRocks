@@ -616,7 +616,7 @@ mod tests {
     ) -> novarocks_query_application::preparation::FrozenExecutionDescription {
         use arrow::datatypes::DataType;
         use novarocks_physical_plan::{
-            ExprKind, FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, PlanBuilder,
+            FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, PlanBuilder,
             PlanVersionId, ValueOrigin, ValueType,
         };
         use novarocks_query_application::preparation::{
@@ -657,12 +657,18 @@ mod tests {
             pool,
             ordinal: source.ordinal(),
         };
+        use novarocks_expression_contract::{ExprKind, RootScope};
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase, EvaluationDemand};
         let literal = fragment
-            .add_expression(node, ty.clone(), ExprKind::Constant(reference))
+            .unit(node)
+            .unwrap()
+            .add(None, ty.clone(), ExprKind::Constant(reference))
             .unwrap();
         let cast = fragment
-            .add_expression(
-                node,
+            .unit(node)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 ExprKind::Cast {
                     expr: literal,
@@ -674,6 +680,11 @@ mod tests {
                     },
                 },
             )
+            .unwrap();
+        let cast = fragment
+            .unit(node)
+            .unwrap()
+            .root(cast, EvaluationDemand::Value, RootScope::AllPorts)
             .unwrap();
         let value = fragment
             .add_value(
@@ -687,6 +698,19 @@ mod tests {
         fragment
             .add_values(node, Box::from([Box::from([cast])]), Box::from([value]))
             .unwrap();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let ports = fragment.node_ports(node).unwrap();
+        let unit = fragment
+            .take_unit_builder(node)
+            .unwrap()
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(Default::default(), &mut work)
+            .unwrap();
+        fragment
+            .install_unit(node, std::sync::Arc::new(unit))
+            .unwrap();
+        work.finish().unwrap();
         let fragment = fragment
             .finish_definition(
                 node,
@@ -699,7 +723,7 @@ mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
-        let mut builder = PlanBuilder::new(PlanVersionId::try_new([29; 16]).unwrap())
+        let mut builder = PlanBuilder::new(PlanVersionId::try_new([29; 16]).unwrap(), policy)
             .with_semantic_parameters(
                 SemanticParameters::try_new([(
                     SemanticParameterId::new(u32::MAX),

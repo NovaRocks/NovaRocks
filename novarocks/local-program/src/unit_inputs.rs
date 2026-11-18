@@ -108,10 +108,14 @@ where
         if self.last[role.cache()] == Some(key) {
             return Ok(());
         }
-        // The sole compiler publishes this canonical empty AllPorts scope
-        // for a zero-port unit. It contains no possible runtime input binding.
+        // The compiler publishes a canonical empty AllPorts scope for a unit
+        // with no ports. A declared zero-column port still has an actual input.
         if scope.schema().fields().is_empty() && scope.columns().is_empty() {
-            return Ok(());
+            return if unit.scopes().is_empty() || input.width() == 0 {
+                Ok(())
+            } else {
+                Err((self.invalid)())
+            };
         }
         if scope.schema().fields().len() != input.width() {
             return Err((self.invalid)());

@@ -147,7 +147,10 @@ mod count_handoff_tests {
                 StagePlacementPolicy::Singleton,
             )
             .unwrap();
-        let mut plan = PlanBuilder::new(PlanVersionId::try_new([199; 16]).unwrap());
+        let mut plan = PlanBuilder::new(
+            PlanVersionId::try_new([199; 16]).unwrap(),
+            crate::application::test_constant_policy(),
+        );
         plan.add_fragment(fragment).unwrap();
         let candidate = CompletedPhysicalPlanCandidate::for_program(
             plan.finish().unwrap(),

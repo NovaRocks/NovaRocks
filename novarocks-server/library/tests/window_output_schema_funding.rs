@@ -27,10 +27,11 @@ use novarocks_execution::{
     runtime::function_set::ExecutionFunctionSetBuilder,
     runtime::{preparation_metadata::CompiledSchemaSite, query_memory::QueryMemoryBinding},
 };
+use novarocks_expression_contract::{BoundFunction, LegacyBindingMetadata, PhysicalCallRequest};
 use novarocks_functions::{
     CallArgumentUses, CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder,
     FunctionBindingRequest, FunctionKind, FunctionResultType, InstalledPureKernel,
-    PureCallPreparation, PureEngineFunctionCatalog, ScopedExpressionEffects, WindowCallOptions,
+    PureCallPreparation, PureEngineFunctionCatalog, ScopedRelationalEffects, WindowCallOptions,
 };
 use novarocks_memory::{
     AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TeardownEvidence, TopUpPolicy,
@@ -213,27 +214,12 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
     builder
         .add_values(values, Box::default(), Box::from([input]))
         .unwrap();
-    let expression = builder
-        .add_expression(
-            window,
-            result_type.clone(),
-            ExprKind::WindowCall {
-                function,
-                distinct: false,
-                args: Box::default(),
-                function_order_by: Box::default(),
-                frame: None,
-                ignore_nulls: false,
-                aggregate_binding: None,
-            },
-        )
-        .unwrap();
     let output = builder
         .add_value(
             result_type.clone(),
-            ValueOrigin::Expr {
+            ValueOrigin::NodeOutput {
                 node: window,
-                expr: expression,
+                output_ordinal: 1,
             },
         )
         .unwrap();
@@ -245,12 +231,25 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
             NodeKind::Window(WindowSpec {
                 partition_by: Box::default(),
                 order_by: Box::default(),
-                expressions: Box::from([WindowExpression { expression, output }]),
+                calls: Box::from([WindowCallSpec {
+                    binding: function,
+                    distinct: false,
+                    arguments: Box::default(),
+                    order_by: Box::default(),
+                    frame: None,
+                    ignore_nulls: false,
+                    aggregate_binding: None,
+                    output,
+                }]),
             }),
         )
         .unwrap();
+    let site = PhysicalCallSite::Window {
+        node: window,
+        call: 0,
+    };
     let fragment = builder
-        .finish_definition(
+        .finish_structure(
             window,
             FragmentSink::RootResult(Box::new(
                 novarocks_result_contract::RootOutputContract::new(
@@ -263,12 +262,14 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
                 max: 1,
                 requires_power_of_two: false,
             },
+            PlanLimits::FROZEN,
+            &Control,
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap()
         .with_call_requests_observed(
             vec![(
-                PhysicalCallDefinition::Expression(expression),
+                site,
                 PhysicalCallRequest {
                     arguments: Box::default(),
                     logical_argument_count: 0,
@@ -279,78 +280,42 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
             &Control,
         )
         .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationRegionId::new(0);
-    let mut invocations = Vec::new();
-    let mut bindings = Vec::new();
-    let mut frozen = Vec::new();
     let parameters = SemanticParameters::try_new([]).unwrap();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let use_id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
-        let context = ExpressionEffectContext {
-            use_id,
-            region: domain,
-            demand: root.demand,
-        };
-        invocations.push(ExpressionInvocation {
-            context,
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, use_id));
-        if root.expr == expression {
-            let token = catalog
-                .prepare_fresh(
-                    CallEffectInput {
-                        context,
-                        argument_uses: CallArgumentUses::SelectedChannels(&[]),
-                        function_id: &bound.function_id,
-                        kind: FunctionKind::Window,
-                        selected: &selection,
-                        request,
-                        environment: &[],
-                        parameters: &parameters,
-                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Region(domain),
-                    },
-                    Arc::clone(&selection),
-                    PureCallPreparation::Window {
-                        arguments: ScopedExpressionEffects::primitive(
-                            context,
-                            ExpressionEffects::PURE_VALUE,
-                        ),
-                        options: WindowCallOptions::try_new(None, false, &Control).unwrap(),
-                    },
-                    &Control,
-                )
-                .unwrap();
-            frozen.push(FrozenPhysicalCall {
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                site: PhysicalCallSite::Expression(use_id),
+    let context = RelationEffectContext::call(RelationCallId::new(0));
+    let token = catalog
+        .prepare_fresh(
+            CallEffectInput {
+                context: context.into(),
+                argument_uses: CallArgumentUses::SelectedChannels(&[]),
+                function_id: &bound.function_id,
+                kind: FunctionKind::Window,
+                selected: &selection,
+                request,
+                environment: &[],
+                parameters: &parameters,
+                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                proof_scope: CallProofScope::Relation(context.identity),
+            },
+            Arc::clone(&selection),
+            PureCallPreparation::Window {
+                arguments: ScopedRelationalEffects::pure_value(context),
+                options: WindowCallOptions::try_new(None, false, &Control).unwrap(),
+            },
+            &Control,
+        )
+        .unwrap();
+    let fragment = fragment
+        .with_calls_observed(
+            vec![FrozenPhysicalCall {
+                site,
                 context,
                 effects: token.call_contract().effects().clone(),
                 materialized_writer_input: None,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            });
-        }
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, frozen, &Control).unwrap();
+            }],
+            &Control,
+        )
+        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment.id(),
@@ -379,8 +344,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
             required: RequiredContracts::default(),
             fragment,
             constants: ConstantPools::empty(),
-            expression_uses: uses,
-            calls,
+            statement_constant_policy: constants(),
             pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
             cuts: FragmentCuts::default(),
             result: Some(result),

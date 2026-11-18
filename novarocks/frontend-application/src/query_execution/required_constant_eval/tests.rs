@@ -104,10 +104,6 @@ impl Fixture {
             sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
             constant_policy: crate::application::test_constant_policy(),
             control,
-            version: novarocks_physical_plan::PlanVersionId::try_new(
-                *uuid::Uuid::now_v7().as_bytes(),
-            )
-            .unwrap(),
         })
         .unwrap_or_else(|cause| panic!("{sql}: {cause}"))
     }
@@ -316,8 +312,6 @@ fn required_unchanged_materialized_input_keeps_original_nonzero_selected_value()
         sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         constant_policy: crate::application::test_constant_policy(),
         control: &control,
-        version: novarocks_physical_plan::PlanVersionId::try_new(*uuid::Uuid::now_v7().as_bytes())
-            .unwrap(),
     })
     .unwrap();
     let value = fixture
@@ -337,25 +331,27 @@ fn required_unchanged_materialized_input_keeps_original_nonzero_selected_value()
 }
 
 #[test]
-fn required_package_author_data_and_control_keep_their_distinct_ports() {
+fn required_unit_compiler_data_and_control_keep_their_distinct_ports() {
     use novarocks_failure_contract::SharedFailureCause;
     let original = SharedFailureCause::new(novarocks_functions::RowDataError::with_reason(
         0,
         novarocks_functions::DataFailureReason::DivisionByZero,
-        "original package author Data",
+        "original unit compiler Data",
     ));
-    let error = package_semantics_error(PackageSemanticsError::PrimitiveSource {
-        source: original.clone(),
-        cast: None,
-    });
+    let error = expression_compile_error(ExprCompileFailure::Owner(
+        novarocks_expression::ExprCompileError::Constant(
+            novarocks_functions::ConstantError::Source(original.clone()),
+        ),
+    ));
     let SqlConstantEvaluationError::Outer(outer) = error else {
         panic!("preparation Data must stay on the outer port");
     };
     assert_eq!(outer.failure_fact(), original.failure_fact());
-    let Some(PackageSemanticsError::PrimitiveSource { source, .. }) =
-        outer.downcast_ref::<PackageSemanticsError>()
+    let Some(ExprCompileFailure::Owner(novarocks_expression::ExprCompileError::Constant(
+        novarocks_functions::ConstantError::Source(source),
+    ))) = outer.downcast_ref::<ExprCompileFailure<CompileControlError>>()
     else {
-        panic!("the original package source owner");
+        panic!("the original unit compiler source owner");
     };
     assert_eq!(source, &original);
     assert!(
@@ -365,13 +361,12 @@ fn required_package_author_data_and_control_keep_their_distinct_ports() {
     );
     let control = CompileControlError::Source(original);
     assert!(
-        matches!(package_semantics_error(PackageSemanticsError::Control(control.clone())), SqlConstantEvaluationError::Control(actual) if actual == control)
+        matches!(expression_compile_error(ExprCompileFailure::Control(control.clone())), SqlConstantEvaluationError::Control(actual) if actual == control)
     );
 }
 
 #[test]
 fn required_real_primitive_capability_refusal_is_not_constant_eligibility() {
-    use novarocks_failure_contract::SharedFailureCause;
     use novarocks_functions::{CastOperation, CastPrepareError, PreparedCastRecipe};
     let control = SqlCompileControl::unbounded();
     // This exact installed cast author explicitly refuses DATE -> narrow int.
@@ -388,21 +383,20 @@ fn required_real_primitive_capability_refusal_is_not_constant_eligibility() {
     )
     .unwrap_err();
     assert_eq!(refusal, CastPrepareError::Unsupported);
-    let original = SharedFailureCause::new(refusal);
-    let error = package_semantics_error(PackageSemanticsError::PrimitiveSource {
-        source: original.clone(),
-        cast: Some((DataType::Date32, DataType::Int8)),
-    });
+    let expected = refusal.failure_fact();
+    let error = expression_compile_error(ExprCompileFailure::Owner(
+        novarocks_expression::ExprCompileError::Cast(refusal),
+    ));
     let SqlConstantEvaluationError::Outer(outer) = error else {
         panic!("real installed capability remains an outer refusal");
     };
-    assert_eq!(outer.failure_fact(), original.failure_fact());
-    let Some(PackageSemanticsError::PrimitiveSource { source, .. }) =
-        outer.downcast_ref::<PackageSemanticsError>()
-    else {
-        panic!("original installed cast cause retained");
-    };
-    assert_eq!(source, &original);
+    assert_eq!(outer.failure_fact(), expected);
+    assert!(matches!(
+        outer.downcast_ref::<ExprCompileFailure<CompileControlError>>(),
+        Some(ExprCompileFailure::Owner(
+            novarocks_expression::ExprCompileError::Cast(CastPrepareError::Unsupported)
+        ))
+    ));
     assert!(
         outer
             .downcast_ref::<RequiredConstantEligibilityFailure>()

@@ -699,8 +699,8 @@ fn assert_invalid_arithmetic(result: &Result<Option<ConstantValue>, SqlConstantE
     );
     assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
     assert!(matches!(
-        source.downcast_ref::<novarocks_local_program::ProgramPrimitiveError>(),
-        Some(novarocks_local_program::ProgramPrimitiveError::Arithmetic(
+        source.downcast_ref::<novarocks_expression::PrimitiveError>(),
+        Some(novarocks_expression::PrimitiveError::Arithmetic(
             novarocks_functions::ArithmeticPrepareError::TypeMismatch
         ))
     ));
@@ -1440,7 +1440,16 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
             .all(|row| *row == (Some(Source::NativeV1Utf8LiteralWhenPresent), true)),
         "the fold author must preserve the exact emitted source and typed decline: {seen:?}"
     );
-    assert!(owner.plan().fragments().values().any(|fragment| fragment.expressions().iter().any(|(_,expression)| matches!(&expression.kind,novarocks_physical_plan::ExprKind::FunctionCall {function,..} if function.function_id.as_str()=="builtin.scalar/regexp_count/v1"))), "failed literal evaluation must retain the actual call, never fold to NULL");
+    assert!(
+        super::sql_fold_dependency_observation_tests::expression_sources(&owner).any(
+            |(_, _, expression)| matches!(
+                &expression.kind,
+                novarocks_expression_contract::ExprKind::FunctionCall { function, .. }
+                    if function.function_id.as_str() == "builtin.scalar/regexp_count/v1"
+            )
+        ),
+        "failed literal evaluation must retain the actual call, never fold to NULL"
+    );
 }
 
 #[test]

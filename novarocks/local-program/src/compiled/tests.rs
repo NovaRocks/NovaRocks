@@ -1073,8 +1073,16 @@ fn final_owner_reference_budget_sums_individually_legal_units_at_near_exact_and_
 
 #[test]
 fn final_owner_rechecks_actual_unit_input_scope_against_its_real_project_input() {
-    use novarocks_expression_contract::ValueId;
-    use novarocks_type_contract::EvaluationDemand;
+    use novarocks_constant_contract::{ConstantPoolId, ConstantPools, ConstantReference};
+    use novarocks_expression::{
+        EvaluationEnvironment, ScopeLayout, ScopeLayouts, compile_expr_set_pure,
+    };
+    use novarocks_expression_contract::{
+        BoundExprSetBuilder, ExprKind, ExprPort, RootScope, UnitLimits, ValueId,
+    };
+    use novarocks_type_contract::{
+        EvaluationDemand, MAX_CONTROL_DEPTH, SemanticParameters, ValueTypeStorageLifetime,
+    };
     let source = checked(false, true, false);
     let narrow = source.graph.nodes()[0].output_layout().clone();
     let ty = FunctionValueType::new(DataType::Int64, false);
@@ -1177,31 +1185,96 @@ fn final_owner_rechecks_actual_unit_input_scope_against_its_real_project_input()
     assert_eq!(foreign.input(foreign.roots()[0].use_id).unwrap().ordinal, 2);
     assert_eq!(foreign.scopes()[0].schema().fields().len(), 3);
     assert!(Arc::ptr_eq(foreign.scopes()[0].schema(), wide.schema()));
-    let mut actual = make();
-    let graph_error = match LocalProgramGraph::try_new_with_sink(
-        actual.graph.nodes().to_vec(),
-        actual.graph.root(),
-        std::slice::from_ref(&foreign),
-        actual.graph.profile(),
-        actual.graph.requirements().clone(),
-        actual.graph.sink().cloned(),
-    ) {
-        Ok(_) => panic!("graph root input scope must match its actual runtime input"),
-        Err(error) => error,
-    };
-    assert_eq!(graph_error, LocalProgramError::InvalidExpression);
-    actual.units = vec![foreign];
-    let error = match finish(
-        actual,
-        operators(true, u32::MAX),
-        &allowed(),
-        CompiledProgramFacts::default(),
-        &Control::default(),
-    ) {
-        Ok(_) => panic!("compiled input ordinal 2 must not read a one-column runtime input"),
-        Err(error) => error,
-    };
-    assert_eq!(error, LocalProgramCompileError::InvalidExpression);
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+    let value = crate::test_support::integer_typed(7, ty.clone());
+    let pool = ConstantPoolId::new(0);
+    let mut constants = ConstantPools::empty();
+    constants.insert(pool, value.pool().clone()).unwrap();
+    let mut draft = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: MAX_CONTROL_DEPTH,
+    });
+    let definition = draft
+        .add(
+            None,
+            value.value_type().clone(),
+            ExprKind::Constant(ConstantReference {
+                pool,
+                ordinal: value.ordinal(),
+            }),
+        )
+        .unwrap();
+    let root = draft
+        .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let bound = draft
+        .seal(
+            vec![ExprPort {
+                values: Box::default(),
+            }],
+            &mut work,
+        )
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    let empty_scope = ScopeLayout::try_new(
+        Arc::new(Schema::empty()),
+        Arc::from([]),
+        Arc::from([]),
+        ValueTypeStorageLifetime::pure(),
+        &mut work,
+    )
+    .unwrap();
+    let declared_empty = compile_expr_set_pure(
+        &bound,
+        EvaluationEnvironment {
+            constants: &constants,
+            parameters: &SemanticParameters::try_new([]).unwrap(),
+        },
+        ScopeLayouts {
+            ports: &[empty_scope],
+            all_ports: None,
+        },
+        crate::test_support::policy(),
+        &crate::test_support::actual_rng_catalogue(),
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    assert_eq!(declared_empty.scopes().len(), 1);
+    assert!(declared_empty.scopes()[0].schema().fields().is_empty());
+    assert_eq!(declared_empty.root(root).unwrap().scope, RootScope::Port(0));
+
+    for (replacement, description) in [
+        (foreign, "a width-three port with a read at ordinal two"),
+        (declared_empty, "a declared zero-column port"),
+    ] {
+        let mut actual = make();
+        let graph_error = match LocalProgramGraph::try_new_with_sink(
+            actual.graph.nodes().to_vec(),
+            actual.graph.root(),
+            std::slice::from_ref(&replacement),
+            actual.graph.profile(),
+            actual.graph.requirements().clone(),
+            actual.graph.sink().cloned(),
+        ) {
+            Ok(_) => panic!("graph accepted {description} for an actual one-column input"),
+            Err(error) => error,
+        };
+        assert_eq!(graph_error, LocalProgramError::InvalidExpression);
+        actual.units = vec![replacement];
+        let error = match finish(
+            actual,
+            operators(true, u32::MAX),
+            &allowed(),
+            CompiledProgramFacts::default(),
+            &Control::default(),
+        ) {
+            Ok(_) => panic!("final owner accepted {description} for an actual one-column input"),
+            Err(error) => error,
+        };
+        assert_eq!(error, LocalProgramCompileError::InvalidExpression);
+    }
 }
 
 #[test]

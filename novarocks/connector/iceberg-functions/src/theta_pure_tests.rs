@@ -18,11 +18,12 @@
 use super::*;
 use arrow_array::*;
 use arrow_schema::{DataType, TimeUnit};
+use novarocks_functions::ScopedRelationalEffects;
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy,
     EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, ExpressionUseId,
     FunctionInstanceState, FunctionNullBehavior, ObservableEffects, PureCompileControl,
-    SemanticParameters,
+    RelationCallId, RelationEffectContext, SemanticParameters,
 };
 use std::{
     mem::MaybeUninit,
@@ -115,12 +116,8 @@ fn runtime_causes() -> [KernelFailure; 7] {
         KernelFailure::InstanceFailed,
     ]
 }
-fn context() -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(0),
-        region: EvaluationRegionId::new(u32::MAX),
-        demand: EvaluationDemand::Value,
-    }
+fn context() -> RelationEffectContext {
+    RelationEffectContext::call(RelationCallId::new(u32::MAX))
 }
 fn catalog() -> PureEngineFunctionCatalog {
     let mut builder = EngineFunctionCatalogBuilder::new();
@@ -207,20 +204,21 @@ impl Fixture {
                         use_id: ExpressionUseId::new(2),
                         region: EvaluationRegionId::new(u32::MAX - 1),
                         demand: EvaluationDemand::Value,
-                    },
+                    }
+                    .into(),
                     state_input_type: &self.state_type,
                 }
             },
-            context: context(),
+            context: context().into(),
             parameters: &self.parameters,
             environment: &[],
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Region(context().region),
+            proof_scope: CallProofScope::Relation(context().identity),
         }
     }
     fn options(&self, phase: AggregateKernelPhase) -> PureCallPreparation {
         PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::pure_value(context()),
+            arguments: ScopedRelationalEffects::pure_value(context()),
             options: AggregatePreparationOptions {
                 state_interpretation: None,
                 phase,

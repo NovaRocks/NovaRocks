@@ -23,47 +23,38 @@ use arrow::{
     array::{Array, UInt64Array},
     record_batch::{RecordBatch, RecordBatchOptions},
 };
-use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
 use novarocks_execution::runtime::task::{ExecutionFailure, RequiredExpressionRowError};
-use novarocks_failure_contract::{FailureFact, FailureProjection};
+use novarocks_expression::{
+    EvaluationEnvironment, ExprCompileFailure, ExprCreation, ScopeLayouts, compile_expr_set,
+};
+use novarocks_expression_contract::RootScope;
+use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 use novarocks_functions::{
     AggregateStateAllocator, CompileKernelControl, ConstantCreationFailure, ConstantPolicy,
     ConstantPool, ConstantValue, KernelDiagnostic, KernelFailure, PureEngineFunctionCatalog,
     ScalarInvocationActivation, ScalarInvocationScope, Selection,
 };
-use novarocks_local_compiler::{
-    LocalCompileOptions, compile_fragment_with_creation, validate_fragment_providers,
-};
-use novarocks_local_program::{
-    KernelAbiVersion, ProgramChannelLayoutRole, ProgramExpressionRootSite,
-    ProgramNodeExpressionRole, ProgramRootInput, root_input_layout,
-};
-use novarocks_physical_plan::{FragmentPackageExtractionError, extract_fragment_packages};
-use novarocks_spi::connector::ConnectorCodecError;
 use novarocks_sql::compiler::{
     PackageSemanticsError, PreparedRequiredConstant, SqlConstantEvaluationError,
-    author_fragment_package_semantics,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, FunctionInstanceState,
-    PureCompileControl, ValueSchemaCreationFactory, ValueSchemaCreationScope,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionArgumentType,
+    FunctionInstanceState, PureCompileControl, ValueSchemaCreationFactory,
+    ValueSchemaCreationScope,
 };
 use novarocks_workload_control::{ResultWindowAlias, WorkScope};
-use std::{collections::BTreeMap, fmt, num::NonZeroUsize, sync::Arc};
+use std::{fmt, sync::Arc};
 
-use super::package_freeze::CompiledPackageCarrier;
 mod resources;
 use resources::RootResources;
 pub(crate) use resources::with_root_value_creation;
 
-/// Constructed by Server from the SAME frozen interpreter product as the BE.
-/// No default catalogue, provider, codec, constant policy or resource is made.
+/// The server supplies the same sealed function catalogue as the BE.
+/// Each invocation borrows its original statement and Root resources.
 #[derive(Clone)]
 pub struct RequiredConstantInterpreter {
     functions: Arc<PureEngineFunctionCatalog>,
-    providers: Arc<PureProviderProgramCatalog<ConnectorCodecError>>,
-    carrier: CompiledPackageCarrier,
     policy: ConstantPolicy,
 }
 impl fmt::Debug for RequiredConstantInterpreter {
@@ -73,18 +64,8 @@ impl fmt::Debug for RequiredConstantInterpreter {
     }
 }
 impl RequiredConstantInterpreter {
-    pub fn new(
-        functions: Arc<PureEngineFunctionCatalog>,
-        providers: Arc<PureProviderProgramCatalog<ConnectorCodecError>>,
-        carrier: CompiledPackageCarrier,
-        policy: ConstantPolicy,
-    ) -> Self {
-        Self {
-            functions,
-            providers,
-            carrier,
-            policy,
-        }
+    pub fn new(functions: Arc<PureEngineFunctionCatalog>, policy: ConstantPolicy) -> Self {
+        Self { functions, policy }
     }
 
     pub fn evaluate(
@@ -125,124 +106,92 @@ impl RequiredConstantInterpreter {
     ) -> Result<ConstantValue, SqlConstantEvaluationError> {
         let control = prepared.control();
         let source = prepared.source();
-        let semantics = author_fragment_package_semantics(source, self.policy, control)
-            .map_err(package_semantics_error)?;
-        let mut uses = BTreeMap::new();
-        let mut calls = BTreeMap::new();
-        let mut pruning = BTreeMap::new();
-        let mut admissions = BTreeMap::new();
+        let unit = source.unit();
+        let root = source.root();
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-        for (fragment, authored) in semantics {
-            for call in authored.calls.entries().values() {
-                work.step()?;
-                if call.effects.value_stability.is_volatile()
-                    || call.effects.instance_state != FunctionInstanceState::None
-                    || !call.effects.observable_effects.is_empty()
-                {
-                    return Err(SqlConstantEvaluationError::from_domain(
-                        RequiredConstantEligibilityFailure::new(),
-                    ));
-                }
+        for claim in unit.claims().values() {
+            work.step()?;
+            if claim.effects.value_stability.is_volatile()
+                || claim.effects.instance_state != FunctionInstanceState::None
+                || !claim.effects.observable_effects.is_empty()
+            {
+                return Err(SqlConstantEvaluationError::from_domain(
+                    RequiredConstantEligibilityFailure::new(),
+                ));
             }
-            uses.insert(fragment, authored.expression_uses);
-            calls.insert(fragment, authored.calls);
-            pruning.insert(fragment, authored.pruning);
-            admissions.insert(fragment, *self.carrier.admission());
         }
         work.finish()?;
-        let mut packages = extract_fragment_packages(
-            source.plan(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &uses,
-            &calls,
-            &pruning,
-            &admissions,
-            control,
-        )
-        .map_err(|cause| match cause {
-            FragmentPackageExtractionError::Control(cause) => cause.into(),
-            other => SqlConstantEvaluationError::outer_domain(ExtractionFailure(other)),
-        })?;
-        if packages.len() != 1 {
-            return Err(invariant(
-                "required constant has more than one compiled fragment",
-            ));
-        }
-        let (_, package) = packages.pop_first().expect("one checked required fragment");
-        if !package.scans().is_empty()
-            || !package.writes().is_empty()
-            || !package.layouts().is_empty()
-        {
-            return Err(invariant(
-                "required constant contains a provider occurrence",
-            ));
-        }
-        let validated =
-            validate_fragment_providers(Arc::new(package), self.providers.as_ref(), control)
-                .map_err(SqlConstantEvaluationError::outer_domain)?;
-        let retained = resources.factory.begin_scope()?;
+
+        let mut retained = resources.factory.begin_scope()?;
         let mut temporary = resources.factory.begin_scope()?;
-        let program = retained
-            .with_creation(|creation| {
-                compile_fragment_with_creation(
-                    validated,
-                    self.functions.as_ref(),
-                    LocalCompileOptions {
-                        // The one local scalar invocation has no live backend topology.
-                        pipeline_dop: NonZeroUsize::MIN,
-                        root_sink_dop: Some(NonZeroUsize::MIN),
-                        kernel_abi: KernelAbiVersion::CURRENT,
-                        constants: self.policy,
-                    },
-                    creation,
-                    &mut temporary,
-                    &resources.factory,
-                    control,
-                )
-            })
-            .map_err(SqlConstantEvaluationError::outer_domain)?;
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let compiled = compile_expr_set(
+            unit,
+            EvaluationEnvironment {
+                constants: source.constants(),
+                parameters: source.parameters(),
+            },
+            ScopeLayouts {
+                ports: &[],
+                all_ports: None,
+            },
+            source.constant_policy(),
+            self.functions.as_ref(),
+            ExprCreation {
+                temporary: &mut temporary,
+                retained: &mut retained,
+                factory: &resources.factory,
+            },
+            &mut work,
+        );
+        // An original construction refusal keeps priority over the footer.
+        // Ordinary compiler verdicts still flush their pending observation.
+        let has_primary_refusal = compiled.as_ref().is_err_and(|cause| match cause {
+            ExprCompileFailure::Owner(cause) => {
+                cause.is_primary_construction()
+                    || matches!(
+                        cause.failure_fact().class(),
+                        FailureClass::Resource | FailureClass::Control
+                    )
+            }
+            ExprCompileFailure::Control(_)
+            | ExprCompileFailure::Creator(_)
+            | ExprCompileFailure::Resource(_) => true,
+        });
+        if !has_primary_refusal {
+            work.finish()?;
+        }
+        let compiled = compiled.map_err(expression_compile_error)?;
         drop(temporary);
         drop(retained);
-        let program = Arc::new(program);
-        let root_node = program.graph().root();
-        let root = ProgramExpressionRootSite::Node {
-            node: root_node,
-            role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-        };
-        let ProgramRootInput::Layout {
-            node: input_node,
-            role: input_role,
-        } = root_input_layout(program.graph(), root)
-            .map_err(SqlConstantEvaluationError::outer_domain)?
+
+        let declaration = compiled
+            .root(root)
+            .ok_or_else(|| invariant("required constant has no compiled root"))?;
+        let Some(FunctionArgumentType::Value(ty)) =
+            compiled.types().get(declaration.definition.index())
         else {
-            return Err(invariant("required Project has no original input layout"));
-        };
-        let input_layout = program
-            .checked()
-            .channels()
-            .channel_layout(input_node, input_role)
-            .ok_or_else(|| invariant("required input layout is absent"))?;
-        if !input_layout.schema().fields().is_empty() {
-            return Err(invariant("required constant input is not empty"));
-        }
-        let output_layout = program
-            .checked()
-            .channels()
-            .channel_layout(root_node, ProgramChannelLayoutRole::NodeOutput)
-            .ok_or_else(|| invariant("required output layout is absent"))?;
-        let [field] = output_layout.schema().fields().as_ref() else {
-            return Err(invariant("required constant output is not one column"));
-        };
-        // SQL's five targets are flat physical scalars. Arbitrary external Field
-        // attributes would require their own original ConstantSourceOwner.
-        if !field.metadata().is_empty() {
             return Err(invariant(
-                "required scalar output has unexpected source metadata",
+                "required constant root has no complete value type",
+            ));
+        };
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        if !ty
+            .exactly_equals_checked_observed(prepared.value_type(), || work.step())
+            .map_err(SqlConstantEvaluationError::from)?
+        {
+            return Err(invariant(
+                "required constant root type differs from its SQL declaration",
             ));
         }
-        let field = field.clone();
-        let output_storage = output_layout.storage_lifetime();
+        work.finish()?;
+        let output_storage = ty.typed_binding().layout().storage_lifetime();
+        let input_layout = compiled
+            .scope(RootScope::AllPorts)
+            .ok_or_else(|| invariant("required constant has no singleton input layout"))?;
+        if !compiled.scopes().is_empty() || !input_layout.schema().fields().is_empty() {
+            return Err(invariant("required constant must have zero input ports"));
+        }
         let input = RecordBatch::try_new_with_options(
             input_layout.schema().clone(),
             vec![],
@@ -253,7 +202,7 @@ impl RequiredConstantInterpreter {
             CompileKernelControl::new(control, CompilePhase::FunctionSpecialization);
         let allocator: Arc<dyn AggregateStateAllocator> = resources.allocator.clone();
         let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-            program,
+            compiled,
             root,
             &kernel_control,
             Some(allocator),
@@ -346,6 +295,32 @@ impl RequiredConstantInterpreter {
         .into_values();
         drop(indices_scope);
         let mut storage = resources.factory.begin_scope()?;
+        // The required-target contract admits five flat physical carriers.
+        // Fund the new field header and its owned name under the result scope.
+        const OUTPUT_NAME: &str = "value";
+        storage.request_layout(
+            std::alloc::Layout::array::<u8>(OUTPUT_NAME.len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?,
+        )?;
+        storage.request_layout(
+            novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<arrow::datatypes::Field>(),
+            )
+            .map_err(|cause| {
+                CompileControlError::Source(novarocks_failure_contract::SharedFailureCause::new(
+                    cause,
+                ))
+            })?,
+        )?;
+        let mut name = String::new();
+        name.try_reserve_exact(OUTPUT_NAME.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        name.push_str(OUTPUT_NAME);
+        let field = Arc::new(arrow::datatypes::Field::new(
+            name,
+            prepared.value_type().data_type().clone(),
+            prepared.value_type().nullable(),
+        ));
         let lifetime = storage
             .storage_lifetime()
             .retaining_observed::<ConstantCreationFailure<CompileControlError>>(
@@ -422,11 +397,11 @@ impl FailureProjection for RequiredConstantEligibilityFailure {
     }
 }
 
-fn package_semantics_error(error: PackageSemanticsError) -> SqlConstantEvaluationError {
+fn expression_compile_error(
+    error: ExprCompileFailure<CompileControlError>,
+) -> SqlConstantEvaluationError {
     match error {
-        PackageSemanticsError::Control(cause) => SqlConstantEvaluationError::Control(cause),
-        // Package preparation is an outer author. Even a genuine Data fact
-        // here is not a selected row journal from the required invocation.
+        ExprCompileFailure::Control(cause) | ExprCompileFailure::Creator(cause) => cause.into(),
         other => SqlConstantEvaluationError::outer_domain(other),
     }
 }
@@ -489,32 +464,6 @@ fn invariant(message: &str) -> SqlConstantEvaluationError {
     SqlConstantEvaluationError::outer_domain(KernelFailure::InvalidProgram(KernelDiagnostic::new(
         message,
     )))
-}
-
-#[derive(Debug)]
-struct ExtractionFailure(FragmentPackageExtractionError);
-impl fmt::Display for ExtractionFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-impl std::error::Error for ExtractionFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
-impl FailureProjection for ExtractionFailure {
-    fn failure_fact(&self) -> FailureFact {
-        match &self.0 {
-            FragmentPackageExtractionError::Control(cause) => cause.failure_fact(),
-            FragmentPackageExtractionError::Local(cause) => cause.failure_fact(),
-            FragmentPackageExtractionError::Parameter(cause) => cause.failure_fact(),
-            _ => KernelFailure::InvalidProgram(KernelDiagnostic::new(
-                "required package extraction invariant",
-            ))
-            .failure_fact(),
-        }
-    }
 }
 
 #[cfg(test)]

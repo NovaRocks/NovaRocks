@@ -1217,7 +1217,8 @@ mod tests {
     /// including required COUNT state roots. Local slot IDs and labels differ.
     #[test]
     fn count_shuffle_frozen_peers_share_exact_partial_state_declarations() {
-        use novarocks_physical_plan::{AggregatePhase, Distribution, ExprKind, NodeKind};
+        use novarocks_expression_contract::ExprKind;
+        use novarocks_physical_plan::{AggregatePhase, Distribution, NodeKind};
         use novarocks_plan_codec::physical_package_v2::decode_fragment_package;
         use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
@@ -1312,7 +1313,7 @@ mod tests {
                                         && matches!(call.binding.phase, AggregatePhase::Final { .. })
                                         && call.binding.phase.sequence() == partial.binding.phase.sequence()
                                         && call.arguments.len() == 1
-                                        && matches!(receiver.fragment().expressions().get(call.arguments[0]).map(|expr| &expr.kind), Some(ExprKind::Value(value)) if *value == imported.destination)
+                                        && matches!(receiver.fragment().root_expression(node.id, call.arguments[0]).map(|expr| &expr.kind), Some(ExprKind::Value(value)) if *value == imported.destination)
                                 })
                             });
                             assert!(
@@ -1373,12 +1374,14 @@ mod tests {
             });
             canonical |= package
                 .fragment()
-                .expressions()
-                .iter()
-                .any(|(_, expression)| {
+                .nodes()
+                .values()
+                .filter_map(|node| node.expressions.as_deref())
+                .flat_map(|unit| unit.definitions())
+                .any(|expression| {
                     matches!(
                         &expression.kind,
-                        novarocks_physical_plan::ExprKind::FunctionCall { function, .. }
+                        novarocks_expression_contract::ExprKind::FunctionCall { function, .. }
                             if function.function_id.as_str()
                                 == "builtin.scalar/__json_canonical_key/v1"
                     )
@@ -2956,7 +2959,10 @@ mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .expect("scan fragment");
-        let mut builder = PlanBuilder::new(PlanVersionId::try_new([11; 16]).expect("version"));
+        let mut builder = PlanBuilder::new(
+            PlanVersionId::try_new([11; 16]).expect("version"),
+            crate::application::test_constant_policy(),
+        );
         builder.add_fragment(fragment).expect("one fragment");
         builder.finish().expect("validated scan plan")
     }
