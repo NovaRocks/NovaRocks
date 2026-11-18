@@ -36,6 +36,7 @@ struct Counts {
     view_create: AtomicUsize,
     reference: AtomicUsize,
     resolutions: Mutex<Vec<ConnectorTableResolution>>,
+    table_requests: Mutex<Vec<ConnectorTableIdentity>>,
     events: Mutex<Vec<&'static str>>,
 }
 struct ObservedMetadata {
@@ -119,6 +120,11 @@ impl ConnectorMetadata for ObservedMetadata {
             .lock()
             .unwrap()
             .push(request.resolution);
+        self.counts
+            .table_requests
+            .lock()
+            .unwrap()
+            .push(request.table.clone());
         if let Some(error) = &self.error {
             return Err(error.clone().into());
         }
@@ -133,6 +139,11 @@ impl ConnectorMetadata for ObservedMetadata {
                 .lock()
                 .unwrap()
                 .push(request.resolution);
+            self.counts
+                .table_requests
+                .lock()
+                .unwrap()
+                .push(request.table.clone());
             if let Some(error) = &self.error {
                 return Err(error.clone());
             }

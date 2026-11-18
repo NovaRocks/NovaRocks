@@ -708,3 +708,6 @@ async fn captured_numeric_overlay_keeps_the_original_binding_on_every_fact_path(
     })
     .await;
 }
+
+#[path = "quoted_metadata.rs"]
+mod quoted_metadata;
