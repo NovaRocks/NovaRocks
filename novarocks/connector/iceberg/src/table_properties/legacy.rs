@@ -253,3 +253,48 @@ pub fn prepare_legacy_create_table_property_inputs(
     check(control)?;
     Ok(prepared)
 }
+
+/// Temporary inverse of actual old CREATE transform inputs. Remove with the
+/// legacy entry; this is not a general SHOW CREATE or external-schema renderer.
+pub fn prepare_legacy_create_table_partitioning_property(
+    fields: &[novarocks_spi::connector::ConnectorPartitionTransform],
+    control: &dyn ConnectorOperationControl,
+) -> Result<DdlPropertyValue, ConnectorError> {
+    use novarocks_spi::connector::ConnectorPartitionTransform as T;
+    control.check_active()?;
+    let mut values = Vec::with_capacity(fields.len());
+    for field in fields {
+        control.check_active()?;
+        let source = novarocks_types::naming::normalize_identifier(
+            crate::catalog_control::catalog_mutation::partition_source(field),
+        )
+        .map_err(|detail| ConnectorError::new(ConnectorErrorKind::InvalidRequest, detail))?;
+        let text = match field {
+            T::Identity { .. } => source,
+            T::Year { .. } => format!("year({source})"),
+            T::Month { .. } => format!("month({source})"),
+            T::Day { .. } => format!("day({source})"),
+            T::Hour { .. } => format!("hour({source})"),
+            T::Void { .. } => format!("void({source})"),
+            T::Bucket { num_buckets, .. }
+            | T::Truncate {
+                width: num_buckets, ..
+            } => {
+                if *num_buckets == 0 || i32::try_from(*num_buckets).is_err() {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "legacy partition width cannot be represented as a positive INTEGER",
+                    ));
+                }
+                if matches!(field, T::Bucket { .. }) {
+                    format!("bucket({source}, {num_buckets})")
+                } else {
+                    format!("truncate({source}, {num_buckets})")
+                }
+            }
+        };
+        values.push(Some(text));
+    }
+    control.check_active()?;
+    Ok(DdlPropertyValue::ArrayVarchar(values))
+}

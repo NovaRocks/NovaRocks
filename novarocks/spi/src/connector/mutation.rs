@@ -1112,6 +1112,19 @@ pub trait ConnectorCatalogMutation: Send + Sync {
             ),
         ))
     }
+    /// Temporary legacy CREATE partition inverse on this original generation.
+    /// Remove this port with the legacy preparation entry.
+    fn prepare_legacy_create_table_partitioning_property(
+        &self,
+        _fields: &[ConnectorPartitionTransform],
+        _control: &dyn super::ConnectorOperationControl,
+    ) -> Result<super::DdlPropertyValue, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector catalog mutation has no legacy partition preparation",
+        ))
+    }
+
     /// Pure table/storage declarations from this exact control generation.
     /// Absence of this capability is explicit; an empty list is not a default.
     fn table_property_declarations(
@@ -1273,6 +1286,17 @@ impl ConnectorCatalogMutationSession {
     {
         self.mutation
             .prepare_legacy_create_table_property_inputs(input, control)
+    }
+
+    /// Forward actual legacy transforms and control through the same lease.
+    /// Remove with the legacy preparation entry.
+    pub fn prepare_legacy_create_table_partitioning_property(
+        &self,
+        fields: &[ConnectorPartitionTransform],
+        control: &dyn super::ConnectorOperationControl,
+    ) -> Result<super::DdlPropertyValue, ConnectorError> {
+        self.mutation
+            .prepare_legacy_create_table_partitioning_property(fields, control)
     }
 
     /// Borrow declarations through this session's original generation lease.
@@ -2115,6 +2139,13 @@ mod tests {
         assert_eq!(failure.input_index, None);
         assert_eq!(failure.error.kind(), ConnectorErrorKind::Unsupported);
         assert_eq!(
+            lease
+                .prepare_legacy_create_table_partitioning_property(&[], &context)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        assert_eq!(
             lease.table_property_declarations().unwrap_err().kind(),
             ConnectorErrorKind::Unsupported
         );
@@ -2185,6 +2216,20 @@ mod tests {
                         value: input[1].1.to_string(),
                     },
                 }])
+            }
+            fn prepare_legacy_create_table_partitioning_property(
+                &self,
+                fields: &[ConnectorPartitionTransform],
+                control: &dyn crate::connector::ConnectorOperationControl,
+            ) -> Result<crate::connector::DdlPropertyValue, ConnectorError> {
+                control.check_active()?;
+                let [ConnectorPartitionTransform::Identity { column }] = fields else {
+                    panic!("original transform input must be forwarded");
+                };
+                assert!(Arc::ptr_eq(column, &self.raw_input[0].0));
+                Ok(crate::connector::DdlPropertyValue::ArrayVarchar(vec![
+                    Some(column.to_string()),
+                ]))
             }
             fn table_property_declarations(
                 &self,
@@ -2276,6 +2321,18 @@ mod tests {
                 .unwrap(),
             expected_preparation
         );
+        let partitioning_input = [ConnectorPartitionTransform::Identity {
+            column: raw_input[0].0.clone(),
+        }];
+        let expected_partitioning = crate::connector::DdlPropertyValue::ArrayVarchar(vec![Some(
+            raw_input[0].0.to_string(),
+        )]);
+        assert_eq!(
+            lease
+                .prepare_legacy_create_table_partitioning_property(&partitioning_input, &context)
+                .unwrap(),
+            expected_partitioning
+        );
         let properties = lease.table_property_declarations().unwrap();
         assert_eq!(properties.len(), 1);
         assert_eq!(properties[0].name(), "test_limit");
@@ -2308,6 +2365,12 @@ mod tests {
                 .prepare_legacy_create_table_property_inputs(&raw_input, &context)
                 .unwrap(),
             expected_preparation
+        );
+        assert_eq!(
+            retained
+                .prepare_legacy_create_table_partitioning_property(&partitioning_input, &context)
+                .unwrap(),
+            expected_partitioning
         );
         drop(retained);
         assert!(released.load(Ordering::SeqCst));

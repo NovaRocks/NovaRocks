@@ -96,6 +96,14 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         crate::table_properties::prepare_legacy_create_table_property_inputs(input, control)
     }
 
+    fn prepare_legacy_create_table_partitioning_property(
+        &self,
+        fields: &[ConnectorPartitionTransform],
+        control: &dyn ConnectorOperationControl,
+    ) -> Result<novarocks_spi::connector::DdlPropertyValue, ConnectorError> {
+        crate::table_properties::prepare_legacy_create_table_partitioning_property(fields, control)
+    }
+
     fn table_property_declarations(
         &self,
     ) -> Result<Vec<novarocks_spi::connector::DdlPropertyDeclaration>, ConnectorError> {
@@ -1448,6 +1456,22 @@ pub(crate) fn table_properties(
     Ok((format_version, properties))
 }
 
+pub(crate) fn initial_partition_field(
+    field: &ConnectorPartitionTransform,
+    source_id: i32,
+    index: usize,
+) -> Result<UnboundPartitionField, String> {
+    let field_id = INITIAL_PARTITION_FIELD_ID
+        .checked_add(i32::try_from(index).map_err(|_| "too many partition fields")?)
+        .ok_or_else(|| "Iceberg partition field ID overflow".to_string())?;
+    Ok(UnboundPartitionField {
+        source_id,
+        field_id: Some(field_id),
+        name: partition_field_name(field),
+        transform: partition_transform(field),
+    })
+}
+
 pub(crate) fn initial_partition_spec(
     schema: &Schema,
     fields: &[ConnectorPartitionTransform],
@@ -1458,17 +1482,10 @@ pub(crate) fn initial_partition_spec(
     let mut builder = UnboundPartitionSpec::builder().with_spec_id(0);
     for (index, field) in fields.iter().enumerate() {
         let source_id = partition_source_id(schema, field)?;
-        validate_partition_transform(schema, source_id, field)?;
-        let field_id = INITIAL_PARTITION_FIELD_ID
-            .checked_add(i32::try_from(index).map_err(|_| "too many partition fields")?)
-            .ok_or_else(|| "Iceberg partition field ID overflow".to_string())?;
+        validate_partition_transform(schema, source_id, field)
+            .map_err(|error| error.to_string())?;
         builder = builder
-            .add_partition_fields([UnboundPartitionField {
-                source_id,
-                field_id: Some(field_id),
-                name: partition_field_name(field),
-                transform: partition_transform(field),
-            }])
+            .add_partition_fields([initial_partition_field(field, source_id, index)?])
             .map_err(|error| format!("build Iceberg partition spec: {error}"))?;
     }
     Ok(Some(builder.build()))
@@ -1495,7 +1512,8 @@ fn prepare_partition_change(
         .collect::<Vec<UnboundPartitionField>>();
     if let Some(field) = add.first() {
         let source_id = partition_source_id(schema, field).map_err(invalid)?;
-        validate_partition_transform(schema, source_id, field).map_err(invalid)?;
+        validate_partition_transform(schema, source_id, field)
+            .map_err(|error| invalid(error.to_string()))?;
         let transform = partition_transform(field);
         if fields
             .iter()
@@ -1580,7 +1598,7 @@ fn partition_source_id(
         .ok_or_else(|| format!("partition source column `{name}` does not exist"))
 }
 
-fn partition_source(field: &ConnectorPartitionTransform) -> &str {
+pub(crate) fn partition_source(field: &ConnectorPartitionTransform) -> &str {
     match field {
         ConnectorPartitionTransform::Identity { column }
         | ConnectorPartitionTransform::Year { column }
@@ -1708,47 +1726,91 @@ fn reject_nanosecond_partition_source(data_type: &Type) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_partition_transform(
+#[derive(Debug)]
+pub(crate) enum PartitionTransformValidationFailure {
+    InvalidType(String),
+    Capability(String),
+}
+impl PartitionTransformValidationFailure {
+    pub(crate) fn into_connector_error(self) -> ConnectorError {
+        let kind = match &self {
+            Self::InvalidType(_) => ConnectorErrorKind::InvalidRequest,
+            Self::Capability(_) => ConnectorErrorKind::Unsupported,
+        };
+        ConnectorError::from_domain(kind, self)
+    }
+}
+impl std::fmt::Display for PartitionTransformValidationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidType(detail) | Self::Capability(detail) => f.write_str(detail),
+        }
+    }
+}
+impl std::error::Error for PartitionTransformValidationFailure {}
+impl novarocks_failure_contract::FailureProjection for PartitionTransformValidationFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::FailureProjection;
+        match self {
+            Self::InvalidType(_) => ConnectorErrorKind::InvalidRequest.failure_fact(),
+            Self::Capability(_) => ConnectorErrorKind::Unsupported.failure_fact(),
+        }
+    }
+}
+
+pub(crate) fn validate_partition_transform(
     schema: &Schema,
     source_id: i32,
     field: &ConnectorPartitionTransform,
-) -> Result<(), String> {
-    let source = schema
-        .field_by_id(source_id)
-        .ok_or_else(|| format!("partition source field ID {source_id} is missing"))?;
+) -> Result<(), PartitionTransformValidationFailure> {
+    let source = schema.field_by_id(source_id).ok_or_else(|| {
+        PartitionTransformValidationFailure::InvalidType(format!(
+            "partition source field ID {source_id} is missing"
+        ))
+    })?;
     let data_type = source.field_type.as_ref();
     if matches!(data_type, Type::Variant(_)) {
-        return Err("variant columns cannot appear in the partition spec".to_string());
+        return Err(PartitionTransformValidationFailure::Capability(
+            "variant columns cannot appear in the partition spec".to_string(),
+        ));
     }
     match field {
         ConnectorPartitionTransform::Year { .. }
         | ConnectorPartitionTransform::Month { .. }
         | ConnectorPartitionTransform::Day { .. } => {
-            reject_nanosecond_partition_source(data_type)?;
+            reject_nanosecond_partition_source(data_type)
+                .map_err(PartitionTransformValidationFailure::Capability)?;
             if !matches!(
                 data_type,
                 Type::Primitive(
                     PrimitiveType::Date | PrimitiveType::Timestamp | PrimitiveType::Timestamptz
                 )
             ) {
-                return Err(
+                return Err(PartitionTransformValidationFailure::InvalidType(
                     "temporal partition transform requires date/timestamp source".to_string(),
-                );
+                ));
             }
         }
         ConnectorPartitionTransform::Hour { .. } => {
-            reject_nanosecond_partition_source(data_type)?;
+            reject_nanosecond_partition_source(data_type)
+                .map_err(PartitionTransformValidationFailure::Capability)?;
             if !matches!(
                 data_type,
                 Type::Primitive(PrimitiveType::Timestamp | PrimitiveType::Timestamptz)
             ) {
-                return Err("hour partition transform requires timestamp source".to_string());
+                return Err(PartitionTransformValidationFailure::InvalidType(
+                    "hour partition transform requires timestamp source".to_string(),
+                ));
             }
         }
         _ => partition_transform(field)
             .result_type(data_type)
             .map(|_| ())
-            .map_err(|error| format!("invalid Iceberg partition transform: {error}"))?,
+            .map_err(|error| {
+                PartitionTransformValidationFailure::InvalidType(format!(
+                    "invalid Iceberg partition transform: {error}"
+                ))
+            })?,
     }
     Ok(())
 }
@@ -12412,5 +12474,232 @@ mod tests {
                 .table_exists_for_request("atomic", "events", &context())
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn typed_partition_binding_retains_native_names_ids_and_exact_sources() {
+        use crate::table_properties::bind_create_table_partitioning as bind;
+        let source = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        41,
+                        "c",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        42,
+                        "s",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::optional(
+                        43,
+                        "c_bucket",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let control = context();
+        let spec = bind(
+            source.clone(),
+            &[
+                Some("bucket(c, 4)".into()),
+                Some("truncate(s, 2)".into()),
+                Some("c_bucket".into()),
+            ],
+            &control,
+        )
+        .unwrap();
+        assert_eq!(spec.spec_id(), 0);
+        assert_eq!(
+            spec.fields()
+                .iter()
+                .map(|field| (
+                    field.source_id,
+                    field.field_id,
+                    field.name.as_str(),
+                    field.transform
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (41, 1000, "c_bucket_4", Transform::Bucket(4)),
+                (42, 1001, "s_truncate_2", Transform::Truncate(2)),
+                (43, 1002, "c_bucket", Transform::Identity),
+            ]
+        );
+        assert!(
+            bind(source.clone(), &[], &control)
+                .unwrap()
+                .fields()
+                .is_empty()
+        );
+        let missing = bind(source, &[Some("\"C\"".into())], &control).unwrap_err();
+        assert_eq!(missing.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(missing.message().contains("`C` does not exist"));
+    }
+
+    #[test]
+    fn typed_partition_binding_preserves_parse_lookup_and_deferred_type_order() {
+        use crate::table_properties::bind_create_table_partitioning as bind;
+        let source = Arc::new(schema());
+        let control = context();
+        let missing = bind(
+            source.clone(),
+            &[Some("missing".into()), Some("not a transform".into())],
+            &control,
+        )
+        .unwrap_err();
+        assert!(missing.message().contains("`missing` does not exist"));
+        let syntax = bind(
+            source.clone(),
+            &[Some("year(id)".into()), Some("not a transform".into())],
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(syntax.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(!syntax.message().contains("requires date/timestamp"));
+        let invalid_type = bind(source.clone(), &[Some("year(id)".into())], &control).unwrap_err();
+        assert_eq!(invalid_type.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            invalid_type.message(),
+            "temporal partition transform requires date/timestamp source"
+        );
+        for fields in [
+            vec![Some("bucket(id, 4)".into()), Some("bucket(id, 8)".into())],
+            vec![Some("year(ts)".into()), Some("month(ts)".into())],
+        ] {
+            assert_eq!(
+                bind(source.clone(), &fields, &control).unwrap_err().kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+        }
+        let nanos = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    7,
+                    "n",
+                    Type::Primitive(PrimitiveType::TimestampNs),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        assert_eq!(
+            bind(nanos, &[Some("day(n)".into())], &control)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        let nested = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    8,
+                    "parent",
+                    Type::Struct(crate::iceberg::spec::StructType::new(vec![Arc::new(
+                        NestedField::optional(9, "child", Type::Primitive(PrimitiveType::Long)),
+                    )])),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        assert_eq!(
+            bind(nested, &[Some("\"parent.child\"".into())], &control)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn legacy_partition_inverse_uses_original_normalization_without_width_loss() {
+        use crate::table_properties::prepare_legacy_create_table_partitioning_property as inverse;
+        use novarocks_spi::connector::{ConnectorPartitionTransform as P, DdlPropertyValue as V};
+        let control = context();
+        let fields = [
+            P::Identity {
+                column: "ID".into(),
+            },
+            P::Year {
+                column: "TS".into(),
+            },
+            P::Month {
+                column: "TS".into(),
+            },
+            P::Day {
+                column: "TS".into(),
+            },
+            P::Hour {
+                column: "TS".into(),
+            },
+            P::Bucket {
+                column: "ID".into(),
+                num_buckets: 4,
+            },
+            P::Truncate {
+                column: "S".into(),
+                width: 2,
+            },
+            P::Void {
+                column: "ID".into(),
+            },
+        ];
+        assert_eq!(
+            inverse(&fields, &control).unwrap(),
+            V::ArrayVarchar(
+                [
+                    "id",
+                    "year(ts)",
+                    "month(ts)",
+                    "day(ts)",
+                    "hour(ts)",
+                    "bucket(id, 4)",
+                    "truncate(s, 2)",
+                    "void(id)"
+                ]
+                .into_iter()
+                .map(|text| Some(text.to_string()))
+                .collect()
+            )
+        );
+        for width in [0, u32::MAX] {
+            for field in [
+                P::Bucket {
+                    column: "id".into(),
+                    num_buckets: width,
+                },
+                P::Truncate {
+                    column: "s".into(),
+                    width,
+                },
+            ] {
+                assert_eq!(
+                    inverse(&[field], &control).unwrap_err().kind(),
+                    ConnectorErrorKind::Unsupported
+                );
+            }
+        }
+        assert_eq!(inverse(&[], &control).unwrap(), V::ArrayVarchar(vec![]));
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let stopped = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            stop.view(),
+            1024,
+            4096,
+        )
+        .unwrap();
+        stop.request_stop();
+        let expected = stopped.check_active().unwrap_err();
+        let actual = inverse(&fields, &stopped).unwrap_err();
+        assert_eq!(actual.kind(), expected.kind());
+        assert_eq!(actual.message(), expected.message());
+        let actual = crate::table_properties::bind_create_table_partitioning(
+            Arc::new(schema()),
+            &[],
+            &stopped,
+        )
+        .unwrap_err();
+        assert_eq!(actual.kind(), expected.kind());
+        assert_eq!(actual.message(), expected.message());
     }
 }

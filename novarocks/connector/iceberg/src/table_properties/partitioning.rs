@@ -44,13 +44,24 @@ pub fn parse_table_partitioning_property(
     let mut result = Vec::with_capacity(fields.len());
     for (index, field) in fields.iter().enumerate() {
         control.check_active()?;
-        let field = field
-            .as_deref()
-            .ok_or_else(|| invalid(&format!("partition field at index {index} cannot be NULL")))?;
-        result.push(parse_table_partitioning_element(field, control)?);
+        result.push(parse_optional_partitioning_element(
+            field.as_deref(),
+            index,
+            control,
+        )?);
     }
     control.check_active()?;
     Ok(result)
+}
+
+pub(super) fn parse_optional_partitioning_element(
+    field: Option<&str>,
+    index: usize,
+    control: &dyn ConnectorOperationControl,
+) -> Result<ConnectorPartitionTransform, ConnectorError> {
+    let field = field
+        .ok_or_else(|| invalid(&format!("partition field at index {index} cannot be NULL")))?;
+    parse_table_partitioning_element(field, control)
 }
 
 /// Parse one partition-field declaration, without binding it to a schema.

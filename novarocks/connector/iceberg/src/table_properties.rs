@@ -23,7 +23,8 @@
 mod legacy;
 pub use legacy::{
     LegacyPreparedTableProperty, LegacyPreparedTablePropertyValue,
-    LegacyTablePropertyPreparationFailure, prepare_legacy_create_table_property_inputs,
+    LegacyTablePropertyPreparationFailure, prepare_legacy_create_table_partitioning_property,
+    prepare_legacy_create_table_property_inputs,
 };
 
 mod create;
@@ -32,6 +33,9 @@ pub(crate) use create::{PreparedCreateTableProperties, prepare_create_table_prop
 mod projection;
 pub use projection::project_partial_raw_table_property;
 pub(crate) use projection::project_raw_table_property_set;
+
+mod partitioning_binding;
+pub(crate) use partitioning_binding::bind_create_table_partitioning;
 
 mod partitioning;
 pub use partitioning::{parse_table_partitioning_element, parse_table_partitioning_property};

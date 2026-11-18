@@ -123,6 +123,7 @@ mod set_action;
 mod statement_action;
 pub(crate) mod statement_computation;
 pub(crate) mod statement_publication;
+mod table_mutation_action;
 pub(crate) mod write_action;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
