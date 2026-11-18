@@ -154,6 +154,7 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
     .unwrap();
     let units = vec![crate::test_support::read_unit(
         &input_layout,
+        &[FunctionValueType::new(DataType::Int64, false)],
         &[(
             novarocks_expression_contract::ValueId::new(2),
             FunctionValueType::new(DataType::Int64, false),
@@ -223,6 +224,7 @@ fn program_summary_table_rejects_duplicate_kinds_and_all_current_node_authors() 
             graph.root(),
             &[crate::test_support::read_unit(
                 graph.nodes()[0].output_layout(),
+                &[FunctionValueType::new(DataType::Int64, false)],
                 &[(
                     novarocks_expression_contract::ValueId::new(2),
                     FunctionValueType::new(DataType::Int64, false),

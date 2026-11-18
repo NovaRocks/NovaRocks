@@ -116,6 +116,7 @@ pub(crate) fn int32_typed(value: i32, ty: FunctionValueType) -> ConstantValue {
 /// complete value facts; no function claim or runtime binding is synthesized.
 pub(crate) fn read_unit(
     layout: &crate::StaticLayout,
+    ordinal_types: &[FunctionValueType],
     values: &[(novarocks_expression_contract::ValueId, FunctionValueType)],
     roots: &[(usize, novarocks_type_contract::EvaluationDemand)],
 ) -> Arc<novarocks_expression::CompiledExprSet> {
@@ -148,6 +149,7 @@ pub(crate) fn read_unit(
         .unwrap();
     let scope = ScopeLayout::try_new(
         layout.schema().clone(),
+        Arc::from(ordinal_types),
         values
             .iter()
             .enumerate()
@@ -317,7 +319,7 @@ pub(crate) fn argument_unit(
         .enumerate()
         .map(|(ordinal, _)| (ordinal, novarocks_type_contract::EvaluationDemand::Value))
         .collect();
-    read_unit(&layout, &values, &roots)
+    read_unit(&layout, types, &values, &roots)
 }
 
 /// A real invocation-only owner keeps a large reachable static subtree inert.
@@ -566,6 +568,7 @@ pub(crate) fn large_static_unit(count: usize) -> Arc<novarocks_expression::Compi
         Arc::new(arrow_schema::Schema::new(vec![
             source_type.try_to_field("source").unwrap(),
         ])),
+        Arc::from([source_type.clone()]),
         Arc::from([ScopeColumn {
             value: ValueId::new(1),
             ordinal: 0,

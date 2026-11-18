@@ -538,6 +538,22 @@ pub(crate) fn scope_layout<H>(
         )
         .into());
     }
+    let mut ordinal_types = Vec::new();
+    crate::creation::reserve_vec(&mut ordinal_types, values.len(), Some(creation), work)?;
+    for ordinal in 0..values.len() {
+        work.step()?;
+        let binding =
+            layout
+                .value_binding_at(ordinal)
+                .ok_or(crate::FragmentCompileError::Invalid(
+                    "expression runtime input lacks its complete value binding",
+                ))?;
+        ordinal_types.push(
+            novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+                binding.clone_observed(|| work.step())?,
+            )?,
+        );
+    }
     let mut columns = Vec::new();
     crate::creation::reserve_vec(&mut columns, declarations.len(), Some(creation), work)?;
     let mut index = BTreeMap::new();
@@ -559,16 +575,8 @@ pub(crate) fn scope_layout<H>(
             .ok_or(crate::FragmentCompileError::Invalid(
                 "declared expression input is absent from runtime layout",
             ))?;
-        let binding =
-            layout
-                .value_binding_at(ordinal)
-                .ok_or(crate::FragmentCompileError::Invalid(
-                    "expression runtime input lacks its complete value binding",
-                ))?;
-        let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
-            binding.clone_observed(|| work.step())?,
-        )?;
-        if !ty.exactly_equals_observed::<crate::FragmentCreationError<H>>(&actual, || {
+        let actual = &ordinal_types[ordinal];
+        if !ty.exactly_equals_observed::<crate::FragmentCreationError<H>>(actual, || {
             work.step().map_err(Into::into)
         })? {
             return Err(crate::FragmentCompileError::Invalid(
@@ -579,15 +587,19 @@ pub(crate) fn scope_layout<H>(
         columns.push(ScopeColumn {
             value: *value,
             ordinal: u32::try_from(ordinal).map_err(|_| CompileControlError::ResourceExhausted)?,
-            ty: actual,
+            ty: actual.clone_observed(|| work.step())?,
         });
     }
     work.flush()?;
     creation.request_layout(novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::array::<ScopeColumn>(columns.len()).map_err(|_|novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)?)?).map_err(crate::FragmentCreationError::Creator)?;
     let columns = Arc::from(columns);
+    work.flush()?;
+    creation.request_layout(novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::array::<novarocks_type_contract::FunctionValueType>(ordinal_types.len()).map_err(|_|novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)?)?).map_err(crate::FragmentCreationError::Creator)?;
+    let ordinal_types = Arc::from(ordinal_types);
     let scope = match temporary.as_mut() {
         Some(temporary) => ScopeLayout::try_new_with_creator_in(
             Arc::clone(layout.schema()),
+            ordinal_types,
             columns,
             creation.storage_lifetime(),
             *temporary,
@@ -596,6 +608,7 @@ pub(crate) fn scope_layout<H>(
         .map_err(ExpressionCreationFailure::from)?,
         None => ScopeLayout::try_new(
             Arc::clone(layout.schema()),
+            ordinal_types,
             columns,
             creation.storage_lifetime(),
             work,

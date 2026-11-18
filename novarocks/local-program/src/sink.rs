@@ -668,6 +668,10 @@ mod tests {
         .unwrap();
         vec![crate::test_support::read_unit(
             &layout,
+            &[novarocks_functions::FunctionValueType::new(
+                DataType::Int64,
+                false,
+            )],
             &[(
                 novarocks_expression_contract::ValueId::new(1),
                 novarocks_functions::FunctionValueType::new(DataType::Int64, false),

@@ -1080,6 +1080,7 @@ fn final_owner_rechecks_actual_unit_input_scope_against_its_real_project_input()
     let ty = FunctionValueType::new(DataType::Int64, false);
     let current = crate::test_support::read_unit(
         &narrow,
+        std::slice::from_ref(&ty),
         &[(ValueId::new(30), ty.clone())],
         &[(0, EvaluationDemand::Value)],
     );
@@ -1165,6 +1166,7 @@ fn final_owner_rechecks_actual_unit_input_scope_against_its_real_project_input()
     .unwrap();
     let foreign = crate::test_support::read_unit(
         &wide,
+        &[ty.clone(), ty.clone(), ty.clone()],
         &[
             (ValueId::new(10), ty.clone()),
             (ValueId::new(20), ty.clone()),
@@ -1253,6 +1255,7 @@ fn final_owner_checks_unmapped_runtime_fields_with_a_canonical_value_subset() {
     let valid_scope = scope_layout(DataType::Int64);
     let current = crate::test_support::read_unit(
         &valid_scope,
+        &[ty.clone(), ty.clone()],
         &[(ValueId::new(10), ty.clone())],
         &[(0, EvaluationDemand::Value)],
     );
@@ -1325,6 +1328,7 @@ fn final_owner_checks_unmapped_runtime_fields_with_a_canonical_value_subset() {
     let foreign_scope = scope_layout(DataType::Boolean);
     let foreign = crate::test_support::read_unit(
         &foreign_scope,
+        &[ty.clone(), FunctionValueType::new(DataType::Boolean, false)],
         &[(ValueId::new(10), ty.clone())],
         &[(0, EvaluationDemand::Value)],
     );
@@ -1358,6 +1362,137 @@ fn final_owner_checks_unmapped_runtime_fields_with_a_canonical_value_subset() {
         graph.sink().cloned(),
     ) {
         Ok(_) => panic!("Graph must also check the complete actual runtime schema"),
+        Err(error) => error,
+    };
+    assert_eq!(graph_error, LocalProgramError::InvalidExpression);
+
+    // Retain the carrier-mismatch case above. This second actual input has an
+    // unmapped UTF8 column, so JSON differs only in its complete nominal facts.
+    let utf8 = FunctionValueType::new(DataType::Utf8, false);
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::Utf8,
+        false,
+        novarocks_type_contract::ValueLogicalType::Json,
+    )
+    .unwrap();
+    assert_eq!(utf8.data_type(), json.data_type());
+    assert_eq!(utf8.nullable(), json.nullable());
+    assert_ne!(utf8, json);
+    let nominal_schema = Arc::new(Schema::new(vec![
+        Field::new("physical_first", DataType::Int64, false),
+        Field::new("physical_unmapped", DataType::Utf8, false),
+    ]));
+    let nominal_input = StaticLayout::try_new_typed_for_compile(
+        nominal_schema.clone(),
+        Arc::from([SlotId::new(10), SlotId::new(20)]),
+        vec![
+            (ty.typed_binding().clone(), None),
+            (utf8.typed_binding().clone(), None),
+        ],
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        |_| Ok(()),
+        &Control::default(),
+    )
+    .unwrap();
+    let nominal_values = StaticValues::try_new(
+        RecordBatch::try_new(
+            nominal_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![7])),
+                Arc::new(arrow_array::StringArray::from(vec!["{}"])),
+            ],
+        )
+        .unwrap(),
+        nominal_input.clone(),
+    )
+    .unwrap();
+    let nominal_scope = scope_layout(DataType::Utf8);
+    let plain_unit = crate::test_support::read_unit(
+        &nominal_scope,
+        &[ty.clone(), utf8.clone()],
+        &[(ValueId::new(10), ty.clone())],
+        &[(0, EvaluationDemand::Value)],
+    );
+    let nominal_graph = LocalProgramGraph::try_new_with_sink(
+        vec![
+            ProgramNode::new_local(
+                ProgramNodeId::new(0),
+                vec![DiagnosticSourceNodeId::new(u32::MAX)],
+                ProgramNodeKind::Values {
+                    values: nominal_values,
+                },
+                nominal_input,
+            ),
+            graph.nodes()[1].clone(),
+        ],
+        graph.root(),
+        std::slice::from_ref(&plain_unit),
+        graph.profile(),
+        graph.requirements().clone(),
+        graph.sink().cloned(),
+    )
+    .unwrap();
+    let nominal_fixture = || Fixture {
+        graph: nominal_graph.clone(),
+        units: vec![plain_unit.clone()],
+        calls: vec![],
+        channels: [(0, 0, ty.clone()), (0, 1, utf8.clone()), (1, 0, ty.clone())]
+            .into_iter()
+            .map(|(node, ordinal, ty)| {
+                (
+                    ProgramChannelSite::Layout {
+                        node: ProgramNodeId::new(node),
+                        role: ProgramChannelLayoutRole::NodeOutput,
+                        ordinal,
+                    },
+                    ty,
+                )
+            })
+            .collect(),
+    };
+    finish(
+        nominal_fixture(),
+        operators(true, u32::MAX),
+        &allowed(),
+        CompiledProgramFacts::default(),
+        &Control::default(),
+    )
+    .expect("the actual UTF8 ordinal is valid with its original complete type");
+    let foreign_nominal = crate::test_support::read_unit(
+        &nominal_scope,
+        &[ty.clone(), json.clone()],
+        &[(ValueId::new(10), ty.clone())],
+        &[(0, EvaluationDemand::Value)],
+    );
+    let scope = &foreign_nominal.scopes()[0];
+    assert_eq!(scope.schema(), plain_unit.scopes()[0].schema());
+    assert_eq!(scope.columns().len(), 1);
+    assert_eq!(scope.columns()[0].ordinal, 0);
+    assert_eq!(scope.columns()[0].ty, ty);
+    assert_eq!(scope.ordinal_type(1), Some(&json));
+    assert_eq!(plain_unit.scopes()[0].ordinal_type(1), Some(&utf8));
+    let mut actual = nominal_fixture();
+    actual.units = vec![foreign_nominal.clone()];
+    let error = match finish(
+        actual,
+        operators(true, u32::MAX),
+        &allowed(),
+        CompiledProgramFacts::default(),
+        &Control::default(),
+    ) {
+        Ok(_) => panic!("unmapped ordinal must retain its original complete nominal type"),
+        Err(error) => error,
+    };
+    assert_eq!(error, LocalProgramCompileError::InvalidExpression);
+    let graph_error = match LocalProgramGraph::try_new_with_sink(
+        nominal_graph.nodes().to_vec(),
+        nominal_graph.root(),
+        std::slice::from_ref(&foreign_nominal),
+        nominal_graph.profile(),
+        nominal_graph.requirements().clone(),
+        nominal_graph.sink().cloned(),
+    ) {
+        Ok(_) => panic!("Graph must reject an unmapped ordinal's different nominal type"),
         Err(error) => error,
     };
     assert_eq!(graph_error, LocalProgramError::InvalidExpression);

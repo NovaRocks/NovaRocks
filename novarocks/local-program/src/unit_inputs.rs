@@ -120,7 +120,7 @@ where
             return Err((self.invalid)());
         };
         // The canonical value map can omit repeated physical publications.
-        // Check every runtime carrier before the mapped complete value facts.
+        // Check every runtime carrier and its original complete value facts.
         // Top-level labels and annotations are not expression input identity.
         for (expected, actual) in scope.schema().fields().iter().zip(layout.schema().fields()) {
             (self.observe)()?;
@@ -140,21 +140,16 @@ where
                 return Err((self.invalid)());
             }
         }
-        for column in scope.columns() {
+        for (ordinal, expected) in scope.ordinal_types().iter().enumerate() {
             (self.observe)()?;
-            let binding = layout
-                .value_binding_at(column.ordinal as usize)
-                .ok_or_else(&self.invalid)?;
+            let binding = layout.value_binding_at(ordinal).ok_or_else(&self.invalid)?;
             // These are the actual complete runtime bindings, including nominal
             // children. Arrow carrier metadata is not a source of such facts.
             let actual = FunctionValueType::try_from_typed_binding(
                 binding.clone_observed(&mut self.observe)?,
             )
             .map_err(|_| (self.invalid)())?;
-            if !column
-                .ty
-                .exactly_equals_checked_observed(&actual, &mut self.observe)?
-            {
+            if !expected.exactly_equals_checked_observed(&actual, &mut self.observe)? {
                 return Err((self.invalid)());
             }
         }

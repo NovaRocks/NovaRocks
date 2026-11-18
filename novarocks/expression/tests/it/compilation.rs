@@ -125,6 +125,7 @@ fn layouts(values: &[(ValueId, ValueType)]) -> ScopeLayout {
     ));
     ScopeLayout::try_new(
         s,
+        values.iter().map(|(_, ty)| ty.clone()).collect(),
         values
             .iter()
             .enumerate()
@@ -358,6 +359,45 @@ fn scope_full_type_width_and_missing_combined_layout_are_rejected() {
         )
         .is_err()
     );
+    let nominal =
+        ValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap();
+    let schema = Arc::new(Schema::new(vec![nominal.try_to_field("nominal").unwrap()]));
+    let canonical: Arc<[ScopeColumn]> = Arc::from([ScopeColumn {
+        value: values[0].0,
+        ordinal: 0,
+        ty: nominal.clone(),
+    }]);
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+    assert!(matches!(
+        ScopeLayout::try_new(
+            schema.clone(),
+            Arc::from([]),
+            canonical,
+            ValueTypeStorageLifetime::pure(),
+            &mut work,
+        ),
+        Err(ExprCompileError::Invalid(
+            "scope schema and complete columns differ"
+        ))
+    ));
+    assert!(matches!(
+        ScopeLayout::try_new(
+            schema,
+            Arc::from([nominal]),
+            Arc::from([ScopeColumn {
+                value: values[0].0,
+                ordinal: 0,
+                ty: ValueType::new(DataType::Utf8, true),
+            }]),
+            ValueTypeStorageLifetime::pure(),
+            &mut work,
+        ),
+        Err(ExprCompileError::Invalid(
+            "scope field differs from its complete input declaration"
+        ))
+    ));
+    work.finish().unwrap();
 }
 #[test]
 fn lambda_is_an_explicit_unsupported_compiler_shape() {
@@ -2241,14 +2281,18 @@ fn late_scope_clone_shares_source_columns_and_retains_only_their_original_owner(
         ty: int(false),
     }]);
     let source_pointer = columns.as_ptr();
+    let nominal =
+        ValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap();
+    let ordinal_types: Arc<[ValueType]> = Arc::from([int(false), nominal.clone()]);
+    let ordinal_pointer = ordinal_types.as_ptr();
     let c = Control::good();
     let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
     let scope = ScopeLayout::try_new(
-        Arc::new(Schema::new(vec![Field::new(
-            "source",
-            DataType::Int64,
-            false,
-        )])),
+        Arc::new(Schema::new(vec![
+            Field::new("source", DataType::Int64, false),
+            nominal.try_to_field("unmapped_nominal").unwrap(),
+        ])),
+        ordinal_types,
         columns,
         ValueTypeStorageLifetime::held(hold.clone()),
         &mut work,
@@ -2279,6 +2323,21 @@ fn late_scope_clone_shares_source_columns_and_retains_only_their_original_owner(
     .unwrap();
     let late = p.scope(RootScope::Port(0)).unwrap().clone();
     assert_eq!(late.columns().as_ptr(), source_pointer);
+    assert_eq!(late.ordinal_types().as_ptr(), ordinal_pointer);
+    assert_eq!(late.ordinal_types().len(), 2);
+    assert_eq!(late.ordinal_type(1), Some(&nominal));
+    assert_eq!(late.columns().len(), 1);
+    assert!(Arc::ptr_eq(late.schema(), scope.schema()));
+    {
+        let storage = late.storage_lifetime();
+        assert!(!storage.is_pure());
+        storage
+            .retaining_observed::<novarocks_type_contract::owned_resources::layout::LayoutResourceError>(
+                &scope.storage_lifetime(),
+                |_| panic!("scope clone must retain the same original storage"),
+            )
+            .unwrap();
+    }
     drop(p);
     drop(scope);
     drop(hold);
@@ -2368,6 +2427,7 @@ fn scope_layout_creator_funds_only_actual_temporary_duplicate_checks() {
         let mut work = CompileCheckpoints::try_new(control.as_ref(), CompilePhase::Decode).unwrap();
         let result = ScopeLayout::try_new_with_creator_in(
             schema.clone(),
+            columns.iter().map(|column| column.ty.clone()).collect(),
             columns.clone(),
             ValueTypeStorageLifetime::held(source_hold.clone()),
             &mut temporary,
@@ -2448,6 +2508,7 @@ fn scope_layout_creator_keeps_original_phase_and_every_first_control_cause() {
         let mut work = CompileCheckpoints::try_new(control.as_ref(), CompilePhase::Decode)?;
         let result = ScopeLayout::try_new_with_creator_in(
             schema.clone(),
+            columns.iter().map(|column| column.ty.clone()).collect(),
             columns.clone(),
             ValueTypeStorageLifetime::pure(),
             &mut temporary,
@@ -2536,6 +2597,7 @@ fn runtime_columns_keep_canonical_value_reads_after_repeated_publications() {
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
         let layout = ScopeLayout::try_new(
             schema.clone(),
+            actual.iter().map(|(_, ty)| ty.clone()).collect(),
             columns,
             ValueTypeStorageLifetime::pure(),
             &mut work,
@@ -2568,6 +2630,7 @@ fn runtime_columns_keep_canonical_value_reads_after_repeated_publications() {
     assert!(matches!(
         ScopeLayout::try_new(
             combined.schema().clone(),
+            combined.ordinal_types().to_vec().into(),
             wrong.into(),
             ValueTypeStorageLifetime::pure(),
             &mut work

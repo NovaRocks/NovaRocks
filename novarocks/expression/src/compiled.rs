@@ -420,6 +420,7 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         None if unit.ports().is_empty() => Some(ScopeLayout::try_new(
             Arc::new(arrow::datatypes::Schema::empty()),
             Arc::from([]),
+            Arc::from([]),
             storage.clone(),
             work,
         )?),
@@ -481,12 +482,17 @@ fn charge_structure<H>(
         }
     }
     if unit.ports().is_empty() && scopes.all_ports.is_none() {
-        out.request::<ProgramPrimitiveError>(
+        for layout in [
             arc_layout(Layout::new::<arrow::datatypes::Schema>())
                 .map_err(ExprCompileFailure::Resource)?,
-            work,
-        )
-        .map_err(publication)?;
+            arc_layout(Layout::new::<[crate::ScopeColumn; 0]>())
+                .map_err(ExprCompileFailure::Resource)?,
+            arc_layout(Layout::new::<[novarocks_type_contract::FunctionValueType; 0]>())
+                .map_err(ExprCompileFailure::Resource)?,
+        ] {
+            out.request::<ProgramPrimitiveError>(layout, work)
+                .map_err(publication)?;
+        }
     }
     macro_rules! map {
         ($key:ty,$value:ty,$count:expr) => {{

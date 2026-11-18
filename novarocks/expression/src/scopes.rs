@@ -35,6 +35,7 @@ pub struct ScopeColumn {
 #[derive(Clone, Debug)]
 pub struct ScopeLayout {
     schema: SchemaRef,
+    ordinal_types: Arc<[FunctionValueType]>,
     columns: Arc<[ScopeColumn]>,
     storage: ValueTypeStorageLifetime,
 }
@@ -44,12 +45,14 @@ impl ScopeLayout {
     /// channel author supplies the proven representative's actual ordinal.
     pub fn try_new(
         schema: SchemaRef,
+        ordinal_types: Arc<[FunctionValueType]>,
         columns: Arc<[ScopeColumn]>,
         storage: ValueTypeStorageLifetime,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, ExprCompileError> {
         Self::try_new_core(
             schema,
+            ordinal_types,
             columns,
             storage,
             ProgramCreation::<std::convert::Infallible> { creator: None },
@@ -64,6 +67,7 @@ impl ScopeLayout {
     /// This entry creates no factory, retention grant, phase or footer.
     pub fn try_new_with_creator_in<H>(
         schema: SchemaRef,
+        ordinal_types: Arc<[FunctionValueType]>,
         columns: Arc<[ScopeColumn]>,
         storage: ValueTypeStorageLifetime,
         temporary: &mut dyn ValueSchemaCreationScope<H>,
@@ -71,6 +75,7 @@ impl ScopeLayout {
     ) -> Result<Self, ExprCompileFailure<H>> {
         Self::try_new_core(
             schema,
+            ordinal_types,
             columns,
             storage,
             ProgramCreation {
@@ -82,24 +87,43 @@ impl ScopeLayout {
 
     fn try_new_core<H>(
         schema: SchemaRef,
+        ordinal_types: Arc<[FunctionValueType]>,
         columns: Arc<[ScopeColumn]>,
         storage: ValueTypeStorageLifetime,
         mut creation: ProgramCreation<'_, H>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, ExprCompileFailure<H>> {
-        if columns.len() > schema.fields().len()
+        if ordinal_types.len() != schema.fields().len()
+            || columns.len() > schema.fields().len()
             || (columns.is_empty() && !schema.fields().is_empty())
         {
             return Err(
                 ExprCompileError::Invalid("scope schema and complete columns differ").into(),
             );
         }
+        for (field, ty) in schema.fields().iter().zip(ordinal_types.iter()) {
+            work.step()?;
+            if field.is_nullable() != ty.nullable()
+                || !novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<
+                    ExprCompileError,
+                >(
+                    field.data_type(),
+                    ty.data_type(),
+                    novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
+                    || work.step().map_err(Into::into),
+                )?
+            {
+                return Err(ExprCompileError::Invalid(
+                    "scope runtime field differs from its complete input declaration",
+                )
+                .into());
+            }
+        }
         let mut values = std::collections::BTreeSet::new();
         for column in columns.iter() {
             work.step()?;
-            let field =
-                schema
-                    .fields()
+            let actual =
+                ordinal_types
                     .get(column.ordinal as usize)
                     .ok_or(ExprCompileError::Invalid(
                         "scope input ordinal is outside its runtime schema",
@@ -108,15 +132,9 @@ impl ScopeLayout {
                 .before_tree_insert::<ExprCompileError, ValueId, ()>(values.len(), work)
                 .map_err(scope_creation_failure)?;
             if !values.insert(column.value)
-                || field.is_nullable() != column.ty.nullable()
-                || !novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<
-                    ExprCompileError,
-                >(
-                    field.data_type(),
-                    column.ty.data_type(),
-                    novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
-                    || work.step().map_err(Into::into),
-                )?
+                || !actual.exactly_equals_observed::<ExprCompileError>(&column.ty, || {
+                    work.step().map_err(Into::into)
+                })?
             {
                 return Err(ExprCompileError::Invalid(
                     "scope field differs from its complete input declaration",
@@ -126,6 +144,7 @@ impl ScopeLayout {
         }
         Ok(Self {
             schema,
+            ordinal_types,
             columns,
             storage,
         })
@@ -135,6 +154,14 @@ impl ScopeLayout {
     }
     pub fn columns(&self) -> &[ScopeColumn] {
         &self.columns
+    }
+    /// Complete types at actual runtime ordinals, including repeated values
+    /// omitted from the canonical value map. Supplied by the original owner.
+    pub fn ordinal_types(&self) -> &[FunctionValueType] {
+        &self.ordinal_types
+    }
+    pub fn ordinal_type(&self, ordinal: usize) -> Option<&FunctionValueType> {
+        self.ordinal_types.get(ordinal)
     }
     pub fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
         self.storage.clone()

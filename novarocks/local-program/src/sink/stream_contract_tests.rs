@@ -48,7 +48,13 @@ fn stream(key_type: DataType, conditional: bool) -> Result<StaticSinkProgram, St
         (1..=values.len()).map(|i| SlotId::new(i as u32)).collect(),
     )
     .unwrap();
-    let units = vec![crate::test_support::read_unit(&layout, &values, &roots)];
+    let ordinal_types: Vec<_> = values.iter().map(|(_, ty)| ty.clone()).collect();
+    let units = vec![crate::test_support::read_unit(
+        &layout,
+        &ordinal_types,
+        &values,
+        &roots,
+    )];
     let branch = StaticStreamBranch::try_new(
         1,
         DataStreamPartitionType::HashPartitioned,
