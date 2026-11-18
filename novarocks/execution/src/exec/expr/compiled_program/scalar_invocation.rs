@@ -233,7 +233,7 @@ impl FrameFailure for crate::runtime::task::ExecutionFailure {
         selection: Selection<'_>,
         error: novarocks_functions::RowDataError,
     ) -> Self {
-        match crate::runtime::task::RequiredExpressionRowError::try_new(root, selection, error) {
+        match novarocks_expression::RequiredExpressionRowError::try_new(root, selection, error) {
             Ok(error) => error.into(),
             Err(cause) => cause.into(),
         }

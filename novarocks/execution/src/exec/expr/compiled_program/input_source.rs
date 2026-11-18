@@ -20,26 +20,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSourceAuthorityRef};
 
-/// Data-only column coordinates and their actual metadata creator. The caller
-/// funds the vector and shared header before publishing this original map.
-pub(crate) struct InputColumnProjection {
-    ordinals: Vec<usize>,
-    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
-}
-impl InputColumnProjection {
-    pub(crate) fn from_owned(
-        ordinals: Vec<usize>,
-        storage: novarocks_type_contract::ValueTypeStorageLifetime,
-    ) -> Self {
-        Self {
-            ordinals,
-            _storage: storage,
-        }
-    }
-    pub(crate) fn ordinals(&self) -> &[usize] {
-        &self.ordinals
-    }
-}
+use novarocks_expression::InputColumnProjection;
 
 /// One synchronous input. The Chunk variant structurally pairs its own batch
 /// and attached owners, without cloning either or accepting another batch.

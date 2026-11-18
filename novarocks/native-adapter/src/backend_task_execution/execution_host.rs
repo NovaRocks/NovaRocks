@@ -5813,8 +5813,8 @@ pub(crate) mod tests {
     fn typed_failure_native_preparation_preserves_required_row_address_in_final_detail() {
         use novarocks_execution::runtime::task::{
             LocalTaskLaunchError, LocalTaskLaunchErrorKind, LocalTaskLaunchStage,
-            RequiredExpressionRowError,
         };
+        use novarocks_expression::RequiredExpressionRowError;
         use novarocks_expression_contract::RootOrdinal;
         use novarocks_functions::{RowDataError, Selection};
         let required = RequiredExpressionRowError::try_new(
@@ -5947,10 +5947,10 @@ pub(crate) mod tests {
 
     #[test]
     fn typed_failure_native_required_root_reports_original_selected_and_batch_row() {
-        use novarocks_execution::runtime::task::RequiredExpressionRowError;
         use novarocks_execution_contract::task_execution::status::{
             TaskFailurePhase, TerminationDetail,
         };
+        use novarocks_expression::RequiredExpressionRowError;
         use novarocks_expression_contract::RootOrdinal;
         use novarocks_functions::{RowDataError, Selection};
         let selection = Selection::try_sparse(101, &[0, 50, 100]).unwrap();

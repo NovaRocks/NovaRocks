@@ -24,7 +24,8 @@ use arrow::{
     record_batch::{RecordBatch, RecordBatchOptions},
 };
 use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
-use novarocks_execution::runtime::task::{ExecutionFailure, RequiredExpressionRowError};
+use novarocks_execution::runtime::task::ExecutionFailure;
+use novarocks_expression::RequiredExpressionRowError;
 use novarocks_expression::{
     EvaluationEnvironment, ExprCompileFailure, ExprCreation, ScopeLayouts, compile_expr_set,
 };

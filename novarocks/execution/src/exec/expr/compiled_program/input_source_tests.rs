@@ -151,7 +151,7 @@ fn checked_slot_pairs_exact_column_and_original_chunk_authority() {
 
 #[test]
 fn projected_input_maps_original_slots_through_actual_sparse_domains() {
-    use super::input_source::InputColumnProjection;
+    use novarocks_expression::InputColumnProjection;
     use novarocks_type_contract::ValueTypeStorageLifetime;
     let program = program(SeedMode::Input, false);
     let full = input_chunk(&program, vec![Some(11), Some(42), None, Some(7)]);
@@ -210,7 +210,7 @@ fn projected_input_maps_original_slots_through_actual_sparse_domains() {
 
 #[test]
 fn projected_input_does_not_promote_equal_arrow_fields_to_a_logical_binding() {
-    use super::input_source::InputColumnProjection;
+    use novarocks_expression::InputColumnProjection;
     use novarocks_type_contract::{FunctionValueType, ValueLogicalType, ValueTypeStorageLifetime};
     use novarocks_types::SlotId;
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![

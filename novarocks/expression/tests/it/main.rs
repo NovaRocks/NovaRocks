@@ -17,4 +17,5 @@
 
 mod compilation;
 mod definitions;
+mod evaluation_failure;
 mod primitive_sources;

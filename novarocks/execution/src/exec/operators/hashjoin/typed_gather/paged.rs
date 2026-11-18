@@ -21,12 +21,13 @@
 use super::*;
 use crate::exec::{
     chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema},
-    expr::compiled_program::{CompiledExpressionInstance, input_source::InputColumnProjection},
+    expr::compiled_program::CompiledExpressionInstance,
     operators::hashjoin::{
         build_pages::{B3RunId, BuildPageAddress, BuildPageProjection, BuildRowId, BuildRows},
         join_completion::{funded_shared, funded_vec},
     },
 };
+use novarocks_expression::InputColumnProjection;
 use novarocks_functions::{KernelEvaluationControl, selected_copy};
 use novarocks_type_contract::ValueSchemaCreation;
 

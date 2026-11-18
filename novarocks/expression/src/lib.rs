@@ -38,3 +38,13 @@ mod failure;
 use compiled::CompiledParts;
 
 pub(crate) use creation::ProgramCreationFailure;
+
+pub mod evaluator;
+pub use evaluator::{
+    EvaluationInput, ExprEvaluationFailure, InputColumnProjection, InputSourceStorage,
+    InputStorageFailure, RequiredExpressionRowError, ScalarCallFailure, ScalarCallHost,
+    ScalarCallPhase, ScalarCallRequestFacts,
+};
+
+#[cfg(any(test, novarocks_dev_controls))]
+pub mod testkit;

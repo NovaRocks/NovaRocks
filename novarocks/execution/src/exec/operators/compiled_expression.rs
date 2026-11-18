@@ -50,7 +50,8 @@ use crate::exec::pipeline::{
     step::{NextStep, StepResult},
 };
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
-use crate::runtime::task::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::{InputColumnProjection, RequiredExpressionRowError};
 
 #[cfg(test)]
 pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
@@ -275,7 +276,7 @@ pub(crate) fn evaluate_projected_chunk_all(
     site: ProgramRootRef,
     input: &Chunk,
     declared: &ChunkSchema,
-    projection: &Arc<crate::exec::expr::compiled_program::input_source::InputColumnProjection>,
+    projection: &Arc<InputColumnProjection>,
     control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     let loan = CompiledInputLoan::from_projected_chunk(input, declared, projection, control)?;
@@ -302,7 +303,7 @@ pub(crate) fn evaluate_projected_chunk_rows(
     site: ProgramRootRef,
     input: &Chunk,
     declared: &ChunkSchema,
-    projection: &Arc<crate::exec::expr::compiled_program::input_source::InputColumnProjection>,
+    projection: &Arc<InputColumnProjection>,
     rows: &[usize],
     control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {

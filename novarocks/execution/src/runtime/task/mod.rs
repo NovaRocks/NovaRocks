@@ -32,7 +32,7 @@ pub use domain_failure::SharedDomainFailure;
 
 pub use execution_failure::{
     ExecutionFailure, ExecutionFailureCause, ExecutionFailureReporter, ExecutionResult,
-    OperatorFailureSite, PipelineOperation, RequiredExpressionRowError,
+    OperatorFailureSite, PipelineOperation,
 };
 
 mod execution_reason;

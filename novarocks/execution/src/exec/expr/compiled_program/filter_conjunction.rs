@@ -19,7 +19,8 @@
 use super::boolean_region::BooleanRows;
 use super::input_source::CompiledInputLoan;
 use super::*;
-use crate::runtime::task::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::RequiredExpressionRowError;
 use novarocks_type_contract::EvaluationDemand;
 
 pub(crate) struct CompiledFilterConjunctionInstance {

@@ -1280,10 +1280,9 @@ mod failure_latch_tests {
     };
     use super::family_fixture::{FixtureControl, int64};
     use super::*;
-    use crate::runtime::task::{
-        ExecutionFailureCause, PipelineOperation, RequiredExpressionRowError,
-    };
+    use crate::runtime::task::{ExecutionFailureCause, PipelineOperation};
     use arrow::array::{Array, Int64Array};
+    use novarocks_expression::RequiredExpressionRowError;
     use novarocks_functions::PureKernelAbi;
     use novarocks_physical_plan::{
         AggregateCallId, AggregateGrouping, AggregatePhase, FragmentId, FragmentSink,

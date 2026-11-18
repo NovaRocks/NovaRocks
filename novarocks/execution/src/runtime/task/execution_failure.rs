@@ -18,8 +18,8 @@
 //! Execution-owned failure payloads. These facts own no terminal latch.
 
 use crate::exec::pipeline::operator::input_construction::ConstructionFailure;
-use novarocks_expression_contract::RootOrdinal;
-use novarocks_functions::{KernelDiagnostic, KernelFailure, RowDataError, Selection};
+use novarocks_expression::RequiredExpressionRowError;
+use novarocks_functions::KernelFailure;
 use std::{
     error::Error,
     fmt,
@@ -35,62 +35,6 @@ pub trait ExecutionFailureReporter: Send + Sync {
     fn report_failure(&self, error: ExecutionFailure);
     fn report_cleanup(&self, cause: &ExecutionFailure);
     fn report_unresolved_exit(&self, cause: &ExecutionFailure);
-}
-
-/// A required root's remaining journal error, after its legal guards ran.
-/// The original selected ordinal and message remain in the original payload.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RequiredExpressionRowError {
-    root: RootOrdinal,
-    batch_row: usize,
-    error: RowDataError,
-}
-
-impl RequiredExpressionRowError {
-    pub fn try_new(
-        root: RootOrdinal,
-        selection: Selection<'_>,
-        error: RowDataError,
-    ) -> Result<Self, KernelFailure> {
-        let batch_row = selection.row(error.selected_ordinal()).ok_or_else(|| {
-            KernelFailure::Internal(KernelDiagnostic::new(
-                "required expression error ordinal is outside its selection",
-            ))
-        })?;
-        Ok(Self {
-            root,
-            batch_row,
-            error,
-        })
-    }
-
-    pub const fn root(&self) -> RootOrdinal {
-        self.root
-    }
-    pub const fn batch_row(&self) -> usize {
-        self.batch_row
-    }
-    pub const fn error(&self) -> &RowDataError {
-        &self.error
-    }
-}
-
-impl fmt::Display for RequiredExpressionRowError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "required expression {:?} failed at batch row {} (selected ordinal {}): {}",
-            self.root,
-            self.batch_row,
-            self.error.selected_ordinal(),
-            self.error.message()
-        )
-    }
-}
-impl Error for RequiredExpressionRowError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.error)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -802,15 +746,19 @@ mod tests {
     }
     #[test]
     fn failure_observers_share_one_occurrence_while_equal_new_failures_remain_distinct() {
-        let first: ExecutionFailure =
-            KernelFailure::Internal(KernelDiagnostic::new("same local message")).into();
+        let first: ExecutionFailure = KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new("same local message"),
+        )
+        .into();
         let observed = first.clone().at_operator(7, PipelineOperation::Push);
         assert!(first.same_occurrence(&observed));
         assert!(std::ptr::eq(first.cause(), observed.cause()));
         assert!(first.site().is_none());
         assert_eq!(observed.site().unwrap().operator_ordinal, 7);
-        let independent: ExecutionFailure =
-            KernelFailure::Internal(KernelDiagnostic::new("same local message")).into();
+        let independent: ExecutionFailure = KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new("same local message"),
+        )
+        .into();
         assert_eq!(
             first, independent,
             "value comparison remains available for diagnostic oracles"
@@ -908,6 +856,7 @@ mod tests {
         use crate::runtime::task::{
             LocalTaskLaunchError, LocalTaskLaunchErrorKind, LocalTaskLaunchStage,
         };
+        use novarocks_functions::KernelDiagnostic;
         let original = KernelFailure::Internal(KernelDiagnostic::new("original internal cause"));
         let error = LocalTaskLaunchError::from_failure(
             LocalTaskLaunchStage::BuildPipelines,
@@ -945,17 +894,6 @@ mod tests {
     }
 }
 
-impl novarocks_failure_contract::FailureProjection for RequiredExpressionRowError {
-    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        self.error.failure_fact().with_row_position(
-            novarocks_failure_contract::FailureRowPosition {
-                selected_ordinal: u64::try_from(self.error.selected_ordinal())
-                    .expect("supported pointer widths fit u64"),
-                batch_row: u64::try_from(self.batch_row).expect("supported pointer widths fit u64"),
-            },
-        )
-    }
-}
 impl novarocks_failure_contract::FailureProjection for ExecutionFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         self.cause.cause.failure_fact()
@@ -1036,7 +974,9 @@ impl From<novarocks_functions::array_projection::ArrayProjectionFailure> for Exe
 #[cfg(test)]
 mod required_row_source_properties {
     use super::*;
+    use novarocks_expression_contract::RootOrdinal;
     use novarocks_failure_contract::FailureProjection;
+    use novarocks_functions::{RowDataError, Selection};
     #[test]
     fn required_root_preserves_the_row_error_source_and_selection_address() {
         let rows = [1, 4];
