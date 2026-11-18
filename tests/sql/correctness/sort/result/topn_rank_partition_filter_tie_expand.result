@@ -1,5 +1,5 @@
 -- query 4
--- legacy
+-- types	integer	integer	integer	bigint
 id	grp	score	rk
 1	1	100	1
 2	1	95	2

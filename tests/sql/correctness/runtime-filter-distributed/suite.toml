@@ -27,6 +27,12 @@ paths = [
     "novarocks/execution/src/runtime_filter/**",
     "novarocks/execution/src/exec/operators/runtime_filter/**",
     "novarocks/worker/src/**",
+    "novarocks/sql/src/planner/physical/runtime_filter_placement.rs",
+    "novarocks/sql/src/planner/physical/topn_runtime_filter_placement.rs",
+    "novarocks/local-compiler/src/runtime_filter.rs",
+    "novarocks/local-compiler/src/runtime_filter/**",
+    "novarocks/local-program/src/runtime_filter.rs",
+    "novarocks/execution/src/exec/pipeline/builder/runtime_filter.rs",
 ]
 
 [reuse]

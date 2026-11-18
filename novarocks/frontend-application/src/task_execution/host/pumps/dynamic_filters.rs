@@ -318,6 +318,7 @@ impl DynamicFilterRecords {
             .map(TaskExecutionError::preparation_input)
     }
 
+    #[cfg(test)]
     pub(super) fn take_failure(&self, failure: HostFailureRef) -> Option<TaskExecutionError> {
         let mut records = self.records.lock().expect("dynamic read canonical records");
         records
@@ -525,11 +526,7 @@ mod tests {
         drop(records);
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         runtime.drain_original_apply_until(deadline).await.unwrap();
-        runtime
-            .drain_original_subscriptions_until(deadline)
-            .await
-            .unwrap();
-        assert!(runtime.original_apply_joined() && runtime.original_subscriptions_joined());
+        assert!(runtime.original_apply_joined());
         assert!(peer.settle().await);
     }
 }

@@ -49,14 +49,9 @@ pub(crate) mod metrics;
 use crate::native::{
     data_runtime::FrontendDataRuntime, transport_capacity::NativeTransportCapacity,
 };
-use crate::task_execution::bridge::{
-    control::AttemptOwnerControls,
-    terminal::{RegisteredAttemptTerminal, TerminalOutbox},
-};
 use crate::task_execution::host::adapter::{
     AttemptActorRegistration, AttemptRegistrationError, PreparedAttemptHost,
 };
-use crate::task_execution::host::failure_bridge::PendingFailureBridge;
 use crate::task_execution::host::funding::AttemptHostFunding;
 use crate::task_execution::host::observations::{
     ObservationBudget, ObservationError, backing::ObservationBackingQuote,
@@ -66,8 +61,7 @@ use crate::task_execution::host::transport::AttemptCallSource;
 use actor::{FrontendActor, FrontendClock};
 use host::{HostBinding, HostExit, HostRegistrationRefusal, HostRegistry};
 use membership::{
-    AttemptMembershipSource, MembershipErrors, MembershipObserver, MembershipRegistry,
-    MembershipShutdownError,
+    AttemptMembershipSource, MembershipObserver, MembershipRegistry, MembershipShutdownError,
 };
 use metrics::{FrontendHostObservations, FrontendRuntimeMetrics};
 use novarocks_control_runtime::{
@@ -303,17 +297,8 @@ impl FrontendAttemptRuntime {
     }
 }
 
-type AttemptRegistrationRefusal = (
-    HostRegistrationRefusal,
-    AttemptStartup,
-    AttemptOwnerControls,
-    PendingFailureBridge,
-    Arc<TerminalOutbox>,
-    MembershipErrors,
-    AttemptHostFunding,
-);
-
 impl AttemptRegistrationGuard<'_> {
+    #[cfg(test)]
     pub(crate) fn register_binding(
         &self,
         binding: HostBinding,
@@ -321,55 +306,35 @@ impl AttemptRegistrationGuard<'_> {
     ) -> Result<HostExit, HostRegistrationRefusal> {
         self.owner.host.register_with_funding(binding, funding)
     }
-
-    /// Install the real host route before that host can post Bootstrap.
-    /// Refusal returns the Source and its still-unpublished original position.
+    pub(crate) fn register_binding_in(
+        &self,
+        binding: HostBinding,
+        funding: &mut Option<AttemptHostFunding>,
+        original: &mut Option<HostExit>,
+    ) -> Result<(), HostRegistrationRefusal> {
+        self.owner
+            .host
+            .register_with_funding_in(binding, funding, original)
+    }
     pub(crate) fn register_attempt(
         &self,
         prepared: PreparedAttemptHost,
-        funding: AttemptHostFunding,
-    ) -> Result<
-        (
-            AttemptStartup,
-            AttemptOwnerControls,
-            RegisteredAttemptTerminal,
-        ),
-        AttemptRegistrationRefusal,
-    > {
+        funding: &mut Option<AttemptHostFunding>,
+        original: &mut Option<HostExit>,
+    ) -> Result<AttemptStartup, (HostRegistrationRefusal, AttemptStartup)> {
         let PreparedAttemptHost {
             mut binding,
             startup,
-            controls,
             membership,
-            failure,
-            terminal,
         } = prepared;
         assert!(binding.membership.is_none());
-        binding.membership = Some(AttemptMembershipSource::new(
-            self.owner.members.clone(),
-            membership.target,
-        ));
-        let mut funding = Some(funding);
-        match self.register_binding(binding, &mut funding) {
-            Ok(exit) => Ok((
-                startup,
-                controls,
-                RegisteredAttemptTerminal::new(
-                    terminal,
-                    failure.bind(exit, self.owner.backend_processes.clone()),
-                    Some(membership.errors),
-                ),
-            )),
-            Err(refusal) => Err((
-                refusal,
-                startup,
-                controls,
-                failure,
-                terminal,
-                membership.errors,
-                funding.expect("registration refusal returns the original funding"),
-            )),
-        }
+        binding.membership = Some(
+            AttemptMembershipSource::new(self.owner.members.clone(), membership.target)
+                .with_original_errors(membership.errors),
+        );
+        self.register_binding_in(binding, funding, original)
+            .map_err(|refusal| (refusal, startup.clone()))?;
+        Ok(startup)
     }
 }
 
@@ -589,3 +554,5 @@ pub(crate) mod transport_withdrawal;
 
 #[cfg(test)]
 mod installed_subscription_tests;
+
+pub(crate) mod logical;

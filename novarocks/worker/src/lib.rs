@@ -73,7 +73,6 @@ pub mod result_buffer;
 pub mod root_result_channel;
 mod runtime_filter_error;
 mod settlement;
-pub mod sink_commit;
 mod task_completion;
 mod task_completion_set;
 mod task_conclusion;

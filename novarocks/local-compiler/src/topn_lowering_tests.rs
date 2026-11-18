@@ -20,7 +20,7 @@ use super::*;
 use crate::FragmentCompileError;
 use crate::{compile_fragment, topn::lower_topn};
 use arrow_array::{ArrayRef, Int64Array, StringArray, StructArray};
-use novarocks_local_program::{ProgramNodeId, ProgramNodeKind, SortTopNType};
+use novarocks_local_program::{LocalSortMode, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::NodeKind;
 use novarocks_physical_plan::{
     NullOrdering, SortDirection, SortExpr, SortMode, TopNPhase, TopNSequenceId,
@@ -176,28 +176,15 @@ fn single_topn_public_compile_preserves_ordered_keys_root_occurrences_and_exact_
     let program = compile(package.clone(), &Control::good()).unwrap();
     let ProgramNodeKind::Sort {
         input,
-        use_top_n,
         order_by,
-        limit,
-        offset,
-        topn_type,
-        max_buffered_rows,
-        max_buffered_bytes,
-        partition_exprs,
-        partition_limit,
+        mode: LocalSortMode::RowsTopN { limit, offset },
     } = program.graph().nodes()[1].kind()
     else {
         panic!("actual local TopN sort")
     };
     assert_eq!(input.index(), 0);
-    assert!(*use_top_n);
-    assert_eq!(*limit, Some(2));
+    assert_eq!(*limit, 2);
     assert_eq!(*offset, 1);
-    assert_eq!(*topn_type, SortTopNType::RowNumber);
-    assert_eq!(*max_buffered_rows, None);
-    assert_eq!(*max_buffered_bytes, None);
-    assert!(partition_exprs.is_empty());
-    assert_eq!(*partition_limit, None);
     assert_eq!(
         order_by
             .iter()
@@ -261,16 +248,17 @@ fn single_topn_zero_and_host_representable_max_rows_preserve_values_without_buff
         }
         let program = result.unwrap();
         let ProgramNodeKind::Sort {
-            limit: actual,
-            offset: actual_offset,
-            use_top_n,
+            mode:
+                LocalSortMode::RowsTopN {
+                    limit: actual,
+                    offset: actual_offset,
+                },
             ..
         } = program.graph().nodes()[1].kind()
         else {
             panic!("TopN")
         };
-        assert!(*use_top_n);
-        assert_eq!(*actual, Some(usize::try_from(limit).unwrap()));
+        assert_eq!(*actual, usize::try_from(limit).unwrap());
         assert_eq!(*actual_offset, usize::try_from(offset).unwrap());
     }
     // A legal host conversion never replaces the original u64 sum validator.
@@ -495,18 +483,11 @@ fn actual_closed_partial_final_topn_package_lowers_both_phases_and_keeps_origina
         .filter_map(|node| match node.kind() {
             ProgramNodeKind::Sort {
                 input,
-                use_top_n: true,
                 order_by,
-                limit,
-                offset,
-                topn_type: SortTopNType::RowNumber,
-                max_buffered_rows: None,
-                max_buffered_bytes: None,
-                partition_exprs,
-                partition_limit: None,
-            } if partition_exprs.is_empty() => Some((
+                mode: LocalSortMode::RowsTopN { limit, offset },
+            } => Some((
                 input.index(),
-                *limit,
+                Some(*limit),
                 *offset,
                 order_by
                     .iter()
@@ -648,27 +629,15 @@ fn lowered_window(
 ) -> (Option<usize>, usize, Vec<(bool, bool)>) {
     let ProgramNodeKind::Sort {
         input,
-        use_top_n,
         order_by,
-        limit,
-        offset,
-        topn_type,
-        max_buffered_rows,
-        max_buffered_bytes,
-        partition_exprs,
-        partition_limit,
+        mode: LocalSortMode::RowsTopN { limit, offset },
     } = program.graph().nodes()[1].kind()
     else {
         panic!("actual local TopN sort")
     };
     assert_eq!(input.index(), 0);
-    assert!(*use_top_n);
-    assert_eq!(*topn_type, SortTopNType::RowNumber);
-    assert_eq!((*max_buffered_rows, *max_buffered_bytes), (None, None));
-    assert!(partition_exprs.is_empty());
-    assert_eq!(*partition_limit, None);
     let keys = order_by.iter().map(|k| (k.asc, k.nulls_first)).collect();
-    (*limit, *offset, keys)
+    (Some(*limit), *offset, keys)
 }
 
 #[test]
@@ -814,8 +783,7 @@ fn topn_owner_refuses_a_partial_offset_and_a_grouped_state_reduction() {
             "partial TopN carries an offset before global completion"
         ))
     ));
-    // A grouped-state reduction merges by the full group key and has no
-    // local owner in any phase.
+    // GroupedStates has a separate lowering owner; it cannot enter row-count lowering.
     for phase in [TopNPhase::Partial { sequence }, TopNPhase::Single] {
         let mut node = original.clone();
         let NodeKind::TopN {
@@ -836,10 +804,9 @@ fn topn_owner_refuses_a_partial_offset_and_a_grouped_state_reduction() {
         };
         assert!(matches!(
             lower_topn(&node, ProgramNodeId::new(0), layout, &ids, &Control::good()),
-            Err(FragmentCompileError::Unsupported {
-                node: Some(id),
-                feature: "grouped-state TopN",
-            }) if id == NodeId::new(0)
+            Err(FragmentCompileError::Invalid(
+                "row-count TopN physical kind differs"
+            ))
         ));
     }
 }
@@ -859,7 +826,7 @@ mod scan_split {
     use novarocks_connector_contract::*;
     use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
     use novarocks_local_program::{
-        KernelAbiVersion, LocalProgram, ProgramNodeKind, SortTopNType, StaticSinkProgram,
+        KernelAbiVersion, LocalProgram, LocalSortMode, ProgramNodeKind, StaticSinkProgram,
     };
     use novarocks_physical_plan::*;
     use novarocks_type_contract::{
@@ -1273,18 +1240,11 @@ mod scan_split {
             .filter_map(|node| match node.kind() {
                 ProgramNodeKind::Sort {
                     input,
-                    use_top_n: true,
                     order_by,
-                    limit,
-                    offset,
-                    topn_type: SortTopNType::RowNumber,
-                    max_buffered_rows: None,
-                    max_buffered_bytes: None,
-                    partition_exprs,
-                    partition_limit: None,
-                } if partition_exprs.is_empty() && order_by.len() == 1 => Some((
+                    mode: LocalSortMode::RowsTopN { limit, offset },
+                } if order_by.len() == 1 => Some((
                     input.index(),
-                    *limit,
+                    Some(*limit),
                     *offset,
                     order_by[0].asc,
                     order_by[0].nulls_first,
@@ -1349,4 +1309,160 @@ mod scan_split {
             "{error}"
         );
     }
+}
+
+#[test]
+fn grouped_topn_refuses_invalid_phase_offset_and_empty_keys_before_construction() {
+    let package = package(&integer_pool(), 1, false, 2, 0);
+    let original = &package.fragment().nodes()[&NodeId::new(0)];
+    let NodeKind::TopN { order_by, .. } = &original.kind else {
+        panic!("TopN")
+    };
+    let expr = order_by[0].expr;
+    let ExprKind::Value(value) = package
+        .fragment()
+        .root_expression(NodeId::new(0), expr)
+        .unwrap()
+        .kind
+    else {
+        panic!("direct key")
+    };
+    let sequence = TopNSequenceId::new(3);
+    for (phase, offset, empty) in [
+        (TopNPhase::Single, 0, false),
+        (TopNPhase::Partial { sequence }, 1, false),
+        (TopNPhase::Partial { sequence }, 0, true),
+    ] {
+        let mut node = original.clone();
+        let NodeKind::TopN {
+            phase: actual,
+            offset: actual_offset,
+            reduction,
+            ..
+        } = &mut node.kind
+        else {
+            unreachable!()
+        };
+        *actual = phase;
+        *actual_offset = offset;
+        *reduction = novarocks_physical_plan::TopNReduction::GroupedStates {
+            group_by: if empty {
+                Box::default()
+            } else {
+                Box::from([(expr, value)])
+            },
+            calls: Box::default(),
+            comparator: novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1,
+        };
+        assert!(matches!(
+            crate::topn::admit_grouped_topn_shape(&node),
+            Err(FragmentCompileError::Invalid(
+                "GroupedTopN requires complete keys and a partial zero-offset input"
+            ))
+        ));
+        let mut request = |_| -> Result<(), std::convert::Infallible> {
+            panic!("reject the invalid contract before constructing values")
+        };
+        let mut opaque = |_| -> Result<(), std::convert::Infallible> {
+            panic!("reject the invalid contract before constructing values")
+        };
+        let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut opaque,
+        );
+        let error = crate::topn::lower_grouped_topn_with_creation(
+            &package,
+            &node,
+            ProgramNodeId::new(0),
+            &BTreeMap::new(),
+            &[],
+            &Control::good(),
+            &mut creation,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::FragmentCreationError::Compile(FragmentCompileError::Invalid(
+                "GroupedTopN requires complete keys and a partial zero-offset input"
+            ))
+        ));
+    }
+}
+
+#[test]
+fn grouped_topn_rejects_a_key_outside_the_partition_domain() {
+    let pool = checked_pool(
+        Arc::new(
+            arrow_array::FixedSizeBinaryArray::try_from_iter(
+                [b"12345678", b"abcdefgh", b"87654321"].into_iter(),
+            )
+            .unwrap(),
+        ),
+        false,
+        ValueLogicalType::Physical,
+    );
+    // The original package is a valid row-count TopN. Only the private
+    // grouped lowering author receives this standalone contract input.
+    let package = package(&pool, 1, false, 2, 0);
+    let mut node = package.fragment().nodes()[&NodeId::new(0)].clone();
+    let NodeKind::TopN {
+        phase,
+        reduction,
+        order_by,
+        ..
+    } = &mut node.kind
+    else {
+        unreachable!()
+    };
+    let expr = order_by[0].expr;
+    let definition = package
+        .fragment()
+        .root_expression(NodeId::new(0), expr)
+        .unwrap();
+    let ExprKind::Value(value) = definition.kind else {
+        unreachable!()
+    };
+    let comparator = novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1;
+    assert!(
+        !novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
+            .supports_partition_key(definition.ty.data_type())
+    );
+    assert!(!novarocks_physical_plan::grouped_state_topn_key_supported(
+        comparator,
+        &definition.ty
+    ));
+    *phase = TopNPhase::Partial {
+        sequence: TopNSequenceId::new(3),
+    };
+    *reduction = novarocks_physical_plan::TopNReduction::GroupedStates {
+        group_by: Box::from([(expr, value)]),
+        calls: Box::default(),
+        comparator,
+    };
+    let mut request =
+        |_| -> Result<(), std::convert::Infallible> { panic!("reject before value construction") };
+    let mut opaque =
+        |_| -> Result<(), std::convert::Infallible> { panic!("reject before value construction") };
+    let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut opaque,
+    );
+    let error = crate::topn::lower_grouped_topn_with_creation(
+        &package,
+        &node,
+        ProgramNodeId::new(0),
+        &BTreeMap::new(),
+        &[novarocks_types::SlotId(0)],
+        &Control::good(),
+        &mut creation,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::FragmentCreationError::Compile(FragmentCompileError::Invalid(
+            "GroupedTopN key is not an exact supported direct value"
+        ))
+    ));
 }

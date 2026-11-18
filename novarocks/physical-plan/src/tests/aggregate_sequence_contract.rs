@@ -1500,3 +1500,29 @@ pub(super) fn runtime_filter_grouped_utf8_fragment(nullable: bool) -> Fragment {
     let plan = grouped_reduction_plan(GroupedReductionFixture::Utf8Key(nullable)).unwrap();
     plan.fragments().values().next().unwrap().clone()
 }
+
+#[test]
+fn grouped_state_topn_key_domain_matches_comparison_and_partitioning() {
+    let comparator = OrderedComparisonAlgorithm::NativeScalarOrderV1;
+    for data_type in [
+        DataType::Boolean,
+        DataType::Int64,
+        DataType::Utf8,
+        DataType::Date32,
+    ] {
+        assert!(grouped_state_topn_key_supported(
+            comparator,
+            &ty(data_type, true)
+        ));
+    }
+    for data_type in [
+        DataType::Float64,
+        DataType::Binary,
+        DataType::FixedSizeBinary(16),
+    ] {
+        assert!(!grouped_state_topn_key_supported(
+            comparator,
+            &ty(data_type, false)
+        ));
+    }
+}

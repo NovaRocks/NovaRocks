@@ -19,18 +19,13 @@
 //!
 //! Tokens and grant references are correlation values, never authorization.
 //! The issuing owner retains the actual permits and rich request allocations.
-//! The bridge resolves references against that original owner; copying a message
-//! cannot mint authority. Each request prepays exactly one reply position.
-//! Failure type parameters carry passive attempt facts, never application owners.
+//! Correlation identities cannot mint authority. Each request prepays exactly
+//! one reply position; cross-core failure messages live in logical_port.
 
-use crate::{
-    AttemptActivationIdentity, MonotonicInstant, ResultParticipationWithdrawal,
-    SelectedTaskTermination,
-};
+use crate::{AttemptActivationIdentity, MonotonicInstant, SelectedTaskTermination};
 use novarocks_execution_contract::root_result::RootResultEnd;
 use novarocks_execution_contract::{
-    AbortParticipation, AcquireParticipationAdmissionTicket, OperationOutcome,
-    ParticipationAdmissionTicketReceipt, ParticipationRef, TaskIdentity, TaskOperationId,
+    OperationOutcome, ParticipationAdmissionTicketReceipt, ParticipationRef, TaskIdentity,
     TaskStatus,
 };
 use novarocks_types::BackendProcessId;
@@ -60,7 +55,7 @@ impl AttemptActionId {
     }
 }
 
-/// Opaque reference to the bridge's original issued authorization.
+/// Deterministic correlation identity issued by the original logical core.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct AttemptAuthorizationRef(NonZeroU64);
 impl AttemptAuthorizationRef {
@@ -162,42 +157,6 @@ pub struct AttemptRootProjection {
     pub failure: AttemptRootFailure,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AttemptTerminal<F> {
-    Completed,
-    Failed(F),
-    Stopped {
-        reason: AttemptStopReason,
-        /// Original typed cancellation/logical failure; never reconstructed
-        /// from the coarse control reason or its display text.
-        failure: F,
-    },
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum AttemptAuthorization {
-    BeginAdmission(AcquireParticipationAdmissionTicket),
-    SettleAdmission {
-        /// Resolve this same original QA receipt; identity grants no access.
-        issue: AttemptAuthorizationRef,
-        participation: ParticipationRef,
-        operation_id: TaskOperationId,
-        outcome: Option<OperationOutcome>,
-        receipt: Option<ParticipationAdmissionTicketReceipt>,
-        prior_transport_unknown: bool,
-    },
-    /// The original request allocation is held by the host under this exact identity.
-    Establish {
-        participation: ParticipationRef,
-        operation_id: TaskOperationId,
-    },
-    ReauthorizeEstablish {
-        participation: ParticipationRef,
-        /// Expected original request, checked against the returned submission.
-        operation_id: TaskOperationId,
-    },
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttemptAuthorizationDecision {
     AdmissionStarted(AttemptAuthorizationRef),
@@ -218,16 +177,6 @@ pub struct AttemptAuthorizationLimits {
 
 pub const ABORT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Independent typed facts from the original QA call. The host does not
-/// combine its budget error with protocol history or infer recovery policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AttemptAuthorizationFailure<F> {
-    Rejected(F),
-    /// Only QA's actual EstablishIssueError::AuthorizationBudgetExhausted.
-    /// The pure gate still decides whether this same operation was unknown.
-    EstablishBudgetExhausted(F),
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttemptIssueSettlement {
     TransportOwned,
@@ -235,134 +184,6 @@ pub enum AttemptIssueSettlement {
     TransportUnknown,
     PreWorkerRejected,
     Worker(OperationOutcome),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AbortIssueSettlement {
-    DefinitelyUnsent,
-    TransportUnknown,
-    Worker(OperationOutcome),
-    FailedClosed,
-}
-
-/// Each envelope is checked against the registered activation before application.
-#[derive(Clone, Debug)]
-pub struct LogicalToAttempt<F> {
-    pub activation: AttemptActivationIdentity,
-    pub body: LogicalToAttemptBody<F>,
-}
-
-#[derive(Clone, Debug)]
-pub enum LogicalToAttemptBody<F> {
-    AuthorizationReply {
-        token: AttemptRequestToken,
-        decision: Result<AttemptAuthorizationDecision, AttemptAuthorizationFailure<F>>,
-    },
-    /// The selected original guard method has actually returned. Handoff and
-    /// work/capture exit cannot replace its Result or authorize the next item.
-    EstablishSettlementReply {
-        token: AttemptRequestToken,
-        authorization: AttemptAuthorizationRef,
-        result: Result<(), F>,
-    },
-    /// The credentialed owner actually disposed of this retained late guard.
-    EstablishDetachReply {
-        token: AttemptRequestToken,
-        authorization: AttemptAuthorizationRef,
-        result: Result<(), F>,
-    },
-    PreReadyReplacementReply {
-        token: AttemptRequestToken,
-        may_observe: bool,
-    },
-    /// Hint from the SAME original QA observation registered with this query.
-    /// It never grants permission: ask the original policy owner again before
-    /// continuing observation. Query/register itself must not emit this hint.
-    PreReadyReplacementChanged { token: AttemptRequestToken },
-    Abort {
-        action: AttemptActionId,
-        request: AbortParticipation,
-    },
-    Stop {
-        reason: AttemptStopReason,
-        failure: F,
-    },
-    /// Must share the observation source FIFO, including across mailbox classes.
-    SealRequest { token: AttemptRequestToken },
-    TerminalControlDemand {
-        token: AttemptRequestToken,
-        root: TaskIdentity,
-    },
-    BeginConvergence {
-        mode: AttemptConvergenceMode,
-        remote_deadline: MonotonicInstant,
-        computation_ready: Option<AttemptComputationCut>,
-        retain_diagnostics: bool,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub struct AttemptToLogical<F> {
-    pub activation: AttemptActivationIdentity,
-    pub action: AttemptActionId,
-    pub body: AttemptToLogicalBody<F>,
-}
-
-#[derive(Clone, Debug)]
-pub enum AttemptToLogicalBody<F> {
-    AuthorizationRequest {
-        token: AttemptRequestToken,
-        request: AttemptAuthorization,
-    },
-    PreReadyReplacementQuery {
-        token: AttemptRequestToken,
-        refusal: F,
-    },
-    EstablishSettlement {
-        token: AttemptRequestToken,
-        /// AP selects current/oldest-late/all-late order, not the host lookup.
-        authorization: AttemptAuthorizationRef,
-        participation: ParticipationRef,
-        operation_id: TaskOperationId,
-        settlement: AttemptIssueSettlement,
-    },
-    DetachEstablish {
-        token: AttemptRequestToken,
-        authorization: AttemptAuthorizationRef,
-        participation: ParticipationRef,
-        operation_id: TaskOperationId,
-    },
-    AbortSettlement {
-        /// Original actor submission and its corresponding Native admission.
-        abort_action: AttemptActionId,
-        generation: AttemptActionId,
-        /// The canonical positive receipt can come from a different generation.
-        receipt_generation: Option<AttemptActionId>,
-        participation: ParticipationRef,
-        operation_id: TaskOperationId,
-        settlement: AbortIssueSettlement,
-    },
-    RootStatus(Box<AttemptRootProjection>),
-    SealResult {
-        token: AttemptRequestToken,
-        result: Result<std::sync::Arc<[ResultParticipationWithdrawal]>, F>,
-    },
-    TerminalControlResult {
-        token: AttemptRequestToken,
-        result: Result<(), F>,
-    },
-    AttemptTerminal(AttemptTerminal<F>),
-    /// The failed core is never read to reconstruct this host-authored fact.
-    AttemptLost {
-        failure: F,
-        unknown_participations: Box<[ParticipationRef]>,
-        unresolved_actions: Box<[AttemptActionId]>,
-    },
-    ConvergenceProgress {
-        local_exited: bool,
-        closure: Option<std::sync::Arc<AttemptConvergenceClosure>>,
-        lifecycle_runtime_filters: Option<std::sync::Arc<RuntimeFilterDiagnostic>>,
-    },
 }
 
 /// Exact contribution references selected by the original attempt Core.

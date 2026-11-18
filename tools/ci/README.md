@@ -40,8 +40,6 @@ tools/ci/dev-test.sh test
 tools/ci/dev-test.sh list -E 'package(novarocks-test-support)'
 tools/ci/dev-test.sh test -E 'package(novarocks-test-support) & test(caller_exit)'
 tools/ci/dev-test.sh test -E 'binary(process_monitor)'
-tools/ci/dev-test.sh test --run-ignored only -E \
-  'package(novarocks-cluster-harness) & test(native_proxy_cluster_keeps_advertisement_across_process_restarts)'
 tools/ci/dev-test.sh test -E 'rdeps(novarocks-test-support)' --test-threads 2
 tools/ci/dev-test.sh doc
 tools/ci/dev-test.sh check --target-dir target/ide
@@ -74,11 +72,6 @@ a two-test group limit and a ten-minute watchdog. Process-monitor mechanics use
 their own two-test group. These limits prevent runaway tests; they are not
 performance requirements and do not extend functional operation deadlines.
 Doctests remain a separate Cargo command.
-
-The ignored example is a public native-cluster integration case; the entry
-supplies its required `NOVAROCKS_BIN` from the current prepared receipt. Internal
-ignored mechanics helpers require their outer owner and private handshake inputs,
-so ordinary examples do not select all ignored mechanics helpers.
 
 ## Formal execution
 

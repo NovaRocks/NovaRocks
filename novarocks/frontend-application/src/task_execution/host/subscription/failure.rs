@@ -136,6 +136,7 @@ impl std::error::Error for OriginalSubscriptionFailure {
 enum Slot {
     Unreported,
     Retained(OriginalSubscriptionFailure),
+    #[cfg(test)]
     Transferred,
 }
 
@@ -180,6 +181,7 @@ impl SubscriptionFailureRecord {
             if !matches!(original.original.kind(), ObservationFailureKind::RecoverableTransport { .. }))
     }
 
+    #[cfg(test)]
     pub(crate) fn take(&self, reference: HostFailureRef) -> Option<OriginalSubscriptionFailure> {
         if reference != self.reference {
             return None;
@@ -375,3 +377,7 @@ mod tests {
         assert!(matches!(original.original, SubscriptionError::Ingress(raw) if raw == error));
     }
 }
+
+#[cfg(test)]
+#[path = "failure/typed_wire_tests.rs"]
+mod typed_wire_tests;

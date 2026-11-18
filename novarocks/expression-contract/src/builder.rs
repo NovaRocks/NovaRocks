@@ -16,7 +16,7 @@
 // under the License.
 
 //! Mutable unit construction ends before any immutable unit is exposed.
-// Design: ADR-0236-self-contained-expression-units-and-explicit-environments.md
+// Design: ADR-0238-self-contained-expression-units-and-explicit-environments.md
 use crate::{
     BoundExprSet, DefinitionControl, ExprId, ExprKind, ExprNode, ExprPort, ExprRoot,
     ExpressionCallClaim, PhysicalCallRequest, RootOrdinal, RootScope, UnitError, UnitLimits,

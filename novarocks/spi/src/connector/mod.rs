@@ -374,10 +374,9 @@ pub use write::{
     ConnectorWriteFieldRequest, ConnectorWriteFieldToken, ConnectorWriteInputRequest,
     ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWriteOperationId,
     ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
-    ConnectorWriteReceipt, ConnectorWriteTargetRef, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES,
-    DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES, MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES,
-    MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS, MAX_CONNECTOR_WRITE_RECEIPT_BYTES,
-    WriteCommitEvidenceLedger, WriteCommitEvidenceLimits, WriteCommitEvidenceUsage,
+    ConnectorWriteReceipt, ConnectorWriteTargetRef,
+    MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES, MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS,
+    MAX_CONNECTOR_WRITE_RECEIPT_BYTES,
 };
 
 pub use process_local::ConnectorProcessLocalPayload;

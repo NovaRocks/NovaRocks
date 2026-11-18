@@ -55,6 +55,15 @@ pub(super) struct MvNativePhase {
     ready_local_exit: bool,
 }
 impl MvNativePhase {
+    pub(super) fn poll_supervision_failure(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Option<novarocks_query_application::api::QueryExecutionError> {
+        self.tail
+            .as_mut()
+            .and_then(|tail| tail.poll_supervision_failure(cx))
+            .or_else(|| self.computation.poll_supervision_failure(cx))
+    }
     pub(super) fn new(
         root: WorkScope,
         initial: InitialComputationReservation,

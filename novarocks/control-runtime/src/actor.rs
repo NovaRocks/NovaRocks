@@ -75,12 +75,23 @@ pub(crate) enum InputSourceMode {
     All,
     Only(ActorId),
     Prefer(ActorId),
+    OnlyWithOwner { source: ActorId, owner: ActorId },
+    PreferWithOwner { source: ActorId, owner: ActorId },
 }
 impl InputSourceMode {
+    pub(crate) fn owner_source(self) -> Option<ActorId> {
+        match self {
+            Self::OnlyWithOwner { owner, .. } | Self::PreferWithOwner { owner, .. } => Some(owner),
+            Self::All | Self::Only(_) | Self::Prefer(_) => None,
+        }
+    }
     pub(crate) fn contending_source(self) -> Option<ActorId> {
         match self {
             Self::All => None,
-            Self::Only(source) | Self::Prefer(source) => Some(source),
+            Self::Only(source)
+            | Self::Prefer(source)
+            | Self::OnlyWithOwner { source, .. }
+            | Self::PreferWithOwner { source, .. } => Some(source),
         }
     }
 }
@@ -244,6 +255,16 @@ impl<'a, E> ActorStep<'a, E> {
     /// to All. No Source identity, input, Work or capacity is created here.
     pub fn prefer_input_source(&mut self, source: ActorId) {
         self.input_source = Some(InputSourceMode::Prefer(source));
+    }
+    /// Keep the original continuation cut while admitting the complete head
+    /// of one separately frozen owner source. All classes retain that source's
+    /// cross-class FIFO; selecting only its Control class could strand a Stop
+    /// behind an earlier Lifecycle head. This grants no input or Work authority.
+    pub fn select_input_source_with_owner(&mut self, source: ActorId, owner: ActorId) {
+        self.input_source = Some(InputSourceMode::OnlyWithOwner { source, owner });
+    }
+    pub fn prefer_input_source_with_owner(&mut self, source: ActorId, owner: ActorId) {
+        self.input_source = Some(InputSourceMode::PreferWithOwner { source, owner });
     }
     /// Transfer a still-unbound synchronous reservation into the same atomic
     /// handoff as its neutral effect. No queue/capture may bind it beforehand.

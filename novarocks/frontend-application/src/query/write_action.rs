@@ -433,6 +433,15 @@ impl<P: WriteStatementFamily> WriteStatementAction<P> {
         // Its business result and later physical retirement remain separate.
         if self.publication.as_ref().unwrap().call.is_none()
             && self.selected.is_none()
+            && let Some(error) = self
+                .native_tail
+                .as_mut()
+                .and_then(|tail| tail.poll_supervision_failure(cx))
+        {
+            self.fail(governed_query_execution_error(error));
+        }
+        if self.publication.as_ref().unwrap().call.is_none()
+            && self.selected.is_none()
             && let Some(reason) = cancellation.reason()
         {
             self.fail(cancellation_error(reason));

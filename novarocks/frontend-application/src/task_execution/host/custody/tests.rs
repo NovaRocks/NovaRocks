@@ -336,9 +336,13 @@ impl TestActor for WithdrawalTarget {
                     if matches!(
                         value.as_ref(),
                         AttemptInput::Executor(ExecutorFact::ReadProgress(_))
+                        | AttemptInput::Port(novarocks_coordination_contract::LogicalToAttempt {
+                            body: novarocks_coordination_contract::LogicalToAttemptBody::PreReadyReplacementChanged { .. }, ..
+                        })
                     ) =>
                 {
                     assert_eq!(envelope.class, InputClass::Ordinary);
+                    assert_eq!(crate::task_execution::host::adapter::input_class(value),envelope.class);
                     return;
                 }
                 _ => {}
@@ -652,17 +656,6 @@ impl WithdrawalInbox {
             self.reserve_standing(work),
         )
     }
-    pub(crate) fn retire_native_receipt_for_test(
-        &self,
-        receipt: &mut crate::task_execution::host::transport::NativeReceiptInput,
-    ) -> crate::task_execution::intent::OperationAcknowledgement {
-        let std::task::Poll::Ready(Some(retained)) = receipt.retire_ready_after_exit().unwrap()
-        else {
-            panic!("the original Native receipt and its reporter must have retired");
-        };
-        assert!(retained.unpublished.is_none());
-        retained.original
-    }
 
     pub(crate) fn assert_no_result(&self) {
         assert_eq!(
@@ -700,10 +693,6 @@ impl WithdrawalInbox {
 
     fn try_commit_attempt_from(&self, source: ActorId) -> Option<(InputId, AttemptInput)> {
         self.try_commit_from(source, InputClass::Lifecycle)
-    }
-
-    pub(crate) fn try_commit_owner_control(&self) -> Option<(InputId, AttemptInput)> {
-        self.try_commit_from(self.registration.actor(), InputClass::Control)
     }
 
     fn try_commit_from(
@@ -1055,7 +1044,7 @@ async fn publication_host_returns_original_result_and_typed_failure() {
         .bind(WorkKind::Cleanup)
         .unwrap();
     let (record, mut receiver, root, plan) = tests::fixture();
-    let owner = AttemptPublicationOwner::new(record, None, None);
+    let owner = AttemptPublicationOwner::new(record, None);
     let activation = owner.activation();
     let id = |n| AttemptActionId::new(NonZeroU64::new(n).unwrap());
     let first = id(1);
@@ -1117,7 +1106,8 @@ async fn publication_host_returns_original_result_and_typed_failure() {
             startup: None,
             capacity: None,
             membership: None,
-            owner_controls: None,
+
+            local_exit: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("original publication host"));
@@ -1359,7 +1349,8 @@ async fn read_confirmation_host_holds_the_exact_stream_through_executor_capture_
             startup: None,
             capacity: None,
             membership: None,
-            owner_controls: None,
+
+            local_exit: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("original confirmation host"));
@@ -1442,17 +1433,9 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         },
         query_execution::lifecycle_plan::QueryCredentialLeases,
         task_execution::{
-            actor_gate::tests::logical_execution,
-            bridge::{
-                qa::AttemptQaBridge,
-                terminal::{RegisteredAttemptTerminal, TerminalOutbox},
-            },
             host::transport::{
                 ActorTransportExecutor, AttemptCallOwner, AttemptCallSource,
                 AttemptEstablishMaterial, AttemptProcessObserver,
-            },
-            host::{
-                failure_bridge::PendingFailureBridge, failure_publication::FailurePublications,
             },
             sources::AttemptEstablishFacts,
         },
@@ -1460,12 +1443,14 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     use novarocks_attempt_protocol::effect::{
         AttemptEffect, EffectBody, EffectClass, OperationIntent,
     };
+    use novarocks_attempt_protocol::port_output::{
+        AttemptAuthorization, AttemptTerminal, AttemptToLogical, AttemptToLogicalBody,
+    };
     use novarocks_control_runtime::actor_turn::{Clock, ProcessClock};
     use novarocks_coordination_contract::{
-        AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision,
-        AttemptAuthorizationRef, AttemptConvergenceClosure, AttemptIssueSettlement,
-        AttemptParticipationConvergence, AttemptRequestToken, AttemptTerminal, AttemptToLogical,
-        AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
+        AttemptActionId, AttemptAuthorizationDecision, AttemptAuthorizationRef,
+        AttemptConvergenceClosure, AttemptIssueSettlement, AttemptParticipationConvergence,
+        AttemptRequestToken, LogicalToAttemptBody, MonotonicInstant,
     };
     use novarocks_execution_contract::{
         AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
@@ -1480,8 +1465,6 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
 
     use novarocks_query_application::api::{
         BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
-        NativeActiveConvergenceClosure, NativeActiveConvergenceRequest, NativeAttemptConvergence,
-        NativeParticipationConvergence,
     };
 
     struct FrozenProcess {
@@ -1509,6 +1492,375 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         }
     }
 
+    use crate::control_runtime::host::{EffectBindRefusal, EffectExecutor, PreparedEffectBinding};
+    use crate::control_runtime::logical::adapter::{LogicalEffectEnvelope, LogicalHostEffect};
+    use crate::task_execution::host::port::{
+        facts::{AttemptFactBank, FactPositionLoanObligation, FactRole},
+        requests::AttemptRequests,
+    };
+    use novarocks_control_runtime_core::{
+        effect::{EffectDescriptor, EffectKind},
+        identity::ActionId,
+    };
+    use novarocks_coordination_contract::logical_port::{
+        AttemptToLogical as CanonicalMessage, AttemptToLogicalBody as CanonicalBody,
+        LogicalToAttempt as CanonicalReply,
+    };
+    use std::{num::NonZeroUsize, task::Wake};
+
+    struct HostWake {
+        runtime: ActorRuntime<FrontendActor>,
+        registration: ActorRegistration,
+    }
+    impl Wake for HostWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.runtime.notify_host_actor(&self.registration);
+        }
+    }
+    // The receiving actor is deliberately a scripted carrier, not a second
+    // logical policy engine. Every reply uses an actual same-LP effect ticket.
+    struct LogicalReceiver {
+        attempt: ActorId,
+        seen: Arc<Mutex<Vec<CanonicalMessage>>>,
+        next: Arc<Mutex<Option<FrontendEffect>>>,
+    }
+    impl TestActor for LogicalReceiver {
+        fn handle(
+            &mut self,
+            _: Tick,
+            envelope: InputEnvelope,
+            input: FrontendInput,
+            step: &mut ActorStep<'_, FrontendEffect>,
+        ) {
+            assert!(step.charge(1));
+            if matches!(input, FrontendInput::Test(_)) {
+                assert_eq!(envelope.class, InputClass::Lifecycle);
+                let effect = self
+                    .next
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one original script reply");
+                let FrontendEffect::Logical(original) = &effect else {
+                    unreachable!()
+                };
+                let LogicalHostEffect::Protocol(original) = &original.body else {
+                    unreachable!()
+                };
+                step.effect(
+                    EffectDescriptor {
+                        id: ActionId::new(original.action.get()).unwrap(),
+                        work: step
+                            .input_work()
+                            .expect("same original LP financial author"),
+                        kind: EffectKind::Settlement,
+                        dependencies: Vec::new(),
+                    },
+                    effect,
+                )
+                .unwrap();
+                return;
+            }
+            assert_eq!(envelope.source, self.attempt);
+            let FrontendInput::Logical(input) = input else {
+                panic!("original final LP inlet")
+            };
+            let novarocks_logical_execution_protocol::input::LogicalInput::AttemptPort(message) =
+                *input
+            else {
+                unreachable!()
+            };
+            let expected_class = match &message.body {
+                CanonicalBody::AuthorizationRequest { .. }
+                | CanonicalBody::EstablishSettlement { .. }
+                | CanonicalBody::PreReadyReplacementQuery { .. } => InputClass::Ordinary,
+                _ => InputClass::Lifecycle,
+            };
+            assert_eq!(envelope.class, expected_class);
+            self.seen.lock().unwrap().push(*message);
+        }
+    }
+    struct LogicalReceivingSource {
+        scope: ScopeHandle,
+        closing: bool,
+    }
+    impl EffectSource for LogicalReceivingSource {
+        fn prepay_result(
+            &mut self,
+            _: &FrontendEffect,
+        ) -> Option<CausalInputObligation<FrontendActor>> {
+            unreachable!("the original script ticket is completed before Host indexing")
+        }
+        fn bind_job(
+            &mut self,
+            _: &ActorRuntime<FrontendActor>,
+            _: &ActorHostTurn<FrontendActor>,
+            _: &EffectTicket<FrontendEffect>,
+            _: CausalInputObligation<FrontendActor>,
+        ) -> PreparedEffectJob {
+            unreachable!()
+        }
+        fn return_unclaimed_result(&mut self, _: CausalInputObligation<FrontendActor>) {
+            unreachable!()
+        }
+        fn core_consumed(&mut self, _: &[InputId]) {}
+        fn owner_failed_pending(&mut self, _: PendingHandoff) {
+            unreachable!()
+        }
+        fn close_external(&mut self) {
+            self.closing = true;
+            self.scope.close_external().unwrap();
+        }
+        fn result_admission_closed(&self) -> bool {
+            self.closing
+        }
+        fn progress_retirement(
+            &mut self,
+            runtime: &ActorRuntime<FrontendActor>,
+            turn: &ActorHostTurn<FrontendActor>,
+            _: Tick,
+            budget: usize,
+        ) -> SourceProgress {
+            SourceProgress {
+                units: usize::from(budget != 0),
+                progressed: false,
+                more: budget == 0 && self.closing,
+                retired: budget != 0
+                    && self.closing
+                    && runtime
+                        .snapshot(turn.registration().actor())
+                        .unwrap()
+                        .inputs
+                        == 0
+                    && self.scope.join_ready().unwrap(),
+            }
+        }
+    }
+    // Three final families have their original paid roles. Admission and
+    // Establish share exactly ONE Authorization call/result credit.
+    struct Row {
+        token: Option<AttemptRequestToken>,
+        job: Option<PreparedEffectJob>,
+    }
+    struct PortCalls {
+        scope: ScopeHandle,
+        calls: [Arc<Mutex<AttemptCallSource>>; 3],
+        process: Arc<Mutex<AttemptCallSource>>,
+        requests: Arc<AttemptRequests>,
+        bank: Arc<AttemptFactBank>,
+        material: Arc<AttemptEstablishMaterial>,
+        compatibility: NativeCompatibilityId,
+        executor: ActorTransportExecutor,
+        published: Arc<AtomicUsize>,
+        loan: Option<FactPositionLoanObligation>,
+        selected: Option<FactRole>,
+        rows: [Option<Row>; 3],
+        next: usize,
+        closed: bool,
+    }
+    impl EffectSource for PortCalls {
+        fn prepay_result(
+            &mut self,
+            effect: &FrontendEffect,
+        ) -> Option<CausalInputObligation<FrontendActor>> {
+            let FrontendEffect::Attempt(effect) = effect else {
+                unreachable!()
+            };
+            self.selected = FactRole::for_protocol_effect(&effect.protocol.body);
+            let Some(role) = self.selected else {
+                return self.process.lock().unwrap().prepay(effect).unwrap();
+            };
+            if self.rows[role.index()].is_some() || !self.requests.has_capacity() {
+                return None;
+            }
+            let loan = self.bank.try_loan(role)?;
+            let result = self.calls[role.index()]
+                .lock()
+                .unwrap()
+                .prepay(effect)
+                .unwrap()?;
+            assert!(self.loan.replace(loan).is_none());
+            Some(result)
+        }
+        fn bind_job(
+            &mut self,
+            _: &ActorRuntime<FrontendActor>,
+            _: &ActorHostTurn<FrontendActor>,
+            ticket: &EffectTicket<FrontendEffect>,
+            result: CausalInputObligation<FrontendActor>,
+        ) -> PreparedEffectJob {
+            assert!(self.selected.is_none());
+            self.process.lock().unwrap().bind(ticket, result)
+        }
+        fn try_bind_effect(
+            &mut self,
+            runtime: &ActorRuntime<FrontendActor>,
+            turn: &ActorHostTurn<FrontendActor>,
+            ticket: &EffectTicket<FrontendEffect>,
+            result: CausalInputObligation<FrontendActor>,
+        ) -> Result<PreparedEffectBinding, EffectBindRefusal> {
+            let Some(role) = self.selected else {
+                return Ok(PreparedEffectBinding::Job(
+                    self.bind_job(runtime, turn, ticket, result),
+                ));
+            };
+            let FrontendEffect::Attempt(effect) = &ticket.effect else {
+                unreachable!()
+            };
+            let original = match &effect.protocol.body {
+                EffectBody::EstablishAuthorization { operation, request } => {
+                    let AttemptToLogicalBody::AuthorizationRequest {
+                        request: authorization,
+                        ..
+                    } = request.body
+                    else {
+                        unreachable!()
+                    };
+                    self.material
+                        .for_authorization(operation, authorization)
+                        .unwrap();
+                    request
+                }
+                EffectBody::Port(original) => original,
+                _ => unreachable!(),
+            };
+            let message = novarocks_attempt_protocol::port_projection::project_attempt_message(
+                original,
+                &mut |_| None,
+                &mut |p, op| self.material.authorization_facts(p, op, self.compatibility),
+                &mut |_, _, _| None,
+            )
+            .unwrap();
+            let request = match message.body {
+                CanonicalBody::AuthorizationRequest { token, .. }
+                | CanonicalBody::PreReadyReplacementQuery { token, .. }
+                | CanonicalBody::EstablishSettlement { token, .. } => Some(token),
+                _ => None,
+            };
+            let mut job = self.calls[role.index()]
+                .lock()
+                .unwrap()
+                .bind(ticket, result);
+            let transport = job.transport.take();
+            let row = if request.is_some() {
+                self.requests.insert(&message, job).unwrap();
+                Row {
+                    token: request,
+                    job: None,
+                }
+            } else {
+                Row {
+                    token: None,
+                    job: Some(job),
+                }
+            };
+            assert!(self.rows[role.index()].replace(row).is_none());
+            self.loan
+                .take()
+                .unwrap()
+                .publish_now(runtime, ticket, message)
+                .unwrap();
+            // The complete SAME job is retained before current-ticket commit.
+            // The original Host tracks its Join before this Source can launch it.
+            Ok(PreparedEffectBinding::Retained { transport })
+        }
+        fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>) {
+            drop(self.loan.take());
+            match self.selected {
+                Some(role) => self.calls[role.index()]
+                    .lock()
+                    .unwrap()
+                    .return_unclaimed(result),
+                None => self.process.lock().unwrap().return_unclaimed(result),
+            }
+        }
+        fn core_consumed(&mut self, _: &[InputId]) {}
+        fn transport_event(&mut self, action: AttemptActionId, event: TransportSourceEvent) {
+            let call = if action.get() == 6 {
+                &self.process
+            } else {
+                &self.calls[if action.get() <= 4 {
+                    FactRole::Authorization
+                } else if action.get() == 5 {
+                    FactRole::PreReady
+                } else {
+                    FactRole::Lifecycle
+                }
+                .index()]
+            };
+            let mut call = call.lock().unwrap();
+            match event {
+                TransportSourceEvent::Result(original) => {
+                    call.accept(original)
+                        .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)));
+                    if action.get() >= 6 {
+                        self.published.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                TransportSourceEvent::Retired => call.transport_retired(action),
+                original => std::panic::resume_unwind(Box::new(original)),
+            }
+        }
+        fn owner_failed_pending(&mut self, original: PendingHandoff) {
+            std::panic::resume_unwind(Box::new(original));
+        }
+        fn close_external(&mut self) {
+            self.closed = true;
+            self.scope.close_external().unwrap();
+        }
+        fn result_admission_closed(&self) -> bool {
+            self.closed
+        }
+        fn progress_retirement(
+            &mut self,
+            _: &ActorRuntime<FrontendActor>,
+            _: &ActorHostTurn<FrontendActor>,
+            _: Tick,
+            budget: usize,
+        ) -> SourceProgress {
+            let mut units = 0;
+            let mut progressed = false;
+            while units < budget.min(4) {
+                let index = self.next;
+                self.next = (self.next + 1) % 4;
+                units += 1;
+                if index < 3 {
+                    if let Some(row) = &mut self.rows[index] {
+                        if let Some(token) = row.token
+                            && let Some(original) = self.requests.take_replied(token)
+                        {
+                            assert_eq!(original.token, token);
+                            row.token = None;
+                            row.job = Some(original.job);
+                            progressed = true;
+                        }
+                        if let Some(job) = row.job.take() {
+                            match self.executor.handoff(job) {
+                                Ok(()) => {
+                                    self.rows[index] = None;
+                                    progressed = true;
+                                }
+                                Err(job) => row.job = Some(job),
+                            }
+                        }
+                    }
+                    progressed |= self.calls[index].lock().unwrap().retire_result().unwrap();
+                } else {
+                    progressed |= self.process.lock().unwrap().retire_result().unwrap();
+                }
+            }
+            SourceProgress {
+                units,
+                progressed,
+                more: progressed,
+                retired: self.closed && self.scope.join_ready().unwrap(),
+            }
+        }
+    }
+
     let fixture = Fixture::new();
     let generation = Generation::new(1).unwrap();
     let (mut parent, mut payer) = fixture
@@ -1527,7 +1879,6 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let (mut logical, drive, _abort_intake) = logical_execution(participation).await;
     let compatibility = NativeCompatibilityId::new([31; 32]);
     let lease = LeaseValidFor::new(Duration::from_secs(30)).unwrap();
     let admission = AcquireParticipationAdmissionTicket::new(
@@ -1550,7 +1901,11 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         AttemptEstablishMaterial::project(&facts, [participation], &mut next_payload).unwrap();
     let operation_id = TaskOperationId::new_v7();
     let quote = quotes[&participation];
-    let activation = drive.identity();
+    let activation = novarocks_coordination_contract::AttemptActivationIdentity::from_parts(
+        1,
+        participation.query_execution_id(),
+        1,
+    );
     let id = |number| NonZeroU64::new(number).unwrap();
     let port = |number, body| AttemptToLogical {
         activation,
@@ -1703,7 +2058,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     });
     let remote = progress(8, false, Some(closure.clone()), None);
     let local = progress(9, true, None, Some(selection.clone()));
-    let mailbox = [8; 4];
+    let mailbox = [10, 8, 8, 8];
     let inbox = WithdrawalInbox::with_commands(
         &fixture.scope,
         [
@@ -1712,20 +2067,85 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         .map(|effect| (effect, None)),
         mailbox,
     );
-    let source = Arc::new(Mutex::new(AttemptCallSource::new(
-        &parent,
-        &payer,
-        generation,
-        observer(),
-        AttemptCallOwner::Qa(Arc::new(tokio::sync::Mutex::new(AttemptQaBridge::new(
-            Arc::new(drive),
-            compatibility,
-            Arc::new(material),
-        )))),
-        inbox.reserve_result(&parent),
-    )));
-    let terminal = TerminalOutbox::new(activation);
-    source.lock().unwrap().install_terminal(terminal.clone());
+    let runtime = &inbox.runtime;
+    let logical_scope = fixture.ledger.open_scope_next(None, generation).unwrap();
+    let (mut logical_work, mut logical_payer) = logical_scope
+        .reserve_next(
+            generation,
+            ReservationResources::work_only(),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    logical_work.start().unwrap();
+    let logical_seen = Arc::new(Mutex::new(Vec::new()));
+    let next_reply = Arc::new(Mutex::new(None));
+    let config = ActorConfig {
+        mailbox: [16; 4],
+        max_batches: 16,
+        max_effects_per_step: 1,
+        max_dependencies_per_effect: 0,
+        turn_budget: 12,
+        max_step_work: 2,
+    };
+    let logical = runtime
+        .register_bound(
+            ActorId::new(31).unwrap(),
+            logical_scope.clone(),
+            FrontendActor::Test(Box::new(LogicalReceiver {
+                attempt: inbox.registration.actor(),
+                seen: logical_seen.clone(),
+                next: next_reply.clone(),
+            })),
+            config,
+        )
+        .unwrap_or_else(|(error, _)| panic!("same actual LP carrier actor: {error:?}"));
+    let ap_wake = Waker::from(Arc::new(HostWake {
+        runtime: runtime.clone(),
+        registration: inbox.registration.clone(),
+    }));
+    let lp_wake = Waker::from(Arc::new(HostWake {
+        runtime: runtime.clone(),
+        registration: logical.clone(),
+    }));
+    let bank = AttemptFactBank::reserve(
+        runtime,
+        &logical,
+        &inbox.registration,
+        activation,
+        &logical_work,
+        ap_wake.clone(),
+        lp_wake,
+    )
+    .unwrap();
+    let requests = AttemptRequests::new(
+        activation,
+        inbox.registration.clone(),
+        logical.clone(),
+        NonZeroUsize::MIN,
+        ap_wake,
+    );
+    let material = Arc::new(material);
+    let calls = FactRole::ALL.map(|role| {
+        Arc::new(Mutex::new(AttemptCallSource::new(
+            &parent,
+            &payer,
+            generation,
+            observer(),
+            AttemptCallOwner::LogicalPort(role),
+            CausalInputObligation::reserve_admitted(
+                runtime,
+                &inbox.registration,
+                logical.actor(),
+                InputClass::Lifecycle,
+                &parent,
+            )
+            .unwrap(),
+        )))
+    });
+    let source = calls[FactRole::Authorization.index()].clone();
     let endpoint = RuntimeEndpoint::new("127.0.0.1", 1701).unwrap();
     let replacement = BackendProcessId::new_v7();
     let processes = Arc::new(FrozenProcess {
@@ -1766,7 +2186,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         ))),
     );
     let handle = Handle::current();
-    let host_exit = host
+    let mut host_exit = host
         .register(HostBinding {
             scope: fixture.scope.clone(),
             registration: inbox.registration.clone(),
@@ -1777,39 +2197,120 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             },
             policy: FrontendLanePolicy::attempt(1),
             executor: Arc::new(ActorTransportExecutor(handle.clone())),
-            source: Box::new(CallFixtureSource {
+            source: Box::new(PortCalls {
                 scope: fixture.scope.clone(),
-                source: source.clone(),
+                calls: calls.clone(),
+                process: process.clone(),
+                requests: requests.clone(),
+                bank: bank.clone(),
+                material: material.clone(),
+                compatibility,
+                executor: ActorTransportExecutor(handle.clone()),
                 published: published.clone(),
-                process: Some(process.clone()),
-                process_pending: false,
+                loan: None,
+                selected: None,
+                rows: std::array::from_fn(|_| None),
+                next: 0,
                 closed: false,
             }),
             transport: Some(TransportRetirements::new(
                 inbox.runtime.clone(),
                 inbox.registration.clone(),
-                handle,
+                handle.clone(),
                 1,
             )),
             startup: None,
             capacity: None,
             membership: None,
-            owner_controls: None,
+
+            local_exit: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("original QA host registration"));
-    let (failure, _residual_port) = PendingFailureBridge::new(
-        inbox.registration.clone(),
-        activation,
-        members,
-        Arc::new(FailurePublications::new(
-            inbox.registration.clone(),
-            activation,
-            &fixture.scope,
-        )),
-    );
-    let mut registered_terminal =
-        RegisteredAttemptTerminal::new(terminal.clone(), failure.bind(host_exit, processes), None);
+    let actual_ap_exit = host_exit.observe_actual_exit();
+    let mut logical_exit = host
+        .register(HostBinding {
+            scope: logical_scope.clone(),
+            registration: logical.clone(),
+            kind: FrontendActorKind::Test,
+            config,
+            policy: FrontendLanePolicy::logical(1),
+            source: Box::new(LogicalReceivingSource {
+                scope: logical_scope.clone(),
+                closing: false,
+            }),
+            executor: Arc::new(ActorTransportExecutor(handle)),
+            transport: None,
+            startup: None,
+            capacity: None,
+            membership: None,
+            local_exit: None,
+            ordered_observations: None,
+        })
+        .unwrap_or_else(|_| panic!("actual LP receiving Host and Source"));
+    let reply_triggers = Mutex::new(Vec::new());
+    let reply = |number, body| {
+        let message = CanonicalReply { activation, body };
+        let original = FrontendEffect::Logical(Arc::new(LogicalEffectEnvelope {
+            reservation: logical_payer.id(),
+            body: LogicalHostEffect::Protocol(Box::new(
+                novarocks_logical_execution_protocol::effect::LogicalEffect {
+                    action: novarocks_logical_execution_protocol::LogicalActionId::new(id(number)),
+                    body:
+                        novarocks_logical_execution_protocol::effect::LogicalEffectBody::AttemptPort(
+                            Box::new(message.clone()),
+                        ),
+                },
+            )),
+        }));
+        assert!(next_reply.lock().unwrap().replace(original).is_none());
+        let position = runtime
+            .reserve_admitted_input_for(
+                &logical,
+                logical.actor(),
+                InputClass::Lifecycle,
+                &logical_work,
+            )
+            .unwrap()
+            .into_standing_input()
+            .unwrap_or_else(|_| panic!("same original LP reply trigger"));
+        let input = position.fill(FrontendInput::Test(1)).unwrap();
+        for _ in 0..16 {
+            runtime.poll_one(Tick(1)).unwrap();
+            if runtime
+                .effect_inventory(logical.actor(), input, None, 1)
+                .is_ok_and(|v| !v.is_empty())
+            {
+                break;
+            }
+        }
+        let ticket = runtime
+            .take_effect(logical.actor(), input, ActionId::new(number).unwrap())
+            .unwrap();
+        let original_input = requests
+            .deliver_reply_now(runtime, &ticket, message)
+            .unwrap();
+        assert!(
+            runtime
+                .input_custody(inbox.registration.actor(), original_input)
+                .unwrap()
+                .is_some()
+        );
+        runtime.effect_completed(ticket).unwrap();
+        assert_eq!(
+            runtime
+                .effect_inventory(logical.actor(), input, None, 1)
+                .unwrap()[0]
+                .1,
+            novarocks_control_runtime_core::effect::EffectState::Completed
+        );
+        // The synchronous original script delivered its SAME current ticket.
+        // Retire that completed input before this passive LP Host indexes it;
+        // keep its original idle role until the final explicit close below.
+        assert!(position.retire_ready_after_exit().unwrap());
+        published.fetch_add(1, Ordering::SeqCst);
+        reply_triggers.lock().unwrap().push(position);
+    };
     let submit_pair = || {
         let commands = [inbox.submit_command(&parent), inbox.submit_command(&parent)];
         assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
@@ -1824,12 +2325,16 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         }
     };
     let commit_reply = || {
-        let (_, AttemptInput::Port(reply)) = inbox.try_commit_attempt().unwrap() else {
+        let (_, AttemptInput::Port(reply)) =
+            inbox.try_commit_attempt_from(logical.actor()).unwrap()
+        else {
             panic!("same original QA reply");
         };
         reply.body
     };
     let drive_host = || {
+        bank.progress(3, false, false).unwrap();
+        while inbox.runtime.poll_one(Tick(1)).unwrap() {}
         while let Some(turn) = inbox.runtime.claim_host_actor() {
             host.drive(Tick(1), turn);
         }
@@ -1848,15 +2353,81 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             .unwrap();
         }
     };
+    let await_fact = |number: u64| {
+        let drive_host = &drive_host;
+        let seen = &logical_seen;
+        async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    drive_host();
+                    if let Some(original) = seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|m| m.action.get() == number)
+                        .cloned()
+                    {
+                        break original;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+    };
     let commands = submit_pair();
-    await_reply(1).await;
+    let first = await_fact(1).await;
+    assert!(
+        matches!(first.body, CanonicalBody::AuthorizationRequest { token: t,
+        request: novarocks_coordination_contract::logical_port::AttemptAuthorization::BeginAdmission(original),
+    } if t == token(1) && original.envelope() == admission.envelope()
+        && original.participation() == participation && original.valid_for() == lease
+        && original.native_compatibility_id() == compatibility
+        && original.admission_epoch_capability() == admission.admission_epoch_capability())
+    );
     drive_host();
-    assert_eq!(published.load(Ordering::SeqCst), 1);
+    assert!(
+        logical_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|m| m.action.get() != 2),
+        "second original authorization cannot overwrite the original outstanding reply"
+    );
     assert!(!source.lock().unwrap().retire_result().unwrap());
+    assert_eq!(published.load(Ordering::SeqCst), 0);
+    // Explicit script protocol references confer no WC resource grant.
+    reply(
+        1,
+        LogicalToAttemptBody::AuthorizationReply {
+            token: token(1),
+            decision: Ok(AttemptAuthorizationDecision::AdmissionStarted(
+                admission_issue,
+            )),
+        },
+    );
+    await_reply(1).await;
     assert!(
         matches!(commit_reply(), LogicalToAttemptBody::AuthorizationReply {
         token: reply_token, decision: Ok(AttemptAuthorizationDecision::AdmissionStarted(issue)),
     } if reply_token == token(1) && issue == admission_issue)
+    );
+    let granted = await_fact(2).await;
+    assert!(
+        matches!(granted.body, CanonicalBody::AuthorizationRequest { token: t,
+        request: novarocks_coordination_contract::logical_port::AttemptAuthorization::SettleAdmission {
+            issue, participation: p, operation_id: op, outcome: Some(OperationOutcome::Accepted), receipt: Some(r), prior_transport_unknown: false,
+        },
+    } if t == token(2) && issue == admission_issue && p == participation
+        && op == admission.envelope().operation_id() && r.ticket_id() == ticket)
+    );
+    reply(
+        2,
+        LogicalToAttemptBody::AuthorizationReply {
+            token: token(2),
+            decision: Ok(AttemptAuthorizationDecision::AdmissionGranted),
+        },
     );
     await_reply(2).await;
     assert!(
@@ -1868,11 +2439,73 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     drive_host();
 
     let commands = submit_pair();
+    let establish = await_fact(3).await;
+    let CanonicalBody::AuthorizationRequest {
+        token: t,
+        request:
+            novarocks_coordination_contract::logical_port::AttemptAuthorization::Establish {
+                participation: p,
+                operation_id: op,
+                ticket_id,
+                semantics,
+                native_compatibility_id,
+            },
+    } = establish.body
+    else {
+        panic!("same original complete Establish metadata")
+    };
+    let expected = material
+        .authorization_facts(participation, operation_id, compatibility)
+        .unwrap();
+    assert_eq!(
+        (t, p, op, ticket_id, semantics, native_compatibility_id),
+        (
+            token(3),
+            participation,
+            operation_id,
+            ticket,
+            expected.semantics,
+            compatibility
+        )
+    );
+    drive_host();
+    assert!(
+        logical_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|m| m.action.get() != 4)
+    );
+    assert!(!source.lock().unwrap().retire_result().unwrap());
+    reply(
+        3,
+        LogicalToAttemptBody::AuthorizationReply {
+            token: token(3),
+            decision: Ok(AttemptAuthorizationDecision::EstablishAuthorized(
+                authorization,
+            )),
+        },
+    );
     await_reply(3).await;
     assert!(
         matches!(commit_reply(), LogicalToAttemptBody::AuthorizationReply {
         token: reply_token, decision: Ok(AttemptAuthorizationDecision::EstablishAuthorized(guard)),
     } if reply_token == token(3) && guard == authorization)
+    );
+    let settled = await_fact(4).await;
+    assert!(
+        matches!(settled.body, CanonicalBody::EstablishSettlement { token: t,
+        authorization: original, participation: p, operation_id: op,
+        settlement: AttemptIssueSettlement::DefinitelyUnsent,
+    } if t == token(4) && original == authorization && p == participation && op == operation_id)
+    );
+    reply(
+        4,
+        LogicalToAttemptBody::EstablishSettlementReply {
+            token: token(4),
+            authorization,
+            result: Ok(()),
+        },
     );
     await_reply(4).await;
     assert!(
@@ -1886,6 +2519,23 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     // have different source authors and neither can stand in for the other.
     let permission_command = inbox.submit_command(&parent);
     assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    let permission = await_fact(5).await;
+    let CanonicalBody::PreReadyReplacementQuery {
+        token: exact,
+        refusal: original_refusal,
+    } = permission.body
+    else {
+        unreachable!()
+    };
+    assert_eq!(exact, token(5));
+    assert!(original_refusal.pre_ready_replacement().is_none());
+    reply(
+        5,
+        LogicalToAttemptBody::PreReadyReplacementReply {
+            token: token(5),
+            may_observe: false,
+        },
+    );
     await_reply(5).await;
     assert!(
         matches!(commit_reply(), LogicalToAttemptBody::PreReadyReplacementReply {
@@ -1913,10 +2563,12 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     let terminal_command = inbox.submit_command(&parent);
     assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
     await_reply(7).await;
-    let novarocks_query_application::api::NativeAttemptTerminal::Failed(failure) =
-        terminal.terminal().await.unwrap()
+    let terminal_fact = await_fact(7).await;
+    let CanonicalBody::AttemptTerminal(
+        novarocks_coordination_contract::logical_port::AttemptTerminal::Failed(failure),
+    ) = terminal_fact.body
     else {
-        panic!("the original refusal was delivered");
+        panic!("original typed refusal actual handoff")
     };
     assert!(failure.pre_ready_replacement().is_none());
     assert_eq!(
@@ -1924,7 +2576,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         novarocks_query_application::execution_error::ExecutionFailureSite::Operation {
             participation,
             operation_id,
-            kind: OperationKind::UpdateParticipation,
+            kind: OperationKind::UpdateParticipation
         }
     );
     inbox
@@ -1936,21 +2588,29 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     let remote_command = inbox.submit_command(&parent);
     assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
     await_reply(8).await;
-    {
-        let mut waiting = Box::pin(terminal.normal_convergence());
-        assert!(futures::poll!(waiting.as_mut()).is_pending());
-    }
+    let original_remote = await_fact(8).await;
+    assert!(
+        matches!(&original_remote.body, CanonicalBody::ConvergenceProgress {
+        local_exited: false, closure: Some(original), lifecycle_runtime_filters: None,
+    } if Arc::ptr_eq(original, &closure))
+    );
+    assert!(
+        !*actual_ap_exit.borrow(),
+        "positive remote metadata is not actual Source exit"
+    );
     retire_commands(&[remote_command]);
     let local_command = inbox.submit_command(&parent);
     assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
     await_reply(9).await;
-    assert!(Arc::ptr_eq(&terminal.normal_convergence().await, &closure));
-    assert!(Arc::ptr_eq(&terminal.normal_convergence().await, &closure));
-    assert!(registered_terminal.normal_convergence_ready().await);
+    let original_local = await_fact(9).await;
     assert!(
-        registered_terminal
-            .lifecycle_runtime_filter_diagnostic()
-            .is_none()
+        matches!(&original_local.body, CanonicalBody::ConvergenceProgress {
+        local_exited: true, closure: None, lifecycle_runtime_filters: Some(original),
+    } if Arc::ptr_eq(original, &selection))
+    );
+    assert!(
+        !*actual_ap_exit.borrow(),
+        "original parent/capture boundary remains independent"
     );
     retire_commands(&[local_command]);
     drive_host();
@@ -1963,29 +2623,35 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             .expect("original Process owner retired")
     };
     drop(process_owner);
-    let bridge = {
-        let mut qa = source.lock().unwrap();
-        assert!(qa.close_idle().unwrap());
-        qa.take_drained_owner().expect("original QA bridge retired")
-    };
-    drop(bridge);
-    use crate::query_execution::native_execution_adapter::source_cohort::tests as wc;
-    let (workload, driver, _capacity) = wc::fixture();
-    let query = workload
-        .try_begin_root(novarocks_workload_control::WorkRequest::new(
-            novarocks_workload_control::WorkClass::Query,
-        ))
+    for call in &calls {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                drive_host();
+                if call.lock().unwrap().close_idle().unwrap() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
         .unwrap();
-    let request = NativeActiveConvergenceRequest::new(
-        query.owner.scope().cancellation().unwrap(),
-        std::time::Instant::now() + Duration::from_secs(1),
-    );
+        let original = call
+            .lock()
+            .unwrap()
+            .take_drained_owner()
+            .expect("same final call owner after actual Join");
+        drop(original);
+    }
+    assert!(requests.is_empty());
+    host_exit.request_close().unwrap();
+    drive_host();
     {
-        let mut waiting = Box::pin(registered_terminal.finish_convergence(request.clone()));
+        let mut waiting = Box::pin(host_exit.wait());
         assert!(futures::poll!(waiting.as_mut()).is_pending());
         drive_host();
         assert!(futures::poll!(waiting.as_mut()).is_pending());
     }
+    assert!(!*actual_ap_exit.borrow());
     parent.body_exited().unwrap();
     parent.captures_exited().unwrap();
     payer.finish().unwrap();
@@ -1995,49 +2661,53 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         .notify_host_actor(&inbox.registration)
         .unwrap();
     drive_host();
-    let closure = tokio::time::timeout(
-        Duration::from_secs(1),
-        registered_terminal.finish_convergence(request),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(matches!(
-        closure,
-        NativeActiveConvergenceClosure::Evidence(
-            NativeAttemptConvergence::Participations(rows),
-        ) if rows.as_ref() == [NativeParticipationConvergence::never_established(participation)]
-    ));
-    registered_terminal.request_host_close().unwrap();
-    assert!(std::ptr::eq(
-        registered_terminal
-            .lifecycle_runtime_filter_diagnostic()
-            .unwrap(),
-        selection.as_ref(),
-    ));
-    assert!(host.is_empty() && inbox.runtime.is_empty() && fixture.ledger.is_empty());
-    wc::finish(workload, query, driver);
-    logical.abandon_running_attempt();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while logical
-            .stand_down_snapshot(participation)
-            .await
-            .unwrap()
-            .is_none()
-        {
-            tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), host_exit.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(*actual_ap_exit.borrow());
+    assert!(
+        matches!(&original_remote.body, CanonicalBody::ConvergenceProgress { closure: Some(original), .. } if Arc::ptr_eq(original, &closure))
+    );
+    assert!(
+        matches!(&original_local.body, CanonicalBody::ConvergenceProgress { lifecycle_runtime_filters: Some(original), .. } if Arc::ptr_eq(original, &selection))
+    );
+    requests.close_admission();
+    bank.original_producer_exited();
+    let mut closed = false;
+    for _ in 0..16 {
+        while runtime.poll_one(Tick(1)).unwrap() {}
+        while let Some(turn) = runtime.claim_host_actor() {
+            host.drive(Tick(1), turn);
         }
-    })
-    .await
-    .unwrap();
-    logical
-        .observe_worker_process_replaced(participation)
-        .await
+        closed = bank.progress(3, true, false).unwrap().complete;
+        if closed {
+            break;
+        }
+    }
+    assert!(closed && bank.is_closed());
+    for mut position in reply_triggers.into_inner().unwrap() {
+        assert!(position.retire_ready_after_exit().unwrap());
+        position.close_after_exit().unwrap();
+    }
+    drop((requests, bank));
+    logical_work.body_exited().unwrap();
+    logical_work.captures_exited().unwrap();
+    logical_payer.finish().unwrap();
+    logical_scope.close_external().unwrap();
+    fixture
+        .ledger
+        .reap_scope_ready(logical_scope.id(), 128)
         .unwrap();
-    logical
-        .finish_until(std::time::Instant::now() + Duration::from_secs(2))
+    logical_exit.request_close().unwrap();
+    while let Some(turn) = runtime.claim_host_actor() {
+        host.drive(Tick(1), turn);
+    }
+    tokio::time::timeout(Duration::from_secs(1), logical_exit.wait())
         .await
+        .unwrap()
         .unwrap();
+    assert!(host.is_empty() && runtime.is_empty() && fixture.ledger.is_empty());
 }
 
 #[tokio::test]
@@ -2309,7 +2979,8 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         startup: None,
         capacity: None,
         membership: None,
-        owner_controls: None,
+
+        local_exit: None,
         ordered_observations: None,
     })
     .unwrap_or_else(|_| panic!("same original host route"));
@@ -2521,4 +3192,21 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     }
     assert!(host.is_empty() && inbox.runtime.is_empty() && fixture.ledger.is_empty());
     assert!(wc.finish());
+}
+
+/// Passive test observation of the SAME retained Join, including its actual
+/// completed fact. It grants no start, cancellation, result or exit authority.
+pub(crate) fn original_transport_join_id(
+    original: &OriginalTransportJoinObligation,
+) -> Option<tokio::task::Id> {
+    let state = original
+        .role
+        .joined
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    state
+        .join
+        .as_ref()
+        .map(tokio::task::JoinHandle::id)
+        .or_else(|| state.facts.map(|facts| facts.id))
 }

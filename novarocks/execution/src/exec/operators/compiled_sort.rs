@@ -15,16 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compiled global and analytic Sort and ordinary row-count TopN.
+//! Compiled full/partitioned Sort and row-count/partition-rank TopN.
 //!
-//! The local compiler emits exactly three shapes of the local Sort
-//! vocabulary: a global sort (`use_top_n = false`, no limit, offset 0), an
-//! analytic sort (the same with partition keys and no partition limit) and an
-//! ordinary row-count TopN (`use_top_n = true`, `limit`, `offset`, RowNumber,
-//! no partition keys). None has a buffering cap. An analytic sort orders by
-//! its partition keys first, each with its own direction and NULL placement,
-//! and then by its order keys; it emits every row, so its partitions arrive
-//! contiguously. Every other Sort shape is an explicit refusal here.
+//! LocalProgram carries a closed ordering mode. Full and partitioned sorts
+//! emit the complete relation; row-count TopN emits its exact offset window.
+//! Partition TopN keeps each partition's rows whose selected rank is at most K.
 //!
 //! The TopN shape serves every phase of a `Rows` reduction alike, because
 //! each is the window of its own instance input. Single and Final read the
@@ -44,10 +39,12 @@
 //!
 //! Semantics: rows are ordered by the keys with each key's direction and
 //! NULL placement, ties keep arrival order (stable), and the output is the
-//! sorted rows `[offset, offset + limit)`. TopN bounds its buffer by keeping
-//! only the first `offset + limit` sorted rows once enough rows arrive; this
-//! is exact because a row outside that prefix can never re-enter it. A full
-//! sort buffers its whole input in memory (no spill, ADR-0162).
+//! sorted rows. Row-count TopN emits `[offset, offset + limit)` and retains
+//! its first `offset + limit` rows. Partition TopN retains rows whose selected
+//! rank is at most K, including complete boundary peer groups for Rank and
+//! DenseRank. Retained rows precede new arrivals in later sorts. Rank ties can
+//! retain arbitrarily many rows; K is not a memory bound. Full sorts buffer
+//! their whole input in memory (no spill, ADR-0162).
 
 use crate::exec::fragment::error::{
     FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
@@ -58,7 +55,7 @@ use std::sync::Arc;
 use arrow::array::ArrayRef;
 use arrow::compute::{SortColumn, SortOptions};
 use novarocks_local_program::{
-    LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef, SortTopNType,
+    LocalProgram, LocalSortMode, PartitionRank, ProgramNodeId, ProgramNodeKind, ProgramRootRef,
 };
 
 use super::compiled_expression::{
@@ -78,6 +75,13 @@ use crate::exec::pipeline::{
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::ExecutionResult;
 
+#[derive(Clone, Copy)]
+struct RankRetention {
+    partition_keys: usize,
+    rank: PartitionRank,
+    keep: usize,
+}
+
 /// TopN prunes its buffer to `offset + limit` rows once it holds at least
 /// `max(PRUNE_FACTOR * kept, PRUNE_MIN_ROWS)` rows, as the legacy TopN does.
 const PRUNE_FACTOR: usize = 4;
@@ -88,11 +92,11 @@ pub struct CompiledSortProcessorFactory {
     program: Arc<LocalProgram>,
     sites: Vec<ProgramRootRef>,
     options: Vec<SortOptions>,
-    /// `offset + limit` for a TopN; `None` for a full sort.
-    keep: Option<usize>,
+    retention: Option<RankRetention>,
     limit: Option<usize>,
     offset: usize,
     prune_rows: usize,
+    prune_min_rows: usize,
     output_node: ProgramNodeId,
     error: Arc<RuntimeErrorState>,
 }
@@ -109,77 +113,53 @@ impl CompiledSortProcessorFactory {
                 format!("compiled Sort node {} is absent", node.index()),
             )
         })?;
-        let ProgramNodeKind::Sort {
-            use_top_n,
-            order_by,
-            limit,
-            offset,
-            topn_type,
-            max_buffered_rows,
-            max_buffered_bytes,
-            partition_exprs,
-            partition_limit,
-            ..
-        } = graph_node.kind()
-        else {
+        let ProgramNodeKind::Sort { order_by, mode, .. } = graph_node.kind() else {
             return Err(program_binding_failure(
                 PlanBindingKind::InvalidAssignment,
                 format!("compiled local node {} is not a Sort", node.index()),
             ));
         };
         let at = node.index();
-        if partition_limit.is_some() {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                format!(
-                    "compiled Sort at local node {at} with a partition limit is not executable"
-                ),
-            ));
-        }
-        if *use_top_n && !partition_exprs.is_empty() {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                format!("compiled TopN at local node {at} with partition keys is not executable"),
-            ));
-        }
-        if *topn_type != SortTopNType::RowNumber {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                format!(
-                    "compiled TopN at local node {at} with {topn_type:?} ranking is not executable"
-                ),
-            ));
-        }
-        if max_buffered_rows.is_some() || max_buffered_bytes.is_some() {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                format!(
-                    "compiled Sort at local node {at} carries a buffering cap the compiler never authors"
-                ),
-            ));
-        }
+        let partition_exprs = mode.partition_by();
+        let (limit, offset, retention) = match mode {
+            LocalSortMode::Full | LocalSortMode::Partitioned { .. } => (None, 0, None),
+            LocalSortMode::RowsTopN { limit, offset } => {
+                let keep = offset.checked_add(*limit).ok_or_else(|| {
+                    program_binding_failure(
+                        PlanBindingKind::InvalidAssignment,
+                        format!("compiled TopN at local node {at} limit and offset overflow"),
+                    )
+                })?;
+                (
+                    Some(*limit),
+                    *offset,
+                    Some(RankRetention {
+                        partition_keys: 0,
+                        rank: PartitionRank::RowNumber,
+                        keep,
+                    }),
+                )
+            }
+            LocalSortMode::PartitionTopN {
+                partition_by,
+                limit,
+                rank,
+            } => (
+                None,
+                0,
+                Some(RankRetention {
+                    partition_keys: partition_by.len(),
+                    rank: *rank,
+                    keep: limit.get(),
+                }),
+            ),
+        };
         if order_by.is_empty() && partition_exprs.is_empty() {
             return Err(program_binding_failure(
                 PlanBindingKind::InvalidAssignment,
                 format!("compiled Sort at local node {at} has no ordering key"),
             ));
         }
-        let keep = if *use_top_n {
-            let limit = limit.ok_or_else(|| {
-                program_binding_failure(
-                    PlanBindingKind::MissingAssignment,
-                    format!("compiled TopN at local node {at} has no row limit"),
-                )
-            })?;
-            Some(offset.checked_add(limit).ok_or_else(|| {
-                program_binding_failure(
-                    PlanBindingKind::MissingAssignment,
-                    format!("compiled TopN at local node {at} limit and offset overflow"),
-                )
-            })?)
-        } else {
-            None
-        };
         let mut sites = Vec::with_capacity(partition_exprs.len() + order_by.len());
         let mut options = Vec::with_capacity(partition_exprs.len() + order_by.len());
         // Partition keys lead, then the order keys within each partition.
@@ -192,11 +172,13 @@ impl CompiledSortProcessorFactory {
                 nulls_first: key.nulls_first,
             });
         }
-        let prune_rows = keep.map_or(usize::MAX, |keep| {
-            keep.saturating_mul(PRUNE_FACTOR).max(PRUNE_MIN_ROWS)
+        let prune_rows = retention.map_or(usize::MAX, |retention| {
+            retention
+                .keep
+                .saturating_mul(PRUNE_FACTOR)
+                .max(PRUNE_MIN_ROWS)
         });
-        let (limit, offset) = (*limit, *offset);
-        let name = if *use_top_n {
+        let name = if retention.is_some() {
             format!("COMPILED_TOP_N (node={at})")
         } else {
             format!("COMPILED_SORT (node={at})")
@@ -206,10 +188,11 @@ impl CompiledSortProcessorFactory {
             program,
             sites,
             options,
-            keep,
+            retention,
             limit,
             offset,
             prune_rows,
+            prune_min_rows: PRUNE_MIN_ROWS,
             output_node: node,
             error,
         })
@@ -219,8 +202,9 @@ impl CompiledSortProcessorFactory {
     /// pruning with few rows. The kept prefix is unchanged.
     #[cfg(test)]
     pub(crate) fn with_prune_rows(mut self, rows: usize) -> Self {
-        if self.keep.is_some() {
+        if self.retention.is_some() {
             self.prune_rows = rows;
+            self.prune_min_rows = rows;
         }
         self
     }
@@ -237,10 +221,11 @@ impl OperatorFactory for CompiledSortProcessorFactory {
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
             options: self.options.clone(),
-            keep: self.keep,
+            retention: self.retention,
             limit: self.limit,
             offset: self.offset,
             prune_rows: self.prune_rows,
+            prune_min_rows: self.prune_min_rows,
             output_node: self.output_node,
             output: None,
             construction: None,
@@ -264,10 +249,11 @@ struct CompiledSortProcessor {
     program: Arc<LocalProgram>,
     sites: Vec<ProgramRootRef>,
     options: Vec<SortOptions>,
-    keep: Option<usize>,
+    retention: Option<RankRetention>,
     limit: Option<usize>,
     offset: usize,
     prune_rows: usize,
+    prune_min_rows: usize,
     output_node: ProgramNodeId,
     output: Option<ChunkSchemaRef>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
@@ -397,25 +383,137 @@ impl CompiledSortProcessor {
         }))
     }
 
+    /// One rank-retention author for pruning and final output. Row-count
+    /// TopN is the unpartitioned RowNumber fast path.
+    // Design: ADR-0236 (docs/adr/ADR-0236-installed-optimization-domains-and-partition-rank-retention.md)
+    fn retain(&self, keep_keys: bool) -> ExecutionResult<Option<SortedRun>> {
+        let Some(retention) = self.retention else {
+            return self.sort_runs(None, keep_keys);
+        };
+        if retention.partition_keys == 0 && retention.rank == PartitionRank::RowNumber {
+            return self.sort_runs(Some(retention.keep), keep_keys);
+        }
+        let Some(sorted) = self.sort_runs(None, true)? else {
+            return Ok(None);
+        };
+        let creation = self.creation()?;
+        let source = sorted.batch.clone().into_chunk();
+        let temporary = creation.begin(&source)?;
+        let mut partition_converter = None;
+        let partitions = creation.encode_keys(
+            &mut partition_converter,
+            &sorted.keys[..retention.partition_keys],
+            sorted.keys.storage_lifetime(),
+            super::sort::creation::encoding_failure,
+        )?;
+        let mut peer_converter = None;
+        let peers = if retention.partition_keys < sorted.keys.len() {
+            Some(creation.encode_keys(
+                &mut peer_converter,
+                &sorted.keys[retention.partition_keys..],
+                sorted.keys.storage_lifetime(),
+                super::sort::creation::encoding_failure,
+            )?)
+        } else {
+            None
+        };
+        let mut selected = creation.vector::<u64>(source.len(), temporary.as_ref())?;
+        let (mut position, mut group_first, mut groups) = (0, 0, 0);
+        for row in 0..source.len() {
+            creation.observe_work(1)?;
+            let new_partition = row == 0 || partitions.row(row) != partitions.row(row - 1);
+            if new_partition {
+                position = 0;
+                groups = 0;
+            }
+            position += 1;
+            if new_partition
+                || peers
+                    .as_ref()
+                    .is_some_and(|peers| peers.row(row) != peers.row(row - 1))
+            {
+                group_first = position;
+                groups += 1;
+            }
+            let rank = match retention.rank {
+                PartitionRank::RowNumber => position,
+                PartitionRank::Rank => group_first,
+                PartitionRank::DenseRank => groups,
+            };
+            if rank <= retention.keep {
+                selected.push(u64::try_from(row).expect("supported row ordinal fits u64"));
+            }
+        }
+        if selected.len() == source.len() {
+            return Ok(Some(sorted));
+        }
+        creation.buffer_adoption(temporary.as_ref())?;
+        let indices = arrow::array::UInt64Array::from(selected);
+        let payload = creation.begin(&source)?;
+        let key_owner = creation.begin(&source)?;
+        let batch =
+            creation.take_batch(source.record_batch(), &indices, &source, payload.as_ref())?;
+        let mut keys = creation.vector::<ArrayRef>(
+            if keep_keys { sorted.keys.len() } else { 0 },
+            key_owner.as_ref(),
+        )?;
+        if keep_keys {
+            for key in sorted.keys.columns() {
+                keys.push(creation.take_array(key, &indices, &source, key_owner.as_ref())?);
+            }
+        }
+        let key_storage = if keep_keys {
+            key_owner
+                .storage_lifetime()
+                .retaining_observed::<ConstructionFailure>(
+                    &sorted.keys.array_storage_lifetime(),
+                    |layout| key_owner.request(layout),
+                )?
+        } else {
+            key_owner.storage_lifetime()
+        };
+        let storage = payload
+            .storage_lifetime()
+            .retaining_observed::<ConstructionFailure>(
+                &source.array_type_storage_lifetime(),
+                |layout| payload.request(layout),
+            )?;
+        let batch = creation
+            .publish_with_storage(batch, &source, storage, payload.as_ref())?
+            .into_batch_projection();
+        Ok(Some(SortedRun {
+            batch,
+            keys: CreatedSortColumns::new(keys, sorted.keys.storage_lifetime(), key_storage),
+        }))
+    }
+
     fn prune(&mut self) -> ExecutionResult<()> {
-        let Some(keep) = self.keep else {
+        let Some(retention) = self.retention else {
             return Ok(());
         };
-        if self.buffered_rows < self.prune_rows || self.buffered_rows <= keep {
+        if self.buffered_rows < self.prune_rows
+            || (retention.partition_keys == 0 && self.buffered_rows <= retention.keep)
+        {
             return Ok(());
         }
-        let kept = self.sort_runs(Some(keep), true)?;
+        let kept = self.retain(true)?;
         self.runs.clear();
         self.buffered_rows = 0;
         if let Some(run) = kept {
             self.buffered_rows = run.batch.len();
             self.runs.push(run);
         }
+        if retention.partition_keys > 0 {
+            self.prune_rows = self
+                .buffered_rows
+                .saturating_mul(PRUNE_FACTOR)
+                .max(self.prune_min_rows);
+        }
         Ok(())
     }
 
     fn final_output(&self) -> ExecutionResult<Option<Chunk>> {
-        let Some(sorted) = self.sort_runs(self.keep, false)? else {
+        let Some(sorted) = self.retain(false)? else {
             return Ok(None);
         };
         let rows = sorted.batch.len();
@@ -542,7 +640,7 @@ impl TransformKernel for CompiledSortProcessor {
         let keys = CreatedSortColumns::new(keys, type_storage, array_storage);
         // Every arriving row's keys are evaluated, even when no row can be
         // kept, so a key's row error never depends on the limit.
-        if self.keep == Some(0) {
+        if self.retention.is_some_and(|retention| retention.keep == 0) {
             return Ok(StepResult::new(None, NextStep::NeedInput, rows));
         }
         self.buffered_rows = self.buffered_rows.saturating_add(chunk.len());

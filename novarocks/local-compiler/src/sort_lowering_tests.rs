@@ -20,7 +20,7 @@ use super::*;
 use crate::sort::lower_sort;
 use crate::{FragmentCompileError, compile_fragment};
 use arrow_array::StringArray;
-use novarocks_local_program::{ProgramNodeId, ProgramNodeKind};
+use novarocks_local_program::{LocalSortMode, PartitionRank, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{NullOrdering, SortDirection, SortExpr, SortMode, TopNPhase};
 use novarocks_type_contract::ValueLogicalType;
 
@@ -221,31 +221,13 @@ fn global_sort_public_compile_preserves_keys_occurrences_channels_and_inactive_f
     let program = compile(package, &Control::good()).unwrap();
     let ProgramNodeKind::Sort {
         input,
-        use_top_n,
         order_by,
-        limit,
-        offset,
-        topn_type,
-        max_buffered_rows,
-        max_buffered_bytes,
-        partition_exprs,
-        partition_limit,
+        mode: LocalSortMode::Full,
     } = program.graph().nodes()[1].kind()
     else {
-        panic!("sort")
+        panic!("global sort")
     };
     assert_eq!(input.index(), 0);
-    assert!(!use_top_n);
-    assert_eq!(*limit, None);
-    assert_eq!(*offset, 0);
-    assert!(matches!(
-        topn_type,
-        novarocks_local_program::SortTopNType::RowNumber
-    ));
-    assert_eq!(*max_buffered_rows, None);
-    assert_eq!(*max_buffered_bytes, None);
-    assert!(partition_exprs.is_empty());
-    assert_eq!(*partition_limit, None);
     assert_eq!(
         order_by
             .iter()
@@ -318,22 +300,57 @@ fn global_sort_downstream_project_filter_limit_keep_original_ordered_source() {
     assert!(program.units().iter().flat_map(|unit|unit.types().iter()).any(|ty| matches!(ty,novarocks_type_contract::FunctionArgumentType::Value(ty) if ty.logical_type()==ValueLogicalType::Json && ty.nullable())));
 }
 #[test]
-fn partition_topn_sort_mode_stays_explicitly_unsupported() {
-    let source = integer_pool();
-    let package = package(
-        &source,
-        1,
-        false,
-        SortMode::PartitionTopN {
-            partition_by: Box::default(),
-            limit: 1,
-            kind: novarocks_physical_plan::PartitionTopNType::RowNumber,
-        },
-        false,
-    );
-    assert!(
-        matches!(compile(package,&Control::good()),Err(FragmentCompileError::Unsupported {node:Some(node),feature:"sort mode without a local owner"}) if node==NodeId::new(0))
-    );
+fn partition_topn_sort_preserves_keys_limit_ranking_and_root_bindings() {
+    use novarocks_physical_plan::PartitionTopNType;
+    for (kind, expected) in [
+        (PartitionTopNType::RowNumber, PartitionRank::RowNumber),
+        (PartitionTopNType::Rank, PartitionRank::Rank),
+        (PartitionTopNType::DenseRank, PartitionRank::DenseRank),
+    ] {
+        let source = integer_pool();
+        let package = package(
+            &source,
+            1,
+            false,
+            SortMode::PartitionTopN {
+                partition_by: Box::default(),
+                limit: 2,
+                kind,
+            },
+            false,
+        );
+        let program = compile(package, &Control::good()).unwrap();
+        let node = ProgramNodeId::new(1);
+        let ProgramNodeKind::Sort {
+            input,
+            order_by,
+            mode:
+                LocalSortMode::PartitionTopN {
+                    partition_by,
+                    limit,
+                    rank,
+                },
+        } = program.graph().nodes()[node.index()].kind()
+        else {
+            panic!("partition TopN")
+        };
+        assert_eq!(input.index(), 0);
+        assert_eq!(limit.get(), 2);
+        assert_eq!(*rank, expected);
+        assert_eq!((order_by.len(), partition_by.len()), (1, 1));
+        assert!(partition_by[0].asc && !partition_by[0].nulls_first);
+        assert!(!order_by[0].asc && order_by[0].nulls_first);
+        assert_eq!(partition_by[0].expr.unit, order_by[0].expr.unit);
+        assert_ne!(partition_by[0].expr.root, order_by[0].expr.root);
+        assert_eq!(
+            crate::test_units::input_ordinal(&program, partition_by[0].expr),
+            0
+        );
+        assert_eq!(
+            crate::test_units::input_ordinal(&program, order_by[0].expr),
+            0
+        );
+    }
 }
 #[test]
 fn analytic_sort_leads_with_its_partition_keys_and_binds_their_roots() {
@@ -351,9 +368,9 @@ fn analytic_sort_leads_with_its_partition_keys_and_binds_their_roots() {
     let sort = ProgramNodeId::new(1);
     let ProgramNodeKind::Sort {
         order_by,
-        partition_exprs,
-        partition_limit,
-        use_top_n,
+        mode: LocalSortMode::Partitioned {
+            partition_by: partition_exprs,
+        },
         ..
     } = program.graph().nodes()[sort.index()].kind()
     else {
@@ -363,8 +380,6 @@ fn analytic_sort_leads_with_its_partition_keys_and_binds_their_roots() {
     // Partition keys keep their own frozen direction and NULL placement.
     assert!(partition_exprs[0].asc && !partition_exprs[0].nulls_first);
     assert!(!order_by[0].asc && order_by[0].nulls_first);
-    assert!(partition_limit.is_none() && !use_top_n);
-    assert_eq!(partition_exprs.len(), 1);
     for reference in partition_exprs
         .iter()
         .map(|key| key.expr)

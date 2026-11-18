@@ -52,8 +52,8 @@ use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
-use arrow::compute::{SortOptions, concat};
-use arrow::row::{OwnedRow, Rows};
+use arrow::compute::concat;
+use arrow::row::OwnedRow;
 use novarocks_functions::{
     AggregateStateAllocator, EvaluatedArgument, FullPartitionWindowInput, KernelEvaluationControl,
     KernelFailure, PreparedWindowKernel, Selection, WindowEvaluationPartition,
@@ -74,7 +74,7 @@ use super::analytic_shared::{
 };
 use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
 use super::compiled_window_geometry::{admit_frame, frame_table, frame_table_tracked, peer_groups};
-use super::sort::creation::{CreatedSortConverter, SortCreation};
+use super::sort::creation::{CreatedSortConverter, CreatedSortRows, SortCreation};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
@@ -411,18 +411,6 @@ struct WindowOutputCursor {
     _length_storage: ValueTypeStorageLifetime,
 }
 
-/// The row encoding owns shared converter fields independently of the converter.
-/// Row bytes and offsets remain under the original window payload policy.
-struct CreatedWindowRows {
-    rows: Rows,
-    storage: ValueTypeStorageLifetime,
-}
-impl std::ops::Deref for CreatedWindowRows {
-    type Target = Rows;
-    fn deref(&self) -> &Rows {
-        &self.rows
-    }
-}
 struct CreatedPartitionKey {
     row: OwnedRow,
     _storage: ValueTypeStorageLifetime,
@@ -434,22 +422,9 @@ fn encode(
     keys: &[ArrayRef],
     type_storage: ValueTypeStorageLifetime,
     creation: &SortCreation<'_>,
-) -> ExecutionResult<CreatedWindowRows> {
-    if converter.is_none() {
-        *converter = Some(creation.row_converter(
-            keys,
-            type_storage,
-            std::iter::repeat_n(SortOptions::default(), keys.len()),
-        )?);
-    }
-    let converter = converter.as_ref().expect("converter was created");
-    let rows = converter
-        .converter()
-        .convert_columns(keys)
-        .map_err(|error| arrow_failure(WindowArrowOperation::EncodeKeys, error))?;
-    Ok(CreatedWindowRows {
-        rows,
-        storage: converter.storage_lifetime(),
+) -> ExecutionResult<CreatedSortRows> {
+    creation.encode_keys(converter, keys, type_storage, |error| {
+        arrow_failure(WindowArrowOperation::EncodeKeys, error)
     })
 }
 
@@ -1034,7 +1009,7 @@ impl CompiledWindowProcessor {
             }
             self.last_partition = Some(CreatedPartitionKey {
                 row: encoded.row(rows - 1).owned(),
-                _storage: encoded.storage.clone(),
+                _storage: encoded.storage_lifetime(),
             });
         }
         let mut closed = Vec::new();

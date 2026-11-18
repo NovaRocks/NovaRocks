@@ -36,6 +36,9 @@
 //! every earlier item's receipt completed. It is not, by itself, success: the
 //! owner still joins it with the root's terminal facts.
 
+mod runtime;
+pub use runtime::{RootRelayBinding, RootResultFetchFailure, StreamedRowsComputedCut};
+
 use std::num::NonZeroU64;
 
 use novarocks_execution_contract::TaskIdentity;

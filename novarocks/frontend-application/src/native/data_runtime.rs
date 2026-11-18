@@ -15,10 +15,6 @@ use novarocks_types::{BackendProcessId, NativeEndpoint};
 use tokio::runtime::Handle;
 
 use super::apply_send_owner::{ApplySendOwner, ApplySendPort, DrainObservation};
-#[cfg(test)]
-use super::subscription_owner::{
-    NativeSubscriptionOwner, NativeSubscriptionPort, RegistrationError,
-};
 use super::transport_capacity::NativeTransportCapacity;
 #[cfg(test)]
 use super::transport_supervisor::NativeTransportSupervisor;
@@ -344,10 +340,6 @@ pub(crate) struct FrontendDataRuntime {
     apply_send_port: ApplySendPort,
     // Only the original runtime owns joins. Clones are capability projections.
     original_apply_owner: Option<Mutex<ApplySendOwner>>,
-    #[cfg(test)]
-    subscription_port: Option<NativeSubscriptionPort>,
-    #[cfg(test)]
-    original_subscription_owner: Option<Mutex<NativeSubscriptionOwner>>,
 }
 
 impl Clone for FrontendDataRuntime {
@@ -367,10 +359,6 @@ impl Clone for FrontendDataRuntime {
             connector_blocking_io: self.connector_blocking_io.clone(),
             apply_send_port: self.apply_send_port.clone(),
             original_apply_owner: None,
-            #[cfg(test)]
-            subscription_port: self.subscription_port.clone(),
-            #[cfg(test)]
-            original_subscription_owner: None,
         }
     }
 }
@@ -453,10 +441,6 @@ impl FrontendDataRuntime {
             connector_blocking_io,
             apply_send_port,
             original_apply_owner: Some(Mutex::new(original_apply_owner)),
-            #[cfg(test)]
-            subscription_port: None,
-            #[cfg(test)]
-            original_subscription_owner: None,
         })
     }
 
@@ -498,11 +482,6 @@ impl FrontendDataRuntime {
         runtime
             .open_shared_apply_bank()
             .expect("the test role opens its Shared Apply bank once");
-        runtime
-            .install_original_subscription_reaper(
-                novarocks_workload_control::WorkloadConfig::default().scope_records_limit,
-            )
-            .expect("the test role installs its original subscription owner once");
         runtime
     }
 
@@ -593,115 +572,6 @@ impl FrontendDataRuntime {
 
     pub(crate) fn apply_send_port(&self) -> &ApplySendPort {
         &self.apply_send_port
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_original_subscription_reaper(
-        &mut self,
-        scope_records_limit: usize,
-    ) -> Result<(), String> {
-        if self.original_apply_owner.is_none() || self.subscription_port.is_some() {
-            return Err("Native subscription fixture requires an unbound original role".to_owned());
-        }
-        let (owner, port) = NativeSubscriptionOwner::new(self.handle.clone(), scope_records_limit)
-            .map_err(|_| "allocate Native subscription fixture storage failed".to_owned())?;
-        let owner = self.original_subscription_owner.insert(Mutex::new(owner));
-        self.subscription_port = Some(port);
-        owner
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .start_reaper()
-            .map_err(|error| format!("start original Native subscription owner: {error:?}"))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_original_subscription_owner(&self) -> bool {
-        self.original_subscription_owner.is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn subscription_port(&self) -> Result<&NativeSubscriptionPort, RegistrationError> {
-        self.subscription_port
-            .as_ref()
-            .ok_or(RegistrationError::Closed)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn drain_original_subscriptions_until(
-        &mut self,
-        deadline: std::time::Instant,
-    ) -> Result<(), String> {
-        let owner = self
-            .original_subscription_owner
-            .as_mut()
-            .ok_or_else(|| {
-                "Native subscription drain requested through a capability projection".to_owned()
-            })?
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner());
-        match owner.drain_until(deadline).await {
-            super::subscription_owner::DrainObservation::Joined => Ok(()),
-            failure => Err(format!("drain original Native subscriptions: {failure:?}")),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn original_subscriptions_joined(&self) -> bool {
-        self.original_subscription_owner
-            .as_ref()
-            .is_some_and(|owner| {
-                owner
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .is_joined()
-            })
-    }
-
-    /// While execution drains, a failed original reaper must still retire its
-    /// original children, otherwise those SAME Workload children block drain.
-    #[cfg(test)]
-    pub(crate) async fn recover_failed_subscription_reaper_until(
-        &mut self,
-        deadline: std::time::Instant,
-    ) -> Result<(), String> {
-        let owner = self
-            .original_subscription_owner
-            .as_mut()
-            .ok_or_else(|| {
-                "Native subscription recovery requested through a capability projection".to_owned()
-            })?
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner());
-        owner.wait_for_failed_reaper().await;
-        // Only an already failed/closed original reaper reaches this path.
-        // The same owner polls the same JHs in place, without a replacement.
-        match owner.drain_until(deadline).await {
-            super::subscription_owner::DrainObservation::Joined => Ok(()),
-            failure => Err(format!(
-                "recover original Native subscription reaper: {failure:?}"
-            )),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn abort_original_subscription_reaper(&mut self) {
-        self.original_subscription_owner
-            .as_mut()
-            .unwrap()
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .abort_original_reaper();
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_for_original_subscription_reaper_failure(&mut self) {
-        self.original_subscription_owner
-            .as_mut()
-            .unwrap()
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .wait_for_failed_reaper()
-            .await;
     }
 
     pub(crate) async fn drain_original_apply_until(
@@ -975,7 +845,6 @@ mod tests {
     use novarocks_types::NativeEndpoint;
 
     use super::{FrontendDataRuntime, NativeChannelKey, NativeChannelSlot};
-    use crate::native::subscription_owner::RegistrationError;
     use novarocks_native_adapter::FrontendNativeTransport;
 
     fn slot(key: NativeChannelKey) -> NativeChannelSlot {
@@ -1097,10 +966,6 @@ mod tests {
         });
         assert_eq!(captured.query_blocking, config);
         assert_eq!(captured.internal_cpu.configured_capacity(), config);
-        assert!(matches!(
-            native.subscription_port(),
-            Err(RegistrationError::Closed)
-        ));
         assert!(native.task_transport_supervisor.is_none());
         assert_eq!(
             captured.native.unwrap().transport,

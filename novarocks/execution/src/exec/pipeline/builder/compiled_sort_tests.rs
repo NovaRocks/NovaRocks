@@ -189,13 +189,12 @@ fn compiled_global_sort_orders_by_every_key_direction_and_null_placement() {
     let keys = [A_DESC_NULLS_FIRST, B_DESC];
     let program = program(&keys, Shape::Sort);
     let ProgramNodeKind::Sort {
-        use_top_n, limit, ..
+        mode: novarocks_local_program::LocalSortMode::Full,
+        ..
     } = program.graph().nodes()[1].kind()
     else {
         panic!("the compiler emits a local Sort");
     };
-    assert!(!use_top_n);
-    assert_eq!(*limit, None);
     let rows = int64_rows(&run(&program));
     assert_eq!(rows, oracle(&ROWS, &keys, None, 0));
     // Spot-check the independent oracle itself: NULLs first, then 3, 3 with
@@ -226,15 +225,13 @@ fn compiled_single_topn_returns_the_exact_offset_window() {
         },
     );
     let ProgramNodeKind::Sort {
-        use_top_n,
-        limit,
-        offset,
+        mode: novarocks_local_program::LocalSortMode::RowsTopN { limit, offset },
         ..
     } = program.graph().nodes()[1].kind()
     else {
         panic!("the compiler lowers Single TopN into the local Sort owner");
     };
-    assert_eq!((*use_top_n, *limit, *offset), (true, Some(3), 2));
+    assert_eq!((*limit, *offset), (3, 2));
     let rows = int64_rows(&run(&program));
     assert_eq!(rows, oracle(&ROWS, &keys, Some(3), 2));
     assert_eq!(rows.len(), 3);
@@ -456,15 +453,355 @@ fn partial_topn_runs_as_its_instance_prefix() {
     let program = try_compile(package(builder, topn, ConstantPools::empty(), 1), 1)
         .unwrap_or_else(|error| panic!("a row-count partial TopN compiles: {error}"));
     let ProgramNodeKind::Sort {
-        use_top_n,
-        limit,
-        offset,
+        mode: novarocks_local_program::LocalSortMode::RowsTopN { limit, offset },
         ..
     } = program.graph().nodes()[1].kind()
     else {
         panic!("the compiler lowers a partial TopN into the local Sort owner");
     };
-    assert_eq!((*use_top_n, *limit, *offset), (true, Some(3), 0));
+    assert_eq!((*limit, *offset), (3, 0));
     let rows = int64_rows(&run(&program));
     assert_eq!(rows, oracle(&ROWS, &[A_ASC_NULLS_FIRST], Some(3), 0));
+}
+
+type PartitionRow = (Option<i64>, Option<i64>, i64);
+
+fn partition_program(
+    rows: &[PartitionRow],
+    kind: novarocks_physical_plan::PartitionTopNType,
+    limit: u64,
+    order: Option<Key>,
+) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(35),
+            &fixture_sources,
+        );
+    let source = NodeId::new(0);
+    let sort = NodeId::new(1);
+    let cells = rows
+        .iter()
+        .map(|(g, s, id)| vec![cell(*g), cell(*s), cell(Some(*id))])
+        .collect::<Vec<_>>();
+    let columns = values(
+        &mut builder,
+        source,
+        &[int64(true), int64(true), int64(false)],
+        &cells,
+    );
+    let mut key_root = |column: usize| {
+        let unit = builder.unit(sort).unwrap();
+        let definition = unit
+            .add(None, int64(true), ExprKind::Value(columns[column]))
+            .unwrap();
+        unit.root(definition, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap()
+    };
+    let partition = key_root(0);
+    let order_by = order
+        .map(|key| sort_expr(key_root(1), key))
+        .into_iter()
+        .collect::<Box<[_]>>();
+    builder
+        .add_sort(
+            sort,
+            source,
+            order_by,
+            SortMode::PartitionTopN {
+                partition_by: Box::from([sort_expr(
+                    partition,
+                    Key {
+                        column: 0,
+                        ascending: true,
+                        nulls_first: true,
+                    },
+                )]),
+                limit,
+                kind,
+            },
+        )
+        .unwrap();
+    compile(package(builder, sort, ConstantPools::empty(), 1), 1)
+}
+
+/// Count all strictly preceding rows/values in the complete input, then use
+/// an independent stable Rust sort. No pruning or incremental rank state.
+fn partition_oracle(
+    rows: &[PartitionRow],
+    kind: novarocks_physical_plan::PartitionTopNType,
+    limit: usize,
+    order: Option<Key>,
+) -> Vec<Vec<Option<i64>>> {
+    let cmp = |a, b| order.map_or(Ordering::Equal, |key| compare(a, b, key));
+    let mut sorted = rows.iter().copied().enumerate().collect::<Vec<_>>();
+    sorted.sort_by(|(_, a), (_, b)| a.0.cmp(&b.0).then_with(|| cmp(a.1, b.1)));
+    sorted
+        .into_iter()
+        .filter(|(arrival, row)| {
+            let ahead = rows
+                .iter()
+                .filter(|other| other.0 == row.0 && cmp(other.1, row.1) == Ordering::Less)
+                .count();
+            let rank = match kind {
+                novarocks_physical_plan::PartitionTopNType::RowNumber => {
+                    1 + ahead
+                        + rows[..*arrival]
+                            .iter()
+                            .filter(|other| {
+                                other.0 == row.0 && cmp(other.1, row.1) == Ordering::Equal
+                            })
+                            .count()
+                }
+                novarocks_physical_plan::PartitionTopNType::Rank => 1 + ahead,
+                novarocks_physical_plan::PartitionTopNType::DenseRank => {
+                    1 + rows
+                        .iter()
+                        .filter(|other| other.0 == row.0 && cmp(other.1, row.1) == Ordering::Less)
+                        .map(|other| other.1)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                }
+            };
+            rank <= limit
+        })
+        .map(|(_, row)| vec![row.0, row.1, Some(row.2)])
+        .collect()
+}
+
+fn partition_batches(
+    program: &Arc<LocalProgram>,
+    rows: &[PartitionRow],
+    sizes: impl IntoIterator<Item = usize>,
+) -> Vec<Vec<Option<i64>>> {
+    let state = RuntimeState::default();
+    let factory = CompiledSortProcessorFactory::try_new(
+        Arc::clone(program),
+        ProgramNodeId::new(1),
+        state.error_state(),
+    )
+    .unwrap()
+    .with_prune_rows(2);
+    let mut operator = factory.create(1, 0);
+    let tracker = crate::runtime::mem_tracker::MemTracker::new_root("partition TopN construction");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    operator.set_mem_tracker(tracker.clone());
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker,
+        state.error_state(),
+    ));
+    operator.prepare().unwrap();
+    operator.bind_runtime_state(&state).unwrap();
+    let layout = program.graph().nodes()[0].output_layout();
+    let schema = ChunkSchema::from_compiled_layout(layout).unwrap();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
+    let mut start = 0;
+    for size in sizes {
+        if start == rows.len() {
+            break;
+        }
+        let end = (start + size).min(rows.len());
+        let part = &rows[start..end];
+        let batch = RecordBatch::try_new(
+            layout.schema().clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    part.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    part.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    part.iter().map(|row| row.2).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        processor
+            .input_without_output(
+                Chunk::try_new_with_chunk_schema(batch, Arc::clone(&schema)).unwrap(),
+            )
+            .unwrap();
+        start = end;
+    }
+    assert_eq!(start, rows.len());
+    processor.signal_eos().unwrap();
+    let mut chunks = Vec::new();
+    while let Some(chunk) = processor.advance_to_boundary().unwrap().output {
+        chunks.push(chunk);
+    }
+    assert!(matches!(processor.next(), NextStep::Finished));
+    int64_rows(&chunks)
+}
+
+#[test]
+fn compiled_partition_topn_matches_rank_definitions_across_batches_and_pruning() {
+    use novarocks_physical_plan::PartitionTopNType::{DenseRank, Rank, RowNumber};
+    let mut seed = 0x7654_3210_1357_2468_u64;
+    let rows = (0..96)
+        .map(|index| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let group = match (seed >> 32) % 5 {
+                0 => None,
+                g => Some(g as i64),
+            };
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let score = match (seed >> 32) % 5 {
+                0 => None,
+                s => Some(s as i64 * 10),
+            };
+            (group, score, i64::from(index) + 1)
+        })
+        .collect::<Vec<_>>();
+    for kind in [RowNumber, Rank, DenseRank] {
+        for order in [
+            None,
+            Some(Key {
+                column: 1,
+                ascending: true,
+                nulls_first: true,
+            }),
+            Some(Key {
+                column: 1,
+                ascending: false,
+                nulls_first: false,
+            }),
+        ] {
+            for limit in [1, 2, 200] {
+                let program = partition_program(&rows, kind, limit as u64, order);
+                let expected = partition_oracle(&rows, kind, limit, order);
+                for split in [1, 0x1122_3344, 0xffff_eeee] {
+                    assert_eq!(
+                        partition_batches(&program, &rows, random_batch_sizes(split)),
+                        expected,
+                        "kind={kind:?} limit={limit} split={split}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn random_batch_sizes(mut seed: u64) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        Some(1 + ((seed >> 32) as usize % 11))
+    })
+}
+
+#[test]
+fn compiled_partition_topn_keeps_late_peers_after_several_prunes() {
+    use novarocks_physical_plan::PartitionTopNType::{DenseRank, Rank, RowNumber};
+    let scores = [
+        8, 9, 2, 3, 4, 5, 6, 7, 1, 1, 1, 4, 4, 4, 0, 0, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+        10, 0, 0,
+    ];
+    let rows = scores
+        .into_iter()
+        .enumerate()
+        .map(|(i, score)| (Some(1), Some(score), i as i64 + 1))
+        .collect::<Vec<_>>();
+    let order = Some(Key {
+        column: 1,
+        ascending: true,
+        nulls_first: true,
+    });
+    for kind in [RowNumber, Rank, DenseRank] {
+        let program = partition_program(&rows, kind, 2, order);
+        let actual = partition_batches(&program, &rows, [2, 6, 6, 14, 2]);
+        assert_eq!(actual, partition_oracle(&rows, kind, 2, order));
+        let ids = actual.iter().map(|row| row[2].unwrap()).collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            match kind {
+                RowNumber => vec![15, 16],
+                Rank => vec![15, 16, 29, 30],
+                DenseRank => vec![15, 16, 29, 30, 9, 10, 11],
+            }
+        );
+    }
+}
+
+#[test]
+fn compiled_partition_topn_preserves_refusal_and_releases_retained_input_on_exit() {
+    use crate::runtime::{mem_tracker::MemTracker, task::ExecutionFailure};
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_functions::KernelFailure;
+    use novarocks_physical_plan::PartitionTopNType::DenseRank;
+    let rows = [
+        (Some(1), Some(3), 1),
+        (Some(1), Some(2), 2),
+        (Some(1), Some(1), 3),
+    ];
+    for cancel in [false, true] {
+        let program = partition_program(&rows, DenseRank, 2, Some(A_ASC_NULLS_FIRST));
+        let input_tracker = MemTracker::new_root("partition input metadata");
+        let chunk = super::family_fixture::paid_input(&program, &input_tracker);
+        let tracker = MemTracker::new_root("partition refusal construction");
+        let state = RuntimeState::default();
+        let factory = CompiledSortProcessorFactory::try_new(
+            program,
+            ProgramNodeId::new(1),
+            state.error_state(),
+        )
+        .unwrap()
+        .with_prune_rows(2);
+        let mut operator = factory.create(1, 0);
+        operator.set_mem_tracker(tracker.clone());
+        operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+            tracker.clone(),
+            state.error_state(),
+        ));
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&state).unwrap();
+        let mut driver = TestDriver::new(operator.as_mut(), &state);
+        driver.input_without_output(chunk).unwrap();
+        let original = if cancel {
+            let original = ExecutionFailure::from(KernelFailure::Cancelled);
+            state.error_state().set_error(original.clone());
+            Some(original)
+        } else {
+            tracker.install_limit_once(tracker.current()).unwrap();
+            None
+        };
+        // Cancellation can be observed by either protocol entry; neither is
+        // evidence that retained construction has already exited.
+        let failure = match driver.signal_eos() {
+            Err(failure) => failure,
+            Ok(()) => driver.advance_to_boundary().unwrap_err(),
+        };
+        assert_eq!(
+            failure.failure_fact().class(),
+            if cancel {
+                FailureClass::Control
+            } else {
+                FailureClass::Resource
+            }
+        );
+        if let Some(original) = original {
+            assert_eq!(failure, original);
+        }
+        assert_eq!(
+            driver.advance_to_boundary().unwrap_err(),
+            failure,
+            "the first refusal remains authoritative"
+        );
+        drop(driver);
+        if cancel {
+            operator.cancel();
+        } else {
+            operator.begin_exit().unwrap();
+        }
+        assert_eq!(
+            input_tracker.current(),
+            0,
+            "input metadata exits with actual retained runs"
+        );
+        drop(operator);
+        assert_eq!(
+            tracker.current(),
+            0,
+            "construction responsibility ends after actual operator exit"
+        );
+    }
 }

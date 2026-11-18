@@ -201,9 +201,8 @@ fn helper(directory: &Directory) -> Helper {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args([
-            "--ignored",
             "--exact",
-            "caller_lifetime_helper",
+            "caller_death_is_cleaned_by_an_independent_monitor_with_original_record",
             "--nocapture",
         ])
         .env_clear()
@@ -235,6 +234,10 @@ fn wait_file(path: &Path, deadline: Instant) -> Vec<u8> {
 
 #[test]
 fn caller_death_is_cleaned_by_an_independent_monitor_with_original_record() {
+    if std::env::var_os("MONITOR_HELPER_READY").is_some() {
+        caller_lifetime_helper();
+        return;
+    }
     let directory = Directory::new();
     let mut helper = helper(&directory);
     let root = PathBuf::from(
@@ -266,8 +269,6 @@ fn caller_death_is_cleaned_by_an_independent_monitor_with_original_record() {
     }
 }
 
-#[test]
-#[ignore = "internal exact helper; the outer test owns and waits this process"]
 fn caller_lifetime_helper() {
     let ready =
         std::env::var_os("MONITOR_HELPER_READY").expect("outer test must supply ready path");
@@ -293,6 +294,10 @@ fn caller_lifetime_helper() {
 
 #[test]
 fn caller_drop_settles_with_a_full_unread_stderr_pipe() {
+    if std::env::var_os("MONITOR_HELPER_READY").is_some() {
+        caller_drop_full_stderr_helper();
+        return;
+    }
     let directory = Directory::new();
     // Keep every locator and monitor record if the bounded regression fails.
     let result = std::panic::catch_unwind(|| {
@@ -300,9 +305,8 @@ fn caller_drop_settles_with_a_full_unread_stderr_pipe() {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
-                "--ignored",
                 "--exact",
-                "caller_drop_full_stderr_helper",
+                "caller_drop_settles_with_a_full_unread_stderr_pipe",
                 "--nocapture",
             ])
             .env_clear()
@@ -368,8 +372,6 @@ fn caller_drop_settles_with_a_full_unread_stderr_pipe() {
     }
 }
 
-#[test]
-#[ignore = "internal exact helper; the outer test owns and waits this process"]
 fn caller_drop_full_stderr_helper() {
     let ready =
         std::env::var_os("MONITOR_HELPER_READY").expect("outer test must supply ready path");

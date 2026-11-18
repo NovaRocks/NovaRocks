@@ -85,7 +85,7 @@ pub(crate) struct StatementObservationResponse {
     pub root_status: Option<StatementRootStatusResponse>,
 }
 
-/// Scalar facts copied only by the original TaskRound root-status author.
+/// Scalar facts copied only by the original attempt's root-status author.
 /// This value owns no execution, admission, result or cleanup authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StatementRootStatusObservation {

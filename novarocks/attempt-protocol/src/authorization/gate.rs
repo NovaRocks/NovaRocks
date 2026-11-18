@@ -31,6 +31,7 @@ use super::{
     },
     observations::ObserverDebt,
 };
+use crate::port_output::{AttemptAuthorization, AttemptToLogical, AttemptToLogicalBody};
 use crate::{
     effect::{AttemptEffect, EffectBody, EffectClass, OperationIntent},
     error::TaskExecutionError,
@@ -39,8 +40,8 @@ use crate::{
 #[cfg(test)]
 use novarocks_coordination_contract::AttemptAuthorizationRef;
 use novarocks_coordination_contract::{
-    AttemptActionId, AttemptActivationIdentity, AttemptAuthorization, AttemptAuthorizationLimits,
-    AttemptRequestToken, AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody,
+    AttemptActionId, AttemptActivationIdentity, AttemptAuthorizationLimits, AttemptRequestToken,
+    LogicalToAttemptBody,
 };
 use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use std::collections::BTreeMap;
@@ -82,13 +83,16 @@ pub(crate) enum ObserverStep {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "this synchronous gate result moves the original complete failure inline without allocating another carrier"
+)]
 pub(crate) enum QaReply {
     Stale,
     Authorized(TaskOperationId),
     AuthorizationFailed(AttemptFailure),
     ObserverProgress,
     ClosingProgress,
-    ClosingFailed(AttemptFailure),
     ObserverComplete { retire: Option<TaskOperationId> },
 }
 
@@ -306,7 +310,7 @@ impl AuthorizationGate {
                         let retire = self.complete_establish(operation, completed)?;
                         return Ok(ObserverStep::Consumed { retire });
                     }
-                    Step::Waiting | Step::WaitingTransport | Step::DetachLate { .. } => {
+                    Step::Waiting | Step::WaitingTransport => {
                         return Err(schedule("unexpected Establish observer transition"));
                     }
                 }
@@ -326,7 +330,7 @@ impl AuthorizationGate {
 
     pub(crate) fn replied(
         &mut self,
-        body: LogicalToAttemptBody<AttemptFailure>,
+        body: LogicalToAttemptBody,
     ) -> Result<QaReply, TaskExecutionError> {
         if self.close.waiting_for_reply() {
             return self.close_replied(body);
@@ -393,7 +397,11 @@ impl AuthorizationGate {
                     .establishments
                     .get_mut(&operation)
                     .expect("original Establish observer row");
-                match establish.settled(token, authorization, result)? {
+                match establish.settled(
+                    token,
+                    authorization,
+                    result.map_err(AttemptFailure::Logical),
+                )? {
                     SettlementReply::Stale => return Ok(QaReply::Stale),
                     SettlementReply::Progress => QaReply::ObserverProgress,
                     completed => QaReply::ObserverComplete {
@@ -567,14 +575,11 @@ mod tests {
     use super::*;
     use crate::{
         authorization::observations::{EstablishObservation, ObservedDispatch},
-        failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
         ids::{IdSeed, OperationIds},
         input::SendGeneration,
         start::PayloadRef,
     };
-    use novarocks_coordination_contract::{
-        AttemptAuthorizationDecision, AttemptFailureClass, AttemptIssueSettlement,
-    };
+    use novarocks_coordination_contract::{AttemptAuthorizationDecision, AttemptIssueSettlement};
     use novarocks_execution_contract::{
         AdmissionTicketId, LeaseSequence, LeaseValidFor, OperationEnvelope, OperationKind,
         OperationOutcome,
@@ -724,14 +729,16 @@ mod tests {
                 .unwrap(),
             ObserverStep::Waiting
         ));
-        let original = AttemptFailure::Host(HostProjectedFailure {
-            original: HostFailureRef(nz(90)),
-            kind: HostFailureKind::EstablishAuthorization,
-            class: AttemptFailureClass::ExecutionFailure,
-            site: AttemptFailureSite::Attempt,
-        });
+        let original = AttemptFailure::Logical(crate::test_support::logical_failure(
+            "original selected Establish settlement refused",
+        ));
         assert!(matches!(
-            gate.replied(result(4, 1, Err(original.clone()))).unwrap(),
+            gate.replied(result(
+                4,
+                1,
+                Err(crate::test_support::passive_failure(&original))
+            ))
+            .unwrap(),
             QaReply::ObserverProgress
         ));
         assert_eq!(
@@ -897,6 +904,11 @@ mod tests {
             GatePreparation::Applied { ready: false }
         );
         assert!(!gate.close_needs_drive());
+        assert_eq!(
+            gate.establishments[&older.operation_id()].local_late_ref_count(),
+            1,
+            "pure late reference remains until the exact physical generation is withdrawn"
+        );
         assert!(
             gate.note_establish_withdrawn(
                 older.operation_id(),
@@ -924,38 +936,35 @@ mod tests {
             gate.replied(settled(12, 3)).unwrap(),
             QaReply::ClosingProgress
         ));
-        let CloseProgress::Request(AttemptEffect {
-            body: EffectBody::Port(port),
-            class: EffectClass::Cleanup,
-            ..
-        }) = gate
-            .advance_close(action(13), token(13), &mut Units(32))
-            .unwrap()
-        else {
-            panic!("expected actual original late guard disposal");
-        };
-        assert!(matches!(port.body, AttemptToLogicalBody::DetachEstablish {
-            token: request, authorization, operation_id, ..
-        } if request == token(13) && authorization == issue(1) && operation_id == older.operation_id()));
-        assert!(matches!(
-            gate.replied(settled(13, 1)).unwrap(),
-            QaReply::Stale
-        ));
-        assert_eq!(gate.preparation(), GatePreparation::Applying);
-        assert!(matches!(
-            gate.replied(LogicalToAttemptBody::EstablishDetachReply {
-                token: token(13),
-                authorization: issue(1),
-                result: Ok(()),
-            })
-            .unwrap(),
-            QaReply::ClosingProgress
-        ));
-        assert!(matches!(
-            gate.advance_close(action(14), token(14), &mut Units(32))
-                .unwrap(),
-            CloseProgress::Ready
-        ));
+        let mut done = false;
+        for n in 13..77 {
+            let before = gate.establishments[&older.operation_id()].local_late_ref_count();
+            match gate
+                .advance_close(action(n), token(n), &mut Units(1))
+                .unwrap()
+            {
+                CloseProgress::Yield => assert_eq!(gate.preparation(), GatePreparation::Applying),
+                CloseProgress::Ready => {
+                    done = true;
+                }
+                other => panic!(
+                    "pure local-reference cleanup must not issue an effect or await LP: {other:?}"
+                ),
+            }
+            let after = gate.establishments[&older.operation_id()].local_late_ref_count();
+            assert!(
+                before - after <= 1,
+                "one original pure reference per charged unit"
+            );
+            if done {
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(
+            gate.establishments[&older.operation_id()].local_late_ref_count(),
+            0
+        );
         assert_eq!(gate.preparation(), GatePreparation::Applied { ready: true });
     }
 }

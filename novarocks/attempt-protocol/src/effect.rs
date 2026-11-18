@@ -21,10 +21,9 @@
 use crate::capacity::ReservationToken;
 use crate::config::DispatchLane;
 use crate::failure::AttemptFailure;
+use crate::port_output::AttemptToLogical;
 use crate::start::PayloadRef;
-use novarocks_coordination_contract::{
-    AttemptActionId, AttemptRequestToken, AttemptRootProjection, AttemptToLogical, MonotonicInstant,
-};
+use novarocks_coordination_contract::{AttemptActionId, AttemptRequestToken, MonotonicInstant};
 use novarocks_execution_contract::{
     AbortParticipation, AcquireParticipationAdmissionTicket, AdmissionTicketId, CancelTask,
     ContentFingerprint, CredentialDomainId, CredentialEpoch, DomainVersion, EdgeOpenVersion,
@@ -152,7 +151,6 @@ pub enum PumpKind {
 
 #[derive(Clone, Debug)]
 pub enum Publication {
-    RootStatus(Box<AttemptRootProjection>),
     ProtocolBatch(crate::publication::ProtocolPublication),
     FinalTaskInfo(crate::input::FinalTaskInfoRef),
     Diagnostics(crate::publication::DiagnosticPublication),

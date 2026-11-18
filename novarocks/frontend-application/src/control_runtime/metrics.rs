@@ -38,6 +38,19 @@ pub(crate) struct PendingEffectObservation {
     pub(crate) claimed_not_handed_off: u64,
     pub(crate) unindexed_inputs: u64,
 }
+/// Interval aggregate of the original live LogicalActor diagnostic headers.
+/// Retirement may reduce these gauges. They prove neither a committed runtime
+/// batch nor physical exit and are never consumed by control decisions.
+#[derive(Default)]
+pub(crate) struct LogicalProcessObservation {
+    pub(crate) actors: u64,
+    pub(crate) completed_steps: u64,
+    pub(crate) last_step_effects: u64,
+    pub(crate) total_effects: u64,
+    pub(crate) max_step_effects: u64,
+    pub(crate) outstanding_actions: u64,
+    pub(crate) next_deadline_ns: Option<u64>,
+}
 #[derive(Clone, Copy)]
 pub(crate) struct HostObservation {
     pub(crate) turns: u64,
@@ -120,6 +133,7 @@ pub(crate) struct FrontendRuntimeMetrics {
     waits: IntGaugeVec,
     pending: IntGaugeVec,
     host_turns: IntGaugeVec,
+    logical: IntGaugeVec,
     available: IntGaugeVec,
 }
 fn gauge(
@@ -234,6 +248,12 @@ impl FrontendRuntimeMetrics {
                 "Cumulative finite metadata host-turn units/handoffs and elapsed observations. Handoff completion is not physical exit.",
                 &["resource"],
             )?,
+            logical: gauge(
+                registry,
+                "novarocks_frontend_control_runtime_logical",
+                "Normal Core-return diagnostics of live original logical actors. Not runtime commit, capacity, or actual-exit proofs. Retirement may reduce sums; an absent deadline is explicit and unavailable samples are omitted.",
+                &["resource"],
+            )?,
             available: gauge(
                 registry,
                 "novarocks_frontend_control_runtime_observation_available",
@@ -252,6 +272,7 @@ impl FrontendRuntimeMetrics {
         self.waits.reset();
         self.pending.reset();
         self.host_turns.reset();
+        self.logical.reset();
         let original = self.original.snapshot().filter(counters_representable);
         self.available
             .with_label_values(&["counters"])
@@ -326,11 +347,63 @@ impl FrontendRuntimeMetrics {
             }
         }
         let Some(owner) = self.owner.upgrade() else {
-            for source in ["transport_process", "transport_keys", "waits", "effects"] {
+            for source in [
+                "transport_process",
+                "transport_keys",
+                "waits",
+                "effects",
+                "logical",
+            ] {
                 self.available.with_label_values(&[source]).set(0);
             }
             return;
         };
+        let logical = owner
+            .try_logical_observation()
+            .ok()
+            .flatten()
+            .and_then(|sample| {
+                let values = metric_values([
+                    sample.actors,
+                    sample.completed_steps,
+                    sample.last_step_effects,
+                    sample.total_effects,
+                    sample.max_step_effects,
+                    sample.outstanding_actions,
+                ])?;
+                let deadline = sample
+                    .next_deadline_ns
+                    .map(i64::try_from)
+                    .transpose()
+                    .ok()?;
+                Some((values, deadline))
+            });
+        self.available
+            .with_label_values(&["logical"])
+            .set(i64::from(logical.is_some()));
+        if let Some((values, deadline)) = logical {
+            for (resource, value) in [
+                "actors",
+                "core_steps",
+                "last_step_effects",
+                "emitted_effects",
+                "max_step_effects",
+                "outstanding_actions",
+            ]
+            .into_iter()
+            .zip(values)
+            {
+                self.logical.with_label_values(&[resource]).set(value);
+            }
+            self.logical
+                .with_label_values(&["deadline_present"])
+                .set(i64::from(deadline.is_some()));
+            if let Some(deadline) = deadline {
+                self.logical
+                    .with_label_values(&["next_deadline_ns"])
+                    .set(deadline);
+            }
+        }
         let (ledger, _runtime) = owner.observation_owners();
         let transport = self.layout.snapshot(ledger).ok().flatten();
         let process = transport

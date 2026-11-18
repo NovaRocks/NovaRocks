@@ -17,6 +17,9 @@
 
 //! Paid per-purpose inputs, original transport joins and canonical pump records.
 
+#[cfg(test)]
+use crate::task_execution::host::publication::OriginalHostFailure;
+
 use super::{
     BoundPumpWork, DiagnosticRecords, DiagnosticRegistration, DynamicFilterRecords,
     DynamicReadRegistration, PumpOutcome,
@@ -33,7 +36,6 @@ use crate::{
     task_execution::host::{
         RetirementScan,
         custody::{ReturnedActorTransportResult, TransportSourceEvent},
-        publication::OriginalHostFailure,
         transport::{BodyOutcome, prepare_actor_pump},
     },
 };
@@ -669,6 +671,7 @@ impl AttemptPumpSource {
             .or_else(|| self.split_failure.as_ref()?.project_failure(reference))
     }
 
+    #[cfg(test)]
     pub(crate) fn take_failure(
         &mut self,
         reference: HostFailureRef,
@@ -985,8 +988,8 @@ mod tests {
                 custody::tests::WithdrawalInbox,
                 pumps::{split::SplitPayloadRegistration, split_source::SplitPayloadError},
             },
-            status_intake::CountingWake,
         },
+        wake::CountingWake,
     };
     use novarocks_control_runtime::transaction::RuntimeLedger;
     use novarocks_control_runtime_core::scope::WorkAdmission;
@@ -1176,11 +1179,6 @@ mod tests {
         use crate::{
             query_execution::lifecycle_plan::QueryCredentialLeases,
             task_execution::{
-                actor_gate::tests::logical_execution,
-                bridge::{
-                    qa::AttemptQaBridge,
-                    terminal::{TerminalOutbox, TerminalPublication},
-                },
                 host::{
                     adapter::tests::start,
                     custody::TransportRetirements,
@@ -1189,6 +1187,7 @@ mod tests {
                 sources::AttemptEstablishFacts,
             },
         };
+        use novarocks_attempt_protocol::port_output::{AttemptTerminal, AttemptToLogicalBody};
         use novarocks_attempt_protocol::{
             AttemptCore, AttemptStep, Core, InputSelection,
             capacity::{QueueStage, StepContext},
@@ -1201,13 +1200,11 @@ mod tests {
             },
             publication::SplitDiagnosticObservation,
         };
-        use novarocks_coordination_contract::{
-            AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody, MonotonicInstant,
-        };
+        use novarocks_coordination_contract::{AttemptFailureClass, MonotonicInstant};
         use novarocks_execution_contract::OperationKind;
         use novarocks_query_application::{
-            api::{NativeAttemptTerminal, NativeAttemptTopologyRequirement},
-            execution_error::QueryFailureReason,
+            api::NativeAttemptTopologyRequirement,
+            execution_error::{ExecutionFailurePresentation, QueryFailureReason},
         };
         use novarocks_types::BackendProcessId;
 
@@ -1231,10 +1228,7 @@ mod tests {
         let mut frozen = start();
         let participation = *frozen.plan.establish_material.keys().next().unwrap();
         let execution = participation.query_execution_id();
-        let (mut logical, drive, mut abort_intake) = logical_execution(participation).await;
-        let activation = drive.identity();
-        frozen.activation.identity = activation;
-        frozen.plan.authorization_limits = drive.authorization_limits();
+        let activation = frozen.activation.identity;
         // The fixture runtime's original external Source is the transport callback role.
         std::mem::swap(
             &mut frozen.sources.transport,
@@ -1252,11 +1246,7 @@ mod tests {
         let (quotes, material) =
             AttemptEstablishMaterial::project(&facts, [participation], &mut next_payload).unwrap();
         frozen.plan.establish_material = quotes;
-        let mut qa = AttemptQaBridge::new(
-            Arc::new(drive),
-            frozen.plan.compatibility,
-            Arc::new(material),
-        );
+        let _original_material = material;
         let pump_ref = PayloadRef(next_payload);
         frozen.plan.pumps = Box::new([(pump_ref, PumpKind::SplitAssignment)]);
         let now = frozen.initial_now;
@@ -1401,16 +1391,37 @@ mod tests {
             .unwrap_or_else(|_| panic!("original split handoff receipt"));
         runtime.retire_input(actor, command).unwrap();
 
-        // The original QA authority may authorize an Admission candidate, but
-        // the test holds its transport admission and supplies no Worker result.
+        // The scripted reply advances only this AP component. Its original
+        // transport admission stays held and no Worker receipt is supplied.
         let step_after_start = step(sources.actor, AttemptInput::Timer, None);
         let authorized = next(&mut step, step_after_start).effect.unwrap();
         let EffectBody::Port(authorization) = authorized.body else {
             panic!("the first Native candidate must ask original QA");
         };
-        let reply = qa.handle_port(&authorization).await.unwrap();
-        assert!(reply.failure.is_none());
-        let applied = step(sources.qa, AttemptInput::Port(reply.reply), None);
+        let AttemptToLogicalBody::AuthorizationRequest {
+            token,
+            request:
+                novarocks_attempt_protocol::port_output::AttemptAuthorization::BeginAdmission(request),
+        } = authorization.body
+        else {
+            panic!("the original admission request")
+        };
+        assert_eq!(request.participation(), participation);
+        // Scripted AP-component reply, not an LP authorization or capacity grant.
+        let reply = novarocks_coordination_contract::LogicalToAttempt {
+            activation,
+            body: novarocks_coordination_contract::LogicalToAttemptBody::AuthorizationReply {
+                token,
+                decision: Ok(
+                    novarocks_coordination_contract::AttemptAuthorizationDecision::AdmissionStarted(
+                        novarocks_coordination_contract::AttemptAuthorizationRef::new(
+                            NonZeroU64::MIN,
+                        ),
+                    ),
+                ),
+            },
+        };
+        let applied = step(sources.qa, AttemptInput::Port(reply), None);
         let queued = next(&mut step, applied).effect.unwrap();
         let EffectBody::AdmitQueuedInput { operation, .. } = queued.body else {
             panic!("the original Native Admission remains queued");
@@ -1505,13 +1516,18 @@ mod tests {
                 SplitAssignmentDriverError::SourceEnumeration { .. }
             ))
         ));
-        let mut terminal = TerminalPublication::new(terminal);
-        assert_eq!(terminal.host_reference(), Some(reference));
-        terminal.attach_host_failure(reference, original_error);
-        let outbox = TerminalOutbox::new(activation);
-        assert!(outbox.publish(Box::new(terminal)).is_ok());
-        let NativeAttemptTerminal::Failed(terminal) = outbox.terminal().await.unwrap() else {
-            panic!("the original enumeration is a typed failure");
+        let canonical = novarocks_attempt_protocol::port_projection::project_attempt_message(
+            &terminal,
+            &mut |exact| (exact == reference).then(|| selected.clone()),
+            &mut |_, _| None,
+            &mut |_, _, _| None,
+        )
+        .unwrap();
+        let novarocks_coordination_contract::logical_port::AttemptToLogicalBody::AttemptTerminal(
+            novarocks_coordination_contract::logical_port::AttemptTerminal::Failed(terminal),
+        ) = &canonical.body
+        else {
+            panic!("the original enumeration is a typed failure")
         };
         assert_eq!(terminal.input(), &selected);
         assert_eq!(selected.fact(), provider_resource_fact());
@@ -1530,7 +1546,7 @@ mod tests {
         assert!(!terminal.error().message().contains("opaque provider text"));
         assert_eq!(terminal.class(), AttemptFailureClass::ResourceGovernance);
         assert_eq!(
-            terminal.topology_requirement(),
+            terminal.input().topology_requirement(),
             NativeAttemptTopologyRequirement::LiveSnapshot
         );
         assert!(terminal.pre_ready_replacement().is_none());
@@ -1620,10 +1636,8 @@ mod tests {
         assert_eq!(enumerations.load(Ordering::SeqCst), 1);
         assert_eq!(closes.load(Ordering::SeqCst), 1);
         assert!(original.deliveries().producer_closed());
-        assert_eq!(
-            outbox.terminal().await.unwrap(),
-            NativeAttemptTerminal::Failed(terminal)
-        );
+        assert_eq!(terminal.input(), &selected);
+        assert!(matches!(original_error, OriginalHostFailure::Task(_)));
 
         parent.body_exited().unwrap();
         parent.captures_exited().unwrap();
@@ -1641,29 +1655,5 @@ mod tests {
         assert!(ledger.is_empty());
         drop(original);
         workers.shutdown().await;
-
-        drop(qa);
-        logical.abandon_running_attempt();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(effect) = abort_intake.try_recv() {
-                    let crate::task_execution::intent::OperationIntent::AbortParticipation(request) = effect.intent() else {
-                        panic!("QA teardown keeps the original Abort");
-                    };
-                    assert_eq!(request.participation(), participation);
-                    effect.fail_closed().unwrap();
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        }).await.unwrap();
-        logical
-            .observe_worker_process_replaced(participation)
-            .await
-            .unwrap();
-        logical
-            .finish_until(std::time::Instant::now() + Duration::from_secs(2))
-            .await
-            .unwrap();
     }
 }

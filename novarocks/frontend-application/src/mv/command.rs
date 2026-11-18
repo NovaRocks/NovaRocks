@@ -926,6 +926,7 @@ mod refresh_refusal_projection_tests {
     use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError;
     use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
     use novarocks_query_application::api::CommandErrorKind;
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use novarocks_sql::{
         analyze_error::{AnalyzeError, AnalyzeErrorKind},
         compiler::SqlCompileError,

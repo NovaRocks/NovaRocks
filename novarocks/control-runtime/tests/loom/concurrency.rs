@@ -1031,6 +1031,7 @@ fn admitted_neutral_input_and_scope_failure_share_the_actual_author_transaction(
 enum EffectForwardInput {
     Emit,
     Value(u64),
+    OriginalValue(Arc<u64>),
 }
 #[derive(Debug)]
 struct EffectForwardActor {
@@ -1063,6 +1064,7 @@ impl Actor for EffectForwardActor {
                 )
                 .unwrap(),
             EffectForwardInput::Value(value) => self.seen.push(value),
+            EffectForwardInput::OriginalValue(value) => self.seen.push(*value),
         }
     }
     fn next_deadline(&self) -> Option<Tick> {
@@ -1072,6 +1074,7 @@ impl Actor for EffectForwardActor {
 }
 struct EffectForwardOwner {
     actor: ActorId,
+    registration: novarocks_control_runtime::actor_turn::ActorRegistration,
     scope: novarocks_control_runtime::transaction::ScopeHandle,
     work: novarocks_control_runtime::obligation::WorkObligation,
     capacity: novarocks_control_runtime::obligation::ReservationObligation,
@@ -1099,8 +1102,8 @@ impl EffectForwardFixture {
                 .bind(WorkKind::Settlement)
                 .unwrap();
             work.start().unwrap();
-            runtime
-                .register_next(
+            let registration = runtime
+                .register_bound(
                     actor,
                     scope.clone(),
                     EffectForwardActor {
@@ -1119,6 +1122,7 @@ impl EffectForwardFixture {
                 .unwrap_or_else(|(error, _)| panic!("actual forwarding model actor: {error:?}"));
             owners.push(EffectForwardOwner {
                 actor,
+                registration,
                 scope,
                 work,
                 capacity,
@@ -1752,4 +1756,553 @@ fn two_refused_targets_concurrently_release_one_logical_wait_exactly_once() {
         assert_eq!(ledger.capacity_waiter_count(), 0);
         assert!(ledger.try_keyed_usage_snapshot().unwrap().is_empty());
     });
+}
+
+mod owner_source_selection_models {
+    use super::*;
+    use loom::sync::Mutex;
+    use novarocks_control_runtime::{
+        actor::InputSourceCut,
+        actor_turn::{InputPhase, TimerSourceState},
+        transaction::ScopeHandle,
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    enum Selection {
+        All,
+        Only,
+        Prefer,
+        OnlyWithOwner(ActorId),
+        PreferWithOwner(ActorId),
+    }
+    impl Selection {
+        fn apply(self, step: &mut ActorStep<'_, ()>) {
+            match self {
+                Self::All => step.select_input_source(None),
+                Self::Only => step.select_input_source(Some(aid(2))),
+                Self::Prefer => step.prefer_input_source(aid(2)),
+                Self::OnlyWithOwner(owner) => step.select_input_source_with_owner(aid(2), owner),
+                Self::PreferWithOwner(owner) => step.prefer_input_source_with_owner(aid(2), owner),
+            }
+        }
+    }
+    #[derive(Debug)]
+    enum Input {
+        Select(Selection),
+        Value(u64),
+    }
+    type Record = (u64, InputEnvelope, Option<InputSourceCut>);
+    struct Receiver {
+        selection: Selection,
+        records: Arc<Mutex<Vec<Record>>>,
+    }
+    impl Actor for Receiver {
+        type Input = Input;
+        type Effect = ();
+        fn timer_input(_: Tick) -> Input {
+            panic!("this finite model has no timer");
+        }
+        fn handle(
+            &mut self,
+            _: Tick,
+            input: InputEnvelope,
+            value: Input,
+            step: &mut ActorStep<'_, ()>,
+        ) {
+            assert!(step.charge(1));
+            match value {
+                Input::Select(selection) => self.selection = selection,
+                Input::Value(value) => {
+                    self.records
+                        .lock()
+                        .unwrap()
+                        .push((value, input, step.selected_source_cut()))
+                }
+            }
+            // Real repeated directives must not restart the source rotation.
+            self.selection.apply(step);
+        }
+        fn next_deadline(&self) -> Option<Tick> {
+            None
+        }
+        fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {
+            panic!("a selection model must not fail its original actor");
+        }
+    }
+    struct Fixture {
+        ledger: RuntimeLedger,
+        runtime: ActorRuntime<Receiver>,
+        scope: ScopeHandle,
+        records: Arc<Mutex<Vec<Record>>>,
+        inputs: Vec<InputId>,
+    }
+    impl Fixture {
+        fn new(selection: Selection) -> Self {
+            let ledger = RuntimeLedger::new(ResourceVector::default());
+            let scope = ledger.open_scope_next(None, generation()).unwrap();
+            let runtime = ActorRuntime::new();
+            let records = Arc::new(Mutex::new(Vec::new()));
+            runtime
+                .register_bound_with_source_cut(
+                    aid(1),
+                    scope.clone(),
+                    Receiver {
+                        selection: Selection::All,
+                        records: records.clone(),
+                    },
+                    ActorConfig {
+                        mailbox: [16; 4],
+                        max_batches: 32,
+                        max_effects_per_step: 1,
+                        max_dependencies_per_effect: 0,
+                        max_step_work: 1,
+                        turn_budget: 32,
+                    },
+                    aid(2),
+                )
+                .unwrap_or_else(|(error, _)| panic!("selection actor registration: {error:?}"));
+            let mut f = Self {
+                ledger,
+                runtime,
+                scope,
+                records,
+                inputs: Vec::new(),
+            };
+            if !matches!(selection, Selection::All) {
+                f.fill(aid(1), InputClass::Lifecycle, Input::Select(selection));
+                assert!(f.runtime.poll_one(Tick(1)).unwrap());
+            }
+            f
+        }
+        fn fill(&mut self, source: ActorId, class: InputClass, value: Input) -> InputId {
+            let input = self
+                .runtime
+                .reserve_input(aid(1), source, class)
+                .unwrap()
+                .fill(value)
+                .unwrap();
+            self.inputs.push(input);
+            input
+        }
+        fn drain(&self) {
+            // At most eight data inputs are admitted by these finite cases.
+            // Extra polls exercise genuine idle; no timer or artificial wake.
+            for _ in 0..4 {
+                self.runtime.poll_one(Tick(2)).unwrap();
+            }
+        }
+        fn rows(&self) -> Vec<Record> {
+            self.records.lock().unwrap().clone()
+        }
+        fn values(&self) -> Vec<u64> {
+            self.rows().iter().map(|row| row.0).collect()
+        }
+        fn finish(mut self) {
+            self.fill(aid(1), InputClass::Lifecycle, Input::Select(Selection::All));
+            self.drain();
+            for input in self.inputs {
+                assert_eq!(
+                    self.runtime
+                        .input_custody(aid(1), input)
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    InputPhase::Committed
+                );
+                self.runtime.retire_input(aid(1), input).unwrap();
+            }
+            self.runtime.close_actor_admission(aid(1)).unwrap();
+            assert_eq!(
+                self.runtime.close_timer_source(aid(1)).unwrap(),
+                TimerSourceState::ClosedDrained
+            );
+            while let Some(turn) = self.runtime.claim_host_actor() {
+                turn.release(false).unwrap();
+            }
+            self.runtime.seal_actor(aid(1)).unwrap();
+            self.scope.close_external().unwrap();
+            drop(self.runtime.remove_actor(aid(1)).unwrap());
+            self.ledger.remove_scope(self.scope.id()).unwrap();
+            assert!(self.runtime.is_empty());
+            assert!(self.ledger.is_empty());
+        }
+    }
+
+    #[test]
+    fn three_original_heads_keep_the_primary_cut_and_bounded_fifo_despite_reassertion() {
+        for prefer in [false, true] {
+            model(move || {
+                let mode = if prefer {
+                    Selection::PreferWithOwner(aid(3))
+                } else {
+                    Selection::OnlyWithOwner(aid(3))
+                };
+                let mut f = Fixture::new(mode);
+                f.fill(aid(2), InputClass::Ordinary, Input::Value(10));
+                let primary_tail = f.fill(aid(2), InputClass::Ordinary, Input::Value(11));
+                for (source, first) in [(aid(1), 20), (aid(3), 30)] {
+                    f.fill(source, InputClass::Ordinary, Input::Value(first));
+                    f.fill(source, InputClass::Ordinary, Input::Value(first + 1));
+                }
+                let runtime = f.runtime.clone();
+                let filling = thread::spawn(move || {
+                    runtime
+                        .reserve_input(aid(1), aid(3), InputClass::Ordinary)
+                        .unwrap()
+                        .fill(Input::Value(32))
+                        .unwrap()
+                });
+                let runtime = f.runtime.clone();
+                let consuming = thread::spawn(move || runtime.poll_one(Tick(2)).unwrap());
+                f.inputs.push(filling.join().unwrap());
+                consuming.join().unwrap();
+                f.drain();
+                let rows = f.rows();
+                assert_eq!(rows.len(), 7);
+                // Independent original rotation, not a replay of the selector.
+                assert_eq!(
+                    rows[..3].iter().map(|row| row.0).collect::<Vec<_>>(),
+                    [10, 20, 30]
+                );
+                for (source, expected) in [
+                    (aid(2), vec![10, 11]),
+                    (aid(1), vec![20, 21]),
+                    (aid(3), vec![30, 31, 32]),
+                ] {
+                    assert_eq!(
+                        rows.iter()
+                            .filter(|row| row.1.source == source)
+                            .map(|row| row.0)
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                }
+                for row in &rows[..3] {
+                    assert_eq!(
+                        row.2,
+                        Some(InputSourceCut {
+                            source: aid(2),
+                            tail: Some(primary_tail)
+                        })
+                    );
+                }
+                f.finish();
+            });
+        }
+    }
+
+    #[test]
+    fn owner_lifecycle_head_precedes_its_control_and_only_excludes_a_foreign_source() {
+        model(|| {
+            let mut f = Fixture::new(Selection::OnlyWithOwner(aid(3)));
+            let stranger = f.fill(aid(4), InputClass::Control, Input::Value(99));
+            f.fill(aid(3), InputClass::Lifecycle, Input::Value(30));
+            f.fill(aid(3), InputClass::Control, Input::Value(31));
+            f.drain();
+            assert_eq!(f.values(), [30, 31]);
+            assert_eq!(
+                f.runtime
+                    .input_custody(aid(1), stranger)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                InputPhase::Filled
+            );
+            for row in f.rows() {
+                assert_eq!(
+                    row.2,
+                    Some(InputSourceCut {
+                        source: aid(2),
+                        tail: None
+                    })
+                );
+            }
+            assert!(
+                !f.runtime.poll_one(Tick(2)).unwrap(),
+                "a parked continuation does not spin on an ineligible paid head"
+            );
+            f.finish();
+        });
+    }
+
+    fn cross_class_case(selection: Selection) -> Vec<u64> {
+        let mut f = Fixture::new(selection);
+        f.fill(aid(4), InputClass::Ordinary, Input::Value(99));
+        f.fill(aid(2), InputClass::Ordinary, Input::Value(10));
+        f.fill(aid(2), InputClass::Control, Input::Value(11));
+        f.fill(aid(1), InputClass::Ordinary, Input::Value(20));
+        f.fill(aid(1), InputClass::Control, Input::Value(21));
+        f.drain();
+        let values = f.values();
+        // Both admitted pairs keep their original cross-class head order.
+        for pair in [[10, 11], [20, 21]] {
+            let first = values.iter().position(|value| *value == pair[0]).unwrap();
+            let second = values.iter().position(|value| *value == pair[1]).unwrap();
+            assert!(first < second);
+        }
+        f.finish();
+        values
+    }
+
+    #[test]
+    fn owner_aliases_use_the_original_two_head_only_and_prefer_contracts() {
+        for prefer in [false, true] {
+            for owner in [aid(1), aid(2)] {
+                model(move || {
+                    let original = cross_class_case(if prefer {
+                        Selection::Prefer
+                    } else {
+                        Selection::Only
+                    });
+                    let with_owner = cross_class_case(if prefer {
+                        Selection::PreferWithOwner(owner)
+                    } else {
+                        Selection::OnlyWithOwner(owner)
+                    });
+                    assert_eq!(with_owner, original);
+                    // Concrete legacy contract: primary's later Control cannot
+                    // pass its Ordinary head; only Prefer admits the outsider.
+                    assert_eq!(&original[..2], &[10, 11]);
+                    assert_eq!(original.contains(&99), prefer);
+                    assert_eq!(original.len(), if prefer { 5 } else { 4 });
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn no_owner_all_only_and_prefer_keep_independently_specified_original_sequences() {
+        for mode in [Selection::All, Selection::Only, Selection::Prefer] {
+            model(move || {
+                let mut f = Fixture::new(mode);
+                // The default All contract follows actual insertion order.
+                f.fill(aid(4), InputClass::Ordinary, Input::Value(99));
+                f.fill(aid(2), InputClass::Ordinary, Input::Value(10));
+                f.fill(aid(2), InputClass::Control, Input::Value(11));
+                f.drain();
+                let expected: &[u64] = match mode {
+                    Selection::All => &[99, 10, 11],
+                    Selection::Only => &[10, 11],
+                    Selection::Prefer => &[10, 11, 99],
+                    _ => unreachable!(),
+                };
+                assert_eq!(f.values(), expected);
+                for row in f.rows() {
+                    assert_eq!(
+                        row.2.map(|cut| cut.source),
+                        if matches!(mode, Selection::All) {
+                            None
+                        } else {
+                            Some(aid(2))
+                        }
+                    );
+                }
+                f.finish();
+            });
+        }
+    }
+}
+
+mod causal_current_ticket_models {
+    use super::*;
+    use novarocks_control_runtime::{
+        actor_turn::ActorTurnError, causal_input::CausalInputObligation,
+    };
+
+    fn original_role(
+        f: &EffectForwardFixture,
+    ) -> (
+        CausalInputObligation<EffectForwardActor>,
+        novarocks_control_runtime::obligation::WorkObligation,
+        novarocks_control_runtime::obligation::ReservationObligation,
+    ) {
+        let (mut author, capacity) = f.owners[1]
+            .scope
+            .reserve_next(
+                generation(),
+                ReservationResources::new(
+                    ResourceVector::default(),
+                    OwnedSlotNeed {
+                        work_headers: 1,
+                        inputs: 2,
+                        ..Default::default()
+                    },
+                ),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        author.start().unwrap();
+        let role = CausalInputObligation::reserve_admitted(
+            &f.runtime,
+            &f.owners[1].registration,
+            aid(1),
+            InputClass::Control,
+            &author,
+        )
+        .unwrap();
+        (role, author, capacity)
+    }
+    fn retire_role(
+        f: &EffectForwardFixture,
+        mut role: CausalInputObligation<EffectForwardActor>,
+        mut author: novarocks_control_runtime::obligation::WorkObligation,
+        mut capacity: novarocks_control_runtime::obligation::ReservationObligation,
+    ) {
+        assert!(role.retire_ready_after_exit().unwrap());
+        role.close_after_exit().unwrap();
+        author.body_exited().unwrap();
+        author.captures_exited().unwrap();
+        capacity.finish().unwrap();
+        f.ledger
+            .reap_scope_ready(f.owners[1].scope.id(), 8)
+            .unwrap();
+    }
+
+    #[test]
+    fn original_causal_event_ticket_and_source_failure_have_one_actual_fill_order() {
+        model(|| {
+            let f = EffectForwardFixture::new();
+            let ticket = f.ticket(aid(1));
+            let (mut role, author, capacity) = original_role(&f);
+            let original_author = role.event_author().unwrap();
+            let value = Arc::new(73);
+            let outgoing = value.clone();
+            let runtime = f.runtime.clone();
+            let filling = thread::spawn(move || {
+                let result = role.fill_event_from_effect(
+                    &runtime,
+                    &ticket,
+                    Some(&original_author),
+                    EffectForwardInput::OriginalValue(outgoing),
+                );
+                (role, ticket, result)
+            });
+            let scope = f.owners[0].scope.clone();
+            let failing = thread::spawn(move || scope.fail().unwrap());
+            let (mut role, ticket, result) = filling.join().unwrap();
+            failing.join().unwrap();
+            let receipts = role.in_flight().unwrap();
+            let accepted = match result {
+                Ok(input) => {
+                    assert_eq!(receipts, [None, Some(input)]);
+                    assert!(
+                        f.runtime
+                            .input_header_authors(aid(2), input, 4)
+                            .unwrap()
+                            .contains(&author.reference())
+                    );
+                    assert_eq!(role.event_author().unwrap().work(), author.reference());
+                    true
+                }
+                Err((
+                    ActorTurnError::FailurePublicationRequired,
+                    EffectForwardInput::OriginalValue(returned),
+                )) => {
+                    assert!(Arc::ptr_eq(&returned, &value));
+                    assert_eq!(receipts, [None, None]);
+                    false
+                }
+                other => panic!("unexpected causal current-ticket outcome: {other:?}"),
+            };
+            if accepted {
+                // The original event is still queued, even though its sender
+                // has since failed. Busy cannot discard or replace that event.
+                match role.fill_event_from_effect(
+                    &f.runtime,
+                    &ticket,
+                    None,
+                    EffectForwardInput::OriginalValue(value.clone()),
+                ) {
+                    Err((
+                        ActorTurnError::StandingInputBusy,
+                        EffectForwardInput::OriginalValue(returned),
+                    )) => assert!(Arc::ptr_eq(&returned, &value)),
+                    other => {
+                        panic!("a published causal event remains in actual custody: {other:?}")
+                    }
+                }
+                assert!(!role.retire_ready_after_exit().unwrap());
+            }
+            f.runtime.poll_one(Tick(2)).unwrap();
+            retire_role(&f, role, author, capacity);
+            let seen = f.finish(vec![ticket], vec![]);
+            assert_eq!(
+                seen,
+                if accepted {
+                    vec![vec![], vec![73]]
+                } else {
+                    vec![vec![], vec![]]
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn original_causal_prefix_and_event_prevent_a_second_ticket_handoff_until_real_retirement() {
+        model(|| {
+            let f = EffectForwardFixture::new();
+            let ticket = f.ticket(aid(1));
+            let (mut role, author, capacity) = original_role(&f);
+            let value = Arc::new(79);
+            let (prefix, event) = role
+                .fill_with_receipt(
+                    Some(EffectForwardInput::Value(71)),
+                    EffectForwardInput::Value(72),
+                )
+                .unwrap_or_else(|failure| panic!("original causal fill: {:?}", failure.error));
+            assert!(prefix.is_some());
+            let refused = role.fill_event_from_effect(
+                &f.runtime,
+                &ticket,
+                None,
+                EffectForwardInput::OriginalValue(value.clone()),
+            );
+            match refused {
+                Err((
+                    ActorTurnError::StandingInputBusy,
+                    EffectForwardInput::OriginalValue(returned),
+                )) => assert!(Arc::ptr_eq(&returned, &value)),
+                other => panic!("a live original prefix/event cannot be bypassed: {other:?}"),
+            }
+            assert_eq!(role.in_flight().unwrap(), [prefix, Some(event)]);
+            assert!(!role.retire_ready_after_exit().unwrap());
+            f.runtime.poll_one(Tick(2)).unwrap();
+            // The event's real batch can retire while its original prefix
+            // holder still owns the earlier occurrence. Empty event alone
+            // cannot authorize a later causal cut.
+            f.runtime.retire_input(aid(2), event).unwrap();
+            assert_eq!(role.in_flight().unwrap(), [prefix, None]);
+            match role.fill_event_from_effect(
+                &f.runtime,
+                &ticket,
+                None,
+                EffectForwardInput::OriginalValue(value.clone()),
+            ) {
+                Err((
+                    ActorTurnError::StandingInputBusy,
+                    EffectForwardInput::OriginalValue(returned),
+                )) => assert!(Arc::ptr_eq(&returned, &value)),
+                other => panic!("an unretired original prefix cannot be skipped: {other:?}"),
+            }
+            assert!(role.retire_ready_after_exit().unwrap());
+            assert_eq!(role.in_flight().unwrap(), [None, None]);
+            let original_author = role.event_author().unwrap();
+            let input = role
+                .fill_event_from_effect(
+                    &f.runtime,
+                    &ticket,
+                    Some(&original_author),
+                    EffectForwardInput::OriginalValue(value),
+                )
+                .unwrap();
+            assert_eq!(role.in_flight().unwrap(), [None, Some(input)]);
+            f.runtime.poll_one(Tick(3)).unwrap();
+            retire_role(&f, role, author, capacity);
+            let seen = f.finish(vec![ticket], vec![]);
+            assert_eq!(seen, vec![vec![], vec![71, 72, 79]]);
+        });
+    }
 }

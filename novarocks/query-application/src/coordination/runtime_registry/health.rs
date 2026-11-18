@@ -34,6 +34,8 @@ struct HealthInner {
 pub(in crate::coordination) struct OriginalHealth {
     message: &'static str,
     _panic: Option<Box<dyn Any + Send>>,
+    _owner_failure_custody: Option<Box<dyn Any + Send>>,
+    typed_error: Option<QueryExecutionError>,
     _cause: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 /// The custody transaction is finished. Deliver only after every caller lock.
@@ -70,7 +72,11 @@ impl LogicalExecutionHealth {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(|h| QueryExecutionError::new(QueryExecutionErrorKind::Failed, h.message))
+            .map(|h| {
+                h.typed_error.clone().unwrap_or_else(|| {
+                    QueryExecutionError::new(QueryExecutionErrorKind::Failed, h.message)
+                })
+            })
     }
     pub(in crate::coordination) fn record_health(
         &self,
@@ -83,6 +89,8 @@ impl LogicalExecutionHealth {
                 *state = Some(OriginalHealth {
                     message,
                     _panic: panic,
+                    _owner_failure_custody: None,
+                    typed_error: None,
                     _cause: None,
                 });
                 None
@@ -129,6 +137,8 @@ impl LogicalExecutionHealth {
             *state = Some(OriginalHealth {
                 message: "logical execution supervision task panicked",
                 _panic: original.take(),
+                _owner_failure_custody: None,
+                typed_error: None,
                 _cause: None,
             });
         }
@@ -136,6 +146,39 @@ impl LogicalExecutionHealth {
         Some(LogicalExecutionHealthNotification(Arc::clone(&self.0)))
     }
 
+    /// Original owner failure custody, separate from a panic packet or Join.
+    /// An earlier primary health cause retains precedence.
+    pub(crate) fn record_owner_failure_in(
+        &self,
+        original: &mut Option<Box<dyn Any + Send>>,
+        error: QueryExecutionError,
+    ) -> Option<LogicalExecutionHealthNotification> {
+        if original.is_none() {
+            return None;
+        }
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .as_ref()
+            .is_some_and(|first| first._owner_failure_custody.is_some())
+        {
+            return None;
+        }
+        if let Some(first) = state.as_mut() {
+            first._owner_failure_custody = original.take();
+        } else {
+            *state = Some(OriginalHealth {
+                message: "logical execution owner failed",
+                _panic: None,
+                _owner_failure_custody: original.take(),
+                typed_error: Some(error),
+                _cause: None,
+            });
+        }
+        drop(state);
+        Some(LogicalExecutionHealthNotification(Arc::clone(&self.0)))
+    }
+
+    #[cfg(test)]
     pub(crate) fn record_supervision_join_failure(&self, error: tokio::task::JoinError) {
         if error.is_panic() {
             self.record_supervision_panic(error.into_panic());
@@ -144,19 +187,6 @@ impl LogicalExecutionHealth {
                 "logical execution supervision task exited before actual local closure",
                 Arc::new(error),
             ));
-        }
-    }
-    pub(crate) fn record_root_ack_join_failure(&self, error: tokio::task::JoinError) {
-        if error.is_panic() {
-            self.record_health(
-                "optional root ACK task panicked after actual local exit",
-                Some(error.into_panic()),
-            );
-        } else {
-            self.record_health_cause(
-                "optional root ACK task was cancelled after actual local exit",
-                Arc::new(error),
-            );
         }
     }
     pub(crate) fn record_unproven_exit(&self, failure: StatementNativeHealthFailure) {
@@ -173,6 +203,8 @@ impl LogicalExecutionHealth {
             *state = Some(OriginalHealth {
                 message,
                 _panic: None,
+                _owner_failure_custody: None,
+                typed_error: None,
                 _cause: Some(cause),
             });
         } else if let Some(first) = state.as_mut()
@@ -319,6 +351,10 @@ mod tests {
         let registry = LogicalExecutionHealth::new(Arc::new(Notify::new()));
         let drops = Arc::new(AtomicUsize::new(0));
         let original = Arc::clone(&drops);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This test awaits the actual task JoinError and checks that its original panic payload remains in health custody."
+        )]
         let error = tokio::spawn(async move {
             std::panic::panic_any(PanicPayload(original));
         })
@@ -448,5 +484,42 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         notice.notify();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn owner_failure_retains_typed_cause_and_actual_custody_without_a_panic_packet() {
+        let health = LogicalExecutionHealth::new(Arc::new(Notify::new()));
+        let error =
+            QueryExecutionError::new(QueryExecutionErrorKind::Failed, "original owner failure");
+        let mut original: Option<Box<dyn Any + Send>> = Some(Box::new(17u64));
+        let notice = health
+            .record_owner_failure_in(&mut original, error.clone())
+            .unwrap();
+        assert!(original.is_none());
+        assert_eq!(health.health(), Some(error));
+        {
+            let state = health.0.state.lock().unwrap();
+            let state = state.as_ref().unwrap();
+            assert!(state._panic.is_none());
+            assert_eq!(
+                state
+                    ._owner_failure_custody
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<u64>(),
+                Some(&17)
+            );
+        }
+        let mut later: Option<Box<dyn Any + Send>> = Some(Box::new(19u64));
+        assert!(
+            health
+                .record_owner_failure_in(
+                    &mut later,
+                    QueryExecutionError::new(QueryExecutionErrorKind::Failed, "later failure")
+                )
+                .is_none()
+        );
+        assert_eq!(*later.unwrap().downcast::<u64>().unwrap(), 19);
+        notice.notify();
+        health.abandon_for_process_exit();
     }
 }

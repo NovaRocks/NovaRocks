@@ -51,7 +51,7 @@ is the NIDL-0 baseline; later NIDL tasks add the staged packages below.
 控制、标量声明与请求。类型、常量与函数绑定表由 package 共享。窗口使用关系调用，
 帧偏移直接引用常量。退役的 fragment 表达式表和 package 控制字段的名称及编号均保留，
 原 codec 边界拒绝退役载荷。原生兼容身份使用修订号 27 与当前描述符摘要，epoch 为 15。详见
-[ADR-0236](../../docs/adr/ADR-0236-self-contained-expression-units-and-explicit-environments.md)。
+[ADR-0238](../../docs/adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)。
 
 ## Tag discipline
 

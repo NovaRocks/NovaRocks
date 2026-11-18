@@ -37,6 +37,7 @@ paths = [
     "novarocks/functions/src/arrow_result_custody.rs",
     "novarocks/functions/src/array_backing_geometry.rs",
     "novarocks/functions/src/source_custody_resources.rs",
+    "novarocks/execution/src/exec/operators/sort/creation.rs",
 ]
 
 [reuse]

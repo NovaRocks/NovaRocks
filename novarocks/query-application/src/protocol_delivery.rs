@@ -17,6 +17,9 @@
 
 //! Move-only protocol settlement for governed query application output.
 
+#[cfg(test)]
+use crate::execution_error::ExecutionFailurePresentation;
+
 use crate::api::{
     ExecutionOutput, ExecutionOutputObligation, LocalResultProducer, OwnedLocalResult,
     QueryExecutionError, QueryResult, QueryResultStream, ResultDelivery, ResultFailureView,

@@ -34,7 +34,6 @@ pub(crate) struct NativeApplyKnownInputLayouts {
     pub(crate) receipts: Layout,
     pub(crate) unencodable_slots: Layout,
     pub(crate) queue_pointers: Layout,
-    pub(crate) queue_payloads: Layout,
     pub(crate) one_run_operations: Layout,
     pub(crate) one_control_run: Layout,
     pub(crate) reply_ids: Layout,
@@ -60,6 +59,9 @@ pub(crate) fn known_input_layouts_for_composition(
     fn array<T>(items: usize) -> Result<Layout, WorkError> {
         Layout::array::<T>(items).map_err(|_| WorkError::ArithmeticOverflow)
     }
+    // Retain the original queue-pointee geometry preflight. This unused
+    // layout value was never an invoice or a capacity grant.
+    let _ = array::<NativeTransportQueuePermit>(items)?;
     Ok(NativeApplyKnownInputLayouts {
         original: original(apply_operations)?,
         operation_slots: array::<(bool, proto::TaskOperation)>(items)?,
@@ -71,7 +73,6 @@ pub(crate) fn known_input_layouts_for_composition(
         queue_pointers: array::<Box<dyn crate::task_execution::intent::TaskOperationQueuePermit>>(
             items,
         )?,
-        queue_payloads: array::<NativeTransportQueuePermit>(items)?,
         one_run_operations: array::<proto::TaskOperation>(items)?,
         one_control_run: array::<proto::TaskControlOperation>(items)?,
         reply_ids: array::<TaskOperationId>(items)?,

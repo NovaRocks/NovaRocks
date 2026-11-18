@@ -26,7 +26,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WATCHDOG: Duration = Duration::from_secs(30);
-const HELPER_NAME: &str = "retention_process_helper";
+const RETENTION_CHILD_TEST: &str =
+    "ordinary_default_keeps_three_completed_runs_and_excludes_an_active_pin";
 
 struct Evidence {
     root: PathBuf,
@@ -64,7 +65,7 @@ impl Evidence {
         let executable = std::env::current_exe().unwrap();
         let mut command = Command::new(&executable);
         command
-            .args(["--ignored", "--exact", HELPER_NAME, "--nocapture"])
+            .args(["--exact", RETENTION_CHILD_TEST, "--nocapture"])
             .env_clear()
             .env("HOME", self.root.join("home"))
             .env("XDG_STATE_HOME", self.root.join("state"))
@@ -88,7 +89,7 @@ impl Evidence {
             directory.join("command.json"),
             serde_json::to_vec_pretty(&json!({
                 "program": executable,
-                "arguments": ["--ignored", "--exact", HELPER_NAME, "--nocapture"],
+                "arguments": ["--exact", RETENTION_CHILD_TEST, "--nocapture"],
                 "environment_cleared": true,
                 "environment": {
                     "HOME": self.root.join("home"),
@@ -236,6 +237,10 @@ fn actual_final(launch: &Path) -> Value {
 
 #[test]
 fn ordinary_default_keeps_three_completed_runs_and_excludes_an_active_pin() {
+    if std::env::var_os("RETENTION_HELPER_DIRECTORY").is_some() {
+        retention_process_helper();
+        return;
+    }
     let mut evidence = Evidence::new("default-three-active-pin");
     let oldest = evidence.completed("forgotten");
     let mut active = evidence.spawn("forgotten", None);
@@ -409,8 +414,6 @@ fn failed_process_initialization_stays_rejected_on_same_process_retry() {
     assert!(!root.join("monitor").exists());
 }
 
-#[test]
-#[ignore = "internal helper; the outer test supplies private state and owns its actual Child"]
 fn retention_process_helper() {
     let directory = PathBuf::from(
         std::env::var_os("RETENTION_HELPER_DIRECTORY").expect("outer helper directory"),
@@ -536,228 +539,5 @@ fn retention_process_helper() {
             "outer owner never released retention helper"
         );
         std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn native_fixture_directory() -> PathBuf {
-    let directory = PathBuf::from(
-        std::env::var_os("RETENTION_NATIVE_FIXTURE")
-            .expect("the native lease orchestrator must supply RETENTION_NATIVE_FIXTURE"),
-    );
-    assert!(directory.is_absolute() && directory.is_dir());
-    for name in [
-        "NEXTEST_RUN_ID",
-        "NEXTEST_BINARY_ID",
-        "NEXTEST_TEST_NAME",
-        "NEXTEST_VERSION",
-    ] {
-        assert!(
-            std::env::var_os(name).is_some_and(|value| !value.is_empty()),
-            "native lease fixture requires actual {name}"
-        );
-    }
-    directory
-}
-
-fn native_failed_launch(slot: usize) {
-    let directory = native_fixture_directory();
-    let mut command = ManagedCommand::new("/bin/sh");
-    command.args([
-        "-c",
-        "trap 'exit 0' TERM; printf 'NATIVE_LEASE_READY\\n'; while :; do sleep 1; done",
-    ]);
-    let mut process = ManagedProcess::spawn(
-        format!("native lease failure {slot}"),
-        command,
-        ReadyMarker::StdoutContains("NATIVE_LEASE_READY".into()),
-        WATCHDOG,
-        directory.join(format!("failure-{slot}.locator")),
-    )
-    .unwrap();
-    process.stop().unwrap();
-    actual_final(process.diagnostic_root());
-    fs::write(
-        directory.join(format!("failure-{slot}.json")),
-        serde_json::to_vec_pretty(&json!({
-            "launch": process.diagnostic_root(),
-            "native_run_id": std::env::var("NEXTEST_RUN_ID").unwrap(),
-            "native_test_name": std::env::var("NEXTEST_TEST_NAME").unwrap(),
-            "test_process_id": std::process::id(),
-            "expected_assertion_failure": true,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    // Deliberately retain original diagnostics. This is an expected fixture
-    // assertion failure, not a passing test or a product regression.
-    panic!("expected native lease fixture assertion failure slot={slot}");
-}
-
-#[test]
-#[ignore = "internal native lease fixture; requires the retained nextest orchestrator"]
-fn retention_native_failure_one() {
-    native_failed_launch(1);
-}
-
-#[test]
-#[ignore = "internal native lease fixture; requires the retained nextest orchestrator"]
-fn retention_native_failure_two() {
-    native_failed_launch(2);
-}
-
-#[test]
-#[ignore = "internal native lease fixture; requires the retained nextest orchestrator"]
-fn retention_native_failure_three() {
-    native_failed_launch(3);
-}
-
-#[test]
-#[ignore = "internal native lease fixture; requires the retained nextest orchestrator"]
-fn retention_native_failure_four() {
-    native_failed_launch(4);
-}
-
-#[test]
-#[ignore = "internal raw native gap fixture; never establishes a retention pin itself"]
-fn retention_native_raw_gap() {
-    let directory = native_fixture_directory();
-    let deadline = Instant::now() + Duration::from_secs(180);
-    while !(1..=4).all(|slot| directory.join(format!("failure-{slot}.json")).is_file()) {
-        assert!(
-            Instant::now() < deadline,
-            "native failure fixtures never arrived"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    // No managed operation or ensure call is permitted in this helper. The
-    // guard alone must retain the run after the four failing tests have exited.
-    fs::write(directory.join("raw-gap.ready"), b"four markers observed\n").unwrap();
-    while !directory.join("raw-gap.release").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "native gap owner never released the helper"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn nested_native_child(directory: &Path, expectation: &str) {
-    let child_directory = directory.join(format!("nested-{expectation}"));
-    fs::create_dir(&child_directory).unwrap();
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command
-        .args([
-            "--ignored",
-            "--exact",
-            "retention_native_nested_child",
-            "--nocapture",
-        ])
-        .env_clear()
-        .env("RETENTION_NATIVE_FIXTURE", directory)
-        .env("RETENTION_NATIVE_NESTED_EXPECTATION", expectation)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(
-            File::create(child_directory.join("stdout.log")).unwrap(),
-        ))
-        .stderr(Stdio::from(
-            File::create(child_directory.join("stderr.log")).unwrap(),
-        ));
-    // Preserve the real inherited native identity and the exact same local
-    // state directory; no invented parent identity or second run is supplied.
-    for name in [
-        "HOME",
-        "XDG_STATE_HOME",
-        "NEXTEST_RUN_ID",
-        "NEXTEST_BINARY_ID",
-        "NEXTEST_TEST_NAME",
-        "NEXTEST_VERSION",
-    ] {
-        command.env(name, std::env::var_os(name).expect("native nested input"));
-    }
-    let child = command.spawn().unwrap();
-    let mut helper = Helper {
-        child,
-        directory: child_directory,
-        reaped: false,
-        ready: json!({"native_nested_expectation": expectation}),
-    };
-    // This child returns immediately after its original verdict; the common
-    // owner still supplies bounded actual wait and failure cleanup.
-    helper.finish();
-}
-
-#[test]
-#[ignore = "internal native nested boundary fixture; requires actual nextest execution"]
-fn retention_native_nested_boundary() {
-    let directory = native_fixture_directory();
-    nested_native_child(&directory, "first-rejected");
-    let run = std::env::var("NEXTEST_RUN_ID").unwrap();
-    let root = PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap())
-        .join("novarocks/test-runs/nextest")
-        .join(run);
-    assert!(
-        !root.exists(),
-        "rejected nested first use created a placeholder root"
-    );
-    ensure_run_retention(Instant::now() + WATCHDOG).unwrap();
-    assert!(root.join("Ready").is_file());
-    nested_native_child(&directory, "joined");
-    fs::write(
-        directory.join("nested-boundary.complete"),
-        b"original reject then explicit outer ensure and join passed\n",
-    )
-    .unwrap();
-}
-
-#[test]
-#[ignore = "internal raw nested child; an outer native test owns and waits its actual Child"]
-fn retention_native_nested_child() {
-    let directory = native_fixture_directory();
-    match std::env::var("RETENTION_NATIVE_NESTED_EXPECTATION")
-        .expect("outer native test must supply an expectation")
-        .as_str()
-    {
-        "first-rejected" => {
-            let error = ensure_run_retention(Instant::now() + WATCHDOG)
-                .expect_err("nested first use must require explicit outer ensure");
-            assert!(
-                error
-                    .to_string()
-                    .contains("direct cargo-nextest test child"),
-                "unexpected nested admission refusal: {error}"
-            );
-            fs::write(
-                directory.join("nested-first-refusal.txt"),
-                error.to_string(),
-            )
-            .unwrap();
-        }
-        "joined" => {
-            let mut command = ManagedCommand::new("/bin/sh");
-            command.args([
-                "-c",
-                "trap 'exit 0' TERM; printf 'NESTED_READY\\n'; while :; do sleep 1; done",
-            ]);
-            let mut process = ManagedProcess::spawn(
-                "native joined nested payload".into(),
-                command,
-                ReadyMarker::StdoutContains("NESTED_READY".into()),
-                WATCHDOG,
-                directory.join("nested-output.locator"),
-            )
-            .unwrap();
-            process.stop().unwrap();
-            actual_final(process.diagnostic_root());
-            fs::write(
-                directory.join("nested-launch.json"),
-                serde_json::to_vec_pretty(&json!({
-                    "launch": process.diagnostic_root(),
-                    "native_run_id": std::env::var("NEXTEST_RUN_ID").unwrap(),
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        }
-        other => panic!("unknown native nested expectation: {other}"),
     }
 }

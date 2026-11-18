@@ -864,10 +864,11 @@ fn every_window_call_lowers_to_a_prepared_call_with_its_own_explicit_frame() {
     assert_eq!((partition_exprs.len(), order_by_exprs.len()), (1, 1));
     // The analytic Sort below leads with its partition key.
     let ProgramNodeKind::Sort {
-        partition_exprs: sort_partition,
+        mode:
+            novarocks_local_program::LocalSortMode::Partitioned {
+                partition_by: sort_partition,
+            },
         order_by: sort_order,
-        partition_limit: None,
-        use_top_n: false,
         ..
     } = program.graph().nodes()[input.index()].kind()
     else {

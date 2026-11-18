@@ -85,7 +85,7 @@ tools/ci/dev-verify.sh compose --base origin/main --root /absolute/local/task-ev
 
 新增测试、workload、采样/比较定义、SQL 指令或架构检查前，先确认现有覆盖为何不足、产品性质、资产性质和最低充分层级、独立预期，以及输入、隔离、真实退出、维护 owner、成本、消费链路和频率。答案靠近原生定义；简单测试可由函数、断言和模块说明承载，无需逐例表单。一次性探索只有明确长期消费者后才按同样条件晋升源码资产。
 
-Rust 测试放在哪个 crate 的哪个位置、可以依赖谁、fixture 归谁，见 [Rust 测试组织](rust-test-organization.md)。
+Rust 测试放在哪个 crate 的哪个位置、可以依赖谁、fixture 归谁，以及改动时怎样迁移旧布局的测试，见 [Rust 测试组织](rust-test-organization.md)；快速验证与 SQL 级测试的分工见其中的“选层”。
 
 SQL 文件保留必要的语义输入和断言，多步生命周期编排归 system owner；未知、非法或未实现指令不得静默成为无断言通过。现有指令拒绝行为由 TST-G13 迁移。依赖方向由 crate 结构与 review 维持，不新增依赖边界检查、源码形状守卫或产品前提检查。API 级约束使用所属 crate 的 Clippy `disallowed-*`，供应链使用 cargo-deny。产品前提优先由行为测试保护；没有行为测试时，在设计中写明它的定位与接受的代价。长期裁决见 [ADR-0190](../../adr/ADR-0190-dependency-direction-by-structure-and-review.md)。
 
@@ -213,7 +213,7 @@ nextest 日常使用原生最低版本要求 **0.9.148**，兼容新版不因自
 
 正式材料不受普通 release/GC 影响，继续遵守上文正式保留/交接规则。运行锁及状态目录只支持经实际 FD 检查的本地 APFS/ext/XFS/Btrfs/tmpfs；容器显式 bind-mount 支持的本地状态目录，overlay/网络/未知文件系统不降级。完整范围、嵌套示例、平台验证缺口和 macOS 按需排查入口见 [test-support README](../../../tests/test-support/README.md)。当前 native Linux x86_64 仍缺本轮生命周期/FD及真实消费者证据，文档和 macOS 定向通过不能替代该平台验收。
 
-Hadoop local fencing 保留普通原生测试，内部 child helper 为 ignored 且只能由父测试 `--ignored --exact` 启动；缺输入失败。MinIO、MySQL、FoundationDB 和 Java interop 继续各自专用入口及真实前置，Paimon 暂停边界保留。Loom/Miri 保留专用工具链与 Tree Borrows 等条件。nextest 全量不自动扩展这些矩阵，也不接管 Docker、外部实例或所有 raw spawn 的生命周期。
+Hadoop local fencing 由父测试按准确名称进入同一个测试程序的子进程分支，子进程使用父测试提供的私有输入。默认 Rust 单测无需另行准备 Server、Docker 或外部服务。MinIO、MySQL 和 FoundationDB 依赖由各自的专项入口准备，Paimon 暂停边界保留。Loom/Miri 保留专用工具链与 Tree Borrows 等条件。nextest 全量不自动扩展这些矩阵，也不接管 Docker、外部实例或所有 raw spawn 的生命周期。
 
 ### 兼容专项的选择
 

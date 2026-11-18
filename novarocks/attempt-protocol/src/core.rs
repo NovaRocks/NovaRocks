@@ -158,6 +158,7 @@ impl Core {
         } = plan;
         let AttemptSources {
             actor,
+            owner: _,
             publication: publication_source,
             qa,
             process,
@@ -745,7 +746,7 @@ impl Core {
         &mut self,
         now: MonotonicInstant,
         source: AttemptSourceId,
-        input: LogicalToAttempt<AttemptFailure>,
+        input: LogicalToAttempt,
     ) -> Result<RootControlApplication, TaskExecutionError> {
         self.verify_common_observation_phase(source)?;
         if input.activation != self.activation {
@@ -917,7 +918,7 @@ impl Core {
 
     pub(crate) fn apply_qa_reply(
         &mut self,
-        input: LogicalToAttempt<AttemptFailure>,
+        input: LogicalToAttempt,
     ) -> Result<QaReply, TaskExecutionError> {
         if input.activation != self.activation {
             return Ok(QaReply::Stale);
@@ -1148,6 +1149,7 @@ mod tests {
             observe_lifecycle_diagnostics: false,
             sources: AttemptSources {
                 actor: AttemptSourceId(id(3)),
+                owner: AttemptSourceId(id(3)),
                 publication: AttemptSourceId(id(4)),
                 qa: AttemptSourceId(id(5)),
                 process: AttemptSourceId(id(6)),
@@ -1159,6 +1161,221 @@ mod tests {
                 transport: AttemptSourceId(id(12)),
                 mailbox: [4; 4],
             },
+        }
+    }
+
+    #[test]
+    fn direct_logical_stop_preserves_selected_task_and_replacement_witness_at_core_boundary() {
+        use crate::{
+            AttemptCore,
+            input::{AttemptInput, AttemptInputClaim},
+            terminal::{GatePreparation, TerminalDirective, TerminalFacts, TerminalWake},
+        };
+        use novarocks_coordination_contract::{
+            AttemptStopReason, ExecutionFailure, ExecutionFailureInput, ExecutionFailureSite,
+            PreReadyProcessReplacementWitness, QueryFailureReason, SelectedTaskTermination,
+        };
+        use novarocks_execution_contract::{
+            OperationKind, SafeDetail, TaskFailure,
+            failure::{FailureClass, FailureFact, FailureProjection},
+        };
+        let seed = start();
+        let root = seed.plan.graph.root;
+        let participation = seed
+            .plan
+            .graph
+            .tasks
+            .values()
+            .find(|task| task.identity == root)
+            .unwrap()
+            .participation;
+        let selected = SelectedTaskTermination::new(
+            root,
+            TerminationDetail::Failed(TaskFailure::new(
+                QueryFailureReason::ResultProtocol.failure_fact(),
+                SafeDetail::truncating("original selected Task failure"),
+            )),
+        );
+        let selected = ExecutionFailure::from_input(
+            ExecutionFailureInput::from_selected_task(&selected).unwrap(),
+        );
+        let mut ids = OperationIds::new(IdSeed::new(91, 92));
+        let operation = ids.issue();
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(
+                FailureClass::Invariant,
+                novarocks_coordination_contract::TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
+            ),
+            SafeDetail::truncating("original CreateTask refusal with independent replacement"),
+            ExecutionFailureSite::Operation {
+                participation,
+                operation_id: operation,
+                kind: OperationKind::CreateTask,
+            },
+        );
+        let witness = PreReadyProcessReplacementWitness::try_new(
+            &input,
+            participation,
+            operation,
+            crate::test_support::backend(999),
+        )
+        .unwrap();
+        let mut replacement = ExecutionFailure::from_input(input);
+        replacement.attach_pre_ready_replacement(witness).unwrap();
+        for original in [selected, replacement] {
+            let seed = start();
+            let now = seed.initial_now;
+            let activation = seed.activation.identity;
+            let sources = seed.sources;
+            let mut core = Core::new(seed).unwrap();
+            let claim = |source, n| AttemptInputClaim {
+                source,
+                input: AttemptInputId(id(n)),
+                native_cut: None,
+                selected_cut: None,
+            };
+            core.handle(
+                now,
+                claim(sources.actor, 701),
+                AttemptInput::Bootstrap,
+                &mut Units(32),
+            )
+            .unwrap();
+            let applied = core
+                .handle(
+                    now,
+                    claim(sources.owner, 702),
+                    AttemptInput::Port(LogicalToAttempt {
+                        activation,
+                        body: LogicalToAttemptBody::Stop {
+                            reason: AttemptStopReason::LogicalExecutionFailed,
+                            failure: original.clone(),
+                        },
+                    }),
+                    &mut Units(32),
+                )
+                .unwrap();
+            assert!(applied.stop_producing);
+            let terminal = core
+                .terminal
+                .poll(
+                    now,
+                    TerminalFacts {
+                        success_ready: false,
+                        selected_task: None,
+                        gate: GatePreparation::Applied { ready: true },
+                        horizon: None,
+                        wake: TerminalWake::Cancellation,
+                    },
+                    None,
+                )
+                .unwrap();
+            let TerminalDirective::Selected(crate::port_output::AttemptTerminal::Failed(
+                AttemptFailure::Logical(retained),
+            )) = terminal
+            else {
+                panic!("original passive Stop must select its complete failure");
+            };
+            assert_eq!(retained, original);
+            assert_eq!(
+                crate::port_projection::project_failure(
+                    &AttemptFailure::Logical(retained),
+                    &mut |_| panic!("passive input has no HostRef")
+                )
+                .unwrap(),
+                original
+            );
+            // A later control input cannot replace the accepted original cause.
+            core.handle(
+                now,
+                claim(sources.owner, 703),
+                AttemptInput::Port(LogicalToAttempt {
+                    activation,
+                    body: LogicalToAttemptBody::Stop {
+                        reason: AttemptStopReason::Client,
+                        failure: crate::test_support::logical_failure("later unrelated Stop"),
+                    },
+                }),
+                &mut Units(32),
+            )
+            .unwrap();
+            assert_eq!(
+                core.terminal.terminal(),
+                Some(&crate::port_output::AttemptTerminal::Failed(
+                    AttemptFailure::Logical(original)
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn logical_owner_port_source_is_independent_of_the_actual_attempt_actor() {
+        use crate::{
+            AttemptCore,
+            input::{AttemptInput, AttemptInputClaim},
+        };
+        use novarocks_coordination_contract::AttemptStopReason;
+        for failed_reply in [false, true] {
+            for use_owner in [false, true] {
+                let mut start = start();
+                start.sources.owner = start.sources.qa;
+                let sources = start.sources;
+                let activation = start.activation.identity;
+                let now = start.initial_now;
+                let mut core = Core::new(start).unwrap();
+                core.handle(
+                    now,
+                    AttemptInputClaim {
+                        source: sources.actor,
+                        input: AttemptInputId(id(300)),
+                        native_cut: None,
+                        selected_cut: None,
+                    },
+                    AttemptInput::Bootstrap,
+                    &mut Units(32),
+                )
+                .unwrap();
+                let result = core.handle(
+                    now,
+                    AttemptInputClaim {
+                        source: if use_owner {
+                            sources.owner
+                        } else {
+                            sources.actor
+                        },
+                        input: AttemptInputId(id(301)),
+                        native_cut: None,
+                        selected_cut: None,
+                    },
+                    AttemptInput::Port(LogicalToAttempt {
+                        activation,
+                        body: if failed_reply {
+                            LogicalToAttemptBody::PreReadyReplacementOwnerFailed {
+                                token: novarocks_coordination_contract::AttemptRequestToken::new(
+                                    id(19),
+                                ),
+                                failure:
+                                    novarocks_coordination_contract::ExecutionFailure::from_input(
+                                        crate::port_projection::owner_failure(),
+                                    ),
+                            }
+                        } else {
+                            LogicalToAttemptBody::Stop {
+                                reason: AttemptStopReason::LogicalExecutionFailed,
+                                failure: crate::test_support::logical_failure(
+                                    "original logical owner stop",
+                                ),
+                            }
+                        },
+                    }),
+                    &mut Units(32),
+                );
+                assert_eq!(result.is_ok(), use_owner, "{result:?}");
+                if use_owner {
+                    assert!(result.unwrap().stop_producing);
+                    assert!(core.terminal.requires_logical_failure_stand_down());
+                }
+            }
         }
     }
 
@@ -1301,12 +1518,13 @@ mod tests {
 
     #[test]
     fn failed_status_and_ready_root_control_use_their_common_source_order() {
+        use crate::port_output::AttemptToLogicalBody;
         use crate::{
             AttemptCore,
             effect::Publication,
             input::{AttemptInput, AttemptInputClaim},
         };
-        use novarocks_coordination_contract::{AttemptToLogicalBody, SelectedTaskTermination};
+        use novarocks_coordination_contract::SelectedTaskTermination;
         use novarocks_execution_contract::{
             SafeDetail, TaskFailure,
             failure::{FailureClass, FailureFact, FailureReason},
@@ -1366,9 +1584,10 @@ mod tests {
                     for _ in 0..16 {
                         let publication = step.effect.take().and_then(|effect| {
                             let applied = match &effect.body {
-                                EffectBody::Publish(Publication::RootStatus(_)) => {
-                                    Some(PublicationApplied::RootStatus)
-                                }
+                                EffectBody::Port(crate::port_output::AttemptToLogical {
+                                    body: crate::port_output::AttemptToLogicalBody::RootStatus(_),
+                                    ..
+                                }) => Some(PublicationApplied::RootStatus),
                                 EffectBody::Publish(Publication::ProtocolBatch(_)) => {
                                     Some(PublicationApplied::ProtocolBatch { published: true })
                                 }
@@ -1523,7 +1742,7 @@ mod tests {
                 let prefix = finish_prefix(&mut core, prefix, 3);
                 assert!(prefix.iter().any(|body| matches!(
                     body,
-                    EffectBody::Publish(Publication::RootStatus(projection))
+                    EffectBody::Port(crate::port_output::AttemptToLogical { body: crate::port_output::AttemptToLogicalBody::RootStatus(projection), .. })
                         if projection.status.identity() == root
                             && projection.status.state() == TaskState::Finished
                             && projection.failure == if failure_first {
@@ -1602,14 +1821,13 @@ mod tests {
 
     #[test]
     fn actual_qa_replies_settle_all_original_debts_after_publication() {
+        use crate::port_output::{AttemptAuthorization, AttemptToLogicalBody};
         use crate::{
             effect::EffectClass,
             execution::ack_phase::{admission_intent, dispatch_admission},
-            failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
         };
         use novarocks_coordination_contract::{
-            AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationFailure,
-            AttemptAuthorizationRef, AttemptFailureClass, AttemptToLogicalBody,
+            AttemptAuthorizationDecision, AttemptAuthorizationFailure, AttemptAuthorizationRef,
         };
         use novarocks_execution_contract::OperationOutcome;
         let start = start();
@@ -1709,12 +1927,9 @@ mod tests {
             }
         }
 
-        let original_failure = AttemptFailure::Host(HostProjectedFailure {
-            original: HostFailureRef(id(55)),
-            kind: HostFailureKind::LogicalActor,
-            class: AttemptFailureClass::ExecutionFailure,
-            site: AttemptFailureSite::Attempt,
-        });
+        let original_failure = AttemptFailure::Logical(crate::test_support::logical_failure(
+            "original original_failure",
+        ));
         assert!(matches!(
             core.advance_ack_settlement(token(10), action(10), &mut Charge(false))
                 .unwrap(),
@@ -1753,7 +1968,7 @@ mod tests {
             ));
             let decision = if index == 0 {
                 Err(AttemptAuthorizationFailure::Rejected(
-                    original_failure.clone(),
+                    crate::test_support::passive_failure(&original_failure),
                 ))
             } else {
                 Ok(AttemptAuthorizationDecision::AdmissionGranted)
@@ -2090,14 +2305,13 @@ mod tests {
     #[test]
     fn round_tail_waits_for_publication_then_releases_expired_grant_before_qa() {
         use super::round_tail::RoundTailStep;
+        use crate::port_output::{AttemptAuthorization, AttemptToLogicalBody};
         use crate::{
             execution::ack_phase::{admission_intent, dispatch_admission, queue_establish},
-            failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
             input::{QueuedInputGrantRef, SendGeneration},
         };
         use novarocks_coordination_contract::{
-            AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationFailure,
-            AttemptAuthorizationRef, AttemptFailureClass, AttemptToLogicalBody,
+            AttemptAuthorizationDecision, AttemptAuthorizationFailure, AttemptAuthorizationRef,
         };
         use novarocks_execution_contract::OperationOutcome;
 
@@ -2222,15 +2436,13 @@ mod tests {
             RoundTailStep::AwaitQa
         ));
 
-        let later_error = AttemptFailure::Host(HostProjectedFailure {
-            original: HostFailureRef(id(40)),
-            kind: HostFailureKind::LogicalActor,
-            class: AttemptFailureClass::ExecutionFailure,
-            site: AttemptFailureSite::Attempt,
-        });
+        let later_error =
+            AttemptFailure::Logical(crate::test_support::logical_failure("original later_error"));
         core.apply_qa_reply(qa_reply(
             13,
-            Err(AttemptAuthorizationFailure::Rejected(later_error)),
+            Err(AttemptAuthorizationFailure::Rejected(
+                crate::test_support::passive_failure(&later_error),
+            )),
         ))
         .unwrap();
         assert!(matches!(
@@ -2635,7 +2847,7 @@ mod tests {
                 );
                 assert!(matches!(
                     published.effect,
-                    Some(AttemptEffect { body: EffectBody::Publish(Publication::RootStatus(projection)), .. })
+                    Some(AttemptEffect { body: EffectBody::Port(crate::port_output::AttemptToLogical { body: crate::port_output::AttemptToLogicalBody::RootStatus(projection), .. }), .. })
                     if matches!(projection.failure, AttemptRootFailure::Authoritative(_))
                 ));
             } else {
@@ -2667,12 +2879,12 @@ mod tests {
 
     #[test]
     fn seal_preserves_exact_root_on_leaf_exhaustion_and_refuses_expired_gap() {
+        use crate::port_output::AttemptToLogicalBody;
         use crate::{
             AttemptCore,
             effect::Publication,
             input::{AttemptInput, AttemptInputClaim},
         };
-        use novarocks_coordination_contract::AttemptToLogicalBody;
         use novarocks_execution_contract::ExchangeDeliveryRequirement;
         use std::cell::Cell;
 
@@ -2777,9 +2989,10 @@ mod tests {
                 for _ in 0..24 {
                     let publication = pending.effect.take().and_then(|effect| {
                         let applied = match &effect.body {
-                            EffectBody::Publish(Publication::RootStatus(_)) => {
-                                Some(PublicationApplied::RootStatus)
-                            }
+                            EffectBody::Port(crate::port_output::AttemptToLogical {
+                                body: crate::port_output::AttemptToLogicalBody::RootStatus(_),
+                                ..
+                            }) => Some(PublicationApplied::RootStatus),
                             EffectBody::Publish(Publication::ProtocolBatch(_)) => {
                                 Some(PublicationApplied::ProtocolBatch { published: true })
                             }
@@ -2851,7 +3064,7 @@ mod tests {
             let effects = observe(&mut core, now, frames);
             assert!(effects.iter().any(|effect| matches!(
                 effect,
-                EffectBody::Publish(Publication::RootStatus(projection))
+                EffectBody::Port(crate::port_output::AttemptToLogical { body: crate::port_output::AttemptToLogicalBody::RootStatus(projection), .. })
                     if projection.status.identity() == root
                         && projection.status.state() == TaskState::Finished
                         && projection.status.output().responsibility_complete()
@@ -2956,6 +3169,7 @@ mod tests {
     #[test]
     fn diagnostic_snapshot_keeps_early_data_and_excludes_late_data_until_actual_exit() {
         use super::round_tail::RoundTailStep;
+        use crate::port_output::AttemptToLogicalBody;
         use crate::{
             AttemptCore,
             effect::Publication,
@@ -2965,9 +3179,7 @@ mod tests {
             },
             publication::{DiagnosticClosure, DiagnosticMissing, DiagnosticTaskObservation},
         };
-        use novarocks_coordination_contract::{
-            AttemptComputationCut, AttemptConvergenceMode, AttemptToLogicalBody,
-        };
+        use novarocks_coordination_contract::{AttemptComputationCut, AttemptConvergenceMode};
         use novarocks_execution_contract::root_result::RootResultEnd;
 
         for at_deadline in [false, true] {
@@ -3150,7 +3362,11 @@ mod tests {
                     }
                     Some(AttemptEffect {
                         id,
-                        body: EffectBody::Publish(Publication::RootStatus(_)),
+                        body:
+                            EffectBody::Port(crate::port_output::AttemptToLogical {
+                                body: crate::port_output::AttemptToLogicalBody::RootStatus(_),
+                                ..
+                            }),
                         ..
                     }) => {
                         handle(
@@ -3324,10 +3540,12 @@ mod tests {
 
     #[test]
     fn first_split_pump_failure_keeps_its_typed_cause_and_upgrades_later_convergence() {
+        use crate::failure::{
+            AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure,
+        };
         use crate::{
             AttemptCore,
             effect::PumpKind,
-            failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
             input::{AttemptInput, AttemptInputClaim},
         };
         use novarocks_coordination_contract::{AttemptConvergenceMode, AttemptFailureClass};
@@ -3641,12 +3859,12 @@ mod tests {
 
     #[test]
     fn unified_step_emits_seal_only_after_matching_root_publication() {
+        use crate::port_output::AttemptToLogicalBody;
         use crate::{
             AttemptCore,
             effect::Publication,
             input::{AttemptInput, AttemptInputClaim},
         };
-        use novarocks_coordination_contract::AttemptToLogicalBody;
 
         let mut attempt = start();
         attempt.observe_dev_root = true;
@@ -3756,7 +3974,11 @@ mod tests {
         let root_work = step(&mut core, sources.actor, 3, AttemptInput::Timer);
         let Some(AttemptEffect {
             id: root_effect,
-            body: EffectBody::Publish(crate::effect::Publication::RootStatus(projection)),
+            body:
+                EffectBody::Port(crate::port_output::AttemptToLogical {
+                    body: crate::port_output::AttemptToLogicalBody::RootStatus(projection),
+                    ..
+                }),
             ..
         }) = root_work.effect
         else {
@@ -3870,7 +4092,7 @@ mod tests {
         }
         assert!(
             matches!(completed.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
-            if matches!(port.body, AttemptToLogicalBody::AttemptTerminal(novarocks_coordination_contract::AttemptTerminal::Completed)))
+            if matches!(port.body, AttemptToLogicalBody::AttemptTerminal(crate::port_output::AttemptTerminal::Completed)))
         );
     }
 
@@ -3943,7 +4165,7 @@ mod tests {
             activation,
             body: LogicalToAttemptBody::Stop {
                 reason: AttemptStopReason::LogicalExecutionFailed,
-                failure: AttemptFailure::TaskProtocol(Box::new(schedule("original stop"))),
+                failure: crate::test_support::logical_failure("original stop"),
             },
         });
         let closed = step(&mut core, sources.actor, 3, stop.clone(), Some(tail), None);
@@ -4036,9 +4258,9 @@ mod tests {
         assert_eq!(finished.round_result, Some(Ok(())));
         assert!(
             matches!(finished.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
-            if matches!(port.body, novarocks_coordination_contract::AttemptToLogicalBody::AttemptTerminal(
-                novarocks_coordination_contract::AttemptTerminal::Failed(AttemptFailure::TaskProtocol(ref error))
-            ) if **error == schedule("original stop")))
+            if matches!(port.body, crate::port_output::AttemptToLogicalBody::AttemptTerminal(
+                crate::port_output::AttemptTerminal::Failed(AttemptFailure::Logical(ref error))
+            ) if *error == crate::test_support::logical_failure("original stop")))
         );
 
         step(
@@ -4057,13 +4279,14 @@ mod tests {
 
     #[test]
     fn convergence_waits_for_exact_process_read_and_reports_local_exit_separately() {
+        use crate::port_output::AttemptToLogicalBody;
         use crate::{
             AttemptCore,
             effect::Publication,
             execution::ack_phase::{admission_intent, dispatch_admission},
             input::{AttemptInput, AttemptInputClaim, MembershipObservation, PublicationApplied},
         };
-        use novarocks_coordination_contract::{AttemptConvergenceMode, AttemptToLogicalBody};
+        use novarocks_coordination_contract::AttemptConvergenceMode;
         use novarocks_execution_contract::OperationOutcome;
 
         let mut start = start();
@@ -4188,12 +4411,26 @@ mod tests {
                         Publication::ProtocolBatch(_) => {
                             PublicationApplied::ProtocolBatch { published: true }
                         }
-                        Publication::RootStatus(_) => PublicationApplied::RootStatus,
                         other => panic!("unexpected pre-close publication: {other:?}"),
                     };
                     applied = Some(ExecutorFact::PublicationApplied {
                         effect: *id,
                         result: Ok(receipt),
+                    });
+                }
+                if let Some(AttemptEffect {
+                    id,
+                    body:
+                        EffectBody::Port(crate::port_output::AttemptToLogical {
+                            body: crate::port_output::AttemptToLogicalBody::RootStatus(_),
+                            ..
+                        }),
+                    ..
+                }) = &result.effect
+                {
+                    applied = Some(ExecutorFact::PublicationApplied {
+                        effect: *id,
+                        result: Ok(PublicationApplied::RootStatus),
                     });
                 }
                 matches!(
@@ -4247,11 +4484,11 @@ mod tests {
     }
 
     fn drive_original_admission_and_establish(replacement: Option<bool>) {
+        use crate::port_output::{AttemptAuthorization, AttemptTerminal, AttemptToLogicalBody};
         use crate::{
             AttemptCore,
             capacity::ReservationToken,
             effect::{OperationIntent, Publication},
-            failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
             input::{
                 AckPayload, AttemptInput, AttemptInputClaim, LocalDispatchResult,
                 MembershipObservation, MembershipView, OperationObservation, OperationReply,
@@ -4259,9 +4496,8 @@ mod tests {
             },
         };
         use novarocks_coordination_contract::{
-            AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationFailure,
-            AttemptAuthorizationRef, AttemptFailureClass, AttemptIssueSettlement, AttemptTerminal,
-            AttemptToLogicalBody,
+            AttemptAuthorizationDecision, AttemptAuthorizationFailure, AttemptAuthorizationRef,
+            AttemptIssueSettlement,
         };
         use novarocks_execution_contract::{
             AdmissionTicketId, OperationKind, OperationOutcome,
@@ -4827,13 +5063,8 @@ mod tests {
         now.set(initial.saturating_add(Duration::from_secs(4)));
         report_unknown(&mut core, replay_send, replay_generation, second_guard);
 
-        let (action, token) = reauthorize(&mut core);
-        let original_failure = HostProjectedFailure {
-            original: HostFailureRef(id(action.get())),
-            kind: HostFailureKind::EstablishAuthorization,
-            class: AttemptFailureClass::ExecutionFailure,
-            site: AttemptFailureSite::Attempt,
-        };
+        let (_, token) = reauthorize(&mut core);
+        let original_failure = crate::test_support::establish_budget_failure();
         assert!(
             step(
                 &mut core,
@@ -4843,7 +5074,7 @@ mod tests {
                     body: LogicalToAttemptBody::AuthorizationReply {
                         token,
                         decision: Err(AttemptAuthorizationFailure::EstablishBudgetExhausted(
-                            AttemptFailure::Host(original_failure),
+                            original_failure.clone(),
                         )),
                     },
                 }),
@@ -4928,38 +5159,8 @@ mod tests {
         let evidence = step(&mut core, sources.process, sample(request, observation));
         assert!(evidence.effect.is_none());
 
-        for guard in [first_guard, second_guard] {
-            let EffectBody::Port(port) = drive(&mut core).body else {
-                panic!("expected original Establish guard detach");
-            };
-            let AttemptToLogicalBody::DetachEstablish {
-                token,
-                authorization,
-                participation: detached,
-                operation_id,
-            } = port.body
-            else {
-                panic!("terminal publication must follow original guard detach");
-            };
-            assert_eq!(
-                (authorization, detached, operation_id),
-                (guard, participation, establish_operation)
-            );
-            step(
-                &mut core,
-                sources.qa,
-                AttemptInput::Port(LogicalToAttempt {
-                    activation,
-                    body: LogicalToAttemptBody::EstablishDetachReply {
-                        token,
-                        authorization,
-                        result: Ok(()),
-                    },
-                }),
-            );
-        }
         let EffectBody::Port(port) = drive(&mut core).body else {
-            panic!("expected the terminal decision after both original guard exits");
+            panic!("expected the terminal decision after pure local references are cleared");
         };
         assert!(matches!(port.body, AttemptToLogicalBody::AttemptTerminal(
             AttemptTerminal::Failed(actual)
@@ -4968,6 +5169,7 @@ mod tests {
 
     #[test]
     fn actor_abort_gets_exact_control_grant_and_owner_failed_never_closes_participation() {
+        use crate::port_output::{AbortIssueSettlement, AttemptToLogicalBody};
         use crate::{
             AttemptCore,
             capacity::ReservationToken,
@@ -4976,7 +5178,6 @@ mod tests {
                 QueuedInputGrantRef,
             },
         };
-        use novarocks_coordination_contract::{AbortIssueSettlement, AttemptToLogicalBody};
         use novarocks_execution_contract::{
             AbortCause, AbortParticipation, OperationKind, OperationOutcome,
             operation::OperationResult,
@@ -5192,6 +5393,7 @@ mod tests {
 
     #[test]
     fn stop_waits_for_unused_establish_guard_before_finishing_gate_close() {
+        use crate::port_output::AttemptToLogicalBody;
         use crate::{
             AttemptCore,
             execution::ack_phase::{admission_intent, dispatch_admission, queue_establish},
@@ -5200,7 +5402,7 @@ mod tests {
         };
         use novarocks_coordination_contract::{
             AttemptAuthorizationDecision, AttemptAuthorizationRef, AttemptIssueSettlement,
-            AttemptStopReason, AttemptToLogicalBody,
+            AttemptStopReason,
         };
         use novarocks_execution_contract::OperationOutcome;
 
@@ -5256,9 +5458,7 @@ mod tests {
                 activation,
                 body: LogicalToAttemptBody::Stop {
                     reason: AttemptStopReason::Client,
-                    failure: AttemptFailure::TaskProtocol(Box::new(schedule(
-                        "original client stop",
-                    ))),
+                    failure: crate::test_support::logical_failure("original client stop"),
                 },
             }),
             None,
@@ -5320,7 +5520,7 @@ mod tests {
         let stopped = step(&mut core, sources.actor, 7, AttemptInput::Timer, None);
         assert!(
             matches!(stopped.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
-            if matches!(port.body, AttemptToLogicalBody::AttemptTerminal(novarocks_coordination_contract::AttemptTerminal::Failed(_))))
+            if matches!(port.body, AttemptToLogicalBody::AttemptTerminal(crate::port_output::AttemptTerminal::Failed(_))))
         );
         step(&mut core, sources.actor, 8, AttemptInput::Timer, None);
         step(
@@ -5364,11 +5564,11 @@ mod tests {
 
     #[test]
     fn terminal_replacement_waits_for_the_original_process_token() {
+        use crate::port_output::{AttemptTerminal, AttemptToLogicalBody};
         use crate::{
             AttemptCore,
             input::{AttemptInput, AttemptInputClaim, MembershipObservation},
         };
-        use novarocks_coordination_contract::{AttemptTerminal, AttemptToLogicalBody};
 
         let start = start();
         let sources = start.sources;

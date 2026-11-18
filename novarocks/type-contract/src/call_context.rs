@@ -16,7 +16,7 @@
 // under the License.
 
 //! Exact call identity separates scalar control from relational lifecycles.
-// Design: ADR-0236-self-contained-expression-units-and-explicit-environments.md
+// Design: ADR-0238-self-contained-expression-units-and-explicit-environments.md
 use crate::{CallProofScope, EvaluationDemand, ExpressionEffectContext, FunctionKind};
 
 /// Issued by the original relation-call author and bound to one actual site.

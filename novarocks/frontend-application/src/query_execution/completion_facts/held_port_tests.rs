@@ -254,7 +254,6 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
             novarocks_types::identity::QueryProcessNamespace::new(0x9b1),
             novarocks_types::identity::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
-                NonZeroUsize::new(8).unwrap(),
                 NonZeroUsize::MIN,
                 NonZeroUsize::MIN,
                 LogicalExecutionRowsConfig::new(

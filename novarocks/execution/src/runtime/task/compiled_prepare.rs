@@ -510,14 +510,11 @@ fn prepare_compiled_task_in(
         ));
     }
     let mut resources = LocalTaskResources::new(
-        Arc::clone(&context.commit_port),
         Arc::clone(&context.exchange_receiver_port),
         context.cleanup_faults(),
     );
     resources.hold_query_task(context.query_task.take());
     let prepare_result = (|| {
-        resources.acquire_sink_commit(instance_task_key)?;
-        context.fail_if_injected(PrepareFailurePoint::AfterSinkCommit)?;
         let mut result_spec = context.result_spec.clone().unwrap_or_else(|| {
             ResultWriteSpec::new(
                 instance_task_key,

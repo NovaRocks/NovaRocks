@@ -17,7 +17,7 @@
 
 //! Deterministic frontend attempt protocol contracts.
 //!
-//! Design: ADR-0228.
+//! Design: ADR-0230.
 //!
 //! The shared boundary is the neutral activation/port vocabulary, frozen plan,
 //! input/effect values, seeded operation identities and synchronous step port.
@@ -97,3 +97,7 @@ pub(crate) mod terminal;
 pub(crate) mod convergence;
 
 pub(crate) mod authorization;
+
+pub mod port_projection;
+
+pub mod port_output;

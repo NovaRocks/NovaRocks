@@ -20,19 +20,15 @@ mod create;
 use super::{AttemptEstablishMaterial, AttemptProcessObserver};
 use crate::{
     control_runtime::membership::FrozenMember,
-    query_execution::{
-        lifecycle_plan::QueryCredentialLeases, native_execution_adapter::LogicalAbortRouter,
-    },
+    query_execution::lifecycle_plan::QueryCredentialLeases,
     task_execution::{
-        bridge::{
-            control::AttemptOwnerControls,
-            qa::AttemptQaBridge,
-            terminal::{TerminalOutbox, TerminalPublication},
-        },
-        host::{adapter::tests::start, custody::tests::WithdrawalInbox},
+        host::adapter::tests::start,
         intent::{AckPayload, OperationAcknowledgement},
         sources::AttemptEstablishFacts,
     },
+};
+use novarocks_attempt_protocol::port_output::{
+    AttemptTerminal, AttemptToLogical, AttemptToLogicalBody,
 };
 use novarocks_attempt_protocol::{
     AttemptCore, AttemptStep, Core, InputSelection,
@@ -48,16 +44,10 @@ use novarocks_attempt_protocol::{
     },
     start::{AttemptSources, AttemptStart},
 };
-use novarocks_control_runtime::{actor_turn::Clock, transaction::RuntimeLedger};
-use novarocks_control_runtime_core::{
-    capacity::{ReservationResources, ResourceVector},
-    identity::{Generation, Tick},
-    mailbox::InputClass,
-    scope::{WorkAdmission, WorkKind},
-};
+use novarocks_control_runtime::actor_turn::Clock;
+use novarocks_control_runtime_core::identity::Tick;
 use novarocks_coordination_contract::{
-    AttemptActivationIdentity, AttemptFailureClass, AttemptRequestToken, AttemptTerminal,
-    AttemptToLogical, AttemptToLogicalBody, ExecutionEffect, LogicalToAttemptBody,
+    AttemptActivationIdentity, AttemptFailureClass, AttemptRequestToken, LogicalToAttemptBody,
     MonotonicInstant,
 };
 use novarocks_execution_contract::{
@@ -65,51 +55,22 @@ use novarocks_execution_contract::{
     ParticipationRef, RuntimeEndpoint, SafeDetail,
 };
 use novarocks_query_application::{
-    api::{
-        BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
-        NativeAttemptTerminal, ResultRowCarrier, ResultSchema,
-    },
-    coordination::{
-        EstablishIssueState, EstablishWorkerSettlement, LogicalExecutionActorConfig,
-        ReplacementQualificationEffectAdmission, ReplacementQualificationEffectPort,
-        ReplacementQualificationRequest,
-    },
+    api::{BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError},
     execution_error::ExecutionFailureSite,
-    test_support::LogicalExecutionTestHarness,
 };
-use novarocks_result_contract::{ClientRowProfile, RootOutputKind, RootProfileV1};
 use novarocks_types::BackendProcessId;
-use novarocks_workload_control::{
-    CancellationReason, CancellationView, ResourceConfig, Stage, WorkCancellationRequester,
-    WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
-};
+use novarocks_workload_control::CancellationReason;
 use std::{
-    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
+    num::NonZeroU64,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 fn id(value: u64) -> NonZeroU64 {
     NonZeroU64::new(value).unwrap()
-}
-
-#[derive(Debug)]
-struct NoSuccessor(tokio::sync::watch::Sender<u64>);
-
-impl ReplacementQualificationEffectPort for NoSuccessor {
-    fn subscribe_capacity(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.0.subscribe()
-    }
-
-    fn try_reserve(
-        &self,
-        _: &ReplacementQualificationRequest,
-    ) -> ReplacementQualificationEffectAdmission {
-        panic!("the original Native observation must not start a successor")
-    }
 }
 
 #[derive(Default)]
@@ -189,19 +150,29 @@ struct Cut {
     core: Core,
     sources: AttemptSources,
     clock: Arc<SampleClock>,
-    qa: AttemptQaBridge,
+    owner: PermissionOwner,
+    material: Arc<AttemptEstablishMaterial>,
+    compatibility: novarocks_types::NativeCompatibilityId,
     next: u64,
     round_failure: Option<AttemptFailure>,
 }
 
 impl Cut {
-    fn new(start: AttemptStart, clock: Arc<SampleClock>, qa: AttemptQaBridge) -> Self {
+    fn new(
+        start: AttemptStart,
+        clock: Arc<SampleClock>,
+        owner: PermissionOwner,
+        material: Arc<AttemptEstablishMaterial>,
+    ) -> Self {
+        let compatibility = start.plan.compatibility;
         let sources = start.sources;
         let mut cut = Self {
             core: <Core as AttemptCore>::new(start).unwrap(),
             sources,
             clock,
-            qa,
+            owner,
+            material,
+            compatibility,
             next: 100,
             round_failure: None,
         };
@@ -297,9 +268,25 @@ impl Cut {
                         continue;
                     }
                     EffectBody::EstablishAuthorization { operation, request } => {
-                        let reply = self.qa.authorize(operation, request).await.unwrap();
-                        assert!(reply.failure.is_none());
-                        step = self.step(self.sources.qa, AttemptInput::Port(reply.reply));
+                        let AttemptToLogicalBody::AuthorizationRequest {
+                            request: authorization,
+                            ..
+                        } = request.body
+                        else {
+                            panic!("original Establish request");
+                        };
+                        let canonical = self
+                            .material
+                            .for_authorization(operation, authorization)
+                            .unwrap();
+                        let reply = self.exchange(request).await;
+                        // Canonical lookup remains the very same Arc after LP reply.
+                        let same = self
+                            .material
+                            .for_authorization(operation, authorization)
+                            .unwrap();
+                        assert!(Arc::ptr_eq(&canonical, &same));
+                        step = self.step(self.sources.qa, AttemptInput::Port(reply));
                         continue;
                     }
                     EffectBody::Port(port)
@@ -307,12 +294,10 @@ impl Cut {
                             port.body,
                             AttemptToLogicalBody::AuthorizationRequest { .. }
                                 | AttemptToLogicalBody::EstablishSettlement { .. }
-                                | AttemptToLogicalBody::DetachEstablish { .. }
                         ) =>
                     {
-                        let reply = self.qa.handle_port(port).await.unwrap();
-                        assert!(reply.failure.is_none());
-                        step = self.step(self.sources.qa, AttemptInput::Port(reply.reply));
+                        let reply = self.exchange(port).await;
+                        step = self.step(self.sources.qa, AttemptInput::Port(reply));
                         continue;
                     }
                     EffectBody::ReleaseCreationPayload { .. } => {}
@@ -377,19 +362,98 @@ impl Cut {
         (operation, generation, send.id)
     }
 
+    async fn exchange(&mut self, port: &Port) -> novarocks_coordination_contract::LogicalToAttempt {
+        let projected = novarocks_attempt_protocol::port_projection::project_attempt_message(
+            port,
+            &mut |_| panic!("this original refusal owns no Host failure reference"),
+            &mut |p, op| self.material.authorization_facts(p, op, self.compatibility),
+            &mut |_, _, _| panic!("these cases have no original Abort receipt"),
+        )
+        .unwrap();
+        let reply = self.owner.exchange(projected, self.clock.instant()).await;
+        match &reply.body {
+            LogicalToAttemptBody::AuthorizationReply { decision, .. } => assert!(decision.is_ok()),
+            LogicalToAttemptBody::EstablishSettlementReply { result, .. } => {
+                assert!(result.is_ok())
+            }
+            LogicalToAttemptBody::PreReadyReplacementReply { .. } => {}
+            _ => panic!("only original request replies: {reply:?}"),
+        }
+        reply
+    }
+    fn assert_original_settlement(
+        &self,
+        p: ParticipationRef,
+        op: novarocks_execution_contract::TaskOperationId,
+        settlement: novarocks_coordination_contract::AttemptIssueSettlement,
+        ticket: ParticipationAdmissionTicketReceipt,
+    ) {
+        use novarocks_coordination_contract::logical_port::{
+            AttemptAuthorization as A, AttemptToLogicalBody as B,
+        };
+        let (reference, token) = self
+            .owner
+            .sent
+            .iter()
+            .find_map(|m| match m.body {
+                B::EstablishSettlement {
+                    token,
+                    authorization,
+                    participation,
+                    operation_id,
+                    settlement: actual,
+                } if participation == p && operation_id == op && actual == settlement => {
+                    Some((authorization, token))
+                }
+                _ => None,
+            })
+            .expect("same original AP settlement crossed the actual current-ticket port");
+        assert!(self.owner.replies.iter().any(|m| matches!(&m.body,
+            LogicalToAttemptBody::EstablishSettlementReply { token: actual, authorization, result: Ok(()) }
+                if *actual == token && *authorization == reference)));
+        let original = self
+            .owner
+            .sent
+            .iter()
+            .find_map(|m| match &m.body {
+                B::AuthorizationRequest {
+                    request:
+                        A::Establish {
+                            participation,
+                            operation_id,
+                            ticket_id,
+                            semantics,
+                            native_compatibility_id,
+                        },
+                    ..
+                } if *participation == p && *operation_id == op => {
+                    Some((*ticket_id, *semantics, *native_compatibility_id))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let expected = self
+            .material
+            .authorization_facts(p, op, self.compatibility)
+            .unwrap();
+        assert_eq!(
+            original,
+            (ticket.ticket_id(), expected.semantics, self.compatibility)
+        );
+        self.owner.assert_unconcluded();
+    }
     async fn permission(&mut self, port: Port, expected: bool) -> AttemptStep {
         let AttemptToLogicalBody::PreReadyReplacementQuery { token, .. } = port.body else {
             panic!("original QA permission port");
         };
-        let reply = self.qa.handle_port(&port).await.unwrap();
-        assert!(reply.failure.is_none());
-        assert_eq!(reply.reply.activation, port.activation);
+        let reply = self.exchange(&port).await;
+        assert_eq!(reply.activation, port.activation);
         assert!(matches!(
-            reply.reply.body,
+            reply.body,
             LogicalToAttemptBody::PreReadyReplacementReply { token: actual, may_observe }
                 if actual == token && may_observe == expected
         ));
-        self.step(self.sources.qa, AttemptInput::Port(reply.reply))
+        self.step(self.sources.qa, AttemptInput::Port(reply))
     }
 }
 
@@ -460,8 +524,6 @@ async fn original_establish_refusal_observes_only_with_qa_permission_and_keeps_i
 async fn rejected_establish(case: Case) {
     let mut start = start();
     let participation = *start.plan.establish_material.keys().next().unwrap();
-    let execution = participation.query_execution_id();
-    let compatibility = start.plan.compatibility;
     let facts = AttemptEstablishFacts::freeze(
         Default::default(),
         [(participation.backend_process_id(), Default::default())],
@@ -474,74 +536,10 @@ async fn rejected_establish(case: Case) {
         AttemptEstablishMaterial::project(&facts, [participation], &mut next_payload).unwrap();
     start.plan.establish_material = quotes;
 
-    let workload = WorkloadControl::try_new(
-        WorkloadConfig::default(),
-        ResourceConfig {
-            total_bytes: 1 << 20,
-            control_bytes: 1 << 12,
-            per_scope_bytes: 1 << 18,
-        },
-    )
-    .unwrap();
-    workload.mark_ready().unwrap();
-    let work = workload
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    let scope = work.owner.scope();
-    let cancellation = scope.cancellation().unwrap();
-    let requester = work.owner.cancellation_requester();
-    let stage = scope.try_acquire(Stage::Execution).unwrap();
-    let roster = vec![participation];
-    let two = NonZeroUsize::new(2).unwrap();
-    let config = if case == Case::NoRecovery {
-        LogicalExecutionActorConfig::single_attempt_completion(
-            execution,
-            ExecutionEffect::None,
-            two,
-            roster.clone(),
-            two,
-            two,
-            work.owner,
-            stage,
-        )
-    } else {
-        let profile = ClientRowProfile::try_new(
-            RootProfileV1::SEGMENT_BYTES,
-            RootProfileV1::ROW_PAYLOAD_BYTES,
-        )
-        .unwrap();
-        LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
-            execution,
-            two,
-            roster.clone(),
-            two,
-            two,
-            NonZeroU32::new(2).unwrap(),
-            Arc::new(NoSuccessor(tokio::sync::watch::channel(0).0)),
-            work.owner,
-            stage,
-            Duration::from_secs(30),
-            ResultSchema::new(Vec::new()),
-            NonZeroUsize::MIN,
-            ResultRowCarrier::relayed(RootOutputKind::ClientRows, Some(profile)).unwrap(),
-        )
-    }
-    .unwrap()
-    .with_abort_participation_effect_port(LogicalAbortRouter::new(), two);
-    let mut logical = LogicalExecutionTestHarness::install(
-        tokio::runtime::Handle::current(),
-        config,
-        execution,
-        roster,
-    )
-    .unwrap();
-    let activation = logical.activate_initial().await.unwrap();
-    let drive = Arc::new(logical.native_attempt_drive());
-    start.activation.identity = activation;
-    start.plan.authorization_limits = drive.authorization_limits();
-    let bridge = AttemptQaBridge::new(drive, compatibility, Arc::new(material));
+    let owner = PermissionOwner::new(&mut start, case != Case::NoRecovery).await;
+    let activation = start.activation.identity;
     let clock = Arc::new(SampleClock::default());
-    let mut cut = Cut::new(start, clock.clone(), bridge);
+    let mut cut = Cut::new(start, clock.clone(), owner, Arc::new(material));
 
     let endpoint = RuntimeEndpoint::new("127.0.0.1", 19091).unwrap();
     let probe = Arc::new(ProcessProbe {
@@ -559,7 +557,6 @@ async fn rejected_establish(case: Case) {
         }]),
         clock.clone(),
     );
-    let outbox = TerminalOutbox::new(activation);
 
     let begun = cut.actor(AttemptInput::StartProtocol);
     let admitted = cut.advance(begun).await.unwrap();
@@ -641,35 +638,16 @@ async fn rejected_establish(case: Case) {
         matches!(&permission.body, AttemptToLogicalBody::PreReadyReplacementQuery { refusal, .. } if refusal == &original)
     );
 
-    loop {
-        if let Some(snapshot) = logical.establish_snapshot(participation).await.unwrap()
-            && snapshot.state()
-                == EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Rejected(
-                    OperationOutcome::IdentityMismatch,
-                ))
-        {
-            let exact = snapshot.identity().unwrap();
-            assert_eq!(exact.activation(), activation);
-            assert_eq!(exact.operation_id(), operation_id);
-            assert_eq!(exact.participation(), participation);
-            assert_eq!(snapshot.ticket(), ticket);
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-
-    assert_eq!(logical.actor_snapshot().await.unwrap().conclusion, None);
-    if case == Case::NoRecovery {
-        assert!(
-            !logical
-                .native_attempt_drive()
-                .may_observe_pre_ready_replacement(&expected)
-                .await
-                .unwrap()
-        );
-    }
+    cut.assert_original_settlement(
+        participation,
+        operation_id,
+        novarocks_coordination_contract::AttemptIssueSettlement::Worker(
+            OperationOutcome::IdentityMismatch,
+        ),
+        ticket,
+    );
     if case == Case::StopBeforePermission {
-        stop(&requester, &cancellation, activation, &mut cut);
+        stop(&mut cut).await;
     }
     let positive = matches!(case, Case::Replacement | Case::StopAfterSample);
     let permitted = cut.permission(permission, positive).await;
@@ -679,13 +657,11 @@ async fn rejected_establish(case: Case) {
         assert_eq!(probe.reads.load(Ordering::SeqCst), 1);
         let original_horizon = MonotonicInstant::ORIGIN.saturating_add(ticket.valid_for().get());
         assert_eq!(cut.core.next_deadline(), Some(original_horizon));
-        {
-            let mut terminal = Box::pin(outbox.terminal());
-            assert!(futures::poll!(terminal.as_mut()).is_pending());
-        }
+        assert!(cut.round_failure.is_some());
+        cut.owner.assert_unconcluded();
         clock.set_seconds(2);
         if case == Case::StopAfterSample {
-            let stopped = stop(&requester, &cancellation, activation, &mut cut);
+            let stopped = stop(&mut cut).await;
             cut.advance(stopped).await.unwrap()
         } else {
             probe.replaced.store(true, Ordering::SeqCst);
@@ -725,11 +701,18 @@ async fn rejected_establish(case: Case) {
     };
     let terminal = terminal_port(effect);
     assert_eq!(terminal.activation, activation);
-    let original_port = TerminalPublication::new(terminal);
-    assert!(original_port.host_reference().is_none());
-    assert!(outbox.publish(Box::new(original_port)).is_ok());
-    let NativeAttemptTerminal::Failed(failure) = outbox.terminal().await.unwrap() else {
-        panic!("the exact original refusal must remain the Native terminal");
+    let projected = novarocks_attempt_protocol::port_projection::project_attempt_message(
+        &terminal,
+        &mut |_| panic!("no Host failure reference"),
+        &mut |_, _| panic!("terminal is not an Establish authorization"),
+        &mut |_, _, _| panic!("terminal is not an Abort receipt"),
+    )
+    .unwrap();
+    let novarocks_coordination_contract::logical_port::AttemptToLogicalBody::AttemptTerminal(
+        novarocks_coordination_contract::logical_port::AttemptTerminal::Failed(failure),
+    ) = &projected.body
+    else {
+        panic!("the exact original refusal stays the passive terminal");
     };
     assert_eq!(failure.input(), &expected);
     assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
@@ -754,95 +737,277 @@ async fn rejected_establish(case: Case) {
             u64::from(case == Case::StopAfterSample)
         );
     }
-    assert_eq!(
-        outbox.terminal().await.unwrap(),
-        NativeAttemptTerminal::Failed(failure)
-    );
-
-    drop(cut);
-    logical.abandon_running_attempt();
-    while logical
-        .stand_down_snapshot(participation)
-        .await
-        .unwrap()
-        .is_none()
-    {
-        tokio::task::yield_now().await;
-    }
-    logical
-        .observe_worker_process_replaced(participation)
-        .await
-        .unwrap();
-    drop(requester);
-    drop(cancellation);
-    work.business.release();
-    logical
-        .finish_until(Instant::now() + Duration::from_secs(2))
-        .await
-        .unwrap();
-    scope.wait_released().await;
-    workload.close_admission();
-    assert!(workload.shutdown().is_ok());
+    // The final terminal is one owned passive message, with no mutable old
+    // outbox/watch to reread or reconstruct through a compatibility API.
+    cut.owner.finish().await;
 }
 
-fn stop(
-    requester: &WorkCancellationRequester,
-    cancellation: &CancellationView,
-    activation: AttemptActivationIdentity,
-    cut: &mut Cut,
-) -> AttemptStep {
-    let generation = Generation::new(1).unwrap();
-    let ledger = RuntimeLedger::new(ResourceVector::default());
-    let scope = ledger.open_scope_next(None, generation).unwrap();
-    let inbox = WithdrawalInbox::new(&scope);
-    let (mut work, mut payer) = scope
-        .reserve_next(
-            generation,
-            ReservationResources::work_only(),
-            WorkKind::Settlement,
-            WorkAdmission::External,
-        )
-        .unwrap()
-        .bind(WorkKind::Settlement)
-        .unwrap();
-    work.start().unwrap();
-    let actor = inbox.registration().actor();
-    assert_eq!(cut.sources.actor.0.get(), actor.get());
-    let runtime = inbox.runtime();
-    let control = || {
-        runtime
-            .reserve_admitted_input_for(inbox.registration(), actor, InputClass::Control, &work)
-            .unwrap()
-            .into_standing_input()
-            .unwrap()
-    };
-    let mut controls = AttemptOwnerControls::new(activation, control(), control());
-
-    requester.request(CancellationReason::Requested).unwrap();
-    let reason = cancellation
-        .reason()
-        .expect("original cancellation is visible");
-    let stop_id = controls.stop_for_cancellation(reason).unwrap().unwrap();
-    let (actual, input) = inbox.try_commit_owner_control().unwrap();
-    assert_eq!(actual, stop_id);
-    assert!(matches!(&input, AttemptInput::Port(port)
-        if port.activation == activation && matches!(port.body, LogicalToAttemptBody::Stop { .. })));
+async fn stop(cut: &mut Cut) -> AttemptStep {
+    cut.owner.advance_to(cut.clock.instant());
+    let (input, original) = cut.owner.stop().await;
     let stopped = cut.step_at(
-        cut.sources.actor,
-        input,
-        Some(AttemptInputId(id(stop_id.get()))),
+        cut.sources.owner,
+        AttemptInput::Port(original),
+        Some(AttemptInputId(id(input.get()))),
     );
     assert!(stopped.stop_producing && stopped.effect.is_none() && stopped.round_result.is_none());
-    runtime.retire_input(actor, stop_id).unwrap();
-
-    work.body_exited().unwrap();
-    work.captures_exited().unwrap();
-    controls.close_after_exit().unwrap();
-    payer.finish().unwrap();
-    scope.close_external().unwrap();
-    ledger.reap_scope_ready(scope.id(), 8).unwrap();
-    inbox.finish();
-    ledger.remove_scope(scope.id()).unwrap();
-    assert!(ledger.is_empty());
     stopped
+}
+
+/// The independently driven AP Core still selects every original message.
+/// This existing scripted AP carries it under a real current ticket to the
+/// real LP Core; it does not decide the permission or invent a Worker reply.
+struct PermissionOwner {
+    fixture: crate::fixtures::FrontendFixture,
+    logical: crate::fixtures::LogicalCase,
+    attempt: crate::fixtures::AttemptCase,
+    sent: Vec<novarocks_coordination_contract::logical_port::AttemptToLogical>,
+    replies: Vec<novarocks_coordination_contract::LogicalToAttempt>,
+    now: MonotonicInstant,
+}
+impl PermissionOwner {
+    async fn new(start: &mut AttemptStart, recovery: bool) -> Self {
+        use crate::fixtures::{AttemptScript, FrontendFixture, LogicalScript};
+        let mut initial = LogicalScript::start(700, 0, 2);
+        initial.identity = start.activation.identity.execution().query_id();
+        initial.actor_instance = start.activation.identity.actor();
+        initial.first_attempt.activation = start.activation.identity;
+        initial.first_attempt.participations =
+            start.plan.establish_material.keys().copied().collect();
+        initial.policy.recovery = if recovery {
+            novarocks_coordination_contract::RecoveryMode::RestartAttemptBeforeVisibility
+        } else {
+            novarocks_coordination_contract::RecoveryMode::NoRecovery
+        };
+        initial.budgets.replacement_reservation_valid_for =
+            recovery.then_some(Duration::from_secs(30));
+        initial.budgets.establish_per_participation =
+            start.plan.authorization_limits.establish_per_participation;
+        initial.budgets.abort_per_participation =
+            start.plan.authorization_limits.abort_per_participation;
+        // This test never opens client visibility. The original permission
+        // predicate reads recovery/effect/budget/deadline/visibility state,
+        // not the output carrier. Actual Client/Ready wiring is separate.
+        let mut fixture = FrontendFixture::new();
+        let logical = fixture.install_logical(initial, LogicalScript::default());
+        let attempt = fixture
+            .activate_attempt(
+                &logical,
+                start.activation.identity,
+                AttemptScript::default(),
+            )
+            .await;
+        start.sources.actor = AttemptSourceId(id(attempt.registration.actor().get()));
+        start.sources.owner = AttemptSourceId(id(logical.registration.actor().get()));
+        // These are the pure AP driver's external source descriptors, not
+        // registrations or newly granted runtime input positions.
+        let source = |n: u64| AttemptSourceId(id(10_000 + n));
+        start.sources.publication = source(1);
+        start.sources.qa = source(2);
+        start.sources.process = source(3);
+        start.sources.native = source(4);
+        start.sources.observation = source(5);
+        start.sources.capacity = source(6);
+        start.sources.membership = source(7);
+        start.sources.subscription = source(8);
+        start.sources.transport = source(9);
+        Self {
+            fixture,
+            logical,
+            attempt,
+            sent: Vec::new(),
+            replies: Vec::new(),
+            now: MonotonicInstant::ORIGIN,
+        }
+    }
+    fn activation(&self) -> AttemptActivationIdentity {
+        self.attempt.activation
+    }
+    fn advance_to(&mut self, now: MonotonicInstant) {
+        assert!(now >= self.now);
+        self.fixture
+            .advance_time(now.saturating_duration_since(self.now));
+        self.now = now;
+    }
+    async fn turn(&mut self) {
+        self.fixture
+            .progress(
+                crate::fixtures::ProgressSelection::All,
+                crate::fixtures::ProgressBudget::default(),
+            )
+            .await;
+    }
+    fn assert_unconcluded(&self) {
+        use novarocks_logical_execution_protocol::effect::{
+            ConsumerEffect, LogicalEffectBody, NativeEffect,
+        };
+        let actual = self.fixture.observe(&self.logical);
+        assert!(!actual.failed);
+        assert!(!actual.effects.iter().any(|e| matches!(
+            e,
+            LogicalEffectBody::Consumer(
+                ConsumerEffect::PublishFailure(_) | ConsumerEffect::PublishCompletion
+            ) | LogicalEffectBody::Native(
+                NativeEffect::PrepareSuccessor { .. } | NativeEffect::DispatchQualification { .. }
+            )
+        )));
+    }
+    async fn exchange(
+        &mut self,
+        message: novarocks_coordination_contract::logical_port::AttemptToLogical,
+        now: MonotonicInstant,
+    ) -> novarocks_coordination_contract::LogicalToAttempt {
+        use novarocks_coordination_contract::logical_port::AttemptToLogicalBody as Body;
+        let token = match &message.body {
+            Body::AuthorizationRequest { token, .. }
+            | Body::EstablishSettlement { token, .. }
+            | Body::PreReadyReplacementQuery { token, .. } => *token,
+            _ => panic!("only the original request family"),
+        };
+        assert_eq!(message.activation, self.activation());
+        self.advance_to(now);
+        let action = message.action;
+        self.sent.push(message.clone());
+        self.attempt.script.enqueue_original(message);
+        for _ in 0..256 {
+            if let Some(reply) =
+                self.attempt
+                    .script
+                    .received()
+                    .into_iter()
+                    .find(|m| match &m.body {
+                        LogicalToAttemptBody::AuthorizationReply { token: actual, .. }
+                        | LogicalToAttemptBody::EstablishSettlementReply {
+                            token: actual, ..
+                        }
+                        | LogicalToAttemptBody::PreReadyReplacementReply {
+                            token: actual, ..
+                        } => *actual == token,
+                        _ => false,
+                    })
+            {
+                assert!(self.attempt.script.published().contains(&action));
+                assert_eq!(reply.activation, self.activation());
+                self.replies.push(reply.clone());
+                return reply;
+            }
+            self.turn().await;
+        }
+        panic!(
+            "actual current-ticket LP request did not produce its exact reply; sent={:?}, received={:?}",
+            self.sent,
+            self.attempt.script.received()
+        );
+    }
+    async fn stop(
+        &mut self,
+    ) -> (
+        novarocks_control_runtime_core::identity::InputId,
+        novarocks_coordination_contract::LogicalToAttempt,
+    ) {
+        self.logical
+            .request_cancel(CancellationReason::Requested)
+            .unwrap();
+        for _ in 0..256 {
+            if let Some(original) = self
+                .attempt
+                .script
+                .received_inputs()
+                .into_iter()
+                .find(|(_, m)| matches!(m.body, LogicalToAttemptBody::Stop { .. }))
+            {
+                assert!(matches!(&original.1.body, LogicalToAttemptBody::Stop {
+                    reason: novarocks_coordination_contract::AttemptStopReason::Client,
+                    failure,
+                } if failure.input().site() == ExecutionFailureSite::Coordinator));
+                let LogicalToAttemptBody::Stop { failure, .. } = &original.1.body else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    failure.input().fact(),
+                    novarocks_execution_contract::failure::FailureProjection::failure_fact(
+                        &novarocks_coordination_contract::QueryFailureReason::Cancelled
+                    )
+                );
+                return original;
+            }
+            self.turn().await;
+        }
+        panic!("the original Scope latch did not reach the actual LP/AP Stop port");
+    }
+    async fn finish(mut self) {
+        use novarocks_coordination_contract::{
+            AttemptConvergenceClosure, AttemptParticipationConvergence,
+            logical_port::AttemptToLogicalBody,
+        };
+        use novarocks_logical_execution_protocol::effect::{ConsumerEffect, LogicalEffectBody};
+        // The pure AP decision probe has already ended. Close the SAME actual
+        // carrier through the original Scope cancellation and explicit script
+        // facts. A script fact is never claimed to be a real remote RPC exit.
+        self.stop().await;
+        let roster = self.logical.start.first_attempt.participations.to_vec();
+        let closure = self
+            .attempt
+            .script
+            .enqueue(AttemptToLogicalBody::ConvergenceProgress {
+                local_exited: false,
+                closure: Some(Arc::new(AttemptConvergenceClosure::Evidence(
+                    roster
+                        .into_iter()
+                        .map(|p| (p, AttemptParticipationConvergence::WorkerProcessReplaced))
+                        .collect(),
+                ))),
+                lifecycle_runtime_filters: None,
+            });
+        let local = self
+            .attempt
+            .script
+            .enqueue(AttemptToLogicalBody::ConvergenceProgress {
+                local_exited: true,
+                closure: None,
+                lifecycle_runtime_filters: None,
+            });
+        self.logical.script.run.open();
+        let mut concluded = false;
+        for _ in 0..256 {
+            self.turn().await;
+            let actual = self.fixture.observe(&self.logical);
+            if self.attempt.script.published().contains(&closure)
+                && self.attempt.script.published().contains(&local)
+                && actual.effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        LogicalEffectBody::Consumer(ConsumerEffect::PublishFailure(_))
+                    )
+                })
+            {
+                concluded = true;
+                break;
+            }
+        }
+        assert!(
+            concluded,
+            "actual cancellation and both explicit closure facts must be consumed before Registry close"
+        );
+        assert_eq!(
+            self.attempt
+                .script
+                .received()
+                .iter()
+                .filter(|m| matches!(m.body, LogicalToAttemptBody::Stop { .. }))
+                .count(),
+            1,
+            "the same original cancellation produces one Stop, even after a repeated request"
+        );
+        self.fixture.finish().await;
+        assert!(
+            self.attempt.exited(),
+            "the real AP Actor/Scope must exit independently of its scripted local fact"
+        );
+        let history =
+            crate::fixtures::history::CapturedHistory::drain(&self.fixture.history(), usize::MAX);
+        history
+            .check_completed_runtime(self.fixture.runtime(), self.fixture.ledger())
+            .unwrap();
+    }
 }

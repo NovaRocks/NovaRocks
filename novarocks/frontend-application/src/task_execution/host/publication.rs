@@ -20,8 +20,10 @@
 //! jobs; these methods run outside the actor poller and every runtime lock.
 
 use super::pumps::{DiagnosticRecords, PumpRecordError};
+use crate::query_execution::logical_binding::{
+    OriginalAttemptObservation, OriginalComputationCutPublisher, OriginalProfilePublication,
+};
 use crate::{
-    control_runtime::actor::{FrontendActor, FrontendEffect},
     query_execution::{
         lifecycle_diagnostics::{
             RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
@@ -32,7 +34,6 @@ use crate::{
         },
     },
     task_execution::{
-        bridge::root_control::{RootControlRequests, reply_kind},
         error::TaskExecutionError,
         intent::{AckPayload, OperationAcknowledgement},
         profile_diagnostics::{
@@ -53,22 +54,18 @@ use novarocks_attempt_protocol::{
     },
     start::{AttemptStart, PayloadRef},
 };
-use novarocks_control_runtime::actor_turn::{ActorRuntime, ActorTurnError, EffectTicket};
-use novarocks_coordination_contract::{
-    AttemptActionId, AttemptActivationIdentity, AttemptRootFailure, AttemptToLogical,
-};
+use novarocks_coordination_contract::{AttemptActionId, AttemptActivationIdentity};
 use novarocks_execution_contract::{
     ParticipationRef, ReleaseOutcome, SafeDetail, TaskIdentity, failure::FailureProjection,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::{
     api::{ComputationReadyToken, QueryExecutionError},
-    coordination::{AcceptedAttemptFailure, AcceptedRootStatusSender},
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
 use novarocks_types::BackendProcessId;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// A read-only projection of the original Source's frozen graph binding.
 /// This carries no grant, executable callback, or new sampling authority.
@@ -515,28 +512,23 @@ impl DiagnosticSourceSnapshot {
 }
 
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Publication refusal returns the original typed protocol error inline."
-)]
 pub(crate) enum PublicationError {
-    MissingRootPublisher,
-    MissingRootControlReply,
     MissingProfileObserver,
     MissingDiagnosticRecords,
     MissingOriginalComputationCut,
     MissingDiagnosticSources,
     ForeignOriginalComputationCut,
-    Protocol(TaskExecutionError),
+    ForeignRootFactHandoff,
+    Protocol(Box<TaskExecutionError>),
     Diagnostic(PumpRecordError),
-    Root(QueryExecutionError),
+    Observation(QueryExecutionError),
 }
 impl std::fmt::Display for PublicationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Protocol(error) => write!(f, "original attempt publication failed: {error}"),
             Self::Diagnostic(error) => write!(f, "original diagnostic publication failed: {error}"),
-            Self::Root(error) => write!(f, "original root publication failed: {error}"),
+            Self::Observation(error) => write!(f, "original observation receipt failed: {error}"),
             other => write!(f, "attempt publication custody invariant failed: {other:?}"),
         }
     }
@@ -544,9 +536,9 @@ impl std::fmt::Display for PublicationError {
 impl std::error::Error for PublicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Protocol(error) => Some(error),
+            Self::Protocol(error) => Some(error.as_ref()),
             Self::Diagnostic(error) => Some(error),
-            Self::Root(error) => Some(error),
+            Self::Observation(error) => Some(error),
             _ => None,
         }
     }
@@ -555,23 +547,23 @@ impl std::error::Error for PublicationError {
 /// The original host error stays owned until the terminal or disposal
 /// custodian receives it. The Core only sees the compact typed projection.
 pub(crate) enum OriginalHostFailure {
+    #[cfg(test)]
     Subscription(super::subscriptions::OriginalSubscriptionFailure),
+    #[cfg(test)]
     Task(TaskExecutionError),
     Publication(PublicationError),
 }
 
+pub(crate) type PublicationInput = (AttemptInput, Option<(HostFailureRef, OriginalHostFailure)>);
+
 impl OriginalHostFailure {
     pub(crate) fn preparation_input(&self) -> ExecutionFailureInput {
         match self {
+            #[cfg(test)]
             Self::Subscription(original) => original.preparation_input(),
-            Self::Task(original) | Self::Publication(PublicationError::Protocol(original)) => {
-                original.preparation_input()
-            }
-            Self::Publication(PublicationError::Root(original))
-                if original.execution_failure().is_some() =>
-            {
-                original.execution_failure().unwrap().clone()
-            }
+            #[cfg(test)]
+            Self::Task(original) => original.preparation_input(),
+            Self::Publication(PublicationError::Protocol(original)) => original.preparation_input(),
             Self::Publication(_) => ExecutionFailureInput::new(
                 QueryFailureReason::PreparationProtocol.failure_fact(),
                 SafeDetail::truncating("Native attempt publication failed"),
@@ -587,89 +579,108 @@ pub(crate) struct AttemptPublicationOwner {
     activation: AttemptActivationIdentity,
     record: tokio::sync::Mutex<PublicationRecord>,
     diagnostics: Option<Arc<dyn OriginalDiagnosticRecords>>,
-    root: Option<Arc<RootControlRequests>>,
+    port_root: OnceLock<Arc<super::port::root_control::RootControlRequests>>,
+    observation: OnceLock<Weak<OriginalAttemptObservation>>,
+    registered_cut: Mutex<Option<ComputationReadyToken>>,
+}
+
+impl OriginalComputationCutPublisher for AttemptPublicationOwner {
+    fn register_ready_with(
+        &self,
+        original: ComputationReadyToken,
+        commit: &mut dyn FnMut() -> Result<(), super::port::control::PortControlError>,
+    ) -> Result<(), super::port::control::PortControlError> {
+        use super::port::control::PortControlError;
+        let mut registered = self
+            .registered_cut
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if original.activation() != self.activation
+            || registered.is_some_and(|previous| previous != original)
+        {
+            return Err(PortControlError::ConflictingCut);
+        }
+        if let Some(row) = self.observation.get() {
+            let row = row.upgrade().ok_or(PortControlError::Closed)?;
+            row.commit_registered_cut(original, commit)?;
+        } else {
+            commit()?;
+        }
+        *registered = Some(original);
+        Ok(())
+    }
 }
 
 impl AttemptPublicationOwner {
     pub(crate) fn new(
         record: PublicationRecord,
         diagnostics: Option<Arc<dyn OriginalDiagnosticRecords>>,
-        root: Option<Arc<RootControlRequests>>,
     ) -> Arc<Self> {
-        let owner = Arc::new(Self {
+        Arc::new(Self {
             activation: record.activation,
             record: tokio::sync::Mutex::new(record),
             diagnostics,
-            root,
-        });
-        if let Some(root) = &owner.root {
-            root.bind_publisher(&owner);
-        }
-        owner
+            port_root: OnceLock::new(),
+            observation: OnceLock::new(),
+            registered_cut: Mutex::new(None),
+        })
     }
 
     pub(crate) fn activation(&self) -> AttemptActivationIdentity {
         self.activation
     }
 
-    pub(crate) async fn register_computation_cut(
+    pub(crate) fn bind_port_root(
         &self,
-        ready: ComputationReadyToken,
-    ) -> Result<(), PublicationError> {
-        self.record.lock().await.register_computation_cut(ready)
+        original: Arc<super::port::root_control::RootControlRequests>,
+    ) {
+        assert_eq!(original.binding().activation(), self.activation);
+        assert!(
+            self.port_root.set(original).is_ok(),
+            "one original port root binding"
+        );
+    }
+
+    pub(crate) fn bind_observation(self: &Arc<Self>, original: &Arc<OriginalAttemptObservation>) {
+        assert_eq!(self.activation, original.activation());
+        assert!(
+            self.observation.set(Arc::downgrade(original)).is_ok(),
+            "one original publication observation row"
+        );
+        original.bind_publisher(self);
     }
 
     pub(crate) fn matches_root(&self, binding: &super::observations::RootControlBinding) -> bool {
-        self.root.as_ref().is_some_and(|root| root.matches(binding))
+        self.port_root
+            .get()
+            .is_some_and(|root| root.binding().same_original(binding))
     }
 
-    pub(crate) fn commit_root_reply(
+    pub(crate) fn acknowledge_root_fact(
         &self,
-        runtime: &ActorRuntime<FrontendActor>,
-        ticket: &EffectTicket<FrontendEffect>,
-        original: Arc<AttemptToLogical<AttemptFailure>>,
-        projection: Option<(HostFailureRef, ExecutionFailureInput)>,
-    ) -> Result<(), (ActorTurnError, Arc<AttemptToLogical<AttemptFailure>>)> {
-        let Some(root) = &self.root else {
-            return Err((ActorTurnError::PublicationTargetMismatch, original));
-        };
-        root.commit_reply(runtime, ticket, original, projection)
+        original: &Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
+        receipt: super::port::facts::RootStatusFactReceipt,
+    ) -> (AttemptInput, Option<(HostFailureRef, OriginalHostFailure)>) {
+        Self::publication_result(
+            original.protocol.id,
+            receipt
+                .confirm(self.activation, original)
+                .map(|()| PublicationApplied::RootStatus)
+                .map_err(|_| PublicationError::ForeignRootFactHandoff),
+        )
     }
 
-    pub(crate) async fn deliver_committed_root(
+    pub(crate) fn acknowledge_root_reply(
         &self,
-        token: novarocks_coordination_contract::AttemptRequestToken,
-    ) -> Result<(), PublicationError> {
-        self.root
-            .as_ref()
-            .expect("original root-control request owner")
-            .deliver(token, &mut *self.record.lock().await)
-    }
-
-    pub(crate) async fn deliver_root_reply(
-        &self,
-        port: &AttemptToLogical<AttemptFailure>,
-    ) -> Result<
-        Option<(AttemptInput, Option<(HostFailureRef, OriginalHostFailure)>)>,
-        PublicationError,
-    > {
-        use super::failure_publication::RootControlReplyKind;
-        let (token, kind) = reply_kind(&port.body).expect("original root-control reply");
-        let root = self
-            .root
-            .as_ref()
-            .expect("original root-control request owner");
-        let result = self.deliver_committed_root(token).await;
-        if matches!(result, Err(PublicationError::MissingRootControlReply)) && root.owner_failed() {
-            return Ok(None);
-        }
-        match kind {
-            RootControlReplyKind::Seal => Ok(Some(Self::publication_result(
-                port.action,
-                result.map(|()| PublicationApplied::SealResult),
-            ))),
-            RootControlReplyKind::TerminalControl => result.map(|()| None),
-        }
+        original: &Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
+        receipt: super::port::root_control::RootReplyFactReceipt,
+    ) -> Result<Option<PublicationInput>, PublicationError> {
+        let seal = receipt
+            .confirm(self.activation, original)
+            .map_err(|_| PublicationError::ForeignRootFactHandoff)?;
+        Ok(seal.then(|| {
+            Self::publication_result(original.protocol.id, Ok(PublicationApplied::SealResult))
+        }))
     }
 
     pub(crate) async fn publish(
@@ -715,12 +726,73 @@ impl AttemptPublicationOwner {
         let sources = records
             .ok_or(PublicationError::MissingDiagnosticSources)
             .and_then(|records| {
-                DiagnosticSourceSnapshot::resolve(cut, records).map_err(PublicationError::Protocol)
+                DiagnosticSourceSnapshot::resolve(cut, records)
+                    .map_err(|error| PublicationError::Protocol(Box::new(error)))
             });
-        let (result, profile) = {
+        let (result, profile, ready) = {
             let mut record = self.record.lock().await;
-            let result = sources.and_then(|sources| record.publish(publication, Some(sources)));
-            (result, record.profile.take())
+            let registered = *self
+                .registered_cut
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let result = registered
+                .ok_or(PublicationError::MissingOriginalComputationCut)
+                .and_then(|ready| record.register_computation_cut(ready))
+                .and(sources)
+                .and_then(|sources| record.publish(publication, Some(sources)));
+            (result, record.profile.take(), record.ready)
+        };
+        let result = if let Some(original) = self.observation.get().and_then(Weak::upgrade) {
+            match result {
+                Ok(applied) => {
+                    let receipt = ready.ok_or(PublicationError::MissingOriginalComputationCut)
+                        .and_then(|ready| original.profile_published(OriginalProfilePublication::Published {
+                            cut: ready,
+                            selected_at: cut.sources.selected_at,
+                            closure: match cut.closure {
+                                novarocks_attempt_protocol::publication::DiagnosticClosure::FrontierSettled => crate::task_execution::profile_diagnostics::ProfileDiagnosticClosure::FrontierSettled,
+                                novarocks_attempt_protocol::publication::DiagnosticClosure::ObservationDeadline => crate::task_execution::profile_diagnostics::ProfileDiagnosticClosure::ObservationDeadline,
+                                novarocks_attempt_protocol::publication::DiagnosticClosure::Cancelled => crate::task_execution::profile_diagnostics::ProfileDiagnosticClosure::Cancelled,
+                            },
+                        }).map_err(PublicationError::Observation));
+                    if receipt.is_err() {
+                        original.profile_failed(QueryExecutionError::from_execution(
+                            ExecutionFailureInput::new(
+                                QueryFailureReason::PreparationProtocol.failure_fact(),
+                                SafeDetail::truncating(
+                                    "the original profile publication receipt was refused",
+                                ),
+                                ExecutionFailureSite::Coordinator,
+                            ),
+                        ));
+                    }
+                    receipt.map(|()| applied)
+                }
+                Err(error) => {
+                    original.profile_failed(QueryExecutionError::from_execution(
+                        ExecutionFailureInput::new(
+                            QueryFailureReason::PreparationProtocol.failure_fact(),
+                            SafeDetail::truncating("the original profile publication failed"),
+                            ExecutionFailureSite::Coordinator,
+                        ),
+                    ));
+                    Err(error)
+                }
+            }
+        } else if self.observation.get().is_some() {
+            result.and_then(|_| {
+                Err(PublicationError::Observation(
+                    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+                        QueryFailureReason::PreparationProtocol.failure_fact(),
+                        SafeDetail::truncating(
+                            "the original profile publication observation row is unavailable",
+                        ),
+                        ExecutionFailureSite::Coordinator,
+                    )),
+                ))
+            })
+        } else {
+            result
         };
         // The one-shot cut is now settled. The receiver retains a published
         // snapshot, and a failed cut closes its watch. Leaving the sender in
@@ -736,7 +808,6 @@ impl AttemptPublicationOwner {
 
 pub(crate) struct PublicationRecord {
     activation: AttemptActivationIdentity,
-    root: Option<AcceptedRootStatusSender>,
     protocol: AttemptProtocolFactsPublisher,
     profile: Option<TaskFinalInfoCollector>,
     diagnostic_records: Option<Arc<DiagnosticRecords>>,
@@ -747,14 +818,12 @@ pub(crate) struct PublicationRecord {
 impl PublicationRecord {
     pub(in crate::task_execution) fn new(
         activation: AttemptActivationIdentity,
-        root: AcceptedRootStatusSender,
         protocol: AttemptProtocolFactsPublisher,
         profile: Option<TaskFinalInfoCollector>,
         diagnostic_records: Option<Arc<DiagnosticRecords>>,
     ) -> Self {
         Self {
             activation,
-            root: Some(root),
             protocol,
             profile,
             diagnostic_records,
@@ -792,26 +861,11 @@ impl PublicationRecord {
         mut sources: Option<DiagnosticSourceSnapshot>,
     ) -> Result<PublicationApplied, PublicationError> {
         match publication {
-            Publication::RootStatus(projection) => {
-                let failure = match &projection.failure {
-                    AttemptRootFailure::None => AcceptedAttemptFailure::None,
-                    AttemptRootFailure::DerivedPending => AcceptedAttemptFailure::DerivedPending,
-                    AttemptRootFailure::Authoritative(failure) => {
-                        AcceptedAttemptFailure::Authoritative(failure.clone())
-                    }
-                };
-                self.root
-                    .as_ref()
-                    .ok_or(PublicationError::MissingRootPublisher)?
-                    .publish_attempt_observation(projection.status.clone(), failure)
-                    .map_err(PublicationError::Root)?;
-                Ok(PublicationApplied::RootStatus)
-            }
             Publication::ProtocolBatch(batch) => {
                 let published = self
                     .protocol
                     .publish_core_batch(self.activation, batch)
-                    .map_err(PublicationError::Protocol)?;
+                    .map_err(|error| PublicationError::Protocol(Box::new(error)))?;
                 Ok(PublicationApplied::ProtocolBatch { published })
             }
             Publication::FinalTaskInfo(reference) => {
@@ -826,8 +880,10 @@ impl PublicationRecord {
                     .take_information(*reference)
                     .map_err(PublicationError::Diagnostic)?;
                 if info.final_status().identity() != reference.task() {
-                    return Err(PublicationError::Protocol(TaskExecutionError::Schedule(
-                        "core diagnostic payload names a foreign Task".into(),
+                    return Err(PublicationError::Protocol(Box::new(
+                        TaskExecutionError::Schedule(
+                            "core diagnostic payload names a foreign Task".into(),
+                        ),
                     )));
                 }
                 profile.collected.push(Arc::from(info));
@@ -854,7 +910,7 @@ impl PublicationRecord {
                             .take_information(reference)
                             .map_err(|error| TaskExecutionError::Schedule(error.to_string()))
                     })
-                    .map_err(PublicationError::Protocol)?;
+                    .map_err(|error| PublicationError::Protocol(Box::new(error)))?;
                 Ok(PublicationApplied::Diagnostics)
             }
             Publication::DevRootObservation { status, installed } => {
@@ -873,15 +929,6 @@ impl PublicationRecord {
                 Ok(PublicationApplied::DevRootObservation)
             }
         }
-    }
-    /// The bridge consumes this exact publisher for the original seal reply.
-    /// There is no Clone path and no replacement root publisher is constructed.
-    pub(crate) fn take_root_for_seal(
-        &mut self,
-    ) -> Result<AcceptedRootStatusSender, PublicationError> {
-        self.root
-            .take()
-            .ok_or(PublicationError::MissingRootPublisher)
     }
 }
 

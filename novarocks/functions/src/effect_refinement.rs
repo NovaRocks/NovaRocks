@@ -16,7 +16,7 @@
 // under the License.
 
 //! Exact-owner call refinement. Binding validation and semantic refinement
-// Design: ADR-0236-self-contained-expression-units-and-explicit-environments.md
+// Design: ADR-0238-self-contained-expression-units-and-explicit-environments.md
 //! share the implementation owner; this interface never performs name lookup.
 use crate::{FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind};
 use novarocks_type_contract::{

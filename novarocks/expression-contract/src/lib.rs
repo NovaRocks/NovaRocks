@@ -16,7 +16,7 @@
 // under the License.
 
 //! Self-contained scalar expression contract.
-// Design: ADR-0236-self-contained-expression-units-and-explicit-environments.md
+// Design: ADR-0238-self-contained-expression-units-and-explicit-environments.md
 
 macro_rules! numeric_id {
     ($name:ident) => {

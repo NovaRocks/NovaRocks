@@ -1,6 +1,5 @@
 //! Host capability ports used by a prepared fragment.
 
-pub mod commit;
 pub mod error;
 pub mod events;
 pub mod exchange;
@@ -13,10 +12,6 @@ pub mod exchange_stream_sender;
 pub mod exchange_unit;
 pub mod result;
 
-pub use commit::{
-    TabletCommitInfo, TabletFailInfo, TaskCommitPort, TaskCommitRegistration, TaskCommitReport,
-    TaskSinkLoadStats, UnavailableTaskCommitPort,
-};
 pub use error::{TaskIoError, TaskIoErrorKind, TaskIoOperation};
 pub use events::{NoopTaskEventSink, TaskEvent, TaskEventSink, TaskProfileSnapshot, TaskProgress};
 pub use exchange::ExchangeFrameTransmitter;

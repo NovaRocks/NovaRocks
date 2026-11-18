@@ -259,11 +259,14 @@ impl TerminalTrace {
             EffectBody::Publish(Publication::ProtocolBatch(_)) => {
                 Some(PublicationApplied::ProtocolBatch { published: true })
             }
-            EffectBody::Publish(Publication::RootStatus(_)) => Some(PublicationApplied::RootStatus),
+            EffectBody::Port(crate::port_output::AttemptToLogical {
+                body: crate::port_output::AttemptToLogicalBody::RootStatus(_),
+                ..
+            }) => Some(PublicationApplied::RootStatus),
             EffectBody::Port(port)
                 if matches!(
                     port.body,
-                    novarocks_coordination_contract::AttemptToLogicalBody::SealResult { .. }
+                    crate::port_output::AttemptToLogicalBody::SealResult { .. }
                 ) =>
             {
                 Some(PublicationApplied::SealResult)
@@ -609,13 +612,12 @@ fn fatal_current_subscription_fails_the_attempt_with_its_original_participation(
 }
 
 fn current_identity_violation_remains_fatal(root_finished: bool) {
+    use crate::port_output::{AttemptTerminal, AttemptToLogicalBody};
     use crate::{
         failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
         input::{ObservationFailure, ObservationFailureKind},
     };
-    use novarocks_coordination_contract::{
-        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
-    };
+    use novarocks_coordination_contract::AttemptFailureClass;
 
     let mut trace = TerminalTrace::new();
     let now = trace.core.execution.monotonic_now();
@@ -830,14 +832,13 @@ fn current_identity_violation_remains_fatal(root_finished: bool) {
 
 #[test]
 fn covered_exhaustion_follows_required_unproven_task_and_exact_terminal_control() {
+    use crate::port_output::{AttemptTerminal, AttemptToLogicalBody};
     use crate::{
         error::ParticipantObservationFailure,
         failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
         input::{ObservationFailure, ObservationFailureKind},
     };
-    use novarocks_coordination_contract::{
-        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
-    };
+    use novarocks_coordination_contract::AttemptFailureClass;
 
     for connection_lost in [false, true] {
         for stood_down in [false, true] {
@@ -1027,6 +1028,7 @@ fn covered_exhaustion_follows_required_unproven_task_and_exact_terminal_control(
 
 #[test]
 fn covered_exhaustion_preserves_healthy_sibling_phases_and_deadlines() {
+    use crate::port_output::{AttemptTerminal, AttemptToLogicalBody};
     use crate::{
         error::ParticipantObservationFailure,
         failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
@@ -1036,9 +1038,7 @@ fn covered_exhaustion_preserves_healthy_sibling_phases_and_deadlines() {
             opening::{COVERED_LIVENESS_BUDGET, COVERED_OPENING_BUDGET},
         },
     };
-    use novarocks_coordination_contract::{
-        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
-    };
+    use novarocks_coordination_contract::AttemptFailureClass;
     use novarocks_execution_contract::ParticipationRef;
 
     #[derive(Clone, Copy)]
@@ -1396,15 +1396,13 @@ fn covered_exhaustion_preserves_healthy_sibling_phases_and_deadlines() {
 
 #[test]
 fn covered_exhaustion_respects_the_exact_root_terminal_before_seal() {
+    use crate::port_output::{AttemptTerminal, AttemptToLogicalBody};
     use crate::{
-        effect::Publication,
         error::ParticipantObservationFailure,
         failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
         input::{ObservationFailure, ObservationFailureKind},
     };
-    use novarocks_coordination_contract::{
-        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
-    };
+    use novarocks_coordination_contract::AttemptFailureClass;
 
     let progression = [
         (2, TaskState::Running),
@@ -1488,7 +1486,7 @@ fn covered_exhaustion_respects_the_exact_root_terminal_before_seal() {
             assert_eq!(round, Ok(()));
             assert!(effects.iter().any(|effect| matches!(
                 &effect.body,
-                EffectBody::Publish(Publication::RootStatus(projection))
+                EffectBody::Port(crate::port_output::AttemptToLogical { body: crate::port_output::AttemptToLogicalBody::RootStatus(projection), .. })
                     if projection.status == expected_status
                         && projection.failure == AttemptRootFailure::None
             )));
@@ -1600,15 +1598,14 @@ fn covered_exhaustion_respects_the_exact_root_terminal_before_seal() {
 
 #[test]
 fn accepted_failing_task_takes_precedence_over_its_covered_exhaustion() {
+    use crate::port_output::{AttemptTerminal, AttemptToLogicalBody};
     use crate::{
         error::ParticipantObservationFailure,
         failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
         input::{ObservationFailure, ObservationFailureKind},
         root_control::{FailureReadiness, RootCompletion},
     };
-    use novarocks_coordination_contract::{
-        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
-    };
+    use novarocks_coordination_contract::AttemptFailureClass;
 
     for connection_lost in [false, true] {
         for failing in [false, true] {
@@ -1848,9 +1845,9 @@ fn accepted_failing_task_takes_precedence_over_its_covered_exhaustion() {
 
 #[test]
 fn successful_seal_releases_queued_startup_without_native_dispatch() {
+    use crate::port_output::{AttemptTerminal, AttemptToLogicalBody};
     use novarocks_coordination_contract::{
         AttemptAuthorizationDecision, AttemptAuthorizationRef, AttemptIssueSettlement,
-        AttemptTerminal, AttemptToLogicalBody,
     };
 
     for establish in [false, true] {
@@ -2304,7 +2301,7 @@ fn attempt_failure_refinement_queues_only_the_new_terminal_task() {
 #[test]
 fn create_identity_mismatch_asks_qa_about_original_process_replacement() {
     use crate::input::MembershipObservation;
-    use novarocks_coordination_contract::{AttemptTerminal, AttemptToLogicalBody};
+    use crate::port_output::{AttemptTerminal, AttemptToLogicalBody};
 
     let replacement = crate::test_support::backend(99);
     let positive = MembershipObservation::ExactReplacement(replacement);
@@ -2511,7 +2508,10 @@ fn root_read_projection_waits_for_exact_installation_not_create_reply() {
             for _ in 0..24 {
                 let publication = pending.effect.take().and_then(|effect| {
                     let applied = match effect.body {
-                        EffectBody::Publish(Publication::RootStatus(projection)) => {
+                        EffectBody::Port(crate::port_output::AttemptToLogical {
+                            body: crate::port_output::AttemptToLogicalBody::RootStatus(projection),
+                            ..
+                        }) => {
                             assert_eq!(projection.failure, AttemptRootFailure::None);
                             roots.push(projection.status);
                             PublicationApplied::RootStatus

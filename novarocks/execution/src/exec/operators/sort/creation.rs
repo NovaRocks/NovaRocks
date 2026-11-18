@@ -122,6 +122,30 @@ impl std::ops::DerefMut for CreatedSortConverter {
     }
 }
 
+/// Encoded normalized keys keep the converter's finite type storage.
+/// Row bytes and offsets retain their caller's original payload policy.
+pub(crate) struct CreatedSortRows {
+    rows: arrow::row::Rows,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl CreatedSortRows {
+    pub(crate) fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
+}
+impl std::ops::Deref for CreatedSortRows {
+    type Target = arrow::row::Rows;
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
+pub(crate) fn encoding_failure(
+    source: arrow::error::ArrowError,
+) -> crate::runtime::task::ExecutionFailure {
+    failure::arrow(Operation::RowConverter, source)
+}
+
 pub(crate) struct SortCreation<'a> {
     factory: &'a dyn InputConstructionFactory,
     output: &'a crate::exec::chunk::ChunkSchemaRef,
@@ -132,6 +156,35 @@ impl<'a> SortCreation<'a> {
         output: &'a crate::exec::chunk::ChunkSchemaRef,
     ) -> Self {
         Self { factory, output }
+    }
+
+    pub(crate) fn encode_keys(
+        &self,
+        converter: &mut Option<CreatedSortConverter>,
+        keys: &[arrow::array::ArrayRef],
+        type_storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        map_error: impl FnOnce(arrow::error::ArrowError) -> crate::runtime::task::ExecutionFailure,
+    ) -> ExecutionResult<CreatedSortRows> {
+        if converter.is_none() {
+            *converter = Some(self.row_converter(
+                keys,
+                type_storage,
+                std::iter::repeat_n(arrow::compute::SortOptions::default(), keys.len()),
+            )?);
+        }
+        let converter = converter.as_ref().expect("converter was created");
+        let rows = converter
+            .converter()
+            .convert_columns(keys)
+            .map_err(map_error)?;
+        Ok(CreatedSortRows {
+            rows,
+            storage: converter.storage_lifetime(),
+        })
+    }
+
+    pub(crate) fn observe_work(&self, units: usize) -> ExecutionResult<()> {
+        Ok(self.factory.observe_input_work(units)?)
     }
 
     pub(crate) fn row_converter<I>(

@@ -19,3 +19,5 @@ mod compile_control;
 mod fixtures;
 mod implementation_availability;
 mod numeric_negation;
+
+mod installed_domains;

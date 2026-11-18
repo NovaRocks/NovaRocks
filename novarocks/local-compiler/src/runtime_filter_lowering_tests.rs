@@ -598,6 +598,9 @@ enum Consumer {
     StartUnfilteredScan,
     /// A blocking consumer of the join's own probe key.
     ProbeKey,
+    StartUnfilteredProbe,
+    LiveProbe,
+    RowStartUnfilteredScan,
 }
 
 #[derive(Clone, Copy)]
@@ -616,7 +619,10 @@ impl Rf {
         }
     }
     const fn scan_consumer(self) -> bool {
-        !matches!(self.consumer, Consumer::ProbeKey)
+        !matches!(
+            self.consumer,
+            Consumer::ProbeKey | Consumer::StartUnfilteredProbe | Consumer::LiveProbe
+        )
     }
 }
 
@@ -634,17 +640,29 @@ fn join_filter(
 ) -> RuntimeFilter {
     let late_apply = LateApplyGranularity::Batch;
     let consumer = match rf.consumer {
-        Consumer::ProbeKey => RuntimeFilterConsumer {
-            endpoint: RuntimeFilterEndpoint {
-                fragment: producer_fragment,
-                node: JOIN,
-                values: Box::from([consumer_value]),
-            },
-            apply_point: RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 },
-            capabilities: Box::default(),
-            activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
-            target: RuntimeFilterConsumerTarget::JoinProbeKey { equality: EQUALITY },
-        },
+        Consumer::ProbeKey | Consumer::StartUnfilteredProbe | Consumer::LiveProbe => {
+            RuntimeFilterConsumer {
+                endpoint: RuntimeFilterEndpoint {
+                    fragment: producer_fragment,
+                    node: JOIN,
+                    values: Box::from([consumer_value]),
+                },
+                apply_point: RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 },
+                capabilities: Box::default(),
+                activation: match rf.consumer {
+                    Consumer::StartUnfilteredProbe => {
+                        RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+                            late_apply,
+                        }
+                    }
+                    Consumer::LiveProbe => {
+                        RuntimeFilterConsumerActivation::NonBlockingLive { late_apply }
+                    }
+                    _ => RuntimeFilterConsumerActivation::BlockingSnapshot,
+                },
+                target: RuntimeFilterConsumerTarget::JoinProbeKey { equality: EQUALITY },
+            }
+        }
         other => RuntimeFilterConsumer {
             endpoint: RuntimeFilterEndpoint {
                 fragment: consumer_fragment,
@@ -659,6 +677,11 @@ fn join_filter(
                 }
                 Consumer::StartUnfilteredScan => {
                     RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete { late_apply }
+                }
+                Consumer::RowStartUnfilteredScan => {
+                    RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+                        late_apply: LateApplyGranularity::Row,
+                    }
                 }
                 _ => RuntimeFilterConsumerActivation::BlockingSnapshot,
             },
@@ -1147,6 +1170,19 @@ fn assert_producer(program: &LocalProgram, binding: u32, null_semantics: FilterN
 /// The scan's one blocking membership consumer: binding `binding`, channel
 /// FILTER, keyed by its `RuntimeFilter { binding: 0 }` slot read of output 0.
 fn assert_consumer(program: &LocalProgram, binding: u32, null_semantics: FilterNullSemantics) {
+    assert_consumer_activation(
+        program,
+        binding,
+        null_semantics,
+        FilterConsumerActivation::BlockingSnapshot,
+    );
+}
+fn assert_consumer_activation(
+    program: &LocalProgram,
+    binding: u32,
+    null_semantics: FilterNullSemantics,
+    activation: FilterConsumerActivation,
+) {
     let scan = node_of(program, |kind| matches!(kind, ProgramNodeKind::Scan { .. }));
     let node = &program.graph().nodes()[scan.index()];
     let ProgramNodeKind::Scan {
@@ -1162,10 +1198,7 @@ fn assert_consumer(program: &LocalProgram, binding: u32, null_semantics: FilterN
     };
     assert_eq!(consumer.consumer.binding_id(), binding);
     assert_eq!(consumer.consumer.channel_id(), FILTER.get());
-    assert_eq!(
-        consumer.consumer.activation(),
-        FilterConsumerActivation::BlockingSnapshot
-    );
+    assert_eq!(consumer.consumer.activation(), activation);
     assert_eq!(consumer.consumer.reduction(), FilterReduction::SetUnion);
     assert_eq!(consumer.consumer.contract(), &membership(null_semantics));
     // The frozen dynamic filter stays with the compiled seal: it names the
@@ -1288,22 +1321,31 @@ fn partitioned_producer_and_consumer_compile_in_their_own_fragments() {
 // refusal at any callback is the compile's one primary cause.
 #[test]
 fn every_runtime_filter_compile_callback_keeps_the_original_control_cause() {
-    let package = broadcast(Rf::blocking());
-    let baseline = Trace::new(None);
-    compile_with(&package, None, &baseline).unwrap();
-    let expected = baseline.events.lock().unwrap().clone();
-    for at in 0..expected.len() {
-        for cause in [
-            CompileControlError::Cancelled,
-            CompileControlError::DeadlineExceeded,
-            CompileControlError::ResourceExhausted,
-        ] {
-            let control = Trace::new(Some((at, cause.clone())));
-            assert!(matches!(
-                compile_with(&package, None, &control),
-                Err(FragmentCompileError::Control(actual)) if actual == cause
-            ));
-            assert_eq!(*control.events.lock().unwrap(), expected[..=at]);
+    for consumer in [
+        Consumer::BlockingScan,
+        Consumer::StartUnfilteredScan,
+        Consumer::StartUnfilteredProbe,
+    ] {
+        let package = broadcast(Rf {
+            consumer,
+            ..Rf::blocking()
+        });
+        let baseline = Trace::new(None);
+        compile_with(&package, None, &baseline).unwrap();
+        let expected = baseline.events.lock().unwrap().clone();
+        for at in 0..expected.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = Trace::new(Some((at, cause.clone())));
+                assert!(matches!(
+                    compile_with(&package, None, &control),
+                    Err(FragmentCompileError::Control(actual)) if actual == cause
+                ));
+                assert_eq!(*control.events.lock().unwrap(), expected[..=at]);
+            }
         }
     }
 }
@@ -1316,7 +1358,7 @@ fn runtime_filter_shapes_outside_m1_are_refused_by_name() {
             "non-blocking live runtime-filter consumer activation",
         ),
         (
-            Consumer::StartUnfilteredScan,
+            Consumer::RowStartUnfilteredScan,
             "start-unfiltered runtime-filter consumer activation",
         ),
     ] {
@@ -2183,3 +2225,421 @@ pub(super) use grouped_topn_lowering_tests::ordered_scan_package;
 
 #[path = "complete_topn_lowering_tests.rs"]
 mod complete_topn_lowering_tests;
+
+#[test]
+fn complete_once_downgraded_scan_and_probe_keep_their_original_sites() {
+    let expected = FilterConsumerActivation::NonBlockingLive {
+        late_apply: novarocks_local_program::FilterLateApplyGranularity::Batch,
+    };
+    for consumer in [
+        Consumer::StartUnfilteredScan,
+        Consumer::StartUnfilteredProbe,
+    ] {
+        let program = compile(
+            &broadcast(Rf {
+                consumer,
+                ..Rf::blocking()
+            }),
+            None,
+        )
+        .unwrap();
+        if consumer == Consumer::StartUnfilteredScan {
+            assert_consumer_activation(&program, 2, FilterNullSemantics::NeverMatches, expected);
+        } else {
+            let join = node_of(&program, |kind| {
+                matches!(kind, ProgramNodeKind::Join { .. })
+            });
+            let ProgramNodeKind::Join {
+                condition,
+                runtime_filter_consumers,
+                left_layout,
+                ..
+            } = program.graph().nodes()[join.index()].kind()
+            else {
+                unreachable!()
+            };
+            let [site] = runtime_filter_consumers.as_slice() else {
+                panic!("one probe consumer")
+            };
+            assert_eq!(site.consumer.activation(), expected);
+            assert_eq!(site.consumer.binding_id(), 2);
+            assert_eq!(site.consumer.channel_id(), FILTER.get());
+            assert_eq!(site.consumer.reduction(), FilterReduction::SetUnion);
+            assert_eq!(
+                site.consumer.contract(),
+                &membership(FilterNullSemantics::NeverMatches)
+            );
+            assert_eq!(site.key_ordinal, 0);
+            assert_eq!(site.expr_id, condition.keys()[0].probe);
+            // The consumer reuses the admitted probe occurrence and its exact input scope.
+            let (unit, root) = crate::test_units::compiled_root(&program, site.expr_id);
+            let binding = unit.input(root.use_id).expect("direct probe input");
+            assert_eq!(binding.ordinal, 0);
+            assert_eq!(binding.scope, root.scope);
+            assert_eq!(
+                unit.scope(binding.scope).unwrap().schema().as_ref(),
+                left_layout.schema().as_ref()
+            );
+        }
+        let mut requirements = filter_requirements(&program);
+        requirements.sort_unstable();
+        assert_eq!(requirements, vec![1, 2]);
+    }
+    refused(
+        &broadcast(Rf {
+            consumer: Consumer::LiveProbe,
+            ..Rf::blocking()
+        }),
+        None,
+        JOIN,
+        "non-blocking join probe-key runtime-filter consumer activation",
+    );
+}
+
+/// Exercise the real site planner on raw endpoint facts, with the original
+/// checked package left intact. The public package validator rejects these
+/// inconsistent contracts before they could reach public compilation.
+fn raw_site_refusal(
+    package: &FragmentPackage,
+    producer: bool,
+    change: impl FnOnce(&mut RuntimeFilter),
+) -> FragmentCompileError {
+    let mut filter = package.cuts().runtime_filters[0].clone();
+    change(&mut filter);
+    let binding = package
+        .cuts()
+        .runtime_filter_bindings
+        .iter()
+        .find(|binding| {
+            matches!(
+                (producer, binding.role),
+                (true, RuntimeFilterBindingRole::Producer(0))
+                    | (false, RuntimeFilterBindingRole::Consumer(0))
+            )
+        })
+        .unwrap();
+    let mut planned = super::runtime_filter::PlannedRuntimeFilters::default();
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        &FixtureControl,
+        CompilePhase::LowerProgram,
+    )
+    .unwrap();
+    let result = if producer {
+        super::runtime_filter::plan_producer::<std::convert::Infallible, super::creation::NoFactory>(
+            package,
+            &filter,
+            binding,
+            0,
+            &mut planned,
+            None,
+            None,
+            &mut work,
+        )
+    } else {
+        super::runtime_filter::plan_consumer::<std::convert::Infallible, super::creation::NoFactory>(
+            package,
+            &filter,
+            binding,
+            0,
+            &mut planned,
+            None,
+            None,
+            &mut work,
+        )
+    };
+    match result {
+        Err(FragmentCreationError::Compile(error)) => error,
+        Err(other) => panic!("expected a compile refusal, got {other:?}"),
+        Ok(()) => panic!("inconsistent endpoint was accepted"),
+    }
+}
+fn invalid_site(
+    package: &FragmentPackage,
+    producer: bool,
+    change: impl FnOnce(&mut RuntimeFilter),
+    expected: &'static str,
+) {
+    assert!(
+        matches!(raw_site_refusal(package, producer, change), FragmentCompileError::Invalid(actual) if actual == expected)
+    );
+}
+
+#[test]
+fn membership_contract_inconsistencies_are_invalid_at_their_actual_authors() {
+    let scan = broadcast(Rf::blocking());
+    invalid_site(
+        &scan,
+        true,
+        |f| f.lifecycle = RuntimeFilterLifecycle::MonotonicUpdates,
+        "membership runtime filter requires complete-once lifecycle",
+    );
+    invalid_site(
+        &scan,
+        true,
+        |f| f.reduction = RuntimeFilterReduction::UnionOrderedHull,
+        "membership runtime filter requires set-union reduction",
+    );
+    invalid_site(
+        &scan,
+        true,
+        |f| {
+            f.producers[0].endpoint.node = SCAN;
+            f.equality_witnesses[0].join = SCAN;
+        },
+        "runtime-filter producer outside a hash join",
+    );
+    invalid_site(
+        &scan,
+        true,
+        |f| f.equality_witnesses[0].domain_side = JoinSide::Left,
+        "runtime-filter witness domain side differs from the join build side",
+    );
+    invalid_site(
+        &scan,
+        true,
+        |f| f.producers[0].apply_point = RuntimeFilterApplyPoint::NodeOutput,
+        "runtime-filter producer apply point other than its join build input",
+    );
+    invalid_site(
+        &scan,
+        true,
+        |f| {
+            let RuntimeFilterDomain::Membership { ty, .. } = &mut f.domain else {
+                unreachable!()
+            };
+            *ty = ValueType::new(DataType::Int32, false);
+        },
+        "runtime-filter build key type differs from its membership type",
+    );
+    invalid_site(
+        &scan,
+        true,
+        |f| {
+            let RuntimeFilterDomain::Membership { null_semantics, .. } = &mut f.domain else {
+                unreachable!()
+            };
+            *null_semantics = RuntimeFilterNullSemantics::NullSafeEqual;
+        },
+        "runtime-filter NULL semantics differ from the join key equality",
+    );
+    invalid_site(
+        &scan,
+        false,
+        |f| f.consumers[0].apply_point = RuntimeFilterApplyPoint::NodeOutput,
+        "runtime-filter consumer at a node input or output",
+    );
+    for activation in [
+        RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+            late_apply: LateApplyGranularity::RowGroup,
+        },
+        RuntimeFilterConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::File,
+        },
+    ] {
+        invalid_site(
+            &scan,
+            false,
+            |f| f.consumers[0].activation = activation,
+            "membership late application requires Row or Batch granularity",
+        );
+    }
+    let capability_sets: [Box<[RuntimeFilterArtifactCapability]>; 3] = [
+        Box::from([]),
+        Box::from([
+            RuntimeFilterArtifactCapability::Membership,
+            RuntimeFilterArtifactCapability::Membership,
+            RuntimeFilterArtifactCapability::EmptyDomain,
+        ]),
+        Box::from([
+            RuntimeFilterArtifactCapability::EmptyDomain,
+            RuntimeFilterArtifactCapability::Membership,
+        ]),
+    ];
+    for caps in capability_sets {
+        invalid_site(
+            &scan,
+            false,
+            |f| f.consumers[0].capabilities = caps,
+            "membership consumer capabilities differ from its channel matrix",
+        );
+    }
+    let probe = broadcast(Rf {
+        consumer: Consumer::ProbeKey,
+        ..Rf::blocking()
+    });
+    invalid_site(
+        &probe,
+        false,
+        |f| {
+            f.consumers[0].endpoint.node = SCAN;
+            f.equality_witnesses[0].join = SCAN;
+        },
+        "runtime-filter probe consumer outside a hash join",
+    );
+    invalid_site(
+        &probe,
+        false,
+        |f| f.consumers[0].apply_point = RuntimeFilterApplyPoint::NodeInput { input_ordinal: 1 },
+        "runtime-filter probe consumer apply point differs from its probe input",
+    );
+    invalid_site(
+        &probe,
+        false,
+        |f| {
+            let RuntimeFilterDomain::Membership { ty, .. } = &mut f.domain else {
+                unreachable!()
+            };
+            *ty = ValueType::new(DataType::Int32, false);
+        },
+        "runtime-filter probe key type differs from its membership type",
+    );
+    invalid_site(
+        &probe,
+        false,
+        |f| {
+            let RuntimeFilterDomain::Membership { null_semantics, .. } = &mut f.domain else {
+                unreachable!()
+            };
+            *null_semantics = RuntimeFilterNullSemantics::NullSafeEqual;
+        },
+        "runtime-filter NULL semantics differ from the join probe equality",
+    );
+}
+
+#[test]
+fn ordered_contract_inconsistencies_keep_their_contract_classification() {
+    let package = aggregate_topn();
+    invalid_site(
+        &package,
+        true,
+        |f| {
+            f.domain = RuntimeFilterDomain::Membership {
+                ty: int64(),
+                null_semantics: RuntimeFilterNullSemantics::NeverMatches,
+            }
+        },
+        "Aggregate TopN runtime filter requires an ordered domain",
+    );
+    invalid_site(
+        &package,
+        true,
+        |f| f.lifecycle = RuntimeFilterLifecycle::CompleteOnce,
+        "Aggregate TopN runtime filter requires monotonic tightening",
+    );
+    invalid_site(
+        &package,
+        true,
+        |f| f.reduction = RuntimeFilterReduction::UnionOrderedHull,
+        "Aggregate TopN runtime filter requires monotonic tightening",
+    );
+    invalid_site(
+        &package,
+        true,
+        |f| {
+            let RuntimeFilterProducerTarget::AggregateTopNKey { offset, .. } =
+                &mut f.producers[0].target
+            else {
+                unreachable!()
+            };
+            *offset = 1;
+        },
+        "Aggregate TopN runtime-filter phase, limit or offset differs",
+    );
+    invalid_site(
+        &package,
+        true,
+        |f| {
+            let RuntimeFilterProducerTarget::AggregateTopNKey { limit, .. } =
+                &mut f.producers[0].target
+            else {
+                unreachable!()
+            };
+            *limit = 0;
+        },
+        "Aggregate TopN runtime-filter limit is zero",
+    );
+    invalid_site(
+        &package,
+        false,
+        |f| f.consumers[0].endpoint.node = AGGREGATE,
+        "Aggregate TopN runtime-filter consumer requires a scan source",
+    );
+    invalid_site(
+        &package,
+        false,
+        |f| f.consumers[0].capabilities = Box::from([RuntimeFilterArtifactCapability::EmptyDomain]),
+        "Aggregate TopN runtime-filter consumer capabilities differ from its channel matrix",
+    );
+    for activation in [
+        RuntimeFilterConsumerActivation::BlockingSnapshot,
+        RuntimeFilterConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::Row,
+        },
+    ] {
+        invalid_site(
+            &package,
+            false,
+            |f| f.consumers[0].activation = activation,
+            "Aggregate TopN runtime-filter consumer requires live scan activation",
+        );
+    }
+    for (change, feature) in [
+        (0, "inclusive ordered runtime-filter domain"),
+        (1, "Aggregate TopN runtime-filter positive u32 limit"),
+        (2, "Aggregate TopN runtime-filter live Batch scan consumer"),
+    ] {
+        let error = raw_site_refusal(&package, change != 2, |f| match change {
+            0 => {
+                let RuntimeFilterDomain::Ordered { inclusive, .. } = &mut f.domain else {
+                    unreachable!()
+                };
+                *inclusive = false;
+            }
+            1 => {
+                let RuntimeFilterProducerTarget::AggregateTopNKey { limit, .. } =
+                    &mut f.producers[0].target
+                else {
+                    unreachable!()
+                };
+                *limit = u64::from(u32::MAX) + 1;
+            }
+            _ => {
+                f.consumers[0].activation = RuntimeFilterConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::RowGroup,
+                }
+            }
+        });
+        assert!(
+            matches!(error, FragmentCompileError::Unsupported { feature: actual, .. } if actual == feature)
+        );
+    }
+}
+
+#[test]
+fn legal_extra_membership_capabilities_stay_named_installation_refusals() {
+    for (consumer, feature) in [
+        (
+            Consumer::BlockingScan,
+            "runtime-filter consumer capabilities other than membership and empty domain",
+        ),
+        (
+            Consumer::ProbeKey,
+            "runtime-filter probe consumer capabilities other than membership and empty domain",
+        ),
+    ] {
+        let package = broadcast(Rf {
+            consumer,
+            ..Rf::blocking()
+        });
+        let error = raw_site_refusal(&package, false, |filter| {
+            filter.consumers[0].capabilities = Box::from([
+                RuntimeFilterArtifactCapability::Membership,
+                RuntimeFilterArtifactCapability::OrderedRange,
+                RuntimeFilterArtifactCapability::EmptyDomain,
+            ]);
+        });
+        assert!(
+            matches!(error, FragmentCompileError::Unsupported { feature: actual, .. } if actual == feature)
+        );
+    }
+}

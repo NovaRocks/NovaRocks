@@ -21,6 +21,7 @@ use arrow::{
     array::{Array, Float64Array, StringArray},
     datatypes::DataType,
 };
+use novarocks_query_application::api::ExecutionFailurePresentation;
 fn target(catalog: &str, namespace: &str) -> application::StatisticsTableTarget {
     application::StatisticsTableTarget {
         catalog: catalog.into(),

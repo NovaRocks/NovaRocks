@@ -24,9 +24,12 @@ use novarocks_control_runtime::exit_custody::ExitObligation;
 use novarocks_workload_control::WorkError;
 use std::{any::Any, sync::Arc};
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The work body returns original grants and replies in the existing paid join handoff."
+#[cfg_attr(
+    test,
+    expect(
+        clippy::large_enum_variant,
+        reason = "The test-only original failure variants widen the reply in the existing paid join handoff."
+    )
 )]
 pub(crate) enum BodyOutcome {
     /// The same real WC grant moves to its original Join owner.
@@ -47,6 +50,9 @@ pub(crate) enum BodyOutcome {
     LocalFailure(WorkError),
     CreationFailed(TaskExecutionError),
     Call(super::call_source::AttemptCallReply),
+    /// The metadata call's real start fence refused it after its original
+    /// future/captures exited. An LP reply may already fill its result position.
+    CallNotStarted(novarocks_control_runtime::exit_custody::ExitCustodyError),
     Pump(crate::task_execution::host::pumps::PumpOutcome),
     RawFailure(Box<dyn Any + Send>),
 }

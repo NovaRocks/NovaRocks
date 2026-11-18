@@ -320,7 +320,7 @@ impl BoundExprSet {
         crate::validation::validate(&self.ports, &self.definitions, &self.roots, limits, work)
     }
 }
-// Design: ADR-0236-self-contained-expression-units-and-explicit-environments.md
+// Design: ADR-0238-self-contained-expression-units-and-explicit-environments.md
 
 impl BoundExprSet {
     /// Recheck the same immutable structure with actual caller-funded scratch.

@@ -16,7 +16,7 @@
 // under the License.
 
 //! Scoped summaries retain their real scalar or relational call identity.
-// Design: ADR-0236-self-contained-expression-units-and-explicit-environments.md
+// Design: ADR-0238-self-contained-expression-units-and-explicit-environments.md
 use crate::{CallEffectInput, RefinedCallEffects, ScopedExpressionEffects};
 use novarocks_type_contract::{
     CallEffectContext, CallEffects, EffectContractError, ExpressionEffects, FunctionInstanceState,

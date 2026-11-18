@@ -24,7 +24,7 @@
 //! also the `filter_id` a scan's frozen dynamic filter names.
 //!
 //! Complete-once membership sites reuse existing hash-join build/probe keys
-//! and blocking scan consumers. The first monotonic ordered route reuses an
+//! and blocking or downgraded Batch live consumers. The first monotonic ordered route reuses an
 //! original Partial Aggregate group key and its direct Scan's live Batch key.
 //! Every endpoint retains its one original binding requirement. Shapes outside
 //! these installed declarations are refused by name before expressions lower.
@@ -36,17 +36,18 @@ use crate::{
 };
 use novarocks_connector_contract::ConnectorReadProgramRecipe;
 use novarocks_local_program::{
-    BindingRequirement, FilterConsumerActivation, FilterConsumerAtExpr, FilterMembershipSchema,
-    FilterMembershipSchemaError, FilterNullSemantics, FilterProducerKind, FilterReduction,
-    ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId, ProgramRootRef,
+    BindingRequirement, FilterConsumerActivation, FilterConsumerAtExpr, FilterLateApplyGranularity,
+    FilterMembershipSchema, FilterMembershipSchemaError, FilterNullSemantics, FilterProducerKind,
+    FilterReduction, ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId, ProgramRootRef,
     StaticFilterConsumer, StaticFilterContract, StaticFilterProducer,
 };
 use novarocks_physical_plan::{
-    FragmentPackage, NodeId, NodeKind, RuntimeFilter, RuntimeFilterApplyPoint,
-    RuntimeFilterArtifactCapability, RuntimeFilterBindingCut, RuntimeFilterBindingRole,
-    RuntimeFilterCompletion, RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget,
-    RuntimeFilterContributionKind, RuntimeFilterDomain, RuntimeFilterLifecycle,
-    RuntimeFilterNullSemantics, RuntimeFilterProducerTarget, RuntimeFilterReduction, ValueType,
+    FragmentPackage, LateApplyGranularity, NodeId, NodeKind, RuntimeFilter,
+    RuntimeFilterApplyPoint, RuntimeFilterArtifactCapability, RuntimeFilterBindingCut,
+    RuntimeFilterBindingRole, RuntimeFilterCompletion, RuntimeFilterConsumerActivation,
+    RuntimeFilterConsumerTarget, RuntimeFilterContributionKind, RuntimeFilterDomain,
+    RuntimeFilterLifecycle, RuntimeFilterNullSemantics, RuntimeFilterProducerTarget,
+    RuntimeFilterReduction, ValueType,
 };
 use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
 use novarocks_type_contract::{
@@ -100,6 +101,7 @@ struct PlannedJoinConsumer {
 /// Every local runtime-filter endpoint of one fragment, admitted and keyed by
 /// its physical node, each node's sites in binding-table order. Lowering takes
 /// each node's sites exactly once.
+#[derive(Default)]
 pub(crate) struct PlannedRuntimeFilters {
     producers: BTreeMap<NodeId, Vec<PlannedProducer>>,
     aggregate_producers: BTreeMap<NodeId, Vec<ordered::PlannedAggregateProducer>>,
@@ -159,6 +161,84 @@ impl<H> From<LayoutResourceError> for MembershipCreationFailure<H> {
     }
 }
 
+/// The membership domain admitted by both its contract and activation authors.
+fn membership_domain(
+    filter: &RuntimeFilter,
+    node: NodeId,
+) -> Result<(&ValueType, FilterNullSemantics), FragmentCompileError> {
+    let RuntimeFilterDomain::Membership { ty, null_semantics } = &filter.domain else {
+        return Err(unsupported(node, "ordered-domain runtime filter"));
+    };
+    if filter.lifecycle != RuntimeFilterLifecycle::CompleteOnce {
+        return Err(FragmentCompileError::Invalid(
+            "membership runtime filter requires complete-once lifecycle",
+        ));
+    }
+    if filter.reduction != RuntimeFilterReduction::SetUnion {
+        return Err(FragmentCompileError::Invalid(
+            "membership runtime filter requires set-union reduction",
+        ));
+    }
+    let semantics = match null_semantics {
+        RuntimeFilterNullSemantics::NeverMatches => FilterNullSemantics::NeverMatches,
+        RuntimeFilterNullSemantics::NullSafeEqual => FilterNullSemantics::NullSafeEqual,
+    };
+    Ok((ty, semantics))
+}
+
+fn membership_activation(
+    filter: &RuntimeFilter,
+    node: NodeId,
+    activation: RuntimeFilterConsumerActivation,
+    start_unfiltered_feature: &'static str,
+    live_feature: &'static str,
+) -> Result<FilterConsumerActivation, FragmentCompileError> {
+    membership_domain(filter, node)?;
+    match activation {
+        RuntimeFilterConsumerActivation::BlockingSnapshot => {
+            Ok(FilterConsumerActivation::BlockingSnapshot)
+        }
+        RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+            late_apply: LateApplyGranularity::Batch,
+        } => Ok(FilterConsumerActivation::NonBlockingLive {
+            late_apply: FilterLateApplyGranularity::Batch,
+        }),
+        RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+            late_apply: LateApplyGranularity::Row,
+        } => Err(unsupported(node, start_unfiltered_feature)),
+        RuntimeFilterConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::Row | LateApplyGranularity::Batch,
+        } => Err(unsupported(node, live_feature)),
+        _ => Err(FragmentCompileError::Invalid(
+            "membership late application requires Row or Batch granularity",
+        )),
+    }
+}
+
+fn membership_capabilities(
+    node: NodeId,
+    capabilities: &[RuntimeFilterArtifactCapability],
+    feature: &'static str,
+) -> Result<(), FragmentCompileError> {
+    let required = [
+        RuntimeFilterArtifactCapability::Membership,
+        RuntimeFilterArtifactCapability::EmptyDomain,
+    ];
+    if capabilities.windows(2).any(|pair| pair[0] >= pair[1])
+        || required
+            .iter()
+            .any(|capability| !capabilities.contains(capability))
+    {
+        return Err(FragmentCompileError::Invalid(
+            "membership consumer capabilities differ from its channel matrix",
+        ));
+    }
+    if capabilities != required {
+        return Err(unsupported(node, feature));
+    }
+    Ok(())
+}
+
 /// The complete-once membership contract every lowered site of `filter`
 /// shares. `node` names the endpoint a refusal reports.
 fn membership_contract<H, F: ValueSchemaCreationFactory<H>>(
@@ -167,19 +247,7 @@ fn membership_contract<H, F: ValueSchemaCreationFactory<H>>(
     factory: Option<&F>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(StaticFilterContract, FilterNullSemantics), FragmentCreationError<H>> {
-    let RuntimeFilterDomain::Membership { ty, null_semantics } = &filter.domain else {
-        return Err(unsupported(node, "ordered-domain runtime filter").into());
-    };
-    if filter.lifecycle != RuntimeFilterLifecycle::CompleteOnce {
-        return Err(unsupported(node, "monotonic-update runtime-filter lifecycle").into());
-    }
-    if filter.reduction != RuntimeFilterReduction::SetUnion {
-        return Err(unsupported(node, "runtime-filter reduction other than set union").into());
-    }
-    let null_semantics = match null_semantics {
-        RuntimeFilterNullSemantics::NeverMatches => FilterNullSemantics::NeverMatches,
-        RuntimeFilterNullSemantics::NullSafeEqual => FilterNullSemantics::NullSafeEqual,
-    };
+    let (ty, null_semantics) = membership_domain(filter, node)?;
     let contract = match factory {
         Some(factory) => {
             // One canonical entity keeps its own actual creator and borrowed
@@ -280,12 +348,7 @@ pub(crate) fn plan_runtime_filters<H, F: ValueSchemaCreationFactory<H>>(
             .into());
         }
     }
-    let mut planned = PlannedRuntimeFilters {
-        producers: BTreeMap::new(),
-        aggregate_producers: BTreeMap::new(),
-        join_consumers: BTreeMap::new(),
-        consumers: BTreeMap::new(),
-    };
+    let mut planned = PlannedRuntimeFilters::default();
     let mut bound = BTreeSet::new();
     for binding in cuts.runtime_filter_bindings.iter() {
         work.step()?;
@@ -433,7 +496,7 @@ fn requirement_id(
     })
 }
 
-fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
+pub(super) fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     filter: &RuntimeFilter,
     binding: &RuntimeFilterBindingCut,
@@ -517,13 +580,14 @@ fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
         ..
     } = &join.kind
     else {
-        return Err(unsupported(node, "runtime-filter producer outside a hash join").into());
+        return Err(
+            FragmentCompileError::Invalid("runtime-filter producer outside a hash join").into(),
+        );
     };
     // The local build input is the physical build side, so only a witness
     // whose domain is the build side names a local build key.
     if witness.domain_side != *build_side {
-        return Err(unsupported(
-            node,
+        return Err(FragmentCompileError::Invalid(
             "runtime-filter witness domain side differs from the join build side",
         )
         .into());
@@ -533,8 +597,7 @@ fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
             input_ordinal: build_side.input_ordinal(),
         })
     {
-        return Err(unsupported(
-            node,
+        return Err(FragmentCompileError::Invalid(
             "runtime-filter producer apply point other than its join build input",
         )
         .into());
@@ -556,8 +619,7 @@ fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
         contract_type(&contract)?,
         || work.step(),
     )? {
-        return Err(unsupported(
-            node,
+        return Err(FragmentCompileError::Invalid(
             "runtime-filter build key type differs from its membership type",
         )
         .into());
@@ -568,8 +630,7 @@ fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
         FilterNullSemantics::NeverMatches
     };
     if key_semantics != null_semantics {
-        return Err(unsupported(
-            node,
+        return Err(FragmentCompileError::Invalid(
             "runtime-filter NULL semantics differ from the join key equality",
         )
         .into());
@@ -596,7 +657,7 @@ fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
     Ok(())
 }
 
-fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
+pub(super) fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     filter: &RuntimeFilter,
     binding: &RuntimeFilterBindingCut,
@@ -640,33 +701,23 @@ fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
     }
     let (contract, _) = membership_contract(filter, node, factory, work)?;
     if consumer.apply_point != RuntimeFilterApplyPoint::ScanSource {
-        return Err(unsupported(node, "runtime-filter consumer at a node input or output").into());
-    }
-    match consumer.activation {
-        RuntimeFilterConsumerActivation::BlockingSnapshot => {}
-        RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete { .. } => {
-            return Err(
-                unsupported(node, "start-unfiltered runtime-filter consumer activation").into(),
-            );
-        }
-        RuntimeFilterConsumerActivation::NonBlockingLive { .. } => {
-            return Err(
-                unsupported(node, "non-blocking live runtime-filter consumer activation").into(),
-            );
-        }
-    }
-    if consumer.capabilities.as_ref()
-        != [
-            RuntimeFilterArtifactCapability::Membership,
-            RuntimeFilterArtifactCapability::EmptyDomain,
-        ]
-    {
-        return Err(unsupported(
-            node,
-            "runtime-filter consumer capabilities other than membership and empty domain",
+        return Err(FragmentCompileError::Invalid(
+            "runtime-filter consumer at a node input or output",
         )
         .into());
     }
+    let activation = membership_activation(
+        filter,
+        node,
+        consumer.activation,
+        "start-unfiltered runtime-filter consumer activation",
+        "non-blocking live runtime-filter consumer activation",
+    )?;
+    membership_capabilities(
+        node,
+        &consumer.capabilities,
+        "runtime-filter consumer capabilities other than membership and empty domain",
+    )?;
     let scan = fragment
         .nodes()
         .get(&node)
@@ -714,7 +765,7 @@ fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
     let consumer = StaticFilterConsumer::try_new(
         binding.binding_id,
         filter.id.get(),
-        FilterConsumerActivation::BlockingSnapshot,
+        activation,
         contract,
         FilterReduction::SetUnion,
     )
@@ -767,7 +818,10 @@ fn plan_join_consumer<H, F: ValueSchemaCreationFactory<H>>(
         ..
     } = &join.kind
     else {
-        return Err(unsupported(node, "runtime-filter probe consumer outside a hash join").into());
+        return Err(FragmentCompileError::Invalid(
+            "runtime-filter probe consumer outside a hash join",
+        )
+        .into());
     };
     if witness.fragment != fragment.id()
         || witness.join != node
@@ -783,31 +837,23 @@ fn plan_join_consumer<H, F: ValueSchemaCreationFactory<H>>(
             input_ordinal: build_side.opposite().input_ordinal(),
         })
     {
-        return Err(unsupported(
-            node,
+        return Err(FragmentCompileError::Invalid(
             "runtime-filter probe consumer apply point differs from its probe input",
         )
         .into());
     }
-    if consumer.activation != RuntimeFilterConsumerActivation::BlockingSnapshot {
-        return Err(unsupported(
-            node,
-            "non-blocking join probe-key runtime-filter consumer activation",
-        )
-        .into());
-    }
-    if consumer.capabilities.as_ref()
-        != [
-            RuntimeFilterArtifactCapability::Membership,
-            RuntimeFilterArtifactCapability::EmptyDomain,
-        ]
-    {
-        return Err(unsupported(
-            node,
-            "runtime-filter probe consumer capabilities other than membership and empty domain",
-        )
-        .into());
-    }
+    let activation = membership_activation(
+        filter,
+        node,
+        consumer.activation,
+        "non-blocking join probe-key runtime-filter consumer activation",
+        "non-blocking join probe-key runtime-filter consumer activation",
+    )?;
+    membership_capabilities(
+        node,
+        &consumer.capabilities,
+        "runtime-filter probe consumer capabilities other than membership and empty domain",
+    )?;
     let (contract, null_semantics) = membership_contract(filter, node, factory, work)?;
     let key_ordinal =
         usize::try_from(witness.key_ordinal).map_err(|_| CompileControlError::ResourceExhausted)?;
@@ -843,8 +889,7 @@ fn plan_join_consumer<H, F: ValueSchemaCreationFactory<H>>(
             || work.step(),
         )?
     {
-        return Err(unsupported(
-            node,
+        return Err(FragmentCompileError::Invalid(
             "runtime-filter probe key type differs from its membership type",
         )
         .into());
@@ -856,8 +901,7 @@ fn plan_join_consumer<H, F: ValueSchemaCreationFactory<H>>(
             FilterNullSemantics::NeverMatches
         }
     {
-        return Err(unsupported(
-            node,
+        return Err(FragmentCompileError::Invalid(
             "runtime-filter NULL semantics differ from the join probe equality",
         )
         .into());
@@ -866,7 +910,7 @@ fn plan_join_consumer<H, F: ValueSchemaCreationFactory<H>>(
     let consumer = StaticFilterConsumer::try_new(
         binding.binding_id,
         filter.id.get(),
-        FilterConsumerActivation::BlockingSnapshot,
+        activation,
         contract,
         FilterReduction::SetUnion,
     )

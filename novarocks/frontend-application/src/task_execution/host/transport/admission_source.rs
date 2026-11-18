@@ -342,6 +342,27 @@ impl AdmissionSource {
         self.failures.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn failure_records_for_fixture(
+        &self,
+    ) -> std::sync::Weak<Mutex<BTreeMap<HostFailureRef, TaskExecutionError>>> {
+        Arc::downgrade(&self.failures)
+    }
+
+    /// Borrow the exact admission failure without taking its rich owner.
+    #[cfg(test)]
+    pub(crate) fn workload_failure_for_fixture(
+        records: &std::sync::Weak<Mutex<BTreeMap<HostFailureRef, TaskExecutionError>>>,
+        reference: HostFailureRef,
+    ) -> Option<novarocks_workload_control::WorkError> {
+        let original = records.upgrade()?;
+        let records = original.lock().expect("original admission failure records");
+        match records.get(&reference)? {
+            TaskExecutionError::Workload(error) => Some(error.clone()),
+            _ => None,
+        }
+    }
+
     pub(super) fn take_unselected_failure(
         &mut self,
     ) -> Option<(HostFailureRef, TaskExecutionError)> {
@@ -357,10 +378,6 @@ impl AdmissionSource {
             .unwrap()
             .get(&reference)
             .map(TaskExecutionError::preparation_input)
-    }
-
-    pub(crate) fn take_failure(&mut self, failure: HostFailureRef) -> Option<TaskExecutionError> {
-        self.failures.lock().unwrap().remove(&failure)
     }
 
     fn payload_ref(payload: QueuedInputPayload) -> Option<PayloadRef> {
@@ -918,13 +935,13 @@ mod tests {
     use novarocks_task_codec::{TransportBudget, TransportMessageLimits};
 
     fn operation(queued_bytes: usize) -> OperationIntent {
-        let fixture = crate::task_execution::tests::manifest_unstarted_regression_fixture();
+        let graph = crate::task_execution::graph_manifest_tests::unstarted_chain_graph();
         OperationIntent::CreateTask {
             envelope: OperationEnvelope::with_default_wait(
                 TaskOperationId::new_v7(),
                 OperationKind::CreateTask,
             ),
-            identity: fixture.execution().graph().root_identity(),
+            identity: graph.root_identity(),
             creation: PayloadRef(NonZeroU64::MIN),
             queued_bytes,
         }

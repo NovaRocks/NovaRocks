@@ -389,10 +389,9 @@ fn validate_compiled_runtime_filter_bindings(
     Ok(())
 }
 
-/// The blocking membership consumers of one compiled scan, keyed by the
-/// scan's `RuntimeFilter { binding }` roots over its own output. This
-/// milestone executes BlockingSnapshot membership (SetUnion) consumers
-/// only; an ordered-domain or NonBlockingLive consumer is refused by name.
+/// The membership consumers of one compiled scan, keyed by its own output
+/// roots. Complete-once SetUnion accepts blocking snapshots or Batch live
+/// delivery of the final snapshot; ordered domains have their own owner.
 fn compiled_runtime_filter_consumers(
     owner: &'static str,
     display_owner: &'static str,
@@ -415,7 +414,7 @@ fn compiled_runtime_filter_consumers(
 }
 
 /// The ordered Scan keeps full-list root ordinals while sharing the original
-/// blocking membership gate and contract author.
+/// membership contract author and blocking or Batch live activation.
 fn compiled_runtime_filter_consumers_selected(
     owner: &'static str,
     display_owner: &'static str,
@@ -445,7 +444,9 @@ fn compiled_runtime_filter_consumers_selected(
                 ),
             ));
         }
-        if let FilterConsumerActivation::NonBlockingLive { late_apply } = consumer.activation() {
+        if let FilterConsumerActivation::NonBlockingLive { late_apply } = consumer.activation()
+            && late_apply != novarocks_local_program::FilterLateApplyGranularity::Batch
+        {
             return Err(program_failure(
                 FragmentBindingErrorKind::InvalidAssignment,
                 format!(
@@ -972,11 +973,11 @@ fn build_node(
             Ok(build)
         }
         ProgramNodeKind::Sort { input, .. } => {
-            // Global and analytic Sort and every row-count TopN phase order
-            // the whole instance input on one driver. An analytic Sort reads
-            // an input the plan co-locates by its partition keys per instance,
+            // Full/partitioned Sort and every row-count/partition-rank TopN
+            // order the whole instance input on one driver. Partitioned Sort
+            // and partition TopN read an input co-located by partition keys,
             // so one driver holds each partition whole. Single and Final read a Singleton
-            // input, so the instance input is the relation. A Partial keeps
+            // input, so the instance input is the relation. A row-count Partial keeps
             // its input distribution and declares its order keys as its
             // output ordering, which the TopN sequence trace matches against
             // the Final; one gathered driver is what makes the instance's

@@ -30,19 +30,18 @@ use novarocks_connector_iceberg::connector_factory::IcebergConnectorFactory;
 use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 use novarocks_connector_iceberg::iceberg::{Catalog, TableIdent};
 use novarocks_connector_iceberg::novarocks_fs::{
-    FsAccessResolver, FsAccessResources, ObjectStoreConfig, ObjectStoreProviderPool,
-    ObjectStoreSecretMaterial, SecretValue, TokioFileIoRuntime, TokioFileIoSpawner,
+    FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreSecretMaterial,
+    TokioFileIoRuntime, TokioFileIoSpawner,
 };
 use novarocks_connector_iceberg::resources::IcebergMetadataResources;
 use novarocks_spi::connector::{
-    CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-    CatalogProperties, CatalogProperty, CatalogVersion, ConnectorCatalogMutationOperation,
-    ConnectorCatalogMutationRequest, ConnectorColumnDefinition, ConnectorControlCreation,
-    ConnectorControlFactory, ConnectorControlFactoryRequest, ConnectorDataType, ConnectorError,
-    ConnectorErrorKind, ConnectorInstanceId, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorNamespaceIdentity, ConnectorProviderBindingKey,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorStopOwner, ConnectorTableIdentity,
-    CreatePolicy, CredentialConsumerRole, ExternalMutationEffect, ExternalMutationFinalization,
+    CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion,
+    ConnectorCatalogMutationOperation, ConnectorCatalogMutationRequest, ConnectorColumnDefinition,
+    ConnectorControlCreation, ConnectorControlFactory, ConnectorControlFactoryRequest,
+    ConnectorDataType, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorNamespaceIdentity,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext, ConnectorStopOwner,
+    ConnectorTableIdentity, CreatePolicy, ExternalMutationEffect, ExternalMutationFinalization,
     ExternalMutationOutcome, StaticCredentialReference,
 };
 use novarocks_test_support::ManagedCommand;
@@ -56,7 +55,6 @@ const CHILD_ENV: &str = "NR_HADOOP_FENCE_CHILD";
 const WAREHOUSE_ENV: &str = "NR_HADOOP_FENCE_WAREHOUSE";
 const NAMESPACE_ENV: &str = "NR_HADOOP_FENCE_NAMESPACE";
 const TABLE_ENV: &str = "NR_HADOOP_FENCE_TABLE";
-const POLICY_ENV: &str = "NR_HADOOP_FENCE_POLICY";
 const BARRIER_ENV: &str = "NR_HADOOP_FENCE_BARRIER";
 const CHILD_INDEX_ENV: &str = "NR_HADOOP_FENCE_CHILD_INDEX";
 const RESULT_PREFIX: &str = "HADOOP_FENCE_RESULT ";
@@ -72,14 +70,6 @@ impl Policy {
         match self {
             Self::Strict => "strict",
             Self::NoOp => "noop",
-        }
-    }
-
-    fn parse(value: &str) -> Self {
-        match value {
-            "strict" => Self::Strict,
-            "noop" => Self::NoOp,
-            other => panic!("unknown child create policy: {other}"),
         }
     }
 }
@@ -103,6 +93,10 @@ struct PrefixAudit {
 
 #[test]
 fn local_strict_two_process_fencing() -> anyhow::Result<()> {
+    if std::env::var_os(CHILD_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        run_fencing_child(Policy::Strict);
+        return Ok(());
+    }
     let warehouse = tempfile::tempdir().expect("local warehouse");
     RunOwner::local()?.run(|owner| {
         run_race(
@@ -116,6 +110,10 @@ fn local_strict_two_process_fencing() -> anyhow::Result<()> {
 
 #[test]
 fn local_noop_two_process_fencing() -> anyhow::Result<()> {
+    if std::env::var_os(CHILD_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        run_fencing_child(Policy::NoOp);
+        return Ok(());
+    }
     let warehouse = tempfile::tempdir().expect("local warehouse");
     RunOwner::local()?.run(|owner| {
         run_race(
@@ -127,33 +125,14 @@ fn local_noop_two_process_fencing() -> anyhow::Result<()> {
     })
 }
 
-#[test]
-#[ignore = "requires the shared MinIO fixture"]
-fn minio_strict_and_noop_two_process_fencing() -> anyhow::Result<()> {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    RunOwner::minio(&repo)?.run(|owner| {
-        let warehouse = owner.warehouse()?.to_owned();
-        run_race(owner, &warehouse, "minio_strict", Policy::Strict)?;
-        run_race(owner, &warehouse, "minio_noop", Policy::NoOp)
-    })
-}
-
-/// The parent process invokes this exact libtest entry in two independent
-/// processes. It requires the parent's inputs and is excluded from ordinary
-/// test invocations.
-#[test]
-#[ignore = "internal helper invoked exactly by the two-process fencing tests"]
-fn hadoop_fencing_child_process_entry() {
-    assert_eq!(required_env(CHILD_ENV), "1", "invalid child process marker");
-
+fn run_fencing_child(policy: Policy) {
     let warehouse = required_env(WAREHOUSE_ENV);
     let namespace = required_env(NAMESPACE_ENV);
     let table_name = required_env(TABLE_ENV);
-    let policy = Policy::parse(&required_env(POLICY_ENV));
     let barrier = PathBuf::from(required_env(BARRIER_ENV));
     let child_index = required_env(CHILD_INDEX_ENV);
 
-    let config = catalog_configuration(&warehouse, object_store_config(&warehouse));
+    let config = catalog_configuration(&warehouse);
     let runtime = tokio::runtime::Runtime::new().expect("child runtime");
     // Each child constructs its own production control generation. The
     // mutation capability freezes and publishes through that owner's journal.
@@ -307,7 +286,7 @@ fn run_race(
     let namespace = "fencing";
     // Configuration parsing canonicalizes local paths to file:// URIs. Use
     // that same identity for child inputs, receipts and the independent audit.
-    let config = catalog_configuration(warehouse, owner.object_store_config());
+    let config = catalog_configuration(warehouse);
     let warehouse = config.warehouse_uri.as_str();
     let metadata_location = format!(
         "{}/{}/{}/metadata/v1.metadata.json",
@@ -327,22 +306,19 @@ fn run_race(
     );
 
     let barrier = tempfile::tempdir().expect("process barrier");
+    let test = match policy {
+        Policy::Strict => "local_strict_two_process_fencing",
+        Policy::NoOp => "local_noop_two_process_fencing",
+    };
     let commands = std::array::from_fn(|index| {
         let mut command =
             ManagedCommand::new(std::env::current_exe().expect("current test executable"));
         command
-            .args([
-                "--ignored",
-                "--exact",
-                "hadoop_fencing_child_process_entry",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env(CHILD_ENV, "1")
             .env(WAREHOUSE_ENV, warehouse)
             .env(NAMESPACE_ENV, namespace)
             .env(TABLE_ENV, table_name)
-            .env(POLICY_ENV, policy.as_str())
             .env(BARRIER_ENV, barrier.path())
             .env(CHILD_INDEX_ENV, index.to_string());
         command
@@ -540,10 +516,7 @@ fn wait_for_both_children(barrier: &Path) {
     }
 }
 
-fn catalog_configuration(
-    warehouse: &str,
-    object_store_config: Option<ObjectStoreConfig>,
-) -> IcebergCatalogConfiguration {
+fn catalog_configuration(warehouse: &str) -> IcebergCatalogConfiguration {
     let properties = vec![
         ("type".to_string(), "iceberg".to_string()),
         ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
@@ -552,12 +525,8 @@ fn catalog_configuration(
             warehouse.to_string(),
         ),
     ];
-    parse_catalog_configuration_with_object_store_binding(
-        "hadoop_fencing",
-        &properties,
-        object_store_config.as_ref(),
-    )
-    .expect("parse Hadoop catalog configuration")
+    parse_catalog_configuration_with_object_store_binding("hadoop_fencing", &properties, None)
+        .expect("parse Hadoop catalog configuration")
 }
 
 fn catalog_binding(config: &IcebergCatalogConfiguration) -> IcebergReadBinding {
@@ -573,27 +542,6 @@ fn catalog_binding(config: &IcebergCatalogConfiguration) -> IcebergReadBinding {
         novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
         Arc::new(TokioFileIoSpawner::new(runtime)),
     )
-}
-
-fn object_store_config(warehouse: &str) -> Option<ObjectStoreConfig> {
-    if !warehouse.starts_with("s3://") {
-        return None;
-    }
-    Some(ObjectStoreConfig {
-        endpoint: required_env("AWS_S3_ENDPOINT"),
-        access_key_id: SecretValue::new(required_env("AWS_S3_ACCESS_KEY_ID")),
-        access_key_secret: SecretValue::new(required_env("AWS_S3_SECRET_ACCESS_KEY")),
-        session_token: std::env::var("AWS_SESSION_TOKEN")
-            .ok()
-            .map(SecretValue::new),
-        enable_path_style_access: Some(true),
-        region: std::env::var("AWS_REGION").ok(),
-        retry_max_times: None,
-        retry_min_delay_ms: None,
-        retry_max_delay_ms: None,
-        timeout_ms: None,
-        io_timeout_ms: None,
-    })
 }
 
 fn request_context() -> ConnectorRequestContext {
@@ -614,7 +562,7 @@ fn read_request_context(deadline: Instant) -> ConnectorRequestContext {
     .expect("mutation request context")
 }
 
-struct ChildCredentials(Option<ObjectStoreSecretMaterial>);
+struct ChildCredentials;
 
 impl IcebergCredentialResolver for ChildCredentials {
     fn resolve_object_store_static(
@@ -623,22 +571,8 @@ impl IcebergCredentialResolver for ChildCredentials {
     ) -> Result<ObjectStoreSecretMaterial, ConnectorError> {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
-            "fencing child only owns frontend metadata credentials",
+            "local fencing child has no object-store credentials",
         ))
-    }
-
-    fn resolve_object_store_metadata_static(
-        &self,
-        reference: &StaticCredentialReference,
-    ) -> Result<ObjectStoreSecretMaterial, ConnectorError> {
-        assert_eq!(reference.name(), "fencing-metadata");
-        assert_eq!(reference.generation(), "v1");
-        self.0.clone().ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "local fencing child has no object-store credentials",
-            )
-        })
     }
 }
 
@@ -646,7 +580,7 @@ fn child_control(
     config: &IcebergCatalogConfiguration,
     runtime: &tokio::runtime::Runtime,
 ) -> ConnectorControlCreation {
-    let mut properties = vec![
+    let properties = vec![
         ("type".to_string(), "iceberg".to_string()),
         ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
         (
@@ -654,28 +588,6 @@ fn child_control(
             config.warehouse_uri.clone(),
         ),
     ];
-    let mut credentials = Vec::new();
-    if let Some(object_store) = &config.object_store_config {
-        properties.push(("aws.s3.endpoint".to_string(), object_store.endpoint.clone()));
-        properties.push((
-            "aws.s3.enable_path_style_access".to_string(),
-            "true".to_string(),
-        ));
-        if let Some(region) = &object_store.region {
-            properties.push(("aws.s3.region".to_string(), region.clone()));
-        }
-        credentials.push(
-            CatalogCredentialBinding::try_new(
-                CatalogCredentialPurpose::ObjectStoreMetadata,
-                CredentialConsumerRole::Frontend,
-                CatalogCredentialMode::Static(
-                    StaticCredentialReference::try_new("fencing-metadata", "v1")
-                        .expect("metadata credential reference"),
-                ),
-            )
-            .expect("metadata credential binding"),
-        );
-    }
     let instance_id = ConnectorInstanceId::parse("hadoop_fencing").expect("instance identity");
     let provider_id = ConnectorProviderId::parse("iceberg").expect("provider identity");
     let catalog_properties = CatalogProperties::new(
@@ -686,7 +598,7 @@ fn child_control(
             .iter()
             .map(|(key, value)| CatalogProperty::new(key, value).expect("non-secret property"))
             .collect(),
-        credentials,
+        Vec::new(),
     )
     .expect("typed catalog properties");
     let resources = FsAccessResources::new(
@@ -698,12 +610,7 @@ fn child_control(
     );
     let planning_binding = IcebergReadBinding::with_metadata_credential_resolver(
         resources,
-        Arc::new(ChildCredentials(
-            config
-                .object_store_config
-                .as_ref()
-                .map(ObjectStoreConfig::secret_material),
-        )),
+        Arc::new(ChildCredentials),
     );
     let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
         planning_binding,

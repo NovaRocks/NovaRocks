@@ -15,6 +15,7 @@ doctest = false
 [dependencies]
 novarocks-expression-contract.workspace = true
 novarocks-expression.workspace = true
+novarocks-logical-execution-protocol.workspace = true
 novarocks-control-runtime.workspace = true
 novarocks-control-runtime-core.workspace = true
 novarocks-attempt-protocol.workspace = true

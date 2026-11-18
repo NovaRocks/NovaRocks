@@ -155,7 +155,7 @@ fn prove_topn_placement(
         return None;
     }
     let order_expr = &topn.items[0].expr;
-    if !is_supported_topn_key_type(order_expr.value_type.data_type()) {
+    if !novarocks_local_program::is_aggregate_topn_key_type(&order_expr.value_type) {
         return None;
     }
     let direction = if topn.items[0].asc {
@@ -214,11 +214,7 @@ fn prove_topn_placement(
             || aggregate.is_merge.len() != aggregate.aggregates.len()
             || aggregate.is_merge.iter().any(|is_merge| *is_merge)
             || aggregate.aggregates.iter().any(|call| call.distinct)
-            || !matches!(scan.kind, PhysicalPlanKind::Scan(_))
-            || !scan.children.is_empty()
-            || !scan.output_columns.iter().all(|column| {
-                novarocks_local_program::is_ordered_filter_flat_payload_type(&column.value_type)
-            })
+            || !ordered_filter_scan_payload_supported(scan)
             || !matches!(group_input.value_type.data_type(), DataType::Utf8)
             || !novarocks_local_program::is_ordered_filter_flat_payload_type(
                 &group_input.value_type,
@@ -277,6 +273,9 @@ fn trace_exact_source_probes(
     if node.children.is_empty() {
         if !matches!(node.kind, PhysicalPlanKind::Scan(_)) {
             return None;
+        }
+        if !ordered_filter_scan_payload_supported(node) {
+            return Some(Vec::new());
         }
         return Some(vec![ProvenSourceProbe {
             node_path: node_path.clone(),
@@ -425,19 +424,12 @@ fn is_same_column(left: &OutputColumn, right: &OutputColumn) -> bool {
         && left.value_type.nullable() == right.value_type.nullable()
 }
 
-fn is_supported_topn_key_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Utf8
-            | DataType::Date32
-            | DataType::Timestamp(_, _)
-            | DataType::Decimal128(_, _)
-            | DataType::FixedSizeBinary(16)
-    )
+fn ordered_filter_scan_payload_supported(node: &PhysicalPlanNode) -> bool {
+    matches!(node.kind, PhysicalPlanKind::Scan(_))
+        && node.children.is_empty()
+        && node.output_columns.iter().all(|column| {
+            novarocks_local_program::is_ordered_filter_flat_payload_type(&column.value_type)
+        })
 }
 
 fn node_at_path<'a>(root: &'a PhysicalPlanNode, path: &[usize]) -> Option<&'a PhysicalPlanNode> {
@@ -757,13 +749,6 @@ mod tests {
                 SortDirection::Descending,
                 NullOrder::First,
             ),
-            (
-                DataType::FixedSizeBinary(16),
-                true,
-                false,
-                SortDirection::Ascending,
-                NullOrder::Last,
-            ),
         ];
 
         for (data_type, asc, nulls_first, direction, null_order) in cases {
@@ -777,6 +762,83 @@ mod tests {
             assert_eq!(intent.null_order, null_order);
             assert_eq!(source_probes(&plan).len(), 1);
         }
+    }
+
+    #[test]
+    fn ordered_placement_uses_the_installed_key_domain() {
+        for data_type in [
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::FixedSizeBinary(16),
+        ] {
+            let mut plan = eligible_topn_plan(data_type.clone(), true, true);
+            place_aggregate_topn_runtime_filters(&mut plan, &mut 0, 1024);
+            assert!(aggregate_topn_builds(&plan).is_empty(), "{data_type:?}");
+            assert!(source_probes(&plan).is_empty(), "{data_type:?}");
+        }
+    }
+
+    #[test]
+    fn global_ordered_placement_skips_nested_scan_payload() {
+        let mut plan = eligible_topn_plan(DataType::Int64, true, true);
+        let source = &mut aggregate_child_mut(&mut plan).children[0];
+        let payload = output(
+            3,
+            "payload",
+            DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                "item",
+                DataType::Int64,
+                true,
+            ))),
+            true,
+        );
+        let PhysicalPlanKind::Scan(scan) = &mut source.kind else {
+            unreachable!()
+        };
+        scan.columns.push(payload.clone());
+        scan.table.columns.push(ColumnDef {
+            name: payload.name.clone(),
+            data_type: payload.value_type.data_type().clone(),
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        });
+        source.output_columns.push(payload);
+        place_aggregate_topn_runtime_filters(&mut plan, &mut 0, 1024);
+        assert!(aggregate_topn_builds(&plan).is_empty());
+        assert!(source_probes(&plan).is_empty());
+    }
+
+    #[test]
+    fn global_ordered_placement_keeps_flat_union_consumer_when_another_is_nested() {
+        let mut plan = eligible_topn_plan(DataType::Int64, true, true);
+        let flat = leaf(1, "key", DataType::Int64, false);
+        let mut nested = leaf(1, "key", DataType::Int64, false);
+        let payload = output(
+            3,
+            "payload",
+            DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                "item",
+                DataType::Int64,
+                true,
+            ))),
+            true,
+        );
+        let PhysicalPlanKind::Scan(scan) = &mut nested.kind else {
+            unreachable!()
+        };
+        scan.columns.push(payload.clone());
+        scan.table.columns.push(ColumnDef {
+            name: payload.name.clone(),
+            data_type: payload.value_type.data_type().clone(),
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        });
+        nested.output_columns.push(payload);
+        aggregate_child_mut(&mut plan).children[0] = union_all_node(flat, project_node(nested));
+        place_aggregate_topn_runtime_filters(&mut plan, &mut 0, 1024);
+        assert_eq!(aggregate_topn_builds(&plan).len(), 1);
+        assert_eq!(source_probes(&plan).len(), 1);
     }
 
     #[test]

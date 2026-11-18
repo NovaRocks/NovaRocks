@@ -16,10 +16,9 @@
 // under the License.
 
 use novarocks_attempt_protocol::effect::{AttemptEffect, EffectBody};
+use novarocks_attempt_protocol::port_output::AttemptToLogicalBody;
 use novarocks_control_runtime::exit_work::HandoffCell;
-use novarocks_coordination_contract::{
-    AttemptActionId, AttemptAuthorization, AttemptToLogicalBody,
-};
+use novarocks_coordination_contract::AttemptActionId;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, OnceLock, Weak},
@@ -50,36 +49,16 @@ impl AttemptEffectEnvelope {
         self.handoff.as_ref()
     }
 
-    pub(crate) fn is_abort_settlement(&self) -> bool {
-        matches!(&self.protocol.body, EffectBody::Port(port)
-            if matches!(port.body, AttemptToLogicalBody::AbortSettlement { .. }))
-    }
-
-    pub(crate) fn is_qa_call(&self) -> bool {
-        match &self.protocol.body {
-            EffectBody::EstablishAuthorization { .. } => true,
-            EffectBody::Port(port) => matches!(
-                port.body,
-                AttemptToLogicalBody::EstablishSettlement { .. }
-                    | AttemptToLogicalBody::DetachEstablish { .. }
-                    | AttemptToLogicalBody::PreReadyReplacementQuery { .. }
-                    | AttemptToLogicalBody::AttemptTerminal(_)
-                    | AttemptToLogicalBody::ConvergenceProgress { .. }
-                    | AttemptToLogicalBody::AbortSettlement { .. }
-                    | AttemptToLogicalBody::AuthorizationRequest {
-                        request: AttemptAuthorization::BeginAdmission(_)
-                            | AttemptAuthorization::SettleAdmission { .. }
-                            | AttemptAuthorization::ReauthorizeEstablish { .. },
-                        ..
-                    }
-            ),
-            _ => false,
-        }
+    pub(crate) fn is_attempt_port(&self) -> bool {
+        matches!(
+            self.protocol.body,
+            EffectBody::Port(_) | EffectBody::EstablishAuthorization { .. }
+        )
     }
 
     pub(crate) fn uses_join_custody(&self) -> bool {
         self.handoff.is_some()
-            || self.is_qa_call()
+            || self.is_attempt_port()
             || self.is_process_call()
             || self.is_publication_call()
             || self.is_transport_release()
@@ -134,11 +113,20 @@ impl AttemptEffectEnvelope {
 
     pub(crate) fn is_root_control_reply(&self) -> bool {
         matches!(&self.protocol.body, EffectBody::Port(port)
-            if crate::task_execution::bridge::root_control::reply_kind(&port.body).is_some())
+            if matches!(port.body, AttemptToLogicalBody::SealResult { .. } | AttemptToLogicalBody::TerminalControlResult { .. }))
     }
 
     pub(crate) fn is_publication_call(&self) -> bool {
-        matches!(self.protocol.body, EffectBody::Publish(_)) || self.is_root_control_reply()
+        matches!(
+            self.protocol.body,
+            EffectBody::Publish(_)
+                | EffectBody::Port(novarocks_attempt_protocol::port_output::AttemptToLogical {
+                    body: novarocks_attempt_protocol::port_output::AttemptToLogicalBody::RootStatus(
+                        _
+                    ),
+                    ..
+                })
+        ) || self.is_root_control_reply()
     }
 
     pub(crate) fn retire_handoff(&self) {

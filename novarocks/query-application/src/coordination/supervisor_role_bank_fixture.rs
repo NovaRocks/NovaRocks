@@ -96,7 +96,12 @@ impl<F: Future> TestGovernance<F> {
             let revision = self.progress_revision();
             let progress = tokio::time::timeout_at(deadline, self.wait_progress(revision))
                 .await
-                .expect("original test authority did not actually drain");
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "original test authority did not actually drain: {error}; {:?}",
+                        self.observation().snapshot()
+                    )
+                });
             if matches!(
                 progress,
                 novarocks_workload_control::WorkloadProgress::Drained(_)
@@ -158,8 +163,11 @@ fn governance_with_result_positions(
     // This function pointer names the SAME actual opaque async factory. Quote
     // its real M too (a pointer here, not the production zero-sized item).
     let factory: TestRoleFactory<_> = make_logical_role;
+    let source_backing = LogicalExecutionSupervisor::logical_role_source_backing().unwrap();
     let roles = [
         PollRoleGeometry::for_factory_with_context::<_, _, _, Arc<OriginalLogicalExit>>(&factory)
+            .unwrap()
+            .with_source_backing(source_backing)
             .unwrap(),
     ];
     // The same original global scope inventory and actual role factory.
@@ -196,10 +204,11 @@ fn governance_with_result_positions(
     control.configure_result_capacity(result).unwrap();
     let (admission, driver) = control.configure_responsibility(config).unwrap();
     control.configure_control_storage(storage).unwrap();
-    let bank = RolePollBank::<_, _, _, Arc<OriginalLogicalExit>>::install_with_context(
+    let bank = RolePollBank::<_, _, _, Arc<OriginalLogicalExit>>::install_with_context_and_source_backing(
         &mut control,
         0,
         factory,
+        source_backing,
     )
     .unwrap();
     control.mark_ready().unwrap();
@@ -313,7 +322,11 @@ impl TestProgressOwner {
             failure: None,
             joined: false,
         };
-        owner.join = Some(Handle::current().spawn(async move {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This fixture retains the supervisor service JoinHandle and observes its actual shutdown or join failure."
+        )]
+        let join = Handle::current().spawn(async move {
             let interval = Duration::from_millis(1);
             let mut recheck = tokio::time::Instant::now() + interval;
             let mut timer = Box::pin(tokio::time::sleep_until(recheck));
@@ -343,7 +356,8 @@ impl TestProgressOwner {
                     }
                 }
             }
-        }));
+        });
+        owner.join = Some(join);
         owner
     }
     async fn finish(&mut self) {
@@ -386,7 +400,7 @@ where
 {
     let bank = { control.bank.lock().unwrap().take().unwrap() };
     let ingress = bank.ingress().unwrap();
-    let registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+    let registry = LogicalExecutionRuntimeRegistry::new();
     let (shutdown, receiver) = watch::channel(false);
     let driver = QueryExecutionDriverHandle {
         ingress,

@@ -5,6 +5,10 @@ domain: [distributed-query-lifecycle, frontend-architecture, memory-governance]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0237
+    scope: "The bridge between the asynchronous QA actor and the pure attempt core, including active-owner and drive interfaces. Pure attempt decisions, ordered observations, original transport custody and per-send-generation admission remain active."
+    link: "ADR-0237-pure-logical-execution-and-original-host-custody.md"
 partially-supersedes:
   - id: ADR-0198
     scope: "The choice to keep an asynchronous imperative shell as the Native FE attempt decision owner. The logical execution owner, business readiness, publication, recovery and actual convergence rules remain active."

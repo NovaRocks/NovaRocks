@@ -127,7 +127,7 @@ effect 后的验证伪装成同一次观察。
 两个表达式 crate 的生产依赖止于 Functions、中立契约和 Arrow。关系调用及 writer 物化输入
 使用原关系上下文，函数绑定由 wire 修订号 27 的 package 表共享。FE 的必需常量经同一纯编译
 入口接受零端口单根单元，并沿原语句工作范围调用 Execution 的求值器。见
-[ADR-0236](../../adr/ADR-0236-self-contained-expression-units-and-explicit-environments.md)。
+[ADR-0238](../../adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)。
 
 `novarocks/local-program/src/**` 定义纯 `LocalProgram`：节点、表达式、布局、sink
 和 binding requirements 都是静态事实，不持有 scan、writer、Connector 或异步运行能力。

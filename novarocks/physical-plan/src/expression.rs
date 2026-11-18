@@ -16,7 +16,7 @@
 // under the License.
 
 //! Relational bindings, ordering and window-frame specifications.
-// Design: ADR-0236-self-contained-expression-units-and-explicit-environments.md
+// Design: ADR-0238-self-contained-expression-units-and-explicit-environments.md
 use crate::ValueType;
 use novarocks_expression_contract::{
     BoundFunction, LegacyBindingMetadata, MissingLegacyBindingMetadata, RootOrdinal,

@@ -783,11 +783,9 @@ fn run_split(keys: &[Key], limit: u64, offset: u64) -> SplitRun {
         let root = program.graph().root();
         match program.graph().nodes()[root.index()].kind() {
             ProgramNodeKind::Sort {
-                use_top_n: true,
-                limit,
-                offset,
+                mode: novarocks_local_program::LocalSortMode::RowsTopN { limit, offset },
                 ..
-            } => (*limit, *offset),
+            } => (Some(*limit), *offset),
             other => panic!("the split root is a local TopN, got {other:?}"),
         }
     };

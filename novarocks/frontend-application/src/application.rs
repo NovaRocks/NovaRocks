@@ -111,13 +111,10 @@ const DEFAULT_LOGICAL_EXECUTION_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).un
 #[cfg(test)]
 const DEFAULT_REPLACEMENT_RESERVATION_VALID_FOR: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const DEFAULT_LOGICAL_EXECUTION_MAILBOX_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 #[cfg(test)]
 const DEFAULT_LOGICAL_EXECUTION_PARTICIPATION_ISSUE_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(16).unwrap();
 #[cfg(test)]
-const DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
-
 #[cfg(test)]
 fn test_native_trust() -> Arc<NativeTrust> {
     use novarocks_native_trust::{
@@ -344,7 +341,6 @@ struct FrontendQueryRuntimeConfig {
     task_update_retry_policy: TaskUpdateRetryPolicy,
     split_initial_wait_cap: Duration,
     coordination_budgets: CoordinationBudgets,
-    abort_capacity: NonZeroUsize,
 }
 
 impl FrontendExecutionRuntimeOwner {
@@ -708,8 +704,8 @@ impl FrontendExecutionRuntimeOwner {
             }
 
             // Control traversal can advance the revision even when the next
-            // wait is immediately ready. Yield so the SAME Host can poll its
-            // original failed-subscription recovery alongside this drain.
+            // wait is immediately ready. Yield before borrowing the SAME
+            // original workload progress waiter again.
             tokio::task::yield_now().await;
 
             let wait = self
@@ -927,14 +923,12 @@ pub struct FrontendLogicalExecutionRuntimeConfig {
     supervisor: LogicalExecutionSupervisorConfig,
     workload: WorkloadConfig,
     result_profile: FrontendResultCapacityProfile,
-    abort_effect_capacity: NonZeroUsize,
 }
 
 impl FrontendLogicalExecutionRuntimeConfig {
     pub fn new(
         supervisor: LogicalExecutionSupervisorConfig,
         workload: WorkloadConfig,
-        abort_effect_capacity: NonZeroUsize,
         result_profile: FrontendResultCapacityProfile,
         native_capacity_profile: crate::native_workload::FrontendWorkloadCapacityProfile,
     ) -> Self {
@@ -943,7 +937,6 @@ impl FrontendLogicalExecutionRuntimeConfig {
             supervisor,
             workload,
             result_profile,
-            abort_effect_capacity,
         }
     }
 
@@ -958,7 +951,6 @@ impl FrontendLogicalExecutionRuntimeConfig {
     fn for_test() -> Self {
         Self::new(
             LogicalExecutionSupervisorConfig::new(
-                DEFAULT_LOGICAL_EXECUTION_MAILBOX_CAPACITY,
                 DEFAULT_LOGICAL_EXECUTION_PARTICIPATION_ISSUE_CAPACITY,
                 DEFAULT_LOGICAL_EXECUTION_PARTICIPATION_ISSUE_CAPACITY,
                 LogicalExecutionRowsConfig::new(
@@ -968,7 +960,6 @@ impl FrontendLogicalExecutionRuntimeConfig {
                 ),
             ),
             crate::native_workload::original_owner_test_workload(),
-            DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY,
             FrontendResultCapacityProfile::try_new(
                 novarocks_workload_control::ResultCapacityConfig::V1,
             )
@@ -1028,7 +1019,6 @@ pub struct FrontendExecutionConfig {
     logical_execution_supervisor: LogicalExecutionSupervisorConfig,
     workload: WorkloadConfig,
     result_profile: FrontendResultCapacityProfile,
-    logical_abort_effect_capacity: NonZeroUsize,
     /// Connector split enumeration's bounded, server-owned initial feedback
     /// wait. This is frozen at startup and deliberately has no SQL override.
     connector_split_initial_dynamic_filter_wait_cap: Duration,
@@ -1099,7 +1089,6 @@ impl FrontendExecutionConfig {
             logical_execution_supervisor: logical_runtime.supervisor,
             workload: logical_runtime.workload,
             result_profile: logical_runtime.result_profile,
-            logical_abort_effect_capacity: logical_runtime.abort_effect_capacity,
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             lake_publication_runtime_policy: LakePublicationRuntimePolicy::try_new(
@@ -1551,7 +1540,6 @@ impl FrontendApplicationHost {
                 task_update_retry_policy: execution.task_update_retry_policy,
                 split_initial_wait_cap: execution.connector_split_initial_dynamic_filter_wait_cap,
                 coordination_budgets: execution.coordination_budgets,
-                abort_capacity: execution.logical_abort_effect_capacity,
             },
             execution_runtime_owner,
             execution_role,
@@ -2303,7 +2291,6 @@ impl FrontendApplicationHost {
             config.task_update_retry_policy,
             config.split_initial_wait_cap,
             config.coordination_budgets,
-            config.abort_capacity,
             self.execution_runtime_owner.lifecycle_diagnostics(),
             Arc::clone(&self.execution_runtime_owner.clock),
         );
@@ -2618,23 +2605,7 @@ impl FrontendApplicationHost {
         }
         trace_shutdown_stage("workload_join_started");
         let shutdown = self.execution_runtime_owner.drain_workload_until(deadline);
-        #[cfg(not(test))]
         let execution_result = shutdown.await;
-        #[cfg(test)]
-        let execution_result = if self.data_runtime.has_original_subscription_owner() {
-            // Legacy fixtures explicitly install the original reaper. Recover
-            // that same failed owner so its children cannot strand WC drain.
-            tokio::pin!(shutdown);
-            tokio::select! {
-                result = &mut shutdown => result,
-                recovery = self.data_runtime.recover_failed_subscription_reaper_until(deadline) => {
-                    if let Err(error) = recovery { primary_error = Some(error); }
-                    shutdown.await
-                }
-            }
-        } else {
-            shutdown.await
-        };
         trace_shutdown_stage("workload_join_returned");
         if let Err(error) = execution_result {
             if !self.execution_runtime_owner.is_shutdown_complete() {
@@ -2732,28 +2703,6 @@ impl FrontendApplicationHost {
             }
         }
         trace_shutdown_stage("native_apply_join_returned");
-        #[cfg(test)]
-        if self.data_runtime.has_original_subscription_owner() {
-            trace_shutdown_stage("native_subscriptions_join_started");
-            if let Err(error) = self
-                .data_runtime
-                .drain_original_subscriptions_until(deadline)
-                .await
-            {
-                if !self.data_runtime.original_subscriptions_joined() {
-                    return Err(match primary_error {
-                        Some(primary) => format!("{primary}; cleanup failed: {error}"),
-                        None => error,
-                    });
-                }
-                if let Some(primary) = primary_error.as_mut() {
-                    primary.push_str(&format!("; cleanup failed: {error}"));
-                } else {
-                    primary_error = Some(error);
-                }
-            }
-            trace_shutdown_stage("native_subscriptions_join_returned");
-        }
         // Role-owned callers have reached the Native tail. Close future calls,
         // retire cache aliases and wait for the original public IO/body exits
         // before StateStore, using the same absolute Host deadline.
@@ -2966,7 +2915,6 @@ mod tests {
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
-                NonZeroUsize::new(1).unwrap(),
                 LogicalExecutionRowsConfig::new(
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroU32::new(1).unwrap(),
@@ -3015,7 +2963,6 @@ mod tests {
             ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current()),
             novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
-                NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
                 LogicalExecutionRowsConfig::new(
@@ -3077,7 +3024,6 @@ mod tests {
             ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current()),
             novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
-                NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
                 LogicalExecutionRowsConfig::new(

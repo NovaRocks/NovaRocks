@@ -1,6 +1,8 @@
 #[path = "mv_control_plan.rs"]
 pub(super) mod control_plan;
 
+use novarocks_query_application::api::ExecutionFailurePresentation;
+
 use super::mv_uea7::{
     ManagedMvRestFixture, property, require_status_phase, status, wait_for_status_phase,
 };

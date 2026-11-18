@@ -16,7 +16,6 @@
 // under the License.
 
 use super::*;
-use crate::native::task_result_transport::{DynamicFilterRead, DynamicFilterReadError};
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, ActorStep},
     actor_turn::{ActorRegistration, ActorRuntime},
@@ -37,8 +36,8 @@ use novarocks_control_runtime_core::{
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_execution_contract::{
-    DomainVersion, OperatorCounter, OperatorStatistics, SafeDetail, TaskOutputFacts, TaskState,
-    TaskStatus, TaskStatusVersion,
+    OperatorCounter, OperatorStatistics, SafeDetail, TaskOutputFacts, TaskState, TaskStatus,
+    TaskStatusVersion,
 };
 use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId};
 use std::{
@@ -60,13 +59,6 @@ impl TaskResultTransport for OriginalTransport {
             assert_eq!(requested, expected);
             Ok(FinalTaskInfoRead::Available(original))
         })
-    }
-    fn dynamic_filters(
-        &self,
-        _: TaskIdentity,
-        _: Option<DomainVersion>,
-    ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
-        unreachable!("final-info tests never read filters")
     }
 }
 struct ReadRetention(Arc<AtomicUsize>);
@@ -465,13 +457,6 @@ async fn paid_diagnostic_source_reports_actual_exit_before_its_original_result()
                 Ok(FinalTaskInfoRead::Available(original.await.unwrap()))
             })
         }
-        fn dynamic_filters(
-            &self,
-            _: TaskIdentity,
-            _: Option<DomainVersion>,
-        ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
-            unreachable!("only the original diagnostic read")
-        }
     }
 
     let ledger = RuntimeLedger::new(ResourceVector::default());
@@ -616,13 +601,57 @@ async fn paid_diagnostic_source_reports_actual_exit_before_its_original_result()
 }
 
 #[cfg(novarocks_dev_controls)]
+async fn drive_original_diagnostic_fixture<F: std::future::Future>(
+    fixture: &mut crate::fixtures::FrontendFixture,
+    joint: &mut novarocks_workload_control::joint_admission::JointProgressDriver,
+    clock: &crate::task_execution::clock::ManualClock,
+    advance: bool,
+    original: F,
+) -> F::Output {
+    use novarocks_coordination_contract::MonotonicClock;
+    let mut original = Box::pin(original);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        crate::query_execution::native_execution_adapter::source_cohort::tests::drive(joint);
+        if let std::task::Poll::Ready(value) = futures::poll!(original.as_mut()) {
+            return value;
+        }
+        let progress = fixture
+            .progress(
+                crate::fixtures::ProgressSelection::All,
+                crate::fixtures::ProgressBudget::default(),
+            )
+            .await;
+        if advance
+            && progress.actors == 0
+            && progress.hosts == 0
+            && let Some(next) = fixture.runtime().next_deadline()
+            && std::time::Duration::from_nanos(next.0) > clock.now().since_origin()
+        {
+            clock.advance(std::time::Duration::from_nanos(
+                next.0 - u64::try_from(clock.now().since_origin().as_nanos()).unwrap(),
+            ));
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the original diagnostic fixture did not finish"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(novarocks_dev_controls)]
 #[tokio::test(flavor = "current_thread")]
 async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is_held() {
+    use crate::fixtures::native_recipe::{
+        OriginalRecipeContext, OriginalRecipeOperands, PreparedOriginalRecipeProcess, RecipeRoot,
+        count_description, install_original_recipe, prepare_original_recipe_process_with_budgets,
+    };
+    use crate::native::{data_runtime::FrontendDataRuntime, task_transport::tests::Loopback};
+    use crate::query_execution::internal_consumer::profile::profile_computation_consumer;
     use crate::{
         control_runtime::transport_withdrawal::AttemptEffectEnvelope,
-        query_execution::internal_consumer::test_fixture::internal_count_description,
         task_execution::{
-            bridge::root_control::PendingRootControls,
             host::{
                 adapter::tests::start,
                 custody::{TransportRetirements, tests::WithdrawalInbox},
@@ -632,19 +661,13 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
                 pumps::AttemptPumpSource,
                 transport::handoff_actor_transport,
             },
-            intent::{AckPayload, OperationIntent},
             profile_diagnostics::{
                 ProfileDiagnosticClosure, ProfileDiagnosticMissing, ProfileTaskDiagnostic,
-                TaskFinalInfoCollector,
             },
             protocol_facts::AttemptProtocolFactsPublisher,
-            status_intake::CountingWake,
-            tests::{
-                manifest_normal_release_ack_with_actor_facts_fixture,
-                settle_original_actor_establish_facts,
-            },
         },
     };
+    use novarocks_attempt_protocol::port_output::AttemptToLogicalBody;
     use novarocks_attempt_protocol::{
         AttemptCore, Core, InputSelection,
         capacity::{QueueStage, StepContext},
@@ -662,21 +685,14 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
     };
     use novarocks_coordination_contract::{
         AttemptActionId, AttemptComputationCut, AttemptConvergenceMode, AttemptInheritedAdmission,
-        AttemptToLogicalBody, ExecutionEffect, LogicalToAttempt, LogicalToAttemptBody,
-        MonotonicClock,
+        LogicalToAttempt, LogicalToAttemptBody, MonotonicClock,
     };
-    use novarocks_execution_contract::{AdmissionEpochCapability, root_result::RootResultEnd};
-    use novarocks_query_application::{
-        api::ComputationObservationBudgets, coordination::LogicalExecutionActorConfig,
-        test_support::LogicalExecutionTestHarness,
-    };
+    use novarocks_execution_contract::AdmissionEpochCapability;
+    use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
     use novarocks_workload_control::{
-        ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
     };
-    use std::{
-        num::NonZeroUsize,
-        time::{Duration, Instant},
-    };
+    use std::time::{Duration, Instant};
     use tokio::sync::{Notify, oneshot};
 
     struct Units(usize);
@@ -725,124 +741,142 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
                 Ok(FinalTaskInfoRead::Available(receive.await.unwrap()))
             })
         }
-
-        fn dynamic_filters(
-            &self,
-            _: TaskIdentity,
-            _: Option<DomainVersion>,
-        ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
-            unreachable!("this fixture reads only the original final-info RPC")
-        }
     }
 
-    let (round, _, _, clock, establish) = manifest_normal_release_ack_with_actor_facts_fixture();
-    let graph = round.execution().graph();
-    let root = graph.root_identity();
-    let participants = graph.participations().copied().collect::<Vec<_>>();
+    let (send, receive) = oneshot::channel();
+    let polled = Arc::new(Notify::new());
+    let exited = Arc::new(AtomicUsize::new(0));
+    let transport = Arc::new(HeldRead {
+        receive: Mutex::new(Some(receive)),
+        polled: polled.clone(),
+        exited: exited.clone(),
+    });
+    let diagnostic_budget = Duration::from_millis(10);
+    let remote_budget = Duration::from_secs(60);
+    let mut data = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+    let mut peer = Loopback::start().await;
+    let descriptor = peer.bounded_root_descriptor(BackendProcessId::new_v7());
+    let compatibility = descriptor.native_compatibility_id();
+    let history = novarocks_control_runtime::history::HistoryCapture::new(32_768);
+    let PreparedOriginalRecipeProcess {
+        mut fixture,
+        process,
+        clock,
+        mut joint,
+        workload,
+        mut supervisor,
+        client,
+        capacity,
+        handle,
+        descriptor,
+    } = prepare_original_recipe_process_with_budgets(
+        &data,
+        descriptor,
+        history,
+        ResultCapacityConfig::V1,
+        None,
+        diagnostic_budget,
+        remote_budget,
+    );
+    let original_root = workload
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let original_scope = original_root.owner.scope();
+    let original_business = original_root.business;
+    let window = capacity
+        .try_acquire(&original_scope, ResultWindowClass::Internal)
+        .unwrap();
+    let (description, plan) = count_description();
+    let (consumer, offers, output) = profile_computation_consumer(&description, plan).unwrap();
+    let (mut logical, cohort, mut output) = install_original_recipe(
+        OriginalRecipeContext {
+            fixture: &mut fixture,
+            joint: &mut joint,
+            process: &process,
+            data: &data,
+            clock: &clock,
+            handle,
+            descriptor,
+            client,
+        },
+        OriginalRecipeOperands {
+            owner: original_root.owner,
+            binding: QueryResultCapacityBinding::try_new(&original_scope, window.retain_alias())
+                .unwrap(),
+            description,
+            plan,
+            root: RecipeRoot::EmptyCountOnly.with_three_task_protocol_chain(plan, [2, 3]),
+            consumer,
+            offers,
+            output,
+        },
+    );
+    logical
+        .probe
+        .graph_capture_requested
+        .store(true, Ordering::Release);
+    logical
+        .probe
+        .profile_capture_requested
+        .store(true, Ordering::Release);
+    *logical.probe.profile_transport.lock().unwrap() = Some(transport.clone());
+    let installed = fixture.activate_attempt(&logical, &mut joint, false).await;
+    let graph = logical
+        .probe
+        .graph_capture
+        .lock()
+        .unwrap()
+        .take()
+        .expect("same actual frozen graph");
+    assert_eq!(graph.plan, plan);
+    assert_eq!(
+        (graph.tasks.len(), graph.stages.len(), graph.edges.len()),
+        (3, 3, 2)
+    );
+    assert_eq!(graph.fragments, vec![1, 2, 3]);
+    let root = graph.root;
+    let participants = graph.participations.clone();
     assert_eq!(participants.len(), 1);
     let participation = participants[0];
     let expected_fragments = graph
-        .tasks()
+        .tasks
+        .iter()
         .map(|task| (task.identity(), task.fragment_id()))
         .collect::<Vec<_>>();
-    let statuses = graph
-        .tasks()
-        .map(|task| {
-            round
-                .execution()
-                .task(task.task_id())
-                .unwrap()
-                .status()
-                .unwrap()
-                .clone()
-        })
-        .collect::<Vec<_>>();
-    assert!(statuses.iter().all(TaskStatus::is_terminal));
-    let root_status = statuses
-        .iter()
-        .find(|status| status.identity() == root)
-        .unwrap();
-    let inherited = establish
-        .iter()
-        .filter_map(|(intent, ack)| {
-            let (
-                OperationIntent::AcquireParticipationAdmissionTicket(request),
-                AckPayload::AdmissionTicket(receipt),
-            ) = (intent, ack.payload())
-            else {
-                return None;
-            };
-            Some(AttemptInheritedAdmission {
-                participation: request.participation(),
-                receipt: *receipt,
-            })
-        })
-        .collect::<Box<[_]>>();
-    assert_eq!(inherited.len(), 1);
-
-    let workload = WorkloadControl::try_new(
-        WorkloadConfig::default(),
-        ResourceConfig {
-            total_bytes: 1 << 20,
-            control_bytes: 1 << 10,
-            per_scope_bytes: 1 << 18,
-        },
+    let mut profile = logical
+        .probe
+        .profile_capture
+        .lock()
+        .unwrap()
+        .take()
+        .expect("same graph-bound component collector");
+    peer.enable_single_root_lifecycle(root, novarocks_result_contract::RootOutputKind::CountOnly);
+    peer.enable_three_task_roster(
+        graph
+            .tasks
+            .iter()
+            .map(|task| task.identity())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap(),
     )
     .unwrap();
-    workload.mark_ready().unwrap();
-    let governed = workload
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    let stage = governed
-        .owner
-        .scope()
-        .try_acquire(Stage::Execution)
-        .unwrap();
-    let (abort, _intake) = crate::task_execution::abort_effect::NativeAbortEffectAdapter::bounded(
-        NonZeroUsize::new(2).unwrap(),
-        Arc::new(CountingWake::default()),
-    );
-    let config = LogicalExecutionActorConfig::single_attempt_completion(
-        root.query_execution_id(),
-        ExecutionEffect::None,
-        NonZeroUsize::new(8).unwrap(),
-        participants.clone(),
-        NonZeroUsize::new(2).unwrap(),
-        NonZeroUsize::new(2).unwrap(),
-        governed.owner,
-        stage,
+    logical.probe.release_activation();
+    let mut receiving = drive_original_diagnostic_fixture(
+        &mut fixture,
+        &mut joint,
+        clock.as_ref(),
+        false,
+        logical.ready.take().unwrap(),
     )
-    .unwrap()
-    .with_abort_participation_effect_port(abort, NonZeroUsize::new(2).unwrap());
-    let (description, plan) = internal_count_description();
-    let diagnostic_budget = Duration::from_millis(10);
-    let remote_budget = Duration::from_secs(60);
-    let mut logical = LogicalExecutionTestHarness::install_internal(
-        tokio::runtime::Handle::current(),
-        config,
-        &description,
-        NonZeroUsize::MIN,
-        clock.clone() as Arc<dyn MonotonicClock>,
-        ComputationObservationBudgets::new(diagnostic_budget, remote_budget),
-        root.query_execution_id(),
-        participants,
-    )
+    .await
     .unwrap();
-    let activation = logical.activate_initial().await.unwrap();
-    settle_original_actor_establish_facts(&logical, establish).await;
+    let ready = *receiving
+        .ready_token()
+        .expect("the actual consumer/LP Ready");
+    let received = output.take_ready(ready).unwrap();
+    let activation = ready.activation();
     let original_cut = clock.now();
-    let ready = logical
-        .accept_internal_end(
-            root,
-            root_status.clone(),
-            RootResultEnd {
-                sequence: NonZeroU64::MIN,
-                output_rows: 0,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(ready.activation(), activation);
     assert_eq!(ready.root(), root);
     assert_eq!(ready.cut(), original_cut);
     assert_eq!(
@@ -853,17 +887,48 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
         ready.convergence_deadline(),
         original_cut.saturating_add(remote_budget)
     );
-
+    // These are passive operands of the independent AP decision component,
+    // not additional Worker observations or another live Native attempt.
+    let statuses = graph
+        .tasks
+        .iter()
+        .map(|task| {
+            TaskStatus::try_new(
+                task.identity(),
+                TaskStatusVersion::new(3).unwrap(),
+                TaskState::Finished,
+                None,
+                TaskOutputFacts::new(true),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let inherited = Box::new([AttemptInheritedAdmission {
+        participation,
+        receipt: novarocks_execution_contract::ParticipationAdmissionTicketReceipt::new(
+            novarocks_execution_contract::AdmissionTicketId::try_from_bytes([0x71; 16]).unwrap(),
+            participation,
+            novarocks_execution_contract::LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
+        ),
+    }]);
     let mut start = start();
     start.initial_now = original_cut;
     start.activation.identity = activation;
     start.activation.inherited_admissions = inherited;
     start.activation.policy.retain_diagnostics = true;
-    start.plan.authorization_limits = logical.native_attempt_drive().authorization_limits();
+    let binding = logical.binding.bound().unwrap();
+    start.plan.authorization_limits = novarocks_coordination_contract::AttemptAuthorizationLimits {
+        activation,
+        establish_per_participation: binding.start.budgets.establish_per_participation,
+        abort_per_participation: binding.start.budgets.abort_per_participation,
+    };
+    start.plan.compatibility = compatibility;
+    drop(binding);
     start.plan.graph = FrozenTaskGraph {
         root,
         tasks: graph
-            .tasks()
+            .tasks
+            .iter()
             .enumerate()
             .map(|(index, task)| {
                 (
@@ -884,20 +949,29 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
             })
             .collect(),
         stages: graph
-            .stages()
+            .stages
+            .iter()
             .map(|stage| {
                 (
                     stage.stage_id(),
                     stage
                         .tasks()
                         .iter()
-                        .map(|&id| graph.task(id).unwrap().identity())
+                        .map(|&id| {
+                            graph
+                                .tasks
+                                .iter()
+                                .find(|task| task.task_id() == id)
+                                .unwrap()
+                                .identity()
+                        })
                         .collect(),
                 )
             })
             .collect(),
         edges: graph
-            .edges()
+            .edges
+            .iter()
             .map(|edge| {
                 (
                     edge.edge_id(),
@@ -930,42 +1004,45 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
     )]
     .into();
 
-    let (send, receive) = oneshot::channel();
-    let polled = Arc::new(Notify::new());
-    let exited = Arc::new(AtomicUsize::new(0));
-    let transport = Arc::new(HeldRead {
-        receive: Mutex::new(Some(receive)),
-        polled: polled.clone(),
-        exited: exited.clone(),
-    });
-    let records = DiagnosticRecords::new(transport.clone());
-    let mut profile = TaskFinalInfoCollector::from_graph(
-        transport,
-        true,
-        graph,
-        Arc::new(CountingWake::default()),
-    );
+    let records = DiagnosticRecords::new(transport);
     let observer = profile.enable_profile_observation().unwrap();
-    let (protocol, _protocol_facts) = AttemptProtocolFactsPublisher::for_graph(
+    let (protocol, _protocol_facts) = AttemptProtocolFactsPublisher::for_diagnostic_metadata(
         plan,
-        graph,
-        &start.plan.writers,
-        &start.plan.summary_sources,
+        root,
+        &graph
+            .tasks
+            .iter()
+            .map(|task| task.identity())
+            .collect::<Vec<_>>(),
     )
     .unwrap();
-    let (root_sender, _root_statuses, _root_requests) = PendingRootControls::project(root);
     let publication = AttemptPublicationOwner::new(
-        PublicationRecord::new(
-            activation,
-            root_sender,
-            protocol,
-            Some(profile),
-            Some(records.clone()),
-        ),
+        PublicationRecord::new(activation, protocol, Some(profile), Some(records.clone())),
         Some(AttemptDiagnosticSources::new(&start, None)),
-        None,
     );
-    publication.register_computation_cut(ready).await.unwrap();
+    // Bind only passive metadata here; the real Source/HostExit composition is
+    // tested separately. Deliberately never poll Native RecordReady before the
+    // Core's actual profile publication below.
+    use crate::query_execution::logical_binding::{
+        OriginalAttemptObservation, OriginalComputationCutPublisher,
+    };
+    let observation = OriginalAttemptObservation::new(activation, true, false);
+    publication.bind_observation(&observation);
+    let unregistered = OriginalAttemptObservation::new(activation, true, false);
+    unregistered.bind_publisher(&publication);
+    assert!(
+        publication
+            .register_ready_with(ready, &mut || Err(
+                crate::task_execution::host::port::control::PortControlError::Closed
+            ))
+            .is_err()
+    );
+    assert_eq!(observation.original_registered_cut(), None);
+    publication
+        .register_ready_with(ready, &mut || Ok(()))
+        .unwrap();
+    observation.notify_cut_registered();
+    assert_eq!(observation.original_registered_cut(), Some(ready));
 
     let sources = start.sources;
     let mut core = <Core as AttemptCore>::new(start).unwrap();
@@ -1044,6 +1121,39 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
                     observed = step(&mut core, clock.now(), sources.publication, input);
                     continue;
                 }
+                EffectBody::Port(original) => {
+                    assert_eq!(original.activation, activation);
+                    assert_eq!(original.action, effect.id);
+                    let AttemptToLogicalBody::RootStatus(projected) = original.body else {
+                        panic!(
+                            "the independent AP startup only publishes its original root status"
+                        );
+                    };
+                    assert_eq!(
+                        &projected.status,
+                        statuses
+                            .iter()
+                            .find(|status| status.identity() == root)
+                            .unwrap()
+                    );
+                    assert_eq!(
+                        projected.failure,
+                        novarocks_coordination_contract::AttemptRootFailure::None
+                    );
+                    // This independent AP component consumes the passive receipt
+                    // for its exact output. The live Source above already supplied
+                    // genuine Ready; this is no second LP handoff or Ready proof.
+                    observed = step(
+                        &mut core,
+                        clock.now(),
+                        sources.publication,
+                        AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                            effect: effect.id,
+                            result: Ok(PublicationApplied::RootStatus),
+                        }),
+                    );
+                    continue;
+                }
                 EffectBody::ReleaseCreationPayload { .. } | EffectBody::AdjustReadWindow(_) => {}
                 other => panic!("unexpected startup effect {other:?}"),
             }
@@ -1103,7 +1213,7 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
         },
         ..read
     });
-    let process = step(&mut core, clock.now(), sources.actor, AttemptInput::Timer);
+    let process_step = step(&mut core, clock.now(), sources.actor, AttemptInput::Timer);
     let Some(AttemptEffect {
         body:
             EffectBody::ObserveProcess {
@@ -1111,12 +1221,15 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
                 participation: process_participation,
             },
         ..
-    }) = process.effect
+    }) = process_step.effect
     else {
         panic!("the original admission ticket prevents unproven remote closure");
     };
     assert_eq!(process_participation, participation);
-    assert_eq!(process.selection, InputSelection::Only(sources.process));
+    assert_eq!(
+        process_step.selection,
+        InputSelection::Only(sources.process)
+    );
     assert_eq!(core.next_deadline(), Some(ready.diagnostic_deadline()));
 
     let ledger = RuntimeLedger::new(ResourceVector::default());
@@ -1217,6 +1330,25 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
     assert!(matches!(&published,
         AttemptInput::Executor(ExecutorFact::PublicationApplied { effect, result: Ok(PublicationApplied::Diagnostics) })
             if *effect == publication_effect));
+    let original_publisher = Arc::downgrade(&publication);
+    drop(publication);
+    assert!(original_publisher.upgrade().is_none());
+    // First-poll the late Native confirmation only after actual profile
+    // publication and the original rich publisher's destruction.
+    observation.register_cut(ready).unwrap();
+    assert!(unregistered.register_cut(ready).is_err());
+    let foreign = novarocks_query_application::api::ComputationReadyToken::from_runtime_cut(
+        AttemptComputationCut {
+            activation: ready.activation(),
+            root: ready.root(),
+            cut: ready.cut().saturating_add(Duration::from_nanos(1)),
+            diagnostic_deadline: ready.diagnostic_deadline(),
+            convergence_deadline: ready.convergence_deadline(),
+            end: ready.end(),
+        },
+    );
+    assert!(observation.register_cut(foreign).is_err());
+    assert_eq!(observation.original_registered_cut(), Some(ready));
     let after_publication = step(&mut core, clock.now(), sources.publication, published);
     assert_eq!(
         after_publication.selection,
@@ -1381,13 +1513,59 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
     ledger.remove_scope(scope.id()).unwrap();
     assert!(ledger.is_empty());
 
-    logical.abandon_running_attempt();
-    logical
-        .observe_worker_stopped_and_participation_fenced(participation)
+    drop((
+        snapshot,
+        observer,
+        unregistered,
+        observation,
+        records,
+        pump,
+        retirement,
+    ));
+    let mut exit = receiving
+        .take_exit_observer()
+        .or_else(|| logical.exit.take())
+        .expect("same original logical exit observer");
+    drop((received, receiving));
+    let receipt = drive_original_diagnostic_fixture(
+        &mut fixture,
+        &mut joint,
+        clock.as_ref(),
+        true,
+        std::future::poll_fn(|cx| exit.poll_exit(cx)),
+    )
+    .await
+    .unwrap();
+    assert!(*installed.fixture_exit.observe_actual_exit().borrow());
+    assert_eq!(peer.single_root_result_progress(), (true, 1));
+    drop((
+        receipt, exit, installed, logical, output, cohort, window, capacity,
+    ));
+    drive_original_diagnostic_fixture(
+        &mut fixture,
+        &mut joint,
+        clock.as_ref(),
+        true,
+        supervisor.shutdown_until(Instant::now() + Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    drop(supervisor);
+    process.close_original_host_registration_for_fixture();
+    fixture.finish().await;
+    drop(fixture);
+    original_business.release();
+    crate::query_execution::native_execution_adapter::source_cohort::tests::drive(&mut joint);
+    tokio::time::timeout(Duration::from_secs(5), original_scope.wait_released())
         .await
         .unwrap();
-    logical
-        .finish_until(Instant::now() + Duration::from_secs(5))
-        .await
-        .unwrap();
+    drop(original_scope);
+    workload.close_admission();
+    crate::query_execution::native_execution_adapter::source_cohort::tests::drive(&mut joint);
+    assert!(workload.shutdown().is_ok());
+    let until = Instant::now() + Duration::from_secs(5);
+    data.drain_original_apply_until(until).await.unwrap();
+    data.drain_native_outgoing_until(until).await.unwrap();
+    assert!(peer.settle().await);
+    assert!(process.original_registries_empty_for_fixture());
 }

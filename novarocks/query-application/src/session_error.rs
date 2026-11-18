@@ -17,6 +17,8 @@
 
 //! Query-session errors before a protocol adapter maps them to wire codes.
 
+use crate::execution_error::ExecutionFailurePresentation;
+
 use std::{borrow::Cow, fmt, sync::Arc};
 
 use crate::api::StatementExternalEffectDisposition;

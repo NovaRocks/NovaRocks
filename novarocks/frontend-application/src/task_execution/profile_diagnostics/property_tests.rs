@@ -15,23 +15,41 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Original final-info Future custody and accepted terminal-frontier regressions.
+//! Actual final-info Source/job custody; eligibility stays in the AP Core.
 
-use futures::future::BoxFuture;
-use std::collections::{BTreeSet, VecDeque};
-use std::future::poll_fn;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
-
-use super::TaskFinalInfoCollector;
-use crate::native::task_result_transport::{
-    DynamicFilterRead, DynamicFilterReadError, FinalTaskInfoRead, TaskResultTransport,
+use crate::{
+    control_runtime::transport_withdrawal::AttemptEffectEnvelope,
+    native::task_result_transport::{FinalTaskInfoRead, TaskResultTransport},
+    task_execution::host::{
+        custody::{TransportRetirements, tests::WithdrawalInbox},
+        pumps::{AttemptPumpSource, DiagnosticRecords},
+        transport::handoff_actor_transport,
+    },
 };
-use crate::task_execution::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
-use crate::task_execution::status_intake::TestIntakeWake;
-use novarocks_execution_contract::{
-    DomainVersion, OperationKind, OperationOutcome, ParticipationReceipt, ParticipationState,
-    ReleaseOutcome, TaskIdentity,
+use futures::future::BoxFuture;
+use novarocks_attempt_protocol::{
+    effect::{AttemptEffect, EffectBody, EffectClass},
+    input::{DiagnosticRead, ExecutorFact, FinalTaskInfoRef},
+};
+use novarocks_control_runtime::{
+    obligation::{ReservationObligation, WorkObligation},
+    transaction::{RuntimeLedger, ScopeHandle},
+};
+use novarocks_control_runtime_core::{
+    capacity::{ReservationResources, ResourceVector},
+    identity::{ConsumerId, Generation},
+    scope::{WorkAdmission, WorkKind},
+};
+use novarocks_coordination_contract::{AttemptActionId, AttemptRequestToken, MonotonicInstant};
+use novarocks_execution_contract::{OperationOutcome, TaskIdentity};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    future::poll_fn,
+    mem::ManuallyDrop,
+    num::NonZeroU64,
+    sync::{Arc, Mutex},
+    task::Poll,
+    time::Duration,
 };
 
 #[derive(Default)]
@@ -83,85 +101,261 @@ impl TaskResultTransport for GatedFinalInfo {
             Ok(FinalTaskInfoRead::Unavailable(OperationOutcome::Gone))
         })
     }
-    fn dynamic_filters(
-        &self,
-        _: TaskIdentity,
-        _: Option<DomainVersion>,
-    ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
-        panic!("a final-info collector must not fetch dynamic filters")
+}
+
+fn tasks() -> Vec<TaskIdentity> {
+    // Same real frozen graph identities; no TaskRound or observer owns them.
+    let graph = crate::task_execution::graph_manifest_tests::unstarted_chain_graph();
+    let tasks = graph
+        .tasks()
+        .map(|task| task.identity())
+        .collect::<Vec<_>>();
+    assert!(
+        tasks.len() > 1,
+        "the real graph leaves an unread original sibling"
+    );
+    tasks
+}
+fn request(index: usize) -> AttemptRequestToken {
+    AttemptRequestToken::new(NonZeroU64::new(index as u64 + 1).unwrap())
+}
+fn effect(index: usize, task: TaskIdentity) -> Arc<AttemptEffectEnvelope> {
+    AttemptEffectEnvelope::new(AttemptEffect {
+        id: AttemptActionId::new(NonZeroU64::new(index as u64 + 1).unwrap()),
+        class: EffectClass::Settlement,
+        body: EffectBody::CollectDiagnostics {
+            request: request(index),
+            task,
+            deadline: MonotonicInstant::from_origin(Duration::from_secs(1)),
+        },
+    })
+}
+struct SourceFixture {
+    ledger: RuntimeLedger,
+    scope: ScopeHandle,
+    parent: WorkObligation,
+    payer: ReservationObligation,
+    inbox: WithdrawalInbox,
+    source: AttemptPumpSource,
+    retirement: TransportRetirements,
+    records: Arc<DiagnosticRecords>,
+    closing: bool,
+    replies: Vec<ExecutorFact>,
+    actual_notified_visits: usize,
+}
+impl SourceFixture {
+    fn new(transport: Arc<dyn TaskResultTransport>) -> Self {
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let generation = Generation::new(1).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (mut parent, payer) = scope
+            .reserve_next(
+                generation,
+                ReservationResources::work_only(),
+                WorkKind::Cleanup,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Cleanup)
+            .unwrap();
+        parent.start().unwrap();
+        let inbox = WithdrawalInbox::with_commands(&scope, [], [16; 4]);
+        let records = DiagnosticRecords::new(transport);
+        let source = AttemptPumpSource::bind(
+            inbox.runtime(),
+            inbox.registration(),
+            inbox.source(),
+            &parent,
+            &payer,
+            ConsumerId::new(1).unwrap(),
+            None,
+            Some(records.clone()),
+            None,
+        )
+        .unwrap();
+        let retirement = TransportRetirements::new(
+            inbox.runtime().clone(),
+            inbox.registration().clone(),
+            tokio::runtime::Handle::current(),
+            source.capacity(),
+        );
+        Self {
+            ledger,
+            scope,
+            parent,
+            payer,
+            inbox,
+            source,
+            retirement,
+            records,
+            closing: false,
+            replies: Vec::new(),
+            actual_notified_visits: 0,
+        }
+    }
+    fn issue(&mut self, original: Arc<AttemptEffectEnvelope>) {
+        let position = self
+            .source
+            .prepay(&original)
+            .unwrap()
+            .expect("same paid original read role");
+        self.inbox.push_transport_command(original.clone(), None);
+        let ticket = self.inbox.command(&self.parent, original.protocol.id);
+        let command = ticket.input;
+        let mut job = self.source.bind_job(&ticket, position);
+        self.retirement
+            .track(original, job.transport.take().unwrap())
+            .unwrap_or_else(|_| panic!("same original diagnostic report/Join"));
+        handoff_actor_transport(&tokio::runtime::Handle::current(), job)
+            .unwrap_or_else(|_| panic!("same original diagnostic handoff"));
+        self.inbox.runtime().effect_completed(ticket).unwrap();
+        self.inbox
+            .runtime()
+            .retire_input(self.inbox.registration().actor(), command)
+            .unwrap();
+    }
+    fn close_starting(&mut self) {
+        if !self.closing {
+            self.closing = true;
+            // An actual external close owes a finite original Source pass.
+            self.inbox
+                .runtime()
+                .notify_host_actor(self.inbox.registration())
+                .unwrap();
+        }
+    }
+    fn progress(&mut self) {
+        let mut visits = 0;
+        while let Some(turn) = self.inbox.runtime().claim_host_actor() {
+            visits += 1;
+            assert!(visits <= 1024, "an idle Source must not self-wake forever");
+            self.actual_notified_visits += usize::from(turn.was_notified());
+            let source = &mut self.source;
+            let transport = self.retirement.progress(&turn, 1, |effect, event| {
+                source
+                    .transport_event(effect, event)
+                    .unwrap_or_else(|original| std::panic::resume_unwind(original))
+            });
+            let source = self
+                .source
+                .progress(false, self.closing, self.closing, 1, true, drop);
+            turn.release(transport.more || source.more).unwrap();
+        }
+    }
+    fn consume(&mut self) {
+        while let Some((input, fact)) = self.inbox.try_commit_next() {
+            assert!(
+                matches!(
+                    fact,
+                    ExecutorFact::ActualExit { .. }
+                        | ExecutorFact::DiagnosticsFinished {
+                            result: DiagnosticRead::Unavailable(OperationOutcome::Gone),
+                            ..
+                        }
+                ),
+                "only actual exit and the actual unavailable read result are delivered"
+            );
+            self.source.core_consumed(self.inbox.runtime(), &[input]);
+            self.inbox
+                .runtime()
+                .retire_input(self.inbox.registration().actor(), input)
+                .unwrap();
+            self.replies.push(fact);
+        }
+    }
+    fn result_count(&self) -> usize {
+        self.replies
+            .iter()
+            .filter(|fact| matches!(fact, ExecutorFact::DiagnosticsFinished { .. }))
+            .count()
+    }
+    async fn until(&mut self, mut predicate: impl FnMut(&Self) -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                self.progress();
+                self.consume();
+                self.progress();
+                if predicate(self) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual original diagnostic cleanup must finish");
+    }
+    async fn finish(mut self) {
+        self.close_starting();
+        self.until(|fixture| fixture.retirement.is_empty() && fixture.source.is_drained())
+            .await;
+        let original_parent_header = self.parent.retirement_observer();
+        assert!(
+            !original_parent_header.is_retired(),
+            "read completion does not retire its original Source parent"
+        );
+        self.parent.body_exited().unwrap();
+        self.parent.captures_exited().unwrap();
+        self.payer.finish().unwrap();
+        self.scope.close_external().unwrap();
+        self.ledger.reap_scope_ready(self.scope.id(), 32).unwrap();
+        assert!(original_parent_header.is_retired());
+        assert!(self.scope.join_ready().unwrap());
+        self.inbox
+            .runtime()
+            .close_actor_admission(self.inbox.registration().actor())
+            .unwrap();
+        while let Some(turn) = self.inbox.runtime().claim_host_actor() {
+            turn.release(false).unwrap();
+        }
+        self.inbox
+            .runtime()
+            .seal_actor(self.inbox.registration().actor())
+            .unwrap();
+        self.inbox.finish();
+        self.ledger.remove_scope(self.scope.id()).unwrap();
+        assert!(self.ledger.is_empty());
     }
 }
 
 #[tokio::test]
 async fn pending_final_info_survives_borrowed_wait_cancel_and_stop_starting_until_same_future_drops()
  {
-    let (mut round, acks, release) =
-        crate::task_execution::tests::manifest_normal_release_ack_regression_fixture();
-    let terminal_identities = round
-        .execution()
-        .graph()
-        .stages()
-        .flat_map(|stage| {
-            round
-                .execution()
-                .stage(stage.stage_id())
-                .unwrap()
-                .tasks()
-                .map(|(_, task)| {
-                    assert!(
-                        task.is_terminal(),
-                        "the original fixture already observed terminal Tasks"
-                    );
-                    task.identity()
-                })
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        terminal_identities.len() > 1,
-        "the original fixture must leave an unread sibling"
-    );
-    assert!(
-        !round.attempt_drained(),
-        "the original Release ACK has not arrived"
-    );
-    let original_cause = round.failure_cause().cloned();
+    let identities = tasks();
     let (release_read, read_gate) = tokio::sync::oneshot::channel();
     let probe = Arc::new(FinalReadProbe::default());
     let transport: Arc<dyn TaskResultTransport> = Arc::new(GatedFinalInfo {
         release: Mutex::new(VecDeque::from([read_gate])),
-        probe: Arc::clone(&probe),
+        probe: probe.clone(),
     });
-    // Poll the actual collector directly on the original TaskRound fixture.
-    // No coordinator runtime bridge or replacement source is constructed.
-    let mut collector =
-        TaskFinalInfoCollector::new(transport, true, &round, Arc::new(TestIntakeWake::default()));
-    let mut wait = Box::pin(poll_fn(|cx| {
-        collector.poll_observe(&round, cx);
-        if collector.is_closed() {
+    // On a failed assertion retain the original unproven-exit custody instead
+    // of unwinding through a second obligation Drop. Normal cleanup consumes it.
+    let mut fixture = ManuallyDrop::new(SourceFixture::new(transport));
+    fixture.issue(effect(0, identities[0]));
+    fixture
+        .until(|_| probe.started.lock().unwrap().len() == 1)
+        .await;
+    let mut borrowed = Box::pin(poll_fn(|_| {
+        fixture.progress();
+        if fixture.source.is_drained() {
             Poll::Ready(())
         } else {
             Poll::Pending
         }
     }));
-    // This is an actual Pending poll of the same original oneshot read.
-    // No elapsed timeout is used as a stand-in for a cleanup receipt.
-    assert!(futures::poll!(wait.as_mut()).is_pending());
-    drop(wait);
-    let started = probe.started.lock().unwrap().clone();
-    assert_eq!(started.len(), 1);
-    assert!(terminal_identities.contains(&started[0]));
+    assert!(futures::poll!(borrowed.as_mut()).is_pending());
+    drop(borrowed);
+    assert_eq!(*probe.started.lock().unwrap(), [identities[0]]);
     assert!(probe.completed.lock().unwrap().is_empty());
     assert!(
         probe.dropped.lock().unwrap().is_empty(),
-        "dropping a borrowing wait must retain the read"
+        "borrowing wait does not own the read"
     );
-    assert!(!collector.is_closed());
-    assert!(!collector.all_terminal_observed());
+    assert!(!fixture.retirement.is_empty() && !fixture.source.is_drained());
 
-    collector.stop_starting();
-    let mut stopped_wait = Box::pin(poll_fn(|cx| {
-        collector.poll_observe(&round, cx);
-        if collector.is_closed() {
+    fixture.close_starting();
+    let mut stopped_wait = Box::pin(poll_fn(|_| {
+        fixture.progress();
+        if fixture.source.is_drained() {
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -169,100 +363,71 @@ async fn pending_final_info_survives_borrowed_wait_cancel_and_stop_starting_unti
     }));
     assert!(futures::poll!(stopped_wait.as_mut()).is_pending());
     drop(stopped_wait);
-    assert_eq!(*probe.started.lock().unwrap(), started);
+    assert!(
+        fixture
+            .source
+            .prepay(&effect(1, identities[1]))
+            .unwrap()
+            .is_none(),
+        "closing may not issue the unread original sibling"
+    );
+    assert_eq!(*probe.started.lock().unwrap(), [identities[0]]);
     assert!(
         probe.dropped.lock().unwrap().is_empty(),
-        "stop_starting must not drop an already issued read"
+        "stop-starting cannot destroy an issued F"
     );
-    assert!(!collector.is_closed());
-
+    assert!(!fixture.source.is_drained());
     release_read.send(()).unwrap();
-    poll_fn(|cx| {
-        collector.poll_observe(&round, cx);
-        if collector.is_closed() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    })
-    .await;
-    // Further real turns cannot issue a new read after the stop cut.
-    let mut cx = Context::from_waker(Waker::noop());
-    for _ in 0..3 {
-        collector.poll_observe(&round, &mut cx);
-    }
-    let completed = probe.completed.lock().unwrap().clone();
-    let dropped = probe.dropped.lock().unwrap().clone();
-    let remaining_started = probe.started.lock().unwrap().clone();
-    let closed = collector.is_closed();
-    let partial_not_complete = !collector.all_terminal_observed();
-    let no_fabricated_info = collector.collected.is_empty();
-    let original_cause_preserved = round.failure_cause() == original_cause.as_ref();
-
-    // Settle the same fixture's ORIGINAL Release, rather than dropping its
-    // TaskRound and treating that as remote convergence.
-    let OperationIntent::ReleaseParticipation(request) = &release else {
-        unreachable!("the original fixture selected its Release by kind")
-    };
-    acks.publish(OperationAcknowledgement::new(
-        release.operation_id(),
-        OperationKind::ReleaseParticipation,
-        OperationOutcome::Accepted,
-        AckPayload::Release {
-            receipt: ParticipationReceipt::new(
-                request.participation(),
-                ParticipationState::TerminalRetained,
-            ),
-            outcome: ReleaseOutcome::Released,
-            runtime_filter: None,
-        },
-    ));
-    round.turn().expect("the original Release ACK settles");
-    assert!(round.attempt_drained());
+    fixture
+        .until(|fixture| fixture.retirement.is_empty() && fixture.source.is_drained())
+        .await;
+    assert_eq!(*probe.completed.lock().unwrap(), [identities[0]]);
     assert_eq!(
-        remaining_started, started,
-        "no unread sibling was newly dispatched"
+        *probe.dropped.lock().unwrap(),
+        [identities[0]],
+        "same original F really drops once"
     );
     assert_eq!(
-        completed, started,
-        "the originally issued read actually completed"
+        *probe.started.lock().unwrap(),
+        [identities[0]],
+        "unread sibling never starts"
     );
-    assert_eq!(
-        dropped, started,
-        "that same original future actually dropped once"
-    );
-    assert!(closed);
+    assert_eq!(fixture.result_count(), 1);
+    assert_eq!(fixture.replies.len(), 2);
+    assert!(matches!(fixture.replies[0], ExecutorFact::ActualExit { effect } if effect.get() == 1));
     assert!(
-        partial_not_complete,
-        "one optional missing result cannot prove every Task was observed"
+        matches!(fixture.replies[1], ExecutorFact::DiagnosticsFinished { request: actual, task, .. }
+        if actual == request(0) && task == identities[0])
     );
-    assert!(no_fabricated_info);
-    assert!(original_cause_preserved);
+    assert!(
+        fixture
+            .replies
+            .iter()
+            .any(|fact| matches!(fact, ExecutorFact::ActualExit { effect } if effect.get() == 1))
+    );
+    for _ in 0..3 {
+        fixture.progress();
+        fixture.consume();
+    }
+    assert_eq!(*probe.started.lock().unwrap(), [identities[0]]);
+    assert!(
+        fixture
+            .records
+            .take_information(FinalTaskInfoRef::new(request(0), identities[0]))
+            .is_err()
+    );
+    ManuallyDrop::into_inner(fixture).finish().await;
 }
 
 #[tokio::test]
-async fn terminal_frontier_reads_each_original_task_once_and_wakes_each_ready_successor() {
-    use std::future::Future;
-    let (mut round, acks, release) =
-        crate::task_execution::tests::manifest_normal_release_ack_regression_fixture();
-    let frozen = round
-        .execution()
-        .graph()
-        .tasks()
-        .map(|task| task.identity())
-        .collect::<BTreeSet<_>>();
-    // Diagnostic requests follow the original accepted terminal frontier.
-    // Their order is independent of planner ordinals, but coverage is exact.
-    let identities = round.execution().accepted_terminal_tasks().to_vec();
-    assert_eq!(identities.iter().copied().collect::<BTreeSet<_>>(), frozen);
-    assert!(identities.len() > 1);
-    assert!(identities.iter().all(|identity| {
-        round
-            .execution()
-            .task(identity.task_id())
-            .unwrap()
-            .is_terminal()
-    }));
+async fn issued_final_info_reads_keep_each_original_future_and_resume_on_actual_host_progress() {
+    // AP Core tests own first-terminal eligibility/order and no duplicate
+    // candidates. Here each eligible effect uses the SAME actual Source.
+    let identities = tasks();
+    assert_eq!(
+        identities.iter().copied().collect::<BTreeSet<_>>().len(),
+        identities.len()
+    );
     let mut releases = VecDeque::new();
     let mut gates = VecDeque::new();
     for _ in &identities {
@@ -273,68 +438,81 @@ async fn terminal_frontier_reads_each_original_task_once_and_wakes_each_ready_su
     let probe = Arc::new(FinalReadProbe::default());
     let transport: Arc<dyn TaskResultTransport> = Arc::new(GatedFinalInfo {
         release: Mutex::new(gates),
-        probe: Arc::clone(&probe),
+        probe: probe.clone(),
     });
-    let wake = Arc::new(TestIntakeWake::default());
-    let mut collector =
-        TaskFinalInfoCollector::new(Arc::clone(&transport), true, &round, wake.clone());
-    let mut cx = Context::from_waker(Waker::noop());
+    let mut fixture = ManuallyDrop::new(SourceFixture::new(transport));
     for (index, identity) in identities.iter().enumerate() {
-        collector.poll_observe(&round, &mut cx);
+        fixture.issue(effect(index, *identity));
+        fixture
+            .until(|_| probe.started.lock().unwrap().len() == index + 1)
+            .await;
         assert_eq!(*probe.started.lock().unwrap(), identities[..=index]);
         assert_eq!(*probe.completed.lock().unwrap(), identities[..index]);
-        assert_eq!(collector.unread.len(), identities.len() - index - 1);
-        assert!(!collector.is_closed());
-        assert!(!collector.all_terminal_observed());
-        // This one actual read stays pending across repeated turns and
-        // cannot start the next read or consume another receiver.
-        collector.poll_observe(&round, &mut cx);
-        assert_eq!(probe.started.lock().unwrap().last(), Some(identity));
-        assert_eq!(probe.started.lock().unwrap().len(), index + 1);
-        let notified = wake.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
+        for _ in 0..3 {
+            fixture.progress();
+            fixture.consume();
+        }
+        assert_eq!(
+            *probe.started.lock().unwrap(),
+            identities[..=index],
+            "no repeated read factory"
+        );
+        assert_eq!(probe.dropped.lock().unwrap().len(), index);
+        let original_notifications = fixture.actual_notified_visits;
         releases.pop_front().unwrap().send(()).unwrap();
-        collector.poll_observe(&round, &mut cx);
-        let successor_woken =
-            poll_fn(|cx| Poll::Ready(notified.as_mut().poll(cx).is_ready())).await;
-        assert_eq!(successor_woken, index + 1 < identities.len());
+        fixture
+            .until(|fixture| fixture.result_count() == index + 1 && fixture.retirement.is_empty())
+            .await;
+        assert!(
+            fixture.actual_notified_visits > original_notifications,
+            "actual original completion/Join wakes the original Host; no test notification supplies a successor"
+        );
         assert_eq!(*probe.completed.lock().unwrap(), identities[..=index]);
         assert_eq!(*probe.dropped.lock().unwrap(), identities[..=index]);
-        assert!(collector.is_closed());
+        assert_eq!(fixture.replies.len(), 2 * (index + 1));
+        assert!(
+            matches!(fixture.replies[2 * index], ExecutorFact::ActualExit { effect }
+            if effect.get() == index as u64 + 1)
+        );
+        assert!(
+            matches!(fixture.replies[2 * index + 1], ExecutorFact::DiagnosticsFinished { request: actual, task, .. }
+            if actual == request(index) && task == *identity)
+        );
+        assert!(
+            fixture
+                .records
+                .take_information(FinalTaskInfoRef::new(request(index), *identity))
+                .is_err()
+        );
     }
-    assert!(collector.all_terminal_observed());
-    assert!(
-        collector.collected.is_empty(),
-        "Unavailable is never fabricated as Available"
-    );
-    collector.poll_observe(&round, &mut cx);
-    assert_eq!(*probe.started.lock().unwrap(), identities);
-    let mut disabled = TaskFinalInfoCollector::new(transport, false, &round, wake);
-    disabled.poll_observe(&round, &mut cx);
+    let actual = fixture
+        .replies
+        .iter()
+        .filter_map(|fact| match fact {
+            ExecutorFact::DiagnosticsFinished {
+                request,
+                task,
+                result: DiagnosticRead::Unavailable(OperationOutcome::Gone),
+            } => Some((*request, *task)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        disabled.unread.len(),
-        0,
-        "non-profile attempts allocate no task frontier"
+        actual,
+        identities
+            .iter()
+            .enumerate()
+            .map(|(i, task)| (request(i), *task))
+            .collect::<Vec<_>>()
     );
-    assert!(!disabled.all_terminal_observed());
-    assert_eq!(*probe.started.lock().unwrap(), identities);
-    let OperationIntent::ReleaseParticipation(request) = &release else {
-        unreachable!()
-    };
-    acks.publish(OperationAcknowledgement::new(
-        release.operation_id(),
-        OperationKind::ReleaseParticipation,
-        OperationOutcome::Accepted,
-        AckPayload::Release {
-            receipt: ParticipationReceipt::new(
-                request.participation(),
-                ParticipationState::TerminalRetained,
-            ),
-            outcome: ReleaseOutcome::Released,
-            runtime_filter: None,
-        },
-    ));
-    round.turn().expect("the same original Release ACK settles");
-    assert!(round.attempt_drained());
+    for _ in 0..3 {
+        fixture.progress();
+        fixture.consume();
+    }
+    assert_eq!(
+        *probe.started.lock().unwrap(),
+        identities,
+        "finished idle turns cannot create more reads"
+    );
+    ManuallyDrop::into_inner(fixture).finish().await;
 }

@@ -3624,9 +3624,7 @@ fn validate_grouped_topn(
             .root_expression(node.id, *expression)
             .is_some_and(|expr| {
                 matches!(expr.kind, ExprKind::Value(source) if source == *output)
-                    && comparator.supports_value_type(&expr.ty)
-                    && novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
-                        .supports_partition_key(expr.ty.data_type())
+                    && crate::grouped_state_topn_key_supported(comparator, &expr.ty)
             });
         if !valid || !keys.insert(*output) {
             errors.push(ValidationError::new(

@@ -465,6 +465,14 @@ impl MutationAction {
                 }
 
                 Phase::Publication => {
+                    if self.publication.as_ref().unwrap().call.is_none()
+                        && let Some(error) = self
+                            .inline_tail
+                            .as_mut()
+                            .and_then(|tail| tail.poll_supervision_failure(cx))
+                    {
+                        self.fail(governed_query_execution_error(error));
+                    }
                     // No new effect begins after cancellation. Existing Calls
                     // settle once; an Applied verdict survives late cancellation.
                     if self.publication.as_ref().unwrap().call.is_none()
