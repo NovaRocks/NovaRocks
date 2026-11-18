@@ -46,6 +46,8 @@ const TRINO_STANDARD_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("INVALID_SESSION_PROPERTY", 14, "USER_ERROR"),
     ("INVALID_WINDOW_FRAME", 15, "USER_ERROR"),
     ("NUMERIC_VALUE_OUT_OF_RANGE", 19, "USER_ERROR"),
+    ("PROCEDURE_NOT_FOUND", 29, "USER_ERROR"),
+    ("INVALID_PROCEDURE_ARGUMENT", 30, "USER_ERROR"),
     ("QUERY_TEXT_TOO_LARGE", 35, "USER_ERROR"),
     ("ADMINISTRATIVELY_KILLED", 38, "USER_ERROR"),
     ("INVALID_ANALYZE_PROPERTY", 42, "USER_ERROR"),
@@ -66,6 +68,7 @@ const TRINO_STANDARD_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("MISMATCHED_COLUMN_ALIASES", 61, "USER_ERROR"),
     ("INVALID_ARGUMENTS", 76, "USER_ERROR"),
     ("TOO_MANY_ARGUMENTS", 77, "USER_ERROR"),
+    ("DUPLICATE_PROPERTY", 79, "USER_ERROR"),
     ("VIEW_IS_STALE", 81, "USER_ERROR"),
     ("VIEW_IS_RECURSIVE", 82, "USER_ERROR"),
     ("DUPLICATE_WINDOW_NAME", 92, "USER_ERROR"),
@@ -180,6 +183,10 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.admit.invalid_materialized_view_property" => "INVALID_MATERIALIZED_VIEW_PROPERTY",
         "sql.admit.invalid_analyze_property" => "INVALID_ANALYZE_PROPERTY",
         "sql.admit.invalid_branch_property" => "INVALID_BRANCH_PROPERTY",
+        "sql.admit.invalid_table_procedure_arguments" => "INVALID_ARGUMENTS",
+        "sql.admit.table_procedure_not_found" => "PROCEDURE_NOT_FOUND",
+        "sql.admit.invalid_table_procedure_argument" => "INVALID_PROCEDURE_ARGUMENT",
+        "sql.admit.duplicate_table_procedure_argument" => "DUPLICATE_PROPERTY",
         "sql.analyze.too_many_arguments" => "TOO_MANY_ARGUMENTS",
         "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => "GENERIC_USER_ERROR",
         "query.execution.merge_target_row_multiple_matches"
@@ -287,6 +294,7 @@ fn every_registered_user_descriptor_has_an_explicit_trino_mapping() {
         novarocks_sql::analyze_error::ERROR_CODE_DESCRIPTORS,
         novarocks_query_application::sql::session_admit::SESSION_ERROR_CODE_DESCRIPTORS,
         novarocks_query_application::sql::property_admit::DDL_PROPERTY_ERROR_CODE_DESCRIPTORS,
+        novarocks_query_application::sql::table_procedure::TABLE_PROCEDURE_ERROR_CODE_DESCRIPTORS,
         novarocks_query_application::sql::dml_admission::DML_ADMISSION_ERROR_CODE_DESCRIPTORS,
         EXECUTION_ERROR_CODE_DESCRIPTORS,
     ];
@@ -1384,4 +1392,37 @@ fn ddl_property_mapping_keeps_the_old_analyzer_owner_and_never_classifies_error_
         });
         assert_wire(&wire, name);
     }
+}
+
+#[test]
+fn table_property_descriptor_with_original_cause_and_late_effect_maps_to_eighteen() {
+    use novarocks_query_application::{
+        api::StatementExternalEffectDisposition, sql::property_admit::DdlPropertyScope,
+    };
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, InvalidTableProperty};
+    let original = ConnectorError::new(
+        ConnectorErrorKind::InvalidRequest,
+        "actual property producer detail",
+    );
+    let marked = InvalidTableProperty::from_property_error(original);
+    let cause = novarocks_failure_contract::SharedFailureCause::new(marked);
+    let service = QueryServiceError::from_user_error_with_cause(
+        DdlPropertyScope::Table.without_location("actual property producer detail"),
+        cause.clone(),
+    )
+    .attach_external_effect_disposition(StatementExternalEffectDisposition::KnownUncommitted);
+    let wire = query_error(TrinoErrorSource::Service {
+        error: &service,
+        sql: "CREATE TABLE actual_source",
+    });
+    assert_eq!(
+        (wire.error_code, wire.error_name, wire.error_type),
+        (18, "INVALID_TABLE_PROPERTY", "USER_ERROR")
+    );
+    assert!(wire.error_location.is_none());
+    assert_eq!(service.failure_cause(), Some(&cause));
+    assert_eq!(
+        service.external_effect_disposition(),
+        Some(StatementExternalEffectDisposition::KnownUncommitted)
+    );
 }

@@ -17,76 +17,28 @@
 
 //! CREATE CATALOG property computation on the original supervised planning CPU.
 
-use novarocks_functions::ConstantValue;
-use novarocks_parser::ast::{Expr, legacy::CreateCatalog};
+use super::property_cpu_context::PropertyCpuContext;
+use novarocks_parser::ast::legacy::CreateCatalog;
 use novarocks_query_application::{
-    session_error::QueryServiceError,
-    sql::property_evaluation::{
-        DdlPropertyConstantError, DdlPropertyConstantPort, prepare_legacy_create_catalog,
-    },
+    session_error::QueryServiceError, sql::property_evaluation::prepare_legacy_create_catalog,
 };
-use novarocks_sql::{
-    compiler::{
-        RequiredConstantTarget, SqlCompileControl, SqlFunctionCatalog, SqlPlannerTableSnapshot,
-    },
-    semantic::command::CatalogCreateCommand,
-    sql_mode::SqlSemanticSettings,
-};
-use novarocks_workload_control::{ResultWindowAlias, WorkScope};
-use std::sync::{Arc, RwLock};
+use novarocks_sql::semantic::command::CatalogCreateCommand;
+use std::sync::Arc;
 
 pub(crate) struct CatalogPropertyCpuInput {
     pub(crate) source: Arc<str>,
     pub(crate) statement: CreateCatalog,
-    pub(crate) current_database: String,
-    pub(crate) sql_semantics: SqlSemanticSettings,
-    pub(crate) interpreter: Arc<crate::RequiredConstantInterpreter>,
-    pub(crate) control: SqlCompileControl,
-    pub(crate) scope: WorkScope,
-    pub(crate) window: ResultWindowAlias,
-    pub(crate) catalog: Arc<RwLock<novarocks_sql::planning::catalog::PlannerMemoryCatalog>>,
-    pub(crate) functions: Arc<dyn SqlFunctionCatalog>,
-    pub(crate) policy: novarocks_functions::ConstantPolicy,
+    pub(crate) context: PropertyCpuContext,
 }
-
 impl CatalogPropertyCpuInput {
     pub(crate) fn run(self) -> Result<CatalogCreateCommand, QueryServiceError> {
-        let mut port = CatalogConstantPort { input: &self };
-        prepare_legacy_create_catalog(&self.source, &self.statement, &mut port, &self.control)
-    }
-}
-
-struct CatalogConstantPort<'a> {
-    input: &'a CatalogPropertyCpuInput,
-}
-impl DdlPropertyConstantPort for CatalogConstantPort<'_> {
-    fn evaluate(
-        &mut self,
-        expression: &Expr,
-        target: RequiredConstantTarget,
-    ) -> Result<ConstantValue, DdlPropertyConstantError> {
-        let input = self.input;
-        let prepared = {
-            let catalog = input.catalog.read().map_err(super::poisoned_state)?;
-            let evaluator = crate::query_execution::ddl_properties::DdlPropertyConstantEvaluator {
-                catalog: &SqlPlannerTableSnapshot::new(&*catalog),
-                current_database: &input.current_database,
-                functions: input.functions.clone(),
-                sql_semantics: &input.sql_semantics,
-                constant_policy: input.policy,
-                control: &input.control,
-                interpreter: &input.interpreter,
-                scope: &input.scope,
-                window: &input.window,
-            };
-            evaluator.prepare(expression, target)
-        }?;
-        // The catalog read guard and snapshot above have exited. This is the
-        // same required interpreter under the caller's original scope/window.
-        input
-            .interpreter
-            .evaluate(prepared, &input.scope, &input.window)
-            .map_err(crate::query_execution::ddl_properties::evaluation_error)
+        let mut port = self.context.constant_port();
+        prepare_legacy_create_catalog(
+            &self.source,
+            &self.statement,
+            &mut port,
+            &self.context.control,
+        )
     }
 }
 
@@ -95,10 +47,12 @@ mod tests {
     use super::*;
     use novarocks_parser::ast::{CatalogStatement, Statement};
     use novarocks_query_application::sql::{parse_single_statement, session::SessionSqlState};
+    use novarocks_sql::compiler::SqlCompileControl;
     use novarocks_workload_control::{
-        ResourceConfig, ResultCapacityConfig, RootWork, WorkClass, WorkRequest, WorkloadConfig,
-        WorkloadControl,
+        ResourceConfig, ResultCapacityConfig, ResultWindowAlias, RootWork, WorkClass, WorkRequest,
+        WorkloadConfig, WorkloadControl,
     };
+    use std::sync::RwLock;
 
     struct Fixture {
         root: RootWork,
@@ -141,14 +95,19 @@ mod tests {
             };
             let frozen = SessionSqlState::default();
             CatalogPropertyCpuInput {
-                source: Arc::from(source), statement,
-                current_database: frozen.current_database().to_owned(),
-                sql_semantics: frozen.sql_semantics().clone(),
-                interpreter: Arc::new(crate::query_execution::required_constant_eval::test_required_constant_interpreter()),
-                control: SqlCompileControl::unbounded(), scope: self.root.owner.scope(),
-                window: self.window.clone(), catalog: Arc::new(RwLock::new(Default::default())),
-                functions: Arc::new(novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap()),
-                policy: crate::application::test_constant_policy(),
+                source: Arc::from(source),
+                statement,
+                context: PropertyCpuContext {
+                    current_database: frozen.current_database().to_owned(),
+                    sql_semantics: frozen.sql_semantics().clone(),
+                    interpreter: Arc::new(crate::query_execution::required_constant_eval::test_required_constant_interpreter()),
+                    control: SqlCompileControl::unbounded(),
+                    scope: self.root.owner.scope(),
+                    window: self.window.clone(),
+                    catalog: Arc::new(RwLock::new(novarocks_sql::planning::catalog::PlannerMemoryCatalog::default())),
+                    functions: Arc::new(novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap()),
+                    policy: crate::application::test_constant_policy(),
+                },
             }
         }
         fn close(self) {
@@ -173,7 +132,7 @@ mod tests {
     fn catalog_cpu_prepares_complete_configuration_without_publishing_partial_properties() {
         let fixture = Fixture::new();
         let input = fixture.input("CREATE EXTERNAL CATALOG IF NOT EXISTS Warehouse COMMENT 'admitted' PROPERTIES ('type'='iceberg', 'MixedKey'='selected中')");
-        let original_catalog = input.catalog.clone();
+        let original_catalog = input.context.catalog.clone();
         let command = input.run().unwrap();
         assert_eq!(command.name, "Warehouse");
         assert!(command.if_not_exists);

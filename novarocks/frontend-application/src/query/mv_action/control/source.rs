@@ -271,7 +271,7 @@ impl ControlSource {
             wake,
             io,
             requests,
-            capture: CurrentMetadataCapture::new(),
+            capture: crate::mv::domain::staged_create::new_current_metadata_capture(),
             current: CurrentProjectionRegistration::new(),
             call: CatalogCall::new(),
             finite: OnceLock::new(),

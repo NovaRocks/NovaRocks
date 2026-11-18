@@ -23,15 +23,23 @@
 
 use std::sync::Arc;
 
-use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
+use novarocks_query_application::{
+    api::{CommandError, CommandErrorKind},
+    protocol_delivery::QuerySessionOutput as StatementResult,
+    sql::table_procedure::{
+        BoundProcedureArgument, BoundProcedureValue, LegacyProcedureValue,
+        bind_legacy_procedure_arguments, resolve_legacy_table_procedure,
+    },
+};
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorRefAction, ConnectorRefKind,
-    ConnectorTableIdentity, CreateOrReplacePolicy, DropPolicy, ExternalMutationFinalization,
+    ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorProviderId,
+    ConnectorRefAction, ConnectorRefKind, ConnectorTableIdentity, CreateOrReplacePolicy,
+    DdlPropertyValue, DropPolicy, ExternalMutationFinalization,
 };
 use novarocks_sql::semantic::ObjectName;
 use novarocks_sql::semantic::command::{
-    AlterIcebergTableSqlCommand, CommandLiteral, IcebergReferenceKindSql,
-    IcebergReferenceSqlAction, IcebergTableSqlAction, ReferenceAnchorSql,
+    AlterIcebergTableSqlCommand, IcebergReferenceKindSql, IcebergReferenceSqlAction,
+    IcebergTableSqlAction,
 };
 
 /// Execute an Iceberg ref mutation using only the explicit connector-control
@@ -82,6 +90,14 @@ pub(crate) fn execute_with_ports(
     let mutation_lease = exact_lease
         .derive_mutation_lease()
         .map_err(|error| error.to_string())?;
+    let control = crate::query_execution::planning::sql_compile_control_from_connector_request(
+        connector_context,
+    );
+    let action = connector_ref_action(
+        action,
+        &exact_lease.binding().descriptor().provider_id,
+        &control,
+    )?;
     let outcome = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
         &mutation_lease,
         novarocks_spi::connector::ConnectorMutationOperationId::new(),
@@ -91,7 +107,7 @@ pub(crate) fn execute_with_ports(
                 namespace: Arc::from(namespace.as_str()),
                 table: Arc::from(table_name.as_str()),
             },
-            action: connector_ref_action(action)?,
+            action,
         },
         connector_context.clone(),
     );
@@ -134,7 +150,11 @@ pub(crate) fn execute_with_ports(
     Ok(StatementResult::Ok)
 }
 
-fn connector_ref_action(action: &IcebergReferenceSqlAction) -> Result<ConnectorRefAction, String> {
+fn connector_ref_action(
+    action: &IcebergReferenceSqlAction,
+    provider: &ConnectorProviderId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ConnectorRefAction, CommandError> {
     let policy = |replace: bool, if_not_exists: bool| {
         if replace {
             CreateOrReplacePolicy::ReplaceIfExists
@@ -144,33 +164,61 @@ fn connector_ref_action(action: &IcebergReferenceSqlAction) -> Result<ConnectorR
             CreateOrReplacePolicy::FailIfExists
         }
     };
-    let snapshot_anchor = |anchor: &ReferenceAnchorSql| match anchor {
-        ReferenceAnchorSql::Version(CommandLiteral::Number(value)) => value
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|_| "Iceberg reference version must fit i64".to_string()),
-        ReferenceAnchorSql::Version(_) => {
-            Err("Iceberg reference version must be a numeric literal".to_string())
-        }
-        ReferenceAnchorSql::CurrentMain => Ok(None),
-    };
     Ok(match action {
         IcebergReferenceSqlAction::Create {
             kind,
             name,
-            anchor,
+            snapshot_id,
             if_not_exists,
             or_replace,
-            has_uninterpreted_provider_options,
         } => {
-            if *has_uninterpreted_provider_options {
-                return Err("Iceberg reference retention options are not supported".to_string());
-            }
+            let (name, snapshot_id, or_replace, if_not_exists) =
+                if *kind == IcebergReferenceKindSql::Tag {
+                    let mut inputs = Vec::with_capacity(4);
+                    inputs.push(("name", LegacyProcedureValue::Varchar(name)));
+                    if let Some(snapshot_id) = snapshot_id {
+                        inputs.push(("snapshot_id", LegacyProcedureValue::Bigint(*snapshot_id)));
+                    }
+                    inputs.push(("replace", LegacyProcedureValue::Boolean(*or_replace)));
+                    inputs.push((
+                        "if_not_exists",
+                        LegacyProcedureValue::Boolean(*if_not_exists),
+                    ));
+                    let bound = bind_tag(provider, "create_tag", &inputs, control)?;
+                    let mut slots = bound.into_arguments();
+                    let (
+                        Some(DdlPropertyValue::Varchar(name)),
+                        snapshot,
+                        Some(DdlPropertyValue::Boolean(or_replace)),
+                        Some(DdlPropertyValue::Boolean(if_not_exists)),
+                    ) = (
+                        tag_argument(&mut slots, "name")?,
+                        tag_argument(&mut slots, "snapshot_id")?,
+                        tag_argument(&mut slots, "replace")?,
+                        tag_argument(&mut slots, "if_not_exists")?,
+                    )
+                    else {
+                        return Err(tag_binding_invariant());
+                    };
+                    let snapshot = match snapshot {
+                        Some(DdlPropertyValue::Bigint(id)) => Some(id),
+                        None => None,
+                        _ => return Err(tag_binding_invariant()),
+                    };
+                    (Arc::from(name), snapshot, or_replace, if_not_exists)
+                } else {
+                    (
+                        Arc::from(name.as_str()),
+                        *snapshot_id,
+                        *or_replace,
+                        *if_not_exists,
+                    )
+                };
             ConnectorRefAction::Create {
                 kind: connector_ref_kind(*kind),
-                name: Arc::from(name.as_str()),
-                snapshot_id: snapshot_anchor(anchor)?,
-                policy: policy(*or_replace, *if_not_exists),
+                name,
+                snapshot_id,
+                policy: policy(or_replace, if_not_exists),
                 expected_table_uuid: None,
             }
         }
@@ -178,16 +226,85 @@ fn connector_ref_action(action: &IcebergReferenceSqlAction) -> Result<ConnectorR
             kind,
             name,
             if_exists,
-        } => ConnectorRefAction::Drop {
-            kind: connector_ref_kind(*kind),
-            name: Arc::from(name.as_str()),
-            policy: if *if_exists {
-                DropPolicy::NoOpIfMissing
+        } => {
+            let (name, if_exists) = if *kind == IcebergReferenceKindSql::Tag {
+                let bound = bind_tag(
+                    provider,
+                    "drop_tag",
+                    &[
+                        ("name", LegacyProcedureValue::Varchar(name)),
+                        ("if_exists", LegacyProcedureValue::Boolean(*if_exists)),
+                    ],
+                    control,
+                )?;
+                let mut slots = bound.into_arguments();
+                let (
+                    Some(DdlPropertyValue::Varchar(name)),
+                    Some(DdlPropertyValue::Boolean(if_exists)),
+                ) = (
+                    tag_argument(&mut slots, "name")?,
+                    tag_argument(&mut slots, "if_exists")?,
+                )
+                else {
+                    return Err(tag_binding_invariant());
+                };
+                (Arc::from(name), if_exists)
             } else {
-                DropPolicy::FailIfMissing
-            },
-        },
+                (Arc::from(name.as_str()), *if_exists)
+            };
+            ConnectorRefAction::Drop {
+                kind: connector_ref_kind(*kind),
+                name,
+                policy: if if_exists {
+                    DropPolicy::NoOpIfMissing
+                } else {
+                    DropPolicy::FailIfMissing
+                },
+            }
+        }
     })
+}
+
+fn bind_tag<'a>(
+    provider: &ConnectorProviderId,
+    procedure: &str,
+    arguments: &[(&str, LegacyProcedureValue<'a>)],
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_query_application::sql::table_procedure::BoundTableProcedure<'a>, CommandError>
+{
+    let procedure = resolve_legacy_table_procedure(provider, procedure)
+        .map_err(crate::query::procedure_command_error)?;
+    bind_legacy_procedure_arguments(procedure, arguments, control)
+        .map_err(crate::query::procedure_command_error)
+}
+
+fn tag_argument<'a>(
+    slots: &mut impl Iterator<
+        Item = (
+            &'static novarocks_query_application::sql::table_procedure::TableProcedureArgument,
+            BoundProcedureArgument<'a>,
+        ),
+    >,
+    name: &str,
+) -> Result<Option<DdlPropertyValue>, CommandError> {
+    match slots.next() {
+        Some((slot, argument)) if slot.name == name => match argument {
+            BoundProcedureArgument::Omitted => Ok(None),
+            BoundProcedureArgument::Present {
+                value: BoundProcedureValue::Value(value),
+                ..
+            } => Ok(Some(value)),
+            _ => Err(tag_binding_invariant()),
+        },
+        _ => Err(tag_binding_invariant()),
+    }
+}
+
+fn tag_binding_invariant() -> CommandError {
+    CommandError::new(
+        CommandErrorKind::Failed,
+        "Legacy tag binding differs from its original procedure declaration",
+    )
 }
 
 const fn connector_ref_kind(kind: IcebergReferenceKindSql) -> ConnectorRefKind {
@@ -220,24 +337,40 @@ fn resolve_table_parts(name: &ObjectName) -> Result<(String, String, String), St
 mod tests {
     use super::*;
 
+    use novarocks_query_application::sql::{
+        ProductSqlCommand, lower_product_sql_command, parse_single_statement,
+    };
+    use novarocks_sql::semantic::CatalogSqlCommand;
+
     #[test]
     fn semantic_create_ref_preserves_anchor_and_policy() {
-        let action = IcebergReferenceSqlAction::Create {
-            kind: IcebergReferenceKindSql::Branch,
-            name: "release".to_string(),
-            if_not_exists: true,
-            or_replace: false,
-            anchor: ReferenceAnchorSql::Version(CommandLiteral::Number("42".to_string())),
-            has_uninterpreted_provider_options: false,
+        let statement = parse_single_statement(
+            "ALTER TABLE ice.db.orders CREATE BRANCH IF NOT EXISTS release AS OF VERSION 42",
+        )
+        .unwrap();
+        let Some(ProductSqlCommand::Catalog(command)) =
+            lower_product_sql_command(&statement).unwrap()
+        else {
+            panic!("expected a catalog command");
         };
-
+        let CatalogSqlCommand::AlterIcebergTable(command) = *command else {
+            panic!("expected an Iceberg table command");
+        };
+        let IcebergTableSqlAction::Reference(action) = command.action else {
+            panic!("expected a reference action");
+        };
         let ConnectorRefAction::Create {
             kind,
             name,
             snapshot_id,
             policy,
             ..
-        } = connector_ref_action(&action).expect("lower semantic ref")
+        } = connector_ref_action(
+            &action,
+            &ConnectorProviderId::parse("iceberg").unwrap(),
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
         else {
             panic!("expected create ref action");
         };
@@ -248,36 +381,69 @@ mod tests {
     }
 
     #[test]
-    fn semantic_ref_rejects_non_numeric_version_anchor() {
-        let action = IcebergReferenceSqlAction::Create {
-            kind: IcebergReferenceKindSql::Tag,
-            name: "v1".to_string(),
-            if_not_exists: false,
-            or_replace: false,
-            anchor: ReferenceAnchorSql::Version(CommandLiteral::String("42".to_string())),
-            has_uninterpreted_provider_options: false,
+    fn legacy_tag_binding_keeps_bigint_snapshot_and_drop_policy() {
+        let provider = ConnectorProviderId::parse("iceberg").unwrap();
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        let action = |sql| {
+            let statement = parse_single_statement(sql).unwrap();
+            let Some(ProductSqlCommand::Catalog(command)) =
+                lower_product_sql_command(&statement).unwrap()
+            else {
+                panic!("expected catalog command");
+            };
+            let CatalogSqlCommand::AlterIcebergTable(command) = *command else {
+                panic!("reference command");
+            };
+            let IcebergTableSqlAction::Reference(action) = command.action else {
+                panic!("reference action");
+            };
+            connector_ref_action(&action, &provider, &control).unwrap()
         };
-        assert!(
-            connector_ref_action(&action)
-                .expect_err("string snapshot ID must fail")
-                .contains("numeric literal")
+        let ConnectorRefAction::Create {
+            kind,
+            name,
+            snapshot_id,
+            policy,
+            ..
+        } = action(
+            "ALTER TABLE ice.db.orders CREATE TAG IF NOT EXISTS release AS OF VERSION 9223372036854775806",
+        )
+        else {
+            panic!("create tag");
+        };
+        assert_eq!(kind, ConnectorRefKind::Tag);
+        assert_eq!(name.as_ref(), "release");
+        assert_eq!(snapshot_id, Some(i64::MAX - 1));
+        assert_eq!(policy, CreateOrReplacePolicy::NoOpIfExists);
+        let ConnectorRefAction::Drop { kind, name, policy } =
+            action("ALTER TABLE ice.db.orders DROP TAG IF EXISTS release")
+        else {
+            panic!("drop tag");
+        };
+        assert_eq!(kind, ConnectorRefKind::Tag);
+        assert_eq!(name.as_ref(), "release");
+        assert_eq!(policy, DropPolicy::NoOpIfMissing);
+    }
+
+    #[test]
+    fn semantic_ref_rejects_non_numeric_version_anchor() {
+        let statement =
+            parse_single_statement("ALTER TABLE ice.db.orders CREATE TAG v1 AS OF VERSION '42'")
+                .unwrap();
+        assert_eq!(
+            lower_product_sql_command(&statement).unwrap_err(),
+            "Iceberg reference version must be a numeric literal"
         );
     }
 
     #[test]
     fn semantic_ref_rejects_uninterpreted_retention_options() {
-        let action = IcebergReferenceSqlAction::Create {
-            kind: IcebergReferenceKindSql::Branch,
-            name: "release".to_string(),
-            if_not_exists: false,
-            or_replace: false,
-            anchor: ReferenceAnchorSql::CurrentMain,
-            has_uninterpreted_provider_options: true,
-        };
-        assert!(
-            connector_ref_action(&action)
-                .unwrap_err()
-                .contains("retention options")
+        let statement =
+            parse_single_statement("ALTER TABLE ice.db.orders CREATE BRANCH release RETAIN 7 DAYS")
+                .unwrap();
+        assert_eq!(
+            lower_product_sql_command(&statement).unwrap_err(),
+            "Iceberg reference retention options are not supported"
         );
     }
 }

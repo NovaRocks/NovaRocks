@@ -166,6 +166,15 @@ impl FrontendQueryCompiler {
         self.connector_blocking_io.runtime()
     }
 
+    pub(crate) fn table_metadata_cpu(
+        &self,
+    ) -> Result<
+        crate::query_execution::internal_result_cpu::InternalResultCpu,
+        novarocks_workload_control::WorkError,
+    > {
+        self.connector_blocking_io.provider_creator_cpu()
+    }
+
     pub(crate) fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         query: QueryPreparationKernel,
@@ -234,6 +243,26 @@ impl FrontendQueryCompiler {
         super::catalog_property_computation::CatalogPropertyCpuInput {
             source,
             statement,
+            context: self.property_cpu_context(
+                current_database,
+                sql_semantics,
+                interpreter,
+                control,
+                scope,
+                window,
+            ),
+        }
+    }
+    pub(crate) fn property_cpu_context(
+        &self,
+        current_database: String,
+        sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+        interpreter: Arc<crate::RequiredConstantInterpreter>,
+        control: novarocks_sql::compiler::SqlCompileControl,
+        scope: novarocks_workload_control::WorkScope,
+        window: novarocks_workload_control::ResultWindowAlias,
+    ) -> super::property_cpu_context::PropertyCpuContext {
+        super::property_cpu_context::PropertyCpuContext {
             current_database,
             sql_semantics,
             interpreter,

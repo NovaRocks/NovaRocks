@@ -38,7 +38,6 @@ use uuid::Uuid;
 pub mod command;
 pub mod create_table_ddl;
 pub mod iceberg_ref_command;
-pub mod model;
 pub mod query_bindings;
 pub mod query_catalog;
 pub mod query_materializer;

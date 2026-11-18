@@ -20,13 +20,12 @@
 use std::{fmt, sync::Arc};
 
 use novarocks_parser::{ParserError, ast::Statement};
+use novarocks_spi::connector::ConnectorPartitionTransform;
 use novarocks_sql::semantic::command::{
-    AlterIcebergTableSqlCommand, ColumnPositionSql, CommandLiteral, CommandProperty,
-    CreateTableSqlCommand, ExpireSnapshotsOptionSql, IcebergColumnSqlAction,
-    IcebergPartitionSqlChange, IcebergPropertiesSqlAction, IcebergReferenceKindSql,
-    IcebergReferenceSqlAction, IcebergSchemaSqlChange, IcebergTableSqlAction, MaintenanceValueSql,
-    ProcedureArgumentModeSql, ProcedureArgumentSql, ReferenceAnchorSql, TableColumnSqlCommand,
-    TablePartitionSqlCommand,
+    AlterIcebergTableSqlCommand, ColumnPositionSql, CommandLiteral, ExpireSnapshotsOptionSql,
+    IcebergColumnSqlAction, IcebergPartitionSqlChange, IcebergPropertiesSqlAction,
+    IcebergReferenceKindSql, IcebergReferenceSqlAction, IcebergSchemaSqlChange,
+    IcebergTableSqlAction, MaintenanceValueSql, ProcedureArgumentModeSql, ProcedureArgumentSql,
 };
 use novarocks_sql::semantic::{
     CatalogSqlCommand, IcebergPartitionFieldExpr, MaintenanceSqlCommand, ObjectName,
@@ -51,11 +50,16 @@ pub mod session;
 /// Typed session-admission errors and their stable user-error descriptors.
 pub mod session_admit;
 
+/// Temporary old-parser preparation; final commands contain evaluated facts.
+mod legacy_table;
+pub use legacy_table::{LegacyCreateTableColumnsPort, prepare_legacy_create_table};
+
 /// Typed user-data errors for DDL property scopes and stable descriptors.
 pub mod property_admit;
 
 /// Declared DDL-property evaluation through the original required-constant port.
 pub mod property_evaluation;
+pub mod table_procedure;
 
 /// Typed DML statement-shape admission errors and their stable user-error descriptors.
 pub mod dml_admission;
@@ -151,6 +155,15 @@ impl ProductCommandRouter {
             .prepare_statement_action(command, request_context, command_context)
     }
 
+    pub fn acquire_table_read_binding(
+        &self,
+        name: &novarocks_sql::semantic::ObjectName,
+        request_context: &RequestContext,
+    ) -> Result<crate::api::CatalogTableReadBinding, crate::api::CommandError> {
+        self.catalog
+            .acquire_table_read_binding(name, request_context)
+    }
+
     pub fn acquire_table_property_binding(
         &self,
         name: &novarocks_sql::semantic::ObjectName,
@@ -236,9 +249,9 @@ pub fn lower_product_sql_command(
         ParsedStatement::Maintenance(statement) => Ok(Some(ProductSqlCommand::Maintenance(
             lower_maintenance_command(statement)?,
         ))),
-        ParsedStatement::Table(statement) => Ok(Some(ProductSqlCommand::Catalog(Box::new(
-            lower_table_command(statement)?,
-        )))),
+        ParsedStatement::Table(_) => {
+            Err("CREATE TABLE requires evaluated property preparation".to_string())
+        }
         ParsedStatement::Iceberg(statement) => Ok(Some(ProductSqlCommand::Catalog(Box::new(
             lower_iceberg_command(statement)?,
         )))),
@@ -272,6 +285,7 @@ fn lower_catalog_command(
         CatalogStatement::CreateDatabase(statement) => CatalogSqlCommand::CreateDatabase {
             name: lower_object_name(&statement.name),
             if_not_exists: statement.if_not_exists,
+            properties: Vec::new(),
         },
         CatalogStatement::DropDatabase(statement) => CatalogSqlCommand::DropDatabase {
             name: lower_object_name(&statement.name),
@@ -289,180 +303,43 @@ fn lower_catalog_command(
     })
 }
 
-fn lower_table_command(
-    statement: &novarocks_parser::ast::TableStatement,
-) -> Result<CatalogSqlCommand, String> {
-    use novarocks_parser::ast::{TablePartition, TableStatement};
-
-    let TableStatement::Create(statement) = statement;
-    let partition = match &statement.partition {
-        None => None,
-        Some(TablePartition::Transform(partition)) => Some(TablePartitionSqlCommand::Transform(
-            partition
-                .expressions
-                .iter()
-                .map(lower_table_partition_transform)
-                .collect::<Result<_, _>>()?,
-        )),
-        Some(TablePartition::LegacyRange(partition)) => {
-            Some(TablePartitionSqlCommand::UnsupportedLegacyRange {
-                columns: partition
-                    .columns
-                    .iter()
-                    .map(|column| column.value.clone())
-                    .collect(),
-                definition_count: partition.definitions.len(),
-            })
-        }
-    };
-    let columns = statement
-        .columns
-        .iter()
-        .map(lower_table_column)
-        .collect::<Result<Vec<_>, _>>()?;
-    if let Some(key) = &statement.key {
-        for key_column in &key.columns {
-            if !columns
-                .iter()
-                .any(|column| column.name.eq_ignore_ascii_case(&key_column.value))
-            {
-                return Err(format!(
-                    "Iceberg key column `{}` does not exist",
-                    key_column.value
-                ));
+/// Project already authored semantic transform facts without lookup or parsing.
+pub fn connector_partition_transform(
+    field: &IcebergPartitionFieldExpr,
+) -> ConnectorPartitionTransform {
+    match field {
+        IcebergPartitionFieldExpr::Identity { column } => ConnectorPartitionTransform::Identity {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Year { column } => ConnectorPartitionTransform::Year {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Month { column } => ConnectorPartitionTransform::Month {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Day { column } => ConnectorPartitionTransform::Day {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Hour { column } => ConnectorPartitionTransform::Hour {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Bucket {
+            column,
+            num_buckets,
+        } => ConnectorPartitionTransform::Bucket {
+            column: Arc::from(column.as_str()),
+            num_buckets: *num_buckets,
+        },
+        IcebergPartitionFieldExpr::Truncate { column, width } => {
+            ConnectorPartitionTransform::Truncate {
+                column: Arc::from(column.as_str()),
+                width: *width,
             }
         }
+        IcebergPartitionFieldExpr::Void { column } => ConnectorPartitionTransform::Void {
+            column: Arc::from(column.as_str()),
+        },
     }
-    if let Some(distribution) = &statement.distribution {
-        for dist_column in &distribution.columns {
-            if let Some(column) = columns
-                .iter()
-                .find(|column| column.name.eq_ignore_ascii_case(&dist_column.value))
-                && matches!(column.data_type, SqlType::Bitmap | SqlType::Hll)
-            {
-                return Err(format!(
-                    "BITMAP/HLL columns cannot be used as distribution key (column `{}` has type {:?})",
-                    column.name, column.data_type
-                ));
-            }
-        }
-        distribution
-            .buckets
-            .map(|buckets| {
-                u32::try_from(buckets)
-                    .map_err(|_| "distribution bucket count exceeds u32".to_string())
-            })
-            .transpose()?;
-    }
-    Ok(CatalogSqlCommand::CreateTable(CreateTableSqlCommand {
-        temporary: statement.temporary,
-        external: statement.external,
-        if_not_exists: statement.if_not_exists,
-        name: lower_object_name(&statement.name),
-        engine: statement.engine.as_ref().map(|engine| engine.value.clone()),
-        like: statement.like.as_ref().map(lower_object_name),
-        columns,
-        partition,
-        order_by: statement
-            .order_by
-            .iter()
-            .map(|column| column.value.clone())
-            .collect(),
-        properties: statement
-            .properties
-            .iter()
-            .map(|property| {
-                Ok(CommandProperty {
-                    key: lower_command_literal(&property.key)?,
-                    value: lower_command_literal(&property.value)?,
-                })
-            })
-            .collect::<Result<_, String>>()?,
-        comment: statement
-            .comment
-            .as_ref()
-            .map(lower_command_literal)
-            .transpose()?,
-    }))
-}
-
-fn lower_table_column(
-    column: &novarocks_parser::ast::ColumnDefinition,
-) -> Result<TableColumnSqlCommand, String> {
-    let data_type = lower_sql_type(&column.data_type)?;
-    if let Some(aggregation) = &column.aggregation {
-        match aggregation.value.to_ascii_lowercase().as_str() {
-            "sum"
-            | "min"
-            | "max"
-            | "replace"
-            | "replace_if_not_null"
-            | "bitmap_union"
-            | "hll_union" => {}
-            other => return Err(format!("unsupported column aggregation `{other}`")),
-        }
-    }
-    Ok(TableColumnSqlCommand {
-        name: column.name.value.clone(),
-        data_type,
-        nullable: column.nullable,
-        default: column
-            .default
-            .as_ref()
-            .map(lower_command_literal)
-            .transpose()?,
-        comment: column
-            .comment
-            .as_ref()
-            .map(lower_command_literal)
-            .transpose()?,
-    })
-}
-
-fn lower_table_partition_transform(
-    transform: &novarocks_parser::ast::PartitionTransform,
-) -> Result<IcebergPartitionFieldExpr, String> {
-    use novarocks_parser::ast::PartitionTransform;
-
-    let column = |value: &novarocks_parser::ast::Ident| value.value.clone();
-    Ok(match transform {
-        PartitionTransform::Identity { column: value, .. } => IcebergPartitionFieldExpr::Identity {
-            column: column(value),
-        },
-        PartitionTransform::Year { column: value, .. } => IcebergPartitionFieldExpr::Year {
-            column: column(value),
-        },
-        PartitionTransform::Month { column: value, .. } => IcebergPartitionFieldExpr::Month {
-            column: column(value),
-        },
-        PartitionTransform::Day { column: value, .. } => IcebergPartitionFieldExpr::Day {
-            column: column(value),
-        },
-        PartitionTransform::Hour { column: value, .. } => IcebergPartitionFieldExpr::Hour {
-            column: column(value),
-        },
-        PartitionTransform::Void { column: value, .. } => IcebergPartitionFieldExpr::Void {
-            column: column(value),
-        },
-        PartitionTransform::Bucket {
-            buckets,
-            column: value,
-            ..
-        } => IcebergPartitionFieldExpr::Bucket {
-            column: column(value),
-            num_buckets: u32::try_from(*buckets)
-                .map_err(|_| "partition bucket count exceeds u32".to_string())?,
-        },
-        PartitionTransform::Truncate {
-            width,
-            column: value,
-            ..
-        } => IcebergPartitionFieldExpr::Truncate {
-            column: column(value),
-            width: u32::try_from(*width)
-                .map_err(|_| "partition truncate width exceeds u32".to_string())?,
-        },
-    })
 }
 
 fn lower_iceberg_command(
@@ -582,13 +459,20 @@ fn lower_iceberg_action(
                     name: name.value.clone(),
                     if_not_exists: *if_not_exists,
                     or_replace: *or_replace,
-                    anchor: match anchor {
-                        ReferenceAnchor::CurrentMain => ReferenceAnchorSql::CurrentMain,
+                    snapshot_id: match anchor {
+                        ReferenceAnchor::CurrentMain => None,
                         ReferenceAnchor::Version(value) => {
-                            ReferenceAnchorSql::Version(lower_command_literal(value)?)
+                            let CommandLiteral::Number(value) = lower_command_literal(value)?
+                            else {
+                                return Err(
+                                    "Iceberg reference version must be a numeric literal".into()
+                                );
+                            };
+                            Some(value.parse::<i64>().map_err(|_| {
+                                "Iceberg reference version must fit i64".to_string()
+                            })?)
                         }
                     },
-                    has_uninterpreted_provider_options: false,
                 }
             }
             IcebergReferenceAction::Drop {
@@ -801,11 +685,13 @@ fn lower_statistics_command(
     Ok(match statement {
         StatisticsStatement::AnalyzeTable(statement) => StatisticsSqlCommand::AnalyzeTable {
             table: lower_object_name(&statement.name),
-            columns: statement
-                .columns
-                .iter()
-                .map(|column| column.value.clone())
-                .collect(),
+            columns: (!statement.columns.is_empty()).then(|| {
+                statement
+                    .columns
+                    .iter()
+                    .map(|column| column.value.clone())
+                    .collect()
+            }),
         },
         StatisticsStatement::ShowStats(statement) => StatisticsSqlCommand::ShowStats {
             table: lower_object_name(&statement.name),
@@ -920,7 +806,9 @@ fn lower_command_literal(
     }
 }
 
-fn lower_object_name(name: &novarocks_parser::ast::ObjectName) -> ObjectName {
+/// Temporary projection for the original parser's governed DDL caller.
+/// Retired together with that parser entry at the hard switch.
+pub fn lower_object_name(name: &novarocks_parser::ast::ObjectName) -> ObjectName {
     ObjectName {
         parts: name.parts.iter().map(|part| part.value.clone()).collect(),
     }
@@ -1360,7 +1248,7 @@ mod tests {
                     table: novarocks_sql::semantic::ObjectName {
                         parts: vec!["ice".to_string(), "db".to_string(), "events".to_string()],
                     },
-                    columns: vec!["id".to_string(), "kind".to_string()],
+                    columns: Some(vec!["id".to_string(), "kind".to_string()]),
                 }
             ))
         );
@@ -1395,21 +1283,16 @@ mod tests {
 
     #[test]
     fn table_lowering_retains_complete_creation_facts_without_parser_values() {
-        let statement = parse_single_statement(
-            "CREATE TABLE IF NOT EXISTS ice.db.orders (id INT NOT NULL DEFAULT 7 COMMENT 'key') \
-             PRIMARY KEY (id) PARTITION BY day(id) DISTRIBUTED BY HASH (id) BUCKETS 4 \
-             ORDER BY (id) COMMENT 'orders' PROPERTIES ('format-version' = '3')",
-        )
-        .expect("parse create table");
-
-        let Some(ProductSqlCommand::Catalog(boxed_command)) =
-            lower_product_sql_command(&statement).expect("lower command")
-        else {
-            panic!("expected semantic CREATE TABLE command");
-        };
-        let CatalogSqlCommand::CreateTable(command) = *boxed_command else {
-            panic!("expected semantic CREATE TABLE command");
-        };
+        use novarocks_spi::connector::{ConnectorPartitionTransform as P, DdlPropertyValue as V};
+        let sql = "CREATE TABLE IF NOT EXISTS ice.db.orders (id INT NOT NULL DEFAULT 7 COMMENT 'key') PRIMARY KEY(id) PARTITION BY day(id) DISTRIBUTED BY HASH(id) BUCKETS 4 COMMENT 'orders' PROPERTIES('format-version'='3')";
+        let partition = Some((
+            vec![P::Day {
+                column: "id".into(),
+            }],
+            V::ArrayVarchar(vec![Some("day(id)".into())]),
+        ));
+        let command =
+            super::legacy_table::test_support::simple(sql, 3, "orders", partition.clone()).unwrap();
         assert!(command.if_not_exists);
         assert_eq!(command.name.parts, ["ice", "db", "orders"]);
         assert_eq!(command.columns.len(), 1);
@@ -1421,18 +1304,33 @@ mod tests {
             command.columns[0].comment,
             Some(CommandLiteral::String("key".to_string()))
         );
-        let plain = parse_single_statement(
-            "CREATE TABLE IF NOT EXISTS ice.db.orders (id INT NOT NULL DEFAULT 7 COMMENT 'key') \
-             PARTITION BY day(id) ORDER BY (id) COMMENT 'orders' PROPERTIES ('format-version' = '3')",
-        ).expect("same effective CREATE without legacy key/distribution");
+        let plain = "CREATE TABLE IF NOT EXISTS ice.db.orders (id INT NOT NULL DEFAULT 7 COMMENT 'key') PARTITION BY day(id) COMMENT 'orders' PROPERTIES('format-version'='3')";
         assert_eq!(
-            Some(ProductSqlCommand::Catalog(Box::new(
-                CatalogSqlCommand::CreateTable(command.clone())
-            ))),
-            lower_product_sql_command(&plain).unwrap()
+            command,
+            super::legacy_table::test_support::simple(plain, 3, "orders", partition).unwrap()
         );
-        assert_eq!(command.order_by, ["id"]);
-        assert_eq!(command.properties.len(), 1);
+        assert_eq!(command.comment, Some("orders".into()));
+        assert_eq!(
+            command.properties,
+            vec![
+                ("format".into(), V::Varchar("PARQUET".into())),
+                ("format_version".into(), V::Integer(3)),
+                (
+                    "partitioning".into(),
+                    V::ArrayVarchar(vec![Some("day(id)".into())])
+                )
+            ]
+        );
+        let original_with_order = "CREATE TABLE IF NOT EXISTS ice.db.orders (id INT NOT NULL DEFAULT 7 COMMENT 'key') PRIMARY KEY(id) PARTITION BY day(id) DISTRIBUTED BY HASH(id) BUCKETS 4 ORDER BY(id) COMMENT 'orders' PROPERTIES('format-version'='3')";
+        let error =
+            super::legacy_table::test_support::simple(original_with_order, 3, "orders", None)
+                .unwrap_err();
+        assert_eq!(error.message(), "CREATE TABLE does not support ORDER BY");
+        let parsed = parse_single_statement(sql).unwrap();
+        assert_eq!(
+            lower_product_sql_command(&parsed).unwrap_err(),
+            "CREATE TABLE requires evaluated property preparation"
+        );
     }
 
     #[test]
@@ -1441,10 +1339,10 @@ mod tests {
             let source = format!(
                 "CREATE TABLE ice.db.opaque (payload {data_type}) DISTRIBUTED BY HASH(payload) BUCKETS 4"
             );
-            let statement = parse_single_statement(&source).expect("old distribution syntax");
-            let error = lower_product_sql_command(&statement).expect_err("opaque distribution key");
+            let error =
+                super::legacy_table::test_support::simple(&source, 3, "unused", None).unwrap_err();
             assert_eq!(
-                error,
+                error.message(),
                 format!(
                     "BITMAP/HLL columns cannot be used as distribution key (column `payload` has type {:?})",
                     if data_type == "BITMAP" {
@@ -1455,38 +1353,29 @@ mod tests {
                 )
             );
         }
-        let statement = parse_single_statement(
-            "CREATE TABLE ice.db.too_many_buckets (id INT) DISTRIBUTED BY HASH(id) BUCKETS 4294967296",
-        ).expect("old bucket syntax retains u64 source value");
-        assert_eq!(
-            lower_product_sql_command(&statement).unwrap_err(),
-            "distribution bucket count exceeds u32"
-        );
-        let statement =
-            parse_single_statement("CREATE TABLE ice.db.missing_key (id INT) PRIMARY KEY(missing)")
-                .expect("old key syntax");
-        assert_eq!(
-            lower_product_sql_command(&statement).unwrap_err(),
-            "Iceberg key column `missing` does not exist"
-        );
+        for (source, message) in [
+            (
+                "CREATE TABLE ice.db.too_many_buckets (id INT) DISTRIBUTED BY HASH(id) BUCKETS 4294967296",
+                "distribution bucket count exceeds u32",
+            ),
+            (
+                "CREATE TABLE ice.db.missing_key (id INT) PRIMARY KEY(missing)",
+                "Iceberg key column `missing` does not exist",
+            ),
+        ] {
+            let error =
+                super::legacy_table::test_support::simple(source, 3, "unused", None).unwrap_err();
+            assert_eq!(error.message(), message);
+        }
     }
 
     #[test]
     fn legacy_known_column_aggregation_does_not_change_effective_create_command() {
-        let decorated = parse_single_statement(
-            "CREATE TABLE ice.db.measures (id BIGINT SUM NOT NULL DEFAULT 7 COMMENT 'id') \
-             AGGREGATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4 \
-             COMMENT 'table' PROPERTIES('format-version'='3')",
-        )
-        .expect("old aggregation syntax");
-        let plain = parse_single_statement(
-            "CREATE TABLE ice.db.measures (id BIGINT NOT NULL DEFAULT 7 COMMENT 'id') \
-             COMMENT 'table' PROPERTIES('format-version'='3')",
-        )
-        .expect("same effective defaults and comments");
+        let decorated = "CREATE TABLE ice.db.measures (id BIGINT SUM NOT NULL DEFAULT 7 COMMENT 'id') AGGREGATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4 COMMENT 'table' PROPERTIES('format-version'='3')";
+        let plain = "CREATE TABLE ice.db.measures (id BIGINT NOT NULL DEFAULT 7 COMMENT 'id') COMMENT 'table' PROPERTIES('format-version'='3')";
         assert_eq!(
-            lower_product_sql_command(&decorated).unwrap(),
-            lower_product_sql_command(&plain).unwrap()
+            super::legacy_table::test_support::simple(decorated, 3, "table", None).unwrap(),
+            super::legacy_table::test_support::simple(plain, 3, "table", None).unwrap()
         );
     }
 

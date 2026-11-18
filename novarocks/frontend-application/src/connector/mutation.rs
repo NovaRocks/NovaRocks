@@ -168,8 +168,35 @@ pub(crate) fn command_error_from_connector(
     let control = cause
         .downcast_ref::<novarocks_type_contract::CompileControlError>()
         .cloned();
-    novarocks_query_application::api::CommandError::from_failure_cause(cause)
-        .with_compile_control(control)
+    let user = table_property_user_error(&cause, cause.detail());
+    command_failure_with_projection(cause, user).with_compile_control(control)
+}
+
+fn table_property_user_error(
+    cause: &novarocks_failure_contract::SharedFailureCause,
+    detail: &str,
+) -> Option<novarocks_user_error::UserError> {
+    is_table_property_failure(cause).then(|| {
+        novarocks_query_application::sql::property_admit::DdlPropertyScope::Table
+            .without_location(detail)
+    })
+}
+
+fn is_table_property_failure(cause: &novarocks_failure_contract::SharedFailureCause) -> bool {
+    cause.failure_fact().class() == novarocks_failure_contract::FailureClass::Data
+        && cause
+            .downcast_ref::<novarocks_spi::connector::InvalidTableProperty>()
+            .is_some()
+}
+
+fn command_failure_with_projection(
+    cause: novarocks_failure_contract::SharedFailureCause,
+    user: Option<novarocks_user_error::UserError>,
+) -> CommandError {
+    match user {
+        Some(user) => CommandError::from_user_error_with_cause(user, cause),
+        None => CommandError::from_failure_cause(cause),
+    }
 }
 
 fn connector_failure_cause(
@@ -245,7 +272,7 @@ impl FailureProjection for CatalogMutationCommandFailure {
 pub(crate) fn present_catalog_mutation_command_result(
     result: ResolvedCatalogMutation,
 ) -> Result<CompletedCatalogMutation, novarocks_query_application::api::CommandError> {
-    use novarocks_query_application::api::{CommandError, StatementExternalEffectDisposition as D};
+    use novarocks_query_application::api::StatementExternalEffectDisposition as D;
     use novarocks_spi::connector::ExternalMutationEffect;
     let (primary, disposition) = match &result {
         ResolvedCatalogMutation::KnownCommitted(completed) => {
@@ -284,16 +311,21 @@ pub(crate) fn present_catalog_mutation_command_result(
     let control = primary
         .downcast_ref::<novarocks_type_contract::CompileControlError>()
         .cloned();
-    Err(
-        CommandError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(
-            CatalogMutationCommandFailure {
-                primary,
-                outcome: result,
-            },
-        ))
+    // Classify only the real primary marker before wrapping the entire outcome.
+    // The public message still includes original cleanup/publication diagnostics.
+    let property = is_table_property_failure(&primary);
+    let cause =
+        novarocks_failure_contract::SharedFailureCause::new(CatalogMutationCommandFailure {
+            primary,
+            outcome: result,
+        });
+    let user = property.then(|| {
+        novarocks_query_application::sql::property_admit::DdlPropertyScope::Table
+            .without_location(cause.detail())
+    });
+    Err(command_failure_with_projection(cause, user)
         .with_compile_control(control)
-        .with_external_effect_disposition(disposition),
-    )
+        .with_external_effect_disposition(disposition))
 }
 
 /// Executes once and, only for `CommitUnknown`, reconciles once through the
@@ -624,6 +656,7 @@ mod tests {
         instance_id: ConnectorInstanceId,
     ) -> ConnectorCatalogMutationOperation {
         ConnectorCatalogMutationOperation::CreateNamespace {
+            properties: Vec::new(),
             namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
                 instance_id,
                 namespace: Arc::from("db"),
@@ -1138,6 +1171,127 @@ mod tests {
                 matches!(&custody.outcome, ResolvedCatalogMutation::ContractFailure { dispatch: saved, .. } if saved == &dispatch)
             );
             assert!(error.compile_control_error().is_some());
+        }
+    }
+    #[test]
+    fn property_marker_retains_complete_uncommitted_outcome_and_late_effect_through_service() {
+        use novarocks_spi::connector::{ConnectorErrorKind, InvalidTableProperty};
+        let original = ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "actual property value rejected",
+        );
+        let marked = InvalidTableProperty::from_property_error(original.clone());
+        assert_eq!(
+            InvalidTableProperty::from_connector_error(&marked)
+                .unwrap()
+                .source_error(),
+            &original
+        );
+        let original_property_cause = std::error::Error::source(&marked)
+            .unwrap()
+            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            .unwrap()
+            .clone();
+        let failure = ConnectorMutationFailure::from_connector(marked.clone());
+        let cleanup = ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Internal,
+            "original artifact cleanup",
+        ));
+        let command =
+            present_catalog_mutation_command_result(ResolvedCatalogMutation::KnownUncommitted {
+                failure,
+                cleanup: cleanup.clone(),
+            })
+            .unwrap_err();
+        assert_eq!(
+            command.user_error().unwrap().code().as_str(),
+            "sql.admit.invalid_table_property"
+        );
+        assert!(command.user_error().unwrap().location().is_none());
+        assert!(command.to_string().contains("original artifact cleanup"));
+        let cause = command.failure_cause().unwrap().clone();
+        let custody = cause
+            .downcast_ref::<CatalogMutationCommandFailure>()
+            .unwrap();
+        assert!(
+            custody
+                .primary
+                .downcast_ref::<InvalidTableProperty>()
+                .is_some()
+        );
+        assert_eq!(custody.primary, original_property_cause);
+        let ResolvedCatalogMutation::KnownUncommitted {
+            failure,
+            cleanup: retained,
+        } = &custody.outcome
+        else {
+            panic!("retain actual outcome")
+        };
+        assert_eq!(retained, &cleanup);
+        assert_eq!(failure.connector_source(), Some(&marked));
+        assert_eq!(cause.failure_fact(), original.failure_fact());
+        assert_eq!(
+            command.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownUncommitted)
+        );
+        // Late accumulated effects remain independent of the property descriptor.
+        let service =
+            crate::query::product_command_service_error(command.with_external_effect_disposition(
+                Some(StatementExternalEffectDisposition::KnownCommitted),
+            ));
+        assert_eq!(service.failure_cause(), Some(&cause));
+        assert_eq!(
+            service.user_error().unwrap().code().as_str(),
+            "sql.admit.invalid_table_property"
+        );
+        assert_eq!(
+            service.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        );
+        assert!(
+            service
+                .diagnostic_with_external_effect(None)
+                .to_string()
+                .contains("do_not_retry=true")
+        );
+    }
+
+    #[test]
+    fn ordinary_schema_control_capability_and_internal_causes_keep_original_projection() {
+        use novarocks_spi::connector::{ConnectorErrorKind, InvalidTableProperty};
+        for original in [
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "build original schema failed",
+            ),
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "original schema capability",
+            ),
+            ConnectorError::new(ConnectorErrorKind::Internal, "original invariant"),
+            ConnectorError::compile_interruption(
+                novarocks_type_contract::CompileControlError::Cancelled,
+            ),
+        ] {
+            let failure = ConnectorMutationFailure::from_connector(original.clone());
+            let command = present_catalog_mutation_command_result(
+                ResolvedCatalogMutation::KnownUncommitted {
+                    failure,
+                    cleanup: ExternalMutationFinalization::Complete,
+                },
+            )
+            .unwrap_err();
+            assert!(InvalidTableProperty::from_connector_error(&original).is_none());
+            assert!(command.user_error().is_none());
+            let service = crate::query::product_command_service_error(command);
+            assert_eq!(
+                service.execution_failure().unwrap().fact(),
+                original.failure_fact()
+            );
+            assert_ne!(
+                service.user_error().unwrap().code().as_str(),
+                "sql.admit.invalid_table_property"
+            );
         }
     }
 }

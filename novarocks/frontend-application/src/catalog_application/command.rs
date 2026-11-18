@@ -28,15 +28,13 @@ use novarocks_types::naming::normalize_identifier;
 use std::sync::Arc;
 
 use crate::catalog_application::create_table_ddl::build_iceberg_create_table_ddl;
-use crate::catalog_application::model::{CatalogCreateTableKind, CatalogCreateTableRequest};
 use crate::catalog_application::query_catalog::{CatalogServiceSource, QueryCatalogService};
 use crate::catalog_application::resolver::CatalogAdmission;
 use crate::catalog_application::statement::{
     CatalogDropContext, CatalogMutationContext, execute_create_database_statement,
-    execute_create_table_statement, execute_drop_catalog_statement,
-    execute_drop_database_statement, execute_drop_table_statement,
-    lower_semantic_create_table_statement, lower_semantic_iceberg_partition_change,
-    lower_semantic_iceberg_properties_action, lower_semantic_iceberg_schema_change,
+    execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
+    lower_semantic_iceberg_partition_change, lower_semantic_iceberg_properties_action,
+    lower_semantic_iceberg_schema_change,
 };
 use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
@@ -44,9 +42,7 @@ use novarocks_query_application::api::{CommandError, build_utf8_query_result};
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::semantic::command::CatalogCreateCommand as SemanticCatalogCreateCommand;
-use novarocks_sql::semantic::command::{
-    AlterIcebergTableSqlCommand, CreateTableSqlCommand, IcebergTableSqlAction,
-};
+use novarocks_sql::semantic::command::{AlterIcebergTableSqlCommand, IcebergTableSqlAction};
 use novarocks_sql::semantic::{CatalogSqlCommand, ObjectName, TableColumnDef};
 
 /// Catalog DDL capability built from catalog-only leaf ports.
@@ -118,6 +114,39 @@ impl CatalogCommandExecutor {
         }
     }
 
+    /// Resolve the existing source and retain one actual metadata generation.
+    /// No table read or mutation capability is derived by this preparation.
+    pub(crate) fn acquire_table_read_binding(
+        &self,
+        name: &ObjectName,
+        request_context: &novarocks_query_application::admitted_query_context::RequestContext,
+    ) -> Result<novarocks_query_application::api::CatalogTableReadBinding, CommandError> {
+        let source = crate::catalog_application::resolver::resolve_existing_table_target(
+            self,
+            name,
+            request_context.session().current_catalog(),
+            request_context.session().current_database(),
+        )?;
+        let instance_id = ConnectorInstanceId::parse(&source.catalog)
+            .map_err(|cause| CommandError::from(cause.to_string()))?;
+        let planning = self
+            .connector_control
+            .acquire_current(&instance_id)
+            .map_err(|cause| {
+                CommandError::from_failure_cause(
+                    novarocks_failure_contract::SharedFailureCause::new(cause),
+                )
+            })?;
+        novarocks_query_application::api::CatalogTableReadBinding::try_new(
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(source.namespace),
+                table: Arc::from(source.table),
+            },
+            planning,
+        )
+    }
+
     /// Resolve only the semantic target and retain its actual control
     /// generation. This performs no table read or mutation dispatch.
     pub(crate) fn acquire_table_property_binding(
@@ -183,10 +212,12 @@ impl CatalogCommandExecutor {
             CatalogSqlCommand::CreateDatabase {
                 name,
                 if_not_exists,
+                properties,
             } => execute_create_database_statement(
                 self,
                 name,
                 *if_not_exists,
+                properties,
                 current_catalog,
                 connector_context,
             ),
@@ -229,34 +260,6 @@ impl CatalogCommandExecutor {
                 Err(("catalog command belongs to a dedicated semantic adapter".to_string()).into())
             }
         }
-    }
-
-    /// Executes an admitted semantic `CREATE TABLE` command.
-    pub fn execute_table_command(
-        &self,
-        command: &CreateTableSqlCommand,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, CommandError> {
-        if let Some(source) = &command.like {
-            return execute_create_table_like(
-                self,
-                command.name.clone(),
-                source.clone(),
-                command.if_not_exists,
-                current_catalog,
-                current_database,
-                connector_context,
-            );
-        }
-        execute_create_table_statement(
-            self,
-            lower_semantic_create_table_statement(command)?,
-            current_catalog,
-            current_database,
-            connector_context,
-        )
     }
 
     /// Executes a semantic Iceberg `ALTER TABLE` command owned by the catalog
@@ -495,6 +498,10 @@ fn execute_alter_iceberg_schema(
             comment: Arc::from(comment),
         },
     };
+    let control = crate::query_execution::planning::sql_compile_control_from_connector_request(
+        connector_context,
+    );
+    let change = bind_legacy_column_procedure(&target.provider_id, change, &control)?;
     execute_admitted_alter_schema(
         executor.connector_control.as_ref(),
         &instance_id,
@@ -528,6 +535,118 @@ fn execute_alter_iceberg_schema(
     )?;
     crate::catalog_application::resolver::invalidate_iceberg_caches(executor, &target)?;
     Ok(StatementResult::Ok)
+}
+
+fn bind_legacy_column_procedure(
+    provider: &novarocks_spi::connector::ConnectorProviderId,
+    change: novarocks_spi::connector::ConnectorSchemaChange,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_spi::connector::ConnectorSchemaChange, CommandError> {
+    use novarocks_query_application::sql::table_procedure::{
+        BoundProcedureArgument, BoundProcedureValue, LegacyProcedureValue,
+        bind_legacy_procedure_arguments, resolve_legacy_table_procedure,
+    };
+    use novarocks_spi::connector::{
+        ConnectorColumnPosition, ConnectorSchemaChange, DdlPropertyValue,
+    };
+
+    // Other providers retain their original schema admission and error owner.
+    if provider.as_str() != "iceberg" {
+        return Ok(change);
+    }
+    let (name, path, position) = match &change {
+        ConnectorSchemaChange::ReorderColumn { path, position } => {
+            let position = match position {
+                ConnectorColumnPosition::First => ("FIRST", None),
+                ConnectorColumnPosition::After { column } => ("AFTER", Some(column.as_ref())),
+                ConnectorColumnPosition::Before { column } => ("BEFORE", Some(column.as_ref())),
+                ConnectorColumnPosition::Default => return Ok(change),
+            };
+            ("move_column", path, Some(position))
+        }
+        ConnectorSchemaChange::SetColumnNullability {
+            path,
+            nullable: false,
+        } => ("set_column_not_null", path, None),
+        _ => return Ok(change),
+    };
+    let mut arguments = vec![("column", LegacyProcedureValue::ColumnPath(path))];
+    if let Some((position, reference)) = position {
+        arguments.push(("position", LegacyProcedureValue::Varchar(position)));
+        if let Some(reference) = reference {
+            arguments.push(("reference", LegacyProcedureValue::Varchar(reference)));
+        }
+    }
+
+    let procedure = resolve_legacy_table_procedure(provider, name)
+        .map_err(crate::query::procedure_command_error)?;
+    let bound = bind_legacy_procedure_arguments(procedure, &arguments, control)
+        .map_err(crate::query::procedure_command_error)?;
+    let mismatch = || {
+        CommandError::new(
+            novarocks_query_application::api::CommandErrorKind::Failed,
+            "Legacy column arguments differ from their original procedure declaration",
+        )
+    };
+    let mut slots = bound
+        .into_arguments()
+        .map(|(slot, argument)| (slot.name, argument));
+    let Some((
+        "column",
+        BoundProcedureArgument::Present {
+            value: BoundProcedureValue::LegacyColumnPath(path),
+            ..
+        },
+    )) = slots.next()
+    else {
+        return Err(mismatch());
+    };
+    if position.is_none() {
+        if slots.len() != 0 {
+            return Err(mismatch());
+        }
+        return Ok(ConnectorSchemaChange::SetColumnNullability {
+            path,
+            nullable: false,
+        });
+    }
+    let Some((
+        "position",
+        BoundProcedureArgument::Present {
+            value: BoundProcedureValue::Value(DdlPropertyValue::Varchar(position)),
+            ..
+        },
+    )) = slots.next()
+    else {
+        return Err(mismatch());
+    };
+    let position = match (position.as_str(), slots.next()) {
+        ("FIRST", Some(("reference", BoundProcedureArgument::Omitted))) => {
+            ConnectorColumnPosition::First
+        }
+        (
+            position @ ("AFTER" | "BEFORE"),
+            Some((
+                "reference",
+                BoundProcedureArgument::Present {
+                    value: BoundProcedureValue::Value(DdlPropertyValue::Varchar(column)),
+                    ..
+                },
+            )),
+        ) => {
+            let column = Arc::from(column);
+            if position == "AFTER" {
+                ConnectorColumnPosition::After { column }
+            } else {
+                ConnectorColumnPosition::Before { column }
+            }
+        }
+        _ => return Err(mismatch()),
+    };
+    if slots.len() != 0 {
+        return Err(mismatch());
+    }
+    Ok(ConnectorSchemaChange::ReorderColumn { path, position })
 }
 
 /// Admit the complete schema mutation before any metadata-dependent guard.
@@ -619,55 +738,9 @@ fn execute_alter_partition_spec(
     Ok(StatementResult::Ok)
 }
 
-fn execute_create_table_like(
-    executor: &CatalogCommandExecutor,
-    target: ObjectName,
-    source: ObjectName,
-    if_not_exists: bool,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, CommandError> {
-    let source_target = crate::catalog_application::resolver::resolve_existing_table_target(
-        executor,
-        &source,
-        current_catalog,
-        current_database,
-    )?;
-    let source_table = crate::connector::metadata_load_table(
-        executor.connector_control.as_ref(),
-        connector_context.clone(),
-        &source_target.catalog,
-        &source_target.namespace,
-        &source_target.table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-    )?
-    .0;
-    let columns = source_table
-        .columns
-        .iter()
-        .map(create_like_column)
-        .collect::<Result<Vec<_>, String>>()?;
-    execute_create_table_statement(
-        executor,
-        CatalogCreateTableRequest {
-            name: target,
-            kind: CatalogCreateTableKind::Iceberg {
-                columns,
-                partition_fields: Vec::new(),
-                properties: Vec::new(),
-            },
-            if_not_exists,
-        },
-        current_catalog,
-        current_database,
-        connector_context,
-    )
-}
-
 /// Copy the source's complete declaration. A shared Arrow carrier alone
 /// cannot distinguish Variant from binary, including inside nested columns.
-fn create_like_column(
+pub(crate) fn create_like_column(
     column: &novarocks_types::schema::ColumnDef,
 ) -> Result<TableColumnDef, String> {
     let declared = column
@@ -749,6 +822,117 @@ mod tests {
     use novarocks_spi::connector as spi;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn legacy_column_procedure_arguments_keep_authored_segments_and_sibling_position() {
+        use crate::catalog_application::statement::{
+            IcebergSchemaChange, connector_schema_path, connector_schema_position,
+            lower_semantic_iceberg_schema_change,
+        };
+        use novarocks_query_application::sql::{
+            ProductSqlCommand, lower_product_sql_command, parse_single_statement,
+        };
+        use novarocks_sql::compiler::SqlCompileControl;
+
+        let provider = spi::ConnectorProviderId::parse("iceberg").unwrap();
+        let control = SqlCompileControl::unbounded();
+        for (suffix, expected_segments, expected_position, expected_nullable) in [
+            (
+                "parent_field.child_field AFTER parent_field.sibling",
+                &["parent_field", "child_field"][..],
+                Some(spi::ConnectorColumnPosition::After {
+                    column: Arc::from("sibling"),
+                }),
+                None,
+            ),
+            (
+                "`dot.name` FIRST",
+                &["dot.name"][..],
+                Some(spi::ConnectorColumnPosition::First),
+                None,
+            ),
+            (
+                "parent_field.child_field BEFORE parent_field.sibling",
+                &["parent_field", "child_field"][..],
+                Some(spi::ConnectorColumnPosition::Before {
+                    column: Arc::from("sibling"),
+                }),
+                None,
+            ),
+            (
+                "`dot.name` SET NOT NULL",
+                &["dot.name"][..],
+                None,
+                Some(false),
+            ),
+            (
+                "`dot.name` DROP NOT NULL",
+                &["dot.name"][..],
+                None,
+                Some(true),
+            ),
+        ] {
+            let source = format!("ALTER TABLE ice.db.orders ALTER COLUMN {suffix}");
+            let parsed = parse_single_statement(&source).unwrap();
+            let Some(ProductSqlCommand::Catalog(command)) =
+                lower_product_sql_command(&parsed).unwrap()
+            else {
+                panic!("original ALTER TABLE lowerer");
+            };
+            let super::CatalogSqlCommand::AlterIcebergTable(command) = *command else {
+                panic!("original Iceberg ALTER TABLE lowerer");
+            };
+            let super::IcebergTableSqlAction::Schema(change) = command.action else {
+                panic!("original column change lowerer");
+            };
+            let (original_segments, change) =
+                match lower_semantic_iceberg_schema_change(&change).unwrap() {
+                    IcebergSchemaChange::Reorder { path, position } => {
+                        let path = connector_schema_path(path);
+                        (
+                            path.segments.clone(),
+                            spi::ConnectorSchemaChange::ReorderColumn {
+                                path,
+                                position: connector_schema_position(position),
+                            },
+                        )
+                    }
+                    IcebergSchemaChange::SetNullable { path, nullable } => {
+                        let path = connector_schema_path(path);
+                        (
+                            path.segments.clone(),
+                            spi::ConnectorSchemaChange::SetColumnNullability { path, nullable },
+                        )
+                    }
+                    _ => panic!("expected the original position or nullable change"),
+                };
+            let bound = super::bind_legacy_column_procedure(&provider, change, &control).unwrap();
+            let path = match bound {
+                spi::ConnectorSchemaChange::ReorderColumn { path, position } => {
+                    assert_eq!(Some(position), expected_position);
+                    assert_eq!(expected_nullable, None);
+                    path
+                }
+                spi::ConnectorSchemaChange::SetColumnNullability { path, nullable } => {
+                    assert_eq!(Some(nullable), expected_nullable);
+                    assert_eq!(expected_position, None);
+                    path
+                }
+                _ => panic!("expected the bound position or nullable change"),
+            };
+            assert_eq!(
+                path.segments.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+                expected_segments
+            );
+            assert!(
+                path.segments
+                    .iter()
+                    .zip(original_segments)
+                    .all(|(bound, original)| Arc::ptr_eq(bound, &original)),
+                "binding retains the original segment allocations"
+            );
+        }
+    }
 
     // These correctness tests exercise the FE sequencing boundary through real
     // SPI leases. Metadata and mutation calls record their own observations;
@@ -1039,6 +1223,69 @@ mod tests {
             })
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn table_read_binding_keeps_source_generation_without_write_or_mutation() {
+        use novarocks_query_application::api::CatalogTableReadBinding;
+        let (resolver, original, operation, _context) = schema_alter_fixture(None, false);
+        let spi::ConnectorCatalogMutationOperation::AlterSchema { table, .. } = &operation else {
+            panic!("original fixture table");
+        };
+        let original_binding = &resolver.bindings[0];
+        let source = Arc::new(
+            spi::ConnectorControlBinding::try_new(
+                original_binding.descriptor().clone(),
+                original_binding.incarnation(),
+                original_binding.metadata().clone(),
+                original_binding.planning().clone(),
+                original_binding.execution_distribution().clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(source.write().is_none());
+        assert!(source.mutation().is_none());
+        let releases = Arc::new(AtomicUsize::new(0));
+        let release = releases.clone();
+        let planning = spi::ConnectorControlPlanningPin::new(source.clone(), move || {
+            release.fetch_add(1, Ordering::SeqCst);
+        });
+        let retained = planning.clone();
+        let mut foreign = table.clone();
+        foreign.instance_id = spi::ConnectorInstanceId::parse("foreign").unwrap();
+        let error = CatalogTableReadBinding::try_new(foreign, planning.clone())
+            .err()
+            .expect("foreign read instance");
+        assert_eq!(
+            error
+                .failure_cause()
+                .unwrap()
+                .downcast_ref::<spi::ConnectorError>()
+                .unwrap()
+                .kind(),
+            spi::ConnectorErrorKind::Internal
+        );
+        let binding = CatalogTableReadBinding::try_new(table.clone(), planning).unwrap();
+        assert_eq!(binding.table(), table);
+        assert!(Arc::ptr_eq(binding.planning().binding(), &source));
+        assert_eq!(
+            binding.planning().binding().incarnation(),
+            source.incarnation()
+        );
+        assert_eq!(
+            binding.planning().control_runtime_id(),
+            source.control_runtime_id()
+        );
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        let (actual_table, planning) = binding.into_parts();
+        assert_eq!(&actual_table, table);
+        drop(retained);
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        assert!(original.calls.lock().unwrap().is_empty());
+        assert_eq!(resolver.acquired.load(Ordering::SeqCst), 0);
+        drop(planning);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
     #[test]

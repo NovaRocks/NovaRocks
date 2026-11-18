@@ -272,6 +272,17 @@ impl CommandError {
         failure
     }
 
+    /// Retain the original complete domain outcome beside its owner's explicit
+    /// user descriptor. No message or generic failure kind selects that scope.
+    pub fn from_user_error_with_cause(
+        error: novarocks_user_error::UserError,
+        cause: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
+        let mut failure = Self::from_user_error(error);
+        failure.failure_cause = Some(cause);
+        failure
+    }
+
     pub fn user_error(&self) -> Option<&novarocks_user_error::UserError> {
         self.user_error.as_ref()
     }
@@ -377,6 +388,42 @@ impl Error for CommandError {
     }
 }
 
+/// The actual read source and its original retained metadata generation.
+/// This binding grants no I/O, Root, mutation, or publication authority.
+pub struct CatalogTableReadBinding {
+    table: ConnectorTableIdentity,
+    planning: ConnectorControlPlanningPin,
+}
+
+impl CatalogTableReadBinding {
+    pub fn try_new(
+        table: ConnectorTableIdentity,
+        planning: ConnectorControlPlanningPin,
+    ) -> Result<Self, CommandError> {
+        if table.instance_id != planning.binding().descriptor().instance_id {
+            return Err(CommandError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::Internal,
+                        "Table read source does not match its original planning instance",
+                    ),
+                ),
+            ));
+        }
+        Ok(Self { table, planning })
+    }
+
+    pub fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
+    }
+    pub fn planning(&self) -> &ConnectorControlPlanningPin {
+        &self.planning
+    }
+    pub fn into_parts(self) -> (ConnectorTableIdentity, ConnectorControlPlanningPin) {
+        (self.table, self.planning)
+    }
+}
+
 /// The original table target and its retained preparation capabilities.
 /// This is not a final semantic command or an I/O/publication authorization.
 /// The mutation lease is derived once from this exact planning pin; neither
@@ -435,6 +482,18 @@ impl CatalogTablePropertyBinding {
 }
 
 pub trait CatalogCommandConsumer: Send + Sync + 'static {
+    /// Acquire one real read source without deriving a mutation capability.
+    fn acquire_table_read_binding(
+        &self,
+        _name: &novarocks_sql::semantic::ObjectName,
+        _request_context: &RequestContext,
+    ) -> Result<CatalogTableReadBinding, CommandError> {
+        Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "catalog consumer does not provide table read bindings",
+        ))
+    }
+
     /// Acquire the actual target and one retained provider generation for
     /// property preparation under this immutable admitted request.
     fn acquire_table_property_binding(

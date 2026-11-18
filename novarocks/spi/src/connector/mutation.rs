@@ -566,6 +566,7 @@ pub enum ConnectorDropTableDataDisposition {
 pub enum ConnectorCatalogMutationOperation {
     CreateNamespace {
         namespace: ConnectorNamespaceIdentity,
+        properties: Vec<(Arc<str>, super::DdlPropertyValue)>,
         policy: CreatePolicy,
     },
     DropNamespace {
@@ -575,8 +576,8 @@ pub enum ConnectorCatalogMutationOperation {
     CreateTable {
         table: ConnectorTableIdentity,
         columns: Vec<ConnectorColumnDefinition>,
-        partitioning: Vec<ConnectorPartitionTransform>,
-        properties: Vec<(Arc<str>, Arc<str>)>,
+        comment: Option<Arc<str>>,
+        properties: Vec<(Arc<str>, super::DdlPropertyValue)>,
         policy: CreatePolicy,
     },
     /// Typed marker, main-conditioned slot, or full-observation expiry intent.
@@ -606,6 +607,11 @@ pub enum ConnectorCatalogMutationOperation {
         table: ConnectorTableIdentity,
         add: Vec<ConnectorPartitionTransform>,
         drop: Vec<ConnectorPartitionTransform>,
+    },
+    /// User-supplied declared properties evaluated for this table generation.
+    SetTableProperties {
+        table: ConnectorTableIdentity,
+        properties: Vec<(Arc<str>, super::DdlPropertyChange)>,
     },
     AlterProperties {
         table: ConnectorTableIdentity,
@@ -644,6 +650,7 @@ impl ConnectorCatalogMutationOperation {
             Self::DropView { .. } => "drop-view",
             Self::AlterSchema { .. } => "alter-schema",
             Self::AlterPartitionSpec { .. } => "alter-partition-spec",
+            Self::SetTableProperties { .. } => "set-table-properties",
             Self::AlterProperties { .. } => "alter-properties",
             Self::AlterRef { .. } => "alter-ref",
         }
@@ -1135,6 +1142,26 @@ pub trait ConnectorCatalogMutation: Send + Sync {
             "connector catalog mutation does not declare table properties",
         ))
     }
+    /// Pure schema declarations from this exact mutation generation.
+    fn schema_property_declarations(
+        &self,
+    ) -> Result<Vec<super::DdlPropertyDeclaration>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector catalog mutation does not declare schema properties",
+        ))
+    }
+
+    /// Pure branch declarations from this exact mutation generation.
+    fn branch_property_declarations(
+        &self,
+    ) -> Result<Vec<super::DdlPropertyDeclaration>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector catalog mutation does not declare branch properties",
+        ))
+    }
+
     /// Check one scope-canonical name at its original input position. A provider
     /// may reject a recognized unsupported name. Unknown names must remain Ok
     /// so the declaration lookup owner preserves its ordinary unknown error.
@@ -1304,6 +1331,18 @@ impl ConnectorCatalogMutationSession {
         &self,
     ) -> Result<Vec<super::DdlPropertyDeclaration>, ConnectorError> {
         self.mutation.table_property_declarations()
+    }
+
+    pub fn schema_property_declarations(
+        &self,
+    ) -> Result<Vec<super::DdlPropertyDeclaration>, ConnectorError> {
+        self.mutation.schema_property_declarations()
+    }
+
+    pub fn branch_property_declarations(
+        &self,
+    ) -> Result<Vec<super::DdlPropertyDeclaration>, ConnectorError> {
+        self.mutation.branch_property_declarations()
     }
 
     /// Apply the original provider's per-name policy without another lookup.

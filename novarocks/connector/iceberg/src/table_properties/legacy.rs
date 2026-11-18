@@ -25,7 +25,8 @@ use crate::catalog_control::catalog_mutation::{
 use crate::iceberg::spec::{FormatVersion, TableProperties};
 use novarocks_failure_contract::{FailureFact, FailureProjection};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorOperationControl, DdlPropertyValue,
+    ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorPropertyChange,
+    DdlPropertyChange, DdlPropertyValue,
 };
 use std::{collections::HashSet, error::Error, fmt, sync::Arc};
 
@@ -110,6 +111,94 @@ fn copy_text(
     Ok(value)
 }
 
+fn legacy_declared_raw_name(key: &str) -> Option<&'static str> {
+    match key {
+        TableProperties::PROPERTY_DEFAULT_FILE_FORMAT => Some("format"),
+        TableProperties::PROPERTY_COMMIT_NUM_RETRIES => Some("max_commit_retry"),
+        crate::commit::data_writer::PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY => {
+            Some("parquet_writer_row_group_size")
+        }
+        "write.target-file-size-bytes" => Some("target_max_file_size"),
+        TableProperties::PROPERTY_GC_ENABLED => Some("gc_enabled"),
+        "write.data.path" => Some("data_location"),
+        crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY => Some("statistics_collect_on_write"),
+        "novarocks.maintenance.enabled" => Some("maintenance_enabled"),
+        _ => None,
+    }
+}
+
+fn decode_legacy_declared_value(
+    name: &str,
+    value: &str,
+    input_index: usize,
+    control: &dyn ConnectorOperationControl,
+) -> Result<DdlPropertyValue, LegacyTablePropertyPreparationFailure> {
+    let at = |error: ConnectorError| LegacyTablePropertyPreparationFailure::at(input_index, error);
+    Ok(match name {
+        "format_version" => {
+            let version = parse_create_format_version(value).map_err(at)?;
+            DdlPropertyValue::Integer(match version {
+                FormatVersion::V1 => 1,
+                FormatVersion::V2 => 2,
+                FormatVersion::V3 => 3,
+            })
+        }
+        "format" => {
+            super::projection::normalize_declared_format(value).map_err(at)?;
+            DdlPropertyValue::Varchar(copy_text(value, control)?)
+        }
+        "max_commit_retry" => {
+            let number = crate::commit::attempt::parse_retry_count_property_value(value)
+                .map_err(|error| at(scalar(error)))?;
+            let number = i32::try_from(number)
+                .map_err(|_| at(unsupported(Unrepresentable::RetryCountOutsideInteger)))?;
+            DdlPropertyValue::Integer(number)
+        }
+        "parquet_writer_row_group_size" => {
+            let number = crate::commit::data_writer::parse_parquet_row_group_size_property(value)
+                .map_err(|error| {
+                at(ConnectorError::from_domain(
+                    ConnectorErrorKind::InvalidRequest,
+                    error,
+                ))
+            })?;
+            let number = i64::try_from(number)
+                .ok()
+                .filter(|number| {
+                    super::data_size::data_size_range_failure(
+                        super::DataSizeProperty::ParquetWriterRowGroupSize,
+                        *number,
+                    )
+                    .is_none()
+                })
+                .ok_or_else(|| at(unsupported(Unrepresentable::RowGroupOutsideDeclaredSize)))?;
+            DdlPropertyValue::Varchar(format!("{number}B"))
+        }
+        "target_max_file_size" => {
+            let number = crate::storage_inspector::target_file_size_property_value(value)
+                .ok_or_else(|| at(unsupported(Unrepresentable::TargetSizeNotParsed)))?;
+            if number < 0 {
+                return Err(at(unsupported(Unrepresentable::TargetSizeNegative)));
+            }
+            DdlPropertyValue::Varchar(format!("{number}B"))
+        }
+        "gc_enabled" => DdlPropertyValue::Boolean(
+            crate::commit::snapshot_lifecycle_helpers::retention::parse_gc_enabled_property_value(
+                value,
+            )
+            .map_err(|error| at(scalar(error)))?,
+        ),
+        "statistics_collect_on_write" => DdlPropertyValue::Boolean(
+            crate::commit::write_stack::control::collect_on_write_property_enabled(value),
+        ),
+        "maintenance_enabled" => DdlPropertyValue::Boolean(
+            crate::storage_inspector::maintenance_property_enabled(value),
+        ),
+        "data_location" => DdlPropertyValue::Varchar(copy_text(value, control)?),
+        _ => unreachable!("closed declared-name classification above"),
+    })
+}
+
 /// Each success belongs to the same real input ordinal. Extra grouping happens
 /// only after this complete ordered preparation has succeeded.
 pub fn prepare_legacy_create_table_property_inputs(
@@ -136,21 +225,7 @@ pub fn prepare_legacy_create_table_property_inputs(
         let declared = if version {
             Some("format_version")
         } else {
-            match key.as_ref() {
-                TableProperties::PROPERTY_DEFAULT_FILE_FORMAT => Some("format"),
-                TableProperties::PROPERTY_COMMIT_NUM_RETRIES => Some("max_commit_retry"),
-                crate::commit::data_writer::PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY => {
-                    Some("parquet_writer_row_group_size")
-                }
-                "write.target-file-size-bytes" => Some("target_max_file_size"),
-                TableProperties::PROPERTY_GC_ENABLED => Some("gc_enabled"),
-                "write.data.path" => Some("data_location"),
-                crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY => {
-                    Some("statistics_collect_on_write")
-                }
-                "novarocks.maintenance.enabled" => Some("maintenance_enabled"),
-                _ => None,
-            }
+            legacy_declared_raw_name(key)
         };
         let value = if let Some(name) = declared {
             if !declared_names.insert(name) {
@@ -159,73 +234,7 @@ pub fn prepare_legacy_create_table_property_inputs(
                     invalid(format!("duplicate declared Iceberg table property: {name}")),
                 ));
             }
-            let at = |error: ConnectorError| {
-                LegacyTablePropertyPreparationFailure::at(input_index, error)
-            };
-            let parsed = match name {
-                "format_version" => {
-                    let version = parse_create_format_version(value).map_err(at)?;
-                    DdlPropertyValue::Integer(match version {
-                        FormatVersion::V1 => 1,
-                        FormatVersion::V2 => 2,
-                        FormatVersion::V3 => 3,
-                    })
-                }
-                "format" => {
-                    super::projection::normalize_declared_format(value).map_err(at)?;
-                    DdlPropertyValue::Varchar(copy_text(value, control)?)
-                }
-                "max_commit_retry" => {
-                    let number = crate::commit::attempt::parse_retry_count_property_value(value)
-                        .map_err(|error| at(scalar(error)))?;
-                    let number = i32::try_from(number).map_err(|_| {
-                        at(unsupported(Unrepresentable::RetryCountOutsideInteger))
-                    })?;
-                    DdlPropertyValue::Integer(number)
-                }
-                "parquet_writer_row_group_size" => {
-                    let number = crate::commit::data_writer::parse_parquet_row_group_size_property(value)
-                        .map_err(|error| {
-                            at(ConnectorError::from_domain(
-                                ConnectorErrorKind::InvalidRequest,
-                                error,
-                            ))
-                        })?;
-                    let number = i64::try_from(number)
-                        .ok()
-                        .filter(|number| {
-                            super::data_size::data_size_range_failure(
-                                super::DataSizeProperty::ParquetWriterRowGroupSize,
-                                *number,
-                            )
-                            .is_none()
-                        })
-                        .ok_or_else(|| {
-                            at(unsupported(Unrepresentable::RowGroupOutsideDeclaredSize))
-                        })?;
-                    DdlPropertyValue::Varchar(format!("{number}B"))
-                }
-                "target_max_file_size" => {
-                    let number = crate::storage_inspector::target_file_size_property_value(value)
-                        .ok_or_else(|| at(unsupported(Unrepresentable::TargetSizeNotParsed)))?;
-                    if number < 0 {
-                        return Err(at(unsupported(Unrepresentable::TargetSizeNegative)));
-                    }
-                    DdlPropertyValue::Varchar(format!("{number}B"))
-                }
-                "gc_enabled" => DdlPropertyValue::Boolean(
-                    crate::commit::snapshot_lifecycle_helpers::retention::parse_gc_enabled_property_value(value)
-                        .map_err(|error| at(scalar(error)))?,
-                ),
-                "statistics_collect_on_write" => DdlPropertyValue::Boolean(
-                    crate::commit::write_stack::control::collect_on_write_property_enabled(value),
-                ),
-                "maintenance_enabled" => DdlPropertyValue::Boolean(
-                    crate::storage_inspector::maintenance_property_enabled(value),
-                ),
-                "data_location" => DdlPropertyValue::Varchar(copy_text(value, control)?),
-                _ => unreachable!("closed declared-name classification above"),
-            };
+            let parsed = decode_legacy_declared_value(name, value, input_index, control)?;
             LegacyPreparedTablePropertyValue::Declared {
                 name,
                 value: parsed,
@@ -252,6 +261,91 @@ pub fn prepare_legacy_create_table_property_inputs(
     }
     check(control)?;
     Ok(prepared)
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum LegacyAlterSetPreparation {
+    Typed(Vec<(Arc<str>, DdlPropertyChange)>),
+    KeepRaw { input_index: usize },
+}
+
+/// Only for a legacy user SET batch after the original property mutation
+/// author accepts the raw changes against the loaded table. The caller keeps
+/// that already prepared raw change when these inputs cannot round-trip.
+pub(crate) fn prepare_legacy_alter_set_table_property_inputs(
+    changes: &[ConnectorPropertyChange],
+    control: &dyn ConnectorOperationControl,
+) -> Result<LegacyAlterSetPreparation, ConnectorError> {
+    control.check_active()?;
+    let mut properties = Vec::with_capacity(changes.len());
+    let mut extra = Vec::new();
+    let mut extra_position = None;
+    let keep_raw = |input_index| {
+        control.check_active()?;
+        Ok(LegacyAlterSetPreparation::KeepRaw { input_index })
+    };
+    for (input_index, change) in changes.iter().enumerate() {
+        control.check_active()?;
+        let ConnectorPropertyChange::Set { key, value } = change else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "Legacy SET property preparation requires an already checked SET batch",
+            ));
+        };
+        let (name, typed) = if let Some(name) = legacy_declared_raw_name(key) {
+            match decode_legacy_declared_value(name, value, input_index, control) {
+                Ok(value) => (name, value),
+                // An indexed refusal comes from a known legacy reader or its
+                // representable range. The original ALTER writer accepted bytes.
+                Err(failure) if failure.input_index.is_some() => return keep_raw(input_index),
+                Err(failure) => return Err(failure.error),
+            }
+        } else {
+            let key_copy = copy_text(key, control).map_err(|failure| failure.error)?;
+            // Alternate format-version spellings were never an ALTER upgrade.
+            // They also cannot pass the declared-key protection for extras.
+            if super::declared_raw_property(key)
+                || super::normalized_extra_property_key(&key_copy) != key_copy
+            {
+                return keep_raw(input_index);
+            }
+            let value_copy = copy_text(value, control).map_err(|failure| failure.error)?;
+            (
+                "extra_properties",
+                DdlPropertyValue::MapVarcharVarchar(vec![(key_copy, Some(value_copy))]),
+            )
+        };
+        let projected = super::projection::project_raw_table_property_set(
+            name,
+            &typed,
+            ExtraPropertyWrite::Alter,
+            control,
+        )?;
+        if !matches!(
+            projected.as_slice(),
+            [ConnectorPropertyChange::Set { key: actual_key, value: actual_value }]
+                if actual_key == key && actual_value == value
+        ) {
+            return keep_raw(input_index);
+        }
+        if let DdlPropertyValue::MapVarcharVarchar(entries) = typed {
+            extra_position.get_or_insert(properties.len());
+            extra.extend(entries);
+        } else {
+            properties.push((Arc::from(name), DdlPropertyChange::Set(typed)));
+        }
+    }
+    if let Some(position) = extra_position {
+        properties.insert(
+            position,
+            (
+                Arc::from("extra_properties"),
+                DdlPropertyChange::Set(DdlPropertyValue::MapVarcharVarchar(extra)),
+            ),
+        );
+    }
+    control.check_active()?;
+    Ok(LegacyAlterSetPreparation::Typed(properties))
 }
 
 /// Temporary inverse of actual old CREATE transform inputs. Remove with the

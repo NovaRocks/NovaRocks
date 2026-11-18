@@ -262,11 +262,12 @@ async fn properties(
                     unreachable!("property preparation retains its original physical table")
                 };
                 let metadata = loaded.table.metadata();
-                let change = prepare_property_change(
+                let change = prepare_legacy_property_change(
                     metadata,
                     changes,
                     *authority,
                     expected_committed_partitioning.as_ref(),
+                    &request.context,
                 )?;
                 let frozen = crate::commit::staging::freeze_existing_change(
                     loaded.table.identifier().clone(),

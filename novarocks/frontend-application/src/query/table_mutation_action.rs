@@ -641,13 +641,24 @@ pub(crate) fn prepare(
     cancellation: QueryCancellationView,
     runtime: tokio::runtime::Handle,
 ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
+    prepare_owned(prepared, command, cpu, cancellation, runtime)
+        .map(|action| Box::new(action) as Box<dyn GovernedStatementAction>)
+}
+
+fn prepare_owned(
+    prepared: PreparedTableMutationInput,
+    command: CommandContext,
+    cpu: InternalResultCpu,
+    cancellation: QueryCancellationView,
+    runtime: tokio::runtime::Handle,
+) -> Result<Action, CommandError> {
     let window = command
         .result_window_alias()
         .ok_or_else(|| work_command(WorkError::Conflict))?;
     if !window.is_for_scope(command.scope()) {
         return Err(work_command(WorkError::Conflict));
     }
-    Ok(Box::new(Action {
+    Ok(Action {
         source: Some(Box::new(Source {
             pending: Some(prepared),
             input: None,
@@ -672,7 +683,7 @@ pub(crate) fn prepare(
         })),
         delivered: false,
         effect: None,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -734,7 +745,7 @@ mod tests {
                         table: Arc::from("t"),
                     },
                     columns: Vec::new(),
-                    partitioning: Vec::new(),
+                    comment: None,
                     properties: Vec::new(),
                     policy: CreatePolicy::FailIfExists,
                 },
@@ -996,3 +1007,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod composition_tests;

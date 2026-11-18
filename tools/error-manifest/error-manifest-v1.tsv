@@ -23,6 +23,7 @@ sql.admit.client_type_unsupported	Admit
 sql.admit.create_table_unsupported_form	Admit
 sql.admit.delete_requires_where	Admit
 sql.admit.delete_unsupported_form	Admit
+sql.admit.duplicate_table_procedure_argument	Admit
 sql.admit.insert_unsupported_form	Admit
 sql.admit.invalid_analyze_property	Admit
 sql.admit.invalid_branch_property	Admit
@@ -30,6 +31,8 @@ sql.admit.invalid_catalog_property	Admit
 sql.admit.invalid_materialized_view_property	Admit
 sql.admit.invalid_schema_property	Admit
 sql.admit.invalid_session_property	Admit
+sql.admit.invalid_table_procedure_argument	Admit
+sql.admit.invalid_table_procedure_arguments	Admit
 sql.admit.invalid_table_property	Admit
 sql.admit.kill_connection_unsupported	Admit
 sql.admit.kill_denied	Admit
@@ -38,6 +41,7 @@ sql.admit.persisted_definition_semantics_unsupported	Admit
 sql.admit.session_catalog_not_found	Admit
 sql.admit.session_global_scope_unsupported	Admit
 sql.admit.session_transaction_unsupported	Admit
+sql.admit.table_procedure_not_found	Admit
 sql.admit.update_unsupported_form	Admit
 sql.analyze.duplicate_column_name	Analyze
 sql.analyze.internal	Analyze

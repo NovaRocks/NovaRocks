@@ -206,3 +206,54 @@ impl fmt::Display for DdlPropertyDeclarationError {
 }
 
 impl std::error::Error for DdlPropertyDeclarationError {}
+
+/// A pure table-property author's user-data refusal, retaining its real cause.
+/// This carries no SQL scope, location, protocol code or mutation authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvalidTableProperty {
+    source: ConnectorError,
+}
+impl InvalidTableProperty {
+    /// Only an actual pure property stage may call this boundary. Ordinary
+    /// schema, identifier, catalog or I/O errors must never enter it.
+    pub fn from_property_error(error: ConnectorError) -> ConnectorError {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        if error.kind() != super::ConnectorErrorKind::InvalidRequest
+            || error.failure_fact().class() != FailureClass::Data
+            || Self::from_connector_error(&error).is_some()
+        {
+            return error;
+        }
+        let message = error.message().to_owned();
+        ConnectorError::from_domain(
+            super::ConnectorErrorKind::InvalidRequest,
+            Self { source: error },
+        )
+        .map_message(|_| message)
+    }
+
+    pub fn from_connector_error(error: &ConnectorError) -> Option<&Self> {
+        std::error::Error::source(error)?
+            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()?
+            .downcast_ref::<Self>()
+    }
+
+    pub fn source_error(&self) -> &ConnectorError {
+        &self.source
+    }
+}
+impl fmt::Display for InvalidTableProperty {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, formatter)
+    }
+}
+impl std::error::Error for InvalidTableProperty {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for InvalidTableProperty {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.source)
+    }
+}

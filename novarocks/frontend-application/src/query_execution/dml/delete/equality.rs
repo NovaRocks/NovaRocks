@@ -82,13 +82,25 @@ pub(super) async fn prepare_equality_delete_statement_async(
     ).await?;
     let target_binding =
         super::load_delete_target_async(target, planning_pin, connector_context).await?;
-    let column_names = stmt
-        .columns
+    let (columns, row_expressions) = (stmt.columns.as_slice(), stmt.rows.as_slice());
+    #[cfg(novarocks_dev_controls)]
+    let (columns, row_expressions) = bind_original_equality_delete_inputs(
+        &target_binding
+            .planning_pin()
+            .binding()
+            .descriptor()
+            .provider_id,
+        columns,
+        row_expressions,
+        &crate::query_execution::planning::sql_compile_control_from_connector_request(
+            connector_context,
+        ),
+    )?;
+    let column_names = columns
         .iter()
         .map(|column| column.value.clone())
         .collect::<Vec<_>>();
-    let rows = stmt
-        .rows
+    let rows = row_expressions
         .iter()
         .map(|row| row.iter().map(lower_literal).collect())
         .collect::<Result<Vec<Vec<_>>, _>>()?;
@@ -126,7 +138,7 @@ pub(super) async fn prepare_equality_delete_statement_async(
     // Provider admission deliberately precedes literal carrier checks. A
     // rejection here leaves the accepted session in the original receiving.
     let delete_fields = input.validate(&rows)?;
-    let delete_query = build_equality_delete_sink_query(&delete_fields, &stmt.rows)?;
+    let delete_query = build_equality_delete_sink_query(&delete_fields, row_expressions)?;
     let (sql_write_input, table_bindings) =
         bind_equality_delete_write(target, target_binding.planning_pin(), &write_session)?;
     Ok(super::PreparedDeleteWrite {
@@ -140,6 +152,59 @@ pub(super) async fn prepare_equality_delete_statement_async(
         connector_context: connector_context.clone(),
         write_session,
     })
+}
+
+#[cfg(novarocks_dev_controls)]
+fn bind_original_equality_delete_inputs<'a>(
+    provider_id: &novarocks_spi::connector::ConnectorProviderId,
+    columns: &'a [ast::Ident],
+    rows: &'a [Vec<Expr>],
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<
+    (&'a [ast::Ident], &'a [Vec<Expr>]),
+    novarocks_query_application::session_error::QueryServiceError,
+> {
+    use novarocks_query_application::{
+        session_error::{QueryServiceError, QueryServiceErrorKind},
+        sql::table_procedure::{
+            BoundProcedureArgument::Present, BoundProcedureValue, LegacyProcedureValue,
+            bind_legacy_procedure_arguments, resolve_legacy_table_procedure,
+        },
+    };
+
+    let procedure = resolve_legacy_table_procedure(provider_id, "add_equality_delete")?;
+    let bound = bind_legacy_procedure_arguments(
+        procedure,
+        &[
+            ("columns", LegacyProcedureValue::EqualityColumns(columns)),
+            ("rows", LegacyProcedureValue::EqualityRows(rows)),
+        ],
+        control,
+    )?;
+    let mut arguments = bound.into_arguments();
+    match (arguments.next(), arguments.next(), arguments.next()) {
+        (
+            Some((
+                column_slot,
+                Present {
+                    value: BoundProcedureValue::LegacyEqualityColumns(columns),
+                    ..
+                },
+            )),
+            Some((
+                row_slot,
+                Present {
+                    value: BoundProcedureValue::LegacyEqualityRows(rows),
+                    ..
+                },
+            )),
+            None,
+        ) if column_slot.name == "columns" && row_slot.name == "rows" => Ok((columns, rows)),
+        _ => Err(QueryServiceError::new(
+            QueryServiceErrorKind::Internal,
+            "Legacy equality-delete binding differs from its original procedure declaration",
+        )),
+    }
 }
 
 fn sql_object_name(name: &ObjectName) -> SqlObjectName {
@@ -1217,6 +1282,64 @@ mod tests {
             );
         }
     }
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn development_equality_procedure_keeps_original_rows_for_the_typed_sink() {
+        use novarocks_parser::ast::{DmlStatement, Statement};
+        use novarocks_spi::connector::{ConnectorProviderId, ConnectorWriteFieldRequest};
+        use novarocks_type_contract::FunctionValueType;
+
+        let sql = "ALTER TABLE t ADD EQUALITY DELETE (`key`) VALUES (9007199254740993.125), (-9007199254740993.125)";
+        let parsed = novarocks_parser::parse(sql).unwrap();
+        let [Statement::Dml(DmlStatement::AddEqualityDelete(statement))] = parsed.as_slice() else {
+            panic!("expected the original equality delete statement");
+        };
+        let context = request_context();
+        let control =
+            crate::query_execution::planning::sql_compile_control_from_connector_request(&context);
+        let provider = ConnectorProviderId::parse("iceberg").unwrap();
+        let (columns, rows) = super::bind_original_equality_delete_inputs(
+            &provider,
+            &statement.columns,
+            &statement.rows,
+            &control,
+        )
+        .unwrap();
+        assert!(std::ptr::eq(columns, statement.columns.as_slice()));
+        assert!(columns[0].quoted);
+        assert_eq!(columns[0].value, "key");
+        assert!(std::ptr::eq(rows, statement.rows.as_slice()));
+        for (row, raw) in rows
+            .iter()
+            .zip(["9007199254740993.125", "-9007199254740993.125"])
+        {
+            let span = row[0].span();
+            assert_eq!(&sql[span.start()..span.end()], raw);
+            super::lower_literal(&row[0]).unwrap();
+        }
+        let data_type = DataType::Decimal128(38, 3);
+        let field = ConnectorWriteFieldRequest::try_new_typed(
+            Field::new("key", data_type.clone(), true),
+            FunctionValueType::new(data_type, true),
+        )
+        .unwrap();
+        let query = super::equality_delete_sink_query_ast(&[field], rows).unwrap();
+        assert_sink_rows(&query, rows);
+
+        let other = ConnectorProviderId::parse("paimon").unwrap();
+        let error = super::bind_original_equality_delete_inputs(
+            &other,
+            &statement.columns,
+            &statement.rows,
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.user_error().unwrap().code().as_str(),
+            "sql.admit.table_procedure_not_found",
+        );
+    }
+
     #[test]
     fn equality_delete_keeps_numeric_spelling_after_literal_admission() {
         for (source, scale) in [

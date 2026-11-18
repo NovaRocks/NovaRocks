@@ -98,7 +98,7 @@ impl CreatePublicationInput {
                 partitioning: plan
                     .partition_fields
                     .iter()
-                    .map(crate::catalog_application::statement::connector_partition_transform)
+                    .map(novarocks_query_application::sql::connector_partition_transform)
                     .collect(),
                 properties: plan
                     .target_properties

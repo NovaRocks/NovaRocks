@@ -17,14 +17,21 @@
 
 //! Closed table-maintenance command capabilities.
 
-use super::TableMaintenanceEngine;
 use std::sync::Arc;
 
 use super::{
     MaintenanceActionState, MaintenanceRequestContext, MaintenanceStatementResult,
     RequestScopedMaintenanceEngine, TableMaintenanceService,
 };
-use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
+use novarocks_query_application::{
+    api::{CommandError, CommandErrorKind},
+    protocol_delivery::QuerySessionOutput as StatementResult,
+    sql::table_procedure::{
+        BoundProcedureArgument, BoundProcedureValue, LegacyProcedureValue, TableProcedureKind,
+        bind_legacy_procedure_arguments, resolve_legacy_table_procedure,
+    },
+};
+use novarocks_table_maintenance::runtime::TerminalError;
 
 /// Foreground maintenance command capability.  Each invocation creates a
 /// short-lived engine carrying only the Frontend-composed maintenance ports
@@ -57,7 +64,7 @@ impl MaintenanceCommandExecutor {
         >,
     ) -> Result<
         Option<Box<dyn novarocks_query_application::session_control::GovernedStatementAction>>,
-        novarocks_table_maintenance::runtime::TerminalError,
+        CommandError,
     > {
         let lowered = crate::table_maintenance::lower_semantic_maintenance_statement(
             command,
@@ -65,26 +72,40 @@ impl MaintenanceCommandExecutor {
                 current_catalog,
                 current_database,
             },
-        )?;
+        )
+        .map_err(legacy_lower_error)?;
         let crate::table_maintenance::ParsedMaintenanceStatement::SubmitOptimize { name_parts } =
             lowered
         else {
             return Ok(None);
         };
-        super::rewrite_job::direct::prepare_optimize(
+        let context = MaintenanceRequestContext {
+            current_catalog,
+            current_database,
+        };
+        let engine = RequestScopedMaintenanceEngine::new(
+            self.kernel.clone(),
+            execution.clone(),
+            connector.clone(),
+        );
+        let (target, provider) = engine
+            .resolve_target_with_provider(&name_parts, context)
+            .map_err(legacy_target_error)?;
+        let bound = bind_legacy_procedure(&provider, "optimize", &[], execution)?;
+        if bound.declaration().kind() != TableProcedureKind::Optimize {
+            return Err(legacy_binding_mismatch());
+        }
+        super::rewrite_job::direct::prepare_resolved_optimize(
             &self.kernel,
-            &name_parts,
-            MaintenanceRequestContext {
-                current_catalog,
-                current_database,
-            },
+            engine,
+            target,
             execution,
-            connector,
             family,
             #[cfg(novarocks_dev_controls)]
             observation,
         )
         .map(Some)
+        .map_err(crate::query::maintenance_command_error)
     }
     pub(crate) fn prepare_direct_rewrite_action(
         &self,
@@ -147,14 +168,15 @@ impl MaintenanceCommandExecutor {
         family: novarocks_result_contract::ClientPresentationFamily,
     ) -> Result<
         Option<Box<dyn novarocks_query_application::session_control::GovernedStatementAction>>,
-        novarocks_table_maintenance::runtime::TerminalError,
+        CommandError,
     > {
         let context = MaintenanceRequestContext {
             current_catalog,
             current_database,
         };
         let lowered =
-            crate::table_maintenance::lower_semantic_maintenance_statement(command, context)?;
+            crate::table_maintenance::lower_semantic_maintenance_statement(command, context)
+                .map_err(legacy_lower_error)?;
         let crate::table_maintenance::ParsedMaintenanceStatement::Execute {
             name_parts,
             action:
@@ -168,9 +190,29 @@ impl MaintenanceCommandExecutor {
             execution.clone(),
             connector.clone(),
         );
-        let target = engine
-            .resolve_target(&name_parts, context)
-            .map_err(novarocks_table_maintenance::runtime::TerminalError::from)?;
+        let (target, provider) = engine
+            .resolve_target_with_provider(&name_parts, context)
+            .map_err(legacy_target_error)?;
+        let older_than_ms = if matches!(
+            command,
+            novarocks_sql::semantic::MaintenanceSqlCommand::RemoveOrphanFiles { .. }
+        ) {
+            let bound = bind_legacy_procedure(
+                &provider,
+                "remove_orphan_files",
+                &[(
+                    "older_than",
+                    LegacyProcedureValue::OlderThanMillis(older_than_ms),
+                )],
+                execution,
+            )?;
+            if bound.declaration().kind() != TableProcedureKind::RemoveOrphanFiles {
+                return Err(legacy_binding_mismatch());
+            }
+            bound_older_than(&bound)?.ok_or_else(legacy_binding_mismatch)?
+        } else {
+            older_than_ms
+        };
         super::cleanup_action::prepare(
             &self.kernel,
             target,
@@ -184,6 +226,7 @@ impl MaintenanceCommandExecutor {
             family,
         )
         .map(Some)
+        .map_err(crate::query::maintenance_command_error)
     }
 
     /// Construct the actual original producer, without polling provider I/O.
@@ -195,14 +238,15 @@ impl MaintenanceCommandExecutor {
         current_database: &str,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<MaintenanceCommandCall, novarocks_table_maintenance::runtime::TerminalError> {
-        let lowered = crate::table_maintenance::lower_semantic_maintenance_statement(
+    ) -> Result<MaintenanceCommandCall, CommandError> {
+        let mut lowered = crate::table_maintenance::lower_semantic_maintenance_statement(
             command,
             MaintenanceRequestContext {
                 current_catalog,
                 current_database,
             },
-        )?;
+        )
+        .map_err(legacy_lower_error)?;
         if !matches!(
             &lowered,
             crate::table_maintenance::ParsedMaintenanceStatement::Execute {
@@ -227,14 +271,16 @@ impl MaintenanceCommandExecutor {
             } => name_parts,
             _ => unreachable!("closed metadata lower"),
         };
-        let target = super::TableMaintenanceEngine::resolve_target(
-            &original_engine,
-            name_parts,
-            MaintenanceRequestContext {
-                current_catalog,
-                current_database,
-            },
-        )?;
+        let (target, provider) = original_engine
+            .resolve_target_with_provider(
+                name_parts,
+                MaintenanceRequestContext {
+                    current_catalog,
+                    current_database,
+                },
+            )
+            .map_err(legacy_target_error)?;
+        bind_original_metadata_arguments(command, &mut lowered, &provider, execution)?;
         let instance = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|e| e.to_string())?;
         let lease = self
@@ -244,9 +290,9 @@ impl MaintenanceCommandExecutor {
             .map_err(|e| e.to_string())?;
         let profile = lease.io_profile().map_err(|e| e.to_string())?;
         let capacity = execution.result_capacity().ok_or_else(|| {
-            novarocks_table_maintenance::runtime::TerminalError::failed(
+            crate::query::maintenance_command_error(TerminalError::failed(
                 "metadata source has no admitted root capacity",
-            )
+            ))
         })?;
         // Frontend fixed Source/header/F inventory is already paid by the
         // original per-root process backing. Do not charge it again here.
@@ -263,7 +309,9 @@ impl MaintenanceCommandExecutor {
         let engine =
             RequestScopedMaintenanceEngine::new(self.kernel.clone(), execution.clone(), context);
         let original = MaintenanceActionState::default();
-        original.install_engine(engine.clone())?;
+        original
+            .install_engine(engine.clone())
+            .map_err(legacy_lower_error)?;
         let retained = original.clone();
         let service = Arc::clone(self.kernel.service());
         let catalog = current_catalog.map(str::to_owned);
@@ -343,6 +391,122 @@ impl MaintenanceCommandExecutor {
             .block_on(service.handle_typed_statement(&engine, &state, lowered, spark_call, context))
             .map(statement_result)
     }
+}
+
+fn bind_original_metadata_arguments(
+    command: &novarocks_sql::semantic::MaintenanceSqlCommand,
+    lowered: &mut crate::table_maintenance::ParsedMaintenanceStatement,
+    provider: &novarocks_spi::connector::ConnectorProviderId,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+) -> Result<(), CommandError> {
+    use crate::table_maintenance::{ParsedMaintenanceAction as A, ParsedMaintenanceStatement as S};
+    use novarocks_sql::semantic::MaintenanceSqlCommand as C;
+    let S::Execute { action, .. } = lowered else {
+        return Err(legacy_binding_mismatch());
+    };
+    match (command, action) {
+        (
+            C::RewriteManifests { .. },
+            A::RewriteManifests {
+                use_caching,
+                spec_id,
+            },
+        ) => {
+            let bound = bind_legacy_procedure(provider, "optimize_manifests", &[], execution)?;
+            if bound.declaration().kind() != TableProcedureKind::OptimizeManifests
+                || use_caching.is_some()
+                || spec_id.is_some()
+            {
+                return Err(legacy_binding_mismatch());
+            }
+        }
+        (
+            C::ExpireSnapshots { .. },
+            A::ExpireSnapshots {
+                older_than_ms,
+                retain_last,
+            },
+        ) => {
+            let mut arguments = Vec::with_capacity(2);
+            if let Some(value) = *older_than_ms {
+                arguments.push(("older_than", LegacyProcedureValue::OlderThanMillis(value)));
+            }
+            if let Some(value) = *retain_last {
+                arguments.push(("retain_last", LegacyProcedureValue::RetainLast(value)));
+            }
+            let bound = bind_legacy_procedure(provider, "expire_snapshots", &arguments, execution)?;
+            if bound.declaration().kind() != TableProcedureKind::ExpireSnapshots {
+                return Err(legacy_binding_mismatch());
+            }
+            *older_than_ms = bound_older_than(&bound)?;
+            *retain_last = bound
+                .arguments()
+                .find(|(slot, _)| slot.name == "retain_last")
+                .map(|(_, value)| match value {
+                    BoundProcedureArgument::Omitted => Ok(None),
+                    BoundProcedureArgument::Present {
+                        value: BoundProcedureValue::LegacyRetainLast(value),
+                        ..
+                    } => Ok(Some(*value)),
+                    _ => Err(legacy_binding_mismatch()),
+                })
+                .ok_or_else(legacy_binding_mismatch)??;
+        }
+        (C::Call { .. }, _) => {}
+        _ => return Err(legacy_binding_mismatch()),
+    }
+    Ok(())
+}
+
+fn bound_older_than(
+    bound: &novarocks_query_application::sql::table_procedure::BoundTableProcedure<'_>,
+) -> Result<Option<i64>, CommandError> {
+    bound
+        .arguments()
+        .find(|(slot, _)| slot.name == "older_than")
+        .map(|(_, value)| match value {
+            BoundProcedureArgument::Omitted => Ok(None),
+            BoundProcedureArgument::Present {
+                value: BoundProcedureValue::LegacyEpochMillis(value),
+                ..
+            } => Ok(Some(*value)),
+            _ => Err(legacy_binding_mismatch()),
+        })
+        .ok_or_else(legacy_binding_mismatch)?
+}
+
+fn bind_legacy_procedure<'a>(
+    provider: &novarocks_spi::connector::ConnectorProviderId,
+    name: &str,
+    arguments: &[(&str, LegacyProcedureValue<'a>)],
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+) -> Result<novarocks_query_application::sql::table_procedure::BoundTableProcedure<'a>, CommandError>
+{
+    let procedure = resolve_legacy_table_procedure(provider, name)
+        .map_err(crate::query::procedure_command_error)?;
+    bind_legacy_procedure_arguments(
+        procedure,
+        arguments,
+        &crate::query_execution::planning::sql_compile_control_from_execution(execution),
+    )
+    .map_err(crate::query::procedure_command_error)
+}
+
+fn legacy_binding_mismatch() -> CommandError {
+    CommandError::new(
+        CommandErrorKind::Failed,
+        "Legacy maintenance arguments differ from their original procedure declaration",
+    )
+}
+
+fn legacy_lower_error(message: String) -> CommandError {
+    crate::query::maintenance_command_error(TerminalError::from(message))
+}
+
+fn legacy_target_error(
+    error: crate::catalog_application::resolver::TargetResolutionError,
+) -> CommandError {
+    crate::query::maintenance_command_error(TerminalError::from(error))
 }
 
 pub(crate) fn is_async_metadata_command(

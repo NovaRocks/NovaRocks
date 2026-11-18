@@ -1855,8 +1855,21 @@ mod tests {
                     nullable: false,
                     default: None,
                 }],
-                partitioning: vec![],
-                properties: vec![],
+                comment: None,
+                properties: vec![
+                    (
+                        "format".into(),
+                        novarocks_spi::connector::DdlPropertyValue::Varchar("PARQUET".into()),
+                    ),
+                    (
+                        "format_version".into(),
+                        novarocks_spi::connector::DdlPropertyValue::Integer(2),
+                    ),
+                    (
+                        "partitioning".into(),
+                        novarocks_spi::connector::DdlPropertyValue::ArrayVarchar(vec![]),
+                    ),
+                ],
                 policy: CreatePolicy::NoOpIfExists,
             },
             ConnectorCatalogMutationOperation::DropTable {

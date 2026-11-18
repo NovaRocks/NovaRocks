@@ -159,6 +159,8 @@ struct LogicalCatalogInput {
 enum PlanningCpuInput {
     SessionProperties(Box<crate::query::session_property_computation::SessionPropertyCpuInput>),
     CatalogProperties(Box<crate::query::catalog_property_computation::CatalogPropertyCpuInput>),
+    TableProperties(Box<crate::query::table_property_computation::TablePropertyCpuInput>),
+    LikeColumns(Box<crate::query::table_property_computation::LikeColumnsCpuInput>),
     SystemTableBatch,
     SystemTableFinish,
     Start(Box<SqlFinalPlanCompileRequest>),
@@ -180,6 +182,22 @@ enum PlanningCpuInput {
     LogicalFinish(Box<LogicalFinishInput>),
 }
 enum PlanningCpuOutput {
+    TableProperties(
+        Box<
+            Result<
+                crate::query::table_mutation_action::PreparedTableMutationInput,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
+    LikeColumns(
+        Box<
+            Result<
+                Vec<novarocks_sql::semantic::TableColumnDef>,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
     CatalogProperties(
         Box<
             Result<
@@ -272,6 +290,12 @@ impl PlanningCpuOriginal {
             }
             PlanningCpuInput::CatalogProperties(input) => {
                 PlanningCpuOutput::CatalogProperties(Box::new(input.run()))
+            }
+            PlanningCpuInput::TableProperties(input) => {
+                PlanningCpuOutput::TableProperties(Box::new(input.run()))
+            }
+            PlanningCpuInput::LikeColumns(input) => {
+                PlanningCpuOutput::LikeColumns(Box::new(input.run()))
             }
             PlanningCpuInput::SystemTableBatch => PlanningCpuOutput::SystemTableBatch(
                 body.system_snapshot
@@ -969,6 +993,38 @@ impl FrontendPlanningCpuSource {
         self.install(PlanningCpuInput::CatalogProperties(Box::new(input)));
         let PlanningCpuOutput::CatalogProperties(result) = self.receive().await? else {
             panic!("catalog properties returned another CPU phase")
+        };
+        Ok(*result)
+    }
+    pub(crate) async fn table_properties(
+        &self,
+        input: crate::query::table_property_computation::TablePropertyCpuInput,
+    ) -> Result<
+        Result<
+            crate::query::table_mutation_action::PreparedTableMutationInput,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::TableProperties(Box::new(input)));
+        let PlanningCpuOutput::TableProperties(result) = self.receive().await? else {
+            panic!("table properties returned another CPU phase");
+        };
+        Ok(*result)
+    }
+    pub(crate) async fn like_columns(
+        &self,
+        input: crate::query::table_property_computation::LikeColumnsCpuInput,
+    ) -> Result<
+        Result<
+            Vec<novarocks_sql::semantic::TableColumnDef>,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::LikeColumns(Box::new(input)));
+        let PlanningCpuOutput::LikeColumns(result) = self.receive().await? else {
+            panic!("LIKE columns returned another CPU phase");
         };
         Ok(*result)
     }

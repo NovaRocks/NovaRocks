@@ -352,6 +352,12 @@ impl IcebergMetadata {
 }
 
 impl ConnectorMetadata for IcebergMetadata {
+    fn read_planning_initial_dependencies(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::SharedDependency>, ConnectorError> {
+        self.runtime().read_planning_initial_dependencies()
+    }
+
     fn provider_metadata_cpu_author(
         &self,
     ) -> Option<(

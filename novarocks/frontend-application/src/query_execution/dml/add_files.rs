@@ -38,7 +38,14 @@ use crate::connector::data_mutation::{
 };
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_query_application::admitted_query_context::QueryExecutionContext;
+use novarocks_query_application::{
+    admitted_query_context::QueryExecutionContext,
+    session_error::{QueryServiceError, QueryServiceErrorKind},
+    sql::table_procedure::{
+        BoundProcedureArgument, BoundProcedureValue, LegacyProcedureValue,
+        bind_legacy_procedure_arguments, resolve_legacy_table_procedure,
+    },
+};
 use novarocks_sql::semantic::ObjectName;
 
 /// Lowered, parser-owned `ALTER TABLE ... ADD FILES FROM ...` syntax.
@@ -133,6 +140,7 @@ pub enum AddFilesDispatchState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AddFilesPlanError {
+    ProcedureArgument(Box<QueryServiceError>),
     KnownUncommitted(AddFilesFailure),
     ContractFailure {
         failure: AddFilesFailure,
@@ -301,6 +309,14 @@ impl AddFilesEngine for DmlExecutionKernel {
                 &request.execution,
             )
             .map_err(plan_string_failure)?;
+        let location = bind_original_add_files_location(
+            &target.provider_id,
+            &request.command.location,
+            &crate::query_execution::planning::sql_compile_control_from_connector_request(
+                &connector_context,
+            ),
+        )
+        .map_err(|error| AddFilesPlanError::ProcedureArgument(Box::new(error)))?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| plan_connector_failure(error.into()))?;
         let session = DataMutationSession::plan(
@@ -312,7 +328,7 @@ impl AddFilesEngine for DmlExecutionKernel {
                 namespace: target.namespace.clone().into(),
                 table: target.table.clone().into(),
             },
-            DataMutationIntent::register_existing_files(request.command.location.clone()),
+            DataMutationIntent::register_existing_files(location),
             connector_context,
         )
         .map_err(project_plan_error)?;
@@ -433,6 +449,38 @@ fn poisoned_session() -> AddFilesOutcome {
         "ADD FILES prepared session lock is poisoned",
         AddFilesDispatchState::ConfirmedNotDispatched,
     )
+}
+
+fn bind_original_add_files_location(
+    provider: &novarocks_spi::connector::ConnectorProviderId,
+    location: &str,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<String, QueryServiceError> {
+    let procedure = resolve_legacy_table_procedure(provider, "add_files")?;
+    let bound = bind_legacy_procedure_arguments(
+        procedure,
+        &[("location", LegacyProcedureValue::Varchar(location))],
+        control,
+    )?;
+    match bound
+        .into_arguments()
+        .find(|(slot, _)| slot.name == "location")
+    {
+        Some((
+            _,
+            BoundProcedureArgument::Present {
+                value:
+                    BoundProcedureValue::Value(novarocks_spi::connector::DdlPropertyValue::Varchar(
+                        location,
+                    )),
+                ..
+            },
+        )) => Ok(location),
+        _ => Err(QueryServiceError::new(
+            QueryServiceErrorKind::Internal,
+            "Legacy ADD FILES binding differs from its original procedure declaration",
+        )),
+    }
 }
 
 fn plan_string_failure(message: String) -> AddFilesPlanError {

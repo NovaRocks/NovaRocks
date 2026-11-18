@@ -41,6 +41,7 @@ pub enum CatalogSqlCommand {
     CreateDatabase {
         name: ObjectName,
         if_not_exists: bool,
+        properties: Vec<(String, novarocks_spi::connector::DdlPropertyValue)>,
     },
     DropDatabase {
         name: ObjectName,
@@ -67,12 +68,6 @@ pub struct CatalogCreateCommand {
     pub properties: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct CommandProperty {
-    pub key: CommandLiteral,
-    pub value: CommandLiteral,
-}
-
 /// A literal value retained by administrative command syntax.
 ///
 /// `Number` is a lexical numeric value, not a SQL fragment: it preserves
@@ -89,17 +84,12 @@ pub enum CommandLiteral {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateTableSqlCommand {
-    pub temporary: bool,
-    pub external: bool,
     pub if_not_exists: bool,
     pub name: ObjectName,
-    pub engine: Option<String>,
     pub like: Option<ObjectName>,
     pub columns: Vec<TableColumnSqlCommand>,
-    pub partition: Option<TablePartitionSqlCommand>,
-    pub order_by: Vec<String>,
-    pub properties: Vec<CommandProperty>,
-    pub comment: Option<CommandLiteral>,
+    pub comment: Option<String>,
+    pub properties: Vec<(String, novarocks_spi::connector::DdlPropertyValue)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,18 +99,6 @@ pub struct TableColumnSqlCommand {
     pub nullable: Option<bool>,
     pub default: Option<CommandLiteral>,
     pub comment: Option<CommandLiteral>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TablePartitionSqlCommand {
-    Transform(Vec<IcebergPartitionFieldExpr>),
-    /// The parser accepts a legacy range declaration, but no current product
-    /// adapter supports it.  Its individual SQL ranges are deliberately not
-    /// carried across this semantic boundary.
-    UnsupportedLegacyRange {
-        columns: Vec<String>,
-        definition_count: usize,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -206,10 +184,7 @@ pub enum IcebergReferenceSqlAction {
         name: String,
         if_not_exists: bool,
         or_replace: bool,
-        anchor: ReferenceAnchorSql,
-        /// Current product code ignores parser-retained provider extension
-        /// tokens. Keep that fact without passing raw SQL into an adapter.
-        has_uninterpreted_provider_options: bool,
+        snapshot_id: Option<i64>,
     },
     Drop {
         kind: IcebergReferenceKindSql,
@@ -225,16 +200,11 @@ pub enum IcebergReferenceKindSql {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReferenceAnchorSql {
-    CurrentMain,
-    Version(CommandLiteral),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatisticsSqlCommand {
     AnalyzeTable {
         table: ObjectName,
-        columns: Vec<String>,
+        /// Absence selects all columns. An explicit empty list remains explicit.
+        columns: Option<Vec<String>>,
     },
     ShowStats {
         table: ObjectName,

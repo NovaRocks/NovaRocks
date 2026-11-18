@@ -35,7 +35,7 @@ pub use application::{
     acquire_metadata_planning_pin, connector_request_context,
     connector_request_context_for_execution, connector_write_default_at,
     metadata_list_namespaces_with_planning_pin, metadata_load_connector_table_with_planning_pin,
-    metadata_load_table, metadata_read_reference_facts_with_planning_pin, validate_request_context,
+    metadata_read_reference_facts_with_planning_pin, validate_request_context,
 };
 pub(crate) use application::{
     connector_planning_context_for_query_on_runtime,
@@ -44,7 +44,7 @@ pub(crate) use application::{
     context_for_planning_pin, context_for_planning_pin_typed, metadata_binding_typed,
     metadata_namespace_exists_async, metadata_read_reference_facts_with_planning_pin_async,
     query_connector_request_context_on_runtime, require_current_write_authority,
-    sql_column_from_connector_binding,
+    sql_column_from_connector_binding, sql_columns_from_connector_metadata,
 };
 pub use unified_statistics::UnifiedStatisticsResolver;
 

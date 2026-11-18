@@ -240,6 +240,7 @@ fn finalization_error(
 
 fn plan_error(error: AddFilesPlanError) -> DmlError {
     match error {
+        AddFilesPlanError::ProcedureArgument(error) => DmlError::from_application(*error),
         AddFilesPlanError::KnownUncommitted(failure)
         | AddFilesPlanError::ContractFailure { failure, .. } => {
             DmlError::executor(&failure.message)

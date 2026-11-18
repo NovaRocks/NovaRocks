@@ -29,6 +29,7 @@ use novarocks_parser::ERROR_CODE_DESCRIPTORS as PARSER_ERROR_CODE_DESCRIPTORS;
 use novarocks_query_application::sql::dml_admission::DML_ADMISSION_ERROR_CODE_DESCRIPTORS;
 use novarocks_query_application::sql::property_admit::DDL_PROPERTY_ERROR_CODE_DESCRIPTORS;
 use novarocks_query_application::sql::session_admit::SESSION_ERROR_CODE_DESCRIPTORS;
+use novarocks_query_application::sql::table_procedure::TABLE_PROCEDURE_ERROR_CODE_DESCRIPTORS;
 use novarocks_sql::analyze_error::ERROR_CODE_DESCRIPTORS as ANALYZE_ERROR_CODE_DESCRIPTORS;
 use novarocks_user_error::{ErrorCodeDescriptor, ErrorCodeStatus, ErrorPhase};
 
@@ -75,6 +76,7 @@ fn normalized_descriptors() -> Result<Vec<ErrorCodeDescriptor>, String> {
     descriptors.extend_from_slice(DML_ADMISSION_ERROR_CODE_DESCRIPTORS);
     descriptors.extend_from_slice(SESSION_ERROR_CODE_DESCRIPTORS);
     descriptors.extend_from_slice(DDL_PROPERTY_ERROR_CODE_DESCRIPTORS);
+    descriptors.extend_from_slice(TABLE_PROCEDURE_ERROR_CODE_DESCRIPTORS);
     descriptors.extend_from_slice(
         novarocks_query_application::execution_error::EXECUTION_ERROR_CODE_DESCRIPTORS,
     );

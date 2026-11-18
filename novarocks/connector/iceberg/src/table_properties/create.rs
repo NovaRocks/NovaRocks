@@ -41,6 +41,28 @@ pub(crate) struct PreparedCreateTableProperties {
     pub(crate) raw_properties: BTreeMap<String, String>,
 }
 
+impl PreparedCreateTableProperties {
+    pub(crate) fn copy_raw_properties(
+        &self,
+        control: &dyn ConnectorOperationControl,
+    ) -> Result<BTreeMap<String, String>, ConnectorError> {
+        self.raw_properties
+            .iter()
+            .map(|(key, value)| Ok((copy_text(key, control)?, copy_text(value, control)?)))
+            .collect()
+    }
+
+    pub(crate) fn copy_location(
+        &self,
+        control: &dyn ConnectorOperationControl,
+    ) -> Result<Option<String>, ConnectorError> {
+        self.location
+            .as_deref()
+            .map(|value| copy_text(value, control))
+            .transpose()
+    }
+}
+
 #[derive(Debug)]
 enum CreatePropertyContractFailure {
     MissingRequired(&'static str),
@@ -72,6 +94,16 @@ fn contract(cause: CreatePropertyContractFailure) -> ConnectorError {
 /// Missing values are contract failures, never an instruction to guess them.
 pub(crate) fn prepare_create_table_properties(
     properties: &[(Arc<str>, DdlPropertyValue)],
+    comment: Option<&str>,
+    control: &dyn ConnectorOperationControl,
+) -> Result<PreparedCreateTableProperties, ConnectorError> {
+    prepare_create_table_properties_inner(properties, comment, control)
+        .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
+}
+
+fn prepare_create_table_properties_inner(
+    properties: &[(Arc<str>, DdlPropertyValue)],
+    comment: Option<&str>,
     control: &dyn ConnectorOperationControl,
 ) -> Result<PreparedCreateTableProperties, ConnectorError> {
     control.check_active()?;
@@ -152,6 +184,12 @@ pub(crate) fn prepare_create_table_properties(
             "partitioning",
         ))
     })?;
+    if let Some(comment) = comment {
+        if raw_properties.contains_key("comment") {
+            return Err(invalid("Duplicate Iceberg raw property 'comment'"));
+        }
+        raw_properties.insert("comment".to_owned(), copy_text(comment, control)?);
+    }
     control.check_active()?;
     Ok(PreparedCreateTableProperties {
         format_version,
@@ -163,7 +201,9 @@ pub(crate) fn prepare_create_table_properties(
 
 // This is the integer-to-version boundary. The original private internal raw
 // creator keeps its string parser and separate input contract.
-fn typed_format_version(value: &DdlPropertyValue) -> Result<FormatVersion, ConnectorError> {
+pub(crate) fn typed_format_version(
+    value: &DdlPropertyValue,
+) -> Result<FormatVersion, ConnectorError> {
     match value {
         DdlPropertyValue::Integer(1) => Ok(FormatVersion::V1),
         DdlPropertyValue::Integer(2) => Ok(FormatVersion::V2),

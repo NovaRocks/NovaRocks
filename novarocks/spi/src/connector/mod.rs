@@ -269,8 +269,8 @@ pub use predicate::{
 };
 pub use property::{
     DdlPropertyChange, DdlPropertyDeclaration, DdlPropertyDeclarationError, DdlPropertyType,
-    DdlPropertyValue, LegacyPreparedTableProperty, LegacyPreparedTablePropertyValue,
-    LegacyTablePropertyPreparationFailure,
+    DdlPropertyValue, InvalidTableProperty, LegacyPreparedTableProperty,
+    LegacyPreparedTablePropertyValue, LegacyTablePropertyPreparationFailure,
 };
 pub use provider::{
     CatalogActivityEvents, CatalogActivityPhase, CatalogActivityReader, CatalogActivitySnapshot,

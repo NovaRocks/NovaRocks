@@ -3513,6 +3513,7 @@ dependencies = [
  "novarocks-attempt-protocol",
  "novarocks-catalog-application",
  "novarocks-connector-contract",
+ "novarocks-connector-iceberg",
  "novarocks-control-runtime",
  "novarocks-control-runtime-core",
  "novarocks-coordination-contract",

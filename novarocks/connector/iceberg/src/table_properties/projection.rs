@@ -74,6 +74,16 @@ fn project_raw_table_property(
     operation: ExtraPropertyWrite,
     control: &dyn ConnectorOperationControl,
 ) -> Result<Vec<ConnectorPropertyChange>, ConnectorError> {
+    project_raw_table_property_inner(canonical_name, change, operation, control)
+        .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
+}
+
+fn project_raw_table_property_inner(
+    canonical_name: &str,
+    change: BorrowedChange<'_>,
+    operation: ExtraPropertyWrite,
+    control: &dyn ConnectorOperationControl,
+) -> Result<Vec<ConnectorPropertyChange>, ConnectorError> {
     control.check_active()?;
     if super::is_recognized_unsupported_table_property(canonical_name) {
         return Err(unsupported(canonical_name));

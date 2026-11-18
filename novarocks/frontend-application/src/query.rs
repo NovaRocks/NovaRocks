@@ -117,13 +117,16 @@ mod maintenance_action;
 pub(crate) mod mutation_action;
 pub(crate) mod mv_action;
 pub(crate) mod mv_read_action;
+mod property_cpu_context;
 pub(crate) mod read_action;
 pub(crate) mod session_property_computation;
 mod set_action;
 mod statement_action;
 pub(crate) mod statement_computation;
 pub(crate) mod statement_publication;
-mod table_mutation_action;
+mod table_create_action;
+pub(crate) mod table_mutation_action;
+pub(crate) mod table_property_computation;
 pub(crate) mod write_action;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
@@ -246,6 +249,15 @@ struct FrontendCatalogCommandConsumer {
 }
 
 impl CatalogCommandConsumer for FrontendCatalogCommandConsumer {
+    fn acquire_table_read_binding(
+        &self,
+        name: &novarocks_sql::semantic::ObjectName,
+        request_context: &RequestContext,
+    ) -> Result<novarocks_query_application::api::CatalogTableReadBinding, CommandError> {
+        self.catalog
+            .acquire_table_read_binding(name, request_context)
+    }
+
     fn acquire_table_property_binding(
         &self,
         name: &novarocks_sql::semantic::ObjectName,
@@ -291,6 +303,17 @@ impl CatalogCommandConsumer for FrontendCatalogCommandConsumer {
                 ))
             });
         }
+        if matches!(
+            command,
+            novarocks_sql::semantic::CatalogSqlCommand::CreateTable(_)
+        ) {
+            return Box::pin(async {
+                Err(CommandError::new(
+                    CommandErrorKind::Conflict,
+                    "CREATE TABLE requires its original prepared generation",
+                ))
+            });
+        }
         let catalog = self.catalog.clone();
         let view = self.view.clone();
         let iceberg_ref = self.iceberg_ref.clone();
@@ -307,13 +330,6 @@ impl CatalogCommandConsumer for FrontendCatalogCommandConsumer {
                         view.drop_database(DEFAULT_CATALOG, &name.parts[0])?;
                         Ok(StatementResult::Ok)
                     }
-                    novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command) => catalog
-                        .execute_table_command(
-                            &command,
-                            context.session().current_catalog(),
-                            context.session().current_database(),
-                            command_context.connector_context(),
-                        ),
                     novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command)
                         if matches!(
                             &command.action,
@@ -484,7 +500,7 @@ pub(crate) const fn external_effect_from_lake(
     }
 }
 
-fn maintenance_command_error(
+pub(crate) fn maintenance_command_error(
     error: novarocks_table_maintenance::runtime::TerminalError,
 ) -> CommandError {
     use novarocks_spi::connector::LakePublicationDisposition;
@@ -686,6 +702,25 @@ fn routed_distributed_query_failure(
         compile_control,
         external_effect_disposition: None,
     }
+}
+
+pub(crate) fn procedure_command_error(error: QueryServiceError) -> CommandError {
+    let control = error.compile_control_error();
+    let command = match (error.user_error(), error.failure_cause()) {
+        (Some(user), Some(cause)) => {
+            CommandError::from_user_error_with_cause(user.clone(), cause.clone())
+        }
+        (Some(user), None) => CommandError::from_user_error(user.clone()),
+        (None, Some(cause)) => CommandError::from_failure_cause(cause.clone()),
+        (None, None) => match control.clone() {
+            Some(control) => CommandError::from_compile_control(control),
+            None if error.kind() == QueryServiceErrorKind::Unsupported => {
+                CommandError::new(CommandErrorKind::Unsupported, error.message())
+            }
+            None => CommandError::from(error.message().to_owned()),
+        },
+    };
+    command.with_compile_control(control)
 }
 
 fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExecutionError> {
@@ -910,8 +945,13 @@ fn product_command_error(error: CommandError) -> RoutedExecutionError {
     if let Some(cause) = error.failure_cause() {
         // A selected cause and compiler control are independent facts. Keep
         // both in the complete service error across routing and late fallback.
-        let mut service = QueryServiceError::from_failure_cause(cause.clone())
-            .with_compile_control(error.compile_control_error());
+        let service = match error.user_error() {
+            Some(user) => {
+                QueryServiceError::from_user_error_with_cause(user.clone(), cause.clone())
+            }
+            None => QueryServiceError::from_failure_cause(cause.clone()),
+        };
+        let mut service = service.with_compile_control(error.compile_control_error());
         if let Some(disposition) = disposition {
             service = service.attach_external_effect_disposition(disposition);
         }
@@ -1701,6 +1741,18 @@ impl FrontendQuerySession {
             None => command_context,
         };
         let parsed_statement = match parsed_statement {
+            ParsedStatement::Table(ast::TableStatement::Create(create)) => {
+                return self
+                    .execute_observed_table_create(
+                        Arc::from(sql),
+                        create,
+                        context,
+                        command_context,
+                        deadline,
+                        statement,
+                    )
+                    .await;
+            }
             ParsedStatement::Catalog(ast::CatalogStatement::CreateCatalog(create)) => {
                 return self
                     .execute_observed_catalog_create(
@@ -2067,16 +2119,18 @@ impl FrontendQuerySession {
                             execution_owner,
                             producer_window,
                             move || {
-                                prepare_dml
-                                    .prepare_add_files(
-                                        prepare_add_files_engine.as_ref(),
-                                        command,
-                                        &context,
-                                        Some(&query_options),
-                                    )
-                                    .map_err(|error| {
-                                        RoutedExecutionError::Engine(error.to_string())
-                                    })
+                                let result = prepare_dml.prepare_add_files(
+                                    prepare_add_files_engine.as_ref(),
+                                    command,
+                                    &context,
+                                    Some(&query_options),
+                                );
+                                match result {
+                                    Err(error) if error.application_error().is_none() => {
+                                        Err(RoutedExecutionError::Engine(error.to_string()))
+                                    }
+                                    result => dml_result(result),
+                                }
                             },
                             move |prepared| {
                                 dml.execute_prepared_add_files(add_files_engine.as_ref(), prepared)

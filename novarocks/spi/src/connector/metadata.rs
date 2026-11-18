@@ -1692,6 +1692,17 @@ pub type ConnectorTableObjectSnapshotFuture<'a> = std::pin::Pin<
 >;
 
 pub trait ConnectorMetadata: Send + Sync {
+    /// Pure initial read routes from this exact retained metadata generation.
+    /// These facts grant no I/O, mutation, or publication authority.
+    fn read_planning_initial_dependencies(
+        &self,
+    ) -> Result<Vec<super::SharedDependency>, ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector metadata has no original read planning dependency facts",
+        ))
+    }
+
     /// Pure selected first-party metadata CPU author, authenticated with the
     /// original planning pin before any closed phase is accepted.
     fn provider_metadata_cpu_author(
@@ -2348,6 +2359,13 @@ mod tests {
         let metadata = MetadataWithoutObjectBinding {
             instance_id: instance_id.clone(),
         };
+        assert_eq!(
+            metadata
+                .read_planning_initial_dependencies()
+                .unwrap_err()
+                .kind(),
+            super::super::ConnectorErrorKind::Unsupported
+        );
         {
             let job = ConnectorTableJobKind::Statistics;
             let error = metadata

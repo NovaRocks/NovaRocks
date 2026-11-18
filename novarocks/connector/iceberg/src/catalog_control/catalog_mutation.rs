@@ -68,7 +68,7 @@ pub(in crate::catalog_control) mod create_cpu;
 #[path = "catalog_mutation/keyed.rs"]
 mod keyed;
 
-const INITIAL_PARTITION_FIELD_ID: i32 = 1000;
+pub(crate) const INITIAL_PARTITION_FIELD_ID: i32 = 1000;
 
 impl ConnectorCatalogMutation for IcebergMetadata {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
@@ -112,6 +112,42 @@ impl ConnectorCatalogMutation for IcebergMetadata {
                 ConnectorErrorKind::Internal,
                 format!("invalid Iceberg table property declaration: {cause}"),
             )
+        })
+    }
+
+    fn schema_property_declarations(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::DdlPropertyDeclaration>, ConnectorError> {
+        use novarocks_spi::connector::{DdlPropertyDeclaration, DdlPropertyType, DdlPropertyValue};
+        DdlPropertyDeclaration::new(
+            "location",
+            DdlPropertyType::Varchar,
+            DdlPropertyValue::Null,
+            false,
+        )
+        .map(|value| vec![value])
+        .map_err(|cause| {
+            internal(format!(
+                "invalid Iceberg schema property declaration: {cause}"
+            ))
+        })
+    }
+
+    fn branch_property_declarations(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::DdlPropertyDeclaration>, ConnectorError> {
+        use novarocks_spi::connector::{DdlPropertyDeclaration, DdlPropertyType, DdlPropertyValue};
+        DdlPropertyDeclaration::new(
+            "snapshot_id",
+            DdlPropertyType::Bigint,
+            DdlPropertyValue::Null,
+            false,
+        )
+        .map(|value| vec![value])
+        .map_err(|cause| {
+            internal(format!(
+                "invalid Iceberg branch property declaration: {cause}"
+            ))
         })
     }
 
@@ -160,23 +196,11 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         }
         // The owner freezes its exact request once; the shared journal owns
         // dispatch and the conclusion for every create mechanism.
-        if let ConnectorCatalogMutationOperation::CreateTable {
-            table,
-            columns,
-            partitioning,
-            properties,
-            policy,
-        } = &request.operation
-        {
-            return execute_create_table(
-                self,
-                &request,
-                table,
-                columns,
-                partitioning,
-                properties,
-                *policy,
-            );
+        if matches!(
+            &request.operation,
+            ConnectorCatalogMutationOperation::CreateTable { .. }
+        ) {
+            return execute_create_table(self, &request);
         }
         if matches!(
             &request.operation,
@@ -332,7 +356,7 @@ fn catalog_admission_request(request: &ConnectorCatalogMutationRequest) -> Catal
         Mutation::AlterPartitionSpec { table, .. } => {
             (CatalogOperation::AlterPartitionSpec, table_target(table))
         }
-        Mutation::AlterProperties { table, .. } => {
+        Mutation::AlterProperties { table, .. } | Mutation::SetTableProperties { table, .. } => {
             (CatalogOperation::AlterProperties, table_target(table))
         }
         Mutation::AlterRef { table, action } => (
@@ -508,6 +532,7 @@ fn execute_existing_publication(
                     let table = match &request.operation {
                         ConnectorCatalogMutationOperation::AlterSchema { table, .. }
                         | ConnectorCatalogMutationOperation::AlterPartitionSpec { table, .. }
+                        | ConnectorCatalogMutationOperation::SetTableProperties { table, .. }
                         | ConnectorCatalogMutationOperation::AlterProperties { table, .. }
                         | ConnectorCatalogMutationOperation::AlterRef { table, .. } => table,
                         _ => {
@@ -555,16 +580,21 @@ fn execute_existing_publication(
                         ConnectorCatalogMutationOperation::AlterPartitionSpec {
                             add, drop, ..
                         } => prepare_partition_change(metadata, add, drop)?,
+                        ConnectorCatalogMutationOperation::SetTableProperties {
+                            properties,
+                            ..
+                        } => prepare_set_table_properties(metadata, properties, &request.context)?,
                         ConnectorCatalogMutationOperation::AlterProperties {
                             changes,
                             authority,
                             expected_committed_partitioning,
                             ..
-                        } => prepare_property_change(
+                        } => prepare_legacy_property_change(
                             metadata,
                             changes,
                             *authority,
                             expected_committed_partitioning.as_ref(),
+                            &request.context,
                         )?,
                         ConnectorCatalogMutationOperation::AlterRef { action, .. } => {
                             lower_ref_action(
@@ -673,10 +703,12 @@ fn view_properties(
 fn prepare_table_creation(
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
-    partitioning: &[ConnectorPartitionTransform],
-    properties: &[(Arc<str>, Arc<str>)],
+    prepared: &crate::table_properties::PreparedCreateTableProperties,
+    control: &dyn ConnectorOperationControl,
 ) -> Result<(NamespaceIdent, TableCreation), ConnectorError> {
-    let (format_version, mut properties) = table_properties(columns, properties)?;
+    control.check_active()?;
+    let format_version = prepared.format_version;
+    let mut properties = prepared.copy_raw_properties(control)?;
     if format_version != FormatVersion::V3
         && columns.iter().any(|column| {
             column.default.as_ref().is_some_and(|value| {
@@ -701,19 +733,29 @@ fn prepare_table_creation(
             document.encode()?,
         );
     }
-    let spec = initial_partition_spec(&schema, partitioning).map_err(invalid)?;
+    let schema = Arc::new(schema);
+    let spec = crate::table_properties::bind_create_table_partitioning(
+        schema.clone(),
+        &prepared.partitioning,
+        control,
+    )?;
+    let schema = Arc::try_unwrap(schema)
+        .map_err(|_| internal("CREATE partition binding retained an unexpected schema alias"))?;
     let namespace = NamespaceIdent::new(normalize_identifier(&table.namespace).map_err(invalid)?);
     let table_name = normalize_identifier(&table.table).map_err(invalid)?;
     let creation = TableCreation::builder()
         .name(table_name)
         .schema(schema)
         .properties(properties)
-        .format_version(format_version);
-    let creation = if let Some(spec) = spec {
-        creation.partition_spec(spec).build()
-    } else {
-        creation.build()
-    };
+        .format_version(format_version)
+        .location_opt(prepared.copy_location(control)?)
+        .partition_spec_opt(if prepared.partitioning.is_empty() {
+            None
+        } else {
+            Some(spec.into_unbound())
+        })
+        .build();
+    control.check_active()?;
     Ok((namespace, creation))
 }
 
@@ -817,11 +859,6 @@ impl CreateCatalogReads for AsyncCreateCatalogReads {
 struct SynchronousCreateCatalogReads<'a> {
     provider: &'a IcebergMetadata,
     request: &'a ConnectorCatalogMutationRequest,
-    table: &'a ConnectorTableIdentity,
-    columns: &'a [ConnectorColumnDefinition],
-    partitioning: &'a [ConnectorPartitionTransform],
-    properties: &'a [(Arc<str>, Arc<str>)],
-    policy: CreatePolicy,
 }
 impl CreateCatalogReads for SynchronousCreateCatalogReads<'_> {
     type Read<'a>
@@ -837,30 +874,41 @@ impl CreateCatalogReads for SynchronousCreateCatalogReads<'_> {
     where
         Self: 'a;
     fn preflight(&self) -> Self::Preflight<'_> {
+        let ConnectorCatalogMutationOperation::CreateTable {
+            table,
+            columns,
+            comment,
+            properties,
+            ..
+        } = &self.request.operation
+        else {
+            unreachable!("only CREATE constructs its synchronous read transport");
+        };
         std::future::ready(
             prepare_create_preflight(
                 self.provider,
                 self.request,
-                self.table,
-                self.columns,
-                self.properties,
+                table,
+                columns,
+                comment.as_deref(),
+                properties,
             )
             .map_err(CreatePreparationFailure::Provider),
         )
     }
     fn freeze(&self, facts: CreatePreflightFacts) -> Self::Freeze<'_> {
+        let ConnectorCatalogMutationOperation::CreateTable {
+            table,
+            columns,
+            policy,
+            ..
+        } = &self.request.operation
+        else {
+            unreachable!("only CREATE constructs its synchronous read transport");
+        };
         std::future::ready(
-            freeze_ordinary_create(
-                self.provider,
-                self.request,
-                self.table,
-                self.columns,
-                self.partitioning,
-                self.properties,
-                self.policy,
-                &facts,
-            )
-            .map_err(CreatePreparationFailure::Provider),
+            freeze_ordinary_create(self.provider, self.request, table, columns, *policy, &facts)
+                .map_err(CreatePreparationFailure::Provider),
         )
     }
     fn table_exists<'a>(
@@ -944,6 +992,7 @@ pub(in crate::catalog_control) struct CreatePreflightFacts {
     namespace: String,
     name: String,
     seed: ConnectorCatalogMutationReceipt,
+    properties: crate::table_properties::PreparedCreateTableProperties,
 }
 
 fn prepare_create_preflight(
@@ -951,10 +1000,16 @@ fn prepare_create_preflight(
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
-    properties: &[(Arc<str>, Arc<str>)],
+    comment: Option<&str>,
+    properties: &[(Arc<str>, novarocks_spi::connector::DdlPropertyValue)],
 ) -> crate::catalog::publication_dispatch::PreparationResult<CreatePreflightFacts> {
     ensure_owner(provider, &table.instance_id)?;
-    table_properties(columns, properties)?;
+    let properties = crate::table_properties::prepare_create_table_properties(
+        properties,
+        comment,
+        &request.context,
+    )?;
+    validate_create_column_names(columns)?;
     request.context.check_active()?;
     let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
     let name = normalize_identifier(&table.table).map_err(invalid)?;
@@ -963,6 +1018,7 @@ fn prepare_create_preflight(
         namespace,
         name,
         seed,
+        properties,
     })
 }
 
@@ -971,8 +1027,6 @@ fn freeze_ordinary_create(
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
-    partitioning: &[ConnectorPartitionTransform],
-    properties: &[(Arc<str>, Arc<str>)],
     policy: CreatePolicy,
     facts: &CreatePreflightFacts,
 ) -> crate::catalog::publication_dispatch::PreparationResult<PreparedCreate> {
@@ -981,7 +1035,8 @@ fn freeze_ordinary_create(
     let namespace = facts.namespace.clone();
     let name = facts.name.clone();
     let seed = facts.seed.clone();
-    let (_, creation) = prepare_table_creation(table, columns, partitioning, properties)?;
+    let (_, creation) =
+        prepare_table_creation(table, columns, &facts.properties, &request.context)?;
     let frozen = provider
         .runtime()
         .novarocks_catalog()
@@ -1074,23 +1129,15 @@ async fn prepare_ordinary_create<R: CreateCatalogReads>(
 fn execute_create_table(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
-    table: &ConnectorTableIdentity,
-    columns: &[ConnectorColumnDefinition],
-    partitioning: &[ConnectorPartitionTransform],
-    properties: &[(Arc<str>, Arc<str>)],
-    policy: CreatePolicy,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
     use crate::catalog::publication_dispatch::PreparationFailure;
     use futures::FutureExt;
-    let reads = SynchronousCreateCatalogReads {
-        provider,
-        request,
-        table,
-        columns,
-        partitioning,
-        properties,
-        policy,
+    let ConnectorCatalogMutationOperation::CreateTable { table, policy, .. } = &request.operation
+    else {
+        unreachable!("only CREATE enters its ordinary synchronous preparation");
     };
+    let policy = *policy;
+    let reads = SynchronousCreateCatalogReads { provider, request };
     // Both native read adapters return Ready. Pure preparation remains on this
     // caller; only each real metadata read crosses the original runtime bridge.
     let setup = prepare_ordinary_create(provider, request, policy, &reads)
@@ -1450,10 +1497,17 @@ pub(crate) fn table_properties(
 ) -> Result<(FormatVersion, BTreeMap<String, String>), ConnectorError> {
     let (format_version, properties) =
         prepare_create_raw_table_properties(input).map_err(|failure| failure.error)?;
+    validate_create_column_names(columns)?;
+    Ok((format_version, properties))
+}
+
+fn validate_create_column_names(
+    columns: &[ConnectorColumnDefinition],
+) -> Result<(), ConnectorError> {
     for column in columns {
         normalize_identifier(&column.name).map_err(invalid)?;
     }
-    Ok((format_version, properties))
+    Ok(())
 }
 
 pub(crate) fn initial_partition_field(
@@ -1491,6 +1545,16 @@ pub(crate) fn initial_partition_spec(
     Ok(Some(builder.build()))
 }
 
+/// Prepare a complete evaluated partitioning property against current metadata.
+/// An unchanged target carries the same default-spec fence and no updates.
+pub(crate) fn prepare_full_partitioning_change(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    fields: &[Option<String>],
+    control: &dyn ConnectorOperationControl,
+) -> Result<crate::commit::staging::PreparedChange, ConnectorError> {
+    crate::table_properties::prepare_full_partitioning_change(metadata, fields, control)
+}
+
 fn prepare_partition_change(
     metadata: &crate::iceberg::spec::TableMetadata,
     add: &[ConnectorPartitionTransform],
@@ -1501,7 +1565,6 @@ fn prepare_partition_change(
             "Iceberg partition mutation requires exactly one add or drop transform",
         ));
     }
-    let base_spec_id = metadata.default_partition_spec_id();
     let schema = metadata.current_schema();
     let current = metadata.default_partition_spec();
     let mut fields = current
@@ -1537,32 +1600,83 @@ fn prepare_partition_change(
             return Err(not_found("Iceberg partition transform does not exist"));
         }
     }
+    finalize_existing_partition_change(metadata, fields)
+        .map(|(change, _)| change)
+        .map_err(PartitionEvolutionFailure::legacy_error)
+}
+
+#[derive(Debug)]
+pub(crate) enum PartitionEvolutionFailure {
+    Sdk {
+        stage: &'static str,
+        cause: crate::iceberg::Error,
+    },
+    UnchangedDefault,
+    MissingCommittedSpec,
+    UnexpectedUpdates,
+}
+
+impl PartitionEvolutionFailure {
+    fn legacy_error(self) -> ConnectorError {
+        match self {
+            Self::Sdk { stage, cause } => {
+                invalid(format!("{stage} evolved Iceberg partition spec: {cause}"))
+            }
+            Self::UnchangedDefault => {
+                invalid("Iceberg partition mutation did not change the default spec")
+            }
+            Self::MissingCommittedSpec => internal("evolved Iceberg partition spec is absent"),
+            Self::UnexpectedUpdates => {
+                internal("evolved Iceberg partition spec has unexpected updates")
+            }
+        }
+    }
+}
+
+/// The existing-spec SDK author shared by the old single-step operation and
+/// the full-property preparation. Do not reconstruct an initial CREATE spec.
+pub(crate) fn finalize_existing_partition_change(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    fields: Vec<UnboundPartitionField>,
+) -> Result<
+    (
+        crate::commit::staging::PreparedChange,
+        crate::iceberg::spec::PartitionSpecRef,
+    ),
+    PartitionEvolutionFailure,
+> {
+    let base_spec_id = metadata.default_partition_spec_id();
     let mut builder = UnboundPartitionSpecBuilder::new();
     for field in fields {
-        builder = builder
-            .add_partition_fields([field])
-            .map_err(|error| invalid(format!("build evolved Iceberg partition spec: {error}")))?;
+        builder = builder.add_partition_fields([field]).map_err(|cause| {
+            PartitionEvolutionFailure::Sdk {
+                stage: "build",
+                cause,
+            }
+        })?;
     }
     let build =
         crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(metadata.clone(), None)
             .add_default_partition_spec(builder.build())
-            .map_err(|error| invalid(format!("bind evolved Iceberg partition spec: {error}")))?
+            .map_err(|cause| PartitionEvolutionFailure::Sdk {
+                stage: "bind",
+                cause,
+            })?
             .build()
-            .map_err(|error| {
-                invalid(format!("finalize evolved Iceberg partition spec: {error}"))
+            .map_err(|cause| PartitionEvolutionFailure::Sdk {
+                stage: "finalize",
+                cause,
             })?;
     let new_spec_id = build.metadata.default_partition_spec_id();
     if new_spec_id == base_spec_id {
-        return Err(invalid(
-            "Iceberg partition mutation did not change the default spec",
-        ));
+        return Err(PartitionEvolutionFailure::UnchangedDefault);
     }
     let mut updates = build.changes;
     if let Some(TableUpdate::AddSpec { spec }) = updates.first_mut() {
         let committed_spec = build
             .metadata
             .partition_spec_by_id(new_spec_id)
-            .ok_or_else(|| internal("evolved Iceberg partition spec is absent"))?;
+            .ok_or(PartitionEvolutionFailure::MissingCommittedSpec)?;
         // The builder's update may retain unset IDs even though its resulting
         // metadata has assigned them. REST requires a complete AddSpec payload.
         *spec = committed_spec.as_ref().clone().into_unbound();
@@ -1575,16 +1689,17 @@ fn prepare_partition_change(
                 TableUpdate::SetDefaultSpec { .. }
             ]
     ) {
-        return Err(internal(
-            "evolved Iceberg partition spec has unexpected updates",
-        ));
+        return Err(PartitionEvolutionFailure::UnexpectedUpdates);
     }
-    Ok(crate::commit::staging::PreparedChange {
-        requirements: vec![TableRequirement::DefaultSpecIdMatch {
-            default_spec_id: base_spec_id,
-        }],
-        updates,
-    })
+    Ok((
+        crate::commit::staging::PreparedChange {
+            requirements: vec![TableRequirement::DefaultSpecIdMatch {
+                default_spec_id: base_spec_id,
+            }],
+            updates,
+        },
+        build.metadata.default_partition_spec().clone(),
+    ))
 }
 
 fn partition_source_id(
@@ -1678,7 +1793,7 @@ fn committed_partition_transform(
     }
 }
 
-fn partition_transform(field: &ConnectorPartitionTransform) -> Transform {
+pub(crate) fn partition_transform(field: &ConnectorPartitionTransform) -> Transform {
     match field {
         ConnectorPartitionTransform::Identity { .. } => Transform::Identity,
         ConnectorPartitionTransform::Year { .. } => Transform::Year,
@@ -1750,7 +1865,6 @@ impl std::fmt::Display for PartitionTransformValidationFailure {
 impl std::error::Error for PartitionTransformValidationFailure {}
 impl novarocks_failure_contract::FailureProjection for PartitionTransformValidationFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::FailureProjection;
         match self {
             Self::InvalidType(_) => ConnectorErrorKind::InvalidRequest.failure_fact(),
             Self::Capability(_) => ConnectorErrorKind::Unsupported.failure_fact(),
@@ -1846,6 +1960,153 @@ fn prepare_property_change(
         updates: property_updates(metadata, changes, authority)?,
         requirements,
     })
+}
+
+/// Admit through the old raw gate before routing representable legacy SET batches
+/// through the typed setter. Remove this adapter with TBLPROPERTIES.
+fn prepare_legacy_property_change(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    changes: &[ConnectorPropertyChange],
+    authority: ConnectorPropertyAuthority,
+    expected: Option<&ConnectorCommittedPartitioning>,
+    context: &ConnectorRequestContext,
+) -> crate::catalog::publication_dispatch::PreparationResult<crate::commit::staging::PreparedChange>
+{
+    use crate::table_properties::{
+        LegacyAlterSetPreparation, prepare_legacy_alter_set_table_property_inputs,
+    };
+
+    let original = prepare_property_change(metadata, changes, authority, expected)?;
+    if authority != ConnectorPropertyAuthority::UserStatement
+        || expected.is_some()
+        || changes
+            .iter()
+            .any(|change| !matches!(change, ConnectorPropertyChange::Set { .. }))
+    {
+        return Ok(original);
+    }
+    match prepare_legacy_alter_set_table_property_inputs(changes, context)? {
+        LegacyAlterSetPreparation::Typed(properties) => Ok(prepare_set_table_properties(
+            metadata,
+            &properties,
+            context,
+        )?),
+        LegacyAlterSetPreparation::KeepRaw { .. } => Ok(original),
+    }
+}
+
+fn prepare_set_table_properties(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    properties: &[(Arc<str>, novarocks_spi::connector::DdlPropertyChange)],
+    control: &dyn ConnectorOperationControl,
+) -> Result<crate::commit::staging::PreparedChange, ConnectorError> {
+    use novarocks_spi::connector::InvalidTableProperty;
+
+    let prepare = || {
+        use crate::table_properties::{ExtraPropertyWrite, project_partial_raw_table_property};
+        use novarocks_spi::connector::{DdlPropertyChange, DdlPropertyValue};
+        use std::collections::HashSet;
+        control.check_active()?;
+        if properties.is_empty() {
+            return Err(invalid("Iceberg property mutation is empty"));
+        }
+        // Reject unsupported properties before creating any transaction update.
+        for (name, _) in properties {
+            control.check_active()?;
+            if name.as_ref() == "location"
+                || crate::table_properties::is_recognized_unsupported_table_property(name)
+            {
+                return Err(unsupported(format!(
+                    "Iceberg table property '{name}' cannot be updated"
+                )));
+            }
+        }
+        let mut seen = HashSet::with_capacity(properties.len());
+        let mut raw = Vec::new();
+        let mut version = metadata.format_version();
+        let mut partitioning = None;
+        for (name, change) in properties {
+            control.check_active()?;
+            if !seen.insert(name.as_ref()) {
+                return Err(invalid(format!(
+                    "Duplicate Iceberg table property '{name}'"
+                )));
+            }
+            let value = match change {
+                DdlPropertyChange::Set(value) | DdlPropertyChange::Reset(value) => value,
+            };
+            match name.as_ref() {
+                "format_version" => {
+                    version = crate::table_properties::typed_format_version(value)?;
+                    if version < metadata.format_version() {
+                        return Err(invalid(format!(
+                            "Cannot downgrade Iceberg format from {} to {version}",
+                            metadata.format_version()
+                        )));
+                    }
+                }
+                "partitioning" => {
+                    let DdlPropertyValue::ArrayVarchar(fields) = value else {
+                        return Err(invalid(
+                            "Iceberg partitioning requires a non-NULL array(varchar)",
+                        ));
+                    };
+                    partitioning = Some(fields.as_slice());
+                }
+                _ => raw.extend(project_partial_raw_table_property(
+                    name,
+                    change,
+                    ExtraPropertyWrite::Alter,
+                    control,
+                )?),
+            }
+        }
+
+        let mut requirements = Vec::new();
+        let mut updates =
+            property_updates(metadata, &raw, ConnectorPropertyAuthority::UserStatement)?;
+        let upgrading = version != metadata.format_version();
+        if upgrading {
+            updates.push(TableUpdate::UpgradeFormatVersion {
+                format_version: version,
+            });
+        }
+        if let Some(fields) = partitioning {
+            // The reference applies the version upgrade within its transaction
+            // before evolving the spec. Freeze against the original metadata,
+            // using the SDK's effective metadata only for spec preparation.
+            let upgraded = if upgrading {
+                Some(
+                    crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(
+                        metadata.clone(),
+                        None,
+                    )
+                    .upgrade_format_version(version)
+                    .and_then(|builder| builder.build())
+                    .map_err(|cause| invalid(format!("Prepare Iceberg format upgrade: {cause}")))?
+                    .metadata,
+                )
+            } else {
+                None
+            };
+            let change = prepare_full_partitioning_change(
+                upgraded.as_ref().unwrap_or(metadata),
+                fields,
+                control,
+            )?;
+            requirements.extend(change.requirements);
+            requirements.push(TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: metadata.current_schema_id(),
+            });
+            updates.extend(change.updates);
+        }
+        control.check_active()?;
+        Ok(crate::commit::staging::PreparedChange {
+            requirements,
+            updates,
+        })
+    };
+    prepare().map_err(InvalidTableProperty::from_property_error)
 }
 
 fn property_updates(
@@ -2765,12 +3026,26 @@ fn execute_namespace_publication(
     // the SPI boundary instead of returning an unqualified provider error.
     let setup = (|| {
         let frozen = match &request.operation {
-            ConnectorCatalogMutationOperation::CreateNamespace { namespace, policy } => {
+            ConnectorCatalogMutationOperation::CreateNamespace {
+                namespace,
+                properties,
+                policy,
+            } => {
+                use novarocks_spi::connector::DdlPropertyValue;
+                let properties = match properties.as_slice() {
+                    [] => HashMap::new(),
+                    [(name, DdlPropertyValue::Varchar(location))]
+                        if name.as_ref() == "location" =>
+                    {
+                        HashMap::from([(name.to_string(), location.clone())])
+                    }
+                    _ => return Err(internal("Malformed evaluated Iceberg schema properties")),
+                };
                 CatalogPublicationRequest::CreateNamespace {
                     namespace: CatalogNamespaceName::new(
                         normalize_identifier(&namespace.namespace).map_err(invalid)?,
                     ),
-                    properties: HashMap::new(),
+                    properties,
                     no_op_if_exists: *policy == CreatePolicy::NoOpIfExists,
                 }
             }
@@ -3112,6 +3387,7 @@ fn mutation_evidence(
         }
         ConnectorCatalogMutationOperation::AlterSchema { table, .. }
         | ConnectorCatalogMutationOperation::AlterPartitionSpec { table, .. }
+        | ConnectorCatalogMutationOperation::SetTableProperties { table, .. }
         | ConnectorCatalogMutationOperation::AlterProperties { table, .. } => {
             let loaded = provider
                 .runtime()
@@ -4195,6 +4471,7 @@ mod tests {
         let mut operations = vec![
             (
                 ConnectorCatalogMutationOperation::CreateNamespace {
+                    properties: Vec::new(),
                     namespace: namespace.clone(),
                     policy: CreatePolicy::FailIfExists,
                 },
@@ -4411,6 +4688,7 @@ mod tests {
                 incarnation: provider.incarnation(),
             },
             operation: ConnectorCatalogMutationOperation::CreateNamespace {
+                properties: Vec::new(),
                 namespace: ConnectorNamespaceIdentity {
                     instance_id: provider.descriptor().instance_id.clone(),
                     namespace: "admission".into(),
@@ -4456,6 +4734,7 @@ mod tests {
             },
             operation: if create {
                 ConnectorCatalogMutationOperation::CreateNamespace {
+                    properties: Vec::new(),
                     namespace,
                     policy: if conditional {
                         CreatePolicy::NoOpIfExists
@@ -4575,6 +4854,54 @@ mod tests {
             matches!(result, Err(crate::catalog::publication_dispatch::PreparationFailure(failure)) if failure.kind() == ConnectorMutationFailureKind::Unsupported)
         );
         assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn namespace_rest_preserves_evaluated_schema_location_in_publication() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::{DdlPropertyType, DdlPropertyValue};
+
+        let location = "s3://warehouse/other-db";
+        let response =
+            serde_json::json!({"namespace": ["db"], "properties": {"location": location}});
+        let server = TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on("GET", "/v1/namespaces/db", Reply::status(404))
+                .on("POST", "/v1/namespaces", Reply::json(200, &response)),
+        );
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        let declarations = provider.schema_property_declarations().unwrap();
+        let [location_declaration] = declarations.as_slice() else {
+            panic!("one schema location declaration");
+        };
+        assert_eq!(location_declaration.name(), "location");
+        assert_eq!(location_declaration.value_type(), DdlPropertyType::Varchar);
+        assert_eq!(
+            *location_declaration.default_value(),
+            DdlPropertyValue::Null
+        );
+        let mut request = namespace_request(&provider, true, false);
+        let ConnectorCatalogMutationOperation::CreateNamespace { properties, .. } =
+            &mut request.operation
+        else {
+            unreachable!();
+        };
+        properties.push((
+            "location".into(),
+            DdlPropertyValue::Varchar(location.into()),
+        ));
+        assert!(matches!(
+            provider.execute(request).unwrap(),
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                ..
+            }
+        ));
+        let requests = server.requests_to("POST", "/v1/namespaces");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body, response);
     }
 
     #[test]
@@ -5783,9 +6110,7 @@ mod tests {
                 nullable: false,
                 default: None,
             }],
-            &[ConnectorPartitionTransform::Identity {
-                column: "id".into(),
-            }],
+            &[Some("id".to_string())],
             &[],
             CreatePolicy::FailIfExists,
         )
@@ -5853,10 +6178,16 @@ mod tests {
         provider: &IcebergMetadata,
         table: &ConnectorTableIdentity,
         columns: &[ConnectorColumnDefinition],
-        partitioning: &[ConnectorPartitionTransform],
-        properties: &[(Arc<str>, Arc<str>)],
+        partitioning: &[Option<String>],
+        properties: &[(Arc<str>, novarocks_spi::connector::DdlPropertyValue)],
         policy: CreatePolicy,
     ) -> Result<ExternalMutationEffect, ConnectorError> {
+        let mut overrides = properties.to_vec();
+        overrides.push((
+            "partitioning".into(),
+            novarocks_spi::connector::DdlPropertyValue::ArrayVarchar(partitioning.to_vec()),
+        ));
+        let properties = evaluated_create_property_inputs(&overrides);
         let request = ConnectorCatalogMutationRequest {
             operation_id: ConnectorMutationOperationId::new(),
             target: ConnectorProviderBindingKey {
@@ -5866,21 +6197,13 @@ mod tests {
             operation: ConnectorCatalogMutationOperation::CreateTable {
                 table: table.clone(),
                 columns: columns.to_vec(),
-                partitioning: partitioning.to_vec(),
-                properties: properties.to_vec(),
+                comment: None,
+                properties,
                 policy,
             },
             context: context(),
         };
-        match execute_create_table(
-            provider,
-            &request,
-            table,
-            columns,
-            partitioning,
-            properties,
-            policy,
-        )? {
+        match execute_create_table(provider, &request)? {
             ExternalMutationOutcome::KnownCommitted { effect, .. } => Ok(effect),
             ExternalMutationOutcome::KnownUncommitted { failure, .. } => {
                 Err(map_mutation_failure(&failure))
@@ -5915,8 +6238,8 @@ mod tests {
                     nullable: false,
                     default: None,
                 }],
-                partitioning: Vec::new(),
-                properties: Vec::new(),
+                comment: None,
+                properties: evaluated_create_property_defaults(),
                 policy,
             },
             context: context(),
@@ -6954,15 +7277,21 @@ mod tests {
         let ConnectorCatalogMutationOperation::CreateTable {
             table,
             columns,
-            partitioning,
+            comment,
             properties,
             ..
         } = &request.operation
         else {
             panic!("create request");
         };
+        let prepared = crate::table_properties::prepare_create_table_properties(
+            properties,
+            comment.as_deref(),
+            &request.context,
+        )
+        .expect("prepare typed properties");
         let (namespace, creation) =
-            prepare_table_creation(table, columns, partitioning, properties)
+            prepare_table_creation(table, columns, &prepared, &request.context)
                 .expect("prepare table creation");
         let frozen = provider
             .runtime()
@@ -7136,6 +7465,104 @@ mod tests {
             );
             assert_eq!(server.count("POST", "/v1/namespaces/managed/tables/mv"), 1);
         }
+    }
+
+    #[test]
+    fn evaluated_table_properties_publish_one_version_and_preserve_old_spec() {
+        use novarocks_spi::connector::{DdlPropertyChange::Set, DdlPropertyValue};
+
+        let (_executor, warehouse, provider) = provider();
+        create_namespace(&provider, "typed");
+        let table = ConnectorTableIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "typed".into(),
+            table: "events".into(),
+        };
+        create_table_fixture(
+            &provider,
+            &table,
+            &[ConnectorColumnDefinition {
+                name: "id".into(),
+                data_type: ConnectorDataType::BigInt,
+                nullable: true,
+                default: None,
+            }],
+            &[Some("id".into())],
+            &[("format_version".into(), DdlPropertyValue::Integer(1))],
+            CreatePolicy::FailIfExists,
+        )
+        .unwrap();
+        let initial = provider
+            .runtime()
+            .observe_table_for_request("typed", "events", &context())
+            .unwrap();
+        let original = initial.table.metadata();
+        assert_eq!(original.format_version(), FormatVersion::V1);
+        assert_eq!(original.default_partition_spec().fields()[0].name, "id");
+        let request = ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: ConnectorProviderBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            operation: ConnectorCatalogMutationOperation::SetTableProperties {
+                table,
+                properties: vec![
+                    ("gc_enabled".into(), Set(DdlPropertyValue::Boolean(false))),
+                    ("format_version".into(), Set(DdlPropertyValue::Integer(2))),
+                    (
+                        "partitioning".into(),
+                        Set(DdlPropertyValue::ArrayVarchar(vec![Some(
+                            "bucket(id, 8)".into(),
+                        )])),
+                    ),
+                ],
+            },
+            context: context(),
+        };
+        assert!(matches!(
+            provider.execute(request).unwrap(),
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                finalization: ExternalMutationFinalization::Complete,
+                cleanup: ExternalMutationFinalization::Complete,
+                ..
+            }
+        ));
+        let committed = provider
+            .runtime()
+            .observe_table_for_request("typed", "events", &context())
+            .unwrap();
+        let metadata = committed.table.metadata();
+        assert_eq!(metadata.uuid(), original.uuid());
+        assert_eq!(metadata.format_version(), FormatVersion::V2);
+        assert_eq!(
+            metadata.properties().get("gc.enabled").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            metadata
+                .partition_spec_by_id(original.default_partition_spec_id())
+                .unwrap(),
+            original.default_partition_spec(),
+        );
+        let [field] = metadata.default_partition_spec().fields() else {
+            panic!("only the desired partition transform should remain");
+        };
+        assert_eq!(field.transform, Transform::Bucket(8));
+        assert_eq!(field.field_id, original.last_partition_id() + 1);
+        assert!(
+            warehouse
+                .path()
+                .join("typed/events/metadata/v2.metadata.json")
+                .is_file()
+        );
+        assert!(
+            !warehouse
+                .path()
+                .join("typed/events/metadata/v3.metadata.json")
+                .exists()
+        );
     }
 
     #[test]
@@ -8430,7 +8857,14 @@ mod tests {
             column("age", ConnectorDataType::SmallInt),
             column("ordinary", ConnectorDataType::Int),
         ];
-        let (_, creation) = prepare_table_creation(&table, &columns, &[], &[]).unwrap();
+        let control = context();
+        let prepared = crate::table_properties::prepare_create_table_properties(
+            &evaluated_create_property_defaults(),
+            None,
+            &control,
+        )
+        .unwrap();
+        let (_, creation) = prepare_table_creation(&table, &columns, &prepared, &control).unwrap();
         assert!(
             !creation
                 .properties
@@ -8565,9 +8999,7 @@ mod tests {
                     nullable: false,
                     default: None,
                 }],
-                &[ConnectorPartitionTransform::Identity {
-                    column: "id".into(),
-                }],
+                &[Some("id".to_string())],
                 &[],
                 CreatePolicy::FailIfExists,
             )
@@ -8862,8 +9294,19 @@ mod tests {
         for (nesting, arrays, admitted) in [(41, false, true), (42, false, false), (63, true, true)]
         {
             let definition = column(nesting, arrays);
-            let create =
-                prepare_table_creation(&table, std::slice::from_ref(&definition), &[], &[]);
+            let control = context();
+            let prepared = crate::table_properties::prepare_create_table_properties(
+                &evaluated_create_property_defaults(),
+                None,
+                &control,
+            )
+            .unwrap();
+            let create = prepare_table_creation(
+                &table,
+                std::slice::from_ref(&definition),
+                &prepared,
+                &control,
+            );
             assert_eq!(create.is_ok(), admitted);
             if let Err(error) = create {
                 assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
@@ -8881,7 +9324,15 @@ mod tests {
                 assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
             }
         }
-        let (_, creation) = prepare_table_creation(&table, &[column(41, false)], &[], &[]).unwrap();
+        let control = context();
+        let prepared = crate::table_properties::prepare_create_table_properties(
+            &evaluated_create_property_defaults(),
+            None,
+            &control,
+        )
+        .unwrap();
+        let (_, creation) =
+            prepare_table_creation(&table, &[column(41, false)], &prepared, &control).unwrap();
         let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
             creation.schema,
             crate::iceberg::spec::PartitionSpec::unpartition_spec(),
@@ -8918,7 +9369,7 @@ mod tests {
         let server = TestServer::start(Script::new());
         let (_executor, provider) = variant_definition_provider(&server.url());
         for (data_type, path) in variant_definitions() {
-            for format in [None, Some("2"), Some("3")] {
+            for format in [None, Some(2), Some(3)] {
                 for policy in [CreatePolicy::FailIfExists, CreatePolicy::NoOpIfExists] {
                     let mut request =
                         create_request(&provider, ConnectorMutationOperationId::new(), policy);
@@ -8931,10 +9382,16 @@ mod tests {
                         unreachable!()
                     };
                     *columns = vec![definition_column(data_type.clone())];
-                    *properties = format
+                    let overrides = format
                         .into_iter()
-                        .map(|version| ("format-version".into(), version.into()))
-                        .collect();
+                        .map(|version| {
+                            (
+                                Arc::from("format_version"),
+                                novarocks_spi::connector::DdlPropertyValue::Integer(version),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    *properties = evaluated_create_property_inputs(&overrides);
                     assert_definition_refused(
                         &provider,
                         request,
@@ -9676,7 +10133,14 @@ mod tests {
             table: "recursive".into(),
         };
         let columns = nominal_declaration::recursive_tests::columns();
-        let (_, creation) = prepare_table_creation(&table, &columns, &[], &[]).unwrap();
+        let control = context();
+        let prepared = crate::table_properties::prepare_create_table_properties(
+            &evaluated_create_property_defaults(),
+            None,
+            &control,
+        )
+        .unwrap();
+        let (_, creation) = prepare_table_creation(&table, &columns, &prepared, &control).unwrap();
         let mut metadata = crate::iceberg::spec::TableMetadataBuilder::new(
             creation.schema,
             crate::iceberg::spec::PartitionSpec::unpartition_spec(),
@@ -11255,7 +11719,12 @@ mod tests {
             &context(),
         )
         .unwrap_err();
-        let actual = error
+        let property = novarocks_spi::connector::InvalidTableProperty::from_connector_error(&error)
+            .expect("actual raw property projection owns this data refusal");
+        assert_eq!(property.source_error().failure_fact(), error.failure_fact());
+        assert_eq!(property.source_error().message(), error.message());
+        let actual = property
+            .source_error()
             .source()
             .unwrap()
             .downcast_ref::<SharedFailureCause>()
@@ -11480,11 +11949,38 @@ mod tests {
     fn evaluated_create_property_defaults()
     -> Vec<(Arc<str>, novarocks_spi::connector::DdlPropertyValue)> {
         use novarocks_spi::connector::DdlPropertyValue as V;
-        vec![
-            ("format".into(), V::Varchar("PARQUET".into())),
-            ("format_version".into(), V::Integer(2)),
-            ("partitioning".into(), V::ArrayVarchar(vec![])),
-        ]
+        // These are explicit fixture inputs from the installed declarations,
+        // not evidence that a QA default expression has been evaluated.
+        let declarations = crate::table_properties::table_property_declarations().unwrap();
+        ["format", "format_version", "partitioning"]
+            .into_iter()
+            .map(|name| {
+                let value = declarations
+                    .iter()
+                    .find(|declaration| declaration.name() == name)
+                    .expect("required fixture declaration")
+                    .default_value()
+                    .clone();
+                assert!(
+                    !matches!(&value, V::Null),
+                    "required fixture input is non-NULL"
+                );
+                (Arc::from(name), value)
+            })
+            .collect()
+    }
+
+    fn evaluated_create_property_inputs(
+        overrides: &[(Arc<str>, novarocks_spi::connector::DdlPropertyValue)],
+    ) -> Vec<(Arc<str>, novarocks_spi::connector::DdlPropertyValue)> {
+        let mut inputs = evaluated_create_property_defaults()
+            .into_iter()
+            .filter(|(name, _)| !overrides.iter().any(|(actual, _)| actual == name))
+            .collect::<Vec<_>>();
+        // Keep every explicit input, including duplicate names, in original
+        // order. The real composer owns duplicate rejection.
+        inputs.extend_from_slice(overrides);
+        inputs
     }
 
     #[test]
@@ -11499,7 +11995,7 @@ mod tests {
         ] {
             let mut properties = evaluated_create_property_defaults();
             properties[1].1 = V::Integer(version);
-            let result = prepare(&properties, &control).unwrap();
+            let result = prepare(&properties, None, &control).unwrap();
             assert_eq!(result.format_version, expected);
             assert_eq!(result.location, None);
             assert!(result.partitioning.is_empty());
@@ -11525,7 +12021,7 @@ mod tests {
                 ]),
             ),
         ]);
-        let prepared = prepare(&properties, &control).unwrap();
+        let prepared = prepare(&properties, None, &control).unwrap();
         assert_eq!(prepared.location.as_deref(), Some("file:///actual/中"));
         assert_eq!(
             prepared.partitioning,
@@ -11539,8 +12035,21 @@ mod tests {
         assert_eq!(prepared.raw_properties["comment"], "extra text");
         assert_eq!(prepared.raw_properties["gc.enabled"], "false");
         assert_eq!(prepared.raw_properties["write.target-file-size-bytes"], "0");
-        // COMMENT is not part of this API: the real clause composition owner
-        // must reject a collision with the retained raw extra comment above.
+        let collision = prepare(&properties, Some("actual clause comment"), &control)
+            .err()
+            .unwrap();
+        assert_eq!(collision.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            collision.message(),
+            "Duplicate Iceberg raw property 'comment'"
+        );
+        let clause = prepare(
+            &evaluated_create_property_defaults(),
+            Some("actual clause 中"),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(clause.raw_properties["comment"], "actual clause 中");
     }
 
     #[test]
@@ -11552,7 +12061,7 @@ mod tests {
         for required in ["format", "format_version", "partitioning"] {
             let mut properties = evaluated_create_property_defaults();
             properties.retain(|(name, _)| name.as_ref() != required);
-            let error = prepare(&properties, &control).err().unwrap();
+            let error = prepare(&properties, None, &control).err().unwrap();
             assert_eq!(error.kind(), ConnectorErrorKind::Internal);
             assert!(error.source().is_some());
             assert!(error.message().contains(required));
@@ -11573,18 +12082,18 @@ mod tests {
             let mut properties = evaluated_create_property_defaults();
             properties.retain(|(key, _)| key.as_ref() != name);
             properties.push((name.into(), value));
-            let error = prepare(&properties, &control).err().unwrap();
+            let error = prepare(&properties, None, &control).err().unwrap();
             assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest, "{name}");
         }
         let mut properties = evaluated_create_property_defaults();
         properties.push(("format".into(), V::Varchar("PARQUET".into())));
-        let error = prepare(&properties, &control).err().unwrap();
+        let error = prepare(&properties, None, &control).err().unwrap();
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert!(error.message().contains("Duplicate"));
         let mut properties = evaluated_create_property_defaults();
         properties.push(("sorted_by".into(), V::ArrayVarchar(vec![])));
         assert_eq!(
-            prepare(&properties, &control).err().unwrap().kind(),
+            prepare(&properties, None, &control).err().unwrap().kind(),
             ConnectorErrorKind::Unsupported
         );
         let mut properties = evaluated_create_property_defaults();
@@ -11593,7 +12102,7 @@ mod tests {
             V::MapVarcharVarchar(vec![("format-version".into(), Some("3".into()))]),
         ));
         assert_eq!(
-            prepare(&properties, &control).err().unwrap().kind(),
+            prepare(&properties, None, &control).err().unwrap().kind(),
             ConnectorErrorKind::InvalidRequest
         );
     }
@@ -11643,7 +12152,7 @@ mod tests {
         };
         let mut properties = vec![(Arc::from("location"), V::Varchar("x".repeat(4096)))];
         properties.extend(evaluated_create_property_defaults());
-        let error = prepare(&properties, &control).err().unwrap();
+        let error = prepare(&properties, None, &control).err().unwrap();
         assert_eq!(control.calls.load(Ordering::SeqCst), 6);
         assert_eq!(error.kind(), control.original.kind());
         assert_eq!(error.failure_fact(), control.original.failure_fact());
@@ -11893,15 +12402,21 @@ mod tests {
         let ConnectorCatalogMutationOperation::CreateTable {
             table,
             columns,
-            partitioning,
+            comment,
             properties,
             ..
         } = &request.operation
         else {
             panic!("original create request");
         };
+        let prepared = crate::table_properties::prepare_create_table_properties(
+            properties,
+            comment.as_deref(),
+            &request.context,
+        )
+        .unwrap();
         let (namespace, creation) =
-            prepare_table_creation(table, columns, partitioning, properties).unwrap();
+            prepare_table_creation(table, columns, &prepared, &request.context).unwrap();
         let frozen = provider
             .runtime()
             .novarocks_catalog()
@@ -12095,6 +12610,196 @@ mod tests {
             "ObserveOnly does not adjudicate from ordinary REST table presence/absence"
         );
     }
+    #[test]
+    fn legacy_alter_set_only_binds_typed_when_the_original_raw_update_is_identical() {
+        use crate::table_properties::{
+            LegacyAlterSetPreparation, prepare_legacy_alter_set_table_property_inputs as prepare,
+        };
+        use novarocks_spi::connector::{DdlPropertyChange::Set, DdlPropertyValue as V};
+
+        let (_executor, _warehouse, provider) = provider();
+        let table = guarded_table(&provider);
+        let context = context();
+        let loaded = provider
+            .runtime()
+            .observe_table_for_request(&table.namespace, &table.table, &context)
+            .unwrap();
+        let metadata = loaded.table.metadata();
+        let raw_change = |key: &str, value: &str| ConnectorPropertyChange::Set {
+            key: key.into(),
+            value: value.into(),
+        };
+        let prepare_raw = |changes: &[ConnectorPropertyChange]| {
+            prepare_property_change(
+                metadata,
+                changes,
+                ConnectorPropertyAuthority::UserStatement,
+                None,
+            )
+            .unwrap()
+        };
+        let changes = [
+            raw_change("comment", "hello"),
+            raw_change("gc.enabled", "true"),
+            raw_change("write.parquet.compression-codec", "zstd"),
+            raw_change("novarocks.statistics.collect-on-write", "true"),
+        ];
+        let original = prepare_raw(&changes);
+        let LegacyAlterSetPreparation::Typed(properties) = prepare(&changes, &context).unwrap()
+        else {
+            panic!("canonical legacy SET input must retain all typed facts");
+        };
+        assert_eq!(
+            properties,
+            vec![
+                (
+                    Arc::from("extra_properties"),
+                    Set(V::MapVarcharVarchar(vec![
+                        ("comment".into(), Some("hello".into())),
+                        (
+                            "write.parquet.compression-codec".into(),
+                            Some("zstd".into())
+                        ),
+                    ])),
+                ),
+                (Arc::from("gc_enabled"), Set(V::Boolean(true))),
+                (
+                    Arc::from("statistics_collect_on_write"),
+                    Set(V::Boolean(true))
+                ),
+            ],
+        );
+        let typed = prepare_set_table_properties(metadata, &properties, &context).unwrap();
+        let [TableUpdate::SetProperties { updates: original }] = original.updates.as_slice() else {
+            panic!("legacy SET must publish the original raw properties");
+        };
+        let [TableUpdate::SetProperties { updates: typed }] = typed.updates.as_slice() else {
+            panic!("typed SET must publish exactly one raw update");
+        };
+        assert_eq!(typed, original);
+
+        for (key, value) in [
+            ("Case.Key", "original case"),
+            ("gc.enabled", "TRUE"),
+            ("gc.enabled", "junk"),
+            ("commit.retry.num-retries", "003"),
+            ("format_version", "3"),
+            ("Format-Version", "3"),
+        ] {
+            let changes = [raw_change("comment", "untouched"), raw_change(key, value)];
+            let original = prepare_raw(&changes);
+            let [TableUpdate::SetProperties { updates }] = original.updates.as_slice() else {
+                panic!("legacy SET already accepted this input as raw bytes");
+            };
+            assert_eq!(updates.get(key).map(String::as_str), Some(value));
+            assert_eq!(
+                updates.get("comment").map(String::as_str),
+                Some("untouched")
+            );
+            assert_eq!(
+                prepare(&changes, &context).unwrap(),
+                LegacyAlterSetPreparation::KeepRaw { input_index: 1 },
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_alter_set_keeps_the_actual_raw_gate_and_original_control() {
+        use crate::table_properties::prepare_legacy_alter_set_table_property_inputs as prepare;
+        use novarocks_failure_contract::{FailureFact, FailureProjection};
+        use std::error::Error;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_executor, _warehouse, provider) = provider();
+        let table = guarded_table(&provider);
+        let context = context();
+        let loaded = provider
+            .runtime()
+            .observe_table_for_request(&table.namespace, &table.table, &context)
+            .unwrap();
+        let metadata = loaded.table.metadata();
+        let raw_change = |key: &str, value: &str| ConnectorPropertyChange::Set {
+            key: key.into(),
+            value: value.into(),
+        };
+        let protected = ("format-version", "3");
+        let variant = ("write.parquet.variant-shredding.payload", "a:int");
+        for (first, second, kind, message) in [
+            (
+                protected,
+                variant,
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg table property `format-version` is reserved: format version requires a dedicated upgrade operation",
+            ),
+            (
+                variant,
+                protected,
+                ConnectorErrorKind::Unsupported,
+                "Iceberg table property prefix `write.parquet.variant-shredding.` is not supported",
+            ),
+        ] {
+            let changes = [
+                raw_change("gc.enabled", "junk"),
+                raw_change(first.0, first.1),
+                raw_change(second.0, second.1),
+            ];
+            let crate::catalog::publication_dispatch::PreparationFailure(failure) =
+                prepare_property_change(
+                    metadata,
+                    &changes,
+                    ConnectorPropertyAuthority::UserStatement,
+                    None,
+                )
+                .err()
+                .expect("the legacy raw gate must reject the first protected input");
+            let source = failure.connector_source().expect("original raw gate error");
+            assert_eq!(source.kind(), kind);
+            assert_eq!(source.message(), message);
+        }
+
+        #[derive(Debug)]
+        struct OriginalStop;
+        impl std::fmt::Display for OriginalStop {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("original legacy ALTER duration ended")
+            }
+        }
+        impl Error for OriginalStop {}
+        impl FailureProjection for OriginalStop {
+            fn failure_fact(&self) -> FailureFact {
+                ConnectorErrorKind::Cancelled.failure_fact()
+            }
+        }
+        struct Stop(ConnectorError, AtomicUsize);
+        impl ConnectorOperationControl for Stop {
+            fn check_active(&self) -> Result<(), ConnectorError> {
+                if self.1.fetch_add(1, Ordering::Relaxed) >= 2 {
+                    Err(self.0.clone())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let control = Stop(
+            ConnectorError::from_domain(ConnectorErrorKind::Cancelled, OriginalStop),
+            AtomicUsize::new(0),
+        );
+        let changes = [raw_change("gc.enabled", "junk")];
+        prepare_property_change(
+            metadata,
+            &changes,
+            ConnectorPropertyAuthority::UserStatement,
+            None,
+        )
+        .unwrap();
+        let result = prepare(&changes, &control).unwrap_err();
+        assert_eq!(result.failure_fact(), control.0.failure_fact());
+        assert!(std::ptr::eq(
+            result.source().unwrap().source().unwrap(),
+            control.0.source().unwrap().source().unwrap(),
+        ));
+    }
+
     #[test]
     fn legacy_create_property_leaves_preserve_actual_ordinals_readers_and_raw_names() {
         use crate::table_properties::{
@@ -12701,5 +13406,44 @@ mod tests {
         .unwrap_err();
         assert_eq!(actual.kind(), expected.kind());
         assert_eq!(actual.message(), expected.message());
+    }
+    #[test]
+    fn schema_default_invalid_request_is_not_a_table_property_projection() {
+        use novarocks_spi::connector::{
+            ConnectorDefaultValue, DdlPropertyValue, InvalidTableProperty,
+        };
+        let control = context();
+        let typed = crate::table_properties::prepare_create_table_properties(
+            &[
+                ("format".into(), DdlPropertyValue::Varchar("PARQUET".into())),
+                ("format_version".into(), DdlPropertyValue::Integer(3)),
+                (
+                    "partitioning".into(),
+                    DdlPropertyValue::ArrayVarchar(vec![]),
+                ),
+            ],
+            None,
+            &control,
+        )
+        .unwrap();
+        let table = ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("schema_test").unwrap(),
+            namespace: "db".into(),
+            table: "t".into(),
+        };
+        let column = ConnectorColumnDefinition {
+            name: "id".into(),
+            data_type: ConnectorDataType::Int,
+            nullable: false,
+            default: Some(ConnectorDefaultValue::String("bad".into())),
+        };
+        let error = prepare_table_creation(&table, &[column], &typed, &control).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(
+            error
+                .message()
+                .contains("connector default does not match Iceberg type")
+        );
+        assert!(InvalidTableProperty::from_connector_error(&error).is_none());
     }
 }

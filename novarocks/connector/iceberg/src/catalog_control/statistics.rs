@@ -456,6 +456,25 @@ fn evidence_revision(
 }
 
 impl StatisticsCollection for IcebergMetadata {
+    fn analyze_property_declarations(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::DdlPropertyDeclaration>, ConnectorError> {
+        use novarocks_spi::connector::{DdlPropertyDeclaration, DdlPropertyType, DdlPropertyValue};
+        DdlPropertyDeclaration::new(
+            "columns",
+            DdlPropertyType::ArrayVarchar,
+            DdlPropertyValue::Null,
+            false,
+        )
+        .map(|value| vec![value])
+        .map_err(|cause| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                format!("invalid Iceberg ANALYZE property declaration: {cause}"),
+            )
+        })
+    }
+
     fn scoped_cpu_source_type_id(&self) -> Option<std::any::TypeId> {
         Some(std::any::TypeId::of::<scoped_cpu::StatisticsCpuOriginal>())
     }

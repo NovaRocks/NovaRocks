@@ -42,10 +42,12 @@ pub(crate) mod internal_result_cpu;
 pub mod kernels;
 pub(crate) mod lifecycle_diagnostics;
 pub mod lifecycle_plan;
+pub(crate) mod like_source_read;
 pub(crate) mod logical_execution;
 #[cfg(test)]
 pub(crate) mod logical_execution_test_profile;
 pub mod maintenance;
+pub(crate) mod metadata_capture;
 pub mod mv_assembly;
 pub mod mv_native_write;
 pub(crate) mod native_execution_adapter;

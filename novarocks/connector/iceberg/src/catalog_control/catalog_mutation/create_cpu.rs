@@ -56,7 +56,7 @@ impl Work {
         let ConnectorCatalogMutationOperation::CreateTable {
             table,
             columns,
-            partitioning,
+            comment,
             properties,
             policy,
         } = &original.request.operation
@@ -70,6 +70,7 @@ impl Work {
                 &original.request,
                 table,
                 columns,
+                comment.as_deref(),
                 properties,
             )),
             Stage::Freeze(facts) => Output::Freeze(freeze_ordinary_create(
@@ -77,8 +78,6 @@ impl Work {
                 &original.request,
                 table,
                 columns,
-                partitioning,
-                properties,
                 *policy,
                 facts,
             )),

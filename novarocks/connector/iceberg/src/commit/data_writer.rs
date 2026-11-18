@@ -115,7 +115,6 @@ impl std::error::Error for ParquetRowGroupSizeParseError {
 }
 impl novarocks_failure_contract::FailureProjection for ParquetRowGroupSizeParseError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::FailureProjection;
         novarocks_spi::connector::ConnectorErrorKind::InvalidRequest.failure_fact()
     }
 }

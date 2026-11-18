@@ -91,10 +91,9 @@ fn lower_application_command(
                     current_catalog,
                     current_database,
                 )?,
-                columns: if columns.is_empty() {
-                    StatisticsColumnIntent::AllColumns
-                } else {
-                    StatisticsColumnIntent::Explicit(columns.clone())
+                columns: match columns {
+                    None => StatisticsColumnIntent::AllColumns,
+                    Some(columns) => StatisticsColumnIntent::Explicit(columns.clone()),
                 },
             }
         }

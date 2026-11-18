@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::backend;
 use crate::connector::schema_creation::FrontendSchemaLoad;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use std::sync::Arc;
@@ -490,52 +489,6 @@ pub(crate) async fn metadata_read_reference_facts_with_planning_pin_async(
         })
         .await
         .map_err(|error| error.to_string())
-}
-
-pub fn metadata_load_table(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    context: ConnectorRequestContext,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-    resolution: ConnectorTableResolution,
-) -> Result<(backend::ResolvedTable, Option<i32>), String> {
-    let binding = metadata_binding(controls, catalog)?;
-    metadata_load_table_with_planning_pin(binding, context, namespace, table, resolution)
-}
-
-/// Resolve metadata through an admission-frozen planning pin.  Write
-/// callers use this instead of reopening `acquire_current` after target
-/// admission.
-pub fn metadata_load_table_with_planning_pin(
-    binding: novarocks_spi::connector::ConnectorControlPlanningPin,
-    context: ConnectorRequestContext,
-    namespace: &str,
-    table: &str,
-    resolution: ConnectorTableResolution,
-) -> Result<(backend::ResolvedTable, Option<i32>), String> {
-    let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_pin(&binding, context)?;
-    let metadata = binding
-        .binding()
-        .metadata()
-        .load_frontend_table(ConnectorTableRequest {
-            table: ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(namespace),
-                table: Arc::from(table),
-            },
-            resolution,
-            context,
-        })
-        .map_err(|error| error.to_string())?;
-    let columns = sql_columns_from_connector_metadata(&metadata)?;
-    let schema_id = metadata.version.as_ref().and_then(|version| {
-        <[u8; 4]>::try_from(version.as_ref())
-            .ok()
-            .map(i32::from_le_bytes)
-    });
-    Ok((backend::ResolvedTable { columns }, schema_id))
 }
 
 /// Load the exact connector metadata admitted by a retained planning pin.

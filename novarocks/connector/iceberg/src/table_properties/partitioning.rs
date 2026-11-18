@@ -34,6 +34,14 @@ pub fn parse_table_partitioning_property(
     value: &DdlPropertyValue,
     control: &dyn ConnectorOperationControl,
 ) -> Result<Vec<ConnectorPartitionTransform>, ConnectorError> {
+    parse_table_partitioning_property_inner(value, control)
+        .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
+}
+
+fn parse_table_partitioning_property_inner(
+    value: &DdlPropertyValue,
+    control: &dyn ConnectorOperationControl,
+) -> Result<Vec<ConnectorPartitionTransform>, ConnectorError> {
     control.check_active()?;
     let DdlPropertyValue::ArrayVarchar(fields) = value else {
         return Err(ConnectorError::new(
@@ -70,6 +78,14 @@ pub(super) fn parse_optional_partitioning_element(
 /// original field before advancing to the next one. No name/type/source lookup
 /// or partition-spec mutation occurs here.
 pub fn parse_table_partitioning_element(
+    field: &str,
+    control: &dyn ConnectorOperationControl,
+) -> Result<ConnectorPartitionTransform, ConnectorError> {
+    parse_table_partitioning_element_inner(field, control)
+        .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
+}
+
+fn parse_table_partitioning_element_inner(
     field: &str,
     control: &dyn ConnectorOperationControl,
 ) -> Result<ConnectorPartitionTransform, ConnectorError> {

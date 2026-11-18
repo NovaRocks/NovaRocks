@@ -21,6 +21,9 @@
 //! format-version, partition-spec and location changes retain their owners.
 
 mod legacy;
+pub(crate) use legacy::{
+    LegacyAlterSetPreparation, prepare_legacy_alter_set_table_property_inputs,
+};
 pub use legacy::{
     LegacyPreparedTableProperty, LegacyPreparedTablePropertyValue,
     LegacyTablePropertyPreparationFailure, prepare_legacy_create_table_partitioning_property,
@@ -28,11 +31,16 @@ pub use legacy::{
 };
 
 mod create;
-pub(crate) use create::{PreparedCreateTableProperties, prepare_create_table_properties};
+pub(crate) use create::{
+    PreparedCreateTableProperties, prepare_create_table_properties, typed_format_version,
+};
 
 mod projection;
 pub use projection::project_partial_raw_table_property;
 pub(crate) use projection::project_raw_table_property_set;
+
+mod partitioning_evolution;
+pub(crate) use partitioning_evolution::prepare_full_partitioning_change;
 
 mod partitioning_binding;
 pub(crate) use partitioning_binding::bind_create_table_partitioning;
@@ -247,3 +255,7 @@ fn declared_raw_property(key: &str) -> bool {
 fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
 }
+
+#[cfg(test)]
+#[path = "table_properties/create_error_tests.rs"]
+mod create_error_tests;

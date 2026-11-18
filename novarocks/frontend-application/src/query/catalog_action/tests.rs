@@ -18,6 +18,7 @@
 //! Real Catalog property CPU ownership and close-before-result guards.
 
 use super::*;
+use crate::query::property_cpu_context::PropertyCpuContext;
 use crate::task_execution::blocking_io::tests::OriginalExecutorsFixture;
 use novarocks_sql::compiler::{SqlCancellationObservation, SqlFunctionCatalog};
 use novarocks_workload_control::{
@@ -131,20 +132,17 @@ impl Fixture {
         CatalogPropertyCpuInput {
             source: Arc::from(source),
             statement,
-            current_database: frozen.current_database().to_owned(),
-            sql_semantics: frozen.sql_semantics().clone(),
-            interpreter: Arc::new(
-                crate::query_execution::required_constant_eval::test_required_constant_interpreter(
-                ),
-            ),
-            control,
-            scope: self.root.owner.scope(),
-            window: self.window.clone(),
-            catalog: Arc::new(RwLock::new(
-                novarocks_sql::planning::catalog::PlannerMemoryCatalog::default(),
-            )),
-            functions,
-            policy: crate::application::test_constant_policy(),
+            context: PropertyCpuContext {
+                current_database: frozen.current_database().to_owned(),
+                sql_semantics: frozen.sql_semantics().clone(),
+                interpreter: Arc::new(crate::query_execution::required_constant_eval::test_required_constant_interpreter()),
+                control,
+                scope: self.root.owner.scope(),
+                window: self.window.clone(),
+                catalog: Arc::new(RwLock::new(novarocks_sql::planning::catalog::PlannerMemoryCatalog::default())),
+                functions,
+                policy: crate::application::test_constant_policy(),
+            },
         }
     }
     fn tail(&self) -> CatalogNativeTail {

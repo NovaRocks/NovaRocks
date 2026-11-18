@@ -54,6 +54,7 @@ pub(crate) mod create_original;
 mod current_metadata_cpu;
 pub(crate) use current_metadata_cpu::{
     CaptureFailure, CurrentMetadataCapture, CurrentProjectionMetadataCpu,
+    new_current_metadata_capture,
 };
 
 pub(crate) fn now_management_timestamp() -> Result<ManagementTimestamp, String> {
@@ -733,7 +734,7 @@ impl CurrentProjectionRegistration {
     }
     pub(crate) fn new() -> Self {
         Self {
-            capture: current_metadata_cpu::CurrentMetadataCapture::new(),
+            capture: current_metadata_cpu::new_current_metadata_capture(),
             receiving: Arc::new(novarocks_spi::connector::ConnectorCatalogMutationReceiving::new()),
             preparation: std::sync::OnceLock::new(),
             admission: std::sync::OnceLock::new(),

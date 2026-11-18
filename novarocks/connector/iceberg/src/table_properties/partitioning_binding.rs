@@ -34,33 +34,24 @@ pub(crate) fn bind_create_table_partitioning(
     fields: &[Option<String>],
     control: &dyn ConnectorOperationControl,
 ) -> Result<PartitionSpec, ConnectorError> {
+    bind_create_table_partitioning_inner(schema, fields, control)
+        .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
+}
+
+fn bind_create_table_partitioning_inner(
+    schema: SchemaRef,
+    fields: &[Option<String>],
+    control: &dyn ConnectorOperationControl,
+) -> Result<PartitionSpec, ConnectorError> {
     control.check_active()?;
     let mut builder = UnboundPartitionSpec::builder().with_spec_id(0);
     let mut resolved = Vec::with_capacity(fields.len());
     let mut domain = PropertyOutputNames::new(&schema, fields.len())?;
     for (index, field) in fields.iter().enumerate() {
         control.check_active()?;
-        let field = parse_optional_partitioning_element(field.as_deref(), index, control)?;
-        let name = partition_source(&field);
-        // This is the real Schema's exact name index, not an identifier/path
-        // adapter. Parsing and this lookup finish before the next input.
-        let source = schema
-            .field_by_name(name)
-            .ok_or_else(|| invalid(format!("partition source column `{name}` does not exist")))?;
-        let source_id = source.id;
-        if !schema
-            .as_struct()
-            .fields()
-            .iter()
-            .any(|field| field.id == source_id)
-            || !novarocks_types::naming::normalize_identifier(name)
-                .is_ok_and(|normalized| normalized == name)
-        {
-            return Err(unsupported(
-                "nested or non-simple partition source is not supported by the existing CREATE profile",
-            ));
-        }
-        domain.admit(&schema, source_id, &field, control)?;
+        let (source_id, field) =
+            resolve_property_partition_source(&schema, field.as_deref(), index, "CREATE", control)?;
+        domain.admit(&schema, source_id, &field, false, control)?;
         let unbound = initial_partition_field(&field, source_id, index).map_err(invalid)?;
         builder = builder
             .add_partition_fields([unbound])
@@ -80,15 +71,43 @@ pub(crate) fn bind_create_table_partitioning(
     Ok(spec)
 }
 
-/// Only the input language's CREATE output-name checks live here. Source
+pub(super) fn resolve_property_partition_source(
+    schema: &Schema,
+    field: Option<&str>,
+    index: usize,
+    operation: &'static str,
+    control: &dyn ConnectorOperationControl,
+) -> Result<(i32, ConnectorPartitionTransform), ConnectorError> {
+    let field = parse_optional_partitioning_element(field, index, control)?;
+    let name = partition_source(&field);
+    let source = schema
+        .field_by_name(name)
+        .ok_or_else(|| invalid(format!("partition source column `{name}` does not exist")))?;
+    let source_id = source.id;
+    if !schema
+        .as_struct()
+        .fields()
+        .iter()
+        .any(|field| field.id == source_id)
+        || !novarocks_types::naming::normalize_identifier(name)
+            .is_ok_and(|normalized| normalized == name)
+    {
+        return Err(unsupported(&format!(
+            "nested or non-simple partition source is not supported by the existing {operation} profile"
+        )));
+    }
+    Ok((source_id, field))
+}
+
+/// The property grammar's output-name checks do not assign physical IDs. Source
 /// resolution stays with Schema; stored names/IDs stay with the native author.
-struct PropertyOutputNames {
+pub(super) struct PropertyOutputNames {
     names: HashSet<String>,
     dedup: HashSet<(i32, &'static str)>,
     attempts_end: usize,
 }
 impl PropertyOutputNames {
-    fn new(schema: &Schema, field_count: usize) -> Result<Self, ConnectorError> {
+    pub(super) fn new(schema: &Schema, field_count: usize) -> Result<Self, ConnectorError> {
         let attempts_end = schema
             .as_struct()
             .fields()
@@ -101,13 +120,14 @@ impl PropertyOutputNames {
             attempts_end,
         })
     }
-    fn admit(
+    pub(super) fn admit(
         &mut self,
         schema: &Schema,
         source_id: i32,
         field: &ConnectorPartitionTransform,
+        include_width: bool,
         control: &dyn ConnectorOperationControl,
-    ) -> Result<(), ConnectorError> {
+    ) -> Result<String, ConnectorError> {
         use ConnectorPartitionTransform as T;
         let source = partition_source(field);
         let base = match field {
@@ -124,6 +144,10 @@ impl PropertyOutputNames {
             T::Month { .. } => format!("{source}_month"),
             T::Day { .. } => format!("{source}_day"),
             T::Hour { .. } => format!("{source}_hour"),
+            T::Bucket { num_buckets, .. } if include_width => {
+                format!("{source}_bucket_{num_buckets}")
+            }
+            T::Truncate { width, .. } if include_width => format!("{source}_trunc_{width}"),
             T::Bucket { .. } => format!("{source}_bucket"),
             T::Truncate { .. } => format!("{source}_trunc"),
             T::Void { .. } => format!("{source}_null"),
@@ -159,7 +183,7 @@ impl PropertyOutputNames {
                         )));
                     }
                 }
-                return Ok(());
+                return Ok(candidate);
             }
             attempt = attempt
                 .checked_add(1)

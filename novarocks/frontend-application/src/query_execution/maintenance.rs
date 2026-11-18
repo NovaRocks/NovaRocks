@@ -358,6 +358,42 @@ pub(crate) struct RequestScopedMaintenanceEngine {
 }
 
 impl RequestScopedMaintenanceEngine {
+    /// Retain the selected provider fact from the same original target gate.
+    pub(crate) fn resolve_target_with_provider(
+        &self,
+        name_parts: &[String],
+        context: MaintenanceRequestContext<'_>,
+    ) -> Result<
+        (
+            MaintenanceTarget,
+            novarocks_spi::connector::ConnectorProviderId,
+        ),
+        crate::catalog_application::resolver::TargetResolutionError,
+    > {
+        let target = crate::catalog_application::resolver::resolve_existing_table_target(
+            &self.kernel,
+            &novarocks_sql::semantic::ObjectName {
+                parts: name_parts.to_vec(),
+            },
+            context.current_catalog,
+            context.current_database,
+        )?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        self.kernel
+            .connector_control()
+            .acquire_current_metadata_maintenance(&instance_id)
+            .map_err(|error| error.to_string())?;
+        Ok((
+            MaintenanceTarget {
+                catalog: target.catalog,
+                namespace: target.namespace,
+                table: target.table,
+            },
+            target.provider_id,
+        ))
+    }
+
     pub(crate) async fn reject_direct_rewrite_on_mv(
         &self,
         target: &MaintenanceTarget,
@@ -478,25 +514,8 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceTarget, crate::catalog_application::resolver::TargetResolutionError>
     {
-        let target = crate::catalog_application::resolver::resolve_existing_table_target(
-            &self.kernel,
-            &novarocks_sql::semantic::ObjectName {
-                parts: name_parts.to_vec(),
-            },
-            context.current_catalog,
-            context.current_database,
-        )?;
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| error.to_string())?;
-        self.kernel
-            .connector_control()
-            .acquire_current_metadata_maintenance(&instance_id)
-            .map_err(|error| error.to_string())?;
-        Ok(MaintenanceTarget {
-            catalog: target.catalog,
-            namespace: target.namespace,
-            table: target.table,
-        })
+        self.resolve_target_with_provider(name_parts, context)
+            .map(|(target, _provider)| target)
     }
 
     async fn reject_user_action_on_mv(

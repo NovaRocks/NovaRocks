@@ -17,6 +17,9 @@
 
 //! DDL property preparation, separate from expression execution and provider policy.
 
+mod legacy_table_properties;
+pub(super) use legacy_table_properties::prepare_legacy_create_table_properties;
+
 use std::collections::HashSet;
 
 use novarocks_constant_contract::{ConstantError, ConstantValue};
@@ -438,6 +441,24 @@ fn evaluate_value(
     port: &mut dyn DdlPropertyConstantPort,
     control: &dyn PureCompileControl,
 ) -> Result<DdlPropertyValue, QueryServiceError> {
+    evaluate_required_property_value(expression, value_type, port, control, |message, cause| {
+        let error = scope.to_user_error(source, expression.span(), message);
+        match cause {
+            Some(cause) => QueryServiceError::from_user_error_with_cause(error, cause),
+            None => QueryServiceError::from_user_error(error),
+        }
+    })
+}
+
+/// Run the original required-constant port and project its complete result.
+/// The caller authors only its own domain's data-error identity.
+pub(super) fn evaluate_required_property_value(
+    expression: &Expr,
+    value_type: DdlPropertyType,
+    port: &mut dyn DdlPropertyConstantPort,
+    control: &dyn PureCompileControl,
+    invalid_value: impl FnOnce(String, Option<SharedFailureCause>) -> QueryServiceError,
+) -> Result<DdlPropertyValue, QueryServiceError> {
     let target = match value_type {
         DdlPropertyType::Boolean => RequiredConstantTarget::Boolean,
         DdlPropertyType::Integer => RequiredConstantTarget::Integer,
@@ -454,11 +475,7 @@ fn evaluate_value(
         Ok(constant) => constant,
         Err(DdlPropertyConstantError::Failure(error)) => return Err(error),
         Err(DdlPropertyConstantError::InvalidValue { message, cause }) => {
-            let error = scope.to_user_error(source, expression.span(), message);
-            return Err(match cause {
-                Some(cause) => QueryServiceError::from_user_error_with_cause(error, cause),
-                None => QueryServiceError::from_user_error(error),
-            });
+            return Err(invalid_value(message, cause));
         }
     };
     checkpoint(control, 0)?;
@@ -682,13 +699,16 @@ fn observe_bytes(value: &str, control: &dyn PureCompileControl) -> Result<(), Qu
     }
     Ok(())
 }
-fn copy_string(value: &str, control: &dyn PureCompileControl) -> Result<String, QueryServiceError> {
+pub(super) fn copy_string(
+    value: &str,
+    control: &dyn PureCompileControl,
+) -> Result<String, QueryServiceError> {
     observe_bytes(value, control)?;
     let value = value.to_owned();
     checkpoint(control, 0)?;
     Ok(value)
 }
-fn copy_value(
+pub(super) fn copy_value(
     value: &DdlPropertyValue,
     control: &dyn PureCompileControl,
 ) -> Result<DdlPropertyValue, QueryServiceError> {

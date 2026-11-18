@@ -42,19 +42,16 @@ pub(super) fn prepare(
             "maintenance client result requires an explicit presentation",
         )
     })?;
-    if let Some(action) = executor
-        .prepare_optimize_action(
-            command,
-            context.session().current_catalog(),
-            context.session().current_database(),
-            context.execution(),
-            command_context.connector_context(),
-            family,
-            #[cfg(novarocks_dev_controls)]
-            observation.clone(),
-        )
-        .map_err(maintenance_command_error)?
-    {
+    if let Some(action) = executor.prepare_optimize_action(
+        command,
+        context.session().current_catalog(),
+        context.session().current_database(),
+        context.execution(),
+        command_context.connector_context(),
+        family,
+        #[cfg(novarocks_dev_controls)]
+        observation.clone(),
+    )? {
         return Ok(action);
     }
     if let Some(action) = executor
@@ -72,17 +69,14 @@ pub(super) fn prepare(
     {
         return Ok(action);
     }
-    if let Some(action) = executor
-        .prepare_cleanup_action(
-            command,
-            context.session().current_catalog(),
-            context.session().current_database(),
-            context.execution(),
-            command_context.connector_context(),
-            family,
-        )
-        .map_err(maintenance_command_error)?
-    {
+    if let Some(action) = executor.prepare_cleanup_action(
+        command,
+        context.session().current_catalog(),
+        context.session().current_database(),
+        context.execution(),
+        command_context.connector_context(),
+        family,
+    )? {
         return Ok(action);
     }
     let capacity = context.execution().result_capacity().ok_or_else(|| {
@@ -103,15 +97,13 @@ pub(super) fn prepare(
             "maintenance contexts belong to different original scopes",
         ));
     }
-    let call = executor
-        .prepare_command(
-            command,
-            context.session().current_catalog(),
-            context.session().current_database(),
-            context.execution(),
-            command_context.connector_context(),
-        )
-        .map_err(maintenance_command_error)?;
+    let call = executor.prepare_command(
+        command,
+        context.session().current_catalog(),
+        context.session().current_database(),
+        context.execution(),
+        command_context.connector_context(),
+    )?;
     Ok(Box::new(MetadataMaintenanceAction {
         family,
         call,
