@@ -224,7 +224,12 @@ fn reject_extra_property_key(
             }
         }));
     }
-    if let Some(reason) = reserved_property(key) {
+    // This exact historical CREATE key is opaque metadata. ADR-0233 keeps
+    // UPDATE and MERGE on MOR regardless of its stored value. ALTER retains
+    // the original user-statement namespace guard.
+    if let Some(reason) = reserved_property(key)
+        && !(operation == ExtraPropertyWrite::Create && key == "novarocks.update.mode")
+    {
         return Err(invalid(format!(
             "Iceberg table property `{key}` is reserved: {reason}"
         )));

@@ -11067,6 +11067,90 @@ mod tests {
     }
 
     #[test]
+    fn create_retains_opaque_update_mode_while_user_alter_stays_reserved() {
+        use crate::table_properties::{
+            ExtraPropertyWrite, LegacyPreparedTablePropertyValue, extra_property_sets,
+            extra_property_unsets, prepare_legacy_create_table_property_inputs,
+        };
+        use novarocks_spi::connector::DdlPropertyValue;
+
+        let key = "novarocks.update.mode";
+        let value = "copy-on-write";
+        let raw = [(Arc::from(key), Arc::from(value))];
+        let (_, original) = prepare_create_raw_table_properties(&raw).unwrap();
+        assert_eq!(original.get(key).map(String::as_str), Some(value));
+        let mut legacy = prepare_legacy_create_table_property_inputs(&raw, &context()).unwrap();
+        assert_eq!(legacy.len(), 1);
+        let property = legacy.pop().unwrap();
+        assert_eq!(property.input_index, 0);
+        let LegacyPreparedTablePropertyValue::Extra {
+            key: prepared_key,
+            value: prepared_value,
+        } = property.value
+        else {
+            panic!("opaque write-mode text must reach the actual extra property projection");
+        };
+        assert_eq!(prepared_key, key);
+        assert_eq!(prepared_value, value);
+        let extra = DdlPropertyValue::MapVarcharVarchar(vec![(prepared_key, Some(prepared_value))]);
+
+        let (_executor, _warehouse, provider) = provider();
+        create_namespace(&provider, "opaque");
+        let table = ConnectorTableIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "opaque".into(),
+            table: "events".into(),
+        };
+        assert_eq!(
+            create_table_fixture(
+                &provider,
+                &table,
+                &[ConnectorColumnDefinition {
+                    name: "id".into(),
+                    data_type: ConnectorDataType::BigInt,
+                    nullable: false,
+                    default: None,
+                }],
+                &[],
+                &[
+                    ("format_version".into(), DdlPropertyValue::Integer(3)),
+                    ("extra_properties".into(), extra.clone()),
+                ],
+                CreatePolicy::FailIfExists,
+            )
+            .unwrap(),
+            ExternalMutationEffect::Applied,
+        );
+        let loaded = provider
+            .runtime()
+            .observe_table_for_request("opaque", "events", &context())
+            .unwrap();
+        let metadata = loaded.table.metadata();
+        assert_eq!(metadata.format_version(), FormatVersion::V3);
+        assert_eq!(metadata.properties().get(key), original.get(key));
+
+        for error in [
+            property_updates(
+                metadata,
+                &[ConnectorPropertyChange::Set {
+                    key: key.into(),
+                    value: "merge-on-read".into(),
+                }],
+                ConnectorPropertyAuthority::UserStatement,
+            )
+            .unwrap_err(),
+            extra_property_sets(&extra, ExtraPropertyWrite::Alter).unwrap_err(),
+            extra_property_unsets(&[key.into()], true).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert_eq!(
+                error.message(),
+                "Iceberg table property `novarocks.update.mode` is reserved: novarocks.* namespace is reserved for engine-owned properties"
+            );
+        }
+    }
+
+    #[test]
     fn ddl_extra_properties_reject_null_values_and_normalized_duplicate_keys() {
         use crate::table_properties::{ExtraPropertyWrite as Op, extra_property_sets};
         use novarocks_spi::connector::DdlPropertyValue as V;
@@ -11152,6 +11236,7 @@ mod tests {
             "novarocks.maintenance.enabled",
             "current-schema-id",
             "novarocks.table.key_columns",
+            "novarocks.update.mode.future",
         ] {
             let value = V::MapVarcharVarchar(vec![(key.to_uppercase(), Some("source".into()))]);
             for operation in [Op::Create, Op::Alter] {
