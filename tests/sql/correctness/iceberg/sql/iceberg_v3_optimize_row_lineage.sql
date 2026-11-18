@@ -70,7 +70,7 @@ ALTER TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage CREATE TAG pre_opt;
 -- query 3
 -- BEFORE OPTIMIZE: 5 surviving rows, each with a unique `_row_id`.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS n_rows, count(DISTINCT _row_id) AS n_unique_row_ids
+SELECT count() AS n_rows, count(DISTINCT _row_id) AS n_unique_row_ids
   FROM olineage;
 
 -- query 4
@@ -103,7 +103,7 @@ ALTER TABLE olineage OPTIMIZE;
 -- query 8
 -- AFTER OPTIMIZE: same row count, same number of unique row-ids.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS n_rows, count(DISTINCT _row_id) AS n_unique_row_ids
+SELECT count() AS n_rows, count(DISTINCT _row_id) AS n_unique_row_ids
   FROM olineage;
 
 -- query 9
@@ -136,19 +136,19 @@ SELECT count(*) AS baseline_rows_missing_after_optimize
 -- query 12
 -- This private table has no replace snapshot before this deterministic rewrite.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS n_replace_snapshots
-  FROM olineage$snapshots
+SELECT count() AS n_replace_snapshots
+  FROM "olineage$snapshots"
   WHERE operation = 'replace';
 
 -- query 13
 -- Resolve the new current snapshot through refs instead of timestamps. Its
 -- parent must be the exact pre-OPTIMIZE snapshot, proving this publication.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS current_replace_child_of_pre_opt
-  FROM olineage$snapshots AS rewritten
-  JOIN olineage$refs AS current_ref
+SELECT count() AS current_replace_child_of_pre_opt
+  FROM "olineage$snapshots" AS rewritten
+  JOIN "olineage$refs" AS current_ref
     ON rewritten.snapshot_id = current_ref.snapshot_id
-  JOIN olineage$refs AS baseline_ref
+  JOIN "olineage$refs" AS baseline_ref
     ON rewritten.parent_id = baseline_ref.snapshot_id
   WHERE current_ref.name = 'main' AND baseline_ref.name = 'pre_opt'
     AND rewritten.operation = 'replace'
@@ -158,8 +158,8 @@ SELECT count(*) AS current_replace_child_of_pre_opt
 -- All active delete inputs belonged to this table's complete rewrite group.
 -- This does not require OPTIMIZE to clear deletes outside a selected rewrite.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS active_delete_files_after_optimize
-  FROM olineage$files
+SELECT count() AS active_delete_files_after_optimize
+  FROM "olineage$files"
   WHERE content <> 0;
 
 -- query 15
