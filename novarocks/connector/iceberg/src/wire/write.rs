@@ -91,6 +91,10 @@ impl ValidatedCommitFragmentWire {
     pub(crate) fn as_dto(&self) -> &dto::IcebergCommitFragment {
         &self.0
     }
+
+    pub(crate) fn into_dto(self) -> dto::IcebergCommitFragment {
+        self.0
+    }
 }
 
 /// The private scanner charges each field tag or packed value once, so the

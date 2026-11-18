@@ -1305,10 +1305,10 @@ impl IcebergPositionRewriteTarget {
 /// A partition, as one staged artifact reports it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergArtifactPartition {
-    partition_path: String,
-    null_fingerprint: String,
-    partition_spec_id: i32,
-    descriptor: IcebergPartitionDescriptor,
+    pub(super) partition_path: String,
+    pub(super) null_fingerprint: String,
+    pub(super) partition_spec_id: i32,
+    pub(super) descriptor: IcebergPartitionDescriptor,
 }
 
 impl IcebergArtifactPartition {
@@ -1368,10 +1368,10 @@ impl IcebergArtifactPartition {
 /// The physical metrics one staged artifact reports.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IcebergArtifactMetrics {
-    record_count: u64,
-    file_size_in_bytes: u64,
-    split_offsets: Vec<i64>,
-    column_stats: Option<IcebergColumnStats>,
+    pub(super) record_count: u64,
+    pub(super) file_size_in_bytes: u64,
+    pub(super) split_offsets: Vec<i64>,
+    pub(super) column_stats: Option<IcebergColumnStats>,
 }
 
 impl IcebergArtifactMetrics {
@@ -1478,11 +1478,11 @@ impl IcebergContentRange {
 /// One written data file.
 #[derive(Clone, Debug)]
 pub struct IcebergDataFileArtifact {
-    path: String,
-    file_format: IcebergFileFormat,
-    partition: IcebergArtifactPartition,
-    metrics: IcebergArtifactMetrics,
-    first_row_id: Option<i64>,
+    pub(super) path: String,
+    pub(super) file_format: IcebergFileFormat,
+    pub(super) partition: IcebergArtifactPartition,
+    pub(super) metrics: IcebergArtifactMetrics,
+    pub(super) first_row_id: Option<i64>,
 }
 
 impl IcebergDataFileArtifact {
@@ -1533,11 +1533,11 @@ impl IcebergDataFileArtifact {
 /// One written Parquet position-delete file.
 #[derive(Clone, Debug)]
 pub struct IcebergPositionDeleteFileArtifact {
-    path: String,
-    partition: IcebergArtifactPartition,
-    metrics: IcebergArtifactMetrics,
-    referenced_data_file: String,
-    merged_old_references: Vec<EntryIdentity>,
+    pub(super) path: String,
+    pub(super) partition: IcebergArtifactPartition,
+    pub(super) metrics: IcebergArtifactMetrics,
+    pub(super) referenced_data_file: String,
+    pub(super) merged_old_references: Vec<EntryIdentity>,
 }
 
 impl IcebergPositionDeleteFileArtifact {
@@ -1729,13 +1729,13 @@ impl IcebergEqualityDeleteFileArtifact {
 /// One written Puffin deletion vector.
 #[derive(Clone, Debug)]
 pub struct IcebergDeletionVectorArtifact {
-    path: String,
-    partition: IcebergArtifactPartition,
-    metrics: IcebergArtifactMetrics,
-    referenced_data_file: String,
-    content_range: IcebergContentRange,
-    cardinality: u64,
-    merged_old_references: Vec<EntryIdentity>,
+    pub(super) path: String,
+    pub(super) partition: IcebergArtifactPartition,
+    pub(super) metrics: IcebergArtifactMetrics,
+    pub(super) referenced_data_file: String,
+    pub(super) content_range: IcebergContentRange,
+    pub(super) cardinality: u64,
+    pub(super) merged_old_references: Vec<EntryIdentity>,
 }
 
 impl IcebergDeletionVectorArtifact {
@@ -1827,12 +1827,12 @@ fn validate_merged_references(references: &[EntryIdentity]) -> Result<(), Connec
 /// A live data entry identified by its immutable list and physical ordinals.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergDeleteTargetLocator {
-    manifest_list: String,
-    manifest_path: String,
+    pub(super) manifest_list: String,
+    pub(super) manifest_path: String,
     manifest_ordinal: u64,
     entry_ordinal: u64,
     snapshot_id: i64,
-    data_file_path: String,
+    pub(super) data_file_path: String,
     record_count: u64,
 }
 
@@ -1895,9 +1895,9 @@ impl IcebergDeleteTargetLocator {
 /// Original position effect. Only its artifact, when present, names a new object.
 #[derive(Clone, Debug)]
 pub struct IcebergFinalDeleteEffect {
-    target: IcebergDeleteTargetLocator,
-    newly_deleted_rows: std::num::NonZeroU64,
-    kind: IcebergFinalDeleteKind,
+    pub(super) target: IcebergDeleteTargetLocator,
+    pub(super) newly_deleted_rows: std::num::NonZeroU64,
+    pub(super) kind: IcebergFinalDeleteKind,
 }
 
 #[derive(Clone, Debug)]
@@ -2111,6 +2111,7 @@ pub enum IcebergCommitArtifact {
 pub struct IcebergCommitFragment {
     artifact: IcebergCommitArtifact,
     creation: Option<IcebergCreationReceipt>,
+    compact_payload_bytes: Option<usize>,
 }
 
 impl IcebergCommitFragment {
@@ -2118,7 +2119,21 @@ impl IcebergCommitFragment {
         Self {
             artifact,
             creation: None,
+            compact_payload_bytes: None,
         }
+    }
+
+    pub(super) fn with_compact_payload_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.compact_payload_bytes = bytes;
+        self
+    }
+
+    pub(super) const fn compact_payload_bytes(&self) -> Option<usize> {
+        self.compact_payload_bytes
+    }
+
+    pub(super) fn into_artifact(self) -> IcebergCommitArtifact {
+        self.artifact
     }
 
     pub fn data_file(artifact: IcebergDataFileArtifact) -> Self {

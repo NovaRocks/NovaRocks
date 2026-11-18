@@ -31,6 +31,9 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use super::domain::{IcebergSealedWriteTarget, invalid};
 
+#[allow(dead_code, reason = "The compact receiving caller lands in RWM-16 P08")]
+pub(crate) mod compact;
+
 type WriteFragment = (WriteTargetOrdinal, ConnectorCommitFragment);
 
 /// Retained as whole fragments until each flavor moves to compact receiving.

@@ -58,6 +58,127 @@ fn format_error(error: ConnectorError) -> crate::iceberg::Error {
         .with_source(error)
 }
 
+/// Project exactly the admitted writer facts using the frozen write-time
+/// metadata. Compact and whole-set publication share this author.
+pub(in crate::commit) fn written_file_with_historical_partition(
+    fragment: &IcebergCommitFragment,
+    metadata: &TableMetadata,
+    historical_partition: Option<&crate::iceberg::spec::StructType>,
+) -> Result<WrittenFile, ConnectorError> {
+    let partition = fragment
+        .partition()
+        .ok_or_else(|| corrupt("Iceberg result has no written partition"))?;
+    let partition_values = match historical_partition {
+        Some(ty) => crate::write_descriptor::decode_partition_descriptor_with_type(
+            partition.descriptor(),
+            ty,
+        )
+        .map_err(|error| corrupt(error.detail_message()))?,
+        None => decode_partition_values(partition, metadata)?,
+    };
+    let metrics = fragment
+        .metrics()
+        .ok_or_else(|| corrupt("Iceberg result has no written metrics"))?;
+    let record_count = metrics.record_count();
+    let file_size_in_bytes = metrics.file_size_in_bytes();
+    let empty_stats = crate::commit::report::IcebergColumnStats::default();
+    let stats = metrics.column_stats().unwrap_or(&empty_stats);
+    let (
+        format,
+        content,
+        referenced_data_file,
+        first_row_id,
+        content_offset,
+        content_size,
+        cardinality,
+        equality_ids,
+    ) = match fragment.artifact() {
+        IcebergCommitArtifact::DataFile(file) => (
+            DataFileFormat::Parquet,
+            DataContentType::Data,
+            None,
+            file.first_row_id(),
+            None,
+            None,
+            None,
+            None,
+        ),
+        IcebergCommitArtifact::PositionDeleteFile(file) => (
+            DataFileFormat::Parquet,
+            DataContentType::PositionDeletes,
+            Some(file.referenced_data_file().to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        IcebergCommitArtifact::DeletionVector(file) => (
+            DataFileFormat::Puffin,
+            DataContentType::PositionDeletes,
+            Some(file.referenced_data_file().to_string()),
+            None,
+            Some(file.content_range().offset()),
+            Some(file.content_range().size_in_bytes()),
+            Some(file.cardinality()),
+            None,
+        ),
+        // An equality delete names no data file: Iceberg matches it against
+        // every row whose equality-column values agree, so the manifest carries
+        // the field ids instead of a referenced path.
+        IcebergCommitArtifact::EqualityDeleteFile(file) => (
+            DataFileFormat::Parquet,
+            DataContentType::EqualityDeletes,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(file.equality_field_ids().to_vec()),
+        ),
+        IcebergCommitArtifact::FinalDelete(effect) => {
+            let crate::commit::write_stack::domain::IcebergFinalDeleteKind::ReplacePositions(file) =
+                effect.kind()
+            else {
+                return Err(invalid("Iceberg pure removal has no written artifact"));
+            };
+            (
+                DataFileFormat::Puffin,
+                DataContentType::PositionDeletes,
+                Some(file.referenced_data_file().to_owned()),
+                None,
+                Some(file.content_range().offset()),
+                Some(file.content_range().size_in_bytes()),
+                Some(file.cardinality()),
+                None,
+            )
+        }
+    };
+    Ok(WrittenFile {
+        path: fragment.path().to_string(),
+        format,
+        content,
+        partition_values,
+        partition_spec_id: partition.partition_spec_id(),
+        record_count,
+        file_size_in_bytes,
+        split_offsets: metrics.split_offsets().to_vec(),
+        column_sizes: unsigned_counts(&stats.column_sizes)?,
+        value_counts: unsigned_counts(&stats.value_counts)?,
+        null_value_counts: unsigned_counts(&stats.null_value_counts)?,
+        nan_value_counts: unsigned_counts(&stats.nan_value_counts)?,
+        lower_bounds: decode_bounds(&stats.lower_bounds, metadata)?,
+        upper_bounds: decode_bounds(&stats.upper_bounds, metadata)?,
+        key_metadata: None,
+        referenced_data_file,
+        equality_ids,
+        first_row_id,
+        content_offset,
+        content_size_in_bytes: content_size,
+        cardinality,
+    })
+}
+
 struct WriteRecipe {
     source: Arc<TableMetadata>,
     files: Vec<WrittenFile>,
