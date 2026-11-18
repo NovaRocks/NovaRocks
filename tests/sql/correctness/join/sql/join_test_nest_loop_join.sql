@@ -526,8 +526,8 @@ r AS (
 dim AS (
   SELECT 5000 AS mx_lo_orderkey, 4999 AS mn_lo_orderkey
 )
-SELECT COUNT(*)
+SELECT COUNT()
 FROM l
 JOIN  r ON lk = rk
-JOIN dim
+CROSS JOIN dim
 WHERE rk >= mn_lo_orderkey AND rk <= mx_lo_orderkey;
