@@ -815,6 +815,7 @@ pub struct SqlStatementInput {
 )]
 enum SqlStatementInputKind {
     ParsedQuery(Box<novarocks_parser::ast::Query>),
+    AdmittedSessionQuery(Box<novarocks_parser::ast::Query>),
     MaterializedValuesQuery {
         query: Box<novarocks_parser::ast::Query>,
         source: materialized_values::MaterializedValues,
@@ -835,6 +836,18 @@ impl SqlStatementInput {
         Self {
             kind: SqlStatementInputKind::ParsedQuery(query),
         }
+    }
+
+    /// The caller has already evaluated the root's session property expressions
+    /// and supplies their effective settings in the statement's SqlSessionContext.
+    pub fn query_with_admitted_session(query: Box<novarocks_parser::ast::Query>) -> Self {
+        Self {
+            kind: SqlStatementInputKind::AdmittedSessionQuery(query),
+        }
+    }
+
+    fn root_session_admitted(&self) -> bool {
+        matches!(&self.kind, SqlStatementInputKind::AdmittedSessionQuery(_))
     }
 
     /// Bind complete constants to exact expressions of the same owned query.
@@ -1767,6 +1780,7 @@ impl SqlCompiler {
                             _ => None,
                         },
                         request.write_assignments.as_deref(),
+                        request.statement.root_session_admitted(),
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;
@@ -1780,36 +1794,27 @@ impl SqlCompiler {
                     &factory,
                 )?
                 .with_analysis_span(query.span);
-                let consumer_requires_semantic_snapshot =
-                    crate::sql_mode::query_uses_group_concat_legacy(
+                let legacy_semantics;
+                let effective = if request.statement.root_session_admitted() {
+                    &request.session.sql_semantics
+                } else {
+                    legacy_semantics = crate::sql_mode::query_sql_semantics(
                         &request.session.sql_semantics,
                         &query,
                     )
-                    .map_err(SqlCompileError::from)?
-                        || crate::sql_mode::query_uses_decimal_overflow_to_double(
-                            &request.session.sql_semantics,
-                            &query,
-                        )
-                        .map_err(SqlCompileError::from)?
-                        || crate::sql_mode::query_uses_error_if_overflow(
-                            &request.session.sql_semantics,
-                            &query,
-                        )
-                        .map_err(SqlCompileError::from)?;
+                    .map_err(SqlCompileError::from)?;
+                    &legacy_semantics
+                };
+                let consumer_requires_semantic_snapshot =
+                    crate::sql_mode::query_requires_semantic_snapshot(effective, &query);
                 (
                     logical_plan,
                     factory,
                     root_semantics,
                     false,
                     consumer_requires_semantic_snapshot,
-                    crate::sql_mode::query_sql_semantics(&request.session.sql_semantics, &query)
-                        .map_err(SqlCompileError::from)?
-                        .sql_mode()
-                        .allow_throw_exception(),
-                    crate::sql_mode::query_sql_semantics(&request.session.sql_semantics, &query)
-                        .map_err(SqlCompileError::from)?
-                        .sql_mode()
-                        .decimal_overflow_policy(),
+                    effective.sql_mode().allow_throw_exception(),
+                    effective.sql_mode().decimal_overflow_policy(),
                 )
             }
         };
@@ -2078,6 +2083,7 @@ fn parse_query(
 ) -> Result<novarocks_parser::ast::Query, SqlCompileError> {
     match &statement.kind {
         SqlStatementInputKind::ParsedQuery(query)
+        | SqlStatementInputKind::AdmittedSessionQuery(query)
         | SqlStatementInputKind::MaterializedValuesQuery { query, .. } => Ok((**query).clone()),
         SqlStatementInputKind::LogicalPlan { .. } => Err(SqlCompileError::InvalidRequest(
             "logical SQL compiler input must bypass parsing".to_string(),

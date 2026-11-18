@@ -16,7 +16,7 @@
 // under the License.
 
 //! Typed changes prepared by the statement that actually changed its session.
-use crate::sql::session::registry::ValidatedSessionProperty;
+use crate::sql::session::registry::{ResolvedSqlSessionProperty, ValidatedSessionProperty};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetCatalogSchema {
@@ -27,7 +27,7 @@ pub struct SetCatalogSchema {
 pub struct SessionEffects {
     pub(crate) catalog_schema: Option<SetCatalogSchema>,
     pub(crate) properties: Vec<ValidatedSessionProperty>,
-    reset_properties: Vec<String>,
+    pub(crate) reset_properties: Vec<ResolvedSqlSessionProperty>,
 }
 impl SessionEffects {
     pub fn catalog_schema(&self) -> Option<&SetCatalogSchema> {
@@ -38,8 +38,10 @@ impl SessionEffects {
             .iter()
             .map(|property| (property.qualified_name(), property.render()))
     }
-    pub fn reset_properties(&self) -> &[String] {
-        &self.reset_properties
+    pub fn reset_properties(&self) -> impl Iterator<Item = String> + '_ {
+        self.reset_properties
+            .iter()
+            .map(ResolvedSqlSessionProperty::qualified_name)
     }
     pub fn is_empty(&self) -> bool {
         self.catalog_schema.is_none()
@@ -58,14 +60,22 @@ impl SessionEffects {
             ..Self::default()
         }
     }
+    pub fn reset_property(property: ResolvedSqlSessionProperty) -> Self {
+        Self {
+            reset_properties: vec![property],
+            ..Self::default()
+        }
+    }
     pub fn append(&mut self, mut effects: Self) {
         if effects.catalog_schema.is_some() {
             self.catalog_schema = effects.catalog_schema.take();
         }
         self.properties.append(&mut effects.properties);
-        for name in effects.reset_properties {
-            if !self.reset_properties.contains(&name) {
-                self.reset_properties.push(name);
+        for property in effects.reset_properties {
+            if !self.reset_properties.iter().any(|existing| {
+                existing.name() == property.name() && existing.scope() == property.scope()
+            }) {
+                self.reset_properties.push(property);
             }
         }
     }
@@ -80,7 +90,7 @@ mod tests {
     #[test]
     fn use_changes_names_without_property_or_clear_effects() {
         let effects = SessionEffects::set_catalog_schema(Some("lake".into()), "analytics".into());
-        assert!(effects.reset_properties().is_empty());
+        assert!(effects.reset_properties().next().is_none());
         assert_eq!(effects.set_properties().count(), 0);
         let mut state = SessionSqlState::default();
         state.apply_effects(&effects).unwrap();

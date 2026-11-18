@@ -38,7 +38,6 @@ use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{
     ExplainLevel, SqlCompileError, SqlCompileIntent, SqlPlanningEnvironment, SqlSessionContext,
-    SqlStatementInput,
 };
 
 /// Application intent is supplied by the caller, never inferred from a
@@ -206,7 +205,7 @@ impl FrontendQueryCompiler {
     pub(crate) fn session_property_input(
         &self,
         source: Arc<str>,
-        set: novarocks_parser::ast::SetStatement,
+        mutation: super::session_property_computation::SessionPropertyMutation,
         staged: novarocks_query_application::sql::session::SessionSqlState,
         registry: Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
         interpreter: Arc<crate::RequiredConstantInterpreter>,
@@ -216,7 +215,7 @@ impl FrontendQueryCompiler {
     ) -> super::session_property_computation::SessionPropertyCpuInput {
         super::session_property_computation::SessionPropertyCpuInput {
             source,
-            set,
+            mutation,
             staged,
             registry,
             interpreter,
@@ -331,19 +330,52 @@ fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> Que
     QueryOptions::from_proto(raw)
 }
 
-pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
-    let level = match explain.format {
-        ExplainFormat::Default => ExplainLevel::Normal,
-        ExplainFormat::Verbose => ExplainLevel::Verbose,
-        ExplainFormat::Costs => ExplainLevel::Costs,
-        ExplainFormat::Logical => ExplainLevel::Normal,
-        ExplainFormat::Analyze => ExplainLevel::Analyze,
-        ExplainFormat::Contract => ExplainLevel::Contract,
+fn read_query_input(
+    query: Box<novarocks_parser::ast::Query>,
+    root_session_admitted: bool,
+) -> novarocks_sql::compiler::SqlStatementInput {
+    use novarocks_sql::compiler::SqlStatementInput;
+    if root_session_admitted {
+        SqlStatementInput::query_with_admitted_session(query)
+    } else {
+        SqlStatementInput::parsed_query(query)
+    }
+}
+
+pub(crate) fn explain_detail_mode(
+    detail: novarocks_query_application::sql::session::ExplainDetail,
+) -> (ExplainLevel, bool) {
+    use novarocks_query_application::sql::session::ExplainDetail;
+    match detail {
+        ExplainDetail::Normal => (ExplainLevel::Normal, false),
+        ExplainDetail::Verbose => (ExplainLevel::Verbose, false),
+        ExplainDetail::Costs => (ExplainLevel::Costs, false),
+        ExplainDetail::Contract => (ExplainLevel::Contract, false),
+        ExplainDetail::Logical => (ExplainLevel::Normal, true),
+        ExplainDetail::LogicalVerbose => (ExplainLevel::Verbose, true),
+        ExplainDetail::LogicalCosts => (ExplainLevel::Costs, true),
+    }
+}
+
+/// Lower legacy presentation syntax to the same effective property. Profiling
+/// remains a different execution intent, independent of the display detail.
+pub(crate) fn explain_mode(
+    explain: &ExplainQuery,
+    configured: novarocks_query_application::sql::session::ExplainDetail,
+) -> (ExplainLevel, bool) {
+    use novarocks_query_application::sql::session::ExplainDetail;
+    let detail = match (explain.format, explain.logical) {
+        (ExplainFormat::Default, false) => configured,
+        (ExplainFormat::Default, true) | (ExplainFormat::Logical, _) => ExplainDetail::Logical,
+        (ExplainFormat::Verbose, false) => ExplainDetail::Verbose,
+        (ExplainFormat::Verbose, true) => ExplainDetail::LogicalVerbose,
+        (ExplainFormat::Costs, false) => ExplainDetail::Costs,
+        (ExplainFormat::Costs, true) => ExplainDetail::LogicalCosts,
+        (ExplainFormat::Contract, false) => ExplainDetail::Contract,
+        (ExplainFormat::Contract, true) => return (ExplainLevel::Contract, true),
+        (ExplainFormat::Analyze, logical) => return (ExplainLevel::Analyze, logical),
     };
-    (
-        level,
-        explain.logical || matches!(explain.format, ExplainFormat::Logical),
-    )
+    explain_detail_mode(detail)
 }
 
 #[cfg(test)]

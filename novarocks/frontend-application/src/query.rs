@@ -92,9 +92,7 @@ use novarocks_query_application::sql::{
 };
 use novarocks_query_application::sql::{
     SpecializedStatementRoute, parse_single_statement, query_service_parse_error,
-    strip_leading_line_comments,
 };
-use novarocks_query_application::statement_kind::StatementKind;
 use novarocks_type_contract::CompileControlError;
 use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
@@ -118,6 +116,7 @@ pub(crate) mod mutation_action;
 pub(crate) mod mv_action;
 pub(crate) mod mv_read_action;
 mod property_cpu_context;
+mod query_session_action;
 pub(crate) mod read_action;
 pub(crate) mod session_property_computation;
 mod set_action;
@@ -1254,15 +1253,6 @@ impl FrontendQuerySession {
         statement: &str,
     ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
     {
-        let trimmed = strip_leading_line_comments(statement.trim().trim_end_matches(';').trim());
-        if trimmed.is_empty() {
-            return Ok(
-                novarocks_query_application::session::QuerySessionStatement::output_owned(
-                    StatementResult::Ok,
-                    StatementKind::Empty,
-                ),
-            );
-        }
         let source = statement_execution_source(statement);
         let parsed_statement = parse_single_statement(source)
             .map_err(|error| query_service_parse_error(error, source))?;
@@ -1270,9 +1260,23 @@ impl FrontendQuerySession {
         let admitted = novarocks_query_application::session::StatementAdmission::from_statement(
             &parsed_statement,
         );
+        let kind = admitted.kind;
+        if query_session_action::uses_legacy_root_hints(&parsed_statement) {
+            return self
+                .execute_scoped_query_family(
+                    Arc::from(source),
+                    parsed_statement,
+                    query_session_action::ScopedQueryAssignments::LegacyRootHints,
+                )
+                .await
+                .map(|output| {
+                    novarocks_query_application::session::QuerySessionStatement::output_owned(
+                        output, kind,
+                    )
+                });
+        }
         self.admission.publish(admitted);
         *self.output_shape.lock().unwrap_or_else(|p| p.into_inner()) = Some(admitted.shape);
-        let kind = admitted.kind;
         let result = match parsed_statement {
             ParsedStatement::Session(statement) => {
                 self.execute_session_statement(source, &statement).await
@@ -2843,7 +2847,6 @@ mod tests {
     use arrow::array::StringArray;
     use novarocks_query_application::api::BackendTopologySnapshot;
     use novarocks_query_application::cancellation::QueryCancellationSource;
-    use novarocks_query_application::sql::{SqlBatchCursor, split_sql_statements};
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
     use novarocks_workload_control::{
         CancellationReason as WorkCancellationReason, ResourceConfig,
@@ -3689,44 +3692,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_split_preserves_quoted_semicolons_and_statement_order() {
-        let statements = split_sql_statements("SET query_timeout = 1; SELECT ';'; SELECT 3")
-            .expect("batch must parse");
-        assert_eq!(
-            statements,
-            vec![
-                "SET query_timeout = 1".to_string(),
-                "SELECT ';'".to_string(),
-                "SELECT 3".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn batch_split_ignores_semicolons_inside_leading_comments() {
-        let statements = split_sql_statements(
-            "SET query_timeout=120;\n-- license; users may obtain a copy\nCREATE CATALOG c;",
-        )
-        .expect("batch must parse");
-        assert_eq!(statements.len(), 2);
-        assert_eq!(statements[0], "SET query_timeout=120");
-        assert!(statements[1].starts_with("-- license;"));
-    }
-
-    #[test]
-    fn batch_split_rejects_unterminated_quote() {
-        let error = split_sql_statements("SELECT 'unterminated").expect_err("must reject");
-        assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
-    }
-
-    #[test]
-    fn leading_line_comments_preserve_the_following_statement() {
-        let sql = "-- Licensed under the Apache License\n# suite header\nCREATE CATALOG c";
-        assert_eq!(strip_leading_line_comments(sql), "CREATE CATALOG c");
-        assert_eq!(strip_leading_line_comments("-- comment only"), "");
-    }
-
-    #[test]
     fn cancellation_errors_keep_timeout_distinct_from_interrupts() {
         assert_eq!(
             cancellation_error(QueryCancellationReason::DeadlineExceeded { timeout_ms: 25 }).kind(),
@@ -3799,92 +3764,12 @@ mod tests {
     }
 
     #[test]
-    fn batch_cursor_does_not_scan_later_fragments_before_their_turn() {
-        let mut cursor = SqlBatchCursor::new("SELECT 1; SELECT 'unterminated");
-        assert_eq!(
-            cursor.next_fragment().expect("first fragment"),
-            Some("SELECT 1")
-        );
-        assert!(cursor.has_remaining());
-        let error = cursor
-            .next_fragment()
-            .expect_err("later malformed fragment remains deferred");
-        assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
-    }
-
-    #[test]
     fn timeout_message_rounds_a_sampled_deadline_up_to_milliseconds() {
         assert_eq!(
             timeout_message_millis(Duration::from_nanos(999_999_999)),
             1_000
         );
         assert_eq!(timeout_message_millis(Duration::from_millis(1_000)), 1_000);
-    }
-
-    #[test]
-    fn sql_batch_splits_on_statement_boundaries() {
-        let statements = split_sql_statements(
-            "DROP DATABASE IF EXISTS db1 FORCE;\
-             CREATE DATABASE db1;\
-             USE db1;\
-             CREATE TABLE tbl (id int, name string);\
-             INSERT INTO tbl VALUES (1, 'a'), (2, 'b');\
-             SELECT name FROM tbl WHERE id = 2;",
-        )
-        .expect("split a well-formed batch");
-
-        assert_eq!(statements.len(), 6);
-        assert_eq!(statements[0], "DROP DATABASE IF EXISTS db1 FORCE");
-        assert_eq!(statements[5], "SELECT name FROM tbl WHERE id = 2");
-    }
-
-    #[test]
-    fn sql_batch_ignores_semicolons_inside_quotes_and_comments() {
-        // A `;` inside a literal, identifier or comment must not split the
-        // batch. Getting this wrong silently truncates a statement instead of
-        // failing, so each quoting form is pinned separately.
-        let cases = [
-            "INSERT INTO t VALUES ('a;b')",
-            "INSERT INTO t VALUES (\"a;b\")",
-            "SELECT `weird;column` FROM t",
-            "SELECT 1 -- trailing ; comment\n",
-            "SELECT 1 # trailing ; comment\n",
-            "SELECT /* inline ; comment */ 1",
-        ];
-        for sql in cases {
-            let statements =
-                split_sql_statements(sql).unwrap_or_else(|error| panic!("split {sql:?}: {error}"));
-            assert_eq!(statements.len(), 1, "{sql:?} must stay one statement");
-        }
-    }
-
-    #[test]
-    fn sql_batch_drops_empty_fragments_and_keeps_an_unterminated_tail() {
-        assert!(
-            split_sql_statements("").expect("empty batch").is_empty(),
-            "an empty batch has no statements"
-        );
-        assert!(
-            split_sql_statements(" ;; ; ")
-                .expect("separator-only batch")
-                .is_empty(),
-            "separators alone contribute no statements"
-        );
-
-        let statements =
-            split_sql_statements("SELECT 1;;SELECT 2").expect("split around an empty fragment");
-        assert_eq!(statements, vec!["SELECT 1", "SELECT 2"]);
-    }
-
-    #[test]
-    fn sql_batch_rejects_an_unterminated_quote() {
-        let error = split_sql_statements("SELECT 'unterminated")
-            .expect_err("an unterminated literal must fail closed");
-        assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
-        assert!(
-            error.to_string().contains("unterminated quoted string"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]

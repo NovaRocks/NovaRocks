@@ -155,11 +155,19 @@ impl SqlFinalPlanCompileRequest {
         validate_dop_domain(dop_domain)?;
         validate_scan_read_budget(scan_read_budget)?;
         let display_intent = display_intent(&intent);
-        let query = crate::sql_mode::normalize_concat_query(
-            super::parse_query(&statement)?,
-            &session.sql_semantics,
-        )
-        .map_err(SqlCompileError::from)?;
+        let root_session_admitted = statement.root_session_admitted();
+        let query = super::parse_query(&statement)?;
+        let legacy_semantics;
+        let effective = if root_session_admitted {
+            &session.sql_semantics
+        } else {
+            legacy_semantics = crate::sql_mode::query_sql_semantics(&session.sql_semantics, &query)
+                .map_err(SqlCompileError::from)?;
+            &legacy_semantics
+        };
+        let query = crate::sql_mode::normalize_concat_query_with_semantics(query, effective);
+        let consumer_requires_semantic_snapshot =
+            crate::sql_mode::query_requires_semantic_snapshot(effective, &query);
         // Retain the producer's actual checked constants across discovery and
         // catalog rounds. The loan is rebuilt against this normalized query;
         // syntax transformations must validate the original structural sites.
@@ -182,24 +190,12 @@ impl SqlFinalPlanCompileRequest {
             scan_read_budget,
             display_intent,
             materialized_source,
+            root_session_admitted,
         };
 
         // A persisted semantic snapshot is required before an optional MV
         // definition can be replayed. Decide before publishing discovery or
         // catalog needs so an unrelated candidate cannot fail the base query.
-        let consumer_requires_semantic_snapshot =
-            crate::sql_mode::query_uses_group_concat_legacy(&common.session.sql_semantics, &query)
-                .map_err(SqlCompileError::from)?
-                || crate::sql_mode::query_uses_decimal_overflow_to_double(
-                    &common.session.sql_semantics,
-                    &query,
-                )
-                .map_err(SqlCompileError::from)?
-                || crate::sql_mode::query_uses_error_if_overflow(
-                    &common.session.sql_semantics,
-                    &query,
-                )
-                .map_err(SqlCompileError::from)?;
         let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
             && !consumer_requires_semantic_snapshot;
         let initial_catalog = CatalogCompletionState::try_new_with_semantics(
@@ -307,6 +303,7 @@ struct FinalPlanCommon {
     // Both variants hold Arc-backed constant collections. Cloning this source
     // for analysis preserves original pool/ordinal facts, not AST pointers.
     materialized_source: Option<super::materialized_values::MaterializedValues>,
+    root_session_admitted: bool,
 }
 
 pub(crate) struct SqlMaterializedViewCompletionState {
@@ -582,6 +579,9 @@ fn analyze_with_catalog(
                     source: source.clone(),
                 },
             }
+        }
+        None if common.root_session_admitted => {
+            SqlStatementInput::query_with_admitted_session(query)
         }
         None => SqlStatementInput::parsed_query(query),
     };
@@ -2207,6 +2207,37 @@ mod tests {
             .expect("completed values plan");
 
         assert!(matches!(progress, SqlCompileProgress::Complete(_)));
+    }
+
+    #[test]
+    fn admitted_session_completion_uses_frozen_settings_for_expression_assignments() {
+        let source = "WITH SESSION decimal_overflow_to_double = true AND true SELECT 1 AS a";
+        let query = Box::new(novarocks_parser::trino_parser::parse_query(source).unwrap());
+        let mut legacy = request("SELECT 1 AS a", SqlCompileIntent::Query);
+        legacy.statement = SqlStatementInput::parsed_query(query.clone());
+        assert!(matches!(
+            legacy.try_into_completion(),
+            Err(SqlCompileError::Analyze(_))
+        ));
+
+        let mut admitted = request("SELECT 1 AS a", SqlCompileIntent::Query);
+        admitted.statement = SqlStatementInput::query_with_admitted_session(query);
+        admitted.session.sql_semantics =
+            crate::sql_mode::SqlSemanticSettings::default().with_decimal_overflow_to_double(true);
+        let seed = admitted.try_into_completion().unwrap();
+        let completed = SqlCompiler::start(seed, &SqlCompileControl::unbounded())
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert!(matches!(
+            completed.display_intent(),
+            SqlDisplayIntent::Execute
+        ));
+        let result = completed.plan().result_port().expect("query result port");
+        let [field] = result.fields.as_ref() else {
+            panic!("expected one projected column");
+        };
+        assert_eq!(field.alias.as_deref().unwrap_or(field.name.as_ref()), "a");
     }
 
     fn complete_root_intrinsic_fixture(

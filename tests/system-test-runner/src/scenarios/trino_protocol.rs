@@ -499,7 +499,46 @@ fn replay_next(actor: &TrinoClient, uri: &str) -> Result<Option<String>> {
     }
     Ok(next)
 }
+fn single_statement_admission(actor: &TrinoClient) -> Result<()> {
+    for sql in [
+        "SET SESSION pipeline_dop = 3; SELECT 1",
+        "SET SESSION pipeline_dop = 3; SELECT 'unterminated",
+    ] {
+        // The raw Trino actor sends the complete text in one POST.
+        let pages = actor.execute(sql)?;
+        require_error(terminal(&pages)?, (1, "SYNTAX_ERROR", "USER_ERROR"))?;
+        for page in &pages {
+            ensure!(
+                !page.headers.contains_key("x-trino-set-session"),
+                "rejected request applied its first SET statement: {sql}"
+            );
+        }
+    }
+
+    failed_query(
+        actor,
+        "CREATE DATABASE trc1_catalog.single_statement_boundary; SELECT 1",
+        (1, "SYNTAX_ERROR", "USER_ERROR"),
+    )?;
+    failed_query(
+        actor,
+        "USE trc1_catalog.single_statement_boundary",
+        (45, "SCHEMA_NOT_FOUND", "USER_ERROR"),
+    )?;
+    success(
+        actor,
+        "CREATE DATABASE trc1_catalog.single_statement_boundary",
+    )?;
+    success(
+        actor,
+        "DROP DATABASE trc1_catalog.single_statement_boundary",
+    )?;
+    Ok(())
+}
+
 fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
+    single_statement_admission(actor)?;
+    context.action("verified one POST cannot apply the first SET or CREATE in a rejected batch");
     let client = actor.with_session(&[
         ("x-trino-catalog", "trc1_catalog"),
         ("x-trino-schema", "first"),

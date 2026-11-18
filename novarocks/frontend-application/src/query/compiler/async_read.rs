@@ -29,6 +29,7 @@ struct ReadSqlInput {
     current_catalog: Option<String>,
     current_database: String,
     family: Option<novarocks_result_contract::ClientPresentationFamily>,
+    root_session_admitted: bool,
 }
 struct ReadDistributedMetadata {
     query: Query,
@@ -43,6 +44,7 @@ impl FrontendQueryCompiler {
         &self,
         statement: &Statement,
         purpose: FrontendQueryPurpose,
+        root_session_admitted: bool,
         context: &RequestContext,
         query_options: Option<QueryOptions>,
         scope: &novarocks_workload_control::WorkScope,
@@ -63,11 +65,21 @@ impl FrontendQueryCompiler {
                     "read preparation requires a query".into(),
                 ));
             };
-            let planning = connector_planning_context_for_query_on_runtime(
-                self.connector_blocking_io.runtime(),
-                query_options.as_ref(),
-                context.execution().cancellation().clone(),
-            )?;
+            let planning = if root_session_admitted {
+                let request = crate::connector::connector_request_context_for_execution_on_runtime(
+                    query_options.as_ref(),
+                    context.execution(),
+                    self.connector_blocking_io.runtime(),
+                )?;
+                novarocks_spi::connector::ConnectorPlanningContext::try_from_request(request)
+                    .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?
+            } else {
+                connector_planning_context_for_query_on_runtime(
+                    self.connector_blocking_io.runtime(),
+                    query_options.as_ref(),
+                    context.execution().cancellation().clone(),
+                )?
+            };
             let planning = novarocks_spi::connector::ConnectorPlanningContext::try_from_request(
                 planning.request().clone().with_io_admission(io),
             )
@@ -89,6 +101,7 @@ impl FrontendQueryCompiler {
                 current_catalog: context.session().current_catalog().map(str::to_owned),
                 current_database: context.session().current_database().to_owned(),
                 family: context.session().presentation().copied(),
+                root_session_admitted,
             },
             query_options,
             planning,
@@ -127,6 +140,7 @@ impl FrontendQueryCompiler {
             current_catalog,
             current_database,
             family,
+            root_session_admitted,
         } = sql;
         let request: Result<
             (
@@ -170,7 +184,7 @@ impl FrontendQueryCompiler {
             Ok((
                 novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
                     version,
-                    SqlStatementInput::parsed_query(Box::new(query.clone())),
+                    super::read_query_input(Box::new(query.clone()), root_session_admitted),
                     SqlCompileIntent::Query,
                     SqlSessionContext {
                         sql_semantics: execution.sql_semantics().clone(),

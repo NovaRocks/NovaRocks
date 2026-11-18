@@ -92,8 +92,8 @@ impl ControlSource {
         )
         .map_err(connector)?;
         if let MvControlRequest::Alter { statement, .. } = &self.request
-            && let (MvAlterAction::StorageProperties { owner, .. }
-            | MvAlterAction::RefreshAndStorageProperties { owner, .. }) = &statement.action
+            && let MvAlterAction::StorageProperties { owner, .. }
+            | MvAlterAction::RefreshAndStorageProperties { owner, .. } = &statement.action
             && (owner.instance_id != planning.binding().descriptor().instance_id
                 || owner.incarnation != planning.binding().incarnation())
         {

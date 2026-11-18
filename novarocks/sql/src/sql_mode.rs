@@ -231,10 +231,19 @@ pub(crate) fn normalize_concat_query(
     query: ast::Query,
     session: &SqlSemanticSettings,
 ) -> Result<ast::Query, crate::analyze_error::AnalyzeError> {
-    struct Normalizer {
-        sql_semantics: SqlSemanticSettings,
+    let settings = query_sql_semantics(session, &query)?;
+    Ok(normalize_concat_query_with_semantics(query, &settings))
+}
+
+/// The admitted settings authorize all expression normalization in this Query.
+pub(crate) fn normalize_concat_query_with_semantics(
+    query: ast::Query,
+    settings: &SqlSemanticSettings,
+) -> ast::Query {
+    struct Normalizer<'a> {
+        sql_semantics: &'a SqlSemanticSettings,
     }
-    impl Fold for Normalizer {
+    impl Fold for Normalizer<'_> {
         fn fold_function_call(&mut self, call: ast::FunctionCall) -> ast::FunctionCall {
             let mut call = ast::fold_function_call(self, call);
             if call.arguments.is_empty()
@@ -278,10 +287,10 @@ pub(crate) fn normalize_concat_query(
             call
         }
     }
-    let mut normalizer = Normalizer {
-        sql_semantics: query_sql_semantics(session, &query)?,
-    };
-    Ok(normalizer.fold_query(query))
+    Normalizer {
+        sql_semantics: settings,
+    }
+    .fold_query(query)
 }
 
 /// Persisted definitions can contain a SELECT under VALUES or a CTE.
@@ -300,6 +309,16 @@ fn query_has_select(query: &ast::Query) -> bool {
     let mut detector = Detector { has_select: false };
     detector.visit_query(query);
     detector.has_select
+}
+
+pub(crate) fn query_requires_semantic_snapshot(
+    settings: &SqlSemanticSettings,
+    query: &ast::Query,
+) -> bool {
+    (settings.sql_mode().group_concat_legacy()
+        || settings.decimal_overflow_to_double()
+        || settings.sql_mode().error_if_overflow())
+        && query_has_select(query)
 }
 
 /// Detect a numeric policy used by this query's SELECTs under one setting.

@@ -16,10 +16,12 @@
 // under the License.
 
 //! One frozen SET computation runs on the original supervised planning CPU.
+use super::property_cpu_context::PropertyCpuContext;
 use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
 use novarocks_parser::{Span, ast};
 use novarocks_query_application::sql::session::registry::{
-    SessionPropertyError, SessionPropertyOrigin, SessionPropertyRegistry, SessionPropertyType,
+    SessionCatalogPropertyPort, SessionPropertyError, SessionPropertyOrigin,
+    SessionPropertyRegistry, SessionPropertyType, sql_session_property_error_at,
 };
 use novarocks_query_application::sql::{
     session::{SessionSqlState, admit_session_set_assignment, session_property_error},
@@ -33,12 +35,34 @@ use novarocks_sql::compiler::{
     SqlCompileError, SqlConstantEvaluationError, SqlFunctionCatalog, SqlPlannerTableSnapshot,
     prepare_required_constant,
 };
+use novarocks_type_contract::{CompilePhase, PureCompileControl};
 use novarocks_workload_control::{ResultWindowAlias, WorkScope};
 use std::sync::{Arc, RwLock};
 
+/// Semantic input from a typed statement owner. P09 moves the original
+/// qualified name, expression and statement range into these fields.
+pub(crate) enum ScopedSessionMutation {
+    Set {
+        name: ast::ObjectName,
+        value: ast::Expr,
+    },
+    Reset {
+        name: ast::ObjectName,
+        span: Span,
+    },
+}
+
+pub(crate) enum SessionPropertyMutation {
+    LegacySet(ast::SetStatement),
+    Scoped {
+        mutation: Box<ScopedSessionMutation>,
+        catalogs: Arc<dyn SessionCatalogPropertyPort>,
+    },
+}
+
 pub(crate) struct SessionPropertyCpuInput {
     pub(crate) source: Arc<str>,
-    pub(crate) set: ast::SetStatement,
+    pub(crate) mutation: SessionPropertyMutation,
     pub(crate) staged: SessionSqlState,
     pub(crate) registry: Arc<SessionPropertyRegistry>,
     pub(crate) interpreter: Arc<crate::RequiredConstantInterpreter>,
@@ -55,45 +79,42 @@ pub(crate) struct PreparedSessionProperties {
 }
 impl SessionPropertyCpuInput {
     pub(crate) fn run(mut self) -> Result<PreparedSessionProperties, QueryServiceError> {
-        let mut effects = SessionEffects::default();
-        for assignment in &self.set.assignments {
-            admit_session_set_assignment(&self.source, assignment)?;
-            let span = assignment.value.span();
-            let declaration = self
-                .registry
-                .lookup_system(&assignment.name.value, SessionPropertyOrigin::Sql)
-                .map_err(|e| property_error_at(e, &self.source, span))?;
-            let target = match declaration.value_type() {
-                SessionPropertyType::Boolean => RequiredConstantTarget::Boolean,
-                SessionPropertyType::Integer => RequiredConstantTarget::Integer,
-                SessionPropertyType::Bigint => RequiredConstantTarget::Bigint,
-                SessionPropertyType::Double => RequiredConstantTarget::Double,
-                SessionPropertyType::Varchar => RequiredConstantTarget::Varchar,
-            };
-            let prepared = {
-                let catalog = self.catalog.read().map_err(super::poisoned_state)?;
-                prepare_required_constant(RequiredConstantRequest {
-                    input: RequiredConstantInput::Expression(&assignment.value),
-                    target,
-                    catalog: &SqlPlannerTableSnapshot::new(&*catalog),
-                    current_database: self.staged.current_database(),
-                    functions: self.functions.clone(),
-                    sql_semantics: self.staged.sql_semantics(),
-                    constant_policy: self.policy,
-                    control: &self.control,
-                    version: crate::query_execution::physical_encoding::mint_plan_version(),
-                })
+        let evaluator = SessionPropertyEvaluation {
+            interpreter: &self.interpreter,
+            control: &self.control,
+            scope: &self.scope,
+            window: &self.window,
+            catalog: &self.catalog,
+            functions: &self.functions,
+            policy: self.policy,
+        };
+        let effects = match &self.mutation {
+            SessionPropertyMutation::LegacySet(set) => {
+                let mut effects = SessionEffects::default();
+                for assignment in &set.assignments {
+                    admit_session_set_assignment(&self.source, assignment)?;
+                    let span = assignment.value.span();
+                    let declaration = self
+                        .registry
+                        .lookup_system(&assignment.name.value, SessionPropertyOrigin::Sql)
+                        .map_err(|e| property_error_at(e, &self.source, span))?;
+                    let value = evaluator.evaluate(
+                        &self.staged,
+                        &assignment.value,
+                        &assignment.name.value,
+                        declaration.value_type(),
+                    )?;
+                    let property = declaration
+                        .validate_sql_value(&value, &self.control)
+                        .map_err(|e| property_error_at(e, &self.source, span))?;
+                    effects.append(SessionEffects::property(property));
+                }
+                effects
             }
-            .map_err(compile_error)?;
-            let value = self
-                .interpreter
-                .evaluate(prepared, &self.scope, &self.window)
-                .map_err(|e| evaluation_error(e, &assignment.name.value))?;
-            let property = declaration
-                .validate_sql_value(&value, &self.control)
-                .map_err(|e| property_error_at(e, &self.source, span))?;
-            effects.append(SessionEffects::property(property));
-        }
+            SessionPropertyMutation::Scoped { mutation, catalogs } => {
+                self.prepare_scoped(&evaluator, mutation, catalogs.as_ref())?
+            }
+        };
         // Projection is still CPU work. The live session is untouched until
         // this whole computation has returned and its original worker exited.
         self.staged.apply_effects(&effects)?;
@@ -102,7 +123,328 @@ impl SessionPropertyCpuInput {
             effects,
         })
     }
+    fn prepare_scoped(
+        &self,
+        evaluator: &SessionPropertyEvaluation<'_>,
+        mutation: &ScopedSessionMutation,
+        catalogs: &dyn SessionCatalogPropertyPort,
+    ) -> Result<SessionEffects, QueryServiceError> {
+        self.control
+            .checkpoint(CompilePhase::Validate, 0)
+            .map_err(QueryServiceError::from_compile_control)?;
+        match mutation {
+            ScopedSessionMutation::Set { name, value } => {
+                let span = value.span();
+                let property = self
+                    .registry
+                    .resolve_sql_property(name, catalogs)
+                    .map_err(|error| sql_session_property_error_at(error, &self.source, span))?;
+                let evaluated = evaluator.evaluate(
+                    &self.staged,
+                    value,
+                    &property.qualified_name(),
+                    property.value_type(),
+                )?;
+                let validated = property
+                    .validate_sql_value(&evaluated, &self.control)
+                    .map_err(|error| sql_session_property_error_at(error, &self.source, span))?;
+                Ok(SessionEffects::property(validated))
+            }
+            ScopedSessionMutation::Reset { name, span } => {
+                let property = self
+                    .registry
+                    .resolve_sql_property(name, catalogs)
+                    .map_err(|error| sql_session_property_error_at(error, &self.source, *span))?;
+                self.control
+                    .checkpoint(CompilePhase::Validate, 0)
+                    .map_err(QueryServiceError::from_compile_control)?;
+                Ok(SessionEffects::reset_property(property))
+            }
+        }
+    }
 }
+pub(crate) struct QuerySessionPropertyCpuInput {
+    pub(crate) source: Arc<str>,
+    pub(crate) statement: ast::Statement,
+    pub(crate) original: SessionSqlState,
+    pub(crate) registry: Arc<SessionPropertyRegistry>,
+    pub(crate) catalogs: novarocks_query_application::sql::catalog::SessionCatalogService,
+    pub(crate) context: PropertyCpuContext,
+}
+
+pub(crate) struct PreparedQuerySession {
+    pub(crate) statement: ast::Statement,
+    pub(crate) state: SessionSqlState,
+}
+
+impl QuerySessionPropertyCpuInput {
+    pub(crate) fn run(self) -> Result<PreparedQuerySession, QueryServiceError> {
+        let query = match &self.statement {
+            ast::Statement::Query(query) => query,
+            ast::Statement::ExplainQuery(explain) => explain.query.as_ref(),
+            _ => {
+                return Err(super::internal_error(
+                    "scoped properties require the original query",
+                ));
+            }
+        };
+        let evaluator = SessionPropertyEvaluation {
+            interpreter: &self.context.interpreter,
+            control: &self.context.control,
+            scope: &self.context.scope,
+            window: &self.context.window,
+            catalog: &self.context.catalog,
+            functions: &self.context.functions,
+            policy: self.context.policy,
+        };
+        let state = self.registry.prepare_query_session(
+            &self.source,
+            &query.session_properties,
+            &self.original,
+            self.catalogs.as_ref(),
+            &self.context.control,
+            |original, property, value| {
+                evaluator.evaluate(
+                    original,
+                    value,
+                    &property.qualified_name(),
+                    property.value_type(),
+                )
+            },
+        )?;
+        Ok(PreparedQuerySession {
+            statement: self.statement,
+            state,
+        })
+    }
+}
+
+/// First phase of the registered Read/Explain Action. It moves the actual
+/// statement through the required CPU and retains the original queue wait.
+pub(super) struct QuerySessionPreparation {
+    source: Arc<crate::query_execution::completion_facts::FrontendPlanningCpuSource>,
+    input: Option<QuerySessionPreparationInput>,
+    computation: Option<QuerySessionComputation>,
+    effective: Option<PreparedQuerySession>,
+    admission: Option<novarocks_query_application::session_control::SessionQueryAdmission>,
+    grant: Option<novarocks_query_application::session_control::QueuedQueryGrant>,
+    health: Option<novarocks_query_application::api::StatementNativeHealthFailure>,
+}
+
+pub(super) struct QuerySessionPreparationInput {
+    pub(super) source: Arc<str>,
+    pub(super) statement: ast::Statement,
+    pub(super) original: SessionSqlState,
+    pub(super) compiler: super::compiler::FrontendQueryCompiler,
+    pub(super) registry: Arc<SessionPropertyRegistry>,
+    pub(super) catalogs: novarocks_query_application::sql::catalog::SessionCatalogService,
+    pub(super) interpreter: Arc<crate::RequiredConstantInterpreter>,
+}
+
+type QuerySessionComputation = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    Result<PreparedQuerySession, QueryServiceError>,
+                    novarocks_query_application::api::StatementNativeHealthFailure,
+                >,
+            > + Send,
+    >,
+>;
+
+impl QuerySessionPreparation {
+    pub(super) fn new(
+        input: QuerySessionPreparationInput,
+        source: Arc<crate::query_execution::completion_facts::FrontendPlanningCpuSource>,
+    ) -> Self {
+        Self {
+            source,
+            input: Some(input),
+            computation: None,
+            effective: None,
+            admission: None,
+            grant: None,
+            health: None,
+        }
+    }
+
+    pub(super) fn local_health_failure(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
+        self.health
+            .clone()
+            .or_else(|| self.source.local_health_failure())
+    }
+
+    pub(super) fn poll(
+        &mut self,
+        owner: &mut novarocks_query_application::session_control::GovernedActionContext<'_>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<PreparedQuerySession, QueryServiceError>> {
+        use novarocks_query_application::cancellation::QueryCancellationView;
+        use novarocks_query_application::session_outcome::cancellation_error;
+        use std::task::Poll;
+
+        if self.local_health_failure().is_some() {
+            return Poll::Pending;
+        }
+        if let Some(input) = self.input.take() {
+            let cancellation =
+                QueryCancellationView::governed(owner.cancellation().clone(), owner.timeout_ms());
+            if let Some(reason) = cancellation.reason() {
+                return Poll::Ready(Err(cancellation_error(reason)));
+            }
+            let window = owner
+                .result_window_alias()
+                .filter(|alias| {
+                    alias.is_root_backed_internal() && alias.is_for_scope(owner.scope())
+                })
+                .ok_or_else(|| {
+                    super::internal_error("query session CPU lacks its original root retention")
+                })?;
+            let control = SqlCompileControl::new(
+                owner
+                    .cancellation()
+                    .deadline()
+                    .map(tokio::time::Instant::into_std),
+                crate::query_execution::planning::sql_cancellation_observation(cancellation),
+            );
+            let context = input.compiler.property_cpu_context(
+                input.original.current_database().to_owned(),
+                input.original.sql_semantics().clone(),
+                input.interpreter,
+                control,
+                owner.scope().clone(),
+                window,
+            );
+            let cpu_input = QuerySessionPropertyCpuInput {
+                source: input.source,
+                statement: input.statement,
+                original: input.original,
+                registry: input.registry,
+                catalogs: input.catalogs,
+                context,
+            };
+            let source = Arc::clone(&self.source);
+            self.computation = Some(Box::pin(async move {
+                source.query_session_properties(cpu_input).await
+            }));
+        }
+        if let Some(computation) = &mut self.computation {
+            let effective = match computation.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(health)) => {
+                    self.health = Some(health);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(value)) => value,
+            };
+            drop(self.computation.take());
+            self.effective = Some(effective?);
+        }
+        if self.admission.is_none() {
+            let execution = self
+                .effective
+                .as_ref()
+                .expect("received the original session CPU")
+                .state
+                .execution_settings();
+            let timeout = execution
+                .query_timeout_secs()
+                .map(std::time::Duration::from_secs);
+            use novarocks_query_application::session_control::SessionQueryAdmissionError;
+            self.admission = Some(owner.queue_after_session_preparation(timeout).map_err(
+                |error| match error {
+                    SessionQueryAdmissionError::BindDeadline(
+                        novarocks_workload_control::WorkError::ArithmeticOverflow,
+                    ) => super::internal_error("query deadline exceeds monotonic clock range"),
+                    SessionQueryAdmissionError::BindDeadline(error)
+                    | SessionQueryAdmissionError::Queue(error) => {
+                        session_query_work_error(owner, error)
+                    }
+                },
+            )?);
+        }
+        let grant = match self.admission.as_mut().unwrap().as_mut().poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(result) => result,
+        };
+        drop(self.admission.take());
+        self.grant = Some(grant.map_err(|error| session_query_work_error(owner, error))?);
+        let accepted = owner.accept_session_query_grant_in(&mut self.grant);
+        if let Err(error) = accepted {
+            drop(self.grant.take());
+            return Poll::Ready(Err(session_query_work_error(owner, error)));
+        }
+        Poll::Ready(Ok(self
+            .effective
+            .take()
+            .expect("the original queued query input")))
+    }
+}
+
+fn session_query_work_error(
+    owner: &novarocks_query_application::session_control::GovernedActionContext<'_>,
+    error: novarocks_workload_control::WorkError,
+) -> QueryServiceError {
+    if matches!(error, novarocks_workload_control::WorkError::Cancelled(_)) {
+        let view = novarocks_query_application::cancellation::QueryCancellationView::governed(
+            owner.cancellation().clone(),
+            owner.timeout_ms(),
+        );
+        if let Some(reason) = view.reason() {
+            return novarocks_query_application::session_outcome::cancellation_error(reason);
+        }
+    }
+    super::statement_computation::statement_work_error(error)
+}
+
+struct SessionPropertyEvaluation<'a> {
+    interpreter: &'a crate::RequiredConstantInterpreter,
+    control: &'a SqlCompileControl,
+    scope: &'a WorkScope,
+    window: &'a ResultWindowAlias,
+    catalog: &'a RwLock<novarocks_sql::planning::catalog::PlannerMemoryCatalog>,
+    functions: &'a Arc<dyn SqlFunctionCatalog>,
+    policy: novarocks_functions::ConstantPolicy,
+}
+
+impl SessionPropertyEvaluation<'_> {
+    fn evaluate(
+        &self,
+        original: &SessionSqlState,
+        expression: &ast::Expr,
+        name: &str,
+        value_type: SessionPropertyType,
+    ) -> Result<novarocks_functions::ConstantValue, QueryServiceError> {
+        let target = match value_type {
+            SessionPropertyType::Boolean => RequiredConstantTarget::Boolean,
+            SessionPropertyType::Integer => RequiredConstantTarget::Integer,
+            SessionPropertyType::Bigint => RequiredConstantTarget::Bigint,
+            SessionPropertyType::Double => RequiredConstantTarget::Double,
+            SessionPropertyType::Varchar => RequiredConstantTarget::Varchar,
+        };
+        let prepared = {
+            let catalog = self.catalog.read().map_err(super::poisoned_state)?;
+            prepare_required_constant(RequiredConstantRequest {
+                input: RequiredConstantInput::Expression(expression),
+                target,
+                catalog: &SqlPlannerTableSnapshot::new(&*catalog),
+                current_database: original.current_database(),
+                functions: Arc::clone(self.functions),
+                sql_semantics: original.sql_semantics(),
+                constant_policy: self.policy,
+                control: self.control,
+                version: crate::query_execution::physical_encoding::mint_plan_version(),
+            })
+        }
+        .map_err(compile_error)?;
+        self.interpreter
+            .evaluate(prepared, self.scope, self.window)
+            .map_err(|error| evaluation_error(error, name))
+    }
+}
+
 fn property_error_at(error: SessionPropertyError, source: &str, span: Span) -> QueryServiceError {
     match error {
         e @ (SessionPropertyError::UnknownProperty { .. }
@@ -230,7 +572,7 @@ mod tests {
                 panic!("SET fixture");
             };
             SessionPropertyCpuInput {
-                source: Arc::from(sql), set: set.clone(), staged,
+                source: Arc::from(sql), mutation: SessionPropertyMutation::LegacySet(set.clone()), staged,
                 registry: Arc::new(SessionPropertyRegistry::new().unwrap()),
                 interpreter: Arc::new(crate::query_execution::required_constant_eval::test_required_constant_interpreter()),
                 control: SqlCompileControl::unbounded(), scope: self.root.owner.scope(), window: self.window.clone(),
@@ -246,6 +588,77 @@ mod tests {
             self.root.business.release();
         }
     }
+    #[test]
+    fn scoped_query_cpu_uses_real_parser_and_checked_root_retention() {
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1024,
+                per_scope_bytes: (1 << 20) - 1024,
+            },
+        )
+        .unwrap();
+        workload
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let root = workload
+            .root_admission()
+            .begin_query_root_with_deferred_deadline()
+            .unwrap();
+        let window = ResultWindowAlias::from_root_owner(&root.owner).unwrap();
+        let registry = Arc::new(SessionPropertyRegistry::new().unwrap());
+        let live = SessionSqlState::default();
+        let source = "WITH SESSION query_timeout = 1 + 2, decimal_overflow_to_double = true AND true, explain_detail = 'LOGICAL_COSTS' SELECT 1 AS answer";
+        let parsed = novarocks_parser::trino_parser::parse_query(source).unwrap();
+        let catalogs = Arc::new(
+            crate::query_execution::kernels::SessionCatalogResolver::new(
+                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
+                None,
+                Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
+                Arc::clone(&registry),
+                Arc::new(
+                    novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                        .unwrap(),
+                ),
+            ),
+        );
+        let prepared = QuerySessionPropertyCpuInput {
+            source: Arc::from(source),
+            statement: ast::Statement::Query(parsed.clone()),
+            original: live.clone(),
+            registry,
+            catalogs,
+            context: PropertyCpuContext {
+                current_database: live.current_database().to_owned(),
+                sql_semantics: live.sql_semantics().clone(),
+                interpreter: Arc::new(crate::query_execution::required_constant_eval::test_required_constant_interpreter()),
+                control: SqlCompileControl::unbounded(),
+                scope: root.owner.scope(),
+                window: window.clone(),
+                catalog: Arc::new(RwLock::new(Default::default())),
+                functions: Arc::new(novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap()),
+                policy: crate::application::test_constant_policy(),
+            },
+        }.run().unwrap();
+        assert_eq!(prepared.statement, ast::Statement::Query(parsed));
+        assert_eq!(
+            prepared.state.execution_settings().query_timeout_secs(),
+            Some(3)
+        );
+        assert!(prepared.state.sql_semantics().decimal_overflow_to_double());
+        assert_eq!(
+            prepared.state.execution_settings().explain_detail(),
+            novarocks_query_application::sql::session::ExplainDetail::LogicalCosts
+        );
+        assert_eq!(live.execution_settings().query_timeout_secs(), None);
+        assert!(!live.sql_semantics().decimal_overflow_to_double());
+        assert_eq!(window.retained_payload_bytes(), 0);
+        drop(window);
+        root.owner.complete();
+    }
+
     #[test]
     fn whole_set_prepares_typed_values_and_effects_without_optional_folding() {
         let fixture = Fixture::new();

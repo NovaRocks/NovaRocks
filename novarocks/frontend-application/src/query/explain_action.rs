@@ -56,6 +56,8 @@ type PreparationFuture = Pin<
 type DiagnosticFuture =
     Pin<Box<dyn Future<Output = Result<QueryResult, QueryServiceError>> + Send>>;
 
+use super::query_session_action::{QueryActionEnvironment, QueryActionInputs};
+
 struct ExplainPreparationInput {
     compiler: FrontendQueryCompiler,
     topology: BackendTopologyService,
@@ -63,6 +65,7 @@ struct ExplainPreparationInput {
     optimizer_limit: u64,
     sql: String,
     explain: ast::ExplainQuery,
+    root_session_admitted: bool,
     state: SessionSqlState,
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
@@ -107,19 +110,31 @@ async fn make_explain_preparation(
         let presentation = input.state.presentation().copied();
         let (catalog, database, execution, mut optimizer, semantics, property_inputs) =
             input.state.into_query_attempt_inputs();
-        let semantics = novarocks_sql::sql_mode::statement_sql_semantics(
-            &semantics,
-            &ParsedStatement::ExplainQuery(input.explain.clone()),
-        )
-        .map_err(|e| QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql))))?;
+        let semantics = if input.root_session_admitted {
+            semantics
+        } else {
+            novarocks_sql::sql_mode::query_sql_semantics(&semantics, &input.explain.query).map_err(
+                |e| QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql))),
+            )?
+        };
         if optimizer.optimizer_query_mem_limit_bytes.is_none() {
             optimizer.optimizer_query_mem_limit_bytes = Some(input.optimizer_limit as f64);
         }
         let options = with_query_hints(
             query_options_from_session_settings(&execution),
             &semantics,
-            Some(&input.explain.query),
+            (!input.root_session_admitted).then_some(input.explain.query.as_ref()),
         );
+        let options =
+            if input.root_session_admitted && input.explain.format != ast::ExplainFormat::Analyze {
+                // The outer EXPLAIN deadline already belongs to RequestContext.
+                // A missing outer deadline uses the original connector bound.
+                let mut raw = *options.as_proto();
+                raw.query_timeout = 0;
+                QueryOptions::from_proto(raw)
+            } else {
+                options
+            };
         let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
             .map_err(|e| internal_error(e.to_string()))?;
         let context = RequestContext::admit(
@@ -149,10 +164,10 @@ async fn make_explain_preparation(
                 .map_err(internal_error)?,
             None => context,
         };
-        Ok((context, options))
+        Ok((context, options, execution.explain_detail()))
     }
     .await;
-    let (context, options) = match prepared {
+    let (context, options, detail) = match prepared {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
@@ -160,6 +175,8 @@ async fn make_explain_preparation(
         .compiler
         .prepare_explain_async(
             &input.explain,
+            detail,
+            input.root_session_admitted,
             &context,
             Some(options),
             &input.scope,
@@ -588,105 +605,142 @@ impl FrontendQuerySession {
                 ));
             }
         };
-        self.service
-            .query_compiler
-            .validate_original_read_runtime()
-            .map_err(|error| internal_error(error.to_string()))?;
-        let cancellation = QueryCancellationView::governed(
-            statement.cancellation().clone(),
-            statement.timeout_ms(),
-        );
-        let state_store = self
-            .service
-            .state_store
-            .as_ref()
-            .map(|binding| {
-                let owner = binding.for_root(statement.scope().clone())?;
-                let requests: Arc<dyn StateStoreExecutionRequests> =
-                    Arc::new(owner.execution_requests(binding.transaction_deadline, deadline)?);
-                Ok::<_, novarocks_state_store_api::StateStoreExecutionFailure>((owner, requests))
-            })
-            .transpose()
-            .map_err(|cause| {
-                QueryServiceError::from_failure_cause(cause)
-                    .reconcile_local_stop_observation(&cancellation)
-            })?;
-        let dependencies = self
-            .service
-            .state_store
-            .as_ref()
-            .map_or(&[][..], |binding| binding.blocking_dependency_facts());
-        let profile = explain_preparation_profile(dependencies)
-            .map_err(|error| internal_error(error.to_string()))?;
-        let io = ReadMetadataIoSource::new(statement.scope().clone(), profile.clone());
-        io.configure_read_source(&profile)
-            .map_err(|error| internal_error(error.to_string()))?;
-        let (state_store_owner, state_store_requests) = match state_store {
-            Some((owner, requests)) => (Some(owner), Some(requests)),
-            None => (None, None),
-        };
-        let stage = StatementStageAdmission::new(statement.scope().clone(), 0);
-        let provider_source =
-            crate::query_execution::completion_facts::FrontendCompletionCustody::new();
-        let planning_cpu = self.service.query_compiler.new_planning_cpu_source();
-        let input = ExplainPreparationInput {
-            compiler: self.service.query_compiler.clone(),
-            topology: self.service.topology.clone(),
-            role: self.service.role,
-            optimizer_limit: self.service.optimizer_query_mem_limit_bytes,
+        let action = build_explain_action(
+            &QueryActionEnvironment::new(&self.service),
+            QueryActionInputs {
+                scope: statement.scope().clone(),
+                deadline,
+                cancellation: QueryCancellationView::governed(
+                    statement.cancellation().clone(),
+                    statement.timeout_ms(),
+                ),
+                window,
+                planning_cpu: None,
+                root_session_admitted: false,
+                #[cfg(novarocks_dev_controls)]
+                observation,
+                #[cfg(novarocks_dev_controls)]
+                statement_token: statement.token(),
+            },
             sql,
             explain,
             state,
-            deadline,
-            cancellation: QueryCancellationView::governed(
-                statement.cancellation().clone(),
-                statement.timeout_ms(),
-            ),
-            scope: statement.scope().clone(),
-            window,
-            provider_source: Arc::clone(&provider_source),
-            planning_cpu: Arc::clone(&planning_cpu),
-            io: Arc::clone(&io),
-            state_store: state_store_requests,
-            #[cfg(novarocks_dev_controls)]
-            observation: observation.clone(),
-        };
-        let provider_close = Some(Box::pin(close_provider(
-            Arc::clone(&provider_source),
-            Arc::clone(&planning_cpu),
-        )) as ProviderClose);
-        let action = Box::new(ExplainStatementAction {
             family,
-            provider_source,
-            planning_cpu,
-            preparation_health: None,
-            provider_close,
-            provider_close_result: None,
-            tail: Some(Box::new(ReadNativeTail {
-                services: ReadNativeServices::new(state_store_owner, io),
-                native: ReadNativeStageTail::new(stage),
-                health: None,
-            })),
-            bootstrap_ready: false,
-            result_transferred: false,
-            error: None,
-            preparation: Some(Box::pin(make_explain_preparation(input))),
-            preparation_started: false,
-            prepared: None,
-            profile: None,
-            capacity: None,
-            original: OriginalComputationStart::default(),
-            execution: None,
-            diagnostics: None,
-            raw_result: None,
-            local: None,
-            launcher: Arc::clone(&self.service.logical_execution_launcher),
-            #[cfg(novarocks_dev_controls)]
-            observation,
-        });
+        )?;
         self.execute_observed_statement_action(statement, action)
             .await
     }
+}
+
+pub(super) fn build_explain_action(
+    environment: &QueryActionEnvironment,
+    inputs: QueryActionInputs,
+    sql: String,
+    explain: ast::ExplainQuery,
+    state: SessionSqlState,
+    family: novarocks_result_contract::ClientPresentationFamily,
+) -> Result<Box<dyn GovernedStatementAction>, QueryServiceError> {
+    let QueryActionInputs {
+        scope,
+        deadline,
+        cancellation,
+        window,
+        planning_cpu,
+        root_session_admitted,
+        #[cfg(novarocks_dev_controls)]
+        observation,
+        #[cfg(novarocks_dev_controls)]
+            statement_token: _,
+    } = inputs;
+    environment
+        .compiler
+        .validate_original_read_runtime()
+        .map_err(|error| internal_error(error.to_string()))?;
+    let state_store = environment
+        .state_store
+        .as_ref()
+        .map(|binding| {
+            let owner = binding.for_root(scope.clone())?;
+            let requests: Arc<dyn StateStoreExecutionRequests> =
+                Arc::new(owner.execution_requests(binding.transaction_deadline, deadline)?);
+            Ok::<_, novarocks_state_store_api::StateStoreExecutionFailure>((owner, requests))
+        })
+        .transpose()
+        .map_err(|cause| {
+            QueryServiceError::from_failure_cause(cause)
+                .reconcile_local_stop_observation(&cancellation)
+        })?;
+    let dependencies = environment
+        .state_store
+        .as_ref()
+        .map_or(&[][..], |binding| binding.blocking_dependency_facts());
+    let profile = explain_preparation_profile(dependencies)
+        .map_err(|error| internal_error(error.to_string()))?;
+    let io = ReadMetadataIoSource::new(scope.clone(), profile.clone());
+    io.configure_read_source(&profile)
+        .map_err(|error| internal_error(error.to_string()))?;
+    let (state_store_owner, state_store_requests) = match state_store {
+        Some((owner, requests)) => (Some(owner), Some(requests)),
+        None => (None, None),
+    };
+    let stage = StatementStageAdmission::new(scope.clone(), 0);
+    let provider_source =
+        crate::query_execution::completion_facts::FrontendCompletionCustody::new();
+    let planning_cpu =
+        planning_cpu.unwrap_or_else(|| environment.compiler.new_planning_cpu_source());
+    let input = ExplainPreparationInput {
+        compiler: environment.compiler.clone(),
+        topology: environment.topology.clone(),
+        role: environment.role,
+        optimizer_limit: environment.optimizer_limit,
+        sql,
+        explain,
+        root_session_admitted,
+        state,
+        deadline,
+        cancellation,
+        scope: scope.clone(),
+        window,
+        provider_source: Arc::clone(&provider_source),
+        planning_cpu: Arc::clone(&planning_cpu),
+        io: Arc::clone(&io),
+        state_store: state_store_requests,
+        #[cfg(novarocks_dev_controls)]
+        observation: observation.clone(),
+    };
+    let provider_close = Some(Box::pin(close_provider(
+        Arc::clone(&provider_source),
+        Arc::clone(&planning_cpu),
+    )) as ProviderClose);
+    Ok(Box::new(ExplainStatementAction {
+        family,
+        provider_source,
+        planning_cpu,
+        preparation_health: None,
+        provider_close,
+        provider_close_result: None,
+        tail: Some(Box::new(ReadNativeTail {
+            services: ReadNativeServices::new(state_store_owner, io),
+            native: ReadNativeStageTail::new(stage),
+            health: None,
+        })),
+        bootstrap_ready: false,
+        result_transferred: false,
+        error: None,
+        preparation: Some(Box::pin(make_explain_preparation(input))),
+        preparation_started: false,
+        prepared: None,
+        profile: None,
+        capacity: None,
+        original: OriginalComputationStart::default(),
+        execution: None,
+        diagnostics: None,
+        raw_result: None,
+        local: None,
+        launcher: Arc::clone(&environment.launcher),
+        #[cfg(novarocks_dev_controls)]
+        observation,
+    }))
 }
 
 fn explain_preparation_profile(

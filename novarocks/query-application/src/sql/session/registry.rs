@@ -30,12 +30,14 @@ mod catalog;
 mod constant;
 mod declarations;
 mod inputs;
+mod sql_entry;
 pub use catalog::{
     CatalogPropertyDeclarationFactory, CatalogPropertyIdentity, CatalogPropertyMetadata,
     EmptyCatalogPropertyDeclarationFactory, SessionCatalogPropertyAdmission,
     SessionCatalogPropertyPort,
 };
 pub use inputs::{SessionPropertyInputs, SessionPropertyMetadata};
+pub use sql_entry::{ResolvedSqlSessionProperty, sql_session_property_error_at};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionPropertyType {
@@ -255,6 +257,15 @@ pub enum SessionPropertyScope {
         identity: Option<CatalogPropertyIdentity>,
     },
 }
+impl SessionPropertyScope {
+    fn qualify(&self, name: &str) -> String {
+        match self {
+            Self::System => name.to_owned(),
+            Self::Catalog { catalog, .. } => format!("{catalog}.{name}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ValidatedSessionProperty {
     declaration: Arc<PropertyDeclaration>,
@@ -268,10 +279,7 @@ impl ValidatedSessionProperty {
         self.declaration.name()
     }
     pub fn qualified_name(&self) -> String {
-        match &self.scope {
-            SessionPropertyScope::System => self.name().to_owned(),
-            SessionPropertyScope::Catalog { catalog, .. } => format!("{catalog}.{}", self.name()),
-        }
+        self.scope.qualify(self.name())
     }
     pub fn value(&self) -> &SessionPropertyValue {
         &self.value

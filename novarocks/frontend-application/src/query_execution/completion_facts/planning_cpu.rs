@@ -152,12 +152,15 @@ pub(crate) struct LogicalFinishInput {
     pub(crate) level: ExplainLevel,
 }
 struct LogicalCatalogInput {
-    query: novarocks_parser::ast::Query,
+    input: novarocks_sql::compiler::SqlStatementInput,
     session: SqlSessionContext,
     control: SqlCompileControl,
 }
 enum PlanningCpuInput {
     SessionProperties(Box<crate::query::session_property_computation::SessionPropertyCpuInput>),
+    QuerySessionProperties(
+        Box<crate::query::session_property_computation::QuerySessionPropertyCpuInput>,
+    ),
     CatalogProperties(Box<crate::query::catalog_property_computation::CatalogPropertyCpuInput>),
     TableProperties(Box<crate::query::table_property_computation::TablePropertyCpuInput>),
     LikeColumns(Box<crate::query::table_property_computation::LikeColumnsCpuInput>),
@@ -182,6 +185,14 @@ enum PlanningCpuInput {
     LogicalFinish(Box<LogicalFinishInput>),
 }
 enum PlanningCpuOutput {
+    QuerySessionProperties(
+        Box<
+            Result<
+                crate::query::session_property_computation::PreparedQuerySession,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
     TableProperties(
         Box<
             Result<
@@ -285,6 +296,9 @@ impl PlanningCpuOriginal {
         body.started = true;
         let input = body.input.take().expect("original planning input");
         let output = match input {
+            PlanningCpuInput::QuerySessionProperties(input) => {
+                PlanningCpuOutput::QuerySessionProperties(Box::new(input.run()))
+            }
             PlanningCpuInput::SessionProperties(input) => {
                 PlanningCpuOutput::SessionProperties(Box::new(input.run()))
             }
@@ -338,13 +352,13 @@ impl PlanningCpuOriginal {
             ),
             PlanningCpuInput::LogicalCatalog(input) => {
                 let LogicalCatalogInput {
-                    query,
+                    input,
                     session,
                     control,
                 } = *input;
-                PlanningCpuOutput::LogicalCatalog(Box::new(SqlLogicalExplainCatalog::try_new(
-                    query, session, control,
-                )))
+                PlanningCpuOutput::LogicalCatalog(Box::new(
+                    SqlLogicalExplainCatalog::try_new_for_input(input, session, control),
+                ))
             }
             PlanningCpuInput::LogicalContinue { logical, facts } => {
                 PlanningCpuOutput::LogicalCatalog(Box::new(logical.continue_catalog(facts)))
@@ -1028,6 +1042,22 @@ impl FrontendPlanningCpuSource {
         };
         Ok(*result)
     }
+    pub(crate) async fn query_session_properties(
+        &self,
+        input: crate::query::session_property_computation::QuerySessionPropertyCpuInput,
+    ) -> Result<
+        Result<
+            crate::query::session_property_computation::PreparedQuerySession,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::QuerySessionProperties(Box::new(input)));
+        let PlanningCpuOutput::QuerySessionProperties(result) = self.receive().await? else {
+            panic!("query session properties returned another CPU phase");
+        };
+        Ok(*result)
+    }
     pub(crate) async fn session_properties(
         &self,
         input: crate::query::session_property_computation::SessionPropertyCpuInput,
@@ -1051,9 +1081,24 @@ impl FrontendPlanningCpuSource {
         control: SqlCompileControl,
     ) -> Result<Result<SqlLogicalExplainCatalog, SqlCompileError>, StatementNativeHealthFailure>
     {
+        self.logical_catalog_for_input(
+            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
+            session,
+            control,
+        )
+        .await
+    }
+
+    pub(crate) async fn logical_catalog_for_input(
+        &self,
+        input: novarocks_sql::compiler::SqlStatementInput,
+        session: SqlSessionContext,
+        control: SqlCompileControl,
+    ) -> Result<Result<SqlLogicalExplainCatalog, SqlCompileError>, StatementNativeHealthFailure>
+    {
         self.install(PlanningCpuInput::LogicalCatalog(Box::new(
             LogicalCatalogInput {
-                query,
+                input,
                 session,
                 control,
             },

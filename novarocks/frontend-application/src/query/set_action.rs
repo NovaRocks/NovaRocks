@@ -24,7 +24,8 @@ use super::{
 };
 use crate::query::compiler::FrontendQueryCompiler;
 use crate::query::session_property_computation::{
-    PreparedSessionProperties, SessionPropertyCpuInput,
+    PreparedSessionProperties, ScopedSessionMutation, SessionPropertyCpuInput,
+    SessionPropertyMutation,
 };
 use crate::query_execution::completion_facts::FrontendPlanningCpuSource;
 use crate::query_execution::planning::sql_cancellation_observation;
@@ -128,7 +129,7 @@ impl GovernedStatementResidual for SetNativeTail {
 
 struct SetStatementAction {
     source: Arc<str>,
-    set: Option<ast::SetStatement>,
+    mutation: Option<SessionPropertyMutation>,
     live: Arc<Mutex<SessionSqlState>>,
     compiler: FrontendQueryCompiler,
     registry: Arc<SessionPropertyRegistry>,
@@ -153,7 +154,7 @@ impl SetStatementAction {
             self.error
                 .get_or_insert_with(|| governed_cancellation_error(reason));
         }
-        if self.set.is_some() && self.error.is_none() {
+        if self.mutation.is_some() && self.error.is_none() {
             // Only copy the immutable initial session under this short lock.
             // Analysis, kernels and staged projection all run in the CPU turn.
             let staged = match self.live.lock() {
@@ -171,7 +172,9 @@ impl SetStatementAction {
                     Some(window) => {
                         let input = self.compiler.session_property_input(
                             Arc::clone(&self.source),
-                            self.set.take().expect("one admitted SET payload"),
+                            self.mutation
+                                .take()
+                                .expect("one admitted session property mutation"),
                             staged,
                             Arc::clone(&self.registry),
                             Arc::clone(&self.interpreter),
@@ -273,6 +276,67 @@ impl FrontendQuerySession {
         deadline: Option<Instant>,
         statement: GovernedQueryStatementOwner,
     ) -> Result<StatementResult, QueryServiceError> {
+        self.execute_observed_session_mutation(
+            source,
+            SessionPropertyMutation::LegacySet(set),
+            deadline,
+            statement,
+        )
+        .await
+    }
+
+    /// Temporary typed statement call site for the P09 parser/admission
+    /// integration. The public legacy statement route continues to call SET.
+    #[allow(dead_code, reason = "P09 owns the public typed statement route.")]
+    pub(super) async fn execute_scoped_session_mutation(
+        &self,
+        source: Arc<str>,
+        mutation: ScopedSessionMutation,
+    ) -> Result<StatementResult, QueryServiceError> {
+        use novarocks_query_application::session::StatementOutputShape;
+        use novarocks_workload_control::{ResultWindowClass, WorkClass};
+
+        let (deadline, timeout_ms) = {
+            let state = self.state.lock().map_err(poisoned_state)?;
+            novarocks_query_application::session_outcome::governed_query_deadline(&state)?
+        };
+        let token = self.token()?;
+        *self.output_shape.lock().map_err(poisoned_state)? = Some(StatementOutputShape::Empty);
+        let statement = self
+            .service
+            .query_control
+            .begin_governed_statement_with_result(
+                token,
+                &self.service.workload_root_admission,
+                WorkClass::Management,
+                deadline.map(tokio::time::Instant::from_std),
+                timeout_ms,
+                Some(Arc::clone(&source)),
+                ResultWindowClass::Local,
+            )
+            .map_err(|error| self.governed_statement_begin_error(error))?;
+        let catalogs: Arc<
+            dyn novarocks_query_application::sql::session::registry::SessionCatalogPropertyPort,
+        > = self.service.session_catalog_resolver.clone();
+        self.execute_observed_session_mutation(
+            source,
+            SessionPropertyMutation::Scoped {
+                mutation: Box::new(mutation),
+                catalogs,
+            },
+            deadline,
+            statement,
+        )
+        .await
+    }
+
+    async fn execute_observed_session_mutation(
+        &self,
+        source: Arc<str>,
+        mutation: SessionPropertyMutation,
+        deadline: Option<Instant>,
+        statement: GovernedQueryStatementOwner,
+    ) -> Result<StatementResult, QueryServiceError> {
         let cancellation = QueryCancellationView::governed(
             statement.cancellation().clone(),
             statement.timeout_ms(),
@@ -280,7 +344,7 @@ impl FrontendQuerySession {
         let control = SqlCompileControl::new(deadline, sql_cancellation_observation(cancellation));
         let action = SetStatementAction {
             source,
-            set: Some(set),
+            mutation: Some(mutation),
             live: Arc::clone(&self.state),
             compiler: self.service.query_compiler.clone(),
             registry: Arc::clone(&self.service.session_properties),

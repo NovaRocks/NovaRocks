@@ -1018,3 +1018,259 @@ fn catalog_composition_rejects_cross_source_names_and_requires_its_primary_provi
         Err(SessionPropertyError::DuplicateProperty { name }) if name == "limit"
     ));
 }
+
+#[test]
+fn sql_query_properties_use_the_original_session_and_admitted_catalog_binding() {
+    use crate::session_effects::SessionEffects;
+    use arrow::{array::Int32Array, datatypes::DataType};
+    use novarocks_type_contract::FunctionValueType;
+
+    struct Catalog(Arc<CatalogPropertyMetadata>, AtomicUsize);
+    impl SessionCatalogPropertyPort for Catalog {
+        fn session_property_catalog(
+            &self,
+            name: &str,
+        ) -> Result<SessionCatalogPropertyAdmission, QueryServiceError> {
+            assert_eq!(name, "first");
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Ok(SessionCatalogPropertyAdmission::Ready(Arc::clone(&self.0)))
+        }
+    }
+
+    let registry = catalog_registry();
+    let metadata = Arc::new(
+        registry
+            .bind_catalog(
+                "first",
+                identity("first", 1),
+                &[("default".into(), "4".into())],
+            )
+            .unwrap(),
+    );
+    let catalogs = Catalog(Arc::clone(&metadata), AtomicUsize::new(0));
+    let source = r#"WITH SESSION "FIRST"."LIMIT" = 7, PIPELINE_DOP = 3 SELECT 1"#;
+    let query = novarocks_parser::trino_parser::parse_query(source).unwrap();
+    let mut original = SessionSqlState::default();
+    original
+        .apply_effects(&SessionEffects::property(
+            registry
+                .prepare_sql("pipeline_dop", SessionPropertyValue::Integer(2))
+                .unwrap(),
+        ))
+        .unwrap();
+    let pool = constant_pool(
+        Arc::new(Int32Array::from(vec![-1, 7, 3])),
+        FunctionValueType::new(DataType::Int32, false),
+    );
+    let mut calls = 0;
+    let effective = registry
+        .prepare_query_session(
+            source,
+            &query.session_properties,
+            &original,
+            &catalogs,
+            &ConstantControl(None),
+            |base, property, value| {
+                assert!(std::ptr::eq(base, &original));
+                assert_eq!(base.execution_settings().pipeline_dop(), Some(2));
+                assert_eq!(
+                    base.property_inputs()
+                        .read_catalog_override(&metadata, "limit"),
+                    None
+                );
+                assert!(std::ptr::eq(value, &query.session_properties[calls].value));
+                assert_eq!(
+                    property.qualified_name(),
+                    ["first.limit", "pipeline_dop"][calls]
+                );
+                assert_eq!(property.value_type(), SessionPropertyType::Integer);
+                calls += 1;
+                Ok(pool.value(u32::try_from(calls).unwrap()).unwrap())
+            },
+        )
+        .unwrap();
+    assert_eq!(calls, 2);
+    assert_eq!(catalogs.1.load(Ordering::SeqCst), 1);
+    assert_eq!(effective.execution_settings().pipeline_dop(), Some(3));
+    assert_eq!(
+        effective
+            .property_inputs()
+            .read_catalog_override(&metadata, "limit"),
+        Some(&SessionPropertyValue::Integer(7))
+    );
+    let replacement = registry
+        .bind_catalog(
+            "first",
+            identity("first", 2),
+            &[("default".into(), "4".into())],
+        )
+        .unwrap();
+    assert_eq!(
+        effective
+            .property_inputs()
+            .read_catalog_override(&replacement, "limit"),
+        None
+    );
+    assert_eq!(original.execution_settings().pipeline_dop(), Some(2));
+    assert_eq!(
+        original
+            .property_inputs()
+            .read_catalog_override(&metadata, "limit"),
+        None
+    );
+
+    let resolved = registry
+        .resolve_sql_property(&query.session_properties[0].name, &catalogs)
+        .unwrap();
+    let value = pool.value(1).unwrap();
+    let assigned = resolved
+        .validate_sql_value(&value, &ConstantControl(None))
+        .unwrap();
+    let retained = assigned.constant_source().unwrap();
+    assert_eq!(retained.ordinal(), 1);
+    assert_eq!(retained.value_type(), value.value_type());
+    assert!(std::ptr::eq(retained.field(), value.field()));
+    assert!(Arc::ptr_eq(retained.pool().array(), value.pool().array()));
+
+    let mut connection = original;
+    connection
+        .apply_effects(&SessionEffects::property(assigned))
+        .unwrap();
+    let reset = SessionEffects::reset_property(resolved);
+    assert_eq!(
+        reset.reset_properties().collect::<Vec<_>>(),
+        ["first.limit"]
+    );
+    connection.apply_effects(&reset).unwrap();
+    assert_eq!(
+        connection
+            .property_inputs()
+            .read_catalog_override(&metadata, "limit"),
+        None
+    );
+    assert_eq!(
+        connection
+            .property_inputs()
+            .raw_catalog_value("first", "limit"),
+        None
+    );
+    assert_eq!(
+        metadata.lookup("limit").unwrap().default_value(),
+        Some(&SessionPropertyValue::Integer(4))
+    );
+    assert_eq!(connection.execution_settings().pipeline_dop(), Some(2));
+
+    let reset = SessionEffects::reset_property(
+        registry
+            .resolve_sql_property(&query.session_properties[1].name, &catalogs)
+            .unwrap(),
+    );
+    connection.apply_effects(&reset).unwrap();
+    assert_eq!(connection.execution_settings().pipeline_dop(), None);
+    assert_eq!(connection.render_session_property("pipeline_dop"), None);
+    assert_eq!(
+        reset.reset_properties().collect::<Vec<_>>(),
+        ["pipeline_dop"]
+    );
+}
+
+#[test]
+fn sql_query_property_errors_keep_order_and_real_name_parts() {
+    use arrow::{array::Int32Array, datatypes::DataType};
+    use novarocks_type_contract::FunctionValueType;
+
+    let registry = registry();
+    let catalogs = NoCatalog {
+        calls: AtomicUsize::new(0),
+    };
+    let original = SessionSqlState::default();
+    let pool = constant_pool(
+        Arc::new(Int32Array::from(vec![99, 2, 88])),
+        FunctionValueType::new(DataType::Int32, false),
+    );
+    let source = r#"WITH SESSION pipeline_dop = 2, "PIPELINE_DOP" = 1 / 0 SELECT 1"#;
+    let query = novarocks_parser::trino_parser::parse_query(source).unwrap();
+    let mut calls = 0;
+    let result = registry.prepare_query_session(
+        source,
+        &query.session_properties,
+        &original,
+        &catalogs,
+        &ConstantControl(None),
+        |_, _, value| {
+            assert!(std::ptr::eq(value, &query.session_properties[0].value));
+            calls += 1;
+            Ok(pool.value(1).unwrap())
+        },
+    );
+    let error = result.err().expect("the canonical name is duplicated");
+    let error = error.user_error().unwrap();
+    assert_eq!(error.code().as_str(), "sql.admit.invalid_session_property");
+    assert_eq!(
+        error.location(),
+        Some(
+            &query.session_properties[1]
+                .span
+                .to_user_error_location(source)
+        )
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(original.execution_settings().pipeline_dop(), None);
+
+    for (source, code, bindings) in [
+        (
+            r#"WITH SESSION "FIRST.LIMIT" = 2 SELECT 1"#,
+            "sql.admit.invalid_session_property",
+            0,
+        ),
+        (
+            r#"WITH SESSION "FIRST"."LIMIT" = 2 SELECT 1"#,
+            "sql.admit.session_catalog_not_found",
+            1,
+        ),
+    ] {
+        let query = novarocks_parser::trino_parser::parse_query(source).unwrap();
+        let result = registry.prepare_query_session(
+            source,
+            &query.session_properties,
+            &original,
+            &catalogs,
+            &ConstantControl(None),
+            |_, _, _| panic!("bind before evaluating the original expression"),
+        );
+        let error = result.err().expect("the property cannot be bound");
+        assert_eq!(error.user_error().unwrap().code().as_str(), code);
+        assert_eq!(catalogs.calls.load(Ordering::SeqCst), bindings);
+    }
+}
+
+#[test]
+fn explain_detail_keeps_the_session_default_and_rejects_other_values() {
+    use crate::session_effects::SessionEffects;
+    use crate::sql::session::ExplainDetail;
+
+    let registry = registry();
+    let mut state = SessionSqlState::default();
+    assert_eq!(
+        state.execution_settings().explain_detail(),
+        ExplainDetail::Normal
+    );
+    assert_eq!(state.render_session_property("explain_detail"), None);
+    let property = registry
+        .prepare_system_header("explain_detail", "LOGICAL_COSTS")
+        .unwrap();
+    state
+        .apply_effects(&SessionEffects::property(property))
+        .unwrap();
+    assert_eq!(
+        state.execution_settings().explain_detail(),
+        ExplainDetail::LogicalCosts
+    );
+    assert!(matches!(
+        registry.prepare_sql(
+            "explain_detail",
+            SessionPropertyValue::Varchar("ANALYZE".into())
+        ),
+        Err(SessionPropertyError::InvalidValue { .. })
+    ));
+}

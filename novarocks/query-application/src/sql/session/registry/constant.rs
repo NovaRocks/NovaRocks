@@ -29,6 +29,15 @@ impl PropertyDeclaration {
         constant: &ConstantValue,
         control: &dyn PureCompileControl,
     ) -> Result<ValidatedSessionProperty, SessionPropertyError> {
+        self.validate_scoped_sql_value(constant, SessionPropertyScope::System, control)
+    }
+
+    pub(super) fn validate_scoped_sql_value(
+        self: &Arc<Self>,
+        constant: &ConstantValue,
+        scope: SessionPropertyScope,
+        control: &dyn PureCompileControl,
+    ) -> Result<ValidatedSessionProperty, SessionPropertyError> {
         let phase = CompilePhase::Validate;
         control
             .checkpoint(phase, 0)
@@ -41,7 +50,7 @@ impl PropertyDeclaration {
                 self.value_type.sql_name()
             ),
         };
-        if self.project.is_none() {
+        if self.project.is_some() != matches!(&scope, SessionPropertyScope::System) {
             return Err(SessionPropertyError::ProjectionInvariant);
         }
         let binding = constant.value_type();
@@ -112,7 +121,7 @@ impl PropertyDeclaration {
             declaration: self.clone(),
             value,
             raw,
-            scope: SessionPropertyScope::System,
+            scope,
             constant_source: Some(constant.clone()),
         })
     }

@@ -21,7 +21,7 @@
 
 use crate::{
     WorkClass, WorkError, WorkId,
-    cancellation::{Cancellation, CancellationReset},
+    cancellation::{Cancellation, CancellationReset, DeadlineBinding},
     joint_admission::{JointResource, JointResources},
 };
 use std::{
@@ -290,10 +290,10 @@ impl CancellationStorage {
         &mut self,
         class: WorkClass,
         id: WorkId,
-        deadline: Option<Instant>,
+        deadline: DeadlineBinding,
     ) -> Result<SlotId, WorkError> {
         if !self.fixed {
-            let cell = Cancellation::root(deadline);
+            let cell = Cancellation::root_with_deadline(deadline);
             if let Some(reason) = cell.check_reason() {
                 return Err(WorkError::Cancelled(reason));
             }
@@ -311,7 +311,7 @@ impl CancellationStorage {
         let cell = Arc::get_mut(slot.cell.as_mut().unwrap()).ok_or(WorkError::Conflict)?;
         cell.reuse_root(deadline);
         if let Some(reason) = cell.check_reason() {
-            cell.reuse_root(None);
+            cell.reuse_root(DeadlineBinding::Fixed(None));
             return Err(WorkError::Cancelled(reason));
         }
         self.free_head = slot.next_free.take();
@@ -331,6 +331,9 @@ impl CancellationStorage {
         id: WorkId,
         deadline: Option<Instant>,
     ) -> Result<SlotId, WorkError> {
+        if self.cell(parent).deadline_is_deferred() {
+            return Err(WorkError::NotReady);
+        }
         if !self.fixed {
             let cell = self.cell(parent).child_with_sequence(deadline, id);
             if let Some(reason) = cell.check_reason() {

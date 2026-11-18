@@ -814,29 +814,23 @@ pub fn lower_object_name(name: &novarocks_parser::ast::ObjectName) -> ObjectName
     }
 }
 
-/// The application boundary accepts one framed SQL statement.
-///
-/// Query Application owns SQL batch framing and parser admission. Protocol
-/// adapters negotiate multi-result capability and ask the application to
-/// execute each admitted fragment in order; this function rejects a fragment
-/// that contains more than one statement.
+/// Admits exactly one statement from the complete request text.
+/// A client that runs a script must submit each statement separately.
 pub fn parse_single_statement(source: &str) -> Result<Statement, SqlStatementParseError> {
     parse_optional_single_statement(source)?
         .ok_or(SqlStatementParseError::ExpectedExactlyOne { actual: 0 })
 }
 
-/// Parses one protocol-framed SQL fragment, preserving a comment-only fragment
-/// as the absence of a statement.
+/// Parses at most one statement, preserving trivia-only text as the absence
+/// of a statement. Request admission uses `parse_single_statement`.
 pub fn parse_optional_single_statement(
     source: &str,
 ) -> Result<Option<Statement>, SqlStatementParseError> {
-    let statements = novarocks_parser::parse(source).map_err(SqlStatementParseError::Parser)?;
-    match statements.as_slice() {
-        [] => Ok(None),
-        [statement] => Ok(Some(statement.clone())),
-        _ => Err(SqlStatementParseError::ExpectedExactlyOne {
-            actual: statements.len(),
-        }),
+    let mut statements = novarocks_parser::parse(source).map_err(SqlStatementParseError::Parser)?;
+    match statements.len() {
+        0 => Ok(None),
+        1 => Ok(statements.pop()),
+        actual => Err(SqlStatementParseError::ExpectedExactlyOne { actual }),
     }
 }
 
@@ -874,133 +868,11 @@ pub fn query_service_parse_error(error: SqlStatementParseError, source: &str) ->
     }
 }
 
-/// Cursor over semicolon-delimited SQL protocol fragments.
-///
-/// This is protocol-neutral framing: it preserves quote and comment state but
-/// does not decide whether a fragment is an executable product statement.
-#[derive(Clone)]
-pub struct SqlBatchCursor<'a> {
-    sql: &'a str,
-    offset: usize,
-}
-
-impl<'a> SqlBatchCursor<'a> {
-    pub fn new(sql: &'a str) -> Self {
-        Self { sql, offset: 0 }
-    }
-
-    pub fn has_remaining(&self) -> bool {
-        self.offset < self.sql.len()
-    }
-
-    /// Returns one raw semicolon-delimited fragment.
-    pub fn next_fragment(&mut self) -> Result<Option<&'a str>, QueryServiceError> {
-        if !self.has_remaining() {
-            return Ok(None);
-        }
-        #[derive(Clone, Copy)]
-        enum State {
-            Normal,
-            SingleQuote,
-            DoubleQuote,
-            Backtick,
-            LineComment,
-            BlockComment,
-        }
-
-        let start = self.offset;
-        let bytes = self.sql.as_bytes();
-        let mut index = start;
-        let mut state = State::Normal;
-        while index < bytes.len() {
-            match state {
-                State::Normal => match bytes[index] {
-                    b'\'' => state = State::SingleQuote,
-                    b'"' => state = State::DoubleQuote,
-                    b'`' => state = State::Backtick,
-                    b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                        state = State::LineComment;
-                        index += 1;
-                    }
-                    b'#' => state = State::LineComment,
-                    b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                        state = State::BlockComment;
-                        index += 1;
-                    }
-                    b';' => {
-                        self.offset = index + 1;
-                        return Ok(Some(&self.sql[start..index]));
-                    }
-                    _ => {}
-                },
-                State::SingleQuote if bytes[index] == b'\'' => state = State::Normal,
-                State::DoubleQuote if bytes[index] == b'"' => state = State::Normal,
-                State::Backtick if bytes[index] == b'`' => state = State::Normal,
-                State::LineComment if bytes[index] == b'\n' => state = State::Normal,
-                State::BlockComment
-                    if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') =>
-                {
-                    state = State::Normal;
-                    index += 1;
-                }
-                _ => {}
-            }
-            index += 1;
-        }
-        if matches!(
-            state,
-            State::SingleQuote | State::DoubleQuote | State::Backtick
-        ) {
-            self.offset = self.sql.len();
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::Parse,
-                "unterminated quoted string in SQL batch",
-            ));
-        }
-        self.offset = self.sql.len();
-        Ok(Some(&self.sql[start..]))
-    }
-}
-
-/// Splits a protocol SQL batch without interpreting product-specific commands.
-pub fn split_sql_statements(sql: &str) -> Result<Vec<String>, QueryServiceError> {
-    let mut cursor = SqlBatchCursor::new(sql);
-    let mut statements = Vec::new();
-    while let Some(fragment) = cursor.next_fragment()? {
-        let statement = fragment.trim();
-        if !statement.is_empty() {
-            statements.push(statement.to_string());
-        }
-    }
-    Ok(statements)
-}
-
-/// Removes leading whole-line comments while retaining the first SQL token.
-pub fn strip_leading_line_comments(sql: &str) -> &str {
-    let mut remaining = sql.trim();
-    loop {
-        let Some(newline) = remaining.find('\n') else {
-            return if remaining.starts_with("--") || remaining.starts_with('#') {
-                ""
-            } else {
-                remaining
-            };
-        };
-        let line = remaining[..newline].trim();
-        if line.is_empty() || line.starts_with("--") || line.starts_with('#') {
-            remaining = remaining[newline + 1..].trim_start();
-            continue;
-        }
-        return remaining;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ProductSqlCommand, SqlBatchCursor, SqlStatementParseError, lower_product_sql_command,
+        ProductSqlCommand, SqlStatementParseError, lower_product_sql_command,
         parse_optional_single_statement, parse_single_statement, query_service_parse_error,
-        split_sql_statements, strip_leading_line_comments,
     };
     use crate::session_error::QueryServiceErrorKind;
     use novarocks_sql::semantic::command::{
@@ -1159,6 +1031,40 @@ mod tests {
     }
 
     #[test]
+    fn request_admission_uses_the_original_lexer_for_semicolons_and_trivia() {
+        let statement = parse_single_statement(
+            "-- leading ; comment\n# old line comment;\nSELECT 'a;b' AS `label;part`; /* trailing ; comment */",
+        )
+        .expect("one original statement");
+        assert!(matches!(
+            statement,
+            novarocks_parser::ast::Statement::Query(_)
+        ));
+
+        for source in [
+            "",
+            "-- comment only",
+            "# comment only",
+            "/* comment only */",
+        ] {
+            assert!(
+                matches!(
+                    parse_single_statement(source),
+                    Err(SqlStatementParseError::ExpectedExactlyOne { actual: 0 })
+                ),
+                "{source:?}"
+            );
+        }
+        let source = "SET SESSION pipeline_dop = 3; SELECT 'unterminated";
+        let error = parse_single_statement(source).expect_err("malformed request suffix");
+        assert!(matches!(&error, SqlStatementParseError::Parser(_)));
+        assert_eq!(
+            query_service_parse_error(error, source).kind(),
+            QueryServiceErrorKind::Parse,
+        );
+    }
+
+    #[test]
     fn parser_admission_projection_keeps_the_parse_error_vocabulary() {
         let error = query_service_parse_error(
             SqlStatementParseError::ExpectedExactlyOne { actual: 2 },
@@ -1177,44 +1083,6 @@ mod tests {
             parse_optional_single_statement("/* comment */").expect("comment parses"),
             None
         );
-    }
-
-    #[test]
-    fn batch_framing_preserves_quoted_semicolons_and_statement_order() {
-        assert_eq!(
-            split_sql_statements("SET query_timeout = 1; SELECT ';'; SELECT 3")
-                .expect("split SQL batch"),
-            vec![
-                "SET query_timeout = 1".to_string(),
-                "SELECT ';'".to_string(),
-                "SELECT 3".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn batch_cursor_reports_an_unterminated_quote_before_a_later_fragment() {
-        let mut cursor = SqlBatchCursor::new("SELECT 1; SELECT 'unterminated");
-        assert_eq!(
-            cursor.next_fragment().expect("first fragment"),
-            Some("SELECT 1")
-        );
-        let error = cursor
-            .next_fragment()
-            .expect_err("must reject unterminated quote");
-        assert_eq!(
-            error.kind(),
-            crate::session_error::QueryServiceErrorKind::Parse
-        );
-    }
-
-    #[test]
-    fn leading_line_comments_preserve_the_following_statement() {
-        assert_eq!(
-            strip_leading_line_comments("-- generated header\n# another line\nCREATE CATALOG c"),
-            "CREATE CATALOG c"
-        );
-        assert_eq!(strip_leading_line_comments("-- comment only"), "");
     }
 
     #[test]

@@ -113,7 +113,10 @@ impl MvCommandExecutor {
                     current_catalog: context.session().current_catalog().map(str::to_owned),
                     current_database: context.session().current_database().to_owned(),
                     statement: lower_typed_refresh(&explain.refresh)?,
-                    level: lower_typed_explain_level(explain.level),
+                    level: lower_typed_explain_level(
+                        explain.level,
+                        context.session().property_inputs(),
+                    )?,
                     context: command_context.connector_context().clone(),
                 },
             );
@@ -607,12 +610,28 @@ fn lower_typed_refresh(
 
 fn lower_typed_explain_level(
     level: MaterializedViewExplainLevel,
-) -> novarocks_sql::compiler::ExplainLevel {
-    match level {
-        MaterializedViewExplainLevel::Default => novarocks_sql::compiler::ExplainLevel::Normal,
-        MaterializedViewExplainLevel::Verbose => novarocks_sql::compiler::ExplainLevel::Verbose,
-        MaterializedViewExplainLevel::Costs => novarocks_sql::compiler::ExplainLevel::Costs,
+    properties: &novarocks_query_application::sql::session::registry::SessionPropertyInputs,
+) -> Result<novarocks_sql::compiler::ExplainLevel, CommandError> {
+    use novarocks_query_application::sql::session::{ExplainDetail, session_property_error};
+    let detail = match level {
+        MaterializedViewExplainLevel::Default => properties.explain_detail().map_err(|error| {
+            let error = session_property_error(error);
+            match error.failure_cause() {
+                Some(cause) => CommandError::from_failure_cause(cause.clone()),
+                None => CommandError::new(CommandErrorKind::Failed, error.message()),
+            }
+        })?,
+        MaterializedViewExplainLevel::Verbose => ExplainDetail::Verbose,
+        MaterializedViewExplainLevel::Costs => ExplainDetail::Costs,
+    };
+    if detail == ExplainDetail::Contract {
+        return Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "EXPLAIN REFRESH MATERIALIZED VIEW has no physical plan contract",
+        ));
     }
+    // REFRESH always uses the original logical refresh planner.
+    Ok(crate::query::compiler::explain_detail_mode(detail).0)
 }
 
 fn lower_typed_refresh_policy(
@@ -1179,8 +1198,65 @@ mod tests {
             let MaterializedViewStatement::ExplainRefresh(explain) = statement else {
                 panic!("expected typed EXPLAIN REFRESH MATERIALIZED VIEW");
             };
-            assert_eq!(lower_typed_explain_level(explain.level), expected);
+            assert_eq!(
+                lower_typed_explain_level(explain.level, &Default::default()).unwrap(),
+                expected,
+            );
         }
+    }
+    #[test]
+    fn explain_refresh_uses_the_frozen_session_detail_for_implicit_legacy_level() {
+        use novarocks_query_application::sql::session::registry::{
+            SessionPropertyInputs, SessionPropertyRegistry, SessionPropertyValue,
+        };
+
+        let registry = SessionPropertyRegistry::new().unwrap();
+        let mut inputs = SessionPropertyInputs::default();
+        inputs.insert(
+            registry
+                .prepare_sql(
+                    "explain_detail",
+                    SessionPropertyValue::Varchar("LOGICAL_COSTS".into()),
+                )
+                .unwrap(),
+        );
+        for (sql, expected) in [
+            (
+                "EXPLAIN REFRESH MATERIALIZED VIEW db.mv",
+                novarocks_sql::compiler::ExplainLevel::Costs,
+            ),
+            (
+                "EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW db.mv",
+                novarocks_sql::compiler::ExplainLevel::Verbose,
+            ),
+        ] {
+            let MaterializedViewStatement::ExplainRefresh(explain) = typed_mv(sql) else {
+                panic!("expected the original MV EXPLAIN parser output");
+            };
+            assert_eq!(
+                lower_typed_explain_level(explain.level, &inputs).unwrap(),
+                expected
+            );
+        }
+        inputs.insert(
+            registry
+                .prepare_sql(
+                    "explain_detail",
+                    SessionPropertyValue::Varchar("CONTRACT".into()),
+                )
+                .unwrap(),
+        );
+        let MaterializedViewStatement::ExplainRefresh(explain) =
+            typed_mv("EXPLAIN REFRESH MATERIALIZED VIEW db.mv")
+        else {
+            panic!("expected the original MV EXPLAIN parser output");
+        };
+        assert_eq!(
+            lower_typed_explain_level(explain.level, &inputs)
+                .unwrap_err()
+                .kind(),
+            CommandErrorKind::Unsupported,
+        );
     }
 }
 

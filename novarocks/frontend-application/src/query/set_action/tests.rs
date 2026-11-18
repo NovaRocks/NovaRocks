@@ -139,13 +139,21 @@ impl Fixture {
         else {
             panic!("one original SET")
         };
+        self.mutation_input(source, SessionPropertyMutation::LegacySet(set), control)
+    }
+    fn mutation_input(
+        &self,
+        source: Arc<str>,
+        mutation: SessionPropertyMutation,
+        control: SqlCompileControl,
+    ) -> SessionPropertyCpuInput {
         let functions: Arc<dyn SqlFunctionCatalog> = Arc::new(
             novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
                 .unwrap(),
         );
         SessionPropertyCpuInput {
             source,
-            set,
+            mutation,
             staged: self.live.clone(),
             registry: Arc::clone(&self.registry),
             interpreter: Arc::new(
@@ -341,6 +349,150 @@ async fn set_whole_cpu_business_failure_is_atomic_and_resource_source_is_not_pro
             );
         }
         drop(error);
+        fixture.close(tail).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scoped_set_and_reset_use_the_same_catalog_key_and_original_cpu() {
+    use novarocks_mv_application::session_properties::{
+        INCREMENTAL_REFRESH_ENABLED, incremental_refresh_enabled_declaration,
+    };
+    use novarocks_query_application::sql::session::registry::{
+        CatalogPropertyDeclarationFactory, CatalogPropertyIdentity, CatalogPropertyMetadata,
+        PropertyDeclaration, SessionCatalogPropertyAdmission, SessionCatalogPropertyPort,
+        SessionPropertyError,
+    };
+    use novarocks_spi::connector::{
+        ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorProviderId, ProviderBindingEpoch,
+    };
+
+    struct IcebergDeclarations(ConnectorProviderId);
+    impl CatalogPropertyDeclarationFactory for IcebergDeclarations {
+        fn provider_id(&self) -> &ConnectorProviderId {
+            &self.0
+        }
+        fn declarations(
+            &self,
+            _: &CatalogPropertyIdentity,
+            _: &[(String, String)],
+        ) -> Result<Vec<PropertyDeclaration>, SessionPropertyError> {
+            Ok(vec![incremental_refresh_enabled_declaration()?])
+        }
+    }
+
+    struct ObservedCatalog(Arc<CatalogPropertyMetadata>);
+    impl SessionCatalogPropertyPort for ObservedCatalog {
+        fn session_property_catalog(
+            &self,
+            name: &str,
+        ) -> Result<SessionCatalogPropertyAdmission, QueryServiceError> {
+            assert_eq!(name, "lake");
+            Ok(SessionCatalogPropertyAdmission::Ready(Arc::clone(&self.0)))
+        }
+    }
+
+    let provider_id = ConnectorProviderId::parse("iceberg").unwrap();
+    let registry = Arc::new(
+        SessionPropertyRegistry::with_catalog_factories(vec![Arc::new(IcebergDeclarations(
+            provider_id.clone(),
+        ))])
+        .unwrap(),
+    );
+    let instance_id = ConnectorInstanceId::parse("lake").unwrap();
+    let binding_key = ConnectorProviderBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
+    };
+    let identity = CatalogPropertyIdentity {
+        attachment_id: uuid::Uuid::from_u128(1),
+        instance_id,
+        provider_id,
+        generation: 1,
+        binding_key: binding_key.clone(),
+    };
+    let metadata = Arc::new(registry.bind_catalog("lake", identity, &[]).unwrap());
+    let source = r#"WITH SESSION "LAKE"."INCREMENTAL_REFRESH_ENABLED" = false OR false SELECT 1"#;
+
+    for reset in [false, true] {
+        let mut capacity = ResultCapacityConfig::V1;
+        if reset {
+            // A value evaluation could not allocate even its first backing.
+            capacity.all_objects_bytes[1] = 1;
+        }
+        let mut fixture = Fixture::new(capacity);
+        fixture.registry = Arc::clone(&registry);
+        if reset {
+            let value = metadata
+                .prepare_header("lake", INCREMENTAL_REFRESH_ENABLED, "false")
+                .unwrap();
+            fixture
+                .live
+                .apply_effects(
+                    &novarocks_query_application::session_effects::SessionEffects::property(value),
+                )
+                .unwrap();
+        }
+        let mut assignments = novarocks_parser::trino_parser::parse_query(source)
+            .unwrap()
+            .session_properties
+            .into_inner();
+        let property = assignments.pop().expect("one parsed declaration name");
+        assert!(assignments.is_empty());
+        let mutation = if reset {
+            ScopedSessionMutation::Reset {
+                name: property.name,
+                span: property.span,
+            }
+        } else {
+            ScopedSessionMutation::Set {
+                name: property.name,
+                value: property.value,
+            }
+        };
+        let mut tail = fixture.tail();
+        tail.start(fixture.mutation_input(
+            Arc::from(source),
+            SessionPropertyMutation::Scoped {
+                mutation: Box::new(mutation),
+                catalogs: Arc::new(ObservedCatalog(Arc::clone(&metadata))),
+            },
+            SqlCompileControl::unbounded(),
+        ));
+        closed(&mut tail).await;
+        let PreparedSessionProperties { staged, effects } = tail.prepared.take().unwrap().unwrap();
+        let existing = SessionPropertyValue::Boolean(false);
+        let get = |state: &SessionSqlState| {
+            state
+                .property_inputs()
+                .read_catalog_override_for_binding(&binding_key, INCREMENTAL_REFRESH_ENABLED)
+                .cloned()
+        };
+        assert_eq!(get(&fixture.live), reset.then_some(existing.clone()));
+        assert_eq!(get(&staged), (!reset).then_some(existing));
+        assert_old_live(&fixture);
+        assert_eq!(staged.execution_settings().pipeline_dop(), Some(7));
+        let canonical = format!("lake.{INCREMENTAL_REFRESH_ENABLED}");
+        if reset {
+            assert_eq!(effects.reset_properties().collect::<Vec<_>>(), [canonical]);
+            assert_eq!(effects.set_properties().count(), 0);
+            assert_eq!(fixture.window.retained_payload_bytes(), 0);
+            assert_eq!(
+                staged
+                    .property_inputs()
+                    .raw_catalog_value("lake", INCREMENTAL_REFRESH_ENABLED),
+                None
+            );
+        } else {
+            assert_eq!(
+                effects.set_properties().collect::<Vec<_>>(),
+                [(canonical, "false".into())]
+            );
+            assert!(effects.reset_properties().next().is_none());
+            assert!(fixture.window.retained_payload_bytes() > 0);
+        }
+        drop(staged);
+        drop(effects);
         fixture.close(tail).await;
     }
 }

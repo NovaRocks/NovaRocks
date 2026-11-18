@@ -266,6 +266,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     control: &crate::compiler::SqlCompileControl,
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
+    root_session_admitted: bool,
 ) -> Result<
     (
         ResolvedQuery,
@@ -285,6 +286,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
         control,
         materialized,
         assignments,
+        root_session_admitted,
     )
 }
 
@@ -383,6 +385,7 @@ fn analyze_with_factory_and_function_catalog_inner(
         control,
         materialized,
         None,
+        false,
     )
 }
 
@@ -397,6 +400,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     control: &crate::compiler::SqlCompileControl,
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
+    root_session_admitted: bool,
 ) -> Result<
     (
         ResolvedQuery,
@@ -411,9 +415,15 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         0,
     )
     .map_err(AnalyzeError::control)?;
-    let effective_semantics = crate::sql_mode::query_sql_semantics(sql_semantics, query)?;
-    let sql_semantics = &effective_semantics;
-    let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics)?;
+    let legacy_semantics;
+    let sql_semantics = if root_session_admitted {
+        sql_semantics
+    } else {
+        legacy_semantics = crate::sql_mode::query_sql_semantics(sql_semantics, query)?;
+        &legacy_semantics
+    };
+    let query =
+        crate::sql_mode::normalize_concat_query_with_semantics(query.clone(), sql_semantics);
     let query = query_prepass::preanalyze_with_semantics(query, sql_semantics)?;
     let mut materialized_source = materialized
         .map(|source| source.loan(&query, control))

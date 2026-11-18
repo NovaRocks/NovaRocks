@@ -503,6 +503,13 @@ impl WorkScope {
             {
                 return Err(WorkError::Conflict);
             }
+            if state
+                .cancellations
+                .cell(node.cancellation)
+                .deadline_is_deferred()
+            {
+                return Err(WorkError::NotReady);
+            }
             if node.query_admitted {
                 return Err(WorkError::AlreadyAdmitted);
             }

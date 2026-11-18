@@ -52,6 +52,28 @@ impl SessionPropertyInputs {
             }
         }
     }
+    // Return whether an effective system projection must be rebuilt.
+    pub(in crate::sql::session) fn remove_sql_override(
+        &mut self,
+        property: &ResolvedSqlSessionProperty,
+    ) -> bool {
+        match property.scope() {
+            SessionPropertyScope::System => self.system.remove(property.name()).is_some(),
+            SessionPropertyScope::Catalog { catalog, .. } => {
+                // RESET clears the protocol key. A retired generation's stale
+                // spelling is cleared too, though it could never be read by
+                // the replacement binding.
+                if let Some(values) = self.catalogs.get_mut(catalog) {
+                    values.remove(property.name());
+                    if values.is_empty() {
+                        self.catalogs.remove(catalog);
+                    }
+                }
+                false
+            }
+        }
+    }
+
     pub fn raw_system_value(&self, name: &str) -> Option<&str> {
         self.system
             .get(name)
@@ -63,6 +85,18 @@ impl SessionPropertyInputs {
             .get(property)
             .map(ValidatedSessionProperty::raw_value)
     }
+    /// Resolve the display policy from the same frozen session input used by
+    /// the statement, including commands that do not consume QueryOptions.
+    pub fn explain_detail(&self) -> Result<super::super::ExplainDetail, SessionPropertyError> {
+        use super::super::ExplainDetail;
+        match self.read_override("explain_detail") {
+            None => Ok(ExplainDetail::default()),
+            Some(SessionPropertyValue::Varchar(value)) => ExplainDetail::from_sql_value(value)
+                .ok_or(SessionPropertyError::ProjectionInvariant),
+            Some(_) => Err(SessionPropertyError::ProjectionInvariant),
+        }
+    }
+
     pub fn read_override(&self, name: &str) -> Option<&SessionPropertyValue> {
         self.system.get(name).map(ValidatedSessionProperty::value)
     }

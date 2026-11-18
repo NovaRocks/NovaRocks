@@ -17,6 +17,7 @@
 
 //! Ordinary ClientRows preparation and start in the original registered action.
 pub(crate) mod io_source;
+use super::query_session_action::{QueryActionEnvironment, QueryActionInputs};
 use super::statement_computation::{StatementStageAdmission, statement_work_error};
 use super::*;
 use crate::query_execution::completion_facts::{
@@ -48,6 +49,7 @@ pub(super) struct ReadPreparationInput {
     pub(super) optimizer_limit: u64,
     pub(super) sql: Arc<str>,
     pub(super) parsed: ParsedStatement,
+    pub(super) root_session_admitted: bool,
     pub(super) state: SessionSqlState,
     pub(super) deadline: Option<Instant>,
     pub(super) cancellation: QueryCancellationView,
@@ -74,8 +76,13 @@ pub(super) async fn prepare_read(
         let presentation = input.state.presentation().copied();
         let (catalog, database, execution, mut optimizer, semantics, property_inputs) =
             input.state.into_query_attempt_inputs();
-        let semantics = novarocks_sql::sql_mode::statement_sql_semantics(&semantics, &parsed)
-            .map_err(|e| QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql))))?;
+        let semantics = if input.root_session_admitted {
+            semantics
+        } else {
+            novarocks_sql::sql_mode::statement_sql_semantics(&semantics, &parsed).map_err(|e| {
+                QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql)))
+            })?
+        };
         if optimizer.optimizer_query_mem_limit_bytes.is_none() {
             optimizer.optimizer_query_mem_limit_bytes = Some(input.optimizer_limit as f64);
         }
@@ -83,7 +90,7 @@ pub(super) async fn prepare_read(
             query_options_from_session_settings(&execution),
             &semantics,
             match &parsed {
-                ParsedStatement::Query(q) => Some(q),
+                ParsedStatement::Query(q) if !input.root_session_admitted => Some(q),
                 _ => None,
             },
         );
@@ -143,6 +150,7 @@ pub(super) async fn prepare_read(
         .prepare_read_async(
             &parsed,
             input.purpose,
+            input.root_session_admitted,
             &context,
             Some(options),
             &input.scope,
@@ -796,120 +804,32 @@ impl FrontendQuerySession {
         let window = statement
             .result_window_alias()
             .ok_or_else(|| internal_error("Read has no original result window"))?;
-        self.service
-            .query_compiler
-            .validate_original_read_runtime()
-            .map_err(|error| internal_error(error.to_string()))?;
-        let cancellation = QueryCancellationView::governed(
-            statement.cancellation().clone(),
-            statement.timeout_ms(),
-        );
-        let state_store = self
-            .service
-            .state_store
-            .as_ref()
-            .map(|binding| {
-                let owner = binding.for_root(statement.scope().clone())?;
-                let requests: Arc<dyn StateStoreExecutionRequests> =
-                    Arc::new(owner.execution_requests(binding.transaction_deadline, deadline)?);
-                Ok::<_, novarocks_state_store_api::StateStoreExecutionFailure>((owner, requests))
-            })
-            .transpose()
-            .map_err(|cause| {
-                QueryServiceError::from_failure_cause(cause)
-                    .reconcile_local_stop_observation(&cancellation)
-            })?;
-        let dependencies = self
-            .service
-            .state_store
-            .as_ref()
-            .map_or(&[][..], |binding| binding.blocking_dependency_facts());
-        let local = local_preparation_profile_with_dependencies(dependencies)
-            .map_err(|error| internal_error(error.to_string()))?;
-        let (state_store_owner, state_store_requests) = match state_store {
-            Some((owner, requests)) => (Some(owner), Some(requests)),
-            None => (None, None),
-        };
-        let io = ReadMetadataIoSource::new(statement.scope().clone(), local.clone());
-        // This same host-local preparation remains a Source through encoding.
-        // Exact selected Provider/service facts are added before their effects.
-        io.configure_read_source(&local).map_err(|error| {
-            QueryServiceError::from_failure_cause(
-                novarocks_failure_contract::SharedFailureCause::new(error),
-            )
-            .reconcile_local_stop_observation(&cancellation)
-        })?;
-        let stage = StatementStageAdmission::new(statement.scope().clone(), 0);
-        let stage = if window.class() == novarocks_workload_control::ResultWindowClass::Client {
-            stage
-                .with_client_window(&window)
-                .map_err(statement_work_error)?
-        } else {
-            stage
-        };
-        let provider = FrontendCompletionCustody::new();
-        let planning_cpu = self.service.query_compiler.new_planning_cpu_source();
-        #[cfg(novarocks_dev_controls)]
-        let observation = self
-            .service
-            .statement_observation
-            .as_ref()
-            .and_then(|o| o.bound_statement(statement.token()));
-        let input = ReadPreparationInput {
-            compiler: self.service.query_compiler.clone(),
-            topology: self.service.topology.clone(),
-            role: self.service.role,
-            optimizer_limit: self.service.optimizer_query_mem_limit_bytes,
+        let action = build_read_action(
+            &QueryActionEnvironment::new(&self.service),
+            QueryActionInputs {
+                scope: statement.scope().clone(),
+                deadline,
+                cancellation: QueryCancellationView::governed(
+                    statement.cancellation().clone(),
+                    statement.timeout_ms(),
+                ),
+                window,
+                planning_cpu: None,
+                root_session_admitted: false,
+                #[cfg(novarocks_dev_controls)]
+                observation: self
+                    .service
+                    .statement_observation
+                    .as_ref()
+                    .and_then(|owner| owner.bound_statement(statement.token())),
+                #[cfg(novarocks_dev_controls)]
+                statement_token: statement.token(),
+            },
             sql,
             parsed,
             state,
-            deadline,
-            cancellation: QueryCancellationView::governed(
-                statement.cancellation().clone(),
-                statement.timeout_ms(),
-            ),
-            scope: statement.scope().clone(),
-            window,
             purpose,
-            provider: Arc::clone(&provider),
-            planning_cpu: Arc::clone(&planning_cpu),
-            io: Arc::clone(&io),
-            state_store: state_store_requests,
-            #[cfg(novarocks_dev_controls)]
-            observation: observation.clone(),
-            #[cfg(novarocks_dev_controls)]
-            statement_token: statement.token(),
-        };
-        let provider_close = Some(Box::pin(close_provider(
-            Arc::clone(&provider),
-            Arc::clone(&planning_cpu),
-        )) as ProviderClose);
-        let action = ReadStatementAction {
-            planning_cpu,
-            preparation_health: None,
-            provider,
-            provider_close,
-            provider_close_result: None,
-            tail: Some(Box::new(ReadNativeTail {
-                services: ReadNativeServices::new(state_store_owner, io),
-                native: ReadNativeStageTail::new(stage),
-                health: None,
-            })),
-            preparation: Some(Box::pin(prepare_read(input))),
-            prepared: None,
-            read: None,
-            capacity: None,
-            original: OriginalComputationStart::default(),
-            execution: None,
-            error: None,
-            completed_preparation: false,
-            preparation_started: false,
-            bootstrap_ready: false,
-            result_transferred: false,
-            launcher: Arc::clone(&self.service.logical_execution_launcher),
-            #[cfg(novarocks_dev_controls)]
-            observation,
-        };
+        )?;
         #[cfg(novarocks_dev_controls)]
         let handoff_statement = statement.token();
         #[cfg(novarocks_dev_controls)]
@@ -920,19 +840,158 @@ impl FrontendQuerySession {
             .and_then(|o| o.bound_statement(handoff_statement))
             .and_then(|h| h.statement_target());
         let result = self
-            .execute_observed_statement_action(statement, Box::new(action))
+            .execute_observed_statement_action(statement, action)
             .await?;
         #[cfg(novarocks_dev_controls)]
-        if let StatementResult::StreamingQuery(stream) = &result
-            && let Some(control) = &self.service.result_handoff
-        {
-            control
-                .before_protocol(handoff_statement, handoff_target, stream.failure_view())
-                .await
-                .map_err(internal_error)?;
-        }
+        self.finish_observed_read_handoff(handoff_statement, handoff_target, &result)
+            .await?;
         Ok(result)
     }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(super) fn finish_observed_read_handoff<'session>(
+        &'session self,
+        statement: StatementToken,
+        target: Option<(String, StatementToken)>,
+        result: &StatementResult,
+    ) -> impl Future<Output = Result<(), QueryServiceError>> + use<'session> {
+        let failure = match result {
+            StatementResult::StreamingQuery(stream) => Some(stream.failure_view()),
+            _ => None,
+        };
+        async move {
+            if let (Some(failure), Some(control)) = (failure, &self.service.result_handoff) {
+                control
+                    .before_protocol(statement, target, failure)
+                    .await
+                    .map_err(internal_error)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+pub(super) fn build_read_action(
+    environment: &QueryActionEnvironment,
+    inputs: QueryActionInputs,
+    sql: Arc<str>,
+    parsed: ParsedStatement,
+    state: SessionSqlState,
+    purpose: FrontendQueryPurpose,
+) -> Result<Box<dyn GovernedStatementAction>, QueryServiceError> {
+    let QueryActionInputs {
+        scope,
+        deadline,
+        cancellation,
+        window,
+        planning_cpu,
+        root_session_admitted,
+        #[cfg(novarocks_dev_controls)]
+        observation,
+        #[cfg(novarocks_dev_controls)]
+        statement_token,
+    } = inputs;
+    environment
+        .compiler
+        .validate_original_read_runtime()
+        .map_err(|error| internal_error(error.to_string()))?;
+    let state_store = environment
+        .state_store
+        .as_ref()
+        .map(|binding| {
+            let owner = binding.for_root(scope.clone())?;
+            let requests: Arc<dyn StateStoreExecutionRequests> =
+                Arc::new(owner.execution_requests(binding.transaction_deadline, deadline)?);
+            Ok::<_, novarocks_state_store_api::StateStoreExecutionFailure>((owner, requests))
+        })
+        .transpose()
+        .map_err(|cause| {
+            QueryServiceError::from_failure_cause(cause)
+                .reconcile_local_stop_observation(&cancellation)
+        })?;
+    let dependencies = environment
+        .state_store
+        .as_ref()
+        .map_or(&[][..], |binding| binding.blocking_dependency_facts());
+    let local = local_preparation_profile_with_dependencies(dependencies)
+        .map_err(|error| internal_error(error.to_string()))?;
+    let (state_store_owner, state_store_requests) = match state_store {
+        Some((owner, requests)) => (Some(owner), Some(requests)),
+        None => (None, None),
+    };
+    let io = ReadMetadataIoSource::new(scope.clone(), local.clone());
+    // This same host-local preparation remains a Source through encoding.
+    // Exact selected Provider/service facts are added before their effects.
+    io.configure_read_source(&local).map_err(|error| {
+        QueryServiceError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(
+            error,
+        ))
+        .reconcile_local_stop_observation(&cancellation)
+    })?;
+    let stage = StatementStageAdmission::new(scope.clone(), 0);
+    let stage = if window.class() == novarocks_workload_control::ResultWindowClass::Client {
+        stage
+            .with_client_window(&window)
+            .map_err(statement_work_error)?
+    } else {
+        stage
+    };
+    let provider = FrontendCompletionCustody::new();
+    let planning_cpu =
+        planning_cpu.unwrap_or_else(|| environment.compiler.new_planning_cpu_source());
+    let input = ReadPreparationInput {
+        compiler: environment.compiler.clone(),
+        topology: environment.topology.clone(),
+        role: environment.role,
+        optimizer_limit: environment.optimizer_limit,
+        sql,
+        parsed,
+        root_session_admitted,
+        state,
+        deadline,
+        cancellation,
+        scope: scope.clone(),
+        window,
+        purpose,
+        provider: Arc::clone(&provider),
+        planning_cpu: Arc::clone(&planning_cpu),
+        io: Arc::clone(&io),
+        state_store: state_store_requests,
+        #[cfg(novarocks_dev_controls)]
+        observation: observation.clone(),
+        #[cfg(novarocks_dev_controls)]
+        statement_token,
+    };
+    let provider_close = Some(Box::pin(close_provider(
+        Arc::clone(&provider),
+        Arc::clone(&planning_cpu),
+    )) as ProviderClose);
+    Ok(Box::new(ReadStatementAction {
+        planning_cpu,
+        preparation_health: None,
+        provider,
+        provider_close,
+        provider_close_result: None,
+        tail: Some(Box::new(ReadNativeTail {
+            services: ReadNativeServices::new(state_store_owner, io),
+            native: ReadNativeStageTail::new(stage),
+            health: None,
+        })),
+        preparation: Some(Box::pin(prepare_read(input))),
+        prepared: None,
+        read: None,
+        capacity: None,
+        original: OriginalComputationStart::default(),
+        execution: None,
+        error: None,
+        completed_preparation: false,
+        preparation_started: false,
+        bootstrap_ready: false,
+        result_transferred: false,
+        launcher: Arc::clone(&environment.launcher),
+        #[cfg(novarocks_dev_controls)]
+        observation,
+    }))
 }
 #[cfg(test)]
 fn local_preparation_profile() -> Result<ConnectorMetadataMaintenanceIoProfile, WorkError> {

@@ -29,6 +29,7 @@ enum Constraint {
     NonNegative,
     Positive,
     PlatformCount,
+    ExplainDetail,
 }
 fn check(constraint: Constraint, value: &SessionPropertyValue) -> Result<(), String> {
     use SessionPropertyValue as V;
@@ -45,12 +46,16 @@ fn check(constraint: Constraint, value: &SessionPropertyValue) -> Result<(), Str
             _ => false,
         },
         Constraint::PlatformCount => matches!(value, V::Bigint(v) if usize::try_from(*v).is_ok()),
+        Constraint::ExplainDetail => {
+            matches!(value, V::Varchar(v) if super::super::ExplainDetail::from_sql_value(v).is_some())
+        }
     };
     if accepted {
         Ok(())
     } else {
         Err(match constraint {
             Constraint::Positive => "Value must be positive",
+            Constraint::ExplainDetail => "Expected NORMAL, VERBOSE, COSTS, CONTRACT, LOGICAL, LOGICAL_VERBOSE, or LOGICAL_COSTS",
             Constraint::PlatformCount => "Value must be a non-negative platform count",
             _ => "Value must be non-negative",
         }
@@ -127,6 +132,18 @@ pub(super) fn system_declarations() -> Result<Vec<PropertyDeclaration>, SessionP
                 .sql_semantics
                 .clone()
                 .with_decimal_overflow_to_double(*value);
+        }
+    );
+    declaration!(
+        "explain_detail",
+        Varchar,
+        Some(V::Varchar(execution.explain_detail().sql_value().into())),
+        "Plan detail used by EXPLAIN",
+        ExplainDetail,
+        |state, value| {
+            state.execution_settings.explain_detail =
+                super::super::ExplainDetail::from_sql_value(value)
+                    .ok_or(SessionPropertyError::ProjectionInvariant)?;
         }
     );
     declaration!(
