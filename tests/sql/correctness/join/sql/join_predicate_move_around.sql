@@ -375,7 +375,7 @@ on v4 = v7;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 inner join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -384,7 +384,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 left join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -393,7 +393,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -402,7 +402,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 left join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -411,7 +411,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 inner join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -420,7 +420,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -429,7 +429,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -442,7 +442,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 inner join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -451,7 +451,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 left join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -460,7 +460,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -469,7 +469,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 left join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -478,7 +478,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 inner join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -487,7 +487,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -496,7 +496,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 

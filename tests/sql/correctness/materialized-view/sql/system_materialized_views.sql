@@ -87,7 +87,7 @@ WHERE table_schema = 'metadata' AND table_name = 'materialized_views';
 USE system.metadata;
 
 -- query 12
-SELECT count(*) AS mv_count FROM materialized_views
+SELECT count() AS mv_count FROM materialized_views
 WHERE schema_name = '${case_db}' AND name = 'system_mv';
 
 -- query 13

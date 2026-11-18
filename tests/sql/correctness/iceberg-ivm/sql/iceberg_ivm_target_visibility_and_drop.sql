@@ -70,7 +70,7 @@ SELECT order_id, amount FROM target_mv ORDER BY order_id;
 SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'ice_ivm_target_${uuid0}';
 
 -- query 4
-SELECT COUNT(*) FROM target_mv;
+SELECT COUNT() FROM target_mv;
 
 -- query 5
 -- @skip_result_check=true
