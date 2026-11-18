@@ -296,7 +296,15 @@ impl novarocks_query_application::api::BoundedRootReadPort for GatedRootRead {
         &self,
         sealed: novarocks_execution_contract::root_lifetime::RootReadSealed,
     ) -> Result<(), novarocks_query_application::api::QueryExecutionError> {
-        self.gate.wait();
+        // Keep the original seal call pending, while letting independently
+        // scheduled consumer and pump work run on the fixture's Tokio runtime.
+        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(|| self.gate.wait());
+        } else {
+            self.gate.wait();
+        }
         self.original.seal(sealed)
     }
 }
