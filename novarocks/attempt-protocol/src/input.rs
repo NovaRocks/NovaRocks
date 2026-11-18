@@ -624,4 +624,15 @@ impl OperationReply {
             OperationReplyResult::Worker(_) => None,
         }
     }
+
+    pub(crate) fn local_workload_refusal(&self) -> Option<crate::failure::HostProjectedFailure> {
+        match &self.result {
+            OperationReplyResult::Local {
+                result: LocalDispatchResult::NonWorkerRejected,
+                failure: Some(failure),
+                ..
+            } if failure.kind == crate::failure::HostFailureKind::Workload => Some(*failure),
+            _ => None,
+        }
+    }
 }

@@ -665,6 +665,71 @@ mod tests {
     }
 
     #[test]
+    fn local_admission_replay_refusal_keeps_the_original_unknown_worker_result() {
+        use crate::{
+            execution::ack_phase::{admission_intent, dispatch_admission},
+            failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+        };
+        let mut execution = crate::test_support::execution_with_strict_input();
+        let participation = *execution.graph().participations().next().unwrap();
+        let original = admission_intent(&mut execution, participation);
+        let grant = dispatch_admission(&mut execution, original, 1, OperationOutcome::Accepted);
+        let mut unknown = grant.clone();
+        unknown.reply.result = OperationReplyResult::Local {
+            result: LocalDispatchResult::TransportUnknown,
+            failure: None,
+            protocol_failure: None,
+            detail: None,
+        };
+        execution.apply_dispatched_reply(&unknown).1.unwrap();
+
+        let replay = admission_intent(&mut execution, participation);
+        assert_eq!(original.envelope(), replay.envelope());
+        assert_eq!(original.participation(), replay.participation());
+        assert_eq!(original.valid_for(), replay.valid_for());
+        assert_eq!(
+            original.native_compatibility_id(),
+            replay.native_compatibility_id()
+        );
+        assert_eq!(
+            original.admission_epoch_capability(),
+            replay.admission_epoch_capability()
+        );
+        let mut refused = dispatch_admission(&mut execution, replay, 2, OperationOutcome::Accepted);
+        let failure = HostProjectedFailure {
+            original: HostFailureRef(id(2)),
+            kind: HostFailureKind::Workload,
+            class: novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure,
+            site: AttemptFailureSite::Attempt,
+        };
+        refused.reply.result = OperationReplyResult::Local {
+            result: LocalDispatchResult::NonWorkerRejected,
+            failure: Some(failure),
+            protocol_failure: None,
+            detail: None,
+        };
+        assert!(matches!(
+            execution.apply_dispatched_reply(&refused).1,
+            Err(TaskExecutionError::Workload(original)) if original == failure
+        ));
+        assert!(!execution.participation_never_established(participation));
+        assert!(Aborts::still_requires_abort(&execution, participation));
+        assert_eq!(
+            execution.prior_lifecycle_participation(&grant),
+            Some(participation)
+        );
+        execution.apply_dispatched_reply(&grant).1.unwrap();
+        assert!(execution.prior_lifecycle_participation(&grant).is_none());
+        assert!(
+            !execution
+                .owner(participation)
+                .unwrap()
+                .needs_admission_ticket()
+        );
+        assert!(Aborts::still_requires_abort(&execution, participation));
+    }
+
+    #[test]
     fn a_ticket_received_after_production_stops_still_requires_abort() {
         use crate::execution::ack_phase::{admission_intent, dispatch_admission};
         let mut execution = crate::test_support::execution_with_strict_input();

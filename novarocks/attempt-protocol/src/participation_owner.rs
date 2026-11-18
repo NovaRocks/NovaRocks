@@ -930,6 +930,21 @@ impl ParticipationOwner {
         released.awaiting_outcome = false;
         let released = *released;
 
+        if let Some(original) = ack.local_workload_refusal() {
+            // This preparation never reached the Worker. Keep an earlier
+            // uncertain generation eligible for its actual late receipt.
+            let was_qualified = self.admission_qualified;
+            self.admission_qualified = false;
+            self.admission_reissue_at = None;
+            if !self.admission_remote_unknown {
+                self.admission = None;
+            }
+            return if was_qualified {
+                Err(TaskExecutionError::Workload(original))
+            } else {
+                Ok(())
+            };
+        }
         if !self.admission_qualified {
             // The normal lifecycle no longer adopts a grant, but a late
             // grant or an unknown send can still own capacity on the Worker.
@@ -955,19 +970,6 @@ impl ParticipationOwner {
                 self.admission_qualified = false;
                 self.admission_cleanup_required = true;
                 return Err(self.owner_failure_error(ack));
-            }
-            if ack.dispatch_result() == OperationDispatchResult::NonWorkerRejected
-                && let Some(original) = ack
-                    .host_failure()
-                    .filter(|failure| failure.kind == crate::failure::HostFailureKind::Workload)
-            {
-                // This preparation never reached a Worker. Stop issuing
-                // admission while preserving any earlier remote uncertainty
-                // and the exact absence of an Establish on a fresh owner.
-                self.admission = None;
-                self.admission_reissue_at = None;
-                self.admission_qualified = false;
-                return Err(TaskExecutionError::Workload(*original));
             }
             self.fail_admission();
             let Some(_outcome) = ack.worker_outcome() else {
