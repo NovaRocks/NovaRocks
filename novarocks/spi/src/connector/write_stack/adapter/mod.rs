@@ -167,13 +167,19 @@ impl<P: ProviderWriteRuntime> WriteRuntimeAdapter<P> {
         fragment.payload().downcast_ref().ok_or_else(type_error)
     }
 
-    /// Read the original paid size before moving the provider fragment.
+    /// Inspect the original paid value after checking that it can move.
     pub fn measured_commit_fragment<'a>(
         &self,
         fragment: &'a ConnectorCommitFragment,
     ) -> Result<(&'a P::CommitFragment, usize), ConnectorError> {
         if fragment.binding() != &self.binding {
             return Err(binding_error());
+        }
+        if !fragment.payload().is_unique() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cannot move a commit fragment while its original payload has another owner",
+            ));
         }
         fragment.payload().measured().ok_or_else(|| {
             ConnectorError::new(
@@ -196,12 +202,6 @@ impl<P: ProviderWriteRuntime> WriteRuntimeAdapter<P> {
             )
         })?;
         self.measured_commit_fragment(fragment)?;
-        if !fragment.payload().is_unique() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "cannot move a commit fragment while its original payload has another owner",
-            ));
-        }
         Ok(slot
             .take()
             .expect("checked commit fragment slot")

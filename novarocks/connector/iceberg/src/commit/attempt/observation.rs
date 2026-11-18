@@ -26,8 +26,8 @@ use super::{Publisher, Report};
 use crate::catalog::error::CatalogOutcome;
 use crate::catalog::transaction::CommitProof;
 use crate::commit::model::{
-    AttemptToken, CleanupRemainingReason, CleanupScope, FrozenRequest, IcebergCleanupReport,
-    ObjectIdentity, OperationToken, PublicationOutcome, RemainingArtifact,
+    ArtifactReferences, AttemptToken, CleanupRemainingReason, CleanupScope, FrozenRequest,
+    IcebergCleanupReport, OperationToken, PublicationOutcome, RemainingArtifact,
 };
 use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation};
 use crate::commit::publication_descriptor::{
@@ -42,7 +42,9 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ExternalMutationEffect, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationDisposition,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -143,7 +145,7 @@ impl<R: Clone> PublicationReceipts<R> {
 struct Checked<R> {
     evidence: ExternalMutationEvidence,
     receipts: PublicationReceipts<R>,
-    retained: Vec<ObjectIdentity>,
+    retained: ArtifactReferences,
     descriptor: PublicationDescriptor,
     attempt: Option<AttemptToken>,
     preparation: Option<ConnectorRequestContext>,
@@ -482,14 +484,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 "Frozen artifacts name another operation",
             ));
         }
-        let retained = request
-            .artifacts()
-            .references()
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let retained = request.artifacts().references().clone();
         self.prepare(Checked {
             evidence,
             receipts,
@@ -530,7 +525,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         self.prepare(Checked {
             evidence,
             receipts,
-            retained: Vec::new(),
+            retained: ArtifactReferences::default(),
             descriptor: PublicationDescriptor::catalog(
                 self.operation.to_bytes(),
                 targets,
@@ -1465,7 +1460,12 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                     finalization,
                     merge_finalization(
                         ExternalMutationFinalization::Failed(failure.clone()),
-                        remaining_after_bridge(operation, &[], failure.message()).finalization(),
+                        remaining_after_bridge(
+                            operation,
+                            &ArtifactReferences::default(),
+                            failure.message(),
+                        )
+                        .finalization(),
                     ),
                 ),
             },
@@ -1473,7 +1473,12 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 failure: failure.clone(),
                 cleanup: merge_finalization(
                     ExternalMutationFinalization::Failed(failure.clone()),
-                    remaining_after_bridge(operation, &[], failure.message()).finalization(),
+                    remaining_after_bridge(
+                        operation,
+                        &ArtifactReferences::default(),
+                        failure.message(),
+                    )
+                    .finalization(),
                 ),
             },
         }
@@ -1572,10 +1577,9 @@ impl<R> Drop for DispatchClaim<R> {
 /// request's published roots are excluded from unfinished cleanup reporting.
 fn remaining_after_bridge(
     operation: &IcebergCommitOperation,
-    retained: &[ObjectIdentity],
+    retained: &ArtifactReferences,
     message: &str,
 ) -> IcebergCleanupReport {
-    let retained: BTreeSet<_> = retained.iter().collect();
     let remaining = operation
         .recovery_artifacts()
         .into_iter()
@@ -1603,7 +1607,8 @@ fn unconfirmed_cleanup_finalization(
     if matches!(cleanup, IcebergCleanupReport::NotAttempted) {
         merge_finalization(
             cleanup.finalization(),
-            remaining_after_bridge(operation, &[], message).finalization(),
+            remaining_after_bridge(operation, &ArtifactReferences::default(), message)
+                .finalization(),
         )
     } else {
         cleanup.finalization()
@@ -2644,7 +2649,7 @@ mod tests {
             .unwrap();
             engine.stage(&FastAppendPreparer).await.unwrap();
             let request = engine.freeze().unwrap();
-            let retained = request.artifacts().references().to_vec();
+            let retained = request.artifacts().references().clone();
             let journal = PublicationJournal::new(operation.token());
             let dispatches = Arc::new(AtomicUsize::new(0));
             let publisher = journal.observe(Arc::new(Fake {

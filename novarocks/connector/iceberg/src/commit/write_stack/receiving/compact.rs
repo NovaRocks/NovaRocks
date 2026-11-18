@@ -44,7 +44,7 @@ pub(crate) struct CompactEntry {
 }
 
 pub(crate) struct CompactAddition {
-    pub(crate) object_path: Box<str>,
+    pub(crate) object_path: std::sync::Arc<str>,
     pub(crate) writer: Option<ConnectorWriterPhysicalContext>,
     pub(crate) partition_spec_id: i32,
     pub(crate) content: ManifestContentType,
@@ -159,9 +159,13 @@ impl CompactEntry {
             IcebergCommitArtifact::FinalDelete(effect) => effect_backing_bytes(effect)?,
             _ => 0,
         };
-        let object_bytes = fragment.new_object_path().map_or(0, str::len);
+        let object_bytes = fragment
+            .new_object_path()
+            .map(object_path_bytes)
+            .transpose()?
+            .unwrap_or(0);
         let retained_bytes = sum_bytes([
-            std::mem::size_of::<Self>(),
+            retained_entry_node_bytes(),
             payload_bytes,
             object_bytes,
             effect_bytes,
@@ -200,7 +204,7 @@ impl CompactEntry {
     }
 
     #[cfg(test)]
-    fn from_arrival(
+    pub(in crate::commit) fn from_arrival(
         adapter: &IcebergWriteAdapter,
         original: &mut Option<ConnectorCommitFragment>,
         index_bytes: usize,
@@ -214,10 +218,14 @@ impl CompactEntry {
 }
 
 impl PreparedCompactEntry {
+    pub(crate) fn counts(&self) -> AddedCounters {
+        self.counts
+    }
+
     /// Move the exact prepared fragment and its original decode receipt. The
     /// caller retains any paid index backing only for this prepared record.
     pub(crate) fn finish(
-        self,
+        &mut self,
         adapter: &IcebergWriteAdapter,
         original: &mut Option<ConnectorCommitFragment>,
     ) -> Result<CompactEntry, ConnectorError> {
@@ -236,12 +244,6 @@ impl PreparedCompactEntry {
             .map(|path| addition_metadata(fragment, path))
             .transpose()?;
         let (fragment, original_receipt) = adapter.take_measured_commit_fragment(original)?;
-        let receipt = CompactEntryReceipt {
-            original_bytes: self.original_bytes,
-            additional_bytes: self.additional_bytes,
-            _original: original_receipt,
-            _additional: self.additional,
-        };
         let (artifact, delete_effect) = split_effect(fragment.into_artifact());
         let addition = match (addition, artifact) {
             (Some(addition), Some(artifact)) => Some(CompactAddition {
@@ -259,7 +261,13 @@ impl PreparedCompactEntry {
                 ));
             }
         };
-        drop(self.overlap);
+        let receipt = CompactEntryReceipt {
+            original_bytes: self.original_bytes,
+            additional_bytes: self.additional_bytes,
+            _original: original_receipt,
+            _additional: self.additional.take(),
+        };
+        drop(self.overlap.take());
         Ok(CompactEntry {
             addition,
             delete_effect,
@@ -267,6 +275,20 @@ impl PreparedCompactEntry {
             receipt,
         })
     }
+}
+
+fn retained_entry_node_bytes() -> usize {
+    // LinkedList owns two pointer-sized links with the paid entry at the node.
+    std::mem::size_of::<(CompactEntry, [usize; 2])>()
+}
+
+fn object_path_bytes(path: &str) -> Result<usize, ConnectorError> {
+    // The owned path is an Arc<str> so the ledger can adopt its allocation.
+    let header = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>();
+    std::alloc::Layout::array::<u8>(path.len())
+        .and_then(|bytes| header.extend(bytes))
+        .map(|(allocation, _)| allocation.pad_to_align().size())
+        .map_err(|_| corrupt("Iceberg compact object path layout overflow"))
 }
 
 fn reserve_if_occupied(
@@ -281,7 +303,7 @@ fn reserve_if_occupied(
 }
 
 struct AdditionMetadata {
-    object_path: Box<str>,
+    object_path: std::sync::Arc<str>,
     writer: Option<ConnectorWriterPhysicalContext>,
     partition_spec_id: i32,
     content: ManifestContentType,

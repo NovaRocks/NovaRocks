@@ -140,7 +140,8 @@ impl ArtifactWriter for TestWriter {
     fn record_manifest(
         &self,
         object: &crate::commit::model::ObjectIdentity,
-        live_paths: &[String],
+        added_paths: &[String],
+        existing_paths: &[String],
         replaces: &[String],
     ) -> crate::iceberg::Result<()> {
         let mut ledger = self.ledger.lock().unwrap();
@@ -152,12 +153,13 @@ impl ArtifactWriter for TestWriter {
         if !written {
             ledger.confirm_written_for_test(object)?;
         }
-        ledger.record_manifest(object, live_paths, replaces)
+        ledger.record_manifest(object, added_paths, existing_paths, replaces)
     }
 
     fn record_manifest_list(
         &self,
         object: &crate::commit::model::ObjectIdentity,
+        snapshot_id: i64,
         paths: &[String],
     ) -> crate::iceberg::Result<()> {
         let mut ledger = self.ledger.lock().unwrap();
@@ -169,7 +171,7 @@ impl ArtifactWriter for TestWriter {
         if !written {
             ledger.confirm_written_for_test(object)?;
         }
-        ledger.record_manifest_list(object, paths)
+        ledger.record_manifest_list(object, snapshot_id, paths)
     }
 }
 fn existing(metadata: TableMetadata) -> StagingBase {
@@ -1430,10 +1432,37 @@ async fn document_expiry_rejects_every_effect_outside_its_channel() {
 
 #[tokio::test]
 async fn manifest_list_rejects_replacement_together_with_its_source() {
+    check_manifest_list_rejects_replacement_together_with_its_source(false).await;
+}
+
+/// Exercises list construction after the compact stage has sealed its coverage.
+#[tokio::test]
+async fn compact_list_construction_rejects_replacement_together_with_its_source() {
+    check_manifest_list_rejects_replacement_together_with_its_source(true).await;
+}
+
+async fn check_manifest_list_rejects_replacement_together_with_its_source(compact: bool) {
     let metadata = fixture(FormatVersion::V2);
     let writer = TestWriter::new();
     let mut manifests = Vec::new();
-    for path in ["source.parquet", "replacement.parquet"] {
+    let source = "s3://bucket/source.parquet";
+    let replacement = if compact {
+        source
+    } else {
+        "s3://bucket/replacement.parquet"
+    };
+    if compact {
+        writer
+            .ledger
+            .lock()
+            .unwrap()
+            .register(ArtifactRecord::received(
+                ObjectIdentity::new(source).unwrap(),
+                ReceivedPublication::ViaManifest,
+            ))
+            .unwrap();
+    }
+    for path in [source, replacement] {
         manifests.push(
             write_manifest(
                 &writer,
@@ -1443,23 +1472,28 @@ async fn manifest_list_rejects_replacement_together_with_its_source() {
                 metadata.default_partition_spec().as_ref().clone(),
                 ManifestContentType::Data,
                 [ManifestEntryWrite::Added(
-                    AddedContent::new_logical_data(
-                        data(&format!("s3://bucket/{path}"), 1, None),
-                        0,
-                    )
-                    .unwrap(),
+                    AddedContent::new_logical_data(data(path, 1, None), 0).unwrap(),
                 )],
             )
             .await
             .unwrap(),
         );
     }
+    if compact {
+        writer
+            .ledger
+            .lock()
+            .unwrap()
+            .seal_compact_stage(11, &manifests[..1], 1)
+            .unwrap();
+    }
     // Both descriptors come from completed writes. Only the replacement relation
     // is injected here, to exercise the actual list writer's construction gate.
     writer
         .record_manifest(
             &ObjectIdentity::new(&manifests[1].manifest_path).unwrap(),
-            &["s3://bucket/replacement.parquet".to_owned()],
+            &[replacement.to_owned()],
+            &[],
             &[manifests[0].manifest_path.clone()],
         )
         .unwrap();

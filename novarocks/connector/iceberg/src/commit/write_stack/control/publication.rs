@@ -182,6 +182,7 @@ pub(in crate::commit) fn written_file_with_historical_partition(
 struct WriteRecipe {
     source: Arc<TableMetadata>,
     files: Vec<WrittenFile>,
+    compact_stage: Option<usize>,
     materialized: Option<Arc<materialized::MaterializedDeleteStep>>,
     fixed_mutation: bool,
     selected: Option<crate::commit::selected_rewrite::SelectedRewriteFiles>,
@@ -351,6 +352,7 @@ impl WriteRecipe {
         Ok(Self {
             source,
             files,
+            compact_stage: None,
             materialized,
             fixed_mutation,
             selected,
@@ -490,20 +492,34 @@ impl WriteRecipe {
             summary: self.summary.clone(),
             token: operation.token(),
         })
-        .map(|intent| {
-            if self
-                .summary
-                .keys()
-                .any(|key| key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX))
-            {
-                intent.with_snapshot_loading(crate::catalog::SnapshotLoading::Refs)
-            } else {
-                intent
-            }
+        .and_then(|intent| {
+            let intent = match self.compact_stage {
+                Some(stage) => intent.with_compact_stage(stage)?,
+                None => intent,
+            };
+            Ok(
+                if self
+                    .summary
+                    .keys()
+                    .any(|key| key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX))
+                {
+                    intent.with_snapshot_loading(crate::catalog::SnapshotLoading::Refs)
+                } else {
+                    intent
+                },
+            )
         })
     }
 
-    fn preparer(&self) -> Result<Box<dyn Preparer>, ConnectorError> {
+    fn preparer(
+        &self,
+        operation: &IcebergCommitOperation,
+    ) -> Result<Box<dyn Preparer>, ConnectorError> {
+        if self.compact_stage.is_some() {
+            return Ok(Box::new(
+                crate::commit::fast_append::CompactFastAppendPreparer(operation.clone()),
+            ));
+        }
         if let Some(step) = &self.materialized {
             return Ok(Box::new(Arc::clone(step)));
         }
@@ -720,6 +736,46 @@ impl IcebergWriteSessionControl {
         })
     }
 
+    pub(super) fn prepare_compact_operation(
+        &self,
+        handle: &IcebergWriteCommitSession,
+        received: &mut IcebergReceiving,
+        documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
+        context: &ConnectorRequestContext,
+    ) -> Result<ReceivedOperation, ConnectorError> {
+        let compact = received
+            .compact_files()
+            .ok_or_else(|| internal("Expected compact write receiving"))?;
+        let (operation, journal) = self.adopt_compact_operation(handle, compact, context)?;
+        let files = received
+            .take_compact_files()
+            .expect("adopted compact files");
+        let recipe = WriteRecipe::freeze(handle, &[], documents).and_then(|mut recipe| {
+            let stage = usize::from(recipe.keyed_documents.is_some());
+            recipe.compact_stage = Some(stage);
+            recipe.output_facts.data_files = files.counts.data.files;
+            recipe.output_facts.data_rows = files.counts.data.rows;
+            operation
+                .install_stage_new_files(
+                    stage,
+                    crate::commit::new_manifests::PendingNewFiles {
+                        received: files,
+                        source: Arc::clone(&recipe.source),
+                        codec: super::super::codec::CompactFragmentCodec::for_adapter(
+                            &self.adapter,
+                        ),
+                    },
+                )
+                .map_err(|error| internal(error.to_string()))?;
+            Ok(recipe)
+        });
+        Ok(ReceivedOperation {
+            operation,
+            journal,
+            recipe,
+        })
+    }
+
     pub(super) async fn dispatch_operation_async(
         &self,
         handle: &IcebergWriteCommitSession,
@@ -753,7 +809,7 @@ impl IcebergWriteSessionControl {
                 );
             }
         };
-        let data = match recipe.preparer() {
+        let data = match recipe.preparer(&operation) {
             Ok(data) => data,
             Err(error) => {
                 return WritePublicationDispatch::settled(
@@ -987,6 +1043,48 @@ impl IcebergWriteSessionControl {
         ),
         ConnectorError,
     > {
+        let objects = validated
+            .iter()
+            .filter_map(|entry| entry.fragment.new_object_path())
+            .map(ObjectIdentity::new)
+            .collect::<crate::iceberg::Result<BTreeSet<_>>>()
+            .map_err(|error| corrupt(error.to_string()))?;
+        self.adopt_operation_objects(handle, objects, context)
+    }
+
+    fn adopt_compact_operation(
+        &self,
+        handle: &IcebergWriteCommitSession,
+        compact: &super::super::receiving::ReceivedCompactFiles,
+        context: &ConnectorRequestContext,
+    ) -> Result<
+        (
+            IcebergCommitOperation,
+            PublicationJournal<ConnectorWriteReceipt>,
+        ),
+        ConnectorError,
+    > {
+        let objects = compact
+            .entries()
+            .filter_map(|entry| entry.addition.as_ref())
+            .map(|addition| ObjectIdentity::from_shared_path(Arc::clone(&addition.object_path)))
+            .collect::<crate::iceberg::Result<BTreeSet<_>>>()
+            .map_err(|error| corrupt(error.to_string()))?;
+        self.adopt_operation_objects(handle, objects, context)
+    }
+
+    fn adopt_operation_objects(
+        &self,
+        handle: &IcebergWriteCommitSession,
+        objects: BTreeSet<ObjectIdentity>,
+        context: &ConnectorRequestContext,
+    ) -> Result<
+        (
+            IcebergCommitOperation,
+            PublicationJournal<ConnectorWriteReceipt>,
+        ),
+        ConnectorError,
+    > {
         let operation = IcebergCommitOperation::new(
             OperationToken::from_write_session(handle.session_id()),
             handle.table().table_location(),
@@ -1000,15 +1098,10 @@ impl IcebergWriteSessionControl {
             operation.token(),
             self.runtime.resources().catalog_runtime(),
         );
-        // Physical ownership deduplicates objects, while intent keeps full DV identities.
-        let objects: BTreeSet<_> = validated
-            .iter()
-            .filter_map(|entry| entry.fragment.new_object_path().map(str::to_owned))
-            .collect();
-        for path in objects {
+        for object in objects {
             operation
-                .adopt_session_data(ObjectIdentity::new(path).map_err(|e| corrupt(e.to_string()))?)
-                .map_err(|e| internal(e.to_string()))?;
+                .adopt_session_data(object)
+                .map_err(|error| internal(error.to_string()))?;
         }
         // Publish the original owner only after adoption has completed, with
         // no asynchronous boundary or created side effect in between.
@@ -1037,9 +1130,12 @@ impl IcebergWriteSessionControl {
         }
         // This is the original confirmed receiver won by the release or
         // refused finish. No ref/live-set scan or old reference grants deletion.
-        let validated = validate_received_set(handle, &self.adapter, &received)?;
-        let (operation, _) = self.adopt_received_operation(handle, &validated, context)?;
-        drop(validated);
+        let (operation, _) = if let Some(compact) = received.compact_files() {
+            self.adopt_compact_operation(handle, compact, context)?
+        } else {
+            let validated = validate_received_set(handle, &self.adapter, &received)?;
+            self.adopt_received_operation(handle, &validated, context)?
+        };
         drop(received);
         let cleanup = {
             let mut original = std::pin::pin!(operation.cleanup(CleanupScope::EntireOperation));

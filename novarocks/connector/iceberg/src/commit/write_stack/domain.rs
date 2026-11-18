@@ -2749,7 +2749,7 @@ impl IcebergWriteCommitSession {
             empty_cleanup_disposed: std::sync::atomic::AtomicBool::new(false),
             progress: Mutex::new(IcebergWriteSessionProgress {
                 state: IcebergWriteSessionState::Active,
-                receiving: IcebergReceiving::default(),
+                receiving: IcebergReceiving::for_flavor(flavor),
             }),
         })
     }

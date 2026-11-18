@@ -70,6 +70,42 @@ pub(crate) fn write_query_identity() -> ConnectorWriteQueryIdentity {
     ConnectorWriteQueryIdentity::try_new(*uuid::Uuid::now_v7().as_bytes(), 1, [2; 16]).unwrap()
 }
 
+// Exercise the actual wire decoder before any fixture enters compact receiving.
+pub(crate) fn paid_fragments(
+    adapter: &super::runtime::IcebergWriteAdapter,
+    fragments: Vec<ConnectorCommitFragment>,
+) -> (
+    Vec<ConnectorCommitFragment>,
+    novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+) {
+    use novarocks_spi::connector::{
+        ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard,
+        ConnectorWriteFragmentWireDecoder, ConnectorWriteFragmentWireEncoder,
+    };
+    struct FixtureByteAuthor;
+    impl ConnectorPayloadByteBudget for FixtureByteAuthor {
+        fn reserve_bytes(
+            &self,
+            bytes: usize,
+        ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+            Ok(ConnectorPayloadRetentionGuard::new(bytes))
+        }
+    }
+    let author = ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(FixtureByteAuthor));
+    let encoder = super::codec::IcebergWriteFragmentEncoder::new(adapter.clone());
+    let decoder = super::codec::IcebergWriteFragmentDecoder::new(adapter.clone());
+    let paid = fragments
+        .into_iter()
+        .map(|fragment| {
+            let encoded = encoder.encode_commit_fragment_payload(&fragment).unwrap();
+            decoder
+                .decode_commit_fragment_payload(&encoded, &author)
+                .unwrap()
+        })
+        .collect();
+    (paid, author)
+}
+
 pub(crate) fn receive_write_query(
     control: &dyn ConnectorWriteControl,
     commit: &ConnectorWriteCommitSession,

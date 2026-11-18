@@ -221,7 +221,7 @@ fn recipe_refusal_cleans_original_adopted_data_and_repeat_release_observes_it() 
         IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteTableFacts,
     };
     use crate::commit::write_stack::planning::{IcebergWriteSessionPlanInput, plan_write_session};
-    use crate::commit::write_stack::test_support::{data_branch_plan, receive_write_query};
+    use crate::commit::write_stack::test_support::data_branch_plan;
     use novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction;
     use novarocks_spi::connector::{
         ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose, ExternalMutationFinalization,
@@ -263,17 +263,31 @@ fn recipe_refusal_cleans_original_adopted_data_and_repeat_release_observes_it() 
     .unwrap();
     let expected = handle.expected_targets();
     let commit = lake.adapter.wrap_commit_session(handle);
-    receive_write_query(
-        &lake.control,
-        &commit,
-        &expected,
-        vec![(
-            expected[0],
+    let (fragments, author) = super::super::test_support::paid_fragments(
+        &lake.adapter,
+        vec![
             lake.adapter
                 .wrap_commit_fragment(data_fragment(&format!("file://{}", path.display()))),
-        )],
-    )
-    .unwrap();
+        ],
+    );
+    let query = write_query_identity();
+    lake.control
+        .begin_write_query(&commit, &query, &expected, None)
+        .unwrap();
+    lake.control
+        .arrive_write_fragments(
+            &commit,
+            &query,
+            fragments
+                .into_iter()
+                .map(|fragment| (expected[0], fragment))
+                .collect(),
+            &author,
+        )
+        .unwrap();
+    lake.control
+        .confirm_write_received(&commit, &query)
+        .unwrap();
     let ExternalMutationOutcome::KnownUncommitted { failure, cleanup } = lake
         .control
         .finish_write(ConnectorWriteFinishRequest {

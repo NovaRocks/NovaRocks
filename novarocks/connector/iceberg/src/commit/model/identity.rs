@@ -125,16 +125,23 @@ pub struct ObjectIdentity {
 
 impl ObjectIdentity {
     pub fn new(path: impl Into<String>) -> Result<Self> {
-        let path = path.into();
+        Self::from_shared_path(Arc::from(path.into()))
+    }
+
+    pub(crate) fn from_shared_path(path: Arc<str>) -> Result<Self> {
         if path.is_empty() {
             return Err(invalid("Iceberg object path must not be empty"));
         }
-        Ok(Self {
-            path: Arc::from(path),
-        })
+        Ok(Self { path })
     }
     pub fn path(&self) -> &str {
         &self.path
+    }
+}
+
+impl std::borrow::Borrow<str> for ObjectIdentity {
+    fn borrow(&self) -> &str {
+        self.path()
     }
 }
 

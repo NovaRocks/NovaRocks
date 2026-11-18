@@ -26,9 +26,10 @@
 CREATE DATABASE lake_publication_${suite_uuid0}.ns_${uuid0};
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows (
   id BIGINT, writer VARCHAR(16)
-) TBLPROPERTIES (
+) PARTITION BY (id) TBLPROPERTIES (
   "format-version" = "3",
   "write.row-lineage" = "true",
+  "commit.manifest.target-size-bytes" = "1024",
   "commit.retry.num-retries" = "3",
   "commit.retry.min-wait-ms" = "0",
   "commit.retry.max-wait-ms" = "0",
@@ -56,7 +57,11 @@ PYTHON
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
 -- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/iru5-append-companion-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.append_rows VALUES (2, 'spark');" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 -- @skip_result_check=true
-INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows VALUES (3, 'nova');
+INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows VALUES
+  (3, 'nova'), (4, 'nova'), (5, 'nova'), (6, 'nova'), (7, 'nova'), (8, 'nova'), (9, 'nova'), (10, 'nova'),
+  (11, 'nova'), (12, 'nova'), (13, 'nova'), (14, 'nova'), (15, 'nova'), (16, 'nova'), (17, 'nova'), (18, 'nova'),
+  (19, 'nova'), (20, 'nova'), (21, 'nova'), (22, 'nova'), (23, 'nova'), (24, 'nova'), (25, 'nova'), (26, 'nova'),
+  (27, 'nova'), (28, 'nova'), (29, 'nova'), (30, 'nova'), (31, 'nova'), (32, 'nova'), (33, 'nova'), (34, 'nova');
 
 -- query 4
 SELECT id, writer FROM lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows ORDER BY id;
@@ -99,15 +104,19 @@ val parent = table.snapshot(current.parentId())
 require(parent.snapshotId() == snapshots(1).snapshotId(), "successful Nova snapshot has the wrong parent")
 require(current.sequenceNumber() == parent.sequenceNumber() + 1, "fresh append sequence is not actual Java successor")
 val rows = spark.sql(s"SELECT id, writer, _row_id, _last_updated_sequence_number FROM $name ORDER BY id").collect().toSeq
-require(rows.map(r => (r.getLong(0), r.getString(1))) == Seq((1L, "seed"), (2L, "spark"), (3L, "nova")), "lost or repeated append rows")
+val expected = Seq((1L, "seed"), (2L, "spark")) ++ (3L to 34L).map(id => (id, "nova"))
+require(rows.map(r => (r.getLong(0), r.getString(1))) == expected, "lost or repeated append rows")
+require(rows.size == 34 && rows.map(_.getLong(0)).sum == 595L, "the published rows do not satisfy the independent aggregate")
 require(rows.forall(r => !r.isNullAt(2) && !r.isNullAt(3)), "unassigned row lineage")
 require(rows.map(_.getLong(2)).distinct.size == rows.size, "conflicting attempts duplicated row IDs")
 require(rows(1).getLong(3) == parent.sequenceNumber(), "Spark row does not belong to actual parent")
-require(rows(2).getLong(3) == current.sequenceNumber(), "Nova row inherited a predicted or stale sequence")
+require(rows.drop(2).forall(_.getLong(3) == current.sequenceNumber()), "Nova rows inherited a predicted or stale sequence")
 val entries = spark.sql(s"SELECT sequence_number, file_sequence_number FROM $name.entries WHERE status = 1 AND snapshot_id = ${current.snapshotId()}").collect().toSeq
 entries.foreach(r => println(s"IRU5_APPEND_ENTRY data_sequence=${r.getLong(0)} file_sequence=${r.getLong(1)}"))
-require(entries.nonEmpty, "successful append has no actual added entries")
+require(entries.size == 32, "the successful Nova attempt must publish one file for each of its partitions")
 require(entries.forall(r => r.getLong(0) == current.sequenceNumber() && r.getLong(1) == current.sequenceNumber()), "added manifest entry sequence inheritance differs from actual publication")
+val newManifests = spark.sql(s"SELECT count(*) FROM $name.manifests WHERE added_snapshot_id = ${current.snapshotId()} AND content = 0").head().getLong(0)
+require(newManifests >= 2, "the successful attempt did not publish rolled data manifests")
 println("IRU5_APPEND_REPREPARE_OK")
 SPARK_SCALA
 spark_status=0

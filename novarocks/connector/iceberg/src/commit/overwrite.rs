@@ -311,6 +311,19 @@ pub(crate) fn set_physical_rows_after_removal(
     Ok(())
 }
 
+pub(crate) fn compact_append_summary(
+    counts: super::write_stack::receiving::compact::AddedCounters,
+) -> HashMap<String, String> {
+    if counts.data.files == 0 {
+        return HashMap::new();
+    }
+    HashMap::from([
+        ("added-data-files".to_owned(), counts.data.files.to_string()),
+        ("added-records".to_owned(), counts.data.rows.to_string()),
+        ("added-files-size".to_owned(), counts.data.bytes.to_string()),
+    ])
+}
+
 /// Snapshot sizes count logical delete blobs rather than shared Puffin containers.
 pub(crate) fn snapshot_file_summary(
     added: &[super::model::AddedContent],

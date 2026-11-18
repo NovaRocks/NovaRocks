@@ -39,11 +39,10 @@ use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorCommittedVersion, ConnectorDistributedRewriteShape,
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
-    ConnectorMutationRouteInput, ConnectorPayloadRetentionGuard, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorRowMutationEffect, ConnectorWriteAbortOutcome,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteInputShape, ConnectorWriteRouteId,
-    ExternalMutationEffect, ExternalMutationFinalization, ExternalMutationOutcome,
-    ProviderBindingEpoch,
+    ConnectorMutationRouteInput, ConnectorProviderId, ConnectorRequestContext,
+    ConnectorRowMutationEffect, ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteInputShape, ConnectorWriteRouteId, ExternalMutationEffect,
+    ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -94,7 +93,7 @@ fn descriptor(catalog: &str) -> ConnectorInstanceDescriptor {
     }
 }
 
-pub(super) fn adapter(catalog: &str, version: u8) -> IcebergWriteAdapter {
+pub(in crate::commit) fn adapter(catalog: &str, version: u8) -> IcebergWriteAdapter {
     let descriptor = descriptor(catalog);
     let catalog_handle = CatalogHandle::new(
         descriptor.instance_id.clone(),
@@ -307,7 +306,7 @@ pub(super) fn fixed_dv_fragment(
     final_vector(vector)
 }
 
-pub(super) fn data_fragment(path: &str) -> IcebergCommitFragment {
+pub(in crate::commit) fn data_fragment(path: &str) -> IcebergCommitFragment {
     IcebergCommitFragment::data_file(
         IcebergDataFileArtifact::try_new(
             path.to_string(),
@@ -3481,6 +3480,8 @@ impl FrozenRewriteLake {
             }
             writer.finish().await.unwrap()
         });
+        let adapter = self.control.adapter_for_test();
+        let (fragments, author) = super::test_support::paid_fragments(adapter, fragments);
         self.control
             .arrive_write_fragments(
                 session.commit_session(),
@@ -3489,7 +3490,7 @@ impl FrozenRewriteLake {
                     .into_iter()
                     .map(|fragment| (target.ordinal(), fragment))
                     .collect(),
-                &ConnectorPayloadRetentionGuard::new(()),
+                &author,
             )
             .unwrap();
         self.control
@@ -4467,7 +4468,7 @@ fn prepared_logical_rows_require_exact_adapter_and_live_context_and_exclude_ordi
             .kind(),
         ConnectorErrorKind::InvalidRequest
     );
-    receive_write_query(
+    let wrong_generation = receive_write_query(
         &control,
         &commit,
         &[ordinal(0)],
@@ -4476,14 +4477,8 @@ fn prepared_logical_rows_require_exact_adapter_and_live_context_and_exclude_ordi
             foreign_adapter.wrap_commit_fragment(data_fragment("s3://b/foreign.parquet")),
         )],
     )
-    .unwrap();
-    assert_eq!(
-        control
-            .received_logical_row_change(&commit, &request_context())
-            .unwrap_err()
-            .kind(),
-        ConnectorErrorKind::InvalidRequest
-    );
+    .unwrap_err();
+    assert_eq!(wrong_generation.kind(), ConnectorErrorKind::InvalidRequest);
     let stop = novarocks_spi::connector::ConnectorStopOwner::new();
     let cancelled = ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(30),
@@ -4867,6 +4862,7 @@ fn seal_test_data_output(
         .iter()
         .map(|fragment| adapter.commit_fragment(fragment).unwrap().path().to_owned())
         .collect();
+    let (fragments, author) = super::test_support::paid_fragments(adapter, fragments);
     control
         .arrive_write_fragments(
             session.commit_session(),
@@ -4875,7 +4871,7 @@ fn seal_test_data_output(
                 .into_iter()
                 .map(|fragment| (target.ordinal(), fragment))
                 .collect(),
-            &ConnectorPayloadRetentionGuard::new(()),
+            &author,
         )
         .unwrap();
     (

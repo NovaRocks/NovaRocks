@@ -49,18 +49,10 @@ pub(crate) struct StatementIndexes(IndexKeys<'static>);
 
 /// Only the new keys admitted for one record. The caller funds these keys and
 /// materializes their backing before releasing the original fragments.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Compact receiving installs record deltas in P08")
-)]
 pub(crate) struct RecordIndexDelta<'a>(IndexKeys<'a>);
 
 impl RecordIndexDelta<'_> {
     /// Call after the original retention author has funded the quoted backing.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Compact receiving owns record deltas in P08")
-    )]
     pub(crate) fn into_owned(self) -> RecordIndexDelta<'static> {
         let IndexKeys {
             entries,
@@ -87,10 +79,6 @@ impl RecordIndexDelta<'_> {
 }
 
 impl StatementIndexes {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Compact receiving installs record deltas in P08")
-    )]
     pub(crate) fn apply(&mut self, delta: RecordIndexDelta<'static>) {
         let IndexKeys {
             entries,
@@ -126,13 +114,6 @@ impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
         Self::new(handle, None)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Compact records use this overlay when their flavors switch"
-        )
-    )]
     pub(crate) fn for_record(
         handle: &'session IcebergWriteCommitSession,
         previous: &'session StatementIndexes,
@@ -171,13 +152,6 @@ impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
     /// Stage one compact fragment using borrowed keys and quote the bytes
     /// needed to own them. `previous_v2_partition` comes from the existing
     /// effect for the same exact referenced path. Nothing is installed here.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Compact records use this overlay when their flavors switch"
-        )
-    )]
     pub(crate) fn admit_record_fragment(
         &mut self,
         target: WriteTargetOrdinal,
@@ -221,13 +195,6 @@ impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
         Ok(())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Compact records use this overlay when their flavors switch"
-        )
-    )]
     pub(crate) fn finish_record(self) -> RecordIndexDelta<'fragment> {
         RecordIndexDelta(self.keys)
     }

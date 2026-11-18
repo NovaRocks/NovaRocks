@@ -1,0 +1,14 @@
+-- query 2
+-- types	boolean
+rows_match
+true
+
+-- query 3
+-- types	boolean
+rows_match
+true
+
+-- query 4
+-- types	boolean
+rows_match
+true

@@ -518,7 +518,8 @@ mod keyed_record_tests {
         fn record_manifest(
             &self,
             object: &crate::commit::model::ObjectIdentity,
-            live_paths: &[String],
+            added_paths: &[String],
+            existing_paths: &[String],
             replaces: &[String],
         ) -> crate::iceberg::Result<()> {
             let mut ledger = self.ledger.lock().unwrap();
@@ -530,12 +531,13 @@ mod keyed_record_tests {
             if !written {
                 ledger.confirm_written_for_test(object)?;
             }
-            ledger.record_manifest(object, live_paths, replaces)
+            ledger.record_manifest(object, added_paths, existing_paths, replaces)
         }
 
         fn record_manifest_list(
             &self,
             object: &crate::commit::model::ObjectIdentity,
+            snapshot_id: i64,
             paths: &[String],
         ) -> crate::iceberg::Result<()> {
             let mut ledger = self.ledger.lock().unwrap();
@@ -547,7 +549,7 @@ mod keyed_record_tests {
             if !written {
                 ledger.confirm_written_for_test(object)?;
             }
-            ledger.record_manifest_list(object, paths)
+            ledger.record_manifest_list(object, snapshot_id, paths)
         }
     }
 

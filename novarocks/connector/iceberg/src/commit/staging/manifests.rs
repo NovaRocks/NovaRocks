@@ -53,10 +53,31 @@ pub async fn write_manifest(
     content: ManifestContentType,
     entries: impl IntoIterator<Item = ManifestEntryWrite>,
 ) -> Result<ManifestFile> {
+    write_manifest_with_sources(
+        artifacts,
+        (version, snapshot_id, schema, spec, content),
+        entries.into_iter().map(Ok),
+        &[],
+    )
+    .await
+}
+
+pub(crate) async fn write_manifest_with_sources(
+    artifacts: &dyn ArtifactWriter,
+    (version, snapshot_id, schema, spec, content): (
+        FormatVersion,
+        i64,
+        SchemaRef,
+        PartitionSpec,
+        ManifestContentType,
+    ),
+    entries: impl IntoIterator<Item = Result<ManifestEntryWrite>>,
+    replaces: &[String],
+) -> Result<ManifestFile> {
     let encoding = ManifestWriteEncoding::fixed(version, schema, spec)?;
     let entries = entries
         .into_iter()
-        .map(|entry| encoding.encode(entry, None));
+        .map(|entry| encoding.encode(entry?, None));
     write_encoded_manifest(
         artifacts,
         version,
@@ -64,7 +85,7 @@ pub async fn write_manifest(
         &encoding,
         content,
         entries,
-        &[],
+        replaces,
     )
     .await
 }
@@ -95,7 +116,7 @@ pub(crate) async fn write_sourced_manifest(
     .await
 }
 
-async fn write_encoded_manifest(
+pub(super) async fn write_encoded_manifest(
     artifacts: &dyn ArtifactWriter,
     version: FormatVersion,
     snapshot_id: i64,
@@ -123,7 +144,8 @@ async fn write_encoded_manifest(
         (FormatVersion::V3, ManifestContentType::Data) => builder.build_v3_data(),
         (FormatVersion::V3, ManifestContentType::Deletes) => builder.build_v3_deletes(),
     };
-    let mut live_paths = Vec::new();
+    let mut added_paths = Vec::new();
+    let mut existing_paths = Vec::new();
     for entry in entries {
         artifacts.check_active()?;
         match entry? {
@@ -131,11 +153,11 @@ async fn write_encoded_manifest(
                 file,
                 data_sequence,
             } => {
-                live_paths.push(file.file_path().to_owned());
+                added_paths.push(file.file_path().to_owned());
                 writer.add_file(file, data_sequence.manifest_writer_value())?;
             }
             EncodedManifestEntry::Existing { file, facts } => {
-                live_paths.push(file.file_path().to_owned());
+                existing_paths.push(file.file_path().to_owned());
                 writer.add_existing_file(
                     file,
                     facts
@@ -159,7 +181,7 @@ async fn write_encoded_manifest(
         }
     }
     let descriptor = writer.write_manifest_file().await?;
-    artifacts.record_manifest(&object, &live_paths, replaces)?;
+    artifacts.record_manifest(&object, &added_paths, &existing_paths, replaces)?;
     Ok(descriptor)
 }
 
@@ -211,7 +233,7 @@ pub async fn write_manifest_list(
         })
         .transpose()?;
     writer.close().await?;
-    artifacts.record_manifest_list(&object, &paths)?;
+    artifacts.record_manifest_list(&object, snapshot_id, &paths)?;
     artifacts.check_active()?;
     Ok(ManifestListOutput { object, row_range })
 }

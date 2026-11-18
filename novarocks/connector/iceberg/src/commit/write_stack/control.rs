@@ -256,6 +256,11 @@ pub(crate) fn freeze_writer_output(
 }
 
 impl IcebergWriteSessionControl {
+    #[cfg(test)]
+    pub(super) fn adapter_for_test(&self) -> &IcebergWriteAdapter {
+        &self.adapter
+    }
+
     #[cfg(novarocks_dev_controls)]
     pub fn with_test_observation(
         mut self,
@@ -816,8 +821,12 @@ impl IcebergWriteSessionControl {
             "publication_enter",
             phase_started,
         );
-        let validated =
-            self.validate_received_commit(handle, received, request.row_count, context)?;
+        validate_context(context)?;
+        let validated = if received.compact_files().is_none() {
+            Some(self.validate_received_commit(handle, received, request.row_count, context)?)
+        } else {
+            None
+        };
 
         #[cfg(novarocks_dev_controls)]
         emit_iceberg_write_phase_marker(
@@ -846,9 +855,11 @@ impl IcebergWriteSessionControl {
             "publication_dispatch_enter",
             phase_started,
         );
-        let prepared =
-            self.prepare_received_operation(handle, &validated, document_publication, context)?;
-        drop(validated);
+        let prepared = if let Some(validated) = validated {
+            self.prepare_received_operation(handle, &validated, document_publication, context)?
+        } else {
+            self.prepare_compact_operation(handle, received, document_publication, context)?
+        };
         // The retained operation now owns the objects and their frozen recipe.
         drop(std::mem::take(received));
         let publication::WritePublicationDispatch {
@@ -3394,11 +3405,13 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         &self,
         commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitSession,
         query: &ConnectorWriteQueryIdentity,
-        mut fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
-        _author: &ConnectorPayloadRetentionGuard,
+        fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
+        author: &ConnectorPayloadRetentionGuard,
     ) -> Result<(), ConnectorError> {
         let handle = self.adapter.commit_session(commit)?;
-        handle.with_active_receiving(|receiving| receiving.arrive(*query, &mut fragments))
+        handle.with_active_receiving(|receiving| {
+            receiving.arrive_original(handle, &self.adapter, *query, fragments, author)
+        })
     }
 
     fn confirm_write_received(
@@ -4589,7 +4602,8 @@ mod eager_attempt_io_tests {
         fn record_manifest(
             &self,
             object: &crate::commit::model::ObjectIdentity,
-            live_paths: &[String],
+            added_paths: &[String],
+            existing_paths: &[String],
             replaces: &[String],
         ) -> crate::iceberg::Result<()> {
             let mut ledger = self.ledger.lock().unwrap();
@@ -4601,12 +4615,13 @@ mod eager_attempt_io_tests {
             if !written {
                 ledger.confirm_written_for_test(object)?;
             }
-            ledger.record_manifest(object, live_paths, replaces)
+            ledger.record_manifest(object, added_paths, existing_paths, replaces)
         }
 
         fn record_manifest_list(
             &self,
             object: &crate::commit::model::ObjectIdentity,
+            snapshot_id: i64,
             paths: &[String],
         ) -> crate::iceberg::Result<()> {
             let mut ledger = self.ledger.lock().unwrap();
@@ -4618,7 +4633,7 @@ mod eager_attempt_io_tests {
             if !written {
                 ledger.confirm_written_for_test(object)?;
             }
-            ledger.record_manifest_list(object, paths)
+            ledger.record_manifest_list(object, snapshot_id, paths)
         }
     }
 

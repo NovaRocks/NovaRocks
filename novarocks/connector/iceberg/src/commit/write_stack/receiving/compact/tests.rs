@@ -196,9 +196,9 @@ fn compact_top_up_refusal_leaves_original_paid_fragment_available_for_abort() {
         .commit_fragment(original.as_ref().unwrap())
         .unwrap();
     let index_bytes = original_bytes;
-    let retained = std::mem::size_of::<CompactEntry>()
+    let retained = retained_entry_node_bytes()
         + metered_fragment.compact_payload_bytes().unwrap()
-        + metered_fragment.path().len()
+        + object_path_bytes(metered_fragment.path()).unwrap()
         + index_bytes;
     window.lock().unwrap().limit = retained - 1;
     let result = CompactEntry::from_arrival(&original_adapter, &mut original, index_bytes, &author);
@@ -218,7 +218,7 @@ fn compact_top_up_refusal_leaves_original_paid_fragment_available_for_abort() {
     assert!(original.is_some());
     assert_eq!(window.lock().unwrap().live, original_bytes);
 
-    let peak = original_bytes + retained - std::mem::size_of::<CompactEntry>();
+    let peak = original_bytes + retained - retained_entry_node_bytes();
     window.lock().unwrap().limit = peak - 1;
     let result = CompactEntry::from_arrival(&original_adapter, &mut original, index_bytes, &author);
     assert_eq!(
@@ -246,9 +246,10 @@ fn paid_projection_consumes_only_its_exact_original_fragment() {
     let first = decode(&adapter, data(), &author);
     let mut other = Some(decode(&adapter, data(), &author));
     let original = window.lock().unwrap().live;
-    let preparation = CompactEntry::prepare(&adapter, &first, 0, &author).unwrap();
+    let mut preparation = CompactEntry::prepare(&adapter, &first, 0, &author).unwrap();
     assert!(window.lock().unwrap().live > original);
     let result = preparation.finish(&adapter, &mut other);
+    drop(preparation);
     assert_eq!(
         result.err().unwrap().kind(),
         ConnectorErrorKind::InvalidRequest
@@ -431,7 +432,7 @@ fn final_delete_keeps_only_the_unshared_effect_and_the_admitted_addition() {
     else {
         panic!("the compact replacement must preserve its logical delete effect");
     };
-    assert_eq!(merged_old_references, &[old.clone()]);
+    assert_eq!(merged_old_references, std::slice::from_ref(&old));
     let (decoded, temporary) = CompactFragmentCodec::for_adapter(&adapter)
         .decode(&addition.payload, &author)
         .unwrap();

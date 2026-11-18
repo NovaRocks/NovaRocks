@@ -1846,19 +1846,11 @@ fn move_metrics(metrics: IcebergArtifactMetrics) -> dto::IcebergArtifactMetrics 
 
 /// Frozen private decode environment for entries already admitted by this
 /// exact generation. It owns no live adapter, provider session or I/O.
-#[allow(
-    dead_code,
-    reason = "The compact publication caller lands in RWM-16 P08"
-)]
 pub(crate) struct CompactFragmentCodec {
     header: ConnectorEnvelopeHeader,
     values: IcebergWriteValueCodec,
 }
 
-#[allow(
-    dead_code,
-    reason = "The compact publication caller lands in RWM-16 P08"
-)]
 impl CompactFragmentCodec {
     pub(crate) fn for_adapter(adapter: &IcebergWriteAdapter) -> Self {
         let codec = IcebergWriteCodec::new(adapter.clone());

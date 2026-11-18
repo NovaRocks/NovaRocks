@@ -92,27 +92,31 @@ pub(super) fn clone_data_file_with_manifest_values(
 /// Freeze every writer-provided physical fact. Logical DV identity includes
 /// the blob range; statistics and row lineage are never inferred or dropped.
 pub(crate) fn from_written_file(src: &super::WrittenFile) -> crate::iceberg::Result<DataFile> {
+    into_written_file(src.clone())
+}
+
+pub(crate) fn into_written_file(src: super::WrittenFile) -> crate::iceberg::Result<DataFile> {
     src.entry_identity()?;
     let mut builder = DataFileBuilder::default();
     builder
         .content(src.content)
-        .file_path(src.path.clone())
+        .file_path(src.path)
         .file_format(src.format)
-        .partition(src.partition_values.clone())
+        .partition(src.partition_values)
         .partition_spec_id(src.partition_spec_id)
         .record_count(src.record_count)
         .file_size_in_bytes(src.file_size_in_bytes)
-        .column_sizes(src.column_sizes.clone())
-        .value_counts(src.value_counts.clone())
-        .null_value_counts(src.null_value_counts.clone())
-        .nan_value_counts(src.nan_value_counts.clone())
-        .lower_bounds(src.lower_bounds.clone())
-        .upper_bounds(src.upper_bounds.clone())
-        .key_metadata(src.key_metadata.clone())
-        .split_offsets((!src.split_offsets.is_empty()).then(|| src.split_offsets.clone()))
-        .equality_ids(src.equality_ids.clone())
+        .column_sizes(src.column_sizes)
+        .value_counts(src.value_counts)
+        .null_value_counts(src.null_value_counts)
+        .nan_value_counts(src.nan_value_counts)
+        .lower_bounds(src.lower_bounds)
+        .upper_bounds(src.upper_bounds)
+        .key_metadata(src.key_metadata)
+        .split_offsets((!src.split_offsets.is_empty()).then_some(src.split_offsets))
+        .equality_ids(src.equality_ids)
         .first_row_id(src.first_row_id)
-        .referenced_data_file(src.referenced_data_file.clone())
+        .referenced_data_file(src.referenced_data_file)
         .content_offset(src.content_offset)
         .content_size_in_bytes(src.content_size_in_bytes);
     builder.build().map_err(|error| {

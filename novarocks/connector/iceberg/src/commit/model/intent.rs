@@ -74,6 +74,7 @@ pub struct OperationIntentParts {
 pub struct OperationIntent {
     parts: OperationIntentParts,
     snapshot_loading: crate::catalog::SnapshotLoading,
+    compact_stage: Option<usize>,
 }
 
 impl OperationIntent {
@@ -97,7 +98,21 @@ impl OperationIntent {
         Ok(Self {
             parts,
             snapshot_loading: crate::catalog::SnapshotLoading::All,
+            compact_stage: None,
         })
+    }
+    pub(crate) fn with_compact_stage(mut self, stage: usize) -> Result<Self> {
+        if self.shape() != RequestShape::SnapshotProducing || !self.parts.changes.added.is_empty() {
+            return Err(invalid(
+                "Compact additions require an exclusive snapshot stage source",
+            ));
+        }
+        self.compact_stage = Some(stage);
+        Ok(self)
+    }
+
+    pub(crate) fn compact_stage(&self) -> Option<usize> {
+        self.compact_stage
     }
     pub(crate) fn with_snapshot_loading(mut self, mode: crate::catalog::SnapshotLoading) -> Self {
         self.snapshot_loading = mode;
