@@ -463,3 +463,81 @@ fn opposite_actor_forwards_use_one_lock_order_and_both_threads_join() {
     assert_eq!(actual.phase, InputPhase::Committed);
     assert_eq!(received, vec![vec![48], vec![47]]);
 }
+
+#[test]
+fn causal_event_forwarding_keeps_original_request_author_and_current_ticket_fence() {
+    use novarocks_control_runtime::causal_input::CausalInputObligation;
+    use novarocks_control_runtime_core::owned_storage::OwnedSlotNeed;
+    let (f, ticket) = Fixture::new(1, 1, false, None);
+    let scope = &f.owners[0].scope;
+    let (mut author, mut payer) = scope
+        .reserve_next(
+            generation(),
+            ReservationResources::new(
+                ResourceVector::default(),
+                OwnedSlotNeed {
+                    inputs: 2,
+                    work_headers: 1,
+                    ..Default::default()
+                },
+            ),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    author.start().unwrap();
+    let registration = f.runtime.registration_from_effect(&ticket).unwrap();
+    let mut causal = CausalInputObligation::reserve_admitted(
+        &f.runtime,
+        &registration,
+        f.source,
+        InputClass::Control,
+        &author,
+    )
+    .unwrap();
+    let original_author = causal.event_author().unwrap();
+    let value = Arc::new(51);
+    let input = causal
+        .fill_event_from_effect(
+            &f.runtime,
+            &ticket,
+            Some(&original_author),
+            Input::Value(value.clone()),
+        )
+        .unwrap();
+    assert_eq!(causal.in_flight().unwrap(), [None, Some(input)]);
+    assert_eq!(
+        returned_same(
+            causal.fill_event_from_effect(
+                &f.runtime,
+                &ticket,
+                Some(&original_author),
+                Input::Value(value.clone())
+            ),
+            &value
+        ),
+        ActorTurnError::StandingInputBusy
+    );
+    f.runtime.poll_one(Tick(2)).unwrap();
+    assert!(causal.retire_ready_after_exit().unwrap());
+    scope.fail().unwrap();
+    let refused = causal.fill_event_from_effect(
+        &f.runtime,
+        &ticket,
+        Some(&original_author),
+        Input::Value(value.clone()),
+    );
+    returned_same(refused, &value);
+    assert_eq!(causal.in_flight().unwrap(), [None, None]);
+    causal.close_after_exit().unwrap();
+    author.body_exited().unwrap();
+    author.captures_exited().unwrap();
+    payer.finish().unwrap();
+    f.owners[0].ledger.reap_scope_ready(scope.id(), 8).unwrap();
+    assert_eq!(
+        f.finish(ticket).into_iter().flatten().collect::<Vec<_>>(),
+        vec![51]
+    );
+}

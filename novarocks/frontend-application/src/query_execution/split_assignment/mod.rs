@@ -23,8 +23,6 @@
 //! state survives a round.
 
 mod driver;
-#[cfg(test)]
-pub(crate) use driver::SplitAssignmentDriver;
 mod round;
 mod supervised_source;
 mod transport;

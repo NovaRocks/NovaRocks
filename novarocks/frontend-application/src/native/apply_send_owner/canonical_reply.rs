@@ -508,37 +508,6 @@ impl ApplySlot {
     }
 }
 
-/// Only the canonical cell producer for domain component fixtures. It grants
-/// no dispatch capability, Worker verdict, physical permit or context fence.
-#[cfg(test)]
-pub(crate) fn canonical_dispatch_rejection_fixture(
-    operation_id: novarocks_execution::task_execution::TaskOperationId,
-    kind: novarocks_execution::task_execution::OperationKind,
-    cause: novarocks_workload_control::WorkError,
-) -> OperationAcknowledgement {
-    let cells = OnceLock::new();
-    assert!(cells.set(vec![OnceLock::new()].into_boxed_slice()).is_ok());
-    let publisher = OriginalReplyPublisher {
-        backing: Arc::new(ReservationBacking {
-            physical: Mutex::new(None),
-            action: Mutex::new(None),
-            next: AtomicUsize::new(0),
-            acknowledgements: cells,
-            reply: Mutex::new(None),
-            dispatch_failure: OnceLock::new(),
-            dispatch_frozen: OnceLock::new(),
-            core: Weak::new(),
-        }),
-    };
-    publisher.record_dispatch_failure(cause);
-    publisher.canonicalize(OperationAcknowledgement::from_dispatch_result(
-        operation_id,
-        kind,
-        crate::task_execution::operation::OperationDispatchResult::NonWorkerRejected,
-        AckPayload::None,
-    ))
-}
-
 #[cfg(test)]
 mod dispatch_gate_tests {
     use super::*;

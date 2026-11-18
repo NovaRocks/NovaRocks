@@ -434,6 +434,7 @@ pub(crate) fn handoff_actor_transport(
                         // captures already exited. There is no read fact.
                         BodyOutcome::Call(AttemptCallReply::NoInput)
                     }
+                    Err(ExitWorkError::NotStarted(reason)) => BodyOutcome::CallNotStarted(reason),
                     Err(error) => BodyOutcome::RawFailure(Box::new(error)),
                 };
                 stage_actor_outcome(&registration, outcome);

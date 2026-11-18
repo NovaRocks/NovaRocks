@@ -41,6 +41,7 @@ pub(crate) mod internal_result_cpu;
 pub mod kernels;
 pub(crate) mod lifecycle_diagnostics;
 pub mod lifecycle_plan;
+pub(crate) mod logical_binding;
 pub(crate) mod logical_execution;
 #[cfg(test)]
 pub(crate) mod logical_execution_test_profile;

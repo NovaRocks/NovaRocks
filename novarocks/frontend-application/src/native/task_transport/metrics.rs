@@ -191,22 +191,6 @@ pub(crate) fn register_metric_collectors(registry: &Registry) -> Result<(), Stri
     Ok(())
 }
 
-/// Records that one attempt-local owner was handed to a task runner.
-///
-/// This is the supply observable of the per-turn owners. It counts installs,
-/// not constructions: an owner that is built and then dropped -- which is
-/// exactly how the dynamic filter and credential loops were lost -- never
-/// reaches this.
-pub(crate) fn observe_attempt_pump_installed(pump: &'static str) {
-    TASK_ATTEMPT_PUMPS.with_label_values(&[pump]).inc();
-}
-
-/// The installs recorded for one owner so far.
-#[cfg(test)]
-pub(crate) fn installed_attempt_pumps(pump: &str) -> u64 {
-    TASK_ATTEMPT_PUMPS.with_label_values(&[pump]).get()
-}
-
 /// Publishes one dispatch lane's depth.
 ///
 /// The queue belongs to the dispatcher, not to this module, so the owner that
@@ -279,16 +263,4 @@ pub(super) fn observe_refusal(reason: &str, operations: usize) {
     TASK_OPERATION_REFUSALS
         .with_label_values(&[reason])
         .inc_by(operations as u64);
-}
-
-#[cfg(test)]
-pub(super) fn observe_subscription_state(state: SubscriptionState) {
-    TASK_STATUS_SUBSCRIPTION_STATE
-        .with_label_values(&[state.as_str()])
-        .inc();
-}
-
-#[cfg(test)]
-pub(super) fn observe_resubscribe() {
-    TASK_STATUS_RESUBSCRIPTIONS.inc();
 }

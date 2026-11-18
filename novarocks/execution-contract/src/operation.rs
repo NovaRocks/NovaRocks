@@ -982,6 +982,26 @@ pub struct EstablishSemanticIdentity {
 }
 
 impl EstablishSemanticIdentity {
+    /// Project already-frozen, secret-free content facts. This passive value
+    /// grants no admission, credential access, transport or publication right.
+    pub const fn from_facts(
+        catalog_binding: ContentFingerprint,
+        initial_runtime_filter: ContentFingerprint,
+        query_options: ContentFingerprint,
+        credential_domain_id: CredentialDomainId,
+        credential_epoch: CredentialEpoch,
+        initial_lease_valid_for: LeaseValidFor,
+    ) -> Self {
+        Self {
+            catalog_binding,
+            initial_runtime_filter,
+            query_options,
+            credential_domain_id,
+            credential_epoch,
+            initial_lease_valid_for,
+        }
+    }
+
     pub const fn catalog_binding(self) -> ContentFingerprint {
         self.catalog_binding
     }

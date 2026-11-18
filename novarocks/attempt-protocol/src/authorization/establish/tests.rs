@@ -17,17 +17,16 @@
 
 use super::*;
 
-use crate::{
-    failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
-    operation::WorkerReceiptOutcome,
-};
-use novarocks_coordination_contract::AttemptFailureClass;
+use crate::operation::WorkerReceiptOutcome;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 fn gate(m: usize) -> EstablishAuthorization {
+    gate_with_seed(m, 17)
+}
+fn gate_with_seed(m: usize, seed: u128) -> EstablishAuthorization {
     let (graph, activation) = crate::test_support::graph_with_strict_input(false);
     let participation = *graph.participations().next().unwrap();
-    let mut ids = crate::ids::OperationIds::new(crate::ids::IdSeed::new(17, 200));
+    let mut ids = crate::ids::OperationIds::new(crate::ids::IdSeed::new(seed, 200));
     EstablishAuthorizationStorage::new(
         activation,
         AttemptAuthorizationLimits {
@@ -41,11 +40,11 @@ fn gate(m: usize) -> EstablishAuthorization {
     .bind(ids.issue())
 }
 fn failure(n: u64) -> AttemptFailure {
-    AttemptFailure::Host(HostProjectedFailure {
-        original: HostFailureRef(NonZeroU64::new(n).unwrap()),
-        kind: HostFailureKind::EstablishAuthorization,
-        class: AttemptFailureClass::RecoverableInfrastructure,
-        site: AttemptFailureSite::Attempt,
+    AttemptFailure::Host(crate::failure::HostProjectedFailure {
+        original: crate::failure::HostFailureRef(NonZeroU64::new(n).unwrap()),
+        kind: crate::failure::HostFailureKind::EstablishAuthorization,
+        class: novarocks_coordination_contract::AttemptFailureClass::RecoverableInfrastructure,
+        site: crate::failure::AttemptFailureSite::Attempt,
     })
 }
 fn authorize(g: &mut EstablishAuthorization, n: u64, replay: bool) {
@@ -246,20 +245,17 @@ fn final_unknown_uses_original_m_capacity_and_typed_exhaustion_preserves_error()
         g.authorize(token(4)),
         Directive::Request(AttemptAuthorization::ReauthorizeEstablish { .. })
     ));
-    let original = failure(40);
-    let AttemptFailure::Host(host) = original.clone() else {
-        unreachable!()
-    };
+    let passive = crate::test_support::establish_budget_failure();
     assert_eq!(
         g.authorized(
             token(4),
             Err(AttemptAuthorizationFailure::EstablishBudgetExhausted(
-                original
+                passive.clone()
             ))
         )
         .unwrap(),
         AuthorizationReply::Failed(AttemptFailure::EstablishReplayExhausted {
-            original: host,
+            original: passive,
             participation: g.participation,
             operation_id: g.operation_id
         })
@@ -271,11 +267,13 @@ fn final_unknown_uses_original_m_capacity_and_typed_exhaustion_preserves_error()
             .authorized(
                 token(1),
                 Err(AttemptAuthorizationFailure::EstablishBudgetExhausted(
-                    failure(41)
+                    crate::test_support::establish_budget_failure()
                 ))
             )
             .unwrap(),
-        AuthorizationReply::Failed(failure(41))
+        AuthorizationReply::Failed(AttemptFailure::Logical(
+            crate::test_support::establish_budget_failure()
+        ))
     );
     assert!(matches!(clean.authorize(token(2)), Directive::Retired));
 }
@@ -308,7 +306,7 @@ fn unknown_failure_consumes_only_current_and_duplicate_unknown_never_consumes_la
     assert_eq!(g.late.front(), Some(&issue(1)));
 }
 #[test]
-fn closing_emitted_waits_for_real_withdrawal_then_detaches_each_original_late() {
+fn closing_emitted_waits_for_real_withdrawal_then_forgets_each_local_late_ref() {
     let mut g = gate(3);
     authorize(&mut g, 1, false);
     unknown(&mut g, 1);
@@ -316,7 +314,10 @@ fn closing_emitted_waits_for_real_withdrawal_then_detaches_each_original_late() 
     unknown(&mut g, 2);
     authorize(&mut g, 3, true);
     g.emitted(issue(3), send_generation(3)).unwrap();
+    assert!(g.forget_one_closed_late_ref().is_err());
     g.close();
+    assert!(g.forget_one_closed_late_ref().is_err());
+    assert_eq!(g.late.len(), 2);
     for n in 10..100 {
         assert_eq!(g.advance(token(n)), Step::WaitingTransport);
     }
@@ -326,19 +327,19 @@ fn closing_emitted_waits_for_real_withdrawal_then_detaches_each_original_late() 
     assert!(!g.withdrawn(send_generation(3)));
     selected(&mut g, 100, 3, AttemptIssueSettlement::DefinitelyUnsent);
     g.settled(token(100), issue(3), Ok(())).unwrap();
-    for (n, guard) in [(101, 1), (102, 2)] {
-        assert_eq!(
-            g.advance(token(n)),
-            Step::DetachLate {
-                token: token(n),
-                authorization: issue(guard)
-            }
+    assert_eq!(g.advance(token(101)), Step::Ready);
+    for guard in [1, 2] {
+        assert_eq!(g.forget_one_closed_late_ref().unwrap(), Some(issue(guard)));
+        assert!(
+            g.late_entry,
+            "a local pop does not complete whole-gate preparation"
         );
-        assert_eq!(g.advance(token(n + 1)), Step::Waiting);
-        assert!(!g.detached(token(n + 1), issue(guard)).unwrap());
-        assert!(g.settled(token(n), issue(guard), Ok(())).is_err());
-        assert!(g.detached(token(n), issue(guard)).unwrap());
+        assert!(g.permits_protocol_turn());
     }
+    assert_eq!(g.forget_one_closed_late_ref().unwrap(), None);
+    assert!(g.late_entry);
+    assert!(g.forget_closed_local_entry());
+    assert!(!g.late_entry);
     assert_eq!(g.advance(token(103)), Step::Ready);
     assert!(g.permits_protocol_turn());
 }
@@ -367,7 +368,17 @@ fn invalid_reply_shapes_do_not_release_original_call_and_closed_ack_remains_reac
         AttemptIssueSettlement::Worker(OperationOutcome::Accepted),
     );
     assert!(g.finish_empty().is_err());
-    assert!(!g.detached(token(3), issue(1)).unwrap());
+    assert!(matches!(
+        g.settled(token(3), issue(1), Ok(())).unwrap(),
+        SettlementReply::Stale
+    ));
+    assert!(matches!(
+        g.settled(token(2), issue(2), Ok(())).unwrap(),
+        SettlementReply::Stale
+    ));
+    assert!(!g.permits_protocol_turn());
+    assert!(g.finish_empty().is_err());
+    assert!(g.forget_one_closed_late_ref().is_err());
     g.settled(token(2), issue(1), Ok(())).unwrap();
     assert_eq!(g.advance(token(3)), Step::Ready);
 }
@@ -407,10 +418,14 @@ fn rejected_authorization_is_not_reissued_by_a_repeated_carrier() {
     assert_eq!(
         g.authorized(
             token(1),
-            Err(AttemptAuthorizationFailure::Rejected(failure(1)))
+            Err(AttemptAuthorizationFailure::Rejected(
+                crate::test_support::logical_failure("original logical authorization refused")
+            ))
         )
         .unwrap(),
-        AuthorizationReply::Failed(failure(1))
+        AuthorizationReply::Failed(AttemptFailure::Logical(
+            crate::test_support::logical_failure("original logical authorization refused")
+        ))
     );
     assert!(matches!(g.authorize(token(2)), Directive::Retired));
     // Still permit observed old ACKs; rejection is not remote/actual exit.
@@ -426,29 +441,24 @@ fn rejected_authorization_is_not_reissued_by_a_repeated_carrier() {
 }
 #[test]
 fn final_whole_gate_preparation_clears_only_closed_local_correlation() {
-    for last_ref_detached in [false, true] {
+    for late_ref_remaining in [false, true] {
         let mut g = gate(2);
         authorize(&mut g, 1, false);
         unknown(&mut g, 1);
         assert!(!g.forget_closed_local_entry());
-        if !last_ref_detached {
+        if !late_ref_remaining {
             g.begin_settlement(OperationDispatchResult::NonWorkerRejected)
                 .unwrap();
             selected(&mut g, 2, 1, AttemptIssueSettlement::PreWorkerRejected);
             g.settled(token(2), issue(1), Ok(())).unwrap();
         }
         g.close();
-        if last_ref_detached {
-            assert_eq!(
-                g.advance(token(3)),
-                Step::DetachLate {
-                    token: token(3),
-                    authorization: issue(1)
-                }
-            );
+        assert_eq!(g.advance(token(3)), Step::Ready);
+        if late_ref_remaining {
             assert!(!g.forget_closed_local_entry());
-            g.detached(token(3), issue(1)).unwrap();
+            assert_eq!(g.forget_one_closed_late_ref().unwrap(), Some(issue(1)));
         }
+        assert_eq!(g.forget_one_closed_late_ref().unwrap(), None);
         assert_eq!(g.advance(token(4)), Step::Ready);
         assert!(
             g.late_entry,
@@ -592,5 +602,76 @@ fn deferred_journal_preserves_ingress_worker_order_and_selects_guards_only_at_se
         };
         assert_eq!(trace, expected);
         assert!(g.current.is_none() && g.late.is_empty() && g.permits_protocol_turn());
+    }
+}
+
+#[test]
+fn only_typed_budget_and_same_operation_unknown_history_author_replay_exhaustion() {
+    let original = crate::test_support::establish_budget_failure();
+    // Identical fact, code, detail and site cannot substitute for the enum
+    // author, nor can another operation's genuine transport-unknown history.
+    for late in [false, true] {
+        for budget in [false, true] {
+            let mut other = gate_with_seed(3, 98);
+            authorize(&mut other, 1, false);
+            unknown(&mut other, 1);
+            let mut g = gate(3);
+            assert_ne!(g.operation_id, other.operation_id);
+            if late {
+                authorize(&mut g, 1, false);
+                unknown(&mut g, 1);
+            }
+            assert!(matches!(g.authorize(token(2)), Directive::Request(_)));
+            let rejection = if budget {
+                AttemptAuthorizationFailure::EstablishBudgetExhausted(original.clone())
+            } else {
+                AttemptAuthorizationFailure::Rejected(original.clone())
+            };
+            assert_eq!(
+                g.authorized(token(99), Err(rejection.clone())).unwrap(),
+                AuthorizationReply::Stale
+            );
+            assert_eq!(g.authorization_flight, Some(token(2)));
+            let AuthorizationReply::Failed(failure) =
+                g.authorized(token(2), Err(rejection)).unwrap()
+            else {
+                panic!("the exact original refusal must settle this authorization");
+            };
+            if budget && late {
+                assert_eq!(
+                    failure,
+                    AttemptFailure::EstablishReplayExhausted {
+                        original: original.clone(),
+                        participation: g.participation,
+                        operation_id: g.operation_id,
+                    }
+                );
+                let projected = crate::port_projection::project_failure(&failure, &mut |_| {
+                    panic!("no invented HostRef")
+                })
+                .unwrap();
+                assert_eq!(
+                    projected.input(),
+                    &crate::port_projection::failure_input(
+                        novarocks_coordination_contract::QueryFailureReason::ObservationLost,
+                        "frontend task protocol could not continue",
+                        novarocks_coordination_contract::ExecutionFailureSite::Backend {
+                            process: g.participation.backend_process_id()
+                        },
+                    )
+                );
+            } else {
+                assert_eq!(failure, AttemptFailure::Logical(original.clone()));
+                assert_eq!(
+                    crate::port_projection::project_failure(&failure, &mut |_| panic!(
+                        "no HostRef"
+                    ))
+                    .unwrap(),
+                    original
+                );
+            }
+            assert_eq!(other.late.len(), 1);
+            assert!(matches!(g.authorize(token(3)), Directive::Retired));
+        }
     }
 }

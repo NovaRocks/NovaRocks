@@ -209,6 +209,10 @@ mod tests {
             ExternalDispatchKind::ProviderMutation,
         ] {
             let tracker = Arc::clone(&tracker);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This test joins the competing dispatch owners before checking the original first closure."
+            )]
             workers.push(thread::spawn(move || tracker.close_before_dispatch(kind)));
         }
         for worker in workers {

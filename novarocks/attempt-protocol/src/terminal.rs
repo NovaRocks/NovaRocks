@@ -18,15 +18,15 @@
 //! Original attempt terminal priorities. Source ownership, QA recovery policy,
 //! actual gate settlement and work/capture exit remain with their authors.
 
+use crate::port_output::AttemptTerminal;
 use crate::{
     error::{ParticipantObservationFailure, TaskExecutionError},
     execution::QueryTaskExecution,
-    failure::{AttemptFailure, HostFailureKind},
+    failure::AttemptFailure,
     input::MembershipObservation,
 };
 use novarocks_coordination_contract::{
-    AttemptRequestToken, AttemptStopReason, AttemptTerminal, MonotonicInstant,
-    SelectedTaskTermination,
+    AttemptRequestToken, AttemptStopReason, MonotonicInstant, SelectedTaskTermination,
 };
 use novarocks_execution_contract::{
     OperationKind, OperationOutcome, ParticipationRef, TaskOperationId,
@@ -331,18 +331,13 @@ impl TerminalController {
                 )
             }
             AttemptFailure::EstablishReplayExhausted {
-                original,
+                original: _,
                 participation,
                 ..
             } => {
-                if original.kind != HostFailureKind::EstablishAuthorization {
-                    return Err(TaskExecutionError::Schedule(
-                        "exhausted Establish fact lacks its original authorization author".into(),
-                    ));
-                }
-                // The separate operation binding comes from the canonical
-                // request. Preserve original.site unchanged; it may describe
-                // the logical actor instead of the Native operation.
+                // The typed exhausted-budget reply and this gate's original
+                // late transport history author the observation. The complete
+                // passive original failure remains retained without a host ref.
                 (
                     Some(PreReadyObservation::Unknown(
                         participation.backend_process_id(),
@@ -779,7 +774,7 @@ impl TerminalController {
 mod tests {
     use super::*;
     use crate::{
-        failure::{AttemptFailureSite, HostFailureRef, HostProjectedFailure},
+        failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
         ids::{IdSeed, OperationIds},
     };
     use novarocks_coordination_contract::AttemptFailureClass;
@@ -2343,7 +2338,7 @@ mod tests {
         let mut tagged = TerminalController::new();
         tagged
             .record_original_failure(AttemptFailure::EstablishReplayExhausted {
-                original,
+                original: crate::test_support::logical_failure("original budget refusal"),
                 participation: part(),
                 operation_id: operation(1),
             })
@@ -2358,7 +2353,10 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!(retained.site, AttemptFailureSite::Attempt); // No fake Operation site rewrites original cause.
+        assert_eq!(
+            retained,
+            &crate::test_support::logical_failure("original budget refusal")
+        ); // Preserve the full original cause without inventing an Operation site.
     }
     #[test]
     fn unqualified_identity_refusal_does_not_invent_an_original_window() {

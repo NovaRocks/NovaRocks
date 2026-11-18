@@ -875,6 +875,7 @@ mod typed_compile_source_tests {
     use novarocks_execution_contract::failure::{
         FailureClass, FailureProjection, SharedFailureCause,
     };
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use std::error::Error;
     #[test]
     fn source_safe_detail_keeps_distinct_dependency_reasons_without_rendering_private_source() {

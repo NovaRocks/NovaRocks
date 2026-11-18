@@ -84,6 +84,7 @@ impl Driver {
         let source = |n| AttemptSourceId(positive(n));
         start.sources = AttemptSources {
             actor: source(1),
+            owner: source(1),
             observation: source(2),
             subscription: source(3),
             publication: source(6),
@@ -180,7 +181,14 @@ impl Driver {
                         EffectBody::Publish(Publication::ProtocolBatch(_)) => {
                             PublicationApplied::ProtocolBatch { published: true }
                         }
-                        EffectBody::Publish(Publication::RootStatus(_)) => {
+                        EffectBody::Port(message)
+                            if matches!(
+                                message.body,
+                                novarocks_attempt_protocol::port_output::AttemptToLogicalBody::RootStatus(
+                                    _
+                                )
+                            ) =>
+                        {
                             PublicationApplied::RootStatus
                         }
                         EffectBody::AdjustReadWindow(_) => return None,

@@ -1131,6 +1131,105 @@ mod indexed_queue_tests {
     }
 
     #[test]
+    fn task_cancel_leaves_update_backlog_first_and_reaches_control_capacity() {
+        use crate::effect::TaskDomainIntent;
+        use novarocks_execution_contract::{CancelReason, CancelTask, ExchangeEdgeId};
+        let identity = crate::test_support::remote(1).identity();
+        let backend = identity.backend_process_id();
+        let mut ids = OperationIds::new(IdSeed::new(91, 1));
+        let mut update = |version| OperationIntent::UpdateTask {
+            envelope: OperationEnvelope::with_default_wait(ids.issue(), OperationKind::UpdateTask),
+            identity,
+            domains: std::sync::Arc::from([TaskDomainIntent::OpenExchangeEdges {
+                version: novarocks_execution_contract::EdgeOpenVersion::FIRST,
+                edges: vec![ExchangeEdgeId::new(version).unwrap()],
+            }]),
+        };
+        let first = update(1);
+        let second = update(2);
+        let cancel = OperationIntent::CancelTask(CancelTask::new(
+            ids.issue(),
+            identity,
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        let cancel_id = cancel.operation_id();
+        let mut dispatcher =
+            OperationDispatcher::new(DispatchBudget::new(1, 1, 1, 1).unwrap(), limits());
+        dispatcher.register_task(backend).unwrap();
+        dispatcher
+            .enqueue_reserved(first, MonotonicInstant::ORIGIN, grant(1))
+            .unwrap();
+        let original = dispatcher.take_batch().unwrap();
+        dispatcher.accept(&original).unwrap();
+        assert_eq!(dispatcher.lane_in_flight(backend, DispatchLane::Update), 1);
+        dispatcher
+            .enqueue_reserved(second, MonotonicInstant::ORIGIN, grant(2))
+            .unwrap();
+        dispatcher
+            .enqueue_reserved(cancel, MonotonicInstant::ORIGIN, grant(3))
+            .unwrap();
+        let control = dispatcher
+            .take_batch()
+            .expect("control precedes the Update backlog");
+        assert_eq!(control.operations.len(), 1);
+        assert_eq!(control.operations[0].operation_id(), cancel_id);
+        assert_eq!(control.operations[0].kind(), OperationKind::CancelTask);
+        assert_eq!(control.lane, DispatchLane::Control);
+        assert!(control.control_progress);
+        dispatcher.accept(&control).unwrap();
+        assert_eq!(dispatcher.lane_in_flight(backend, DispatchLane::Control), 1);
+        assert_eq!(dispatcher.lane_queued(backend, DispatchLane::Update), 1);
+        assert!(
+            dispatcher.take_batch().is_none(),
+            "the queued Update remains blocked by its original saturated permit"
+        );
+        assert_eq!(control.queued_inputs.as_ref(), &[grant(3)]);
+        assert_eq!(original.queued_inputs.as_ref(), &[grant(1)]);
+    }
+
+    #[test]
+    fn small_operations_keep_grouping_at_the_target_without_losing_the_next_head() {
+        use novarocks_execution_contract::{CancelReason, CancelTask};
+        let identity = crate::test_support::remote(1).identity();
+        let mut ids = OperationIds::new(IdSeed::new(92, 1));
+        let operations = (0..3)
+            .map(|_| {
+                OperationIntent::CancelTask(CancelTask::new(
+                    ids.issue(),
+                    identity,
+                    CancelReason::UpstreamNoLongerNeeded,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let expected = operations
+            .iter()
+            .map(OperationIntent::operation_id)
+            .collect::<Vec<_>>();
+        let mut transport = limits();
+        transport.batch_target_encoded_bytes = 2 * operations[0].queued_bytes();
+        let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
+        for (index, original) in operations.into_iter().enumerate() {
+            dispatcher
+                .enqueue_reserved(original, MonotonicInstant::ORIGIN, grant(index as u64 + 1))
+                .unwrap();
+        }
+        let first = dispatcher.take_batch().unwrap();
+        assert_eq!(
+            first
+                .operations
+                .iter()
+                .map(OperationIntent::operation_id)
+                .collect::<Vec<_>>(),
+            expected[..2]
+        );
+        assert_eq!(first.queued_inputs.as_ref(), &[grant(1), grant(2)]);
+        let last = dispatcher.take_batch().unwrap();
+        assert_eq!(last.operations[0].operation_id(), expected[2]);
+        assert_eq!(last.queued_inputs.as_ref(), &[grant(3)]);
+        assert!(dispatcher.take_batch().is_none());
+    }
+
+    #[test]
     fn bounded_dispatch_sends_a_whole_configured_control_batch() {
         use crate::capacity::{QueueStage, ReservationToken, StepContext};
         use crate::effect::EffectBody;
@@ -1563,4 +1662,6 @@ mod indexed_queue_tests {
         );
         assert!(dispatcher.tracks_input(first_id, grant(1)));
     }
+
+    mod original_pressure_tests;
 }

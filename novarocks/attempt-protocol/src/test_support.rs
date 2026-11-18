@@ -189,3 +189,43 @@ pub(crate) fn execution_with_graph(graph: TaskGraph) -> crate::execution::QueryT
     )
     .unwrap()
 }
+
+/// A complete logical refusal authored before it enters the attempt core.
+pub(crate) fn logical_failure(detail: &str) -> novarocks_coordination_contract::ExecutionFailure {
+    novarocks_coordination_contract::ExecutionFailure::from_input(
+        crate::port_projection::failure_input(
+            novarocks_coordination_contract::QueryFailureReason::PreparationProtocol,
+            detail,
+            novarocks_coordination_contract::ExecutionFailureSite::Coordinator,
+        ),
+    )
+}
+
+/// Project an actual pure failure used by a fixture, refusing missing rich facts.
+pub(crate) fn passive_failure(
+    failure: &crate::failure::AttemptFailure,
+) -> novarocks_coordination_contract::ExecutionFailure {
+    crate::port_projection::project_failure(failure, &mut |_| {
+        panic!("fixture must supply the original passive failure, not a HostRef")
+    })
+    .unwrap()
+}
+
+/// The existing logical Establish ledger's independent resource-budget refusal.
+pub(crate) fn establish_budget_failure() -> novarocks_coordination_contract::ExecutionFailure {
+    use novarocks_coordination_contract::{
+        ExecutionFailure, ExecutionFailureInput, ExecutionFailureSite,
+    };
+    use novarocks_execution_contract::{
+        SafeDetail,
+        failure::{FailureClass, FailureFact, FailureReason, domain},
+    };
+    ExecutionFailure::from_input(ExecutionFailureInput::new(
+        FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(80).unwrap()),
+        ),
+        SafeDetail::truncating("Establish issue authorization budget is exhausted"),
+        ExecutionFailureSite::Coordinator,
+    ))
+}

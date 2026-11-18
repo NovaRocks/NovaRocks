@@ -77,12 +77,21 @@ impl std::task::Wake for MetadataWake {
 pub(crate) struct MetadataIoAdmission {
     wake: Arc<MetadataWake>,
     original: Mutex<Option<Body>>,
+    // Same Source receiving storage, including its Vec backing, remains in
+    // original per-root storage. Registration grants neither I/O nor capacity.
+    requests: Mutex<RequestIngress>,
     // One retention-only pin to the installed original payload. CPU creators
     // can borrow it while the same Source's progress Body is on loan.
     payload_retention: OnceLock<RetainedPayloadAlias>,
     // Publication is an original journal fact, not permission minted by a loan.
     settlement: AtomicBool,
     cleanup: Mutex<CleanupReceipt>,
+}
+#[derive(Default)]
+struct RequestIngress {
+    pending: Vec<Arc<RequestCell>>,
+    // Only never-started withdrawal closes registration, not phase quiescence.
+    withdrawing: bool,
 }
 type MetadataCleanupCompletion = (Result<(), ConnectorError>, Option<Box<dyn Any + Send>>);
 
@@ -606,6 +615,7 @@ impl MetadataIoAdmission {
         let provider_owned_floor = initial_owned_bytes.get();
         Ok(Arc::new(Self {
             wake,
+            requests: Mutex::new(RequestIngress::default()),
             payload_retention: OnceLock::new(),
             settlement: AtomicBool::new(false),
             cleanup: Mutex::new(CleanupReceipt::default()),
@@ -755,10 +765,23 @@ impl MetadataIoAdmission {
     ) -> Result<bool, WorkError> {
         self.wake.register(cx.waker());
         let (result, cells, changed, reobserve) = {
+            let mut requests = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+            if requests.withdrawing {
+                return Err(WorkError::Released);
+            }
             let Some(mut original) = loan(&self.original) else {
                 return Err(WorkError::Conflict);
             };
             let body = original.body.as_mut().unwrap();
+            body.cells
+                .try_reserve(requests.pending.len())
+                .map_err(|_| {
+                    WorkError::Capacity("metadata request record allocation was refused")
+                })?;
+            // Move the SAME Arc; no receiving alias can keep a retired cell live.
+            body.cells.append(&mut requests.pending);
+            // All WC, foreign polls/destructors and wakes follow this short gate.
+            drop(requests);
             body.changed = false;
             body.reobserve = false;
             let mut result = Self::progress(
@@ -1340,7 +1363,13 @@ impl MetadataIoAdmission {
         let Some(bytes) = *formation else {
             return Ok(None);
         };
+        let requests = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+        if !requests.pending.is_empty() {
+            return Err(WorkError::NotReady);
+        }
         let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        // Later requests remain ungranted and observe the later capacity.
+        drop(requests);
         let body = original.body.as_mut().ok_or(WorkError::Released)?;
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(WorkError::Released);
@@ -1525,11 +1554,41 @@ impl MetadataIoAdmission {
                     return Err(WorkError::Conflict);
                 }
             }
+            let mut requests = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+            requests.withdrawing = true;
+            // Pending cells have never entered progress and own no grant or F.
+            // Only the first refusal is an event; observing it again is quiet.
+            let live = requests
+                .pending
+                .iter()
+                .any(|cell| Arc::strong_count(cell) != 1);
+            let mut wake = Vec::new();
+            for cell in &requests.pending {
+                let mut state = cell.original.lock().unwrap_or_else(|p| p.into_inner());
+                let state = state.as_mut().expect("pending original request");
+                if state.failure.is_none() {
+                    state.failure = Some(WorkError::Released);
+                    if live {
+                        wake.push(Arc::clone(cell));
+                    }
+                }
+            }
+            if live {
+                drop(original);
+                drop(requests);
+                for cell in wake {
+                    cell.wake();
+                }
+                return Ok(None);
+            }
+            // No caller alias remains, so there is nobody to notify. Its
+            // original cell still drops with retired originals outside locks.
             body.unstarted_withdrawing = true;
             (
                 body.initial.take(),
                 body.initial_source.take(),
                 body.payload_slot_wait.take(),
+                std::mem::take(&mut requests.pending),
             )
         };
         // Return the Body before any WC callback/Drop. If this unwinds, the
@@ -1593,6 +1652,22 @@ impl MetadataIoAdmission {
         cx: &mut Context<'_>,
         observation: ProgressObservation,
     ) -> Poll<Result<MetadataIoQuiescence, WorkError>> {
+        // Register before observing withdrawal/alias readiness so an actual
+        // request exit reaches this current Source rather than an old poller.
+        self.wake.register(cx.waker());
+        let withdrawing = self
+            .requests
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .withdrawing;
+        if withdrawing {
+            // Revisit only the already accepted original withdrawal. A live
+            // rejected caller is not bootstrap permission or actual exit.
+            return match self.withdraw_unstarted_in()? {
+                Some(observed) => Poll::Ready(Ok(observed)),
+                None => Poll::Pending,
+            };
+        }
         if let Err(error) = self.poll_with_original_owner(owner, cx, observation) {
             return Poll::Ready(Err(error));
         }
@@ -1607,14 +1682,32 @@ impl MetadataIoAdmission {
         {
             return Poll::Pending;
         }
+        // Foreign progress observations run before the receiving gate.
         for original in &mut body.cells {
             if !original.stream_clear() || Arc::get_mut(original).is_none() {
                 return Poll::Pending;
             }
-            let mut cell = loan(&original.original).ok_or(WorkError::Conflict)?;
-            let retired = std::mem::take(cell.body.as_mut().unwrap());
-            drop(retired);
         }
+        let requests = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+        if !requests.pending.is_empty() {
+            return Poll::Pending;
+        }
+        let mut retired = Vec::new();
+        retired.try_reserve(body.cells.len()).map_err(|_| {
+            WorkError::Capacity("metadata retirement record allocation was refused")
+        })?;
+        // The empty receiving frontier and these original dispositions form
+        // one cut. A later phase can still register a new necessary request.
+        for original in &mut body.cells {
+            let Some(mut cell) = loan(&original.original) else {
+                drop(requests);
+                drop(retired);
+                return Poll::Ready(Err(WorkError::Conflict));
+            };
+            retired.push(std::mem::take(cell.body.as_mut().unwrap()));
+        }
+        drop(requests);
+        drop(retired);
         Poll::Ready(Ok(MetadataIoQuiescence {
             ordinary_failure: body.failure.clone(),
         }))
@@ -1636,9 +1729,40 @@ impl MetadataIoAdmission {
                 "metadata cleanup source disposition is unproven",
             ));
         }
-        let Some(mut source) = loan(&self.original) else {
-            return Err(busy());
+        let mut requests = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+        if requests.withdrawing {
+            return Err(error(&WorkError::Released));
+        }
+        let source = if requests.pending.is_empty() {
+            loan(&self.original)
+        } else {
+            None
         };
+        let Some(mut source) = source else {
+            requests.pending.try_reserve(1).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "metadata request record allocation was refused",
+                )
+            })?;
+            let cell = Arc::new(RequestCell::new(Arc::clone(&self.wake)));
+            {
+                let mut original = cell.original.lock().unwrap_or_else(|p| p.into_inner());
+                let state = original.as_mut().expect("new pending original request");
+                state.requested = dependency;
+                state.owned = owned;
+                state.claimed = true;
+            }
+            let caller = Arc::clone(&cell) as Arc<dyn ConnectorIoRequestSource>;
+            requests.pending.push(cell);
+            drop(requests);
+            // The exit-waker getter is foreign code. Receiving owns the cell
+            // before construction, with no gate or Cell mutex held here.
+            let request = ConnectorIoRequest::from_original(caller);
+            self.wake.wake();
+            return Ok(request);
+        };
+        drop(requests);
         let body = source.body.as_mut().unwrap();
         if body.unstarted_withdrawing || body.unstarted_withdrawn {
             return Err(error(&WorkError::Released));
@@ -1691,12 +1815,11 @@ impl MetadataIoAdmission {
             {
                 state.extension = Some(dependency.clone());
             }
-            let request = ConnectorIoRequest::from_original(
-                Arc::clone(cell) as Arc<dyn ConnectorIoRequestSource>
-            );
+            let caller = Arc::clone(cell) as Arc<dyn ConnectorIoRequestSource>;
             drop(original);
             drop(source);
             drop(retired);
+            let request = ConnectorIoRequest::from_original(caller);
             self.wake.wake();
             return Ok(request);
         }
@@ -1714,11 +1837,10 @@ impl MetadataIoAdmission {
             state.owned = owned;
             state.claimed = true;
         }
-        let request = ConnectorIoRequest::from_original(
-            Arc::clone(&cell) as Arc<dyn ConnectorIoRequestSource>
-        );
+        let caller = Arc::clone(&cell) as Arc<dyn ConnectorIoRequestSource>;
         body.cells.push(cell);
         drop(source);
+        let request = ConnectorIoRequest::from_original(caller);
         self.wake.wake();
         Ok(request)
     }
@@ -1811,6 +1933,9 @@ pub(super) mod cleanup_tests;
 
 #[cfg(test)]
 pub(crate) mod fixtures;
+
+#[cfg(test)]
+mod pending_tests;
 
 #[cfg(test)]
 mod original_governor_tests {
@@ -3070,6 +3195,153 @@ mod original_governor_tests {
         );
         drop(failure);
         assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn selected_request_survives_the_same_original_progress_body_loan() {
+        use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+
+        let (control, mut driver, root) = original_governor();
+        let source_bytes = MetadataIoAdmission::body_metadata_bytes().unwrap();
+        let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(source_bytes).unwrap(),
+            NonZeroU64::new(128).unwrap(),
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let source = MetadataIoAdmission::new(root.owner.scope(), profile, source_bytes).unwrap();
+        let stop = ConnectorStopOwner::new();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            stop.view(),
+            1024,
+            4096,
+        )
+        .unwrap()
+        .with_io_admission(source.clone());
+        let route = SharedDependency::Network(
+            novarocks_resource_contract::NetworkServiceOrigin::from_selected_url(
+                &url::Url::parse("https://original-loaned-request.invalid").unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut ready = false;
+        for _ in 0..256 {
+            ready = source.poll_progress(&root.owner, &mut cx).unwrap();
+            if ready {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+
+        // This is the existing private progress loan, not a second admission
+        // owner. The public request runs on another thread during that loan.
+        let borrowed = loan(&source.original).unwrap();
+        let original_context = context.clone();
+        let original_route = route.clone();
+        let (mut request, first) = std::thread::scope(|threads| {
+            threads
+                .spawn(move || {
+                    let mut request = Box::pin(async move {
+                        original_context.admit_selected_io(original_route).await
+                    });
+                    let mut cx = Context::from_waker(Waker::noop());
+                    let first = request.as_mut().poll(&mut cx);
+                    (request, first)
+                })
+                .join()
+                .unwrap()
+        });
+        let first_pending = first.is_pending();
+        // Always restore the SAME loan and settle originals before checking
+        // the counterexample. Old production returns Internal here.
+        drop(borrowed);
+        let mut settled = match first {
+            Poll::Pending => None,
+            Poll::Ready(result) => Some(result),
+        };
+        for _ in 0..256 {
+            if settled.is_some() {
+                break;
+            }
+            drive_original(&mut driver);
+            source.poll_progress(&root.owner, &mut cx).unwrap();
+            if let Poll::Ready(result) = request.as_mut().poll(&mut cx) {
+                settled = Some(result);
+            }
+        }
+        let (permit, refusal, completed) = match settled {
+            Some(Ok(permit)) => (permit, None, true),
+            Some(Err(error)) => (None, Some(error), true),
+            None => (None, None, false),
+        };
+        let original_route_admitted = {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            body.bound.contains(&route)
+                && body
+                    .cells
+                    .iter()
+                    .filter(|cell| {
+                        let state = cell.original.lock().unwrap();
+                        let state = state.as_ref().unwrap();
+                        state.requested.as_ref() == Some(&route)
+                            && state.grant.is_some()
+                            && state
+                                .full
+                                .as_ref()
+                                .is_some_and(|full| full.contains(&route))
+                    })
+                    .count()
+                    == 1
+        };
+        let held_permit_prevents_exit =
+            permit.is_some() && source.poll_quiescent(&root.owner, &mut cx).is_pending();
+        let positive_permit = permit.is_some();
+        drop((permit, request, context));
+        let mut exited = false;
+        for _ in 0..256 {
+            match source.poll_quiescent(&root.owner, &mut cx) {
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    exited = true;
+                    break;
+                }
+                Poll::Pending => drive_original(&mut driver),
+            }
+        }
+        let healthy = source.health_failure().is_none() && source.failure().is_none();
+        drop(source);
+        root.business.release();
+        root.owner.complete_after_terminal_cancel_settled();
+        control.close_admission();
+        drive_original(&mut driver);
+        let drained = control.shutdown().is_ok();
+
+        assert!(
+            exited && drained,
+            "the original Source and WC must really drain"
+        );
+        assert!(
+            healthy,
+            "a bookkeeping loan does not fail the original owner"
+        );
+        assert!(ready, "the real original bootstrap became ready");
+        assert!(
+            first_pending,
+            "same-source request must wait for original progress, not return a business failure: {refusal:?}"
+        );
+        assert!(completed && refusal.is_none() && positive_permit);
+        assert!(
+            original_route_admitted,
+            "only the original author admits the exact new route"
+        );
+        assert!(
+            held_permit_prevents_exit,
+            "actual permit alias prevents early retirement"
+        );
     }
 
     #[test]

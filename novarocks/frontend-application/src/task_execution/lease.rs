@@ -74,9 +74,6 @@ impl RenewSchedule {
     pub const fn next_renew_at(self) -> MonotonicInstant {
         self.next_renew_at
     }
-    pub fn must_renew_at(self, now: MonotonicInstant) -> bool {
-        now.has_reached(self.next_renew_at)
-    }
 }
 
 #[cfg(test)]

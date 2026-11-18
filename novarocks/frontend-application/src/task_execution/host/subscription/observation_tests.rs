@@ -17,8 +17,31 @@
 
 #[path = "observation_tests/liveness.rs"]
 mod liveness;
+#[path = "observation_tests/native_all_frames.rs"]
+mod native_all_frames;
+#[path = "observation_tests/native_cursors.rs"]
+mod native_cursors;
+#[path = "observation_tests/native_failures.rs"]
+mod native_failures;
+#[path = "observation_tests/native_pressure.rs"]
+mod native_pressure;
+#[path = "observation_tests/native_receive.rs"]
+mod native_receive;
+#[path = "observation_tests/native_rpc_retirement.rs"]
+mod native_rpc_retirement;
+#[path = "observation_tests/native_wire_validation.rs"]
+mod native_wire_validation;
+#[path = "observation_tests/original_retirement.rs"]
+mod original_retirement;
+#[path = "observation_tests/panic_retirement.rs"]
+mod panic_retirement;
+#[path = "observation_tests/source_children.rs"]
+mod source_children;
+#[path = "observation_tests/source_children_lifetime.rs"]
+mod source_children_lifetime;
 
 use super::*;
+use novarocks_attempt_protocol::failure::AttemptFailure;
 use novarocks_control_runtime::{
     actor::{ActorConfig, ActorStep},
     actor_turn::ActorRuntime,
@@ -95,7 +118,9 @@ struct Recorder(
     Arc<Mutex<Vec<(InputId, Seen)>>>,
     Arc<Mutex<Vec<ObservationOpening>>>,
     Option<liveness::Capture>,
+    Option<BatchCapture>,
 );
+type BatchCapture = Arc<Mutex<Vec<(InputEnvelope, AttemptInput)>>>;
 impl Actor for Recorder {
     type Input = AttemptInput;
     type Effect = ();
@@ -107,8 +132,21 @@ impl Actor for Recorder {
         _: Tick,
         input: InputEnvelope,
         value: AttemptInput,
-        _: &mut ActorStep<'_, ()>,
+        step: &mut ActorStep<'_, ()>,
     ) {
+        if let Some(capture) = &self.3 {
+            assert!(
+                step.charge(1),
+                "each actual batch-trace input pays one frozen step unit"
+            );
+            let mut original = capture.lock().unwrap();
+            assert!(
+                original.len() < original.capacity(),
+                "fixed actual-turn trace capacity"
+            );
+            original.push((input, value));
+            return;
+        }
         if let Some(capture) = &self.2 {
             assert!(capture.lock().unwrap().replace((input, value)).is_none());
             return;
@@ -190,7 +228,7 @@ pub(in crate::task_execution::host) struct Bank {
     original: Weak<Bank>,
     on_return: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     binding: RootControlBinding,
-    canonical: Mutex<BTreeMap<AttemptRequestToken, LogicalToAttempt<AttemptFailure>>>,
+    canonical: Mutex<BTreeMap<AttemptRequestToken, LogicalToAttempt>>,
     projections: Mutex<usize>,
     metadata: Mutex<TestMetadataRecord>,
     progress: Mutex<Option<CoalescingInput<Recorder, TestReadProgress>>>,
@@ -262,7 +300,7 @@ impl Bank {
     }
     fn root_control(
         &self,
-        request: impl FnOnce(AttemptRequestToken) -> LogicalToAttemptBody<AttemptFailure>,
+        request: impl FnOnce(AttemptRequestToken) -> LogicalToAttemptBody,
     ) -> RootControlRef {
         let token = token(1);
         self.canonical.lock().unwrap().insert(
@@ -462,7 +500,7 @@ impl ObservationSourcePool for Bank {
     fn project_root_control(
         &self,
         reference: &RootControlRef,
-    ) -> Result<LogicalToAttempt<AttemptFailure>, ObservationError> {
+    ) -> Result<LogicalToAttempt, ObservationError> {
         if !reference.belongs_to(&self.binding) {
             return Err(ObservationError::InvalidRootControl);
         }
@@ -579,6 +617,26 @@ impl Fixture {
         opened: bool,
         trace: Option<liveness::Trace>,
     ) -> Self {
+        Self::make_with_captures(queue, byte_frames, opened, trace, None)
+    }
+    fn make_with_captures(
+        queue: usize,
+        byte_frames: usize,
+        opened: bool,
+        trace: Option<liveness::Trace>,
+        batch: Option<BatchCapture>,
+    ) -> Self {
+        Self::make_with_initial_stream(queue, byte_frames, opened, trace, batch, true)
+    }
+    fn make_with_initial_stream(
+        queue: usize,
+        byte_frames: usize,
+        opened: bool,
+        trace: Option<liveness::Trace>,
+        batch: Option<BatchCapture>,
+        register_initial_stream: bool,
+    ) -> Self {
+        assert!(!opened || register_initial_stream);
         let ledger = RuntimeLedger::new(ResourceVector::default());
         let scope = ledger
             .open_scope_next(None, Generation::new(1).unwrap())
@@ -630,7 +688,7 @@ impl Fixture {
             .register_bound(
                 actor(),
                 scope.clone(),
-                Recorder(seen.clone(), openings.clone(), capture),
+                Recorder(seen.clone(), openings.clone(), capture, batch),
                 ActorConfig {
                     mailbox: [8; 4],
                     max_batches: 8,
@@ -685,7 +743,9 @@ impl Fixture {
             Waker::noop().clone(),
         )
         .unwrap();
-        input.register_stream(key).unwrap();
+        if register_initial_stream {
+            input.register_stream(key).unwrap();
+        }
         let fixture = Self {
             ledger,
             scope,
@@ -754,6 +814,25 @@ impl Fixture {
             self.runtime.poll_one(Tick(1)).unwrap();
             self.runtime.retire_input(actor(), id).unwrap();
             phase.input_retired(id).unwrap();
+        }
+    }
+    // The caller has joined every publisher that can use this original bank.
+    // Captured inputs must already have gone through consume_actual_inputs;
+    // this only acknowledges their debts and never polls or retires an input.
+    fn clear_progress_debts_after_publishers_exit(&self) {
+        if let Some(progress) = self.bank.progress.lock().unwrap().as_ref() {
+            assert!(
+                progress.in_flight().unwrap().is_none(),
+                "all original captured progress inputs must be retired first"
+            );
+            assert!(
+                !self
+                    .bank
+                    .progress_failed
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "unresolved real publisher debt cannot be refunded"
+            );
+            self.bank.progress_debts.lock().unwrap().clear();
         }
     }
     fn drain_progress(&self) {
@@ -1720,10 +1799,7 @@ fn compact_controls_project_only_at_fill_and_metadata_refusal_keeps_original() {
     assert_eq!(layout.root_reference, Layout::new::<RootControlRef>());
     assert_eq!(layout.actor_input, Layout::new::<AttemptInput>());
     assert_eq!(layout.ap_projection, Layout::new::<AttemptInput>());
-    assert_eq!(
-        layout.logical_projection,
-        Layout::new::<LogicalToAttempt<AttemptFailure>>()
-    );
+    assert_eq!(layout.logical_projection, Layout::new::<LogicalToAttempt>());
     assert_eq!(layout.batch_item, Layout::new::<ReceivedObservation>());
     assert_eq!(layout.in_flight, Layout::new::<InFlight>());
     assert_eq!(
@@ -2476,13 +2552,14 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
         step: &mut ActorStep<'_, crate::control_runtime::actor::FrontendEffect>,
     ) {
         use crate::control_runtime::actor::{FrontendEffect, FrontendInput};
+        use novarocks_attempt_protocol::port_output::AttemptToLogicalBody;
         use novarocks_attempt_protocol::{
             InputSelection,
             effect::{EffectBody, Publication},
             input::{AttemptInputId, PublicationApplied},
         };
         use novarocks_control_runtime_core::effect::EffectKind;
-        use novarocks_coordination_contract::{AttemptToLogicalBody, SelectedTaskTermination};
+        use novarocks_coordination_contract::SelectedTaskTermination;
         use novarocks_execution_contract::TaskState;
 
         // The ordered observations and Seal run through Core. The fixture has
@@ -2511,6 +2588,16 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
         if let AttemptInput::Executor(ExecutorFact::ReadProgress(progress)) = input.as_ref() {
             assert_eq!(claim.class, InputClass::Ordinary);
             assert_eq!(progress.resume_revision, NonZeroU64::MIN);
+            return;
+        }
+        if let AttemptInput::Port(LogicalToAttempt {
+            body: LogicalToAttemptBody::PreReadyReplacementChanged { token: changed },
+            ..
+        }) = input.as_ref()
+        {
+            assert_eq!(claim.class, InputClass::Ordinary);
+            assert_eq!(claim.source.get(), self.sources.qa.0.get());
+            assert_eq!(*changed, token(2));
             return;
         }
         let input_id = AttemptInputId(NonZeroU64::new(claim.input.get()).unwrap());
@@ -2605,11 +2692,11 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
                     EffectBody::Publish(Publication::ProtocolBatch(_)) => {
                         PublicationApplied::ProtocolBatch { published: true }
                     }
-                    EffectBody::Publish(Publication::RootStatus(projection)) => {
-                        self.observed.lock().unwrap().root = Some(*projection);
-                        PublicationApplied::RootStatus
-                    }
                     EffectBody::Port(port) => match port.body {
+                        AttemptToLogicalBody::RootStatus(projection) => {
+                            self.observed.lock().unwrap().root = Some(*projection);
+                            return Some((effect.id, PublicationApplied::RootStatus));
+                        }
                         AttemptToLogicalBody::SealResult {
                             token: reply,
                             result,
@@ -2994,7 +3081,12 @@ fn run_frontend_ordered_control(scenario: Option<OrderedRootControl>) {
         .sources
     });
     let mailbox = sources.map_or([4; 4], |sources| sources.mailbox);
-    assert_eq!(mailbox[InputClass::Ordinary.index()], 4);
+    // The actual two-participation geometry owns two read-progress roles,
+    // membership, capacity and the independent Changed notification.
+    assert_eq!(
+        mailbox[InputClass::Ordinary.index()],
+        if sources.is_some() { 5 } else { 4 }
+    );
     let config = ActorConfig {
         mailbox,
         // A single committed batch lets the test inspect both sides of the
@@ -3119,6 +3211,8 @@ fn run_frontend_ordered_control(scenario: Option<OrderedRootControl>) {
             )
         })
         .collect::<Vec<_>>();
+    let changed_role =
+        sources.map(|sources| Mutex::new(standing(source_id(sources.qa), InputClass::Ordinary)));
     let read_progress = &progress_roles[0];
     let membership_registry = Arc::new(MembershipRegistry::new());
     let endpoints = [19091, 19092].map(|port| RuntimeEndpoint::new("127.0.0.1", port).unwrap());
@@ -3189,7 +3283,8 @@ fn run_frontend_ordered_control(scenario: Option<OrderedRootControl>) {
             startup,
             capacity,
             membership,
-            owner_controls: None,
+
+            local_exit: None,
             ordered_observations: Some(
                 OrderedObservationHost::new(ingress.clone())
                     .with_read_progress(progress_roles.iter().cloned()),
@@ -3205,6 +3300,7 @@ fn run_frontend_ordered_control(scenario: Option<OrderedRootControl>) {
         }
     };
     if let Some(witness) = startup_witness {
+        witness.release_legacy_run(&runtime);
         drive();
         for _ in 0..2 {
             assert!(runtime.poll_one(Tick(1)).unwrap());
@@ -3236,6 +3332,9 @@ fn run_frontend_ordered_control(scenario: Option<OrderedRootControl>) {
     let mut finish = || {
         for role in &progress_roles {
             role.close_after_exit().unwrap();
+        }
+        if let Some(role) = &changed_role {
+            role.lock().unwrap().close_after_exit().unwrap();
         }
 
         ingress.job_closed(key).unwrap();
@@ -3417,6 +3516,17 @@ fn run_frontend_ordered_control(scenario: Option<OrderedRootControl>) {
         assert_eq!(ledger.capacity_waiter_count(), 1);
         drop(blocker);
         assert_eq!(ledger.capacity_waiter_count(), 0);
+        let changed = changed_role.as_ref().unwrap().lock().unwrap();
+        let changed_standing = changed.id();
+        let changed_input = changed
+            .fill(FrontendInput::Attempt(Box::new(AttemptInput::Port(
+                LogicalToAttempt {
+                    activation,
+                    body: LogicalToAttemptBody::PreReadyReplacementChanged { token: token(2) },
+                },
+            ))))
+            .unwrap();
+        drop(changed);
 
         let ordinary_inventory = || {
             runtime
@@ -3434,6 +3544,7 @@ fn run_frontend_ordered_control(scenario: Option<OrderedRootControl>) {
                 (progress_roles[1].standing_id(), subscription_source),
                 (membership_slot.unwrap(), source_id(sources.membership)),
                 (capacity_slot.unwrap(), source_id(sources.capacity)),
+                (changed_standing, source_id(sources.qa)),
             ];
             assert_eq!(roles.len(), mailbox[InputClass::Ordinary.index()]);
             for (standing, source) in expected {
@@ -3660,7 +3771,32 @@ fn run_frontend_ordered_control(scenario: Option<OrderedRootControl>) {
         for _ in &ordinary {
             assert!(runtime.poll_one(Tick(1)).unwrap());
             drive();
+            // This fixture owns the neutral Changed producer directly. Its
+            // committed occurrence must actually retire before the one-batch
+            // actor can admit the next Ordinary role; a Core return is not it.
+            changed_role
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .retire_ready_after_exit()
+                .unwrap();
         }
+        assert!(
+            changed_role
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .retire_ready_after_exit()
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .input_custody(actor(), changed_input)
+                .unwrap()
+                .is_none()
+        );
         assert!(progress_receipts.iter().all(|receipt| receipt.retired()));
         let idle_roles = ordinary
             .iter()
@@ -3901,3 +4037,12 @@ fn failed_tail_keeps_a_ready_credit_until_the_original_publisher_exits() {
     f.input.retire_stream(f.key).unwrap();
     f.finish();
 }
+
+#[path = "observation_tests/native_blackhole.rs"]
+mod native_blackhole;
+
+#[path = "observation_tests/native_unread.rs"]
+mod native_unread;
+
+#[path = "observation_tests/oversized_receive.rs"]
+mod oversized_receive;

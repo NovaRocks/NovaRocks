@@ -285,6 +285,10 @@ impl ElasticPlanningPool {
                 let (sender, receiver) = mpsc::channel();
                 let pool = Arc::clone(self);
                 before_spawn();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "The elastic CPU pool owns and joins this worker; the original queued job and completion receipt remain with that pool."
+                )]
                 let spawned = std::thread::Builder::new()
                     .name(format!("novarocks-query-planning-{id}"))
                     // Planning traverses nested SQL trees on this worker,
@@ -1555,6 +1559,10 @@ mod tests {
             let gate = Arc::clone(&gate);
             let active = Arc::clone(&active);
             let executor = executor.clone();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This test owns and joins its concurrent probe so the original CPU job and worker exit can be checked independently."
+            )]
             work.push(tokio::spawn(async move {
                 executor
                     .run(move || {
@@ -1650,6 +1658,10 @@ mod tests {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let cancellation = QueryCancellationSource::new();
         let ran = Arc::new(AtomicUsize::new(0));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This test owns and joins its concurrent probe so the original CPU job and worker exit can be checked independently."
+        )]
         let running = tokio::spawn({
             let executor = executor.clone();
             let gate = Arc::clone(&gate);
@@ -1721,6 +1733,10 @@ mod tests {
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
             let executor = executor.clone();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This test owns and joins its concurrent probe so the original CPU job and worker exit can be checked independently."
+            )]
             work.push(tokio::spawn(async move {
                 executor
                     .execute(move || {

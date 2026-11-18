@@ -18,6 +18,7 @@
 //! Route the original Abort through Native. Only explicit logical-owner
 //! failure gives this attempt authority to issue stand-down operations.
 
+use crate::port_output::{AbortIssueSettlement, AttemptToLogicalBody};
 use crate::{
     capacity::StepContext,
     effect::{EffectBody, OperationIntent, QueuedInputPayload},
@@ -26,10 +27,7 @@ use crate::{
     input::{AckPayload, OperationObservation, QueuedInputGrantRef, SendGeneration},
     operation::OperationDispatchResult,
 };
-use novarocks_coordination_contract::{
-    ABORT_RETRY_BACKOFF, AbortIssueSettlement, AttemptActionId, AttemptToLogicalBody,
-    MonotonicInstant,
-};
+use novarocks_coordination_contract::{ABORT_RETRY_BACKOFF, AttemptActionId, MonotonicInstant};
 use novarocks_execution_contract::{
     AbortCause, AbortParticipation, OperationKind, OperationOutcome, ParticipationRef,
     ParticipationState, TaskOperationId,

@@ -486,6 +486,10 @@ mod tests {
     fn a_deposit_slip_reaches_the_same_account() {
         let sink = ReadAccessSink::new();
         let slip = sink.deposits();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This test owns and joins the concurrent access transfer so the original account and caller remain observable."
+        )]
         std::thread::spawn(move || {
             slip.deposit(ProviderReadOccurrenceId::new(5), an_access())
                 .expect("open sink")
@@ -501,6 +505,10 @@ mod tests {
         let slip = sink.deposits();
         assert!(sink.into_taken().is_empty());
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This test owns and joins the concurrent access transfer so the original account and caller remain observable."
+        )]
         let access = std::thread::spawn(move || {
             slip.deposit(ProviderReadOccurrenceId::new(5), an_access())
                 .expect_err("closed plan owner must reject a late read")
@@ -519,6 +527,10 @@ mod tests {
             let slip = sink.deposits();
             let barrier = Arc::new(Barrier::new(2));
             let depositor_barrier = Arc::clone(&barrier);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This test owns and joins the concurrent access transfer so the original account and caller remain observable."
+            )]
             let depositor = std::thread::spawn(move || {
                 depositor_barrier.wait();
                 slip.deposit(ProviderReadOccurrenceId::new(5), an_access())

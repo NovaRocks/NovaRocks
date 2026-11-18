@@ -15,18 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Query Application-owned attempt scheduling and Native drive authority.
+//! Query Application-owned frozen attempt scheduling facts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
-use novarocks_execution_contract::{
-    AcquireParticipationAdmissionTicket, EstablishParticipation, ExchangeEdgeId, ParticipationRef,
-    TaskIdentity,
-};
-use novarocks_types::NativeCompatibilityId;
+use novarocks_execution_contract::{ExchangeEdgeId, ParticipationRef, TaskIdentity};
 use novarocks_types::identity::{
     BackendProcessId, FrontendProcessId, QueryExecutionId, StageId, TaskId,
 };
@@ -35,13 +31,6 @@ use crate::api::{
     ExecutionSchedulingFacts, NativeScanWork, PlanScanIdentity, RuntimeSplitPlacement,
     ScanSchedulingFacts, SchedulingStreamKind,
 };
-
-use super::{
-    AdmissionIssueDisposition, AdmissionIssueReceipt, AdmissionIssueSettlement,
-    EstablishIssuePermit, LogicalExecutionActorError, RunningAttemptDriveAuthority,
-    RunningAttemptPermit,
-};
-use novarocks_coordination_contract::AttemptActivationIdentity;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AttemptScheduleError(Arc<str>);
@@ -724,103 +713,6 @@ fn take_exchange_edge_id(next: &mut Option<u32>) -> Result<ExchangeEdgeId, Attem
         .map_err(|error| AttemptScheduleError::new(error.to_string()))?;
     *next = current.checked_add(1);
     Ok(edge_id)
-}
-
-/// Narrow Native capability for actor-owned admission and Establish effects.
-///
-/// The running permit remains private to the Supervisor. This capability has
-/// no terminal or result-delivery authority and becomes stale when that permit
-/// is consumed.
-#[derive(Clone)]
-pub struct NativeAttemptDrive {
-    authority: RunningAttemptDriveAuthority,
-}
-
-impl fmt::Debug for NativeAttemptDrive {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("NativeAttemptDrive")
-            .field("identity", &self.authority.identity())
-            .finish_non_exhaustive()
-    }
-}
-
-impl NativeAttemptDrive {
-    pub(crate) fn new(permit: &RunningAttemptPermit) -> Self {
-        Self {
-            authority: permit.native_drive_authority(),
-        }
-    }
-
-    pub fn identity(&self) -> AttemptActivationIdentity {
-        self.authority.identity()
-    }
-
-    /// Original activation-time configuration for metadata pricing. This
-    /// historical fact needs no actor query and grants no live/retry authority.
-    pub fn authorization_limits(
-        &self,
-    ) -> novarocks_coordination_contract::AttemptAuthorizationLimits {
-        self.authority.authorization_limits()
-    }
-
-    /// Ask the current logical owner whether this exact refusal may wait for
-    /// independent process-replacement evidence within its ORIGINAL horizon.
-    /// A positive answer grants no retry, topology, terminal, or exit authority;
-    /// callers must ask again before continuing a pending observation. Refusal
-    /// or a stale drive leaves the original failure unchanged.
-    pub async fn may_observe_pre_ready_replacement(
-        &self,
-        refusal: &crate::execution_error::ExecutionFailureInput,
-    ) -> Result<bool, LogicalExecutionActorError> {
-        self.authority
-            .may_observe_pre_ready_replacement(refusal)
-            .await
-    }
-
-    /// Atomically observe the same current QA policy and register its changes.
-    /// The receiver carries hints only; callers re-query before each continued
-    /// process observation. Only original predicate changes notify it.
-    pub async fn observe_pre_ready_replacement(
-        &self,
-        refusal: &crate::execution_error::ExecutionFailureInput,
-    ) -> Result<super::PreReadyReplacementObservation, LogicalExecutionActorError> {
-        self.authority.observe_pre_ready_replacement(refusal).await
-    }
-
-    pub async fn begin_admission_issue(
-        &self,
-        request: AcquireParticipationAdmissionTicket,
-    ) -> Result<AdmissionIssueReceipt, LogicalExecutionActorError> {
-        self.authority.begin_admission_issue(request).await
-    }
-
-    pub async fn settle_admission_issue(
-        &self,
-        issue: AdmissionIssueReceipt,
-        settlement: AdmissionIssueSettlement,
-    ) -> Result<AdmissionIssueDisposition, LogicalExecutionActorError> {
-        self.authority
-            .settle_admission_issue(issue, settlement)
-            .await
-    }
-
-    pub async fn authorize_establish(
-        &self,
-        request: Arc<EstablishParticipation>,
-        native_compatibility_id: NativeCompatibilityId,
-    ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
-        self.authority
-            .authorize_establish(request, native_compatibility_id)
-            .await
-    }
-
-    pub async fn reauthorize_establish(
-        &self,
-        participation: ParticipationRef,
-    ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
-        self.authority.reauthorize_establish(participation).await
-    }
 }
 
 #[cfg(test)]

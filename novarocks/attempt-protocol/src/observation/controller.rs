@@ -551,6 +551,54 @@ mod tests {
     use super::*;
     use crate::input::{ReadPauseCoverage, ReceptionCoverage};
     use std::time::Duration;
+    #[test]
+    fn generation_overflow_is_sticky_before_any_original_spawn() {
+        let participation = crate::test_support::remote(1).participation();
+        let mut original = CoveredSubscription::new(participation, IdSeed::new(100, 1), 2).unwrap();
+        original.activate();
+        let last = generation(u64::MAX);
+        assert_eq!(
+            original.drive(at(0), last, None).unwrap(),
+            Some(SubscriptionDirective::Open { generation: last })
+        );
+        original.reconcile(at(0));
+        assert_eq!(
+            original.drive(at(0), last, None).unwrap(),
+            Some(SubscriptionDirective::Close { generation: last })
+        );
+        assert_eq!(
+            original.drive(at(100), last, None).unwrap(),
+            None,
+            "the original local exit is still an independent input"
+        );
+        // Pure policy input only; this unit test launches no native job and
+        // cannot claim a physical Join from this passive fact.
+        original.observe_actual_exit(last).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                original.drive(at(100), last, None).unwrap_err(),
+                TaskExecutionError::Schedule("covered stream generation exhausted".into())
+            );
+            assert_eq!(original.generation(), Some(last));
+            assert_eq!(
+                original.status(),
+                SubscriptionStatus::Backoff { until: at(0) }
+            );
+        }
+    }
+
+    #[test]
+    fn a_subscription_needs_a_nonzero_error_budget() {
+        let participation = crate::test_support::remote(1).participation();
+        let error = CoveredSubscription::new(participation, IdSeed::new(100, 1), 0)
+            .expect_err("an unbounded retry policy must fail before activation or I/O");
+        assert_eq!(
+            error,
+            TaskExecutionError::Schedule(
+                "covered subscription error budget must be nonzero".into()
+            )
+        );
+    }
     fn at(ms: u64) -> MonotonicInstant {
         MonotonicInstant::from_origin(Duration::from_millis(ms))
     }

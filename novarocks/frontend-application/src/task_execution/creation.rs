@@ -443,12 +443,6 @@ impl TaskCreationSeed {
         &self.split_plan_nodes
     }
 
-    /// The edges this task produces on, which all start closed.
-    #[cfg(test)]
-    pub(crate) fn outbound_edges(&self) -> &[ExchangeEdgeId] {
-        self.view.outbound()
-    }
-
     pub(crate) const fn fragment(&self) -> &Arc<FragmentArtifact> {
         &self.fragment
     }
@@ -483,8 +477,6 @@ impl TaskCreationSeed {
     /// waits behind backpressure is never measured twice.
     #[cfg(test)]
     pub(crate) fn lengths(&self) -> Result<CreationLengths, TaskExecutionError> {
-        #[cfg(test)]
-        tests::record_pricing();
         crate::metrics::task_creation::create_priced();
         self.size_without_projection().map(|sizing| sizing.lengths)
     }
@@ -892,10 +884,6 @@ impl CreateTaskIntent {
         Arc::ptr_eq(&self.original, &other.original)
     }
     #[cfg(test)]
-    pub(crate) fn original_strong_count(&self) -> usize {
-        Arc::strong_count(&self.original)
-    }
-    #[cfg(test)]
     pub(crate) fn weak_original_lifetimes(
         &self,
     ) -> (
@@ -907,10 +895,6 @@ impl CreateTaskIntent {
         let original: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(&self.original) as _;
         let parts: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(&self.original.parts) as _;
         (Arc::downgrade(&original), Arc::downgrade(&parts))
-    }
-    #[cfg(test)]
-    pub(crate) fn same_parts(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.original.parts, &other.original.parts)
     }
 }
 /// The actual two Arc requested layouts created by freeze/replay ownership.
@@ -961,21 +945,10 @@ pub(crate) mod tests {
 
     thread_local! {
         static METADATA_FREEZES: Cell<usize> = const { Cell::new(0) };
-        static PRICINGS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn record_metadata_freeze() {
         METADATA_FREEZES.with(|count| count.set(count.get() + 1));
-    }
-
-    pub(super) fn record_pricing() {
-        PRICINGS.with(|count| count.set(count.get() + 1));
-    }
-
-    /// How many creations this thread has priced, which is how many times a
-    /// creation's metadata message was built only to be measured.
-    pub(crate) fn pricings_on_this_thread() -> usize {
-        PRICINGS.with(Cell::get)
     }
 
     /// How many creation metadata carriers this thread has frozen. Tests read

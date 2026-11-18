@@ -36,13 +36,6 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::QueryExecutionId;
 use std::sync::Arc;
-pub(crate) fn internal_count_description() -> (
-    FrozenExecutionDescription,
-    novarocks_query_application::api::PlanSeal,
-) {
-    internal_description(novarocks_result_contract::FrozenRootOutput::CountOnly)
-}
-
 /// Profile is an effect-free read that can replace its attempt only before
 /// the original actor accepts computation readiness. Statistics/Write fixtures
 /// keep their independently frozen NoRecovery contracts below.
@@ -52,6 +45,56 @@ pub(crate) async fn internal_profile_recovery_description(
     FrozenExecutionDescription,
     novarocks_query_application::api::PlanSeal,
 ) {
+    let completed = original_profile_completed_plan(scope).await;
+    let (candidate, access) = completed.into_parts();
+    drop(access);
+    original_profile_description(candidate)
+}
+
+/// The encoder and logical description share the SAME completed candidate and
+/// original access sidecar. No task graph, Root or Native acceptance is rebuilt.
+pub(crate) async fn internal_profile_recovery_encoded_description(
+    scope: &novarocks_workload_control::WorkScope,
+    carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
+    policy: novarocks_physical_plan::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<
+    (
+        FrozenExecutionDescription,
+        novarocks_query_application::api::PlanSeal,
+        crate::query_execution::physical_encoding::EncodedCompletedPlan,
+    ),
+    novarocks_plan_codec::PhysicalEncodeError,
+> {
+    let completed = original_profile_completed_plan(scope).await;
+    let (description, plan) = original_profile_description(completed.candidate().clone());
+    let encoded = crate::query_execution::physical_encoding::encode_completed_plan_for_test(
+        completed, carrier, policy, None, control,
+    )?;
+    Ok((description, plan, encoded))
+}
+
+async fn original_profile_completed_plan(
+    scope: &novarocks_workload_control::WorkScope,
+) -> novarocks_query_application::preparation::CompletedPlanWithAccess<
+    crate::query_execution::provider_read_facts::FrozenProviderRead,
+> {
+    original_literal_completed_plan(
+        scope,
+        novarocks_result_contract::FrozenRootOutput::CountOnly,
+    )
+    .await
+}
+
+/// A real SQL completion/journal for the finite transport/consumer component.
+/// The peer supplies domain frames; SELECT 1 is not a Statistics/TableWriter
+/// physical implementation, a Worker execution or an M5 fixture.
+async fn original_literal_completed_plan(
+    scope: &novarocks_workload_control::WorkScope,
+    root_output: novarocks_result_contract::FrozenRootOutput,
+) -> novarocks_query_application::preparation::CompletedPlanWithAccess<
+    crate::query_execution::provider_read_facts::FrozenProviderRead,
+> {
     use novarocks_physical_plan::{
         MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
     };
@@ -64,16 +107,16 @@ pub(crate) async fn internal_profile_recovery_description(
         SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
         noop_constant_evaluator,
     };
-    struct LiteralProfileFacts;
+    struct LiteralSqlComponentFacts;
     #[async_trait::async_trait]
-    impl SqlCompletionFactSource for LiteralProfileFacts {
-        type Access = ();
+    impl SqlCompletionFactSource for LiteralSqlComponentFacts {
+        type Access = crate::query_execution::provider_read_facts::FrozenProviderRead;
         async fn resolve(
             &self,
             _: &SqlNeedBatch,
-            _: &ReadAccessSink<()>,
+            _: &ReadAccessSink<Self::Access>,
         ) -> Result<SqlFactBatch, novarocks_sql::compiler::SqlCompileError> {
-            panic!("the literal Profile fixture requires no external facts")
+            panic!("the literal SQL component requires no external facts")
         }
     }
     let version = PlanVersionId::try_new([151; 16]).unwrap();
@@ -108,16 +151,27 @@ pub(crate) async fn internal_profile_recovery_description(
         },
         DEFAULT_COMPLETION_LIMITS,
     );
-    let completed = FinalPlanCompletionDriver::new(Arc::new(LiteralProfileFacts))
+    FinalPlanCompletionDriver::new(Arc::new(LiteralSqlComponentFacts))
         .complete_for_test(request, scope)
         .await
-        .expect("the original literal SQL Profile plan completes without external facts")
-        .freeze_root_output(novarocks_result_contract::FrozenRootOutput::CountOnly)
-        .expect("freeze only the original SQL root carrier as CountOnly");
-    // freeze_root_output preserves the compiler's original public result
-    // declaration. A CountOnly wire carrier is not an empty SQL Read schema.
-    let (candidate, access) = completed.into_parts();
-    drop(access);
+        .expect("the original literal SQL component completes without external facts")
+        .freeze_root_output(root_output)
+        .unwrap_or_else(|(error, original_access)| {
+            // No Debug requirement on opaque Provider capabilities. This
+            // original literal fixture has no external read sidecar entries.
+            drop(original_access);
+            panic!("freeze the original SQL component carrier: {error:?}");
+        })
+}
+
+fn original_profile_description(
+    candidate: CompletedPhysicalPlanCandidate,
+) -> (
+    FrozenExecutionDescription,
+    novarocks_query_application::api::PlanSeal,
+) {
+    // CountOnly retains the compiler's original public SQL result declaration.
+    let version = candidate.plan().version();
     let output =
         OutputContract::from_completed_candidate(QueryExecutionKind::Read, &candidate).unwrap();
     let description = FrozenExecutionDescription::for_completed_plan(
@@ -139,13 +193,96 @@ pub(crate) async fn internal_profile_recovery_description(
     (description, plan)
 }
 
+/// Original structural candidate for pure frozen-contract consumer tests.
+/// The encoded component uses the same source through the pure package validators.
+pub(crate) fn internal_statistics_description_with_candidate() -> (
+    FrozenExecutionDescription,
+    novarocks_query_application::api::PlanSeal,
+    CompletedPhysicalPlanCandidate,
+) {
+    internal_description_with_recovery_and_candidate(
+        novarocks_result_contract::FrozenRootOutput::InternalFacts(
+            novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
+        ),
+        QueryExecutionKind::Statistics,
+        ExecutionEffect::None,
+        RecoveryMode::NoRecovery,
+    )
+}
+
+/// Seal the SAME original structural component through the existing pure
+/// package validators. No SQL source journal or provider access is fabricated.
+pub(crate) fn internal_statistics_encoded_description(
+    carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<
+    (
+        FrozenExecutionDescription,
+        novarocks_query_application::api::PlanSeal,
+        crate::fixtures::native_recipe::RecipeRoot,
+    ),
+    crate::query_execution::package_freeze::PackageFreezeError,
+> {
+    freeze_internal_fixture_description(
+        internal_statistics_description_with_candidate(),
+        carrier,
+        control,
+    )
+}
+
+/// The original PreparedWriteCommitV1 component remains External/NoRecovery.
+/// Its declared protocol writer roles are not a real TableWriter/M5 claim.
+pub(crate) fn internal_write_encoded_description(
+    carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<
+    (
+        FrozenExecutionDescription,
+        novarocks_query_application::api::PlanSeal,
+        crate::fixtures::native_recipe::RecipeRoot,
+    ),
+    crate::query_execution::package_freeze::PackageFreezeError,
+> {
+    let original = internal_description_with_recovery_and_candidate(
+        novarocks_result_contract::FrozenRootOutput::InternalFacts(
+            novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+        ),
+        QueryExecutionKind::Write,
+        ExecutionEffect::External,
+        RecoveryMode::NoRecovery,
+    );
+    freeze_internal_fixture_description(original, carrier, control)
+}
+
+fn freeze_internal_fixture_description(
+    original: (
+        FrozenExecutionDescription,
+        novarocks_query_application::api::PlanSeal,
+        CompletedPhysicalPlanCandidate,
+    ),
+    carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<
+    (
+        FrozenExecutionDescription,
+        novarocks_query_application::api::PlanSeal,
+        crate::fixtures::native_recipe::RecipeRoot,
+    ),
+    crate::query_execution::package_freeze::PackageFreezeError,
+> {
+    let (description, plan, candidate) = original;
+    let root = crate::fixtures::native_recipe::RecipeRoot::from_structural_component(
+        &candidate, plan, carrier, control,
+    )?;
+    Ok((description, plan, root))
+}
+
 pub(crate) fn internal_statistics_description() -> (
     FrozenExecutionDescription,
     novarocks_query_application::api::PlanSeal,
 ) {
-    internal_description(novarocks_result_contract::FrozenRootOutput::InternalFacts(
-        novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
-    ))
+    let (description, plan, _candidate) = internal_statistics_description_with_candidate();
+    (description, plan)
 }
 
 pub(crate) fn internal_write_description() -> (
@@ -158,19 +295,6 @@ pub(crate) fn internal_write_description() -> (
         ),
         QueryExecutionKind::Write,
         ExecutionEffect::External,
-    )
-}
-
-fn internal_description(
-    root_output: novarocks_result_contract::FrozenRootOutput,
-) -> (
-    FrozenExecutionDescription,
-    novarocks_query_application::api::PlanSeal,
-) {
-    internal_description_with_policy(
-        root_output,
-        QueryExecutionKind::Statistics,
-        ExecutionEffect::None,
     )
 }
 
@@ -193,6 +317,21 @@ fn internal_description_with_recovery(
 ) -> (
     FrozenExecutionDescription,
     novarocks_query_application::api::PlanSeal,
+) {
+    let (description, plan, _candidate) =
+        internal_description_with_recovery_and_candidate(root_output, kind, effect, recovery);
+    (description, plan)
+}
+
+fn internal_description_with_recovery_and_candidate(
+    root_output: novarocks_result_contract::FrozenRootOutput,
+    kind: QueryExecutionKind,
+    effect: ExecutionEffect,
+    recovery: RecoveryMode,
+) -> (
+    FrozenExecutionDescription,
+    novarocks_query_application::api::PlanSeal,
+    CompletedPhysicalPlanCandidate,
 ) {
     use novarocks_physical_plan::{
         FragmentBuilder, FragmentId, FragmentSink, OutputPort, PipelineDopDomain, PlanBuilder,
@@ -242,7 +381,7 @@ fn internal_description_with_recovery(
     let output = OutputContract::from_completed_candidate(kind, &candidate).unwrap();
     let description = FrozenExecutionDescription::for_completed_plan(
         kind,
-        candidate,
+        candidate.clone(),
         Vec::new(),
         output,
         effect,
@@ -258,7 +397,7 @@ fn internal_description_with_recovery(
         PlanVersionId::try_new([151; 16]).unwrap(),
     );
     assert!(description.matches_plan_seal(plan));
-    (description, plan)
+    (description, plan, candidate)
 }
 
 /// One actual table via the original lifecycle author, never a re-created

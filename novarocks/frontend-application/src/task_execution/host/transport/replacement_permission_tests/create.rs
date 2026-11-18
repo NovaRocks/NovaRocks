@@ -43,8 +43,6 @@ async fn rejected_create(case: CreateCase) {
     let mut start = start();
     let task = start.plan.graph.root;
     let participation = *start.plan.establish_material.keys().next().unwrap();
-    let execution = participation.query_execution_id();
-    let compatibility = start.plan.compatibility;
     let facts = AttemptEstablishFacts::freeze(
         Default::default(),
         [(participation.backend_process_id(), Default::default())],
@@ -57,72 +55,10 @@ async fn rejected_create(case: CreateCase) {
         AttemptEstablishMaterial::project(&facts, [participation], &mut payload).unwrap();
     start.plan.establish_material = quotes;
 
-    let workload = WorkloadControl::try_new(
-        WorkloadConfig::default(),
-        ResourceConfig {
-            total_bytes: 1 << 20,
-            control_bytes: 1 << 12,
-            per_scope_bytes: 1 << 18,
-        },
-    )
-    .unwrap();
-    workload.mark_ready().unwrap();
-    let work = workload
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    let scope = work.owner.scope();
-    let stage = scope.try_acquire(Stage::Execution).unwrap();
-    let roster = vec![participation];
-    let two = NonZeroUsize::new(2).unwrap();
-    let config = if case == CreateCase::NoRecovery {
-        LogicalExecutionActorConfig::single_attempt_completion(
-            execution,
-            ExecutionEffect::None,
-            two,
-            roster.clone(),
-            two,
-            two,
-            work.owner,
-            stage,
-        )
-    } else {
-        let profile = ClientRowProfile::try_new(
-            RootProfileV1::SEGMENT_BYTES,
-            RootProfileV1::ROW_PAYLOAD_BYTES,
-        )
-        .unwrap();
-        LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
-            execution,
-            two,
-            roster.clone(),
-            two,
-            two,
-            NonZeroU32::new(2).unwrap(),
-            Arc::new(NoSuccessor(tokio::sync::watch::channel(0).0)),
-            work.owner,
-            stage,
-            Duration::from_secs(30),
-            ResultSchema::new(Vec::new()),
-            NonZeroUsize::MIN,
-            ResultRowCarrier::relayed(RootOutputKind::ClientRows, Some(profile)).unwrap(),
-        )
-    }
-    .unwrap()
-    .with_abort_participation_effect_port(LogicalAbortRouter::new(), two);
-    let mut logical = LogicalExecutionTestHarness::install(
-        tokio::runtime::Handle::current(),
-        config,
-        execution,
-        roster,
-    )
-    .unwrap();
-    let activation = logical.activate_initial().await.unwrap();
-    let drive = Arc::new(logical.native_attempt_drive());
-    start.activation.identity = activation;
-    start.plan.authorization_limits = drive.authorization_limits();
-    let bridge = AttemptQaBridge::new(drive, compatibility, Arc::new(material));
+    let owner = PermissionOwner::new(&mut start, case != CreateCase::NoRecovery).await;
+    let activation = start.activation.identity;
     let clock = Arc::new(SampleClock::default());
-    let mut cut = Cut::new(start, clock.clone(), bridge);
+    let mut cut = Cut::new(start, clock.clone(), owner, Arc::new(material));
 
     let endpoint = RuntimeEndpoint::new("127.0.0.1", 19091).unwrap();
     let probe = Arc::new(ProcessProbe {
@@ -140,7 +76,6 @@ async fn rejected_create(case: CreateCase) {
         }]),
         clock.clone(),
     );
-    let outbox = TerminalOutbox::new(activation);
     let Refusal {
         ticket,
         establish,
@@ -153,31 +88,13 @@ async fn rejected_create(case: CreateCase) {
     let ticket_duration = ticket.valid_for().get();
     assert_eq!(ticket_duration, Duration::from_secs(10));
 
-    loop {
-        if let Some(snapshot) = logical.establish_snapshot(participation).await.unwrap()
-            && snapshot.state() == EstablishIssueState::TransportUnknown
-        {
-            let exact = snapshot.identity().unwrap();
-            assert_eq!(exact.activation(), activation);
-            assert_eq!(exact.participation(), participation);
-            assert_eq!(exact.operation_id(), establish);
-            assert_eq!(snapshot.ticket(), ticket);
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(logical.actor_snapshot().await.unwrap().conclusion, None);
-
+    cut.assert_original_settlement(
+        participation,
+        establish,
+        novarocks_coordination_contract::AttemptIssueSettlement::TransportUnknown,
+        ticket,
+    );
     let may_observe = case != CreateCase::NoRecovery;
-    if !may_observe {
-        assert!(
-            !logical
-                .native_attempt_drive()
-                .may_observe_pre_ready_replacement(&expected)
-                .await
-                .unwrap()
-        );
-    }
     let permission = cut.permission(port, may_observe).await;
     let mut waiting_reads = 0;
     let effect = if may_observe {
@@ -205,10 +122,8 @@ async fn rejected_create(case: CreateCase) {
         waiting_reads = probe.reads.load(Ordering::SeqCst);
         let horizon = MonotonicInstant::ORIGIN.saturating_add(ticket_duration);
         assert_eq!(cut.core.next_deadline(), Some(horizon));
-        {
-            let mut terminal = Box::pin(outbox.terminal());
-            assert!(futures::poll!(terminal.as_mut()).is_pending());
-        }
+        assert!(cut.round_failure.is_some());
+        cut.owner.assert_unconcluded();
 
         if case == CreateCase::Replacement {
             clock.set_seconds(4);
@@ -258,11 +173,18 @@ async fn rejected_create(case: CreateCase) {
     };
     let terminal = terminal_port(effect);
     assert_eq!(terminal.activation, activation);
-    let publication = TerminalPublication::new(terminal);
-    assert!(publication.host_reference().is_none());
-    assert!(outbox.publish(Box::new(publication)).is_ok());
-    let NativeAttemptTerminal::Failed(failure) = outbox.terminal().await.unwrap() else {
-        panic!("original Create refusal");
+    let projected = novarocks_attempt_protocol::port_projection::project_attempt_message(
+        &terminal,
+        &mut |_| panic!("no Host failure reference"),
+        &mut |_, _| None,
+        &mut |_, _, _| None,
+    )
+    .unwrap();
+    let novarocks_coordination_contract::logical_port::AttemptToLogicalBody::AttemptTerminal(
+        novarocks_coordination_contract::logical_port::AttemptTerminal::Failed(failure),
+    ) = &projected.body
+    else {
+        panic!("the original Create refusal remains the passive terminal");
     };
     assert_eq!(failure.input(), &expected);
     assert_eq!(
@@ -295,33 +217,9 @@ async fn rejected_create(case: CreateCase) {
             assert_eq!(probe.reads.load(Ordering::SeqCst), waiting_reads);
         }
     }
-    assert_eq!(
-        outbox.terminal().await.unwrap(),
-        NativeAttemptTerminal::Failed(failure)
-    );
-
-    drop(cut);
-    logical.abandon_running_attempt();
-    while logical
-        .stand_down_snapshot(participation)
-        .await
-        .unwrap()
-        .is_none()
-    {
-        tokio::task::yield_now().await;
-    }
-    logical
-        .observe_worker_process_replaced(participation)
-        .await
-        .unwrap();
-    work.business.release();
-    logical
-        .finish_until(Instant::now() + Duration::from_secs(2))
-        .await
-        .unwrap();
-    scope.wait_released().await;
-    workload.close_admission();
-    assert!(workload.shutdown().is_ok());
+    // The final terminal is one owned passive message, with no mutable old
+    // outbox/watch to reread or reconstruct through a compatibility API.
+    cut.owner.finish().await;
 }
 
 fn exact_permission_query(
@@ -449,7 +347,7 @@ async fn create_refusal(
     let decided = cut.native(ExecutorFact::Operation(refused));
     let query = cut.advance(decided).await.unwrap();
     assert_eq!(cut.round_failure, Some(original.clone()));
-    let port = exact_permission_query(query, cut.qa.activation(), &original);
+    let port = exact_permission_query(query, cut.owner.activation(), &original);
     Refusal {
         ticket,
         establish: establish_id,

@@ -372,6 +372,7 @@ impl QueryTaskExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod original_feedback;
     use crate::{
         execution::StatusReport, failure::HostFailureRef, test_support::execution_with_strict_input,
     };

@@ -28,7 +28,6 @@ use super::{
     membership::AttemptMembershipSource,
     metrics::FrontendHostObservations,
 };
-use crate::task_execution::bridge::control::AttemptOwnerControlSource;
 use crate::task_execution::host::custody::{
     TransportRetirement, TransportRetirements, TransportSourceEvent,
 };
@@ -79,6 +78,25 @@ pub(crate) struct PreparedEffectJob {
     /// handing off the launch credential and original result to the executor.
     pub(crate) transport: Option<Box<TransportRetirement>>,
 }
+/// The actual binding destination of the original paid job. A retained
+/// request/metadata job has already moved into its Source's checked custody;
+/// it is never copied, replaced or reported as physically exited here.
+pub(crate) enum PreparedEffectBinding {
+    Job(PreparedEffectJob),
+    Retained {
+        /// The same unlaunched Join owner enters this original Host's tracker
+        /// before another Source turn may submit the retained job. It is not a
+        /// start, result, Join or actual-exit receipt.
+        transport: Option<Box<TransportRetirement>>,
+    },
+}
+/// The SAME unlaunched retirement still belongs to an already-bound job.
+/// Returning it grants no Work start, new Join or publication success.
+pub(crate) type OriginalUntrackedTransport = (
+    Arc<super::transport_withdrawal::AttemptEffectEnvelope>,
+    Box<TransportRetirement>,
+);
+
 pub(crate) trait EffectExecutor: Send + Sync + 'static {
     /// A temporary refusal must arrange the original host's real availability
     /// wake before returning the full job. Retrying uses no timer or new Work.
@@ -119,12 +137,29 @@ pub(crate) trait EffectSource: Send + 'static {
     ) -> Result<PreparedEffectJob, EffectBindRefusal> {
         Ok(self.bind_job(runtime, turn, ticket, result))
     }
+    /// Bind the same original once. Retained is valid only after the complete
+    /// original job is in Source custody and its current-ticket publication
+    /// has committed. Dispatcher/transport-owned tails still use Job. This
+    /// bounded metadata step grants no Work start, result or exit certificate.
+    fn try_bind_effect(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        turn: &ActorHostTurn<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: CausalInputObligation<FrontendActor>,
+    ) -> Result<PreparedEffectBinding, EffectBindRefusal> {
+        self.try_bind_job(runtime, turn, ticket, result)
+            .map(PreparedEffectBinding::Job)
+    }
     fn owner_failed_binding(
         &mut self,
         ticket: EffectTicket<FrontendEffect>,
         refused: EffectBindRefusal,
-    ) {
+    ) -> Option<OriginalUntrackedTransport> {
         std::panic::resume_unwind(Box::new((ticket, refused)));
+    }
+    fn owner_failed_transport_refused(&mut self, original: OriginalUntrackedTransport) {
+        self.retain_transport_failure(Box::new(original));
     }
     fn retain_transport_failure(&mut self, original: Box<dyn Any + Send>) {
         std::panic::resume_unwind(original);
@@ -239,6 +274,17 @@ pub(crate) struct FrontendLanePolicy {
     pub(crate) per_step_inventory: usize,
 }
 impl FrontendLanePolicy {
+    pub(crate) fn logical(per_step_inventory: usize) -> Self {
+        Self {
+            per_step_inventory,
+            lane: |effect| match effect {
+                FrontendEffect::Logical(effect) => {
+                    Some(FrontendLaneKey::Logical(effect.body.lane().into()))
+                }
+                _ => None,
+            },
+        }
+    }
     pub(crate) fn attempt(per_step_inventory: usize) -> Self {
         use novarocks_attempt_protocol::effect::EffectBody;
         Self {
@@ -313,7 +359,7 @@ struct HostMachine {
     startup: Option<crate::task_execution::host::startup::AttemptStartupSource>,
     capacity: Option<AttemptCapacitySource>,
     membership: Option<AttemptMembershipSource>,
-    owner_controls: Option<AttemptOwnerControlSource>,
+    local_exit: Option<crate::task_execution::host::port::local_exit::LocalExitInputObligation>,
     funding: Option<AttemptHostFunding>,
     // A finite pass over original ready markers survives host-budget yield.
     // Resetting this to ready.len() on every turn would busy-loop when all
@@ -329,6 +375,9 @@ struct HostMachine {
     timer_source_closed: bool,
 }
 struct HostEntry {
+    logical_identity: Option<novarocks_coordination_contract::LogicalExecutionActorId>,
+    // Retain the same original inventory through the host's actual exit.
+    _logical_links: Option<Arc<super::logical::links::LogicalAttemptLinks>>,
     scope: ScopeHandle,
     registration: ActorRegistration,
     kind: FrontendActorKind,
@@ -363,6 +412,11 @@ pub(crate) struct HostExit {
     exited: watch::Receiver<bool>,
 }
 impl HostExit {
+    /// Read-only observation of the same Actor and Scope removal. A copied
+    /// receiver grants neither closure authority nor a substitute exit fact.
+    pub(crate) fn observe_actual_exit(&self) -> watch::Receiver<bool> {
+        self.exited.clone()
+    }
     pub(crate) fn matches(&self, registration: &ActorRegistration) -> bool {
         self.registration.same_registration(registration)
     }
@@ -396,7 +450,8 @@ pub(crate) struct HostBinding {
     pub(crate) startup: Option<crate::task_execution::host::startup::AttemptStartupSource>,
     pub(crate) capacity: Option<AttemptCapacitySource>,
     pub(crate) membership: Option<AttemptMembershipSource>,
-    pub(crate) owner_controls: Option<AttemptOwnerControlSource>,
+    pub(crate) local_exit:
+        Option<crate::task_execution::host::port::local_exit::LocalExitInputObligation>,
 }
 #[allow(
     dead_code,
@@ -410,6 +465,7 @@ pub(crate) struct HostRegistrationRefusal {
 struct RegistryState {
     open: bool,
     entries: BTreeMap<ScopeId, Arc<HostEntry>>,
+    logical_routes: BTreeMap<u64, ScopeId>,
 }
 pub(crate) struct HostRegistry {
     runtime: ActorRuntime<FrontendActor>,
@@ -430,6 +486,7 @@ impl HostRegistry {
             state: Mutex::new(RegistryState {
                 open: true,
                 entries: BTreeMap::new(),
+                logical_routes: BTreeMap::new(),
             }),
             observations,
             changed: Notify::new(),
@@ -443,11 +500,76 @@ impl HostRegistry {
         self.register_with_funding(binding, &mut None)
     }
 
+    #[cfg(test)]
     pub(crate) fn register_with_funding(
         &self,
         binding: HostBinding,
         funding: &mut Option<AttemptHostFunding>,
     ) -> Result<HostExit, HostRegistrationRefusal> {
+        self.register_inner(binding, funding, None, None)
+    }
+    /// Store the SAME original exit capability before any notification can
+    /// leave this call. The destination belongs to the caller's stable install
+    /// custody; refusal returns the entire unpublished binding unchanged.
+    pub(crate) fn register_with_funding_in(
+        &self,
+        binding: HostBinding,
+        funding: &mut Option<AttemptHostFunding>,
+        destination: &mut Option<HostExit>,
+    ) -> Result<(), HostRegistrationRefusal> {
+        self.register_inner_in(binding, funding, None, None, destination)
+    }
+    pub(crate) fn contains_logical(
+        &self,
+        identity: novarocks_coordination_contract::LogicalExecutionActorId,
+    ) -> bool {
+        self.state
+            .lock()
+            .expect("frontend host registry lock")
+            .logical_routes
+            .contains_key(&identity.get())
+    }
+    pub(crate) fn register_logical(
+        &self,
+        binding: HostBinding,
+        identity: novarocks_coordination_contract::LogicalExecutionActorId,
+        links: Arc<super::logical::links::LogicalAttemptLinks>,
+    ) -> Result<HostExit, HostRegistrationRefusal> {
+        assert_eq!(binding.kind, FrontendActorKind::Logical);
+        self.register_inner(binding, &mut None, Some(identity), Some(links))
+    }
+    fn register_inner(
+        &self,
+        binding: HostBinding,
+        funding: &mut Option<AttemptHostFunding>,
+        logical_identity: Option<novarocks_coordination_contract::LogicalExecutionActorId>,
+        logical_links: Option<Arc<super::logical::links::LogicalAttemptLinks>>,
+    ) -> Result<HostExit, HostRegistrationRefusal> {
+        let mut original = None;
+        self.register_inner_in(
+            binding,
+            funding,
+            logical_identity,
+            logical_links,
+            &mut original,
+        )?;
+        Ok(original.expect("same original registered HostExit"))
+    }
+    fn register_inner_in(
+        &self,
+        binding: HostBinding,
+        funding: &mut Option<AttemptHostFunding>,
+        logical_identity: Option<novarocks_coordination_contract::LogicalExecutionActorId>,
+        logical_links: Option<Arc<super::logical::links::LogicalAttemptLinks>>,
+        destination: &mut Option<HostExit>,
+    ) -> Result<(), HostRegistrationRefusal> {
+        if destination.is_some() {
+            return Err(HostRegistrationRefusal {
+                reason: "original HostExit receiving slot is already occupied",
+                runtime_error: None,
+                binding,
+            });
+        }
         if !binding.registration.matches_scope(&binding.scope)
             || binding.transport.as_ref().is_some_and(|transport| {
                 !transport.matches_registration(&self.runtime, &binding.registration)
@@ -464,9 +586,9 @@ impl HostRegistry {
                 !membership.matches(&binding.registration) || binding.startup.is_none()
             })
             || binding
-                .owner_controls
+                .local_exit
                 .as_ref()
-                .is_some_and(|controls| !controls.matches(&binding.registration))
+                .is_some_and(|local| !local.matches(&binding.registration))
         {
             return Err(HostRegistrationRefusal {
                 reason: "original actor Scope binding differs",
@@ -578,7 +700,11 @@ impl HostRegistry {
             });
         }
         let mut state = self.state.lock().expect("frontend host registry lock");
-        if !state.open || state.entries.contains_key(&binding.scope.id()) {
+        if !state.open
+            || state.entries.contains_key(&binding.scope.id())
+            || logical_identity
+                .is_some_and(|identity| state.logical_routes.contains_key(&identity.get()))
+        {
             return Err(HostRegistrationRefusal {
                 reason: "frontend actor registration closed or duplicated",
                 runtime_error: None,
@@ -598,6 +724,8 @@ impl HostRegistry {
             original
         });
         let original = Arc::new(HostEntry {
+            logical_identity,
+            _logical_links: logical_links,
             scope: binding.scope,
             registration: binding.registration,
             kind: binding.kind,
@@ -615,7 +743,7 @@ impl HostRegistry {
                 startup: binding.startup,
                 capacity: binding.capacity,
                 membership: binding.membership,
-                owner_controls: binding.owner_controls,
+                local_exit: binding.local_exit,
                 funding,
                 scan_remaining: None,
                 rescan_requested: false,
@@ -634,18 +762,94 @@ impl HostRegistry {
             original: Arc::downgrade(&original),
             exited,
         };
+        if let Some(identity) = original.logical_identity {
+            assert!(
+                state
+                    .logical_routes
+                    .insert(identity.get(), original.scope.id())
+                    .is_none()
+            );
+        }
         state.entries.insert(original.scope.id(), original);
         drop(state);
+        *destination = Some(observed);
         if start_after_registration {
             self.runtime
-                .notify_host_actor(&observed.registration)
+                .notify_host_actor(
+                    &destination
+                        .as_ref()
+                        .expect("original exit was stored")
+                        .registration,
+                )
                 .expect("startup is scheduled on its installed original host");
         }
         self.changed.notify_waiters();
-        Ok(observed)
+        Ok(())
     }
     pub(super) fn observation_owners(&self) -> (&RuntimeLedger, &ActorRuntime<FrontendActor>) {
         (&self.ledger, &self.runtime)
+    }
+    /// Read only the same original logical headers. No machine, ledger, Core,
+    /// callback or Source is driven or reconstructed by an observation.
+    pub(super) fn try_logical_observation(
+        &self,
+    ) -> Result<
+        Option<super::metrics::LogicalProcessObservation>,
+        novarocks_control_runtime::observation::EffectObservationError,
+    > {
+        use novarocks_control_runtime::observation::EffectObservationError;
+        let entries = {
+            let state = match self.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(EffectObservationError::Poisoned);
+                }
+            };
+            state
+                .entries
+                .values()
+                .filter(|entry| entry.kind == FrontendActorKind::Logical)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut result = super::metrics::LogicalProcessObservation::default();
+        for entry in entries {
+            let Some(sample) = entry
+                ._logical_links
+                .as_ref()
+                .and_then(|links| links.try_logical_observation())
+            else {
+                return Ok(None);
+            };
+            let overflow = EffectObservationError::InventoryOverflow;
+            result.actors = result.actors.checked_add(1).ok_or(overflow)?;
+            result.completed_steps = result
+                .completed_steps
+                .checked_add(sample.completed_steps)
+                .ok_or(overflow)?;
+            result.last_step_effects = result
+                .last_step_effects
+                .checked_add(sample.last_step_effects)
+                .ok_or(overflow)?;
+            result.total_effects = result
+                .total_effects
+                .checked_add(sample.total_effects)
+                .ok_or(overflow)?;
+            result.max_step_effects = result.max_step_effects.max(sample.max_step_effects);
+            result.outstanding_actions = result
+                .outstanding_actions
+                .checked_add(sample.outstanding_actions)
+                .ok_or(overflow)?;
+            if let Some(deadline) = sample.next_deadline_ns {
+                result.next_deadline_ns = Some(
+                    result
+                        .next_deadline_ns
+                        .map_or(deadline, |previous| previous.min(deadline)),
+                );
+            }
+        }
+        Ok(Some(result))
     }
     /// One source per original HostMachine/runtime batch inventory. A host
     /// turn holding its machine or an unavailable runtime read returns Busy;
@@ -792,11 +996,16 @@ impl HostRegistry {
                     eprintln!("Frontend Scope retirement failed: {error:?}");
                     std::process::abort()
                 });
-            self.state
-                .lock()
-                .expect("frontend host registry lock")
-                .entries
-                .remove(&entry.scope.id());
+            {
+                let mut state = self.state.lock().expect("frontend host registry lock");
+                state.entries.remove(&entry.scope.id());
+                if let Some(identity) = entry.logical_identity {
+                    assert_eq!(
+                        state.logical_routes.remove(&identity.get()),
+                        Some(entry.scope.id())
+                    );
+                }
+            }
             entry.exit.send_replace(true);
         } else {
             *entry.machine.lock().expect("frontend host state lock") = Some(machine);
@@ -816,6 +1025,25 @@ impl HostRegistry {
     ) -> Result<HostProgress, HostError> {
         let mut budget = entry.budget;
         let mut handoffs = 0;
+        // A different owner can return a purpose position without retiring
+        // any work in this host. Preserve its original notification until
+        // the ready inventory receives a finite pass, even across budget cuts.
+        if turn.was_notified() {
+            machine.rescan_requested = true;
+        }
+        tracing::debug!(
+            actor = ?entry.registration.actor(),
+            scope = ?entry.scope.id(),
+            epoch = ?entry.registration.initial_epoch(),
+            ?now,
+            notified = turn.was_notified(),
+            budget,
+            scan_remaining = ?machine.scan_remaining,
+            rescan_requested = machine.rescan_requested,
+            ready_positions = machine.dispatch.ready_positions(),
+            pending_handoff = machine.pending.is_some(),
+            "Host ready turn entered"
+        );
         // Every dispatch observation can race the Core's real failure fence,
         // including indexing and defer after a Source callback. Preserve the
         // original custodian turn rather than escalating that race to abort.
@@ -936,9 +1164,12 @@ impl HostRegistry {
         let mut capacity_more = false;
         let source_closing = machine.source.result_admission_closed();
         let notifications_closing = source_closing || machine.local_sources_closing;
-        let attempt = entry.kind == FrontendActorKind::Attempt;
+        let hosted_timer = matches!(
+            entry.kind,
+            FrontendActorKind::Attempt | FrontendActorKind::Logical
+        );
         let mut timer_more = false;
-        if attempt {
+        if hosted_timer {
             let actor = entry.registration.actor();
             if (failed || source_closing) && !machine.timer_source_closed {
                 if budget == 0 {
@@ -1006,21 +1237,32 @@ impl HostRegistry {
                 budget -= units;
                 membership_more = membership.progress(failed, notifications_closing)?;
                 if membership.is_closed() {
-                    machine.membership = None;
+                    if !membership.has_original_errors() {
+                        machine.membership = None;
+                    } else if budget != 0 && machine.source.transport_retirement_ready() {
+                        budget -= 1;
+                        let original = membership.take_original_errors_after_exit().unwrap();
+                        machine.membership = None;
+                        machine.source.retain_transport_release(Box::new(original));
+                        membership_more = true;
+                    } else {
+                        membership_more = true;
+                    }
                 }
             }
         }
-        let mut controls_more = false;
-        if let Some(controls) = &mut machine.owner_controls
-            && controls.needs_progress(failed, source_closing)
+        let mut local_exit_more = false;
+        if let Some(local) = &mut machine.local_exit
+            && local.needs_progress(failed, source_closing)
         {
-            if budget < AttemptOwnerControlSource::VISIT_UNITS {
-                controls_more = true;
+            use crate::task_execution::host::port::local_exit::LocalExitInputObligation;
+            if budget < LocalExitInputObligation::VISIT_UNITS {
+                local_exit_more = true;
             } else {
-                budget -= AttemptOwnerControlSource::VISIT_UNITS;
+                budget -= LocalExitInputObligation::VISIT_UNITS;
                 let local_exited = !failed
                     && !source_closing
-                    && controls.waiting_for_local_exit()
+                    && local.waiting_for_local_exit()
                     && machine.capacity.is_none()
                     && machine.membership.is_none()
                     && machine.source.local_convergence_exited()
@@ -1035,9 +1277,9 @@ impl HostRegistry {
                         .as_ref()
                         .is_none_or(OrderedObservationHost::ready_for_close)
                     && self.runtime.snapshot(entry.registration.actor())?.inputs == 0;
-                controls_more = controls.progress(failed, source_closing, local_exited)?;
-                if controls.is_closed() {
-                    machine.owner_controls = None;
+                local_exit_more = local.progress(failed, source_closing, local_exited)?;
+                if local.is_closed() {
+                    machine.local_exit = None;
                 }
             }
         }
@@ -1049,18 +1291,18 @@ impl HostRegistry {
             "Source work uses the original finite host allowance"
         );
         budget -= retired.units;
-        controls_more |= retired.progressed
+        local_exit_more |= retired.progressed
             && machine
-                .owner_controls
+                .local_exit
                 .as_ref()
-                .is_some_and(AttemptOwnerControlSource::waiting_for_local_exit);
+                .is_some_and(|local| local.waiting_for_local_exit());
         // The original Source can finish admission in this progress call.
         // Schedule the remaining roles for their separate final visit.
         if !source_closing && machine.source.result_admission_closed() {
             capacity_more |= machine.capacity.is_some();
             membership_more |= machine.membership.is_some();
-            controls_more |= machine.owner_controls.is_some();
-            timer_more |= attempt && !machine.timer_source_closed;
+            local_exit_more |= machine.local_exit.is_some();
+            timer_more |= hosted_timer && !machine.timer_source_closed;
         }
         if let Some(transport) = transport {
             retired.progressed |= transport.progressed;
@@ -1097,9 +1339,9 @@ impl HostRegistry {
         retired.retired &= machine.startup.is_none()
             && machine.capacity.is_none()
             && machine.membership.is_none()
-            && machine.owner_controls.is_none();
+            && machine.local_exit.is_none();
         retired.more |=
-            startup_more || capacity_more || membership_more || controls_more || timer_more;
+            startup_more || capacity_more || membership_more || local_exit_more || timer_more;
         if retired.retired
             && matches!(
                 self.runtime
@@ -1129,7 +1371,7 @@ impl HostRegistry {
                     });
                 }
             }
-            if attempt
+            if hosted_timer
                 && (!machine.timer_source_closed
                     || self
                         .runtime
@@ -1192,7 +1434,7 @@ impl HostRegistry {
             ));
             budget -= indexed.units;
             indexed_this_turn = !indexed.inputs.is_empty();
-            if attempt
+            if hosted_timer
                 && !indexed.inputs.is_empty()
                 && let Some(timer) = self
                     .runtime
@@ -1218,8 +1460,9 @@ impl HostRegistry {
             if let Some(membership) = &mut machine.membership {
                 membership_more |= membership.index_committed(&indexed.inputs)?;
             }
-            if let Some(controls) = &mut machine.owner_controls {
-                controls_more |= controls.index_committed(&indexed.inputs)?;
+
+            if let Some(local) = &mut machine.local_exit {
+                local_exit_more |= local.index_committed(&indexed.inputs)?;
             }
             machine.source.core_consumed(&indexed.inputs);
             if !indexed.inputs.is_empty()
@@ -1227,6 +1470,10 @@ impl HostRegistry {
             {
                 transport.original_input_progress();
             }
+        }
+        if machine.scan_remaining.is_none() && machine.rescan_requested {
+            machine.scan_remaining = Some(machine.dispatch.ready_positions());
+            machine.rescan_requested = false;
         }
         while budget != 0 {
             if machine.pending.is_none() || handoff_refused {
@@ -1266,10 +1513,35 @@ impl HostRegistry {
                     }
                     Err(error) => return Err(error.into()),
                 };
+                let original = candidate.effect_ref();
                 let Some(metadata) = candidate.metadata() else {
+                    tracing::debug!(
+                        target: "novarocks_original_wait",
+                        process_id = std::process::id(),
+                        actor = ?entry.registration.actor(),
+                        input = ?original.input,
+                        action = ?original.action,
+                        budget,
+                        scan_remaining = ?machine.scan_remaining,
+                        rescan_requested = machine.rescan_requested,
+                        ready_positions = machine.dispatch.ready_positions(),
+                        "Host candidate runtime gate is not ready"
+                    );
                     original_dispatch!(machine.dispatch.defer_candidate(&candidate));
                     continue;
                 };
+                tracing::debug!(
+                    actor = ?entry.registration.actor(),
+                    input = ?original.input,
+                    action = ?original.action,
+                    kind = host_effect_kind(metadata),
+                    protocol_action = ?host_protocol_action(metadata),
+                    budget,
+                    scan_remaining = ?machine.scan_remaining,
+                    rescan_requested = machine.rescan_requested,
+                    ready_positions = machine.dispatch.ready_positions(),
+                    "Host ready candidate visited"
+                );
                 if let FrontendEffect::AttemptRootControlProcessed(input) = metadata {
                     if let Some(ticket) = original_dispatch!(
                         machine.dispatch.claim_candidate(&self.runtime, &candidate)
@@ -1324,14 +1596,14 @@ impl HostRegistry {
                         machine.local_sources_closing = true;
                         machine.source.begin_local_convergence();
                         machine
-                            .owner_controls
+                            .local_exit
                             .as_mut()
                             .expect("original local exit input author")
                             .request_local_exit();
                         self.runtime
                             .effect_completed(ticket)
                             .map_err(|refusal| HostError::Runtime(refusal.error))?;
-                        controls_more = true;
+                        local_exit_more = true;
                     } else {
                         original_dispatch!(machine.dispatch.defer_candidate(&candidate));
                     }
@@ -1358,6 +1630,17 @@ impl HostRegistry {
                     continue;
                 }
                 if machine.pending.is_some() || machine.source.result_admission_closed() {
+                    tracing::debug!(
+                        target: "novarocks_original_wait",
+                        process_id = std::process::id(),
+                        actor = ?entry.registration.actor(),
+                        input = ?original.input,
+                        action = ?original.action,
+                        kind = host_effect_kind(metadata),
+                        protocol_action = ?host_protocol_action(metadata),
+                        pending_handoff = machine.pending.is_some(),
+                        "Host candidate deferred by pending handoff or closed Source"
+                    );
                     original_dispatch!(machine.dispatch.defer_candidate(&candidate));
                     continue;
                 }
@@ -1367,10 +1650,34 @@ impl HostRegistry {
                         .as_ref()
                         .is_some_and(|transport| !transport.has_room())
                 {
+                    tracing::debug!(
+                        target: "novarocks_original_wait",
+                        process_id = std::process::id(),
+                        actor = ?entry.registration.actor(),
+                        input = ?original.input,
+                        action = ?original.action,
+                        kind = host_effect_kind(metadata),
+                        protocol_action = ?host_protocol_action(metadata),
+                        "Host candidate transport retirement inventory is full"
+                    );
                     original_dispatch!(machine.dispatch.defer_candidate(&candidate));
                     continue;
                 }
                 let Some(prepaid) = machine.source.prepay_result(metadata) else {
+                    tracing::debug!(
+                        target: "novarocks_original_wait",
+                        process_id = std::process::id(),
+                        actor = ?entry.registration.actor(),
+                        input = ?original.input,
+                        action = ?original.action,
+                        kind = host_effect_kind(metadata),
+                        protocol_action = ?host_protocol_action(metadata),
+                        budget,
+                        scan_remaining = ?machine.scan_remaining,
+                        rescan_requested = machine.rescan_requested,
+                        ready_positions = machine.dispatch.ready_positions(),
+                        "Host candidate Source prepayment is unavailable"
+                    );
                     // Rotate this same original marker, never its same-lane
                     // tail. An independent purpose may have its own paid role.
                     original_dispatch!(machine.dispatch.defer_candidate(&candidate));
@@ -1382,6 +1689,16 @@ impl HostRegistry {
                 let ticket = match machine.dispatch.claim_candidate(&self.runtime, &candidate) {
                     Ok(Some(ticket)) => ticket,
                     Ok(None) => {
+                        tracing::debug!(
+                            target: "novarocks_original_wait",
+                            process_id = std::process::id(),
+                            actor = ?entry.registration.actor(),
+                            input = ?original.input,
+                            action = ?original.action,
+                            kind = host_effect_kind(metadata),
+                            protocol_action = ?host_protocol_action(metadata),
+                            "Host candidate claim lost readiness after original prepayment"
+                        );
                         machine.source.return_unclaimed_result(prepaid);
                         original_dispatch!(machine.dispatch.defer_candidate(&candidate));
                         continue;
@@ -1400,16 +1717,36 @@ impl HostRegistry {
                         return Err(error.into());
                     }
                 };
-                let mut job =
+                tracing::debug!(
+                    actor = ?ticket.actor,
+                    input = ?ticket.input,
+                    action = ?ticket.descriptor.id,
+                    kind = host_effect_kind(&ticket.effect),
+                    protocol_action = ?host_protocol_action(&ticket.effect),
+                    budget,
+                    "Host candidate claimed its original ticket"
+                );
+                let binding =
                     match machine
                         .source
-                        .try_bind_job(&self.runtime, turn, &ticket, prepaid)
+                        .try_bind_effect(&self.runtime, turn, &ticket, prepaid)
                     {
                         Ok(job) => job,
                         Err(refused)
                             if self.runtime.snapshot(entry.registration.actor())?.failed =>
                         {
-                            machine.source.owner_failed_binding(ticket, refused);
+                            if let Some(original) =
+                                machine.source.owner_failed_binding(ticket, refused)
+                            {
+                                let Some(transport) = machine.transport.as_mut() else {
+                                    machine.source.owner_failed_transport_refused(original);
+                                    return Err(HostError::RetainedTransportRefused);
+                                };
+                                if let Err(original) = transport.track(original.0, original.1) {
+                                    machine.source.owner_failed_transport_refused(original);
+                                    return Err(HostError::RetainedTransportRefused);
+                                }
+                            }
                             machine.scan_remaining = None;
                             return Ok(HostProgress {
                                 units: entry.budget - budget,
@@ -1420,6 +1757,62 @@ impl HostRegistry {
                         }
                         Err(refused) => std::panic::resume_unwind(Box::new((ticket, refused))),
                     };
+                let mut job = match binding {
+                    PreparedEffectBinding::Job(job) => job,
+                    PreparedEffectBinding::Retained {
+                        transport: retirement,
+                    } => {
+                        tracing::debug!(
+                            actor = ?ticket.actor,
+                            input = ?ticket.input,
+                            action = ?ticket.descriptor.id,
+                            kind = host_effect_kind(&ticket.effect),
+                            protocol_action = ?host_protocol_action(&ticket.effect),
+                            budget,
+                            "Host original binding retained by Source"
+                        );
+                        if let Some(retirement) = retirement {
+                            let FrontendEffect::Attempt(effect) = &ticket.effect else {
+                                std::panic::resume_unwind(Box::new((ticket, retirement)));
+                            };
+                            let Some(transport) = machine.transport.as_mut() else {
+                                std::panic::resume_unwind(Box::new((ticket, retirement)));
+                            };
+                            if let Err((_, retirement)) =
+                                transport.track(effect.clone(), retirement)
+                            {
+                                std::panic::resume_unwind(Box::new((ticket, retirement)));
+                            }
+                        }
+                        // Exactly as for an accepted dispatcher handoff below,
+                        // complete only this original ticket/dispatch position.
+                        // The Source still owns the real job and its exit.
+                        if matches!(&ticket.effect, FrontendEffect::Attempt(effect) if must_handoff_before_local_close(effect))
+                        {
+                            machine.local_source_handoffs_pending -= 1;
+                        }
+                        let lane = machine.policy.classify(&ticket.effect);
+                        let receipt = self
+                            .runtime
+                            .effect_completed_with_receipt(ticket)
+                            .map_err(|refusal| HostError::Runtime(refusal.error))?;
+                        if let Some(transport) = &machine.transport {
+                            transport.original_input_progress();
+                        }
+                        if let Some((key, EffectRelease::Completed)) = lane {
+                            original_dispatch!(
+                                machine
+                                    .dispatch
+                                    .completion_observed_with_receipt(key, &receipt)
+                            );
+                        }
+                        if machine.scan_remaining.is_some() {
+                            machine.rescan_requested = true;
+                        }
+                        handoffs += 1;
+                        continue;
+                    }
+                };
                 if let Some(retirement) = job.transport.take() {
                     let FrontendEffect::Attempt(effect) = &ticket.effect else {
                         std::panic::resume_unwind(Box::new((job, retirement)));
@@ -1443,6 +1836,17 @@ impl HostRegistry {
             budget -= 1;
             match machine.executor.handoff(pending.job) {
                 Err(job) => {
+                    tracing::debug!(
+                        target: "novarocks_original_wait",
+                        process_id = std::process::id(),
+                        actor = ?pending.ticket.actor,
+                        input = ?pending.ticket.input,
+                        action = ?pending.ticket.descriptor.id,
+                        kind = host_effect_kind(&pending.ticket.effect),
+                        protocol_action = ?host_protocol_action(&pending.ticket.effect),
+                        budget,
+                        "Host executor refused the same original handoff"
+                    );
                     machine.pending = Some(PendingHandoff {
                         ticket: pending.ticket,
                         job,
@@ -1452,6 +1856,15 @@ impl HostRegistry {
                     handoff_refused = true;
                 }
                 Ok(()) => {
+                    tracing::debug!(
+                        actor = ?pending.ticket.actor,
+                        input = ?pending.ticket.input,
+                        action = ?pending.ticket.descriptor.id,
+                        kind = host_effect_kind(&pending.ticket.effect),
+                        protocol_action = ?host_protocol_action(&pending.ticket.effect),
+                        budget,
+                        "Host executor accepted the original handoff"
+                    );
                     if matches!(&pending.ticket.effect, FrontendEffect::Attempt(effect) if must_handoff_before_local_close(effect))
                     {
                         machine.local_source_handoffs_pending -= 1;
@@ -1489,16 +1902,25 @@ impl HostRegistry {
             && (retired.progressed || indexed_this_turn)
             && machine.scan_remaining.is_none()
             && machine.dispatch.ready_positions() != 0;
+        if initial_scan_pending {
+            machine.scan_remaining = Some(machine.dispatch.ready_positions());
+        }
         let mut rescan = false;
         if machine.scan_remaining == Some(0) {
             machine.scan_remaining = None;
-            rescan = std::mem::take(&mut machine.rescan_requested);
+            if std::mem::take(&mut machine.rescan_requested) {
+                let ready = machine.dispatch.ready_positions();
+                if ready != 0 {
+                    machine.scan_remaining = Some(ready);
+                    rescan = true;
+                }
+            }
         }
         let more = retired.more
             || startup_more
             || capacity_more
             || membership_more
-            || controls_more
+            || local_exit_more
             || timer_more
             || observation_advanced
             || initial_scan_pending
@@ -1507,12 +1929,63 @@ impl HostRegistry {
             || (budget == 0
                 && (machine.scan_remaining.is_some_and(|n| n != 0)
                     || machine.pending.is_some() && !handoff_refused));
+        tracing::debug!(
+            actor = ?entry.registration.actor(),
+            ?now,
+            budget,
+            units = entry.budget - budget,
+            handoffs,
+            more,
+            scan_remaining = ?machine.scan_remaining,
+            rescan_requested = machine.rescan_requested,
+            ready_positions = machine.dispatch.ready_positions(),
+            pending_handoff = machine.pending.is_some(),
+            source_progressed = retired.progressed,
+            source_more = retired.more,
+            indexed_this_turn,
+            "Host ready turn completed"
+        );
         Ok(HostProgress {
             units: entry.budget - budget,
             handoffs,
             more,
             retired: false,
         })
+    }
+}
+fn host_protocol_action(effect: &FrontendEffect) -> Option<u64> {
+    match effect {
+        FrontendEffect::Attempt(effect) => Some(effect.protocol.id.get()),
+        _ => None,
+    }
+}
+fn host_effect_kind(effect: &FrontendEffect) -> &'static str {
+    use novarocks_attempt_protocol::{effect::EffectBody, port_output::AttemptToLogicalBody};
+    match effect {
+        FrontendEffect::Attempt(effect) => match &effect.protocol.body {
+            EffectBody::Port(message) => match &message.body {
+                AttemptToLogicalBody::RootStatus(_) => "RootStatus",
+                AttemptToLogicalBody::SealResult { .. } => "SealResult",
+                AttemptToLogicalBody::TerminalControlResult { .. } => "TerminalControlResult",
+                _ => "AttemptPort",
+            },
+            EffectBody::Publish(_) => "AttemptPublication",
+            EffectBody::PrepareLocalConvergence => "PrepareLocalConvergence",
+            EffectBody::EstablishAuthorization { .. } => "EstablishAuthorization",
+            EffectBody::SendBatch { .. } => "SendBatch",
+            EffectBody::OpenSubscription(_) => "OpenSubscription",
+            EffectBody::AdjustReadWindow(_) => "AdjustReadWindow",
+            EffectBody::CloseSubscription { .. } => "CloseSubscription",
+            EffectBody::ConfirmReadState { .. } => "ConfirmReadState",
+            EffectBody::ObserveProcess { .. } => "ObserveProcess",
+            _ => "AttemptOther",
+        },
+        FrontendEffect::AttemptNotice(_) => "AttemptNotice",
+        FrontendEffect::AttemptRootControlProcessed(_) => "AttemptRootControlProcessed",
+        FrontendEffect::Logical(_) => "Logical",
+        FrontendEffect::OwnerFailed { .. } => "OwnerFailed",
+        #[cfg(test)]
+        FrontendEffect::Test { .. } => "Test",
     }
 }
 fn must_handoff_before_local_close(
@@ -1554,6 +2027,7 @@ struct HostProgress {
     reason = "The host reports the original runtime, dispatch or observation failure through Debug."
 )]
 enum HostError {
+    RetainedTransportRefused,
     Runtime(ActorTurnError),
     Dispatch(DispatchError),
     Observation(ObservationError),
@@ -1771,6 +2245,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_exit_reaches_original_slot_before_notification_and_survives_refusal() {
+        use std::{
+            future::Future,
+            panic::{AssertUnwindSafe, catch_unwind},
+            task::{Context, Wake, Waker},
+        };
+        struct Idle;
+        impl TestActor for Idle {
+            fn handle(
+                &mut self,
+                _: Tick,
+                _: InputEnvelope,
+                _: FrontendInput,
+                _: &mut ActorStep<'_, FrontendEffect>,
+            ) {
+                unreachable!("the original metadata actor has no inputs");
+            }
+        }
+        struct NotificationPanic;
+        impl Wake for NotificationPanic {
+            fn wake(self: Arc<Self>) {
+                panic!("original registration notification panic");
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                panic!("original registration notification panic");
+            }
+        }
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let scope = ledger
+            .open_scope_next(None, Generation::new(1).unwrap())
+            .unwrap();
+        let runtime = ActorRuntime::new();
+        let config = ActorConfig {
+            mailbox: [1; 4],
+            max_batches: 1,
+            max_effects_per_step: 1,
+            max_dependencies_per_effect: 0,
+            turn_budget: 8,
+            max_step_work: 1,
+        };
+        let registration = runtime
+            .register_bound(
+                ActorId::new(1).unwrap(),
+                scope.clone(),
+                FrontendActor::Test(Box::new(Idle)),
+                config,
+            )
+            .unwrap_or_else(|_| panic!("same original metadata actor"));
+        let host = HostRegistry::new(
+            runtime.clone(),
+            ledger.clone(),
+            Arc::new(FrontendHostObservations::new(Arc::new(
+                novarocks_control_runtime::actor_turn::ProcessClock::default(),
+            ))),
+        );
+        let binding = || HostBinding {
+            scope: scope.clone(),
+            registration: registration.clone(),
+            kind: FrontendActorKind::Test,
+            config,
+            policy: FrontendLanePolicy {
+                lane: |_| None,
+                per_step_inventory: 1,
+            },
+            source: Box::new(MetadataSource {
+                scope: scope.clone(),
+                closing: false,
+                retire_batches: false,
+                local_exited: None,
+            }),
+            executor: Arc::new(NoExecutor),
+            transport: None,
+            ordered_observations: None,
+            startup: None,
+            capacity: None,
+            membership: None,
+
+            local_exit: None,
+        };
+        let mut notification = Box::pin(host.changed.notified());
+        let wake = Waker::from(Arc::new(NotificationPanic));
+        assert!(
+            notification
+                .as_mut()
+                .poll(&mut Context::from_waker(&wake))
+                .is_pending()
+        );
+        let mut original = None;
+        let mut funding = None;
+        // Only this test catches the injected observer panic. Production keeps
+        // its original notification/fatal boundaries; no recovery catch is added.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            host.register_with_funding_in(binding(), &mut funding, &mut original)
+        }));
+        let payload = match result {
+            Err(payload) => payload,
+            Ok(_) => panic!("the original wake must panic"),
+        };
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"original registration notification panic")
+        );
+        drop(payload);
+        drop(notification);
+        assert!(original.as_ref().unwrap().matches(&registration));
+        assert!(!host.is_empty() && runtime.snapshot(registration.actor()).is_ok());
+        let refused_binding = binding();
+        let address =
+            refused_binding.source.as_ref() as *const dyn EffectSource as *const () as usize;
+        let refusal =
+            match host.register_with_funding_in(refused_binding, &mut funding, &mut original) {
+                Err(refusal) => refusal,
+                Ok(()) => panic!("an occupied original slot must refuse"),
+            };
+        assert_eq!(
+            refusal.reason,
+            "original HostExit receiving slot is already occupied"
+        );
+        assert_eq!(
+            refusal.binding.source.as_ref() as *const dyn EffectSource as *const () as usize,
+            address
+        );
+        assert!(original.as_ref().unwrap().matches(&registration));
+        drop(refusal);
+        let mut exit = original.take().unwrap();
+        exit.request_close().unwrap();
+        while let Some(turn) = runtime.claim_host_actor() {
+            host.drive(Tick(1), turn);
+        }
+        exit.wait().await.unwrap();
+        assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+    }
+
+    #[tokio::test]
     async fn attempt_host_returns_its_builtin_timer_credit_after_each_committed_tick() {
         struct TimerProbe(u64);
         impl TestActor for TimerProbe {
@@ -1840,7 +2448,8 @@ mod tests {
                 startup: None,
                 capacity: None,
                 membership: None,
-                owner_controls: None,
+
+                local_exit: None,
             })
             .unwrap_or_else(|_| panic!("install original timer host"));
         let drive = |now| {
@@ -1873,16 +2482,7 @@ mod tests {
     }
 
     async fn drive_startup(close_before_bootstrap: bool) {
-        use crate::{
-            query_execution::native_execution_adapter::LogicalAbortRouter,
-            task_execution::{
-                bridge::abort::AttemptAbortIngress,
-                host::startup::{AttemptStartupSource, StartupInput},
-            },
-        };
-        use novarocks_coordination_contract::AttemptActivationIdentity;
-        use novarocks_query_application::coordination::AbortParticipationEffectPort;
-        use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
+        use crate::task_execution::host::startup::{AttemptStartupSource, StartupInput};
 
         struct StartupProbe(Arc<Mutex<Vec<StartupInput>>>);
         impl TestActor for StartupProbe {
@@ -1939,25 +2539,15 @@ mod tests {
         assert!(runtime.claim_host_actor().is_none());
         assert!(!startup.ready_for(&registration));
 
-        let execution =
-            QueryExecutionId::new(QueryId::new(1, 1), AttemptId::new(1).unwrap()).unwrap();
-        let activation = AttemptActivationIdentity::from_parts(1, execution, 1);
-        let aborts = LogicalAbortRouter::new();
-        let route = aborts.reserve_route(execution).unwrap();
-        let endpoint = Arc::new(AttemptAbortIngress::new(
-            registration.clone(),
-            activation,
-            [],
-            aborts.capacity_author(),
-            None,
-        ));
-        let capacity = aborts.subscribe_capacity();
-        let assert_unpublished =
-            |startup: &crate::task_execution::host::startup::AttemptStartup| {
-                assert!(route.publish_registered(startup, endpoint.clone()).is_err());
-                assert!(!capacity.has_changed().unwrap());
-            };
-        assert_unpublished(&startup);
+        // Publication belongs to the final port pair; the old route publisher
+        // and capacity epoch no longer exist. This startup witness cannot
+        // claim protocol readiness before the same paid inputs are consumed
+        // and actually retired.
+        let assert_not_ready = |startup: &crate::task_execution::host::startup::AttemptStartup| {
+            assert!(startup.matches_registration(&registration));
+            assert!(!startup.ready_for(&registration));
+        };
+        assert_not_ready(&startup);
 
         let mut exit = host
             .register(HostBinding {
@@ -1981,9 +2571,21 @@ mod tests {
                 startup: Some(source),
                 capacity: None,
                 membership: None,
-                owner_controls: None,
+
+                local_exit: None,
             })
             .unwrap_or_else(|_| panic!("install original host startup"));
+        for _ in 0..32 {
+            runtime.notify_host_actor(&registration).unwrap();
+            while let Some(turn) = runtime.claim_host_actor() {
+                host.drive(Tick(1), turn);
+            }
+            assert!(!runtime.poll_one(Tick(1)).unwrap());
+            assert!(observed.lock().unwrap().is_empty());
+        }
+        assert_eq!(runtime.snapshot(actor).unwrap().inputs, 0);
+        assert!(startup.release_protocol(&runtime).is_err());
+        startup.release_initialization(&runtime).unwrap();
         let drive_host = || {
             host.drive(
                 Tick(1),
@@ -1997,7 +2599,7 @@ mod tests {
             assert_eq!(startup.wait_ready().await, Err(ActorTurnError::Closed));
             assert_eq!(runtime.snapshot(actor).unwrap().inputs, 1);
             assert!(!startup.ready_for(&registration));
-            assert_unpublished(&startup);
+            assert_not_ready(&startup);
             assert!(runtime.poll_one(Tick(1)).unwrap());
             drive_host(); // Index the already queued Bootstrap.
             drive_host(); // Retire its actual occurrence.
@@ -2014,6 +2616,17 @@ mod tests {
 
         drive_host(); // Index Bootstrap.
         drive_host(); // Retire Bootstrap.
+        startup.wait_initialized().await.unwrap();
+        assert!(startup.initialized_for(&registration));
+        drive_host(); // Initialization cannot release protocol business.
+        for _ in 0..32 {
+            runtime.notify_host_actor(&registration).unwrap();
+            drive_host();
+            assert!(!runtime.poll_one(Tick(1)).unwrap());
+            assert_eq!(*observed.lock().unwrap(), [StartupInput::Bootstrap]);
+        }
+        assert!(runtime.claim_host_actor().is_none());
+        startup.release_protocol(&runtime).unwrap();
         drive_host(); // Fill StartProtocol in the same paid position.
         assert!(runtime.poll_one(Tick(1)).unwrap());
         assert_eq!(
@@ -2021,7 +2634,7 @@ mod tests {
             [StartupInput::Bootstrap, StartupInput::StartProtocol]
         );
         assert!(!startup.ready_for(&registration));
-        assert_unpublished(&startup);
+        assert_not_ready(&startup);
         {
             let wait = startup.wait_ready();
             tokio::pin!(wait);
@@ -2034,21 +2647,11 @@ mod tests {
         }
         drive_host(); // Index StartProtocol.
         drive_host(); // Retire StartProtocol.
-        assert_unpublished(&startup);
+        assert_not_ready(&startup);
         drive_host(); // Return the original standing position.
         startup.wait_ready().await.unwrap();
         assert!(startup.ready_for(&registration));
-        let wrong_execution =
-            QueryExecutionId::new(QueryId::new(1, 1), AttemptId::new(2).unwrap()).unwrap();
-        let wrong_route = aborts.reserve_route(wrong_execution).unwrap();
-        assert!(
-            wrong_route
-                .publish_registered(&startup, endpoint.clone())
-                .is_err()
-        );
-        assert!(!capacity.has_changed().unwrap());
-        route.publish_registered(&startup, endpoint).unwrap();
-        assert!(capacity.has_changed().unwrap());
+        assert!(startup.matches_registration(&registration));
         assert!(
             runtime
                 .standing_input_inventory(actor, None, 1)
@@ -2064,129 +2667,476 @@ mod tests {
 
     #[tokio::test]
     async fn installed_host_retires_owner_control_occurrences_before_reuse_or_close() {
-        use crate::task_execution::bridge::control::AttemptOwnerControls;
+        use crate::control_runtime::logical::adapter::{LogicalEffectEnvelope, LogicalHostEffect};
+        use crate::task_execution::host::port::{
+            control::{
+                ControlBinding, ControlPositions, ControlReaderObligation, PortControlError,
+                SourcePublishedSlot,
+            },
+            local_exit::LocalExitInputObligation,
+            root_control::{RootControlBinding, RootControlRequests},
+        };
         use novarocks_attempt_protocol::input::{AttemptInput, ExecutorFact};
+        use novarocks_control_runtime::{
+            completion::ReportSlot,
+            header_readiness::HeaderReadyRegistration,
+            obligation::{ReservationObligation, WorkObligation},
+            reported_work::ReportedWork,
+        };
+        use novarocks_control_runtime_core::{
+            capacity::ReservationResources,
+            completion::ConsumerKind,
+            effect::{EffectDescriptor, EffectKind, EffectState},
+            identity::{ActionId, ConsumerId, ScopedWorkRef},
+            owned_storage::OwnedSlotNeed,
+            scope::{WorkAdmission, WorkKind},
+        };
         use novarocks_coordination_contract::{
-            AttemptActivationIdentity, AttemptConvergenceMode, AttemptStopReason,
-            LogicalToAttemptBody,
+            AttemptActivationIdentity, AttemptConvergenceMode, AttemptStopReason, ExecutionFailure,
+            ExecutionFailureInput, ExecutionFailureSite, LogicalToAttempt, LogicalToAttemptBody,
+            QueryFailureReason,
         };
-        use novarocks_query_application::api::NativeActiveConvergenceRequest;
-        use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
-        use novarocks_workload_control::{
-            CancellationReason, ResourceConfig, WorkClass, WorkRequest, WorkloadConfig,
-            WorkloadControl,
+        use novarocks_execution_contract::{SafeDetail, TaskIdentity, failure::FailureProjection};
+        use novarocks_logical_execution_protocol::{
+            LogicalActionId,
+            effect::{LogicalEffect, LogicalEffectBody},
         };
+        use novarocks_types::{
+            AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        };
+        use std::{mem::ManuallyDrop, num::NonZeroU64};
 
-        struct Probe(Arc<Mutex<Vec<InputId>>>);
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Seen {
+            Convergence(InputId, MonotonicInstant),
+            Stop(InputId),
+            Local(InputId),
+        }
+        struct Probe {
+            lp: ActorId,
+            ap: ActorId,
+            activation: AttemptActivationIdentity,
+            seen: Arc<Mutex<Vec<Seen>>>,
+            stop: ExecutionFailure,
+        }
         impl TestActor for Probe {
             fn handle(
                 &mut self,
                 _: Tick,
                 envelope: InputEnvelope,
                 input: FrontendInput,
-                _: &mut ActorStep<'_, FrontendEffect>,
+                step: &mut ActorStep<'_, FrontendEffect>,
             ) {
+                assert!(step.charge(1));
                 let FrontendInput::Attempt(input) = input else {
-                    panic!("unexpected input to the owner-control host");
+                    panic!("unexpected input to the original owner-control host");
                 };
                 if matches!(
                     *input,
                     AttemptInput::Executor(ExecutorFact::LocalConvergenceExited)
                 ) {
                     assert_eq!(envelope.class, InputClass::Lifecycle);
-                    self.0.lock().unwrap().push(envelope.input);
+                    assert_eq!(envelope.source, self.ap);
+                    self.seen.lock().unwrap().push(Seen::Local(envelope.input));
                     return;
                 }
                 let AttemptInput::Port(input) = *input else {
-                    panic!("unexpected attempt input to the owner-control host");
+                    panic!("expected the same original passive owner command");
                 };
                 assert_eq!(envelope.class, InputClass::Control);
-                assert!(matches!(
-                    input.body,
-                    LogicalToAttemptBody::BeginConvergence { .. }
-                        | LogicalToAttemptBody::Stop {
-                            reason: AttemptStopReason::Client,
-                            ..
-                        }
-                ));
-                self.0.lock().unwrap().push(envelope.input);
+                assert_eq!(envelope.source, self.lp);
+                assert_eq!(input.activation, self.activation);
+                let observed = match input.body {
+                    LogicalToAttemptBody::BeginConvergence {
+                        mode: AttemptConvergenceMode::Cleanup,
+                        remote_deadline,
+                        computation_ready: None,
+                        retain_diagnostics: false,
+                    } => Seen::Convergence(envelope.input, remote_deadline),
+                    LogicalToAttemptBody::Stop {
+                        reason: AttemptStopReason::Client,
+                        failure,
+                    } => {
+                        assert_eq!(failure, self.stop);
+                        Seen::Stop(envelope.input)
+                    }
+                    other => panic!("unexpected original owner-control payload: {other:?}"),
+                };
+                self.seen.lock().unwrap().push(observed);
             }
         }
-
-        let workload = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 10,
-                per_scope_bytes: 1 << 18,
-            },
-        )
-        .unwrap();
-        workload.mark_ready().unwrap();
-        let root = workload
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let now = Instant::now();
-        let cancellation = root.owner.scope().cancellation().unwrap();
-        let request = NativeActiveConvergenceRequest::new(
-            cancellation.clone(),
-            now + Duration::from_secs(20),
-        );
-        let tightened =
-            NativeActiveConvergenceRequest::new(cancellation, now + Duration::from_secs(10));
+        struct Emitter {
+            work: ScopedWorkRef,
+            payer: novarocks_control_runtime_core::identity::ReservationId,
+            messages: Arc<[LogicalToAttempt]>,
+        }
+        impl TestActor for Emitter {
+            fn handle(
+                &mut self,
+                _: Tick,
+                envelope: InputEnvelope,
+                input: FrontendInput,
+                step: &mut ActorStep<'_, FrontendEffect>,
+            ) {
+                assert!(step.charge(1));
+                assert_eq!(envelope.class, InputClass::Control);
+                let FrontendInput::Test(index) = input else {
+                    panic!("original LP trigger")
+                };
+                let message = self.messages[index as usize].clone();
+                step.effect(
+                    EffectDescriptor {
+                        id: ActionId::new(1).unwrap(),
+                        work: self.work,
+                        kind: EffectKind::Cleanup,
+                        dependencies: vec![],
+                    },
+                    FrontendEffect::Logical(Arc::new(LogicalEffectEnvelope {
+                        body: LogicalHostEffect::Protocol(Box::new(LogicalEffect {
+                            action: LogicalActionId::new(NonZeroU64::new(index + 1).unwrap()),
+                            body: LogicalEffectBody::AttemptPort(Box::new(message)),
+                        })),
+                        reservation: self.payer,
+                    })),
+                )
+                .unwrap();
+            }
+        }
+        /// The same metadata-only AP Source owns the actual paid reader and
+        /// the original AP role author. Neither flag supplies physical exit.
+        struct ControlSource {
+            runtime: ActorRuntime<FrontendActor>,
+            registration: ActorRegistration,
+            scope: ScopeHandle,
+            publisher: SourcePublishedSlot,
+            reader: Option<ControlReaderObligation>,
+            pass_active: bool,
+            more_observation: Arc<AtomicBool>,
+            closing: bool,
+            local_exited: Arc<AtomicBool>,
+            work: Option<WorkObligation>,
+            payer: Option<ReservationObligation>,
+            body_returned: bool,
+            readiness: HeaderReadyRegistration,
+        }
+        impl EffectSource for ControlSource {
+            fn prepay_result(
+                &mut self,
+                _: &FrontendEffect,
+            ) -> Option<CausalInputObligation<FrontendActor>> {
+                unreachable!("metadata-only AP emits no executor work")
+            }
+            fn bind_job(
+                &mut self,
+                _: &ActorRuntime<FrontendActor>,
+                _: &ActorHostTurn<FrontendActor>,
+                _: &EffectTicket<FrontendEffect>,
+                _: CausalInputObligation<FrontendActor>,
+            ) -> PreparedEffectJob {
+                unreachable!("no AP business job was issued")
+            }
+            fn return_unclaimed_result(&mut self, _: CausalInputObligation<FrontendActor>) {
+                unreachable!("no original result role was borrowed")
+            }
+            fn owner_failed_pending(&mut self, _: PendingHandoff) {
+                unreachable!("no original executor handoff was prepared")
+            }
+            fn core_consumed(&mut self, inputs: &[InputId]) {
+                if !inputs.is_empty()
+                    && let Some(reader) = &mut self.reader
+                {
+                    reader.index_committed(&self.runtime, inputs).unwrap();
+                    self.pass_active = true;
+                }
+            }
+            fn close_external(&mut self) {
+                if !self.closing {
+                    self.publisher.close_publication();
+                    self.scope.close_external().unwrap();
+                    self.closing = true;
+                }
+            }
+            fn result_admission_closed(&self) -> bool {
+                self.closing
+            }
+            fn local_convergence_exited(&self) -> bool {
+                // This actor/Source has no foreign I/O, body or rich captures.
+                // The test releases this existing no-issued-job observation.
+                self.local_exited.load(Ordering::Acquire)
+            }
+            fn progress_retirement(
+                &mut self,
+                runtime: &ActorRuntime<FrontendActor>,
+                turn: &ActorHostTurn<FrontendActor>,
+                _: Tick,
+                budget: usize,
+            ) -> SourceProgress {
+                let mut units = 0;
+                let mut progressed = false;
+                let mut close_visited = false;
+                let mut author_visited = false;
+                if let Some(reader) = &mut self.reader {
+                    if turn.was_notified() && !self.pass_active {
+                        reader.begin_pass();
+                        self.pass_active = true;
+                    }
+                    let progress = reader.progress_ordered(budget.min(5)).unwrap();
+                    units += progress.units;
+                    progressed |= progress.progressed;
+                    self.pass_active = progress.more;
+                }
+                self.more_observation
+                    .store(self.pass_active, Ordering::Release);
+                if self.closing && self.reader.is_some() && units < budget {
+                    units += 1;
+                    close_visited = true;
+                    if self
+                        .reader
+                        .as_mut()
+                        .unwrap()
+                        .close_after_exit(runtime)
+                        .unwrap()
+                    {
+                        self.reader.take();
+                        self.pass_active = false;
+                        progressed = true;
+                    }
+                }
+                if self.closing && self.reader.is_none() && self.work.is_some() && units < budget {
+                    units += 1;
+                    author_visited = true;
+                    let work = self.work.as_mut().unwrap();
+                    if !self.body_returned {
+                        work.body_exited().unwrap();
+                        work.captures_exited().unwrap();
+                        self.payer.as_mut().unwrap().finish().unwrap();
+                        self.body_returned = true;
+                        progressed = true;
+                    }
+                    let header = work.retirement_observer();
+                    if self.scope.reap_observed_header(&header).unwrap() {
+                        self.readiness.cancel();
+                        self.work.take();
+                        self.payer.take();
+                        progressed = true;
+                    } else {
+                        self.readiness
+                            .arm(runtime, &self.registration, &header)
+                            .unwrap();
+                    }
+                }
+                let retired = self.closing
+                    && self.reader.is_none()
+                    && self.work.is_none()
+                    && runtime.snapshot(self.registration.actor()).unwrap().inputs == 0
+                    && self.scope.join_ready().unwrap();
+                SourceProgress {
+                    units,
+                    progressed,
+                    more: self.pass_active
+                        || (self.closing && self.reader.is_some() && !close_visited)
+                        || (self.closing
+                            && self.reader.is_none()
+                            && self.work.is_some()
+                            && !author_visited),
+                    retired,
+                }
+            }
+        }
+        fn reserve_author(
+            scope: &ScopeHandle,
+            inputs: usize,
+        ) -> (WorkObligation, ReservationObligation) {
+            let (mut work, payer) = scope
+                .reserve_next(
+                    Generation::new(1).unwrap(),
+                    ReservationResources::new(
+                        ResourceVector::default(),
+                        OwnedSlotNeed {
+                            work_headers: 1,
+                            inputs,
+                            ..Default::default()
+                        },
+                    ),
+                    WorkKind::Settlement,
+                    WorkAdmission::External,
+                )
+                .unwrap()
+                .bind(WorkKind::Settlement)
+                .unwrap();
+            work.start().unwrap();
+            (work, payer)
+        }
+        let epoch = Generation::new(1).unwrap();
         let ledger = RuntimeLedger::new(ResourceVector::default());
-        let scope = ledger
-            .open_scope_next(None, Generation::new(1).unwrap())
-            .unwrap();
+        let scope = ledger.open_scope_next(None, epoch).unwrap();
+        let lp_scope = ledger.open_scope_next(None, epoch).unwrap();
         let runtime = ActorRuntime::new();
-        let clock = Arc::new(TestClock(now));
-        let host = HostRegistry::new(
+        let host = ManuallyDrop::new(HostRegistry::new(
             runtime.clone(),
             ledger.clone(),
             Arc::new(FrontendHostObservations::new(Arc::new(FrontendClock(
-                clock.clone(),
+                Arc::new(TestClock(Instant::now())),
             )))),
-        );
+        ));
         let actor = ActorId::new(1).unwrap();
+        let lp_id = ActorId::new(11).unwrap();
+        let activation = AttemptActivationIdentity::from_parts(
+            1,
+            QueryExecutionId::new(QueryId::new(1, 1), AttemptId::new(1).unwrap()).unwrap(),
+            1,
+        );
+        let at = |seconds| MonotonicInstant::from_origin(Duration::from_secs(seconds));
+        let begin = |deadline| LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::BeginConvergence {
+                mode: AttemptConvergenceMode::Cleanup,
+                remote_deadline: deadline,
+                computation_ready: None,
+                retain_diagnostics: false,
+            },
+        };
+        let original_stop = ExecutionFailure::from_input(ExecutionFailureInput::new(
+            QueryFailureReason::Cancelled.failure_fact(),
+            SafeDetail::truncating("same original client cancellation"),
+            ExecutionFailureSite::Coordinator,
+        ));
+        let stop = LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::Stop {
+                reason: AttemptStopReason::Client,
+                failure: original_stop.clone(),
+            },
+        };
+        // Quote the actual fixed test script: six independent original LP
+        // inputs/tickets, all emitted before the AP has a control occurrence.
+        // Later commits need not poll an unrelated AP to mint another ticket.
+        let messages: Arc<[LogicalToAttempt]> = vec![
+            begin(at(20)),
+            begin(at(20)),
+            begin(at(10)),
+            begin(at(8)),
+            stop.clone(),
+            stop.clone(),
+        ]
+        .into();
+        let mut lp_original = ManuallyDrop::new(reserve_author(&lp_scope, messages.len()));
+        let (mut ap_work, ap_payer) = reserve_author(&scope, 4);
+        let ap_header = ap_work.retirement_observer();
+        let ap_readiness = ap_work.header_readiness_registration().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let config = ActorConfig {
             mailbox: [2; 4],
             max_batches: 2,
             max_effects_per_step: 1,
             max_dependencies_per_effect: 0,
-            turn_budget: 8,
+            turn_budget: 16,
             max_step_work: 1,
         };
         let registration = runtime
             .register_bound(
                 actor,
                 scope.clone(),
-                FrontendActor::Test(Box::new(Probe(seen.clone()))),
+                FrontendActor::Test(Box::new(Probe {
+                    lp: lp_id,
+                    ap: actor,
+                    activation,
+                    seen: seen.clone(),
+                    stop: original_stop,
+                })),
                 config,
             )
-            .unwrap_or_else(|(error, _)| panic!("original actor registration: {error:?}"));
-        let standing = || {
+            .unwrap_or_else(|(error, _)| panic!("actual AP registration: {error:?}"));
+        let lp = runtime
+            .register_bound(
+                lp_id,
+                lp_scope.clone(),
+                FrontendActor::Test(Box::new(Emitter {
+                    work: lp_original.0.reference(),
+                    payer: lp_original.1.id(),
+                    messages: messages.clone(),
+                })),
+                ActorConfig {
+                    mailbox: [messages.len(); 4],
+                    max_batches: messages.len(),
+                    max_step_work: 2,
+                    ..config
+                },
+            )
+            .unwrap_or_else(|(error, _)| panic!("actual LP registration: {error:?}"));
+        let reserve = |class| {
             runtime
-                .reserve_input(actor, actor, InputClass::Control)
+                .reserve_admitted_input_for(&registration, lp_id, class, &ap_work)
                 .unwrap()
                 .into_standing_input()
-                .unwrap()
+                .unwrap_or_else(|_| panic!("same admitted AP position"))
         };
-        let activation = AttemptActivationIdentity::from_parts(
-            1,
-            QueryExecutionId::new(QueryId::new(1, 1), AttemptId::new(1).unwrap()).unwrap(),
-            1,
+        let positions = ControlPositions {
+            stop: reserve(InputClass::Control),
+            convergence: reserve(InputClass::Control),
+            changed: reserve(InputClass::Ordinary),
+        };
+        let convergence_role = positions.convergence.id();
+        let stop_role = positions.stop.id();
+        let local_position = runtime
+            .reserve_admitted_input_for(&registration, actor, InputClass::Lifecycle, &ap_work)
+            .unwrap()
+            .into_standing_input()
+            .unwrap_or_else(|_| panic!("same paid local-exit position"));
+        let mut local_exit = LocalExitInputObligation::new(registration.clone(), local_position);
+        local_exit.request_local_exit();
+        let (work, mut payer) = lp_scope
+            .reserve_child_next(
+                epoch,
+                lp_original.1.id(),
+                ReservationResources::new(
+                    ResourceVector::default(),
+                    OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 1,
+                        captures: 1,
+                        ..Default::default()
+                    },
+                ),
+                WorkKind::Settlement,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        let storage_header = work.retirement_observer();
+        let observer = ConsumerId::new(1).unwrap();
+        let report =
+            ReportSlot::reserve_next(&mut payer, epoch, 1, [(observer, ConsumerKind::Observer)])
+                .unwrap();
+        let root = TaskIdentity::new(
+            activation.execution(),
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
         );
-        let mut controls = AttemptOwnerControls::new(activation, standing(), standing());
-        let mut source = controls.bind_host(registration.clone()).with_local_exit(
-            runtime
-                .reserve_input(actor, actor, InputClass::Lifecycle)
-                .unwrap()
-                .into_standing_input()
+        let roots = RootControlRequests::new(
+            RootControlBinding::for_registered_source(registration.clone(), activation, root)
                 .unwrap(),
         );
-        source.request_local_exit();
+        let (publisher, reader) = SourcePublishedSlot::bind(
+            &runtime,
+            ControlBinding {
+                lp: lp.clone(),
+                ap: registration.clone(),
+                activation,
+                positions,
+                storage: ReportedWork::try_new(work, payer, report).unwrap(),
+                observer,
+                roots,
+            },
+        )
+        .unwrap_or_else(|refusal| {
+            let error = refusal.error;
+            std::mem::forget(refusal._original);
+            panic!("actual paid control binding: {error:?}")
+        });
         let local_exited = Arc::new(AtomicBool::new(false));
+        let control_more = Arc::new(AtomicBool::new(true));
         let mut exit = host
             .register(HostBinding {
                 scope: scope.clone(),
@@ -2197,11 +3147,20 @@ mod tests {
                     lane: |_| None,
                     per_step_inventory: 1,
                 },
-                source: Box::new(MetadataSource {
-                    scope,
+                source: Box::new(ControlSource {
+                    runtime: runtime.clone(),
+                    registration: registration.clone(),
+                    scope: scope.clone(),
+                    publisher: publisher.clone(),
+                    reader: Some(reader),
+                    pass_active: true,
+                    more_observation: control_more.clone(),
                     closing: false,
-                    retire_batches: false,
-                    local_exited: Some(local_exited.clone()),
+                    local_exited: local_exited.clone(),
+                    work: Some(ap_work),
+                    payer: Some(ap_payer),
+                    body_returned: false,
+                    readiness: ap_readiness,
                 }),
                 executor: Arc::new(NoExecutor),
                 transport: None,
@@ -2209,99 +3168,269 @@ mod tests {
                 startup: None,
                 capacity: None,
                 membership: None,
-                owner_controls: Some(source),
+                local_exit: Some(local_exit),
             })
-            .unwrap_or_else(|_| panic!("install original owner-control host"));
-        let drive = || {
-            host.drive(
-                Tick(1),
-                runtime.claim_host_actor().expect("original host wake"),
-            );
-        };
-        let begin = |controls: &mut AttemptOwnerControls, request| {
-            controls.begin_convergence(request, AttemptConvergenceMode::Cleanup, false, &*clock)
-        };
-        let first = begin(&mut controls, &request).unwrap().unwrap();
-        assert_eq!(begin(&mut controls, &request), Ok(None));
-        assert_eq!(
-            begin(&mut controls, &tightened),
-            Err(ActorTurnError::StandingInputBusy)
-        );
-        assert!(runtime.poll_one(Tick(1)).unwrap());
-        drive(); // Index only. A Core commit has not returned the position.
-        assert_eq!(
-            begin(&mut controls, &tightened),
-            Err(ActorTurnError::StandingInputBusy)
-        );
-        {
-            let idle = controls.wait_convergence_idle();
-            tokio::pin!(idle);
-            assert!(futures::poll!(idle.as_mut()).is_pending());
-            // The Source has exited while the last owner control still has
-            // an indexed occurrence. Its retirement must open another visit.
-            local_exited.store(true, Ordering::Release);
-            drive(); // Retire the original occurrence and wake the idle waiter.
-            tokio::time::timeout(Duration::from_secs(1), idle)
-                .await
-                .unwrap()
-                .unwrap();
+            .unwrap_or_else(|refusal| {
+                let reason = refusal.reason;
+                let error = refusal.runtime_error;
+                std::mem::forget(refusal.binding);
+                panic!("actual original control Host registration: {reason}, {error:?}")
+            });
+        let mut triggers = (0..messages.len())
+            .map(|_| {
+                runtime
+                    .reserve_admitted_input_for(
+                        &lp,
+                        ActorId::new(901).unwrap(),
+                        InputClass::Control,
+                        &lp_original.0,
+                    )
+                    .unwrap()
+                    .into_standing_input()
+                    .unwrap_or_else(|_| panic!("actual LP trigger"))
+            })
+            .collect::<Vec<_>>();
+        let inputs = triggers
+            .iter()
+            .enumerate()
+            .map(|(n, input)| {
+                input
+                    .fill(FrontendInput::Test(n as u64))
+                    .unwrap_or_else(|(e, _)| panic!("LP trigger fill: {e:?}"))
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..messages.len() {
+            if inputs.iter().all(|&input| {
+                runtime
+                    .effect_inventory(lp_id, input, None, 1)
+                    .is_ok_and(|rows| !rows.is_empty())
+            }) {
+                break;
+            }
+            assert!(runtime.poll_one(Tick(1)).unwrap());
         }
-
-        assert_eq!(*seen.lock().unwrap(), [first]);
+        assert!(inputs.iter().all(|&input| {
+            runtime
+                .effect_inventory(lp_id, input, None, 1)
+                .is_ok_and(|rows| !rows.is_empty())
+        }));
+        assert!(seen.lock().unwrap().is_empty());
+        let mut tickets = inputs
+            .iter()
+            .map(|&input| {
+                Some(
+                    runtime
+                        .take_effect(lp_id, input, ActionId::new(1).unwrap())
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let complete = |index: usize, tickets: &mut Vec<Option<EffectTicket<FrontendEffect>>>| {
+            let input = tickets[index].as_ref().unwrap().input;
+            runtime
+                .effect_completed(tickets[index].take().unwrap())
+                .unwrap();
+            assert_eq!(
+                runtime.effect_inventory(lp_id, input, None, 1).unwrap()[0].1,
+                EffectState::Completed
+            );
+            assert!(triggers[index].retire_ready_after_exit().unwrap());
+        };
+        let publish = |index: usize, tickets: &mut Vec<Option<EffectTicket<FrontendEffect>>>| {
+            let ticket = tickets[index].as_ref().unwrap();
+            publisher
+                .commit(&runtime, ticket, &messages[index])
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .effect_inventory(lp_id, ticket.input, None, 1)
+                    .unwrap()[0]
+                    .1,
+                EffectState::Published
+            );
+            complete(index, tickets);
+        };
+        let claim_ap = || {
+            while let Some(turn) = runtime.claim_host_actor() {
+                if turn.registration().same_registration(&registration) {
+                    return Some(turn);
+                }
+                // This bare LP is driven by its original test tickets, not
+                // by an unregistered Host. Releasing a scheduling claim does
+                // not consume its outstanding ticket, input or Work.
+                assert!(turn.registration().same_registration(&lp));
+                turn.release(false).unwrap();
+            }
+            None
+        };
+        let drive = || host.drive(Tick(1), claim_ap().expect("original AP Host continuation"));
+        let occurrence = |role| {
+            runtime
+                .standing_input_inventory(actor, None, 4)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.standing_input_id == role)
+                .unwrap()
+                .in_flight
+        };
+        publish(0, &mut tickets);
+        publish(1, &mut tickets); // Same accepted metadata coalesces before materialization.
+        drive();
+        let first = occurrence(convergence_role).unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+        publish(2, &mut tickets); // An occupied original role does not block acceptance.
+        drive();
+        assert_eq!(occurrence(convergence_role), Some(first));
+        assert_eq!(runtime.snapshot(actor).unwrap().inputs, 1);
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+        drive(); // Index the SAME consumed occurrence; it is not yet reusable.
+        assert_eq!(occurrence(convergence_role), Some(first));
+        assert!(runtime.input_custody(actor, first).unwrap().is_some());
+        drive(); // Actually retire first, then materialize the tighter pending value.
+        let second = occurrence(convergence_role).unwrap();
+        assert_ne!(first, second);
+        assert!(runtime.input_custody(actor, first).unwrap().is_none());
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+        drive(); // Index second before its separate retirement visit.
+        assert_eq!(occurrence(convergence_role), Some(second));
+        local_exited.store(true, Ordering::Release);
+        drive(); // Retire second; the local-exit check ran before this transition.
+        assert_eq!(occurrence(convergence_role), None);
+        assert!(
+            !control_more.load(Ordering::Acquire),
+            "no finite control scan remains owed"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                Seen::Convergence(first, at(20)),
+                Seen::Convergence(second, at(10))
+            ]
+        );
         assert!(!runtime.poll_one(Tick(1)).unwrap());
-        let retirement_wake = runtime.claim_host_actor();
+        let retirement_wake = claim_ap();
         let local_exit_reachable = retirement_wake.is_some();
         if let Some(turn) = retirement_wake {
             host.drive(Tick(1), turn);
         } else {
-            // Still release the fixture's original positions if the wake
-            // regression occurs, so their Drop checks preserve the assertion.
+            // Rescue only after preserving the original missing-wake oracle.
             runtime.notify_host_actor(&registration).unwrap();
             drive();
         }
         assert!(runtime.poll_one(Tick(1)).unwrap());
-        let local = seen.lock().unwrap()[1];
-        drive(); // Index the local-exit occurrence.
-        drive(); // Return its original Lifecycle role after retirement.
-
-        let second = begin(&mut controls, &tightened).unwrap().unwrap();
-        let stop = controls
-            .stop_for_cancellation(CancellationReason::Requested)
-            .unwrap()
+        let Seen::Local(local) = seen.lock().unwrap()[2] else {
+            panic!("same Lifecycle local exit")
+        };
+        drive(); // Index LocalConvergenceExited.
+        drive(); // Actually return its original Lifecycle role.
+        for _ in 0..16 {
+            let Some(turn) = claim_ap() else { break };
+            host.drive(Tick(1), turn);
+        }
+        assert!(
+            claim_ap().is_none(),
+            "an idle reader must not keep waking itself"
+        );
+        publish(3, &mut tickets);
+        drive();
+        let third = occurrence(convergence_role).unwrap();
+        assert_ne!(second, third);
+        publisher
+            .deliver_stop(&runtime, tickets[4].as_ref().unwrap(), messages[4].clone())
+            .unwrap();
+        let stop_input = occurrence(stop_role).unwrap();
+        let actual_stop = runtime.input_custody(actor, stop_input).unwrap().unwrap();
+        assert_eq!(actual_stop.source, lp_id);
+        assert_eq!(actual_stop.class, InputClass::Control);
+        assert_eq!(actual_stop.standing_input_id, Some(stop_role));
+        assert_eq!(
+            actual_stop.phase,
+            novarocks_control_runtime::actor_turn::InputPhase::Filled
+        );
+        runtime
+            .validate_effect_ticket(tickets[4].as_ref().unwrap())
             .unwrap();
         assert_eq!(
-            controls.stop_for_cancellation(CancellationReason::Requested),
-            Ok(None)
+            runtime
+                .effect_inventory(lp_id, tickets[4].as_ref().unwrap().input, None, 1)
+                .unwrap()[0]
+                .1,
+            EffectState::Started
         );
-        assert_ne!(first, second);
+        complete(4, &mut tickets);
+        assert!(matches!(
+            publisher.deliver_stop(&runtime, tickets[5].as_ref().unwrap(), stop.clone()),
+            Err(PortControlError::Runtime(ActorTurnError::StandingInputBusy))
+        ));
+        runtime
+            .validate_effect_ticket(tickets[5].as_ref().unwrap())
+            .unwrap();
+        assert!(triggers[5].in_flight().unwrap().is_some());
+        assert_eq!(occurrence(stop_role), Some(stop_input));
         exit.request_close().unwrap();
         drive();
-        assert_eq!(
-            controls.wait_convergence_idle().await,
-            Err(ActorTurnError::Closed)
-        );
+        assert!(!host.is_empty());
+        assert_eq!(runtime.snapshot(actor).unwrap().inputs, 2);
         assert_eq!(
             runtime
-                .standing_input_inventory(actor, None, 2)
+                .standing_input_inventory(actor, None, 4)
                 .unwrap()
                 .len(),
-            2
+            3
         );
-        assert!(!host.is_empty());
-
-        assert!(runtime.poll_one(Tick(1)).unwrap());
-        assert_eq!(*seen.lock().unwrap(), [first, local, second, stop]);
-        for _ in 0..6 {
-            let Some(turn) = runtime.claim_host_actor() else {
+        assert!(!ap_header.is_retired());
+        assert!(!storage_header.is_retired());
+        for _ in 0..2 {
+            if seen.lock().unwrap().len() == 5 {
                 break;
-            };
+            }
+            assert!(runtime.poll_one(Tick(1)).unwrap());
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                Seen::Convergence(first, at(20)),
+                Seen::Convergence(second, at(10)),
+                Seen::Local(local),
+                Seen::Convergence(third, at(8)),
+                Seen::Stop(stop_input)
+            ]
+        );
+        for _ in 0..32 {
+            let Some(turn) = claim_ap() else { break };
             host.drive(Tick(1), turn);
         }
         tokio::time::timeout(Duration::from_secs(1), exit.wait())
             .await
             .unwrap()
             .unwrap();
+        assert!(host.is_empty());
+        assert!(ap_header.is_retired());
+        assert!(matches!(
+            publisher.deliver_stop(&runtime, tickets[5].as_ref().unwrap(), messages[5].clone()),
+            Err(PortControlError::Closed)
+        ));
+        complete(5, &mut tickets); // Typed closed target, never a second Stop fill.
+        assert!(tickets.iter().all(Option::is_none));
+        for trigger in &mut triggers {
+            trigger.close_after_exit().unwrap();
+        }
+        assert!(storage_header.is_retired());
+        let (work, payer) = &mut *lp_original;
+        let header = work.retirement_observer();
+        lp_scope.close_external().unwrap();
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        payer.finish().unwrap();
+        assert!(lp_scope.reap_observed_header(&header).unwrap());
+        while let Some(turn) = runtime.claim_host_actor() {
+            turn.release(false).unwrap();
+        }
+        runtime.remove_actor(lp_id).unwrap();
+        ledger.remove_scope(lp_scope.id()).unwrap();
+        drop(ManuallyDrop::into_inner(lp_original));
         assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+        drop(ManuallyDrop::into_inner(host));
         assert!(
             local_exit_reachable,
             "last owner control retirement lost the local exit wake"
@@ -2441,9 +3570,11 @@ mod tests {
                     registry.clone(),
                     membership.target.clone(),
                 )),
-                owner_controls: None,
+
+                local_exit: None,
             })
             .unwrap_or_else(|_| panic!("install original membership host"));
+        ready.release_legacy_run(&runtime);
         let drive = || {
             host.drive(
                 Tick(1),
@@ -2598,7 +3729,8 @@ mod tests {
                 startup: None,
                 capacity: Some(capacity),
                 membership: None,
-                owner_controls: None,
+
+                local_exit: None,
             })
             .unwrap_or_else(|_| panic!("install original capacity Source"));
         let occupy = || {
@@ -2733,7 +3865,8 @@ mod tests {
                 startup: None,
                 capacity: None,
                 membership: None,
-                owner_controls: None,
+
+                local_exit: None,
                 ordered_observations: None,
             })
             .is_ok()
@@ -3119,7 +4252,8 @@ mod tests {
                 startup: None,
                 capacity: None,
                 membership: None,
-                owner_controls: None,
+
+                local_exit: None,
                 ordered_observations: None,
             })
             .is_ok()
@@ -3336,9 +4470,6 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         data.drain_native_outgoing_until(deadline).await.unwrap();
         data.drain_original_apply_until(deadline).await.unwrap();
-        data.drain_original_subscriptions_until(deadline)
-            .await
-            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3470,7 +4601,8 @@ mod tests {
                         startup: None,
                         capacity: None,
                         membership: None,
-                        owner_controls: None,
+
+                        local_exit: None,
                         ordered_observations: None,
                     },
                     &mut None
@@ -3556,8 +4688,5 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         data.drain_native_outgoing_until(deadline).await.unwrap();
         data.drain_original_apply_until(deadline).await.unwrap();
-        data.drain_original_subscriptions_until(deadline)
-            .await
-            .unwrap();
     }
 }

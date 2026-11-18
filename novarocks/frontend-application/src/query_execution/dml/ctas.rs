@@ -2056,6 +2056,7 @@ impl PreparedGovernedCtasWrite {
 
 #[cfg(test)]
 mod tests {
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use std::sync::atomic::AtomicUsize;
 
     fn admitted_ctas(sql: &str) -> CtasCommand {
@@ -2230,6 +2231,7 @@ mod typed_compile_source_tests {
     use novarocks_execution_contract::failure::{
         FailureClass, FailureProjection, SharedFailureCause,
     };
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use std::error::Error;
     #[test]
     fn compiled_ctas_refusal_preserves_capability_identity_before_publication_wrapping() {

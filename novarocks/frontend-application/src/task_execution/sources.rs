@@ -486,7 +486,6 @@ mod tests {
         use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 
         use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
-        use crate::task_execution::participation_owner::ParticipationEstablishSource;
 
         // A filter deployment gives each backend the role bindings its own
         // tasks play. Handing one backend another's contribution would install

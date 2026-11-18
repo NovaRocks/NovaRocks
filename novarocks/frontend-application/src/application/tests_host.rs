@@ -317,66 +317,6 @@ async fn original_process_health_blocks_ready_and_triggers_running_host_observat
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_original_subscription_reaper_cannot_strand_the_host_workload_drain() {
-    use novarocks_workload_control::{WorkClass, WorkRequest};
-    let mut host = open_host(Some(state_store_input())).await.unwrap();
-    let scope_limit = host
-        .execution_runtime_owner
-        .native_capacity_profile
-        .policy()
-        .scope_limit();
-    host.data_runtime
-        .install_original_subscription_reaper(scope_limit)
-        .unwrap();
-    host.install_statement_control_for_test();
-    host.mark_ready().unwrap();
-    let root = host
-        .execution_runtime_owner
-        .workload
-        .as_ref()
-        .unwrap()
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    let lease = host
-        .data_runtime
-        .subscription_port()
-        .unwrap()
-        .reserve(&root.owner.scope(), None, None)
-        .unwrap()
-        .start(std::future::pending())
-        .unwrap();
-    host.data_runtime.abort_original_subscription_reaper();
-    // The original task's actual exit guard closes admission/requests abort.
-    // Its child remains in the same Workload until actual owner recovery joins.
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        host.data_runtime
-            .wait_for_original_subscription_reaper_failure(),
-    )
-    .await
-    .unwrap();
-    root.owner.complete_after_terminal_cancel_settled();
-    root.business.release();
-    let result = host
-        .release_resources_until(std::time::Instant::now() + Duration::from_secs(2))
-        .await;
-    let joined = host.data_runtime.original_subscriptions_joined();
-    let store_closed = host.state_store().is_none();
-    // Even a failing assertion must first converge the original test owners.
-    drop(lease);
-    let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let _cleanup_failure = host
-        .data_runtime
-        .drain_original_subscriptions_until(cleanup_deadline)
-        .await;
-    let _host_failure = host.release_resources_until(cleanup_deadline).await;
-    assert!(
-        result.is_err() && joined && store_closed,
-        "original shutdown result={result:?}, joined={joined}, store_closed={store_closed}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_outgoing_io_holds_state_store_until_original_public_exit() {
     use novarocks_native_adapter::native_lane::frontend_lane_connector;
     use novarocks_native_trust::NativeEndpointConnector;

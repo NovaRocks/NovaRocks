@@ -492,6 +492,10 @@ impl<R: Send + 'static> BoundedWorkerOwner<R> {
         let mut workers = Vec::with_capacity(worker_threads);
         for index in 0..worker_threads {
             let worker_shared = Arc::clone(&shared);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The bounded CPU pool owns and joins its process workers; submissions retain their original queue and completion owners."
+            )]
             match thread::Builder::new()
                 .name(format!("bounded-worker-{index}"))
                 // Decoding a result walks a nested value as deep as the type
@@ -1174,6 +1178,10 @@ type WorkerSet = Vec<WorkerEntry>;
 /// process reaper owns every fallback join. If the reaper itself cannot be
 /// created, dropping the join handles safely detaches the already-closing
 /// workers instead of blocking the owner destructor.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "The process-static fallback reaper owns worker JoinHandles off runtime threads; it creates no per-query work."
+)]
 fn reap_workers(workers: WorkerSet) {
     if workers.is_empty() {
         return;
@@ -1290,7 +1298,12 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(tokio::spawn(async { 11 }).await.unwrap(), 11);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This test owns and joins its concurrent probe so the original CPU job and worker exit can be checked independently."
+        )]
+        let joined = tokio::spawn(async { 11 }).await.unwrap();
+        assert_eq!(joined, 11);
         release.send(()).unwrap();
         assert_eq!(receipt.complete().await.unwrap(), 7);
     }
@@ -1504,6 +1517,10 @@ mod tests {
         let queued = handle.submit(BoundedWorkerJob::new(|| 2)).await.unwrap();
         wait_for(&handle, 1, 1).await;
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This test owns and joins its concurrent probe so the original CPU job and worker exit can be checked independently."
+        )]
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(600));
             release.send(()).unwrap();
@@ -1514,7 +1531,12 @@ mod tests {
             drop_started.elapsed() < Duration::from_millis(300),
             "fallback owner Drop synchronously waited for a running worker job"
         );
-        assert_eq!(tokio::spawn(async { 7 }).await.unwrap(), 7);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This test owns and joins its concurrent probe so the original CPU job and worker exit can be checked independently."
+        )]
+        let joined = tokio::spawn(async { 7 }).await.unwrap();
+        assert_eq!(joined, 7);
         assert_eq!(
             queued.complete().await,
             Err(BoundedWorkerError::ExecutorClosed)
@@ -1595,6 +1617,10 @@ mod tests {
         drop(running);
         drop(queued);
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This test owns and joins its concurrent probe so the original CPU job and worker exit can be checked independently."
+        )]
         let releaser = std::thread::spawn(move || release.send(()).unwrap());
         owner.shutdown_and_join().unwrap();
         releaser.join().unwrap();
@@ -1629,6 +1655,10 @@ mod tests {
         drop(receipt);
         let drop_started_for_releaser = Arc::clone(&drop_started);
         let drop_returned_for_releaser = Arc::clone(&drop_returned);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This test owns and joins its concurrent probe so the original CPU job and worker exit can be checked independently."
+        )]
         let releaser = std::thread::spawn(move || {
             while drop_started_for_releaser.load(Ordering::Acquire) == 0 {
                 std::thread::yield_now();
@@ -1777,6 +1807,10 @@ mod tests {
             let notice = DropNotice {
                 dropped: Some(dropped),
             };
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This test owns and joins its concurrent probe so the original CPU job and worker exit can be checked independently."
+            )]
             let submitter = thread::spawn(move || {
                 submit_barrier.wait();
                 handle.try_submit(BoundedWorkerJob::new(move || {

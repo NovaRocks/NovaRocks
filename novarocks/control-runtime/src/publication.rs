@@ -39,6 +39,60 @@ pub struct PublishedSnapshot<T> {
     pub(crate) binding: PublicationBinding,
     pub(crate) value: Arc<Mutex<Arc<T>>>,
 }
+/// Passive custody for a publisher whose original prepaid receiver has failed.
+/// This cell never delivers an input to the failed actor or grants new credit.
+#[must_use = "Retire the original passive custody after its real producer and publications exit"]
+pub struct ReceiverFailedSnapshotObligation<T> {
+    pub(crate) sender: ActorRegistration,
+    pub(crate) receiver: ActorRegistration,
+    pub(crate) role: Option<crate::actor_turn::StandingInputId>,
+    pub(crate) header: Option<crate::obligation::WorkHeaderObligation>,
+    pub(crate) snapshot: PublishedSnapshot<T>,
+}
+/// A passive view of the same committed cell. It grants no publication,
+/// header retirement, receiver input, Work or resource-exit authority.
+pub struct ReceiverFailedSnapshotReader<T> {
+    value: Arc<Mutex<Arc<T>>>,
+}
+impl<T> Clone for ReceiverFailedSnapshotReader<T> {
+    fn clone(&self) -> Self {
+        Self {
+            value: Arc::clone(&self.value),
+        }
+    }
+}
+impl<T> ReceiverFailedSnapshotReader<T> {
+    pub fn read(&self) -> Arc<T> {
+        self.value.lock().expect("published snapshot lock").clone()
+    }
+}
+impl<T> ReceiverFailedSnapshotObligation<T> {
+    pub fn reader(&self) -> ReceiverFailedSnapshotReader<T> {
+        ReceiverFailedSnapshotReader {
+            value: Arc::clone(&self.snapshot.value),
+        }
+    }
+    /// Explicitly release only this cell's original header pin. The owner must
+    /// first observe actual producer/publication exit; Drop invents no exit.
+    /// An unconsumed cell retains ledger custody, including without Drop checks.
+    pub fn retire(mut self) -> Arc<T> {
+        if let Some(header) = self.header.take() {
+            let mut ledger = self
+                .snapshot
+                .owner
+                .runtime
+                .shared
+                .state
+                .lock()
+                .expect("runtime ledger lock");
+            header.release_locked(&mut ledger);
+        }
+        self.snapshot.read()
+    }
+    pub fn read(&self) -> Arc<T> {
+        self.snapshot.read()
+    }
+}
 /// A short read of the actual cell without cloning its possibly rich owner.
 /// Copy only known neutral values while borrowed; never invoke host callbacks,
 /// retain this guard across a wait, or destroy an opaque source under it.

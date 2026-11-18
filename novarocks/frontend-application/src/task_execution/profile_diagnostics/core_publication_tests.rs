@@ -18,33 +18,23 @@
 //! Core-selected diagnostic cut publication through the original owner.
 
 use super::*;
-use crate::native::task_result_transport::{DynamicFilterRead, DynamicFilterReadError};
 use crate::task_execution::error::TaskExecutionError;
+use crate::task_execution::graph::TaskGraph;
 use crate::task_execution::host::publication::{
     DiagnosticPayloadAddress, DiagnosticSourceSnapshot, OriginalDiagnosticBinding,
     OriginalDiagnosticPayload, OriginalDiagnosticRecords,
 };
-use crate::task_execution::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
-use crate::task_execution::status_intake::CountingWake;
 use novarocks_attempt_protocol::publication::{
     DiagnosticClosure, DiagnosticMissing, DiagnosticPublication, DiagnosticSources,
     DiagnosticTaskObservation, RuntimeFilterDiagnostic, SplitDiagnosticObservation,
 };
 use novarocks_attempt_protocol::{input::FinalTaskInfoRef, start::PayloadRef};
 use novarocks_coordination_contract::AttemptActivationIdentity;
-use novarocks_coordination_contract::{AttemptComputationCut, ExecutionEffect, MonotonicClock};
+use novarocks_coordination_contract::{AttemptComputationCut, MonotonicClock};
 use novarocks_execution_contract::ParticipationRef;
-use novarocks_execution_contract::{
-    DomainVersion, OperationKind, ParticipationReceipt, ParticipationState, ReleaseOutcome,
-    root_result::RootResultEnd,
-};
+use novarocks_execution_contract::root_result::RootResultEnd;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
-use novarocks_query_application::api::ComputationObservationBudgets;
-use novarocks_query_application::coordination::{
-    AbortParticipationEffectPort, LogicalExecutionActorConfig,
-};
-use novarocks_query_application::test_support::LogicalExecutionTestHarness;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroU64;
 
 struct OriginalRecords {
     activation: AttemptActivationIdentity,
@@ -62,19 +52,25 @@ enum OwnedPayload {
     SplitProfile(AttemptActivationIdentity, TaskIdentity, SplitSourceProfile),
 }
 impl OriginalRecords {
-    fn new(round: &TaskRound, activation: AttemptActivationIdentity) -> Self {
+    fn from_collector(
+        collector: &TaskFinalInfoCollector,
+        activation: AttemptActivationIdentity,
+    ) -> Self {
         Self {
             activation,
-            root: round.root_task(),
-            parts: round
-                .execution()
-                .graph()
-                .participations()
-                .copied()
-                .collect(),
-            fragments: round
-                .execution()
-                .graph()
+            root: collector.root,
+            parts: collector.expected_participations.to_vec(),
+            fragments: collector.expected_fragments.to_vec(),
+            rows: BTreeMap::new(),
+        }
+    }
+
+    fn new(graph: &TaskGraph, activation: AttemptActivationIdentity) -> Self {
+        Self {
+            activation,
+            root: graph.root_identity(),
+            parts: graph.participations().copied().collect(),
+            fragments: graph
                 .tasks()
                 .map(|task| (task.identity(), task.fragment_id()))
                 .collect(),
@@ -126,7 +122,13 @@ fn information_reference(id: u64, task: TaskIdentity) -> FinalTaskInfoRef {
 fn unexpected_resolution(_: FinalTaskInfoRef) -> Result<Box<FinalTaskInfo>, TaskExecutionError> {
     panic!("this publication must not consume a canonical final-info record")
 }
-fn selected_cut(round: &TaskRound, ready: AttemptComputationCut) -> DiagnosticPublication {
+fn selected_cut(graph: &TaskGraph, ready: AttemptComputationCut) -> DiagnosticPublication {
+    selected_cut_for_tasks(graph.tasks().map(|task| task.identity()), ready)
+}
+fn selected_cut_for_tasks(
+    tasks: impl IntoIterator<Item = TaskIdentity>,
+    ready: AttemptComputationCut,
+) -> DiagnosticPublication {
     DiagnosticPublication {
         ready,
         closure: DiagnosticClosure::ObservationDeadline,
@@ -138,23 +140,25 @@ fn selected_cut(round: &TaskRound, ready: AttemptComputationCut) -> DiagnosticPu
             },
             split: SplitDiagnosticObservation::Pending,
         },
-        tasks: round
-            .execution()
-            .graph()
-            .tasks()
+        tasks: tasks
+            .into_iter()
             .map(|task| {
                 (
-                    task.identity(),
+                    task,
                     DiagnosticTaskObservation::Missing(DiagnosticMissing::ReadPending),
                 )
             })
             .collect(),
     }
 }
-fn source_fixture() -> (TaskRound, DiagnosticPublication, OriginalRecords) {
-    let (round, _) = crate::task_execution::tests::manifest_terminal_regression_fixture();
-    let root = round.root_task();
-    let now = round.execution().monotonic_now();
+/// Metadata tier only: the SAME 1-BE, 3-fragment/3-Task chain as the
+/// retired manifest_terminal_regression_fixture's Harness::new(&[0], &[0],64).
+/// These resolver tests read no Task state and create no Ready capability.
+fn source_fixture() -> (TaskGraph, DiagnosticPublication, OriginalRecords) {
+    let graph = crate::task_execution::graph_manifest_tests::unstarted_chain_graph();
+    let root = graph.root_identity();
+    // The old ManualClock was never advanced by its finite fixture turns.
+    let now = MonotonicInstant::ORIGIN;
     let activation = AttemptActivationIdentity::from_parts(910, root.query_execution_id(), 1);
     let ready = AttemptComputationCut {
         activation,
@@ -167,15 +171,15 @@ fn source_fixture() -> (TaskRound, DiagnosticPublication, OriginalRecords) {
             output_rows: 0,
         },
     };
-    let cut = selected_cut(&round, ready);
-    let records = OriginalRecords::new(&round, activation);
-    (round, cut, records)
+    let cut = selected_cut(&graph, ready);
+    let records = OriginalRecords::new(&graph, activation);
+    (graph, cut, records)
 }
 
 #[test]
 fn core_publication_resolves_pre_cut_rows_after_later_rf_and_split_changes() {
     let (_, mut cut, mut records) = source_fixture();
-    let original = crate::task_execution::tests::fixture_runtime_filter_contribution();
+    let original = crate::fixtures::facts::fixture_runtime_filter_contribution();
     records.rows.insert(
         reference(1),
         OwnedPayload::RuntimeFilter(records.activation, records.parts[0], original.clone()),
@@ -297,7 +301,7 @@ fn core_publication_rejects_foreign_wrong_kind_and_changed_selection_refs() {
         OwnedPayload::RuntimeFilter(
             records.activation,
             records.parts[0],
-            crate::task_execution::tests::fixture_runtime_filter_contribution(),
+            crate::fixtures::facts::fixture_runtime_filter_contribution(),
         ),
     );
     assert!(
@@ -331,7 +335,7 @@ fn core_publication_rejects_foreign_wrong_kind_and_changed_selection_refs() {
         .contributions
         .push((novarocks_types::BackendProcessId::new_v7(), reference(1).0));
     assert!(DiagnosticSourceSnapshot::resolve(&cut, &records).is_err());
-    let telemetry = crate::task_execution::tests::fixture_runtime_filter_contribution();
+    let telemetry = crate::fixtures::facts::fixture_runtime_filter_contribution();
     records.rows.insert(
         reference(2),
         OwnedPayload::RuntimeFilter(foreign, records.parts[0], telemetry.clone()),
@@ -355,124 +359,301 @@ fn core_publication_rejects_foreign_wrong_kind_and_changed_selection_refs() {
 
 use std::time::Duration;
 
-struct NoDiagnosticRead;
-impl TaskResultTransport for NoDiagnosticRead {
-    fn final_task_info(
-        &self,
-        _: TaskIdentity,
-    ) -> futures::future::BoxFuture<'_, Result<FinalTaskInfoRead, String>> {
-        panic!("core publication does not issue a final-info read")
-    }
-    fn dynamic_filters(
-        &self,
-        _: TaskIdentity,
-        _: Option<DomainVersion>,
-    ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
-        panic!("core publication does not issue a dynamic-filter read")
+/// Both inputs are passive original metadata. This grants no Ready capability.
+fn sources_for_graph(
+    graph: &TaskGraph,
+    original: AttemptComputationCut,
+    cut: &DiagnosticPublication,
+    records: &OriginalRecords,
+) -> Result<(ReleasedRuntimeFilterContributions, ProfileSplitDiagnostic), TaskExecutionError> {
+    let expected = graph
+        .tasks()
+        .map(|task| task.identity())
+        .collect::<Vec<_>>();
+    let parts = graph.participations().copied().collect::<Vec<_>>();
+    let fragments = graph
+        .tasks()
+        .map(|task| (task.identity(), task.fragment_id()))
+        .collect::<Vec<_>>();
+    let sources = DiagnosticSourceSnapshot::resolve(cut, records)?;
+    resolve_selected_diagnostic_sources(
+        original,
+        DiagnosticSelectionBinding {
+            tasks: &expected,
+            participations: &parts,
+            fragments: &fragments,
+        },
+        cut,
+        sources,
+    )
+}
+
+#[test]
+fn core_publication_expands_the_exact_original_three_task_rows_without_ready() {
+    use novarocks_execution_contract::{TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion};
+    let (graph, mut cut, mut records) = source_fixture();
+    assert_eq!(
+        graph.tasks().count(),
+        3,
+        "the original mixed-row case must remain nonempty"
+    );
+    let root = graph.root_identity();
+    cut.ready.diagnostic_deadline = cut.ready.cut.saturating_add(Duration::from_millis(10));
+    let original = cut.ready;
+    // A resolver's typed metadata payload only, not a status publication,
+    // Ready acceptance, Worker observation or native execution proof.
+    let status = TaskStatus::try_new(
+        root,
+        TaskStatusVersion::new(4).unwrap(),
+        TaskState::Finished,
+        None,
+        TaskOutputFacts::new(true),
+    )
+    .unwrap();
+    let mut foreign = cut.clone();
+    foreign.ready.cut = foreign.ready.cut.saturating_add(Duration::from_nanos(1));
+    assert!(sources_for_graph(&graph, original, &foreign, &records).is_err());
+
+    let mut bad_tasks = cut.clone();
+    let mut root_info = Some(Box::new(
+        FinalTaskInfo::try_new(root, status.clone(), Vec::new(), false).unwrap(),
+    ));
+    let sibling = bad_tasks
+        .tasks
+        .iter_mut()
+        .find(|(task, _)| *task != root)
+        .unwrap();
+    let sibling_reference = information_reference(1, sibling.0);
+    sibling.1 = DiagnosticTaskObservation::Available(sibling_reference);
+    sources_for_graph(&graph, original, &bad_tasks, &records).unwrap();
+    assert!(
+        matches!(expand_selected_diagnostic_rows(&bad_tasks, |reference| {
+        assert_eq!(reference, sibling_reference);
+        Ok(root_info.take().unwrap())
+    }), Err(TaskExecutionError::Schedule(message))
+        if message == "core diagnostic payload names a foreign Task")
+    );
+
+    let mut wrong_reference = cut.clone();
+    wrong_reference
+        .tasks
+        .iter_mut()
+        .find(|(task, _)| *task != root)
+        .unwrap()
+        .1 = DiagnosticTaskObservation::Available(information_reference(2, root));
+    sources_for_graph(&graph, original, &wrong_reference, &records).unwrap();
+    assert!(
+        matches!(expand_selected_diagnostic_rows(&wrong_reference, unexpected_resolution),
+        Err(TaskExecutionError::Schedule(message))
+        if message == "core diagnostic reference names a foreign Task")
+    );
+
+    let root_reference = information_reference(3, root);
+    let mut failed_resolution = cut.clone();
+    failed_resolution
+        .tasks
+        .iter_mut()
+        .find(|(task, _)| *task == root)
+        .unwrap()
+        .1 = DiagnosticTaskObservation::Available(root_reference);
+    sources_for_graph(&graph, original, &failed_resolution, &records).unwrap();
+    assert!(matches!(
+        expand_selected_diagnostic_rows(&failed_resolution, |reference| {
+            assert_eq!(reference, root_reference);
+            Err(TaskExecutionError::UnknownOperation)
+        }),
+        Err(TaskExecutionError::UnknownOperation)
+    ));
+
+    let mut wrong_binding = OriginalRecords::new(&graph, records.activation);
+    wrong_binding.fragments[0].1 = wrong_binding.fragments[0].1.wrapping_add(1);
+    assert!(sources_for_graph(&graph, original, &cut, &wrong_binding).is_err());
+    let before = SplitSourceProfile {
+        files_considered: 7,
+        splits_emitted: 2,
+        ..Default::default()
+    };
+    records.rows.insert(
+        reference(1),
+        OwnedPayload::SplitProfile(records.activation, root, before),
+    );
+    cut.sources.split = SplitDiagnosticObservation::Available(reference(1));
+    cut.tasks
+        .iter_mut()
+        .find(|(task, _)| *task == root)
+        .unwrap()
+        .1 = DiagnosticTaskObservation::Available(root_reference);
+    let mut original_info = Some(Box::new(
+        FinalTaskInfo::try_new(root, status, Vec::new(), false).unwrap(),
+    ));
+    let (rf, split) = sources_for_graph(&graph, original, &cut, &records).unwrap();
+    let mut resolved = 0;
+    let rows = expand_selected_diagnostic_rows(&cut, |reference| {
+        assert_eq!(reference, root_reference);
+        resolved += 1;
+        Ok(original_info.take().unwrap())
+    })
+    .unwrap();
+    assert_eq!(resolved, 1);
+    assert!(original_info.is_none());
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.iter().filter(|(task, _)| *task != root).count(), 2);
+    assert!(rows.iter().all(|(task, fact)| if *task == root {
+        matches!(fact, ProfileTaskDiagnostic::Available(info) if info.final_status().identity() == root)
+    } else { matches!(fact, ProfileTaskDiagnostic::Missing(ProfileDiagnosticMissing::ReadPending)) }));
+    assert!(!rf.is_complete());
+    assert!(matches!(split, ProfileSplitDiagnostic::Available(profile) if profile == before));
+}
+
+async fn drive_profile_original<F: std::future::Future>(
+    fixture: &mut crate::fixtures::FrontendFixture,
+    joint: &mut novarocks_workload_control::joint_admission::JointProgressDriver,
+    clock: &crate::task_execution::clock::ManualClock,
+    allow_original_clock: bool,
+    original: F,
+) -> F::Output {
+    use crate::fixtures::{ProgressBudget, ProgressSelection};
+    let mut original = Box::pin(original);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        crate::query_execution::native_execution_adapter::source_cohort::tests::drive(joint);
+        if let std::task::Poll::Ready(result) = futures::poll!(original.as_mut()) {
+            return result;
+        }
+        let progressed = fixture
+            .progress(ProgressSelection::All, ProgressBudget::default())
+            .await;
+        if allow_original_clock
+            && progressed.actors == 0
+            && progressed.hosts == 0
+            && let Some(next) = fixture.runtime().next_deadline()
+            && std::time::Duration::from_nanos(next.0) > clock.now().since_origin()
+        {
+            clock.advance(Duration::from_nanos(
+                next.0 - u64::try_from(clock.now().since_origin().as_nanos()).unwrap(),
+            ));
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "original diagnostic fixture work did not exit"
+        );
+        tokio::task::yield_now().await;
     }
 }
 
 #[tokio::test]
 async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immutable() {
-    let (mut round, acks, release, clock, establish_facts) =
-        crate::task_execution::tests::manifest_normal_release_ack_with_actor_facts_fixture();
-    let root_task = round.root_task();
-    let participation = *round.execution().graph().participations().next().unwrap();
-    let cut = clock.now();
-    let diagnostic_budget = Duration::from_millis(10);
-    let convergence_budget = Duration::from_secs(60);
-    let control = novarocks_workload_control::WorkloadControl::try_new(
-        novarocks_workload_control::WorkloadConfig::default(),
-        novarocks_workload_control::ResourceConfig {
-            total_bytes: 1 << 20,
-            control_bytes: 1 << 10,
-            per_scope_bytes: 1 << 18,
+    use crate::fixtures::native_recipe::{
+        OriginalRecipeContext, OriginalRecipeOperands, PreparedOriginalRecipeProcess, RecipeRoot,
+        count_description, install_original_recipe, prepare_original_recipe_process,
+    };
+    use crate::native::{data_runtime::FrontendDataRuntime, task_transport::tests::Loopback};
+    use crate::query_execution::internal_consumer::profile::profile_computation_consumer;
+    use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
+    use novarocks_workload_control::{
+        ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+    };
+    use std::sync::atomic::Ordering;
+    let mut data = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+    let mut peer = Loopback::start().await;
+    let descriptor = peer.bounded_root_descriptor(novarocks_types::BackendProcessId::new_v7());
+    let history = novarocks_control_runtime::history::HistoryCapture::new(32_768);
+    let PreparedOriginalRecipeProcess {
+        mut fixture,
+        process,
+        clock,
+        mut joint,
+        workload,
+        mut supervisor,
+        client,
+        capacity,
+        handle,
+        descriptor,
+    } = prepare_original_recipe_process(&data, descriptor, history, ResultCapacityConfig::V1, None);
+    let root_work = workload
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = root_work.owner.scope();
+    let business = root_work.business;
+    let window = capacity
+        .try_acquire(&scope, ResultWindowClass::Internal)
+        .unwrap();
+    let (description, plan) = count_description();
+    let (consumer, offers, output) = profile_computation_consumer(&description, plan).unwrap();
+    let (mut logical, cohort, mut output) = install_original_recipe(
+        OriginalRecipeContext {
+            fixture: &mut fixture,
+            joint: &mut joint,
+            process: &process,
+            data: &data,
+            clock: &clock,
+            handle,
+            descriptor,
+            client,
         },
-    )
-    .unwrap();
-    control.mark_ready().unwrap();
-    let governed = control
-        .try_begin_root(novarocks_workload_control::WorkRequest::new(
-            novarocks_workload_control::WorkClass::Query,
-        ))
-        .unwrap();
-    let stage = governed
-        .owner
-        .scope()
-        .try_acquire(novarocks_workload_control::Stage::Execution)
-        .unwrap();
-    let (abort, _abort_intake) =
-        crate::task_execution::abort_effect::NativeAbortEffectAdapter::bounded(
-            NonZeroUsize::new(2).unwrap(),
-            Arc::new(crate::task_execution::status_intake::CountingWake::default()),
-        );
-    let config = LogicalExecutionActorConfig::single_attempt_completion(
-        root_task.query_execution_id(),
-        ExecutionEffect::None,
-        NonZeroUsize::new(8).unwrap(),
-        vec![participation],
-        NonZeroUsize::new(2).unwrap(),
-        NonZeroUsize::new(2).unwrap(),
-        governed.owner,
-        stage,
-    )
-    .unwrap()
-    .with_abort_participation_effect_port(
-        abort as Arc<dyn AbortParticipationEffectPort>,
-        NonZeroUsize::new(2).unwrap(),
+        OriginalRecipeOperands {
+            owner: root_work.owner,
+            binding: QueryResultCapacityBinding::try_new(&scope, window.retain_alias()).unwrap(),
+            description,
+            plan,
+            root: RecipeRoot::EmptyCountOnly,
+            consumer,
+            offers,
+            output,
+        },
     );
-    let mut logical = LogicalExecutionTestHarness::install_internal(
-        tokio::runtime::Handle::current(),
-        config,
-        &crate::query_execution::internal_consumer::test_fixture::internal_count_description().0,
-        NonZeroUsize::new(1).unwrap(),
-        Arc::clone(&clock) as Arc<dyn MonotonicClock>,
-        ComputationObservationBudgets::new(diagnostic_budget, convergence_budget),
-        root_task.query_execution_id(),
-        vec![participation],
+    logical
+        .probe
+        .profile_capture_requested
+        .store(true, Ordering::Release);
+    let installed = fixture.activate_attempt(&logical, &mut joint, false).await;
+    let root = logical.probe.root.lock().unwrap().unwrap();
+    let mut collector = logical
+        .probe
+        .profile_capture
+        .lock()
+        .unwrap()
+        .take()
+        .expect("collector froze the SAME actual graph before original installation");
+    assert_eq!(collector.root, root);
+    assert_eq!(
+        collector.expected.as_ref(),
+        logical.probe.tasks.lock().unwrap().as_slice()
+    );
+    peer.enable_single_root_lifecycle(root, novarocks_result_contract::RootOutputKind::CountOnly);
+    logical.probe.release_activation();
+    let mut original = drive_profile_original(
+        &mut fixture,
+        &mut joint,
+        clock.as_ref(),
+        false,
+        logical.ready.take().unwrap(),
     )
+    .await
     .unwrap();
-    let activation = logical.activate_initial().await.unwrap();
-    crate::task_execution::tests::settle_original_actor_establish_facts(&logical, establish_facts)
-        .await;
-    let root_status = round
-        .execution()
-        .task(root_task.task_id())
-        .unwrap()
-        .status()
-        .unwrap()
-        .clone();
-    let ready = logical
-        .accept_internal_end(
-            root_task,
-            root_status,
-            RootResultEnd {
-                sequence: NonZeroU64::MIN,
-                output_rows: 0,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(ready.activation(), activation);
-    assert_eq!(ready.root(), root_task);
-    assert_eq!(ready.cut(), cut);
+    let ready = *original
+        .ready_token()
+        .expect("actual Relay/Consumer accepted original Ready");
+    let received = output.take_ready(ready).unwrap();
+    let bound = logical.binding.bound().unwrap();
+    assert_eq!(
+        ready.activation(),
+        logical.probe.activation.lock().unwrap().unwrap()
+    );
+    assert_eq!(ready.root(), root);
+    assert_eq!(ready.cut(), clock.now());
     assert_eq!(
         ready.diagnostic_deadline(),
-        cut.saturating_add(diagnostic_budget)
+        ready
+            .cut()
+            .saturating_add(bound.start.budgets.observation.diagnostics)
     );
     assert_eq!(
         ready.convergence_deadline(),
-        cut.saturating_add(convergence_budget)
+        ready
+            .cut()
+            .saturating_add(bound.start.budgets.observation.convergence)
     );
-
-    let mut collector = TaskFinalInfoCollector::new(
-        Arc::new(NoDiagnosticRead),
-        true,
-        &round,
-        Arc::new(CountingWake::default()),
-    );
-    let observer = collector.enable_profile_observation().unwrap();
-    collector.begin_profile_observation(ready).unwrap();
     let exact = AttemptComputationCut {
         activation: ready.activation(),
         root: ready.root(),
@@ -481,8 +662,10 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
         convergence_deadline: ready.convergence_deadline(),
         end: ready.end(),
     };
-    let mut records = OriginalRecords::new(&round, activation);
-    let mut foreign = selected_cut(&round, exact);
+    let observer = collector.enable_profile_observation().unwrap();
+    collector.begin_profile_observation(ready).unwrap();
+    let mut records = OriginalRecords::from_collector(&collector, ready.activation());
+    let mut foreign = selected_cut_for_tasks(collector.expected.iter().copied(), exact);
     foreign.ready.cut = foreign.ready.cut.saturating_add(Duration::from_nanos(1));
     let sources = DiagnosticSourceSnapshot::resolve(&foreign, &records).unwrap();
     assert!(
@@ -491,81 +674,25 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
             .is_err()
     );
     assert!(observer.current(ready).unwrap().is_none());
-
-    let mut bad_tasks = selected_cut(&round, exact);
-    let status = round
-        .execution()
-        .task(root_task.task_id())
-        .unwrap()
-        .status()
-        .unwrap()
-        .clone();
-    let mut root_info = Some(Box::new(
-        FinalTaskInfo::try_new(root_task, status.clone(), Vec::new(), false).unwrap(),
-    ));
-    let sibling = bad_tasks
+    // The original Ready gate also leaves the watch empty after a typed rich
+    // resolver failure. The mixed three-Task payload/ref cases are above.
+    let root_reference = information_reference(3, root);
+    let mut rejected = selected_cut_for_tasks(collector.expected.iter().copied(), exact);
+    rejected
         .tasks
         .iter_mut()
-        .find(|(task, _)| *task != root_task)
-        .unwrap();
-    let sibling_reference = information_reference(1, sibling.0);
-    sibling.1 = DiagnosticTaskObservation::Available(sibling_reference);
-    let sources = DiagnosticSourceSnapshot::resolve(&bad_tasks, &records).unwrap();
-    assert!(matches!(
-        collector.publish_core_cut(ready, &bad_tasks, sources, |reference| {
-            assert_eq!(reference, sibling_reference);
-            Ok(root_info.take().unwrap())
-        }),
-        Err(TaskExecutionError::Schedule(message))
-            if message == "core diagnostic payload names a foreign Task"
-    ));
-    assert!(observer.current(ready).unwrap().is_none());
-
-    // A row/reference mismatch is rejected before taking any rich object.
-    let mut wrong_reference = selected_cut(&round, exact);
-    wrong_reference
-        .tasks
-        .iter_mut()
-        .find(|(task, _)| *task != root_task)
-        .unwrap()
-        .1 = DiagnosticTaskObservation::Available(information_reference(2, root_task));
-    let sources = DiagnosticSourceSnapshot::resolve(&wrong_reference, &records).unwrap();
-    assert!(matches!(
-        collector.publish_core_cut(ready, &wrong_reference, sources, unexpected_resolution),
-        Err(TaskExecutionError::Schedule(message))
-            if message == "core diagnostic reference names a foreign Task"
-    ));
-    assert!(observer.current(ready).unwrap().is_none());
-
-    // Resolver failure stays an error and cannot publish a partial snapshot.
-    let root_reference = information_reference(3, root_task);
-    let mut failed_resolution = selected_cut(&round, exact);
-    failed_resolution
-        .tasks
-        .iter_mut()
-        .find(|(task, _)| *task == root_task)
+        .find(|(task, _)| *task == root)
         .unwrap()
         .1 = DiagnosticTaskObservation::Available(root_reference);
-    let sources = DiagnosticSourceSnapshot::resolve(&failed_resolution, &records).unwrap();
+    let sources = DiagnosticSourceSnapshot::resolve(&rejected, &records).unwrap();
     assert!(matches!(
-        collector.publish_core_cut(ready, &failed_resolution, sources, |reference| {
+        collector.publish_core_cut(ready, &rejected, sources, |reference| {
             assert_eq!(reference, root_reference);
             Err(TaskExecutionError::UnknownOperation)
         }),
         Err(TaskExecutionError::UnknownOperation)
     ));
     assert!(observer.current(ready).unwrap().is_none());
-
-    // Matching Task IDs cannot disguise a foreign frozen fragment binding.
-    let mut wrong_binding = OriginalRecords::new(&round, activation);
-    wrong_binding.fragments[0].1 = wrong_binding.fragments[0].1.wrapping_add(1);
-    let cut = selected_cut(&round, exact);
-    let sources = DiagnosticSourceSnapshot::resolve(&cut, &wrong_binding).unwrap();
-    assert!(
-        collector
-            .publish_core_cut(ready, &cut, sources, unexpected_resolution)
-            .is_err()
-    );
     let before = SplitSourceProfile {
         files_considered: 7,
         splits_emitted: 2,
@@ -573,105 +700,99 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
     };
     records.rows.insert(
         reference(1),
-        OwnedPayload::SplitProfile(activation, root_task, before),
+        OwnedPayload::SplitProfile(ready.activation(), root, before),
     );
-    let mut first_cut = selected_cut(&round, exact);
+    let mut first_cut = selected_cut_for_tasks(collector.expected.iter().copied(), exact);
     first_cut.sources.split = SplitDiagnosticObservation::Available(reference(1));
-    first_cut
-        .tasks
-        .iter_mut()
-        .find(|(task, _)| *task == root_task)
-        .unwrap()
-        .1 = DiagnosticTaskObservation::Available(root_reference);
-    let mut original_info = Some(Box::new(
-        FinalTaskInfo::try_new(root_task, status, Vec::new(), false).unwrap(),
-    ));
-    let mut resolved = 0;
-    let selected_at = first_cut.sources.selected_at;
-    // The canonical row is sufficient even after the weak live source is gone.
     let sources = DiagnosticSourceSnapshot::resolve(&first_cut, &records).unwrap();
     assert!(
         collector
-            .publish_core_cut(ready, &first_cut, sources, |reference| {
-                assert_eq!(reference, root_reference);
-                resolved += 1;
-                Ok(original_info.take().unwrap())
-            })
+            .publish_core_cut(ready, &first_cut, sources, unexpected_resolution)
             .unwrap()
     );
-    assert_eq!(resolved, 1);
-    assert!(original_info.is_none());
     let first = observer.current(ready).unwrap().unwrap();
     assert_eq!(first.ready, ready);
-    assert_eq!(first.selected_at, selected_at);
+    assert_eq!(first.selected_at, first_cut.sources.selected_at);
     assert_ne!(first.selected_at, ready.cut());
-    assert!(matches!(first.split, ProfileSplitDiagnostic::Available(profile) if profile == before));
-    assert!(first.tasks.iter().all(|(task, fact)| {
-        if *task == root_task {
-            matches!(fact, ProfileTaskDiagnostic::Available(info)
-                if info.final_status().identity() == root_task)
-        } else {
-            matches!(
-                fact,
-                ProfileTaskDiagnostic::Missing(ProfileDiagnosticMissing::ReadPending)
-            )
-        }
-    }));
-    let mut later_cut = selected_cut(&round, exact);
-    later_cut.closure = DiagnosticClosure::Cancelled;
-    later_cut.sources.selected_at = selected_at.saturating_add(Duration::from_millis(1));
-    later_cut.sources.runtime_filters.complete = true;
-    later_cut.sources.split = SplitDiagnosticObservation::SourceGone;
-    // Even a new Available ref cannot consume records after the first cut.
-    later_cut
-        .tasks
-        .iter_mut()
-        .find(|(task, _)| *task == root_task)
-        .unwrap()
-        .1 = DiagnosticTaskObservation::Available(information_reference(4, root_task));
-    let sources = DiagnosticSourceSnapshot::resolve(&later_cut, &records).unwrap();
+    assert!(first.tasks.iter().all(|(_, row)| matches!(
+        row,
+        ProfileTaskDiagnostic::Missing(ProfileDiagnosticMissing::ReadPending)
+    )));
+    let mut later = selected_cut_for_tasks(collector.expected.iter().copied(), exact);
+    later.closure = DiagnosticClosure::Cancelled;
+    later.sources.selected_at = first.selected_at.saturating_add(Duration::from_millis(1));
+    later.sources.runtime_filters.complete = true;
+    later.sources.split = SplitDiagnosticObservation::SourceGone;
+    later.tasks[0].1 = DiagnosticTaskObservation::Available(information_reference(4, root));
+    let sources = DiagnosticSourceSnapshot::resolve(&later, &records).unwrap();
     assert!(
         !collector
-            .publish_core_cut(ready, &later_cut, sources, unexpected_resolution)
+            .publish_core_cut(ready, &later, sources, unexpected_resolution)
             .unwrap()
     );
     let second = observer.current(ready).unwrap().unwrap();
     assert!(Arc::ptr_eq(&first, &second));
-    assert_eq!(second.selected_at, selected_at);
+    assert_eq!(second.selected_at, first_cut.sources.selected_at);
     assert!(
         matches!(second.split, ProfileSplitDiagnostic::Available(profile) if profile == before)
     );
     assert!(!second.runtime_filters.is_complete());
     assert!(collector.final_info_closed());
-
-    // Settle the fixture's original Release and original QA owner rather than
-    // treating dropped observation objects as actual participation exit.
-    let OperationIntent::ReleaseParticipation(request) = &release else {
-        unreachable!()
-    };
-    acks.publish(OperationAcknowledgement::new(
-        release.operation_id(),
-        OperationKind::ReleaseParticipation,
-        OperationOutcome::Accepted,
-        AckPayload::Release {
-            receipt: ParticipationReceipt::new(
-                request.participation(),
-                ParticipationState::TerminalRetained,
-            ),
-            outcome: ReleaseOutcome::Released,
-            runtime_filter: Some(
-                crate::task_execution::tests::fixture_runtime_filter_contribution(),
-            ),
-        },
+    drop((first, second, observer, collector, records, bound));
+    let mut exit = original
+        .take_exit_observer()
+        .or_else(|| logical.exit.take())
+        .expect("same original logical physical-exit observer");
+    drop((received, original));
+    let receipt = drive_profile_original(
+        &mut fixture,
+        &mut joint,
+        clock.as_ref(),
+        true,
+        std::future::poll_fn(|cx| exit.poll_exit(cx)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        *installed.fixture_exit.observe_actual_exit().borrow(),
+        "actual AP Actor and Scope removed"
+    );
+    assert_eq!(
+        peer.single_root_result_progress(),
+        (true, 1),
+        "original End/ACK is independent of component publication"
+    );
+    drop((
+        receipt, exit, installed, logical, output, cohort, window, capacity,
     ));
-    round.turn().unwrap();
-    logical.abandon_running_attempt();
-    logical
-        .observe_worker_stopped_and_participation_fenced(participation)
+    drive_profile_original(
+        &mut fixture,
+        &mut joint,
+        clock.as_ref(),
+        true,
+        supervisor.shutdown_until(std::time::Instant::now() + Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    drop(supervisor);
+    process.close_original_host_registration_for_fixture();
+    fixture.finish().await;
+    drop(fixture);
+    business.release();
+    crate::query_execution::native_execution_adapter::source_cohort::tests::drive(&mut joint);
+    tokio::time::timeout(Duration::from_secs(5), scope.wait_released())
         .await
         .unwrap();
-    logical
-        .finish_until(std::time::Instant::now() + Duration::from_secs(5))
+    drop(scope);
+    workload.close_admission();
+    crate::query_execution::native_execution_adapter::source_cohort::tests::drive(&mut joint);
+    assert!(workload.shutdown().is_ok());
+    data.drain_original_apply_until(std::time::Instant::now() + Duration::from_secs(5))
         .await
         .unwrap();
+    data.drain_native_outgoing_until(std::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(peer.settle().await);
+    assert!(process.original_registries_empty_for_fixture());
 }

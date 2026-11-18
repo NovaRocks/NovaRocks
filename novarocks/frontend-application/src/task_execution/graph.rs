@@ -214,10 +214,6 @@ pub struct StageNode {
 
 #[cfg(test)]
 impl StageNode {
-    pub const fn stage(&self) -> novarocks_execution_contract::StageRef {
-        self.stage
-    }
-
     pub const fn stage_id(&self) -> StageId {
         self.stage.stage_id()
     }
@@ -290,8 +286,6 @@ pub struct TaskGraph {
     #[cfg(test)]
     stages: BTreeMap<StageId, StageNode>,
     edges: BTreeMap<ExchangeEdgeId, EdgeNode>,
-    #[cfg(test)]
-    producer_stages: BTreeMap<StageId, BTreeSet<StageId>>,
     participations: BTreeSet<ParticipationRef>,
     seeds: BTreeMap<TaskId, TaskCreationSeed>,
 }
@@ -323,11 +317,6 @@ impl TaskGraph {
     }
 
     #[cfg(test)]
-    pub fn stage(&self, stage_id: StageId) -> Option<&StageNode> {
-        self.stages.get(&stage_id)
-    }
-
-    #[cfg(test)]
     pub fn stages(&self) -> impl ExactSizeIterator<Item = &StageNode> + '_ {
         self.stages.values()
     }
@@ -335,17 +324,6 @@ impl TaskGraph {
     #[cfg(test)]
     pub fn edges(&self) -> impl ExactSizeIterator<Item = &EdgeNode> + '_ {
         self.edges.values()
-    }
-
-    /// The stages that feed `stage_id`, which are exactly the stages this one
-    /// releases when it stops consuming.
-    #[cfg(test)]
-    pub fn producer_stages(&self, stage_id: StageId) -> impl Iterator<Item = StageId> + '_ {
-        self.producer_stages
-            .get(&stage_id)
-            .into_iter()
-            .flatten()
-            .copied()
     }
 
     /// Every participation this attempt establishes: exactly one per backend
@@ -836,15 +814,6 @@ pub(crate) fn build_task_graph_from_manifest(
             )
         })
         .collect();
-    #[cfg(test)]
-    let mut producer_stages = BTreeMap::<StageId, BTreeSet<StageId>>::new();
-    #[cfg(test)]
-    for edge in edges.values() {
-        producer_stages
-            .entry(edge.consumer_stage)
-            .or_default()
-            .insert(edge.producer_stage);
-    }
     Ok(TaskGraph {
         execution_id: manifest.execution(),
         root_task,
@@ -852,8 +821,6 @@ pub(crate) fn build_task_graph_from_manifest(
         #[cfg(test)]
         stages,
         edges,
-        #[cfg(test)]
-        producer_stages,
         participations,
         seeds,
     })

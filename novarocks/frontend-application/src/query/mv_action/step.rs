@@ -746,6 +746,15 @@ impl MvRefreshProgressPort for StepPort<'_, '_> {
                 }
                 Phase::PreCommit => {
                     if self.execution.future.is_none() {
+                        if let Some(error) = self
+                            .execution
+                            .native
+                            .as_mut()
+                            .and_then(|native| native.poll_supervision_failure(cx))
+                        {
+                            self.execution.reject_execution(novarocks_query_application::session_outcome::governed_query_execution_error(error));
+                            return Poll::Ready(());
+                        }
                         self.execution.future = Some(source.precommit());
                     }
                     match self.execution.poll_phase(cx) {
@@ -755,6 +764,15 @@ impl MvRefreshProgressPort for StepPort<'_, '_> {
                             return Poll::Ready(());
                         }
                         Poll::Ready(Ok(())) => {}
+                    }
+                    if let Some(error) = self
+                        .execution
+                        .native
+                        .as_mut()
+                        .and_then(|native| native.poll_supervision_failure(cx))
+                    {
+                        self.execution.reject_execution(novarocks_query_application::session_outcome::governed_query_execution_error(error));
+                        return Poll::Ready(());
                     }
                     if let Err(error) = source.mark_dispatched() {
                         self.execution.reject_execution(error);
@@ -775,6 +793,16 @@ impl MvRefreshProgressPort for StepPort<'_, '_> {
                     self.execution.phase = Phase::Publish;
                 }
                 Phase::Publish => {
+                    if self.execution.publication.as_ref().unwrap().call.is_none()
+                        && let Some(error) = self
+                            .execution
+                            .native
+                            .as_mut()
+                            .and_then(|native| native.poll_supervision_failure(cx))
+                    {
+                        self.execution.reject_execution(novarocks_query_application::session_outcome::governed_query_execution_error(error));
+                        return Poll::Ready(());
+                    }
                     let session = match source.session() {
                         Ok(Some(session)) => session,
                         Ok(None) => {
