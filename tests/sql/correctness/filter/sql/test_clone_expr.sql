@@ -32,14 +32,14 @@ CREATE TABLE t1 (
 TBLPROPERTIES ("format-version" = "3");
 INSERT INTO t1 SELECT generate_series, generate_series, generate_series % 100, "2024-07-24"
 FROM TABLE(generate_series(1, 10));
-SELECT t2.dt, unnest, sum(d1), sum(d2)
+SELECT t2.dt, `unnest`, sum(d1), sum(d2)
 FROM (
     SELECT * FROM (
         SELECT dt,
             ds_hll_count_distinct(if(province>5 and id>5, age, null), 21) as d1,
             ds_hll_count_distinct(if(id>5 and province>5, age, null), 21) as d2
         FROM t1 GROUP BY dt
-    ) t0, unnest([1, 2, 3]) as unnest(unnest)
+    ) t0, unnest([1, 2, 3]) as `unnest`(`unnest`)
 ) t2
 GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 10;
 
@@ -47,13 +47,13 @@ GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 10;
 USE ${case_db};
 INSERT INTO t1 SELECT generate_series, generate_series, generate_series % 100, "2024-07-24"
 FROM TABLE(generate_series(1, 10));
-SELECT t2.dt, unnest, sum(d1), sum(d2)
+SELECT t2.dt, `unnest`, sum(d1), sum(d2)
 FROM (
     SELECT * FROM (
         SELECT dt,
             ds_hll_count_distinct(if(province>5 and id>5, age, null), 21) as d1,
             ds_hll_count_distinct(if(id>5 and province>5, age, null), 21) as d2
         FROM t1 GROUP BY dt
-    ) t0, unnest([1, 2, 3]) as unnest(unnest)
+    ) t0, unnest([1, 2, 3]) as `unnest`(`unnest`)
 ) t2
 GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 10;

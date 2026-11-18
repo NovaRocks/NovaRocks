@@ -82,7 +82,7 @@ DROP MATERIALIZED VIEW target_mv;
 -- that left the catalog entry behind with its metadata purged; asserting it
 -- would now pin that weaker behavior instead of objective 3.
 -- @expect_error=unknown table
-SELECT COUNT(*) FROM target_mv;
+SELECT COUNT() FROM target_mv;
 
 -- query 7
 -- @cleanup=true

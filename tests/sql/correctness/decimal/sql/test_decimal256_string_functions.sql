@@ -58,8 +58,8 @@ SELECT
     d76_0,
     CAST(d76_0 AS STRING) as d76_string,
     LENGTH(CAST(d76_0 AS STRING)) as string_length,
-    LEFT(CAST(d76_0 AS STRING), 10) as left_10_chars,
-    RIGHT(CAST(d76_0 AS STRING), 10) as right_10_chars,
+    STRLEFT(CAST(d76_0 AS STRING), 10) as left_10_chars,
+    STRRIGHT(CAST(d76_0 AS STRING), 10) as right_10_chars,
     SUBSTR(CAST(d76_0 AS STRING), 1, 20) as first_20_chars
 FROM ${case_db}.decimal_string_test
 ORDER BY id;
