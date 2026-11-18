@@ -127,7 +127,7 @@ REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
 SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvrows_${uuid0}';
 
 -- query 20
-SELECT COUNT(*) AS row_count FROM rows_mv;
+SELECT COUNT() AS row_count FROM rows_mv;
 
 -- query 21
 -- @result_contains=MV_RESULT_ROWS_FILE_CENSUS_OK

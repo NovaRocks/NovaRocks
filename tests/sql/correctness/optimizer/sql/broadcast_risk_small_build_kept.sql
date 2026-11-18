@@ -30,7 +30,7 @@ SET cbo_broadcast_backend_count = 3;
 SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (BROADCAST
 -- @explain_contains=bcast_verdict=feasible
-SELECT COUNT(*) AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
+SELECT COUNT() AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
 
 EXPLAIN VERBOSE
-SELECT COUNT(*) AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
+SELECT COUNT() AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;

@@ -38,5 +38,5 @@ no_stats AS (
     ) projected
     WHERE k > 0
 )
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM big_probe p JOIN no_stats b ON p.k = b.k;

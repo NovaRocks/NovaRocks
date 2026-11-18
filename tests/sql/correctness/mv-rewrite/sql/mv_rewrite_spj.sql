@@ -102,7 +102,7 @@ REFRESH MATERIALIZED VIEW spj_mv WITH SYNC MODE;
 SELECT region, day, amount FROM orders WHERE amount > 98;
 
 -- query 10
-SELECT region, day, COUNT(*) AS c, SUM(amount) AS s
+SELECT region, day, COUNT() AS c, SUM(amount) AS s
 FROM orders WHERE amount > 98 GROUP BY region, day ORDER BY region, day;
 
 -- query 11

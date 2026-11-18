@@ -28,5 +28,5 @@ sb AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 10000))
 )
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM sp p JOIN sb b ON p.k = b.k;

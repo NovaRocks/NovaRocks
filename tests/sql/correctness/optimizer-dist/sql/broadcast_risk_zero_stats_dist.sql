@@ -44,7 +44,7 @@ no_stats AS (
     ) projected
     WHERE k > 0
 )
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM big_probe p JOIN no_stats b ON p.k = b.k;
 
 SET cbo_broadcast_node_mem_budget_bytes = 268435456;
@@ -67,5 +67,5 @@ b AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 10))
 )
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM p JOIN b ON p.k = b.k;

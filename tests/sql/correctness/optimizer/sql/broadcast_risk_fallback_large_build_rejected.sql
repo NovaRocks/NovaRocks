@@ -33,5 +33,5 @@ build_fallback_risky AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 100000000))
 )
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM probe_1m p JOIN build_fallback_risky b ON p.k = b.k;

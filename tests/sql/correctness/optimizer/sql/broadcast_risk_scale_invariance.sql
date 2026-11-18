@@ -37,13 +37,13 @@ ANALYZE TABLE build_10x;
 SET cbo_broadcast_backend_count = 3;
 SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (BROADCAST
-SELECT COUNT(*) AS cnt FROM probe_1x p JOIN build_1x b ON p.k = b.k;
+SELECT COUNT() AS cnt FROM probe_1x p JOIN build_1x b ON p.k = b.k;
 
 EXPLAIN VERBOSE
-SELECT COUNT(*) AS cnt FROM probe_1x p JOIN build_1x b ON p.k = b.k;
+SELECT COUNT() AS cnt FROM probe_1x p JOIN build_1x b ON p.k = b.k;
 
 -- @explain_contains=HASH JOIN (BROADCAST
-SELECT COUNT(*) AS cnt FROM probe_10x p JOIN build_10x b ON p.k = b.k;
+SELECT COUNT() AS cnt FROM probe_10x p JOIN build_10x b ON p.k = b.k;
 
 EXPLAIN VERBOSE
-SELECT COUNT(*) AS cnt FROM probe_10x p JOIN build_10x b ON p.k = b.k;
+SELECT COUNT() AS cnt FROM probe_10x p JOIN build_10x b ON p.k = b.k;

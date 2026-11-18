@@ -29,7 +29,7 @@ ANALYZE TABLE build_1000;
 SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (BROADCAST
 -- @explain_contains=bcast_verdict=feasible
-SELECT COUNT(*) AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
+SELECT COUNT() AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
 
 -- The build has ten i64 keys: 80 payload bytes; every backend receives it.
 -- @skip_result_check=true
@@ -50,5 +50,5 @@ b AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 10))
 )
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM p JOIN b ON p.k = b.k;

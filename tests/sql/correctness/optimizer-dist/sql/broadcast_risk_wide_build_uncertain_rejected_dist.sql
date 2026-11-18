@@ -30,7 +30,7 @@ SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_not_contains=BROADCAST, INNER
 -- @explain_not_contains=memory=inf
-SELECT COUNT(*) AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k = b.k;
+SELECT COUNT() AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k = b.k;
 
 -- Assert the selected distribution and the edge contract, without node numbers.
 -- @skip_result_check=true
@@ -46,7 +46,7 @@ SELECT COUNT(*) AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k
 -- @result_contains=activation = BlockingSnapshot
 -- @result_contains=columns: k
 EXPLAIN VERBOSE
-SELECT COUNT(*) AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k = b.k;
+SELECT COUNT() AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k = b.k;
 
 -- The build has ten i64 keys: 80 payload bytes; every backend receives it.
 -- @skip_result_check=true
@@ -67,5 +67,5 @@ b AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 10))
 )
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM p JOIN b ON p.k = b.k;

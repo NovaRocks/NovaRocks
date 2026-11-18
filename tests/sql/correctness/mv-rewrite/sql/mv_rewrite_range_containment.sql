@@ -109,7 +109,7 @@ REFRESH MATERIALIZED VIEW aug_mv WITH SYNC MODE;
 SELECT dt, region, amount FROM events WHERE dt >= '2021-08-01' AND dt < '2021-09-01';
 
 -- query 10
-SELECT dt, region, COUNT(*) AS c, SUM(amount) AS s
+SELECT dt, region, COUNT() AS c, SUM(amount) AS s
 FROM events WHERE dt >= '2021-08-01' AND dt < '2021-09-01'
 GROUP BY dt, region ORDER BY dt, region;
 
@@ -120,7 +120,7 @@ GROUP BY dt, region ORDER BY dt, region;
 SELECT dt, amount FROM events WHERE dt BETWEEN '2021-08-05' AND '2021-08-20';
 
 -- query 12
-SELECT dt, COUNT(*) AS c, SUM(amount) AS s
+SELECT dt, COUNT() AS c, SUM(amount) AS s
 FROM events WHERE dt BETWEEN '2021-08-05' AND '2021-08-20'
 GROUP BY dt ORDER BY dt;
 
@@ -131,7 +131,7 @@ GROUP BY dt ORDER BY dt;
 SELECT dt, amount FROM events WHERE dt BETWEEN '2021-08-05' AND '2021-09-01';
 
 -- query 14
-SELECT dt, COUNT(*) AS c
+SELECT dt, COUNT() AS c
 FROM events WHERE dt BETWEEN '2021-08-05' AND '2021-09-01'
 GROUP BY dt ORDER BY dt;
 
