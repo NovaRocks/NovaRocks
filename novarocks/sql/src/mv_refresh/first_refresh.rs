@@ -268,21 +268,39 @@ impl SqlMvFirstRefreshArtifact {
         &self.0.query
     }
 
-    /// Declare catalog facts for this original opaque query artifact. Its AST
-    /// stays SQL-owned; the caller observes only exact SchemaOnly requests.
+    /// Declare the catalog observations for the artifact's quoted relations
+    /// without giving the application custody of the query AST.
+    pub fn quoted_metadata_catalogs(
+        &self,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        control: &crate::compiler::SqlCompileControl,
+    ) -> Result<Vec<novarocks_spi::connector::ConnectorInstanceId>, crate::compiler::SqlCompileError>
+    {
+        crate::compiler::quoted_metadata_catalogs(
+            self.query(),
+            current_catalog,
+            current_database,
+            control,
+        )
+    }
+
+    /// Declare exact SchemaOnly requests for this original opaque query.
     pub fn catalog_preparation(
         &self,
         current_catalog: Option<&str>,
         current_database: &str,
         control: crate::compiler::SqlCompileControl,
+        qualifications: crate::compiler::CatalogQualifications,
     ) -> Result<crate::compiler::SqlCapturedCatalogPreparation, crate::compiler::SqlCompileError>
     {
         control.check()?;
-        crate::compiler::SqlCapturedCatalogPreparation::try_new(
+        crate::compiler::SqlCapturedCatalogPreparation::try_new_with_qualifications(
             self.query().clone(),
             current_catalog,
             current_database,
             control,
+            qualifications,
         )
     }
 }

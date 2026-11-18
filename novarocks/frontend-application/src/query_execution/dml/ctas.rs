@@ -1303,18 +1303,31 @@ async fn plan_query_for_ctas_source_async(
     .map_err(internal_failure)?;
     let compile_control =
         crate::query_execution::planning::sql_compile_control_from_execution(execution);
-    let mut preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new(
-        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
-        novarocks_sql::compiler::SqlSessionContext {
-            sql_semantics: execution.sql_semantics().clone(),
-            current_catalog: current_catalog.map(str::to_string),
-            current_database: current_database.to_string(),
-            optimizer_settings: execution.optimizer_settings().clone(),
-        },
-        compile_control.clone(),
-        novarocks_sql::compiler::RootDistributionRequirement::Any,
+    let qualifications = crate::query_execution::compiler::observe_dml_catalog_qualifications(
+        &query,
+        current_catalog,
+        current_database,
+        &compile_control,
+        table_bindings.as_ref(),
+        state.catalog_application().map(Arc::as_ref),
     )
     .map_err(CtasFailure::from_compile)?;
+    let mut preparation =
+        novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent_with_qualifications(
+            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
+            novarocks_sql::compiler::SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
+                current_catalog: current_catalog.map(str::to_string),
+                current_database: current_database.to_string(),
+                optimizer_settings: execution.optimizer_settings().clone(),
+            },
+            compile_control.clone(),
+            novarocks_sql::compiler::SqlCompileIntent::IcebergWrite {
+                root_distribution: novarocks_sql::compiler::RootDistributionRequirement::Any,
+            },
+            qualifications,
+        )
+        .map_err(CtasFailure::from_compile)?;
     while !preparation.needs().is_empty() {
         let facts = provider_source
             .resolve_catalog_relations(preparation.needs())

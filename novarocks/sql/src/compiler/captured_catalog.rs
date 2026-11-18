@@ -38,17 +38,30 @@ impl SqlCapturedCatalogPreparation {
         current_database: &str,
         control: SqlCompileControl,
     ) -> Result<Self, SqlCompileError> {
-        control.check()?;
-        let catalog = CatalogCompletionState::try_new(
+        Self::try_new_with_qualifications(
             query,
             current_catalog,
             current_database,
-            crate::catalog::TableLookupMode::SchemaOnly,
-            0,
-        )?
-        .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
-        control.check()?;
-        Ok(Self { catalog, control })
+            control,
+            super::CatalogQualifications::default(),
+        )
+    }
+
+    pub fn try_new_with_qualifications(
+        query: novarocks_parser::ast::Query,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        control: SqlCompileControl,
+        qualifications: super::CatalogQualifications,
+    ) -> Result<Self, SqlCompileError> {
+        Self::try_new_qualified_catalog(
+            query,
+            current_catalog,
+            current_database,
+            None,
+            control,
+            qualifications,
+        )
     }
 
     pub fn try_new_definition(
@@ -58,16 +71,61 @@ impl SqlCapturedCatalogPreparation {
         target: Option<novarocks_types::naming::TableIdentity>,
         control: SqlCompileControl,
     ) -> Result<Self, SqlCompileError> {
-        control.check()?;
-        let catalog = CatalogCompletionState::try_new(
+        Self::try_new_definition_with_qualifications(
+            query,
+            catalog,
+            database,
+            target,
+            control,
+            super::CatalogQualifications::default(),
+        )
+    }
+
+    pub fn try_new_definition_with_qualifications(
+        query: novarocks_parser::ast::Query,
+        catalog: &str,
+        database: &str,
+        target: Option<novarocks_types::naming::TableIdentity>,
+        control: SqlCompileControl,
+        qualifications: super::CatalogQualifications,
+    ) -> Result<Self, SqlCompileError> {
+        Self::try_new_qualified_catalog(
             query,
             Some(catalog),
             database,
+            Some(target),
+            control,
+            qualifications,
+        )
+    }
+
+    fn try_new_qualified_catalog(
+        query: novarocks_parser::ast::Query,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        definition: Option<Option<novarocks_types::naming::TableIdentity>>,
+        control: SqlCompileControl,
+        qualifications: super::CatalogQualifications,
+    ) -> Result<Self, SqlCompileError> {
+        control.check()?;
+        let catalog = CatalogCompletionState::try_new_with_qualifications(
+            query,
+            &[],
+            &[],
+            current_catalog,
+            current_database,
             crate::catalog::TableLookupMode::SchemaOnly,
             0,
-        )?
-        .with_definition_context(target, &control)?
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            qualifications,
+        )?;
+        let catalog = if let Some(target) = definition {
+            catalog.with_definition_context(target, &control)?
+        } else {
+            catalog
+        }
         .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
+        control.check()?;
         Ok(Self { catalog, control })
     }
 

@@ -151,6 +151,21 @@ pub(crate) struct LogicalFinishInput {
     pub(crate) environment: SqlPlanningEnvironment,
     pub(crate) level: ExplainLevel,
 }
+struct CatalogQualificationSource {
+    bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    application: Arc<dyn novarocks_catalog_application::CatalogApplicationPort>,
+}
+
+impl CatalogQualificationSource {
+    fn observe(
+        &self,
+        candidates: &[novarocks_spi::connector::ConnectorInstanceId],
+    ) -> Result<novarocks_sql::compiler::CatalogQualifications, SqlCompileError> {
+        self.bindings
+            .observe_catalog_qualifications(candidates, Some(self.application.as_ref()))
+    }
+}
+
 struct LogicalCatalogInput {
     input: novarocks_sql::compiler::SqlStatementInput,
     session: SqlSessionContext,
@@ -288,6 +303,7 @@ enum PlanningCpuOutput {
 }
 struct PlanningCpuBody {
     system_snapshot: Option<crate::system_tables::SystemTableCpuStaging>,
+    catalog_qualification_source: Option<CatalogQualificationSource>,
     input: Option<PlanningCpuInput>,
     output: Option<PlanningCpuOutput>,
     candidate: Option<CompletedPhysicalPlanCandidate>,
@@ -389,7 +405,21 @@ impl PlanningCpuOriginal {
                     .finish(),
             ),
             PlanningCpuInput::Start(request) => {
-                PlanningCpuOutput::Progress(SqlCompletionPureSteps::start(*request))
+                let request = *request;
+                let result = if let Some(source) = body.catalog_qualification_source.take() {
+                    request
+                        .quoted_metadata_catalogs()
+                        .and_then(|candidates| source.observe(&candidates))
+                        .map_err(FinalPlanCompletionError::from)
+                        .and_then(|qualifications| {
+                            SqlCompletionPureSteps::start(
+                                request.with_catalog_qualifications(qualifications),
+                            )
+                        })
+                } else {
+                    SqlCompletionPureSteps::start(request)
+                };
+                PlanningCpuOutput::Progress(result)
             }
             PlanningCpuInput::Finish {
                 compilation,
@@ -421,9 +451,22 @@ impl PlanningCpuOriginal {
                     session,
                     control,
                 } = *input;
-                PlanningCpuOutput::LogicalCatalog(Box::new(
-                    SqlLogicalExplainCatalog::try_new_for_input(input, session, control),
-                ))
+                let qualifications = match body.catalog_qualification_source.take() {
+                    Some(source) => input
+                        .quoted_metadata_catalogs(&session, &control)
+                        .and_then(|candidates| source.observe(&candidates)),
+                    None => Ok(novarocks_sql::compiler::CatalogQualifications::default()),
+                };
+                PlanningCpuOutput::LogicalCatalog(Box::new(qualifications.and_then(
+                    |qualifications| {
+                        SqlLogicalExplainCatalog::try_new_for_input_with_qualifications(
+                            input,
+                            session,
+                            control,
+                            qualifications,
+                        )
+                    },
+                )))
             }
             PlanningCpuInput::LogicalContinue { logical, facts } => {
                 PlanningCpuOutput::LogicalCatalog(Box::new(logical.continue_catalog(facts)))
@@ -593,6 +636,7 @@ impl FrontendPlanningCpuSource {
             original: Arc::new(PlanningCpuOriginal {
                 body: Mutex::new(Some(PlanningCpuBody {
                     system_snapshot: None,
+                    catalog_qualification_source: None,
                     input: None,
                     output: None,
                     candidate: None,
@@ -626,6 +670,26 @@ impl FrontendPlanningCpuSource {
             .as_ref()
             .and_then(|s| s.health.clone())
     }
+    pub(crate) fn install_catalog_qualification_source(
+        &self,
+        bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+        application: Option<Arc<dyn novarocks_catalog_application::CatalogApplicationPort>>,
+    ) {
+        let Some(application) = application else {
+            return;
+        };
+        let mut loan = self.original.loan();
+        let body = loan.body.as_mut().expect("original planning body");
+        assert!(
+            body.input.is_none() && body.catalog_qualification_source.is_none(),
+            "catalog observation belongs to one original compiler start",
+        );
+        body.catalog_qualification_source = Some(CatalogQualificationSource {
+            bindings,
+            application,
+        });
+    }
+
     fn install(&self, input: PlanningCpuInput) {
         let mut driver_loan = self.driver_loan();
         let driver = driver_loan.body.as_mut().expect("original planning driver");

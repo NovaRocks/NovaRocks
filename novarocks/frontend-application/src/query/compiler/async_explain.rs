@@ -114,6 +114,14 @@ impl FrontendQueryCompiler {
         if logical_only {
             use novarocks_query_application::preparation::CatalogFactPort;
             let control = sql_compile_control_from_execution(execution);
+            let bindings = match QueryTableBindingStore::try_new() {
+                Ok(bindings) => Arc::new(bindings),
+                Err(error) => return Ok(Err(FrontendQueryCompilerError::Engine(error))),
+            };
+            planning_cpu.install_catalog_qualification_source(
+                Arc::clone(&bindings),
+                self.query.catalog_application().cloned(),
+            );
             let mut logical = match planning_cpu
                 .logical_catalog_for_input(
                     super::read_query_input(Box::new(query), root_session_admitted),
@@ -131,10 +139,6 @@ impl FrontendQueryCompiler {
                 Err(error) => return Ok(Err(FrontendQueryCompilerError::from_compile(error))),
             };
             let catalog: Result<_, FrontendQueryCompilerError> = async {
-                let bindings = Arc::new(
-                    QueryTableBindingStore::try_new()
-                        .map_err(FrontendQueryCompilerError::Engine)?,
-                );
                 let scope =
                     crate::query_execution::completion_facts::StatementFactScope::governed_read_io_in(
                         bindings,
@@ -225,15 +229,15 @@ impl FrontendQueryCompiler {
             state_store,
             ..
         } = ports;
+        let bindings = match QueryTableBindingStore::try_new() {
+            Ok(bindings) => Arc::new(bindings),
+            Err(error) => return Ok(Err(FrontendQueryCompilerError::Engine(error))),
+        };
         let request: Result<
             novarocks_sql::compiler::SqlFinalPlanCompileRequest,
             FrontendQueryCompilerError,
         > = (|| {
             let connector_context = connector_planning_context.request();
-            let bindings = Arc::new(
-                crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
-                    .expect("query table binding scope allocation must not fail"),
-            );
             crate::query_execution::completion_facts::install_frontend_fact_source(
                 provider_source,
                 self.completion_fact_owners(),
@@ -288,6 +292,10 @@ impl FrontendQueryCompiler {
             Err(error) => return Ok(Err(error)),
         };
         let control = request.control().clone();
+        planning_cpu.install_catalog_qualification_source(
+            bindings,
+            self.query.catalog_application().cloned(),
+        );
         provider_source
             .complete_in(request, scope, planning_cpu.as_ref())
             .await?;
@@ -334,6 +342,10 @@ impl FrontendQueryCompiler {
             state_store,
             ..
         } = ports;
+        let bindings = match QueryTableBindingStore::try_new() {
+            Ok(bindings) => Arc::new(bindings),
+            Err(error) => return Ok(Err(FrontendQueryCompilerError::Engine(error))),
+        };
         let request: Result<
             (
                 novarocks_sql::compiler::SqlFinalPlanCompileRequest,
@@ -341,10 +353,6 @@ impl FrontendQueryCompiler {
             ),
             FrontendQueryCompilerError,
         > = (|| {
-            let bindings = Arc::new(
-                QueryTableBindingStore::try_new()
-                    .expect("query table binding scope allocation must not fail"),
-            );
             crate::query_execution::completion_facts::install_frontend_fact_source(
                 provider_source,
                 self.completion_fact_owners(),
@@ -403,6 +411,10 @@ impl FrontendQueryCompiler {
             Err(error) => return Ok(Err(error)),
         };
         let encoding_control = request.control().clone();
+        planning_cpu.install_catalog_qualification_source(
+            bindings,
+            self.query.catalog_application().cloned(),
+        );
         provider_source
             .complete_in(request, scope, planning_cpu.as_ref())
             .await?;

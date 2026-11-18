@@ -263,8 +263,15 @@ impl ViewEngine for FrontendViewEngine {
         let provider = provider
             .with_local_views(request.local_views.clone())
             .with_system_relations(self.kernel.system_relations().clone());
+        let candidates = novarocks_sql::compiler::quoted_metadata_catalogs(
+            request.query,
+            Some(request.catalog),
+            request.database,
+            &control,
+        )?;
+        let qualifications = provider.observe_catalog_qualifications(&candidates)?;
         let mut preparation =
-            novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new_definition(
+            novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new_definition_with_qualifications(
                 request.query.clone(),
                 request.catalog,
                 request.database,
@@ -274,6 +281,7 @@ impl ViewEngine for FrontendViewEngine {
                     table: request.target.view.clone(),
                 }),
                 control.clone(),
+                qualifications,
             )?;
         while !preparation.needs().is_empty() {
             let facts = preparation

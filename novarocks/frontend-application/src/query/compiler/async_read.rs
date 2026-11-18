@@ -133,6 +133,10 @@ impl FrontendQueryCompiler {
             family,
             root_session_admitted,
         } = sql;
+        let bindings = match QueryTableBindingStore::try_new() {
+            Ok(bindings) => Arc::new(bindings),
+            Err(error) => return Ok(Err(FrontendQueryCompilerError::Engine(error))),
+        };
         let request: Result<
             (
                 novarocks_sql::compiler::SqlFinalPlanCompileRequest,
@@ -141,10 +145,6 @@ impl FrontendQueryCompiler {
             FrontendQueryCompilerError,
         > = (|| {
             let connector_context = connector_planning_context.request();
-            let bindings = Arc::new(
-                crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
-                    .expect("query table binding scope allocation must not fail"),
-            );
             crate::query_execution::completion_facts::install_frontend_fact_source(
                 provider_source,
                 self.completion_fact_owners(),
@@ -200,6 +200,10 @@ impl FrontendQueryCompiler {
             Err(error) => return Ok(Err(error)),
         };
         let encoding_control = request.control().clone();
+        planning_cpu.install_catalog_qualification_source(
+            bindings,
+            self.query.catalog_application().cloned(),
+        );
         provider_source
             .complete_in(request, scope, planning_cpu.as_ref())
             .await?;

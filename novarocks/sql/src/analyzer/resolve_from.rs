@@ -23,6 +23,8 @@ use crate::analysis::AnalyzedOutputField as OutputColumn;
 use crate::analysis::*;
 use crate::analyze_error::AnalyzeError;
 use crate::column_id::ColumnId;
+use crate::planner::table::TableDef;
+use crate::planning::catalog::MetadataTableKind;
 
 use super::scope::AnalyzerScope;
 
@@ -607,32 +609,12 @@ impl<'a> super::AnalyzerContext<'a> {
                     scope,
                 ));
             }
-            let alias_name = alias.map(|a| a.name.value.clone());
-
-            // Metadata aliases are materialized by the application
-            // catalog boundary. Their complete schema is already a
-            // SQL table fact here; analysis must not reopen a
-            // provider source to rebuild it.
-            let cols = &table_def.columns;
-            let mut scope = self.new_scope();
-            let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
-            // Collect analyzer-allocated ColumnIds so the planner can reuse
-            // them on the scan's output_columns (keeping ColumnRef ids in the
-            // rest of the plan consistent with the scan's output — same pattern
-            // as `Relation::Scan`).
-            let column_ids: Vec<crate::column_id::ColumnId> = cols
-                .iter()
-                .map(|col| scope.add_table_column(Some(qualifier), col, self.control))
-                .collect::<Result<Vec<_>, AnalyzeError>>()?;
-
-            let relation = Relation::IcebergMetadataScan(IcebergMetadataScanRelation {
-                database: db_lower,
-                table: table_def,
-                metadata_table_type: metadata_ty,
-                alias: alias_name,
-                column_ids,
-            });
-            return Ok((relation, scope));
+            return self.analyze_iceberg_metadata_scan(
+                db_lower,
+                table_def,
+                metadata_ty,
+                alias.map(|a| a.name.value.clone()),
+            );
         }
 
         let (catalog_override, db, tbl) = match parts.len() {
@@ -738,6 +720,32 @@ impl<'a> super::AnalyzerContext<'a> {
                     scope,
                 ));
             }
+        }
+
+        if name.parts.last().is_some_and(|part| part.quoted)
+            && let Some(metadata) = self.catalog.resolve_quoted_iceberg_metadata(
+                name,
+                catalog_override.as_deref(),
+                &db_lower,
+            )
+        {
+            if let Some(version) = version {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "time travel is not supported on metadata relations",
+                    version.span,
+                ));
+            }
+            let table = metadata
+                .resolved
+                .map_err(|error| AnalyzeError::unknown_table(error, name_span))?
+                .planner;
+            let qualifier = alias.map(|a| a.name.value.clone()).unwrap_or(tbl);
+            return self.analyze_iceberg_metadata_scan(
+                metadata.relation.namespace,
+                table,
+                metadata.kind,
+                Some(qualifier),
+            );
         }
 
         if let Some(declaration) = self.catalog.resolve_system_table_for_analysis(
@@ -856,6 +864,31 @@ impl<'a> super::AnalyzerContext<'a> {
             column_ids,
         });
 
+        Ok((relation, scope))
+    }
+
+    fn analyze_iceberg_metadata_scan(
+        &self,
+        database: String,
+        table: TableDef,
+        metadata_table_type: MetadataTableKind,
+        alias: Option<String>,
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
+        let mut scope = self.new_scope();
+        let qualifier = alias.as_deref().unwrap_or(&table.name);
+        // Keep the captured schema and share the same ColumnIds with the scan.
+        let column_ids = table
+            .columns
+            .iter()
+            .map(|column| scope.add_table_column(Some(qualifier), column, self.control))
+            .collect::<Result<Vec<_>, AnalyzeError>>()?;
+        let relation = Relation::IcebergMetadataScan(IcebergMetadataScanRelation {
+            database,
+            table,
+            metadata_table_type,
+            alias,
+            column_ids,
+        });
         Ok((relation, scope))
     }
 

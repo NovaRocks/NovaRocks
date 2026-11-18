@@ -365,20 +365,31 @@ pub(crate) async fn compile_routed_mutation_write(
     let control = crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let assignments = mutation_write_assignments(&query, &kind, &routes, &control)
         .map_err(DmlError::from_compile)?;
-    let mut preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent(
-        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
-        novarocks_sql::compiler::SqlSessionContext {
-            sql_semantics: execution.sql_semantics().clone(),
-            // The old analyzer materializer supplied this effective catalog
-            // for unqualified mutation sources; freeze that same fact here.
-            current_catalog: Some(target.catalog.clone()),
-            current_database: target.namespace.clone(),
-            optimizer_settings: dml_change_stream_optimizer_settings(),
-        },
-        control.clone(),
-        novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
+    let qualifications = crate::query_execution::compiler::observe_dml_catalog_qualifications(
+        &query,
+        Some(target.catalog.as_str()),
+        &target.namespace,
+        &control,
+        bindings.as_ref(),
+        state.catalog_application().map(Arc::as_ref),
     )
     .map_err(DmlError::from_compile)?;
+    let mut preparation =
+        novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent_with_qualifications(
+            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
+            novarocks_sql::compiler::SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
+                // The old analyzer materializer supplied this effective catalog
+                // for unqualified mutation sources; freeze that same fact here.
+                current_catalog: Some(target.catalog.clone()),
+                current_database: target.namespace.clone(),
+                optimizer_settings: dml_change_stream_optimizer_settings(),
+            },
+            control.clone(),
+            novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
+            qualifications,
+        )
+        .map_err(DmlError::from_compile)?;
     if let Some(assignments) = assignments {
         preparation = preparation
             .with_write_assignments(assignments)

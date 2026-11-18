@@ -41,6 +41,7 @@ pub mod iceberg_ref_command;
 pub mod query_bindings;
 pub mod query_catalog;
 pub mod query_materializer;
+mod quoted_metadata_qualification;
 pub mod resolver;
 pub mod statement;
 pub(crate) mod statement_action;

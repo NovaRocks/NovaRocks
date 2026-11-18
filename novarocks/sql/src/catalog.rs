@@ -17,6 +17,7 @@
 
 use crate::planner::table::TableDef;
 use crate::planning::catalog::MetadataTableKind;
+use novarocks_parser::ast;
 use novarocks_types::naming::TableIdentity;
 use novarocks_types::schema::CatalogTable;
 
@@ -53,6 +54,14 @@ impl ResolvedAnalyzerTable {
             planner,
         }
     }
+}
+
+/// A captured metadata lookup for a quoted relation in a selected Iceberg catalog.
+#[derive(Clone, Debug)]
+pub struct QuotedMetadataTable {
+    pub relation: TableIdentity,
+    pub kind: MetadataTableKind,
+    pub resolved: Result<ResolvedAnalyzerTable, String>,
 }
 
 /// Planner-facing table materialization extension.
@@ -148,6 +157,17 @@ pub trait PlannerTableProvider {
 
     /// A replacement definition's target; absent relations still resolve Missing.
     fn view_definition_target(&self) -> Option<&TableIdentity> {
+        None
+    }
+
+    /// Select a captured metadata lookup using the full authored object name.
+    /// A selected lookup keeps its resolution result, including a missing table.
+    fn resolve_quoted_iceberg_metadata(
+        &self,
+        _name: &ast::ObjectName,
+        _catalog: Option<&str>,
+        _database: &str,
+    ) -> Option<QuotedMetadataTable> {
         None
     }
 

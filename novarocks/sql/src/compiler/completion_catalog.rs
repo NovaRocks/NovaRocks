@@ -17,16 +17,17 @@
 
 //! Owned catalog completion state and its fact-only analyzer catalog.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use novarocks_parser::ast::{self, Visit};
+use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderBindingKey};
 use novarocks_types::naming::{TableIdentity, normalize_identifier, resolve_catalog_table_name};
 
-use super::SqlCompileError;
 use super::completion::{
     CatalogLookupTarget, CatalogRelationFact, CatalogRelationNeed, CatalogRelationOutcome,
     CatalogTableSelection, CompileNeedId,
 };
+use super::{CatalogQualifications, SqlCompileError};
 use crate::catalog::{
     IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, TableLookupMode,
 };
@@ -39,6 +40,7 @@ use crate::planner::table::{ScanSource, SqlMetadataTableKind, SqlScanKind};
 /// contains no application catalog, callback, or provider object.
 pub(super) struct CatalogCompletionState {
     query: Box<ast::Query>,
+    qualifications: CatalogQualifications,
     current_catalog: Option<Box<str>>,
     current_database: Box<str>,
     lookup_mode: TableLookupMode,
@@ -55,6 +57,7 @@ pub(super) struct CatalogCompletionState {
 }
 
 impl CatalogCompletionState {
+    #[cfg(test)]
     pub(super) fn try_new(
         query: ast::Query,
         current_catalog: Option<&str>,
@@ -73,6 +76,7 @@ impl CatalogCompletionState {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn try_new_with_semantics(
         query: ast::Query,
         current_catalog: Option<&str>,
@@ -93,6 +97,7 @@ impl CatalogCompletionState {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn try_new_with_additional_queries(
         query: ast::Query,
         additional_queries: &[ast::Query],
@@ -114,6 +119,7 @@ impl CatalogCompletionState {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn try_new_with_additional_queries_and_semantics(
         query: ast::Query,
         additional_queries: &[ast::Query],
@@ -123,6 +129,30 @@ impl CatalogCompletionState {
         lookup_mode: TableLookupMode,
         first_need_ordinal: u32,
         semantics: &crate::sql_mode::SqlSemanticSettings,
+    ) -> Result<Self, SqlCompileError> {
+        Self::try_new_with_qualifications(
+            query,
+            additional_queries,
+            additional_relations,
+            current_catalog,
+            current_database,
+            lookup_mode,
+            first_need_ordinal,
+            semantics,
+            CatalogQualifications::default(),
+        )
+    }
+
+    pub(super) fn try_new_with_qualifications(
+        query: ast::Query,
+        additional_queries: &[ast::Query],
+        additional_relations: &[TableIdentity],
+        current_catalog: Option<&str>,
+        current_database: &str,
+        lookup_mode: TableLookupMode,
+        first_need_ordinal: u32,
+        semantics: &crate::sql_mode::SqlSemanticSettings,
+        qualifications: CatalogQualifications,
     ) -> Result<Self, SqlCompileError> {
         let query = crate::analyzer::query_prepass::preanalyze_with_semantics(query, semantics)
             .map_err(SqlCompileError::Analyze)?;
@@ -140,6 +170,7 @@ impl CatalogCompletionState {
             lookup_mode,
             first_need_ordinal,
         );
+        collector.qualifications = Some(&qualifications);
         collector.collect_query(&query, &CteScope::default())?;
         for additional in additional_queries {
             // Optional definitions do not acquire the root query's session depth.
@@ -156,6 +187,7 @@ impl CatalogCompletionState {
         let (needs, next_need_ordinal) = collector.finish()?;
         Ok(Self {
             query: Box::new(query),
+            qualifications,
             current_catalog,
             current_database,
             lookup_mode,
@@ -224,6 +256,7 @@ impl CatalogCompletionState {
             first,
         )
         .observed(control)?;
+        collector.qualifications = Some(&self.qualifications);
         collector.exact_catalog = true;
         collector.collect_query(&self.query, &CteScope::default())?;
         let (needs, next) = collector.finish()?;
@@ -309,6 +342,26 @@ impl CatalogCompletionState {
             let Ok(query) = crate::analyzer::query_prepass::preanalyze(query.clone()) else {
                 continue;
             };
+            if let Some(qualifications) = fact.view_qualifications() {
+                let candidates = quoted_metadata_catalogs_in_context(
+                    &query,
+                    Some(&view.default_catalog),
+                    &view.default_database,
+                    control,
+                    true,
+                )?;
+                if !qualifications
+                    .entries()
+                    .map(|(name, _)| name)
+                    .eq(candidates.iter())
+                {
+                    return Err(SqlCompileError::InvalidRequest(
+                        "catalog facts do not match the saved view's quoted metadata dependencies"
+                            .into(),
+                    ));
+                }
+                self.qualifications.merge(qualifications)?;
+            }
             let mut child = CatalogNeedCollector::new(
                 Some(&view.default_catalog),
                 &view.default_database,
@@ -317,6 +370,7 @@ impl CatalogCompletionState {
             )
             .observed(control)?;
             child.exact_catalog = true;
+            child.qualifications = Some(&self.qualifications);
             child.keys = std::mem::take(&mut collector.keys);
             // Invalid saved syntax is diagnosed by the view analyzer. The
             // same collector still captures every other legal dependency.
@@ -356,6 +410,7 @@ impl CatalogCompletionState {
             &self.all_needs,
             &self.facts,
         )?;
+        catalog.qualifications = self.qualifications.clone();
         catalog.root_local_view_shadow = self.root_local_view_shadow;
         catalog.definition_target = self.definition_target.clone();
         Ok(catalog)
@@ -385,6 +440,7 @@ impl CatalogCompletionState {
             &self.needs,
             facts,
         )?;
+        catalog.qualifications = self.qualifications.clone();
         catalog.root_local_view_shadow = self.root_local_view_shadow;
         catalog.definition_target = self.definition_target.clone();
         if facts
@@ -452,6 +508,8 @@ struct CatalogNeedCollector<'a> {
     next_need_ordinal: u32,
     keys: HashSet<CatalogFactKey>,
     needs: Vec<CatalogRelationNeed>,
+    qualification_requests: Option<BTreeSet<ConnectorInstanceId>>,
+    qualifications: Option<&'a CatalogQualifications>,
 }
 
 impl<'a> CatalogNeedCollector<'a> {
@@ -471,6 +529,8 @@ impl<'a> CatalogNeedCollector<'a> {
             next_need_ordinal: first_need_ordinal,
             keys: HashSet::new(),
             needs: Vec::new(),
+            qualification_requests: None,
+            qualifications: None,
         }
     }
 
@@ -778,6 +838,39 @@ impl<'a> CatalogNeedCollector<'a> {
                 return Ok(());
             }
         }
+        if let Some(catalogs) = &mut self.qualification_requests {
+            if let Some(instance) = super::catalog_qualification::candidate_catalog(
+                name,
+                self.current_catalog,
+                self.current_database,
+            ) {
+                catalogs.insert(instance);
+            }
+            return self.collect_table_decorations(version, scope);
+        }
+        if let Some(qualified) = self.qualifications.and_then(|catalogs| {
+            catalogs.classify(name, self.current_catalog, self.current_database)
+        }) {
+            if let Some(version) = version {
+                if self.defer_semantic_refusals {
+                    return self.collect_table_decorations(Some(version), scope);
+                }
+                return Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
+                    "time travel is not supported on metadata relations",
+                    version.span,
+                )
+                .into());
+            }
+            return self.add_need_qualified(
+                qualified.relation,
+                CatalogLookupTarget::IcebergMetadata {
+                    kind: qualified.kind,
+                },
+                false,
+                None,
+                Some(qualified.binding.clone()),
+            );
+        }
         let relation = match self.resolve_name_parts(view.parts()) {
             Ok(relation) => relation,
             Err(SqlCompileError::Compilation(_)) if self.defer_semantic_refusals => {
@@ -849,6 +942,7 @@ impl<'a> CatalogNeedCollector<'a> {
                 && version.is_none()
                 && name.parts.len() < 3,
             selection,
+            None,
         )?;
         self.collect_table_decorations(version, scope)
     }
@@ -992,7 +1086,7 @@ impl<'a> CatalogNeedCollector<'a> {
         relation: TableIdentity,
         target: CatalogLookupTarget,
     ) -> Result<(), SqlCompileError> {
-        self.add_need_qualified(relation, target, false, None)
+        self.add_need_qualified(relation, target, false, None, None)
     }
 
     fn add_need_qualified(
@@ -1001,13 +1095,18 @@ impl<'a> CatalogNeedCollector<'a> {
         target: CatalogLookupTarget,
         local_view_shadow: bool,
         selection: Option<CatalogTableSelection>,
+        binding: Option<ConnectorProviderBindingKey>,
     ) -> Result<(), SqlCompileError> {
         self.step()?;
+        if self.qualification_requests.is_some() {
+            return Ok(());
+        }
         let mut key = CatalogFactKey::new(relation.clone(), target);
         key.local_view_shadow = local_view_shadow;
         key.definition_context =
             self.exact_catalog && matches!(target, CatalogLookupTarget::Table { .. });
         key.selection = selection.as_ref().map(|selection| selection.key().clone());
+        key.quoted_metadata_binding = binding.clone();
         if !self.keys.insert(key) {
             return Ok(());
         }
@@ -1017,7 +1116,8 @@ impl<'a> CatalogNeedCollector<'a> {
         })?;
         let need = CatalogRelationNeed::try_new(id, relation, target)
             .map_err(|error| SqlCompileError::InvalidRequest(error.to_string()))?
-            .with_selection(selection);
+            .with_selection(selection)
+            .with_quoted_metadata_binding(binding);
         let need = if self.exact_catalog {
             need.in_definition_context()
         } else {
@@ -1030,6 +1130,68 @@ impl<'a> CatalogNeedCollector<'a> {
         });
         Ok(())
     }
+}
+
+/// Find the catalog observations needed before ordinary dependency discovery.
+/// The original dependency collector owns scope and diagnostic sequencing.
+pub fn quoted_metadata_catalogs(
+    query: &ast::Query,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    control: &super::SqlCompileControl,
+) -> Result<Vec<ConnectorInstanceId>, SqlCompileError> {
+    quoted_metadata_catalogs_in_context(query, current_catalog, current_database, control, false)
+}
+
+pub fn quoted_metadata_catalogs_for_view(
+    definition: &crate::catalog::SqlViewDefinition,
+    control: &super::SqlCompileControl,
+) -> Result<Vec<ConnectorInstanceId>, SqlCompileError> {
+    let Ok(statements) = novarocks_parser::parse(&definition.raw_sql) else {
+        return Ok(Vec::new());
+    };
+    let [ast::Statement::Query(query)] = statements.as_slice() else {
+        return Ok(Vec::new());
+    };
+    let Ok(query) = crate::analyzer::query_prepass::preanalyze(query.clone()) else {
+        return Ok(Vec::new());
+    };
+    quoted_metadata_catalogs_in_context(
+        &query,
+        Some(&definition.default_catalog),
+        &definition.default_database,
+        control,
+        true,
+    )
+}
+
+fn quoted_metadata_catalogs_in_context(
+    query: &ast::Query,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    control: &super::SqlCompileControl,
+    saved_definition: bool,
+) -> Result<Vec<ConnectorInstanceId>, SqlCompileError> {
+    let mut collector = CatalogNeedCollector::new(
+        current_catalog,
+        current_database,
+        TableLookupMode::SchemaOnly,
+        0,
+    )
+    .observed(control)?;
+    collector.defer_semantic_refusals = saved_definition;
+    collector.exact_catalog = saved_definition;
+    collector.qualification_requests = Some(BTreeSet::new());
+    match collector.collect_query(query, &CteScope::default()) {
+        Ok(()) | Err(SqlCompileError::Analyze(_) | SqlCompileError::Compilation(_)) => {}
+        Err(error) => return Err(error),
+    }
+    let catalogs = collector
+        .qualification_requests
+        .take()
+        .expect("qualification discovery");
+    collector.finish()?;
+    Ok(catalogs.into_iter().collect())
 }
 
 struct ExpressionQueryCollector<'collector, 'scope, 'context> {
@@ -1066,6 +1228,7 @@ struct CatalogFactKey {
     local_view_shadow: bool,
     definition_context: bool,
     selection: Option<crate::planning::catalog::SqlTimeTravelSelection>,
+    quoted_metadata_binding: Option<ConnectorProviderBindingKey>,
 }
 
 impl CatalogFactKey {
@@ -1074,6 +1237,7 @@ impl CatalogFactKey {
         key.local_view_shadow = need.allows_local_view_shadow();
         key.definition_context = need.is_definition_context();
         key.selection = need.selection_key().cloned();
+        key.quoted_metadata_binding = need.quoted_metadata_binding().cloned();
         key
     }
     fn from_fact(fact: &CatalogRelationFact) -> Self {
@@ -1081,6 +1245,7 @@ impl CatalogFactKey {
         key.local_view_shadow = fact.allows_local_view_shadow();
         key.definition_context = fact.is_definition_context();
         key.selection = fact.selection_key().cloned();
+        key.quoted_metadata_binding = fact.quoted_metadata_binding().cloned();
         key
     }
 
@@ -1091,6 +1256,7 @@ impl CatalogFactKey {
             local_view_shadow: false,
             definition_context: false,
             selection: None,
+            quoted_metadata_binding: None,
         }
     }
 }
@@ -1139,6 +1305,7 @@ pub(super) struct FactBackedCatalog {
     root_local_view_shadow: bool,
     definition_target: Option<TableIdentity>,
     entries: HashMap<CatalogFactKey, CatalogEntry>,
+    qualifications: CatalogQualifications,
 }
 
 impl FactBackedCatalog {
@@ -1166,6 +1333,7 @@ impl FactBackedCatalog {
                 || fact.allows_local_view_shadow() != need.allows_local_view_shadow()
                 || fact.is_definition_context() != need.is_definition_context()
                 || fact.selection_key() != need.selection_key()
+                || fact.quoted_metadata_binding() != need.quoted_metadata_binding()
             {
                 return Err(SqlCompileError::Compilation(format!(
                     "catalog completion fact {} does not match its exact request",
@@ -1206,6 +1374,7 @@ impl FactBackedCatalog {
             root_local_view_shadow: true,
             definition_target: None,
             entries,
+            qualifications: CatalogQualifications::default(),
         })
     }
 
@@ -1532,6 +1701,37 @@ impl PlannerTableProvider for FactBackedCatalog {
         self.system_table_in_context(catalog, database, table, version)
     }
 
+    fn resolve_quoted_iceberg_metadata(
+        &self,
+        name: &ast::ObjectName,
+        catalog: Option<&str>,
+        database: &str,
+    ) -> Option<crate::catalog::QuotedMetadataTable> {
+        let found = self.qualifications.classify(
+            name,
+            catalog.or(self.current_catalog.as_deref()),
+            database,
+        )?;
+        let mut key = CatalogFactKey::new(
+            found.relation.clone(),
+            CatalogLookupTarget::IcebergMetadata { kind: found.kind },
+        );
+        key.quoted_metadata_binding = Some(found.binding.clone());
+        let resolved = match self.entries.get(&key) {
+            Some(CatalogEntry::Resolved(table)) => Ok(table.as_ref().clone()),
+            Some(CatalogEntry::Missing(reason)) => Err(reason.to_string()),
+            _ => Err(format!(
+                "metadata facts missing for `{}`",
+                found.authored.value
+            )),
+        };
+        Some(crate::catalog::QuotedMetadataTable {
+            relation: found.relation,
+            kind: found.kind,
+            resolved,
+        })
+    }
+
     fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
         Some(self)
     }
@@ -1609,6 +1809,10 @@ fn validate_resolved_target(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "quoted_metadata_completion_tests.rs"]
+mod quoted_metadata_completion_tests;
 
 #[cfg(test)]
 mod tests {

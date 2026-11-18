@@ -850,6 +850,26 @@ impl SqlStatementInput {
         matches!(&self.kind, SqlStatementInputKind::AdmittedSessionQuery(_))
     }
 
+    pub fn quoted_metadata_catalogs(
+        &self,
+        session: &SqlSessionContext,
+        control: &SqlCompileControl,
+    ) -> Result<Vec<novarocks_spi::connector::ConnectorInstanceId>, SqlCompileError> {
+        match &self.kind {
+            SqlStatementInputKind::ParsedQuery(query)
+            | SqlStatementInputKind::AdmittedSessionQuery(query)
+            | SqlStatementInputKind::MaterializedValuesQuery { query, .. } => {
+                quoted_metadata_catalogs(
+                    query,
+                    session.current_catalog.as_deref(),
+                    &session.current_database,
+                    control,
+                )
+            }
+            SqlStatementInputKind::LogicalPlan { .. } => Ok(Vec::new()),
+        }
+    }
+
     /// Bind complete constants to exact expressions of the same owned query.
     /// Other syntax uses its original analyzer and evaluation semantics.
     pub fn query_with_expression_constants(
@@ -1695,6 +1715,8 @@ pub use crate::explain::completed::{
     render_completed_plan,
 };
 pub use crate::explain::completed_tree::render_completed_plan_tree;
+pub use catalog_qualification::{CatalogQualification, CatalogQualifications};
+pub use completion_catalog::{quoted_metadata_catalogs, quoted_metadata_catalogs_for_view};
 pub use completion_driver::SqlFinalPlanCompileRequest;
 pub(crate) use completion_driver::{
     FinalizedProviderRead, FinalizedProviderReadSet, collect_provider_inputs,
@@ -3936,6 +3958,7 @@ mod tests {
         }
     }
 }
+mod catalog_qualification;
 mod completion;
 mod completion_catalog;
 mod completion_driver;

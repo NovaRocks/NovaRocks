@@ -23,7 +23,9 @@ use crate::analysis::{
     ResolvedSelect, TypedExpr,
 };
 use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
-use crate::catalog::{PlannerTableProvider, ResolvedAnalyzerTable, SqlViewDefinition};
+use crate::catalog::{
+    PlannerTableProvider, QuotedMetadataTable, ResolvedAnalyzerTable, SqlViewDefinition,
+};
 use arrow::datatypes::DataType as D;
 use novarocks_parser::{Span, ast};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueKind as K, ValueTypeRef};
@@ -424,6 +426,19 @@ impl PlannerTableProvider for SavedViewCatalog<'_> {
     fn view_definition_target(&self) -> Option<&novarocks_types::naming::TableIdentity> {
         self.inner.view_definition_target()
     }
+    fn resolve_quoted_iceberg_metadata(
+        &self,
+        name: &ast::ObjectName,
+        catalog: Option<&str>,
+        database: &str,
+    ) -> Option<QuotedMetadataTable> {
+        self.inner.resolve_quoted_iceberg_metadata(
+            name,
+            Some(catalog.unwrap_or(self.catalog)),
+            database,
+        )
+    }
+
     fn iceberg_metadata_provider(
         &self,
     ) -> Option<&dyn crate::catalog::IcebergMetadataTableProvider> {
@@ -583,6 +598,10 @@ fn name_reordering_cast(
 mod tests {
     use super::*;
     use crate::catalog::SqlViewColumn;
+    use crate::planner::table::{
+        ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
+        SqlTableVersionSelector, TableDef,
+    };
     use novarocks_type_contract::{FunctionValueType, PureCompileControl};
     use novarocks_types::{naming::TableIdentity, schema::ColumnDef};
     use std::{cell::RefCell, collections::HashMap, sync::Arc};
@@ -594,6 +613,7 @@ mod tests {
         target: Option<TableIdentity>,
         lookup_error: Option<AnalyzeError>,
         table_lookups: RefCell<Vec<(String, String, String)>>,
+        quoted_metadata_lookups: RefCell<Vec<(String, String, String)>>,
     }
     impl PlannerTableProvider for Catalog {
         fn resolve_view_for_analysis(
@@ -634,6 +654,58 @@ mod tests {
             self.tables
                 .resolve_table_for_analysis(catalog, database, table)
         }
+        fn resolve_quoted_iceberg_metadata(
+            &self,
+            name: &ast::ObjectName,
+            catalog: Option<&str>,
+            database: &str,
+        ) -> Option<QuotedMetadataTable> {
+            let authored = name.parts.last()?;
+            assert!(authored.quoted);
+            self.quoted_metadata_lookups.borrow_mut().push((
+                catalog.unwrap_or("caller").into(),
+                database.into(),
+                authored.value.clone(),
+            ));
+            if catalog != Some("ice") || database != "saved" {
+                return None;
+            }
+            let base = authored.value.strip_suffix("$files")?;
+            let kind = SqlMetadataTableKind::Files;
+            let resolved = if base == "missing" {
+                Err("captured metadata table is missing".into())
+            } else {
+                Ok(ResolvedAnalyzerTable::from_planner(
+                    catalog,
+                    database,
+                    TableDef {
+                        name: base.into(),
+                        columns: vec![ColumnDef {
+                            name: "a".into(),
+                            data_type: D::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        }],
+                        iceberg_row_lineage_metadata_columns: vec![],
+                        source: ScanSource::Sql(SqlScanSource::new(
+                            crate::binding::SqlTableBindingId::new_for_test(61),
+                            SqlTableIdentity::try_new("ice".into(), database.into(), base.into())
+                                .unwrap(),
+                            SqlScanKind::Metadata {
+                                kind,
+                                version: SqlTableVersionSelector::Current,
+                            },
+                        )),
+                    },
+                ))
+            };
+            Some(QuotedMetadataTable {
+                relation: TableIdentity::new("ice", database, base),
+                kind,
+                resolved,
+            })
+        }
     }
     fn declaration(sql: &str, published: &str, ty: FunctionValueType) -> SqlViewDefinition {
         SqlViewDefinition {
@@ -663,6 +735,13 @@ mod tests {
         let [ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("query fixture");
         };
+        analyze_and_plan(query, catalog)
+    }
+
+    fn analyze_and_plan(
+        query: &ast::Query,
+        catalog: &Catalog,
+    ) -> Result<ResolvedQuery, AnalyzeError> {
         let (resolved, ctes, mut factory) = crate::analyzer::analyze(query, catalog, "db")?;
         // Check the actual logical construction, including CTE and wrapper IDs.
         let logical = crate::planner::plan_query(
@@ -680,6 +759,101 @@ mod tests {
         )
         .unwrap();
         Ok(resolved)
+    }
+
+    #[test]
+    fn quoted_metadata_uses_the_authored_qualifier_or_explicit_alias() {
+        let catalog = Catalog::default();
+        for (sql, qualifier) in [
+            (r#"SELECT "t$files".a FROM ice.saved."t$files""#, "t$files"),
+            (
+                r#"SELECT saved."t$files".a FROM ice.saved."t$files""#,
+                "t$files",
+            ),
+            (r#"SELECT m.a FROM ice.saved."t$files" AS m"#, "m"),
+        ] {
+            let query = novarocks_parser::trino_parser::parse_query(sql).unwrap();
+            let resolved = analyze_and_plan(&query, &catalog).unwrap();
+            let QueryBody::Select(select) = resolved.body else {
+                panic!("select query");
+            };
+            let Some(Relation::IcebergMetadataScan(scan)) = select.from else {
+                panic!("captured metadata scan");
+            };
+            assert_eq!(scan.alias.as_deref(), Some(qualifier));
+            assert_eq!(scan.database, "saved");
+            assert_eq!(scan.table.name, "t");
+            let [project] = select.projection.as_slice() else {
+                panic!("one selected column");
+            };
+            let ExprKind::ColumnRef { column_id, .. } = &project.expr.kind else {
+                panic!("resolved column reference");
+            };
+            assert_eq!(scan.column_ids, [*column_id]);
+        }
+        let error = analyze(r#"SELECT t.a FROM ice.saved."t$files""#, &catalog).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnknownColumn);
+        assert!(catalog.table_lookups.borrow().is_empty());
+    }
+
+    #[test]
+    fn quoted_metadata_keeps_cte_version_and_missing_precedence() {
+        let catalog = Catalog::default();
+        analyze(
+            r#"WITH "t$files" AS (SELECT 1 AS a) SELECT a FROM "t$files""#,
+            &catalog,
+        )
+        .unwrap();
+        assert!(catalog.quoted_metadata_lookups.borrow().is_empty());
+        let error = analyze(
+            r#"SELECT a FROM ice.saved."missing$files" FOR VERSION AS OF 1"#,
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedQueryShape);
+        assert!(
+            error
+                .message()
+                .contains("time travel is not supported on metadata relations")
+        );
+        let error = analyze(r#"SELECT a FROM ice.saved."missing$files""#, &catalog).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnknownTable);
+        assert_eq!(error.message(), "captured metadata table is missing");
+        assert!(catalog.table_lookups.borrow().is_empty());
+
+        let error = analyze(r#"SELECT a FROM "t$files""#, &catalog).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnknownTable);
+        assert_eq!(
+            catalog.table_lookups.borrow().as_slice(),
+            &[("caller".into(), "db".into(), "t$files".into())],
+        );
+    }
+
+    #[test]
+    fn quoted_metadata_saved_body_uses_the_saved_catalog_and_database() {
+        let mut view = declaration(
+            r#"SELECT a AS x FROM "t$files""#,
+            "x",
+            FunctionValueType::new(D::Int64, false),
+        );
+        view.default_catalog = "ice".into();
+        view.default_database = "saved".into();
+        let mut catalog = catalog(view);
+        analyze("SELECT x FROM v", &catalog).unwrap();
+        assert_eq!(
+            catalog.quoted_metadata_lookups.borrow().as_slice(),
+            &[("ice".into(), "saved".into(), "t$files".into())],
+        );
+        catalog.views.get_mut("caller.db.v").unwrap().raw_sql =
+            r#"SELECT a AS x FROM "missing$files""#.into();
+        let error = analyze("SELECT x FROM v", &catalog).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::InvalidView);
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<AnalyzeError>()
+            .unwrap();
+        assert_eq!(source.kind(), AnalyzeErrorKind::UnknownTable);
+        assert!(catalog.table_lookups.borrow().is_empty());
     }
 
     #[test]

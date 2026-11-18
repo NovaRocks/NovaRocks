@@ -73,6 +73,7 @@ pub struct SqlFinalPlanCompileRequest {
     dop_domain: PipelineDopDomain,
     scan_read_budget: ScanReadBudget,
     limits: CompletionLimits,
+    catalog_qualifications: super::CatalogQualifications,
 }
 
 impl fmt::Debug for SqlFinalPlanCompileRequest {
@@ -123,7 +124,23 @@ impl SqlFinalPlanCompileRequest {
             dop_domain,
             scan_read_budget,
             limits,
+            catalog_qualifications: super::CatalogQualifications::default(),
         }
+    }
+
+    pub fn with_catalog_qualifications(
+        mut self,
+        qualifications: super::CatalogQualifications,
+    ) -> Self {
+        self.catalog_qualifications = qualifications;
+        self
+    }
+
+    pub fn quoted_metadata_catalogs(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::ConnectorInstanceId>, SqlCompileError> {
+        self.statement
+            .quoted_metadata_catalogs(&self.session, &self.control)
     }
 
     /// Returns the immutable request control that must govern every fact round.
@@ -149,6 +166,7 @@ impl SqlFinalPlanCompileRequest {
             dop_domain,
             scan_read_budget,
             limits,
+            catalog_qualifications,
         } = self;
         control.check()?;
         validate_final_intent(&intent)?;
@@ -191,6 +209,7 @@ impl SqlFinalPlanCompileRequest {
             display_intent,
             materialized_source,
             root_session_admitted,
+            catalog_qualifications,
         };
 
         // A persisted semantic snapshot is required before an optional MV
@@ -198,13 +217,16 @@ impl SqlFinalPlanCompileRequest {
         // catalog needs so an unrelated candidate cannot fail the base query.
         let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
             && !consumer_requires_semantic_snapshot;
-        let initial_catalog = CatalogCompletionState::try_new_with_semantics(
+        let initial_catalog = CatalogCompletionState::try_new_with_qualifications(
             query.clone(),
+            &[],
+            &[],
             common.session.current_catalog.as_deref(),
             &common.session.current_database,
             TableLookupMode::SchemaOnly,
             if mv_enabled { 1 } else { 0 },
             &common.session.sql_semantics,
+            common.catalog_qualifications.clone(),
         )?;
         let mut seen_relations = HashSet::new();
         let referenced_relations = initial_catalog
@@ -304,6 +326,7 @@ struct FinalPlanCommon {
     // for analysis preserves original pool/ordinal facts, not AST pointers.
     materialized_source: Option<super::materialized_values::MaterializedValues>,
     root_session_admitted: bool,
+    catalog_qualifications: super::CatalogQualifications,
 }
 
 pub(crate) struct SqlMaterializedViewCompletionState {
@@ -485,7 +508,7 @@ pub(super) fn resume_materialized_view(
         .collect::<Vec<_>>();
     let mv_definitions = MvRewriteDefinitionIndex::try_new(definitions)
         .map_err(|error| SqlCompileError::Compilation(format!("MV completion facts: {error}")))?;
-    let catalog = CatalogCompletionState::try_new_with_additional_queries_and_semantics(
+    let catalog = CatalogCompletionState::try_new_with_qualifications(
         *state.query,
         &[],
         &additional_relations,
@@ -494,6 +517,7 @@ pub(super) fn resume_materialized_view(
         TableLookupMode::SchemaOnly,
         1,
         &state.common.session.sql_semantics,
+        state.common.catalog_qualifications.clone(),
     )?;
     catalog_or_analyze_step(state.common, catalog, Some(mv_definitions), control)
 }

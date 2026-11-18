@@ -23,9 +23,12 @@
 //! `PlannerTableProvider`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use novarocks_spi::connector::ConnectorControlResolver;
+use novarocks_spi::connector::{
+    ConnectorControlPlanningPin, ConnectorControlResolver, ConnectorProviderBindingKey,
+    ConnectorRequestContext,
+};
 
 use crate::catalog_application::query_bindings::{
     QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
@@ -33,7 +36,12 @@ use crate::catalog_application::query_bindings::{
 };
 use crate::catalog_application::query_catalog::{
     CatalogResolutionError, CatalogResolutionResult, ConnectorQueryTableMaterialization,
-    QueryCatalogService, load_connector_table_alias_materialization_with_lease_typed,
+    QueryCatalogService, catalog_application_resolution_error,
+    load_connector_table_alias_materialization_with_lease_typed,
+    load_connector_table_materialization_at_pin, load_connector_table_materialization_at_pin_async,
+};
+use crate::catalog_application::quoted_metadata_qualification::{
+    CatalogReadFenceError, QualifiedCatalogRead,
 };
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::catalog::{
@@ -47,6 +55,18 @@ mod system;
 enum CatalogAdmissionPhase {
     InitialLookup,
     VerifyObservation,
+}
+
+enum MetadataCatalogAdmission {
+    Ordinary(Option<novarocks_catalog_application::CatalogRuntimeObservation>),
+    Quoted(QualifiedCatalogRead),
+}
+
+fn metadata_pin_error(error: CatalogReadFenceError) -> CatalogResolutionError {
+    match error {
+        CatalogReadFenceError::Catalog(error) => catalog_application_resolution_error(error),
+        CatalogReadFenceError::Connector(error) => CatalogResolutionError::from_connector(error),
+    }
 }
 
 /// Project a provider-neutral SPI metadata materialization into the
@@ -115,6 +135,39 @@ pub fn connector_query_binding_from_materialization(
 /// interface is intentionally application-owned because it returns an exact
 /// lease alongside planner facts.  It is not part of SQL's vocabulary.
 pub trait QueryTableBindingLoader: Send + Sync {
+    fn connector_read_context(
+        &self,
+    ) -> Option<(&dyn ConnectorControlResolver, &ConnectorRequestContext)> {
+        None
+    }
+
+    /// Complete the original read using the pin admitted for this metadata alias.
+    fn prepare_metadata_table_at_pin(
+        &self,
+        _pin: ConnectorControlPlanningPin,
+        _namespace: &str,
+        _table: &str,
+        _kind: novarocks_sql::planning::catalog::MetadataTableKind,
+    ) -> CatalogResolutionResult<PreparedQueryTableBinding> {
+        Err(CatalogResolutionError::failed(
+            "exact metadata binding loader is not injected",
+        ))
+    }
+
+    fn prepare_metadata_table_at_pin_async<'a>(
+        &'a self,
+        _pin: ConnectorControlPlanningPin,
+        _namespace: &'a str,
+        _table: &'a str,
+        _kind: novarocks_sql::planning::catalog::MetadataTableKind,
+    ) -> futures::future::BoxFuture<'a, CatalogResolutionResult<PreparedQueryTableBinding>> {
+        Box::pin(async {
+            Err(CatalogResolutionError::failed(
+                "asynchronous exact metadata binding loader is not injected",
+            ))
+        })
+    }
+
     fn prepare_relation(
         &self,
         _need: &novarocks_sql::compiler::CatalogRelationNeed,
@@ -252,15 +305,6 @@ pub struct CatalogServiceMaterializer<'a> {
     loader: Box<dyn QueryTableBindingLoader + 'a>,
     local_views: Option<novarocks_query_application::view::LocalViewSnapshot>,
     system_relations: Option<Arc<novarocks_query_application::system_tables::SystemTableRegistry>>,
-    /// Typed classification paired with binding-store failure memoization.
-    /// The binding store owns the canonical at-most-once load; this sidecar
-    /// retains the original typed producer failure at legacy string-compatible
-    /// table memo boundaries.
-    resolution_errors: Mutex<HashMap<QueryTableBindingKey, CatalogResolutionError>>,
-    // Original capture uses the same binding cache. This sidecar preserves
-    // the producer cause paired with its memoized failure, without reloading.
-    original_resolution_errors:
-        Mutex<HashMap<QueryTableBindingKey, crate::mv::domain::application::MvApplicationError>>,
     /// Frontend-owned attachment admission. The loader still owns the exact
     /// connector lease; this gate preserves Absent versus Unavailable before
     /// Core can materialize an external table.
@@ -344,8 +388,6 @@ impl<'a> CatalogServiceMaterializer<'a> {
             loader,
             local_views: None,
             system_relations: None,
-            resolution_errors: Mutex::new(HashMap::new()),
-            original_resolution_errors: Mutex::new(HashMap::new()),
             catalog_application: None,
             query_local_overlays: overlays
                 .into_iter()
@@ -375,6 +417,17 @@ impl<'a> CatalogServiceMaterializer<'a> {
     ) -> Self {
         self.catalog_application = catalog_application;
         self
+    }
+
+    pub(crate) fn observe_catalog_qualifications(
+        &self,
+        candidates: &[novarocks_spi::connector::ConnectorInstanceId],
+    ) -> Result<
+        novarocks_sql::compiler::CatalogQualifications,
+        novarocks_sql::compiler::SqlCompileError,
+    > {
+        self.bindings
+            .observe_catalog_qualifications(candidates, self.catalog_application)
     }
 
     fn require_catalog_admission(
@@ -417,15 +470,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
         admission
             .require_ready(&instance_id)
             .map(Some)
-            .map_err(|error| {
-                let source = error
-                    .source_failure()
-                    .cloned()
-                    .unwrap_or_else(|| novarocks_failure_contract::SharedFailureCause::new(error));
-                CatalogResolutionError::from(
-                    novarocks_sql::compiler::SqlCompileError::CompilationSource(source),
-                )
-            })
+            .map_err(catalog_application_resolution_error)
     }
 
     fn verify_catalog_admission(
@@ -460,6 +505,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
         load: impl FnOnce(SqlTableBindingId) -> CatalogResolutionResult<QueryTableBinding>,
     ) -> CatalogResolutionResult<SqlTableBindingId> {
         if let Some(error) = self
+            .bindings
             .resolution_errors
             .lock()
             .expect("catalog resolution error lock")
@@ -473,7 +519,8 @@ impl<'a> CatalogServiceMaterializer<'a> {
         let result = self.bindings.resolve_or_insert_with_id(key, |binding_id| {
             let binding = load(binding_id).map_err(|error| {
                 let message = error.message().to_string();
-                self.resolution_errors
+                self.bindings
+                    .resolution_errors
                     .lock()
                     .expect("catalog resolution error lock")
                     .insert(error_key.clone(), error.clone());
@@ -485,14 +532,16 @@ impl<'a> CatalogServiceMaterializer<'a> {
         result.map_err(|message| {
             let error = typed_error
                 .or_else(|| {
-                    self.resolution_errors
+                    self.bindings
+                        .resolution_errors
                         .lock()
                         .expect("catalog resolution error lock")
                         .get(&error_key)
                         .cloned()
                 })
                 .unwrap_or_else(|| CatalogResolutionError::failed(message));
-            self.resolution_errors
+            self.bindings
+                .resolution_errors
                 .lock()
                 .expect("catalog resolution error lock")
                 .insert(error_key, error.clone());
@@ -614,12 +663,98 @@ impl<'a> CatalogServiceMaterializer<'a> {
         .map_err(CatalogResolutionError::failed)
     }
 
+    fn quoted_catalog_admission(
+        &self,
+        catalog: &str,
+        key: &ConnectorProviderBindingKey,
+    ) -> CatalogResolutionResult<QualifiedCatalogRead> {
+        if key.instance_id.as_str() != catalog {
+            return Err(CatalogResolutionError::failed(
+                "metadata qualification names a different catalog",
+            ));
+        }
+        self.bindings.qualified_catalog_read(key)
+    }
+
+    fn metadata_catalog_admission(
+        &self,
+        catalog: &str,
+        quoted_key: Option<&ConnectorProviderBindingKey>,
+    ) -> CatalogResolutionResult<MetadataCatalogAdmission> {
+        match quoted_key {
+            None => self
+                .require_catalog_admission(catalog)
+                .map(MetadataCatalogAdmission::Ordinary),
+            Some(key) => {
+                // Once qualification selected an installed catalog, a later
+                // disappearance is a lifecycle failure even on an earlier memo.
+                self.catalog_admission(catalog, CatalogAdmissionPhase::VerifyObservation)?;
+                self.quoted_catalog_admission(catalog, key)
+                    .map(MetadataCatalogAdmission::Quoted)
+            }
+        }
+    }
+
+    fn qualification_application(
+        &self,
+    ) -> CatalogResolutionResult<&dyn novarocks_catalog_application::CatalogApplicationPort> {
+        self.catalog_application.ok_or_else(|| {
+            CatalogResolutionError::failed("quoted metadata requires original catalog admission")
+        })
+    }
+
+    fn acquire_quoted_metadata_pin(
+        &self,
+        read: &QualifiedCatalogRead,
+    ) -> CatalogResolutionResult<ConnectorControlPlanningPin> {
+        let (controls, _) = self.loader.connector_read_context().ok_or_else(|| {
+            CatalogResolutionError::failed("exact metadata planning controls are not injected")
+        })?;
+        read.acquire_for_read(self.qualification_application()?, controls)
+            .map_err(metadata_pin_error)
+    }
+
+    fn verify_quoted_metadata_binding(
+        &self,
+        read: &QualifiedCatalogRead,
+        binding: &QueryTableBinding,
+    ) -> CatalogResolutionResult<()> {
+        let pin = binding
+            .admission
+            .exact_planning_pin()
+            .map_err(CatalogResolutionError::failed)?;
+        read.verify_pin(&pin)
+            .map_err(catalog_application_resolution_error)?;
+        read.verify_current(self.qualification_application()?)
+            .map_err(catalog_application_resolution_error)
+    }
+
+    fn finish_metadata_binding(
+        &self,
+        catalog: &str,
+        admission: MetadataCatalogAdmission,
+        token: SqlTableBindingId,
+    ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
+        if let MetadataCatalogAdmission::Ordinary(observation) = &admission {
+            self.verify_catalog_admission(catalog, observation.as_ref())?;
+        }
+        let binding = self
+            .bindings
+            .binding(token)
+            .map_err(CatalogResolutionError::failed)?;
+        if let MetadataCatalogAdmission::Quoted(read) = &admission {
+            self.verify_quoted_metadata_binding(read, &binding)?;
+        }
+        Ok(binding.resolved.clone())
+    }
+
     fn metadata_table_def(
         &self,
         catalog: Option<&str>,
         database: &str,
         table: &str,
         metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
+        quoted_key: Option<&ConnectorProviderBindingKey>,
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
         if metadata_table_type == novarocks_sql::planning::catalog::MetadataTableKind::Partitions {
             return Err(CatalogResolutionError::failed(
@@ -628,6 +763,11 @@ impl<'a> CatalogServiceMaterializer<'a> {
         }
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => {
+                if quoted_key.is_some() {
+                    return Err(CatalogResolutionError::failed(
+                        "quoted metadata qualification requires an external catalog",
+                    ));
+                }
                 let local = self
                     .service
                     .local()
@@ -636,25 +776,33 @@ impl<'a> CatalogServiceMaterializer<'a> {
                 resolve_local_catalog_table_typed(&local, database, table)
             }
             Some(catalog) => {
-                let observation = self.require_catalog_admission(catalog)?;
-                let key =
-                    QueryTableBindingKey::metadata(catalog, database, table, metadata_table_type);
-                let token = self.bind_for_sql(key, |binding_id| {
-                    self.loader.load_metadata_table(
+                let admission = self.metadata_catalog_admission(catalog, quoted_key)?;
+                let key = QueryTableBindingKey::metadata_with_qualification(
+                    catalog,
+                    database,
+                    table,
+                    metadata_table_type,
+                    quoted_key,
+                );
+                let token = self.bind_for_sql(key, |binding_id| match &admission {
+                    MetadataCatalogAdmission::Ordinary(_) => self.loader.load_metadata_table(
                         catalog,
                         database,
                         table,
                         metadata_table_type,
                         binding_id,
-                    )
+                    ),
+                    MetadataCatalogAdmission::Quoted(read) => self
+                        .loader
+                        .prepare_metadata_table_at_pin(
+                            self.acquire_quoted_metadata_pin(read)?,
+                            database,
+                            table,
+                            metadata_table_type,
+                        )?
+                        .create(binding_id),
                 })?;
-                self.verify_catalog_admission(catalog, observation.as_ref())?;
-                Ok(self
-                    .bindings
-                    .binding(token)
-                    .map_err(CatalogResolutionError::failed)?
-                    .resolved
-                    .clone())
+                self.finish_metadata_binding(catalog, admission, token)
             }
         }
     }
@@ -680,15 +828,16 @@ impl<'a> CatalogServiceMaterializer<'a> {
         table: &str,
         metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
-        self.metadata_table_def(catalog, database, table, metadata_table_type)
+        self.metadata_table_def(catalog, database, table, metadata_table_type, None)
     }
 
-    pub(crate) async fn resolve_metadata_table_async(
+    async fn resolve_metadata_table_async(
         &self,
         catalog: Option<&str>,
         database: &str,
         table: &str,
         kind: novarocks_sql::planning::catalog::MetadataTableKind,
+        quoted_key: Option<&ConnectorProviderBindingKey>,
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
         if kind == novarocks_sql::planning::catalog::MetadataTableKind::Partitions {
             return Err(CatalogResolutionError::failed(
@@ -697,29 +846,38 @@ impl<'a> CatalogServiceMaterializer<'a> {
         }
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => {
-                self.metadata_table_def(catalog, database, table, kind)
+                self.metadata_table_def(catalog, database, table, kind, quoted_key)
             }
             Some(catalog) => {
-                let observation = self.require_catalog_admission(catalog)?;
-                let key = QueryTableBindingKey::metadata(catalog, database, table, kind);
+                let admission = self.metadata_catalog_admission(catalog, quoted_key)?;
+                let key = QueryTableBindingKey::metadata_with_qualification(
+                    catalog, database, table, kind, quoted_key,
+                );
                 let token = if self.bindings.resolved_lookup(&key).is_some() {
                     self.bind_for_sql(key, |_| unreachable!("completed binding must not reload"))?
                 } else {
-                    let observed = self
-                        .loader
-                        .prepare_metadata_table(catalog, database, table, kind)
-                        .await;
+                    let observed = match &admission {
+                        MetadataCatalogAdmission::Ordinary(_) => {
+                            self.loader
+                                .prepare_metadata_table(catalog, database, table, kind)
+                                .await
+                        }
+                        MetadataCatalogAdmission::Quoted(read) => {
+                            self.loader
+                                .prepare_metadata_table_at_pin_async(
+                                    self.acquire_quoted_metadata_pin(read)?,
+                                    database,
+                                    table,
+                                    kind,
+                                )
+                                .await
+                        }
+                    };
                     self.bind_for_sql(key, |binding| {
                         observed.and_then(|facts| facts.create(binding))
                     })?
                 };
-                self.verify_catalog_admission(catalog, observation.as_ref())?;
-                Ok(self
-                    .bindings
-                    .binding(token)
-                    .map_err(CatalogResolutionError::failed)?
-                    .resolved
-                    .clone())
+                self.finish_metadata_binding(catalog, admission, token)
             }
         }
     }
@@ -735,6 +893,7 @@ pub(crate) struct OriginalCatalogMetadataLookup {
     need: novarocks_sql::compiler::CatalogRelationNeed,
     key: QueryTableBindingKey,
     observation: Option<novarocks_catalog_application::CatalogRuntimeObservation>,
+    quoted: Option<QualifiedCatalogRead>,
     pub(crate) planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     pub(crate) namespace: String,
     pub(crate) physical_table: String,
@@ -792,14 +951,35 @@ impl CatalogServiceMaterializer<'_> {
         if catalog == "default_catalog" {
             return original_catalog_fact(
                 need,
-                self.metadata_table_def(Some(catalog), &relation.namespace, &relation.table, kind),
+                self.metadata_table_def(
+                    Some(catalog),
+                    &relation.namespace,
+                    &relation.table,
+                    kind,
+                    need.quoted_metadata_binding(),
+                ),
             )
             .map(OriginalCatalogLookup::Fact);
         }
         let observation = self.original_catalog_admission(catalog)?;
-        let key =
-            QueryTableBindingKey::metadata(catalog, &relation.namespace, &relation.table, kind);
+        let quoted = need
+            .quoted_metadata_binding()
+            .map(|binding| self.quoted_catalog_admission(catalog, binding))
+            .transpose()
+            .map_err(|error| {
+                crate::mv::domain::application::MvApplicationError::from_compile(
+                    error.into_compile(),
+                )
+            })?;
+        let key = QueryTableBindingKey::metadata_with_qualification(
+            catalog,
+            &relation.namespace,
+            &relation.table,
+            kind,
+            need.quoted_metadata_binding(),
+        );
         if let Some(error) = self
+            .bindings
             .original_resolution_errors
             .lock()
             .unwrap()
@@ -813,20 +993,38 @@ impl CatalogServiceMaterializer<'_> {
                 unreachable!("memoized original metadata alias must not reload")
             });
             let resolved = token.and_then(|token| {
-                self.bindings
+                let binding = self
+                    .bindings
                     .binding(token)
-                    .map(|binding| binding.resolved.clone())
-                    .map_err(CatalogResolutionError::failed)
+                    .map_err(CatalogResolutionError::failed)?;
+                if let Some(read) = &quoted {
+                    self.verify_quoted_metadata_binding(read, &binding)?;
+                }
+                Ok(binding.resolved.clone())
             });
-            if self.original_catalog_admission(catalog)? != observation {
+            if quoted.is_none() && self.original_catalog_admission(catalog)? != observation {
                 return Err(contract_error(
                     "catalog attachment generation changed while acquiring its planning pin",
                 ));
             }
             return original_catalog_fact(need, resolved).map(OriginalCatalogLookup::Fact);
         }
-        let planning_pin =
-            crate::connector::metadata_binding_typed(controls, catalog).map_err(provider_error)?;
+        let planning_pin = match &quoted {
+            Some(read) => read
+                .acquire_for_read(
+                    self.qualification_application()
+                        .map_err(original_metadata_resolution_error)?,
+                    controls,
+                )
+                .map_err(|error| match error {
+                    CatalogReadFenceError::Catalog(error) => original_metadata_resolution_error(
+                        catalog_application_resolution_error(error),
+                    ),
+                    CatalogReadFenceError::Connector(error) => provider_error(error),
+                })?,
+            None => crate::connector::metadata_binding_typed(controls, catalog)
+                .map_err(provider_error)?,
+        };
         let physical_table = format!(
             "{}${}",
             relation.table,
@@ -838,6 +1036,7 @@ impl CatalogServiceMaterializer<'_> {
                 need: need.clone(),
                 key,
                 observation,
+                quoted,
                 planning_pin,
                 namespace: relation.namespace.clone(),
                 physical_table,
@@ -877,7 +1076,7 @@ impl CatalogServiceMaterializer<'_> {
                 let error = crate::query_execution::mv_assembly::refresh_preparation::io_gate::provider_error(error);
                 // Keep the original typed Provider failure. The reader stops;
                 // a repeated need observes this same cause rather than I/O.
-                let retired = self.original_resolution_errors.lock().unwrap()
+                let retired = self.bindings.original_resolution_errors.lock().unwrap()
                     .insert(lookup.key.clone(), error.clone());
                 drop(retired);
                 let _ = self.bind_for_sql(lookup.key, |_| Err(CatalogResolutionError::failed(error.message())));
@@ -901,20 +1100,30 @@ impl CatalogServiceMaterializer<'_> {
                     error.into_compile(),
                 )
             })?;
-        if self.original_catalog_admission(&relation.catalog)? != lookup.observation {
+        if lookup.quoted.is_none()
+            && self.original_catalog_admission(&relation.catalog)? != lookup.observation
+        {
             return Err(contract_error(
                 "catalog attachment generation changed while acquiring its planning pin",
             ));
         }
-        let resolved = self
-            .bindings
-            .binding(token)
-            .map_err(contract_error)?
-            .resolved
-            .clone();
-        novarocks_sql::compiler::CatalogRelationFact::resolved(&lookup.need, resolved)
-            .map_err(|error| contract_error(error.to_string()))
+        let binding = self.bindings.binding(token).map_err(contract_error)?;
+        if let Some(read) = &lookup.quoted {
+            self.verify_quoted_metadata_binding(read, &binding)
+                .map_err(original_metadata_resolution_error)?;
+        }
+        novarocks_sql::compiler::CatalogRelationFact::resolved(
+            &lookup.need,
+            binding.resolved.clone(),
+        )
+        .map_err(|error| contract_error(error.to_string()))
     }
+}
+
+fn original_metadata_resolution_error(
+    error: CatalogResolutionError,
+) -> crate::mv::domain::application::MvApplicationError {
+    crate::mv::domain::application::MvApplicationError::from_compile(error.into_compile())
 }
 
 fn original_catalog_fact(
@@ -1102,6 +1311,65 @@ struct IcebergTableBindingLoader<'a> {
 }
 
 impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
+    fn connector_read_context(
+        &self,
+    ) -> Option<(&dyn ConnectorControlResolver, &ConnectorRequestContext)> {
+        Some((self.controls, &self.connector_context))
+    }
+
+    fn prepare_metadata_table_at_pin(
+        &self,
+        pin: ConnectorControlPlanningPin,
+        namespace: &str,
+        table: &str,
+        kind: novarocks_sql::planning::catalog::MetadataTableKind,
+    ) -> CatalogResolutionResult<PreparedQueryTableBinding> {
+        let alias = format!("{table}${}", metadata_table_alias_suffix(kind)?);
+        let catalog = pin.binding().descriptor().instance_id.as_str().to_owned();
+        let materialization = load_connector_table_materialization_at_pin(
+            pin,
+            self.connector_context.clone(),
+            namespace,
+            &alias,
+            novarocks_spi::connector::ConnectorTableResolution::ProviderReadAlias,
+        )?;
+        Ok(PreparedQueryTableBinding {
+            materialization,
+            catalog,
+            namespace: namespace.to_owned(),
+            table: table.to_owned(),
+            metadata_kind: Some(kind),
+        })
+    }
+
+    fn prepare_metadata_table_at_pin_async<'a>(
+        &'a self,
+        pin: ConnectorControlPlanningPin,
+        namespace: &'a str,
+        table: &'a str,
+        kind: novarocks_sql::planning::catalog::MetadataTableKind,
+    ) -> futures::future::BoxFuture<'a, CatalogResolutionResult<PreparedQueryTableBinding>> {
+        Box::pin(async move {
+            let alias = format!("{table}${}", metadata_table_alias_suffix(kind)?);
+            let catalog = pin.binding().descriptor().instance_id.as_str().to_owned();
+            let materialization = load_connector_table_materialization_at_pin_async(
+                pin,
+                self.connector_context.clone(),
+                namespace,
+                &alias,
+                novarocks_spi::connector::ConnectorTableResolution::ProviderReadAlias,
+            )
+            .await?;
+            Ok(PreparedQueryTableBinding {
+                materialization,
+                catalog,
+                namespace: namespace.to_owned(),
+                table: table.to_owned(),
+                metadata_kind: Some(kind),
+            })
+        })
+    }
+
     fn prepare_relation(
         &self,
         need: &novarocks_sql::compiler::CatalogRelationNeed,
@@ -1410,6 +1678,7 @@ pub(crate) fn metadata_table_alias_suffix(
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -2144,7 +2413,15 @@ mod tests {
             )),
             Some(Err(_))
         ));
-        let repeated = match materializer.begin_original_metadata_lookup(need, &controls) {
+        // A subsequent completion round recreates this materializer but
+        // keeps the original table memo and its typed provider failure.
+        let next_round = CatalogServiceMaterializer::new(
+            Some("ice"),
+            &service,
+            Arc::clone(&bindings),
+            Box::new(OverlayLoader),
+        );
+        let repeated = match next_round.begin_original_metadata_lookup(need, &controls) {
             Err(error) => error,
             Ok(_) => panic!("failed original metadata may not be loaded again"),
         };
@@ -2353,6 +2630,7 @@ mod tests {
 #[cfg(test)]
 mod async_observation_tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MissingLoader {

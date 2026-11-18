@@ -138,6 +138,7 @@ pub struct CatalogRelationNeed {
     local_view_shadow: bool,
     definition_context: bool,
     selection: Option<Box<CatalogTableSelection>>,
+    quoted_metadata_binding: Option<Box<novarocks_spi::connector::ConnectorProviderBindingKey>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,6 +175,7 @@ impl CatalogRelationNeed {
             local_view_shadow: false,
             definition_context: false,
             selection: None,
+            quoted_metadata_binding: None,
         })
     }
 
@@ -190,6 +192,27 @@ impl CatalogRelationNeed {
         assert!(matches!(self.target, CatalogLookupTarget::Table { .. }));
         self.local_view_shadow = true;
         self
+    }
+
+    pub(super) fn with_quoted_metadata_binding(
+        mut self,
+        binding: Option<novarocks_spi::connector::ConnectorProviderBindingKey>,
+    ) -> Self {
+        if let Some(binding) = binding {
+            assert!(matches!(
+                self.target,
+                CatalogLookupTarget::IcebergMetadata { .. }
+            ));
+            assert_eq!(binding.instance_id(), self.relation.catalog);
+            self.quoted_metadata_binding = Some(Box::new(binding));
+        }
+        self
+    }
+
+    pub fn quoted_metadata_binding(
+        &self,
+    ) -> Option<&novarocks_spi::connector::ConnectorProviderBindingKey> {
+        self.quoted_metadata_binding.as_deref()
     }
 
     pub(super) fn with_selection(mut self, selection: Option<CatalogTableSelection>) -> Self {
@@ -229,6 +252,8 @@ impl CatalogRelationNeed {
                     local_view_shadow: self.local_view_shadow,
                     definition_context: self.definition_context,
                     selection: self.selection.clone(),
+                    quoted_metadata_binding: None,
+                    view_qualifications: None,
                     selected_snapshot: None,
                     outcome: CatalogRelationOutcome::SelectionRefused(Box::new(error)),
                 },
@@ -1145,6 +1170,7 @@ impl SqlNeedBatch {
                     checked_sum([
                         table_identity_bytes(&need.relation),
                         catalog_selection_bytes(need.selection.as_deref()),
+                        quoted_metadata_binding_bytes(need.quoted_metadata_binding()),
                     ])
                 })),
             ]),
@@ -1214,6 +1240,8 @@ pub struct CatalogRelationFact {
     local_view_shadow: bool,
     definition_context: bool,
     selection: Option<Box<CatalogTableSelection>>,
+    quoted_metadata_binding: Option<Box<novarocks_spi::connector::ConnectorProviderBindingKey>>,
+    view_qualifications: Option<Box<super::CatalogQualifications>>,
     selected_snapshot: Option<i64>,
     outcome: CatalogRelationOutcome,
 }
@@ -1250,6 +1278,8 @@ impl CatalogRelationFact {
             local_view_shadow: need.local_view_shadow,
             definition_context: need.definition_context,
             selection: None,
+            quoted_metadata_binding: need.quoted_metadata_binding.clone(),
+            view_qualifications: None,
             selected_snapshot: None,
             outcome: CatalogRelationOutcome::SystemTable(declaration),
         })
@@ -1282,6 +1312,8 @@ impl CatalogRelationFact {
             local_view_shadow: need.local_view_shadow,
             definition_context: need.definition_context,
             selection: need.selection.clone(),
+            quoted_metadata_binding: need.quoted_metadata_binding.clone(),
+            view_qualifications: None,
             selected_snapshot: None,
             outcome: CatalogRelationOutcome::SelectionRefused(error.clone()),
         })
@@ -1372,6 +1404,8 @@ impl CatalogRelationFact {
             local_view_shadow: need.local_view_shadow,
             definition_context: need.definition_context,
             selection: need.selection.clone(),
+            quoted_metadata_binding: need.quoted_metadata_binding.clone(),
+            view_qualifications: None,
             selected_snapshot,
             outcome: CatalogRelationOutcome::Resolved(Box::new(table)),
         })
@@ -1408,6 +1442,8 @@ impl CatalogRelationFact {
             local_view_shadow: need.local_view_shadow,
             definition_context: need.definition_context,
             selection: need.selection.clone(),
+            quoted_metadata_binding: need.quoted_metadata_binding.clone(),
+            view_qualifications: None,
             selected_snapshot: None,
             outcome: CatalogRelationOutcome::View(definition),
         })
@@ -1434,6 +1470,8 @@ impl CatalogRelationFact {
             local_view_shadow: need.local_view_shadow,
             definition_context: need.definition_context,
             selection: need.selection.clone(),
+            quoted_metadata_binding: need.quoted_metadata_binding.clone(),
+            view_qualifications: None,
             selected_snapshot: None,
             outcome: CatalogRelationOutcome::Missing { reason },
         })
@@ -1453,6 +1491,30 @@ impl CatalogRelationFact {
 
     pub const fn allows_local_view_shadow(&self) -> bool {
         self.local_view_shadow
+    }
+
+    pub fn with_view_qualifications(
+        mut self,
+        qualifications: super::CatalogQualifications,
+    ) -> Result<Self, CompletionProtocolError> {
+        if !matches!(self.outcome, CatalogRelationOutcome::View(_)) {
+            return Err(CompletionProtocolError::InvalidFact {
+                id: self.id,
+                reason: "catalog qualifications require an original view definition",
+            });
+        }
+        self.view_qualifications = Some(Box::new(qualifications));
+        Ok(self)
+    }
+
+    pub(super) fn view_qualifications(&self) -> Option<&super::CatalogQualifications> {
+        self.view_qualifications.as_deref()
+    }
+
+    pub(super) fn quoted_metadata_binding(
+        &self,
+    ) -> Option<&novarocks_spi::connector::ConnectorProviderBindingKey> {
+        self.quoted_metadata_binding.as_deref()
     }
 
     pub const fn outcome(&self) -> &CatalogRelationOutcome {
@@ -3740,7 +3802,49 @@ fn catalog_fact_bytes(fact: &CatalogRelationFact) -> Result<u64, CompletionProto
         Ok(std::mem::size_of::<CatalogRelationFact>() as u64),
         Ok(relation),
         catalog_selection_bytes(fact.selection.as_deref()),
+        quoted_metadata_binding_bytes(fact.quoted_metadata_binding()),
+        view_catalog_qualifications_bytes(fact.view_qualifications()),
         Ok(outcome),
+    ])
+}
+
+fn quoted_metadata_binding_bytes(
+    binding: Option<&novarocks_spi::connector::ConnectorProviderBindingKey>,
+) -> Result<u64, CompletionProtocolError> {
+    if let Some(binding) = binding {
+        checked_sum([
+            checked_size(std::mem::size_of_val(binding)),
+            checked_size(binding.instance_id().len()),
+        ])
+    } else {
+        Ok(0)
+    }
+}
+
+fn view_catalog_qualifications_bytes(
+    qualifications: Option<&super::CatalogQualifications>,
+) -> Result<u64, CompletionProtocolError> {
+    let Some(qualifications) = qualifications else {
+        return Ok(0);
+    };
+    let entries = qualifications.entries().map(|(instance, qualification)| {
+        let observation = match qualification {
+            super::CatalogQualification::Ready { provider, binding } => checked_sum([
+                checked_size(provider.as_str().len()),
+                checked_size(binding.instance_id().len()),
+            ])?,
+            _ => 0,
+        };
+        checked_sum([
+            checked_size(std::mem::size_of_val(instance)),
+            checked_size(std::mem::size_of_val(qualification)),
+            checked_size(instance.as_str().len()),
+            Ok(observation),
+        ])
+    });
+    checked_sum([
+        checked_size(std::mem::size_of_val(qualifications)),
+        checked_sum(entries),
     ])
 }
 

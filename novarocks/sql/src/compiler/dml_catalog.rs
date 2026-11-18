@@ -58,6 +58,22 @@ impl SqlDmlCatalogPreparation {
         control: SqlCompileControl,
         intent: SqlCompileIntent,
     ) -> Result<Self, SqlCompileError> {
+        Self::try_new_for_intent_with_qualifications(
+            statement,
+            session,
+            control,
+            intent,
+            super::CatalogQualifications::default(),
+        )
+    }
+
+    pub fn try_new_for_intent_with_qualifications(
+        statement: SqlStatementInput,
+        session: SqlSessionContext,
+        control: SqlCompileControl,
+        intent: SqlCompileIntent,
+        qualifications: super::CatalogQualifications,
+    ) -> Result<Self, SqlCompileError> {
         if !matches!(
             &intent,
             SqlCompileIntent::IcebergWrite { .. } | SqlCompileIntent::ChangeStreamWrite
@@ -78,13 +94,16 @@ impl SqlDmlCatalogPreparation {
         };
         let query = crate::sql_mode::normalize_concat_query(query, &session.sql_semantics)
             .map_err(SqlCompileError::from)?;
-        let catalog = CatalogCompletionState::try_new_with_semantics(
+        let catalog = CatalogCompletionState::try_new_with_qualifications(
             query,
+            &[],
+            &[],
             session.current_catalog.as_deref(),
             &session.current_database,
             crate::catalog::TableLookupMode::SchemaOnly,
             0,
             &session.sql_semantics,
+            qualifications,
         )?
         .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
         // Validate the producer's structural sites against the actual query

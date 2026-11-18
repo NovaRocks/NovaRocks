@@ -3840,6 +3840,19 @@ impl PlannerTableProvider for DefinitionResolutionCatalog<'_> {
         )
     }
 
+    fn resolve_quoted_iceberg_metadata(
+        &self,
+        name: &novarocks_parser::ast::ObjectName,
+        catalog: Option<&str>,
+        database: &str,
+    ) -> Option<crate::catalog::QuotedMetadataTable> {
+        self.inner.resolve_quoted_iceberg_metadata(
+            name,
+            Some(catalog.unwrap_or(self.default_catalog)),
+            database,
+        )
+    }
+
     fn iceberg_metadata_provider(
         &self,
     ) -> Option<&dyn crate::catalog::IcebergMetadataTableProvider> {
