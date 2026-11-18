@@ -61,3 +61,22 @@ added_data_files_count	1
 k
 2
 4
+
+-- query 18
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	4
+removed_delete_files_count	0
+added_data_files_count	2
+
+-- query 19
+-- types	varchar	bigint	bigint
+p	row_count	key_sum
+a	3	7
+b	2	8
+
+-- query 20
+-- types	row(p varchar)	bigint
+partition	physical_rows
+["a"]	3
+["b"]	2
