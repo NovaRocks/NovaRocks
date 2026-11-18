@@ -60,7 +60,19 @@ const CREATE_TABLE_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
     status: ErrorCodeStatus::Active,
 };
 
-/// DML statement-shape descriptors consumed by the independent manifest tool.
+const TABLE_ALREADY_EXISTS: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.table_already_exists"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+
+const SCHEMA_ALREADY_EXISTS: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.schema_already_exists"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+
+/// DML statement admission descriptors consumed by the independent manifest tool.
 pub const DML_ADMISSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     DELETE_REQUIRES_WHERE,
     DELETE_UNSUPPORTED_FORM,
@@ -68,6 +80,8 @@ pub const DML_ADMISSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     MERGE_UNSUPPORTED_FORM,
     INSERT_UNSUPPORTED_FORM,
     CREATE_TABLE_UNSUPPORTED_FORM,
+    TABLE_ALREADY_EXISTS,
+    SCHEMA_ALREADY_EXISTS,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +92,8 @@ pub enum DmlAdmissionError {
     MergeUnsupportedForm,
     InsertUnsupportedForm,
     CreateTableUnsupportedForm,
+    TableAlreadyExists,
+    SchemaAlreadyExists,
 }
 
 impl DmlAdmissionError {
@@ -89,6 +105,8 @@ impl DmlAdmissionError {
             Self::MergeUnsupportedForm => MERGE_UNSUPPORTED_FORM,
             Self::InsertUnsupportedForm => INSERT_UNSUPPORTED_FORM,
             Self::CreateTableUnsupportedForm => CREATE_TABLE_UNSUPPORTED_FORM,
+            Self::TableAlreadyExists => TABLE_ALREADY_EXISTS,
+            Self::SchemaAlreadyExists => SCHEMA_ALREADY_EXISTS,
         }
     }
 
@@ -153,7 +171,7 @@ mod tests {
 
     #[test]
     fn manifest_contains_every_dml_statement_shape_code() {
-        assert_eq!(DML_ADMISSION_ERROR_CODE_DESCRIPTORS.len(), 6);
+        assert_eq!(DML_ADMISSION_ERROR_CODE_DESCRIPTORS.len(), 8);
         assert!(
             DML_ADMISSION_ERROR_CODE_DESCRIPTORS
                 .iter()

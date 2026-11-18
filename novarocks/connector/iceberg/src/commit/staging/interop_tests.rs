@@ -2622,6 +2622,7 @@ async fn iru13a_java_rest_stage_create_and_ctas_final_commit() {
                 staged_table_uuid: staged_uuid,
                 snapshot_id: Some(snapshot),
                 final_table_location: None,
+                final_metadata_path: None,
                 properties: vec![marker.clone()],
             }),
         )
@@ -3110,6 +3111,7 @@ async fn iru13b_java_rest_ctas_publishes_staged_metadata_for_every_format_versio
                     staged_table_uuid: staged.uuid(),
                     snapshot_id: Some(snapshot),
                     final_table_location: None,
+                    final_metadata_path: None,
                     properties: vec![marker.clone()],
                 }),
             )

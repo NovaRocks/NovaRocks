@@ -27,7 +27,7 @@ use arrow::{
 };
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool, ConstantValue};
 use novarocks_failure_contract::SharedFailureCause;
-use novarocks_parser::{SYNTHETIC, ast::Expr, trino_parser::parse_expression};
+use novarocks_parser::{SYNTHETIC, Span, ast::Expr, trino_parser::parse_expression};
 use novarocks_query_application::{
     session_error::{QueryServiceError, QueryServiceErrorKind},
     sql::{property_admit::DdlPropertyScope, property_evaluation::*},
@@ -39,6 +39,7 @@ use novarocks_sql::compiler::RequiredConstantTarget as Target;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
 };
+use novarocks_user_error::{ErrorPhase, RetryClass};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -1547,4 +1548,608 @@ fn authored_property_copy_preserves_control_source_and_does_not_reorder_expressi
     .unwrap_err();
     assert_eq!(error, original);
     port.exhausted();
+}
+
+#[test]
+fn trino_catalog_using_is_independent_of_original_with_arguments() {
+    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+
+    let source = "CREATE CATALOG IF NOT EXISTS Warehouse USING iceberg COMMENT 'kept by parser' \
+                  WITH (\"Mixed Key\" = coalesce('source', 'other'), \"Value\" = 'source')";
+    let TrinoStatement::CreateCatalog(statement) = parse_statement(source).unwrap() else {
+        panic!("real CREATE CATALOG");
+    };
+    let mut port = Port::new(vec![
+        Call {
+            expression: statement.properties[0].value.as_ref().unwrap(),
+            target: Target::Varchar,
+            result: Ok(text(Some(" value with both spaces "))),
+        },
+        Call {
+            expression: statement.properties[1].value.as_ref().unwrap(),
+            target: Target::Varchar,
+            result: Ok(text(Some("selected中"))),
+        },
+    ]);
+    let actual = prepare_trino_create_catalog(source, &statement, &mut port, &Control::default())
+        .expect("prepare owned configuration facts");
+    port.exhausted();
+    assert!(actual.if_not_exists);
+    assert_eq!(actual.name, "Warehouse");
+    assert_eq!(actual.connector_name.as_deref(), Some("iceberg"));
+    assert_eq!(
+        actual.properties,
+        vec![
+            ("Mixed Key".into(), " value with both spaces ".into()),
+            ("Value".into(), "selected中".into()),
+        ]
+    );
+}
+
+#[test]
+fn trino_catalog_rejects_type_at_the_original_name_before_its_value() {
+    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+
+    let source =
+        "CREATE CATALOG warehouse USING iceberg WITH (setting = 'good', \"TyPe\" = DEFAULT)";
+    let TrinoStatement::CreateCatalog(statement) = parse_statement(source).unwrap() else {
+        panic!("real CREATE CATALOG");
+    };
+    let original = statement.properties[0].value.as_ref().unwrap();
+    let expected = DdlPropertyScope::Catalog.to_user_error(
+        source,
+        statement.properties[1].name.span,
+        "Catalog property 'type' cannot override the USING connector",
+    );
+    let mut port = Port::new(vec![Call {
+        expression: original,
+        target: Target::Varchar,
+        result: Ok(text(Some("good"))),
+    }]);
+    let actual = prepare_trino_create_catalog(source, &statement, &mut port, &Control::default())
+        .unwrap_err();
+    assert_eq!(actual.user_error(), Some(&expected));
+    port.exhausted();
+    assert_eq!(port.seen, [std::ptr::from_ref(original)]);
+
+    let original_failure =
+        QueryServiceError::new(QueryServiceErrorKind::Unavailable, "original source");
+    let mut port = Port::new(vec![Call {
+        expression: original,
+        target: Target::Varchar,
+        result: Err(original_failure.clone().into()),
+    }]);
+    let actual = prepare_trino_create_catalog(source, &statement, &mut port, &Control::default())
+        .unwrap_err();
+    assert_eq!(actual, original_failure);
+    port.exhausted();
+}
+
+fn assert_create_authorization_refusal(
+    error: &QueryServiceError,
+    source: &str,
+    principal_span: Span,
+    message: &str,
+) {
+    let user = error.user_error().expect("typed authorization refusal");
+    assert_eq!(user.code().as_str(), "sql.admit.unsupported_statement");
+    assert_eq!(user.phase(), ErrorPhase::Admit);
+    assert_eq!(user.retry(), RetryClass::Never);
+    assert_eq!(user.message(), message);
+    assert_eq!(
+        user.location(),
+        Some(&principal_span.to_user_error_location(source)),
+    );
+}
+
+#[test]
+fn trino_catalog_refuses_authorization_and_delimited_provider_names() {
+    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+
+    let source =
+        "CREATE CATALOG warehouse USING iceberg AUTHORIZATION USER user1 WITH (setting = 'value')";
+    let TrinoStatement::CreateCatalog(statement) = parse_statement(source).unwrap() else {
+        panic!("real CREATE CATALOG");
+    };
+    let mut port = Port::new(vec![]);
+    let error = prepare_trino_create_catalog(source, &statement, &mut port, &Control::default())
+        .unwrap_err();
+    assert_create_authorization_refusal(
+        &error,
+        source,
+        statement.principal.as_ref().unwrap().name.span,
+        "CREATE CATALOG AUTHORIZATION is not supported",
+    );
+    assert!(port.seen.is_empty());
+
+    let source = "CREATE CATALOG warehouse USING \"iceberg\"";
+    let TrinoStatement::CreateCatalog(statement) = parse_statement(source).unwrap() else {
+        panic!("real CREATE CATALOG");
+    };
+    let error = prepare_trino_create_catalog(source, &statement, &mut port, &Control::default())
+        .unwrap_err();
+    assert_eq!(error.kind(), QueryServiceErrorKind::InvalidValue);
+    assert_eq!(
+        error.message(),
+        "CREATE CATALOG USING requires an undelimited connector name",
+    );
+    assert!(port.seen.is_empty());
+}
+
+#[test]
+fn trino_schema_properties_use_the_scope_declaration_and_original_value_slot() {
+    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_sql::semantic::CatalogSqlCommand;
+
+    // Independent declaration fixture of the Iceberg provider's current
+    // location profile. The provider's own REST/Hadoop tests own publication.
+    let declarations = [declaration("location", Type::Varchar, Value::Null)];
+    for (property, selected_location) in [
+        (
+            "\"LOCATION\" = coalesce('s3://warehouse/path', '')",
+            Some("s3://warehouse/path"),
+        ),
+        ("location = DEFAULT", None),
+    ] {
+        let source = format!("CREATE SCHEMA IF NOT EXISTS cat.\"MixedDb\" WITH ({property})");
+        let TrinoStatement::CreateSchema(statement) = parse_statement(&source).unwrap() else {
+            panic!("real CREATE SCHEMA");
+        };
+        let mut port = Port::new(
+            statement.properties[0]
+                .value
+                .as_ref()
+                .map(|expression| Call {
+                    expression,
+                    target: Target::Varchar,
+                    result: Ok(text(selected_location)),
+                })
+                .into_iter()
+                .collect(),
+        );
+        let CatalogSqlCommand::CreateDatabase {
+            name,
+            if_not_exists,
+            properties,
+        } = prepare_trino_create_schema(
+            &source,
+            &statement,
+            &declarations,
+            &mut port,
+            &Control::default(),
+        )
+        .unwrap()
+        else {
+            panic!("original semantic schema command");
+        };
+        port.exhausted();
+        assert!(if_not_exists);
+        assert_eq!(name.parts, ["cat", "MixedDb"]);
+        let expected =
+            selected_location.map(|value| ("location".into(), Value::Varchar(value.into())));
+        assert_eq!(properties, expected.into_iter().collect::<Vec<_>>());
+    }
+
+    let source = "CREATE SCHEMA cat.db WITH (unclaimed = 'value')";
+    let TrinoStatement::CreateSchema(statement) = parse_statement(source).unwrap() else {
+        panic!("real CREATE SCHEMA");
+    };
+    let error = prepare_trino_create_schema(
+        source,
+        &statement,
+        &declarations,
+        &mut Port::new(vec![]),
+        &Control::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.user_error(),
+        Some(&DdlPropertyScope::Schema.to_user_error(
+            source,
+            statement.properties[0].name.span,
+            "Unknown property 'unclaimed'",
+        ))
+    );
+
+    let source = "CREATE SCHEMA cat.db AUTHORIZATION ROLE future_role WITH (location = 'value')";
+    let TrinoStatement::CreateSchema(statement) = parse_statement(source).unwrap() else {
+        panic!("real CREATE SCHEMA");
+    };
+    let error = prepare_trino_create_schema(
+        source,
+        &statement,
+        &declarations,
+        &mut Port::new(vec![]),
+        &Control::default(),
+    )
+    .unwrap_err();
+    assert_create_authorization_refusal(
+        &error,
+        source,
+        statement.principal.as_ref().unwrap().name.span,
+        "CREATE SCHEMA AUTHORIZATION is not supported",
+    );
+}
+
+#[test]
+fn trino_column_and_comment_commands_keep_parser_name_segments() {
+    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_query_application::sql::trino_table_command::*;
+    use novarocks_sql::semantic::{
+        CatalogSqlCommand,
+        command::{
+            ColumnPositionSql, CommandLiteral, IcebergColumnSqlAction, IcebergSchemaSqlChange,
+            IcebergTableSqlAction,
+        },
+    };
+    use novarocks_types::schema::SqlType;
+
+    let source =
+        r#"ALTER TABLE lake.ns.t ADD COLUMN "parent.segment".added bigint DEFAULT 7 AFTER anchor"#;
+    let TrinoStatement::AddColumn(statement) = parse_statement(source).unwrap() else {
+        panic!("expected an ADD COLUMN statement");
+    };
+    let CatalogSqlCommand::AlterIcebergTable(command) =
+        lower_trino_add_column(source, &statement).unwrap()
+    else {
+        panic!("expected the original Iceberg table command");
+    };
+    assert_eq!(command.table.parts, ["lake", "ns", "t"]);
+    assert_eq!(
+        command.action,
+        IcebergTableSqlAction::Schema(IcebergSchemaSqlChange::AddColumn {
+            path: vec!["parent.segment".into(), "added".into()],
+            data_type: SqlType::BigInt,
+            nullable: Some(true),
+            default: Some(CommandLiteral::Number("7".into())),
+            position: ColumnPositionSql::After(vec!["anchor".into()]),
+        })
+    );
+
+    let source = r#"COMMENT ON COLUMN lake.ns.t."x.y" IS ''"#;
+    let TrinoStatement::Comment(statement) = parse_statement(source).unwrap() else {
+        panic!("expected a COMMENT ON COLUMN statement");
+    };
+    let CatalogSqlCommand::AlterIcebergTable(command) =
+        lower_trino_table_comment(source, &statement).unwrap()
+    else {
+        panic!("expected the original Iceberg table command");
+    };
+    assert_eq!(command.table.parts, ["lake", "ns", "t"]);
+    assert_eq!(
+        command.action,
+        IcebergTableSqlAction::Schema(IcebergSchemaSqlChange::AlterColumn {
+            path: vec!["x.y".into()],
+            action: IcebergColumnSqlAction::Comment(CommandLiteral::String(String::new())),
+        })
+    );
+
+    let source = "COMMENT ON TABLE lake.ns.t IS NULL";
+    let TrinoStatement::Comment(statement) = parse_statement(source).unwrap() else {
+        panic!("expected a COMMENT ON TABLE statement");
+    };
+    let error = lower_trino_table_comment(source, &statement).unwrap_err();
+    assert_eq!(
+        error.user_error().unwrap().code().as_str(),
+        "sql.admit.unsupported_statement"
+    );
+
+    let source = "ALTER TABLE lake.ns.t DROP COLUMN IF EXISTS col";
+    let TrinoStatement::DropColumn(statement) = parse_statement(source).unwrap() else {
+        panic!("expected a DROP COLUMN statement");
+    };
+    let error = lower_trino_drop_column(source, &statement).unwrap_err();
+    assert_eq!(
+        error.user_error().unwrap().code().as_str(),
+        "sql.admit.unsupported_statement"
+    );
+}
+
+#[test]
+fn trino_analyze_properties_preserve_omission_and_array_custody() {
+    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_query_application::sql::trino_table_command::prepare_trino_analyze;
+    use novarocks_sql::semantic::StatisticsSqlCommand;
+
+    let declared = [declaration("columns", Type::ArrayVarchar, Value::Null)];
+    let control = Control::default();
+    for source in [
+        "ANALYZE lake.ns.t",
+        "ANALYZE lake.ns.t WITH (columns = DEFAULT)",
+    ] {
+        let TrinoStatement::Analyze(statement) = parse_statement(source).unwrap() else {
+            panic!("expected an ANALYZE statement");
+        };
+        let mut port = Port::new(vec![]);
+        let command =
+            prepare_trino_analyze(source, &statement, &declared, &mut port, &control).unwrap();
+        let StatisticsSqlCommand::AnalyzeTable { table, columns } = command else {
+            panic!("expected the original ANALYZE command");
+        };
+        assert_eq!(table.parts, ["lake", "ns", "t"]);
+        assert_eq!(columns, None);
+        port.exhausted();
+    }
+    for (source, selected) in [
+        (
+            "ANALYZE lake.ns.t WITH (columns = ARRAY['Z', 'a'])",
+            &[Some("Z"), Some("a")][..],
+        ),
+        ("ANALYZE lake.ns.t WITH (columns = ARRAY[])", &[][..]),
+        (
+            "ANALYZE lake.ns.t WITH (columns = ARRAY['A', NULL])",
+            &[Some("A"), None][..],
+        ),
+    ] {
+        let TrinoStatement::Analyze(statement) = parse_statement(source).unwrap() else {
+            panic!("expected an ANALYZE statement");
+        };
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.values().append_value("a different ordinal");
+        builder.append(true);
+        for &column in selected {
+            builder.values().append_option(column);
+        }
+        builder.append(true);
+        let expression = statement.properties[0].value.as_ref().unwrap();
+        let mut port = Port::new(vec![Call {
+            expression,
+            target: Target::ArrayVarchar,
+            result: Ok(constant(
+                Arc::new(builder.finish()),
+                ValueLogicalType::Physical,
+            )),
+        }]);
+        let result = prepare_trino_analyze(source, &statement, &declared, &mut port, &control);
+        if selected.contains(&None) {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.user_error().unwrap().code().as_str(),
+                "sql.admit.invalid_analyze_property"
+            );
+            assert!(error.message().contains("Invalid null value"));
+        } else {
+            let StatisticsSqlCommand::AnalyzeTable { table, columns } = result.unwrap() else {
+                panic!("expected the original ANALYZE command");
+            };
+            assert_eq!(table.parts, ["lake", "ns", "t"]);
+            assert_eq!(
+                columns.unwrap(),
+                selected
+                    .iter()
+                    .map(|value| value.unwrap())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(port.seen, [expression as *const Expr]);
+        port.exhausted();
+    }
+}
+
+#[test]
+fn trino_branch_uses_the_authentic_bigint_expression_and_original_ref_command() {
+    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_query_application::sql::trino_table_command::*;
+    use novarocks_sql::semantic::{
+        CatalogSqlCommand,
+        command::{IcebergReferenceKindSql, IcebergReferenceSqlAction, IcebergTableSqlAction},
+    };
+
+    let source =
+        r#"CREATE BRANCH IF NOT EXISTS "b.next" WITH (snapshot_id = 100 + 23) IN TABLE lake.ns.t"#;
+    let TrinoStatement::CreateBranch(statement) = parse_statement(source).unwrap() else {
+        panic!("expected a CREATE BRANCH statement");
+    };
+    let declared = [declaration("snapshot_id", Type::Bigint, Value::Null)];
+    let expression = statement.properties[0].value.as_ref().unwrap();
+    let mut port = Port::new(vec![Call {
+        expression,
+        target: Target::Bigint,
+        result: Ok(constant(
+            Arc::new(Int64Array::from(vec![1, 123])),
+            ValueLogicalType::Physical,
+        )),
+    }]);
+    let control = Control::default();
+    let CatalogSqlCommand::AlterIcebergTable(command) =
+        prepare_trino_create_branch(source, &statement, &declared, &mut port, &control).unwrap()
+    else {
+        panic!("expected the original Iceberg table command");
+    };
+    assert_eq!(command.table.parts, ["lake", "ns", "t"]);
+    assert_eq!(
+        command.action,
+        IcebergTableSqlAction::Reference(IcebergReferenceSqlAction::Create {
+            kind: IcebergReferenceKindSql::Branch,
+            name: "b.next".into(),
+            if_not_exists: true,
+            or_replace: false,
+            snapshot_id: Some(123),
+        })
+    );
+    assert_eq!(port.seen, [expression as *const Expr]);
+    port.exhausted();
+
+    let source = r#"DROP BRANCH IF EXISTS "b.next" IN TABLE lake.ns.t"#;
+    let TrinoStatement::DropBranch(statement) = parse_statement(source).unwrap() else {
+        panic!("expected a DROP BRANCH statement");
+    };
+    let CatalogSqlCommand::AlterIcebergTable(command) = lower_trino_drop_branch(&statement) else {
+        panic!("expected the original Iceberg table command");
+    };
+    assert_eq!(
+        command.action,
+        IcebergTableSqlAction::Reference(IcebergReferenceSqlAction::Drop {
+            kind: IcebergReferenceKindSql::Branch,
+            name: "b.next".into(),
+            if_exists: true,
+        })
+    );
+}
+
+#[test]
+fn trino_table_execute_resolves_provider_and_where_before_evaluating_arguments() {
+    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_query_application::sql::{
+        table_procedure::{
+            BoundProcedureArgument, TableProcedureAbsoluteTimePort, TableProcedureKind,
+        },
+        trino_table_command::bind_trino_table_execute,
+    };
+    use novarocks_spi::connector::ConnectorProviderId;
+
+    struct NoAbsoluteTime;
+    impl TableProcedureAbsoluteTimePort for NoAbsoluteTime {
+        fn legacy_timestamp_literal_millis(
+            &mut self,
+            _: &str,
+            _: novarocks_parser::Span,
+        ) -> Result<i64, QueryServiceError> {
+            panic!("this procedure does not request an absolute time")
+        }
+    }
+
+    let provider = ConnectorProviderId::parse("iceberg").unwrap();
+    let control = Control::default();
+    for (source, code) in [
+        (
+            "ALTER TABLE lake.ns.t EXECUTE not_registered(bad => missing) WHERE id > 0",
+            "sql.admit.table_procedure_not_found",
+        ),
+        (
+            "ALTER TABLE lake.ns.t EXECUTE optimize(bad => missing) WHERE id > 0",
+            "sql.admit.unsupported_statement",
+        ),
+        (
+            "ALTER TABLE lake.ns.t EXECUTE optimize(bad => missing)",
+            "sql.admit.invalid_table_procedure_argument",
+        ),
+    ] {
+        let TrinoStatement::TableExecute(statement) = parse_statement(source).unwrap() else {
+            panic!("expected an ALTER TABLE EXECUTE statement");
+        };
+        let error = bind_trino_table_execute(
+            source,
+            &statement,
+            &provider,
+            &mut Port::new(vec![]),
+            &mut NoAbsoluteTime,
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(error.user_error().unwrap().code().as_str(), code);
+    }
+
+    let source = "ALTER TABLE lake.ns.t EXECUTE optimize";
+    let TrinoStatement::TableExecute(statement) = parse_statement(source).unwrap() else {
+        panic!("expected an ALTER TABLE EXECUTE statement");
+    };
+    let bound = bind_trino_table_execute(
+        source,
+        &statement,
+        &provider,
+        &mut Port::new(vec![]),
+        &mut NoAbsoluteTime,
+        &control,
+    )
+    .unwrap();
+    assert_eq!(bound.declaration().kind(), TableProcedureKind::Optimize);
+    assert!(
+        bound
+            .arguments()
+            .all(|(_, value)| matches!(value, BoundProcedureArgument::Omitted))
+    );
+}
+
+#[test]
+fn table_procedure_timestamp_projection_uses_original_selected_ticks_and_declared_unit() {
+    use arrow::array::{
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
+    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_query_application::sql::{
+        table_procedure::{
+            BoundProcedureArgument, BoundProcedureValue, TableProcedureAbsoluteTimePort,
+        },
+        trino_table_command::bind_trino_table_execute,
+    };
+    use novarocks_spi::connector::ConnectorProviderId;
+
+    struct NoLegacyTimestamp;
+    impl TableProcedureAbsoluteTimePort for NoLegacyTimestamp {
+        fn legacy_timestamp_literal_millis(
+            &mut self,
+            _: &str,
+            _: novarocks_parser::Span,
+        ) -> Result<i64, QueryServiceError> {
+            panic!("a typed expression does not use the legacy literal parser")
+        }
+    }
+
+    let provider = ConnectorProviderId::parse("iceberg").unwrap();
+    let control = Control::default();
+    let source = "ALTER TABLE lake.ns.t EXECUTE expire_snapshots(older_than => CAST('1970-01-01' AS TIMESTAMP))";
+    let TrinoStatement::TableExecute(statement) = parse_statement(source).unwrap() else {
+        panic!("expected ALTER TABLE EXECUTE");
+    };
+    let cases: [(ArrayRef, Option<i64>); 7] = [
+        (
+            Arc::new(TimestampSecondArray::from(vec![10, 7])),
+            Some(7000),
+        ),
+        (
+            Arc::new(TimestampMillisecondArray::from(vec![10, 7123])),
+            Some(7123),
+        ),
+        (
+            Arc::new(TimestampMicrosecondArray::from(vec![10, 7_123_456]).with_timezone("+02:00")),
+            Some(7123),
+        ),
+        (
+            Arc::new(TimestampNanosecondArray::from(vec![10, -1])),
+            Some(-1),
+        ),
+        (
+            Arc::new(TimestampSecondArray::from(vec![10, i64::MAX])),
+            None,
+        ),
+        (
+            Arc::new(TimestampNanosecondArray::from(vec![Some(10), None])),
+            None,
+        ),
+        (Arc::new(arrow::array::NullArray::new(2)), None),
+    ];
+    for (array, expected) in cases {
+        let mut port = Port::new(vec![Call {
+            expression: &statement.arguments[0].value,
+            target: Target::Timestamp,
+            result: Ok(constant(array, ValueLogicalType::Physical)),
+        }]);
+        let result = bind_trino_table_execute(
+            source,
+            &statement,
+            &provider,
+            &mut port,
+            &mut NoLegacyTimestamp,
+            &control,
+        );
+        match expected {
+            Some(millis) => {
+                let bound = result.unwrap();
+                let (_, value) = bound
+                    .arguments()
+                    .find(|(slot, _)| slot.name == "older_than")
+                    .unwrap();
+                assert!(matches!(value, BoundProcedureArgument::Present {
+                    value: BoundProcedureValue::Value(Value::Bigint(actual)), ..
+                } if *actual == millis));
+            }
+            None => assert_eq!(
+                result.unwrap_err().user_error().unwrap().code().as_str(),
+                "sql.admit.invalid_table_procedure_argument",
+            ),
+        }
+        port.exhausted();
+    }
 }

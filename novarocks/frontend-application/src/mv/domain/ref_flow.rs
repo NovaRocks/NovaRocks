@@ -32,15 +32,33 @@ use novarocks_query_application::{
     },
 };
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorProviderId,
-    ConnectorRefAction, ConnectorRefKind, ConnectorTableIdentity, CreateOrReplacePolicy,
-    DdlPropertyValue, DropPolicy, ExternalMutationFinalization,
+    ConnectorCatalogMutationOperation, ConnectorCatalogMutationSession,
+    ConnectorControlPlanningPin, ConnectorInstanceId, ConnectorProviderId, ConnectorRefAction,
+    ConnectorRefKind, ConnectorTableIdentity, CreateOrReplacePolicy, DdlPropertyValue, DropPolicy,
+    ExternalMutationFinalization,
 };
 use novarocks_sql::semantic::ObjectName;
 use novarocks_sql::semantic::command::{
     AlterIcebergTableSqlCommand, IcebergReferenceKindSql, IcebergReferenceSqlAction,
     IcebergTableSqlAction,
 };
+
+pub(crate) struct RefMutationBinding {
+    pin: ConnectorControlPlanningPin,
+    mutation: ConnectorCatalogMutationSession,
+    table: ConnectorTableIdentity,
+}
+
+impl RefMutationBinding {
+    pub(crate) fn mutation(&self) -> &ConnectorCatalogMutationSession {
+        &self.mutation
+    }
+}
+
+pub(crate) struct PreparedRefMutation {
+    binding: RefMutationBinding,
+    action: ConnectorRefAction,
+}
 
 /// Execute an Iceberg ref mutation using only the explicit connector-control
 /// and MV storage-observation ports required for MV-target admission.
@@ -57,7 +75,25 @@ pub(crate) fn execute_with_ports(
     let IcebergTableSqlAction::Reference(action) = &stmt.action else {
         return Err(("Iceberg ref executor received a non-reference action".to_string()).into());
     };
-    let (catalog_name, namespace, table_name) = resolve_table_parts(&stmt.table)?;
+    let binding = prepare_target(
+        connector_control,
+        storage_observation,
+        readiness,
+        &stmt.table,
+        connector_context,
+    )?;
+    prepare_action(binding, action, connector_context)?.execute(connector_context)
+}
+
+pub(crate) fn prepare_target(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    table: &ObjectName,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<RefMutationBinding, CommandError> {
+    crate::connector::validate_request_context(connector_context)?;
+    let (catalog_name, namespace, table_name) = resolve_table_parts(table)?;
     crate::catalog_application::resolver::require_external_target(&catalog_name, &namespace)?;
 
     // Retain one exact generation across MV admission and the ref mutation.
@@ -90,64 +126,89 @@ pub(crate) fn execute_with_ports(
     let mutation_lease = exact_lease
         .derive_mutation_lease()
         .map_err(|error| error.to_string())?;
+    Ok(RefMutationBinding {
+        pin: exact_lease,
+        mutation: mutation_lease,
+        table: ConnectorTableIdentity {
+            instance_id,
+            namespace: Arc::from(namespace),
+            table: Arc::from(table_name),
+        },
+    })
+}
+
+pub(crate) fn prepare_action(
+    binding: RefMutationBinding,
+    action: &IcebergReferenceSqlAction,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PreparedRefMutation, CommandError> {
     let control = crate::query_execution::planning::sql_compile_control_from_connector_request(
         connector_context,
     );
     let action = connector_ref_action(
         action,
-        &exact_lease.binding().descriptor().provider_id,
+        &binding.pin.binding().descriptor().provider_id,
         &control,
     )?;
-    let outcome = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-        &mutation_lease,
-        novarocks_spi::connector::ConnectorMutationOperationId::new(),
-        ConnectorCatalogMutationOperation::AlterRef {
-            table: ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: Arc::from(namespace.as_str()),
-                table: Arc::from(table_name.as_str()),
+    Ok(PreparedRefMutation { binding, action })
+}
+
+impl PreparedRefMutation {
+    pub(crate) fn execute(
+        self,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<StatementResult, CommandError> {
+        let outcome = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
+            &self.binding.mutation,
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+            ConnectorCatalogMutationOperation::AlterRef {
+                table: self.binding.table,
+                action: self.action,
             },
-            action,
-        },
-        connector_context.clone(),
-    );
-    match outcome {
-        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
-            if let ExternalMutationFinalization::Failed(failure) = completed.finalization {
-                return Err((
+            connector_context.clone(),
+        );
+        match outcome {
+            crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
+                if let ExternalMutationFinalization::Failed(failure) = completed.finalization {
+                    return Err((
                     novarocks_query_application::engine_error::EngineError::commit_known_committed_finalize_failed(
                         failure.to_string(),
                     )
                     .to_string()).into());
+                }
             }
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted {
-            failure,
-            cleanup,
-        } => {
-            return Err(
+            crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted {
+                failure,
+                cleanup,
+            } => {
+                return Err(
                 (novarocks_query_application::engine_error::EngineError::commit_known_uncommitted(
                     crate::connector::mutation::known_uncommitted_message(failure, &cleanup),
                 )
                 .to_string())
                 .into(),
             );
+            }
+            crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown {
+                failure, ..
+            } => {
+                return Err(
+                    (novarocks_query_application::engine_error::EngineError::commit_unknown(
+                        failure.to_string(),
+                    )
+                    .to_string())
+                    .into(),
+                );
+            }
+            crate::connector::mutation::ResolvedCatalogMutation::ContractFailure {
+                error, ..
+            } => {
+                return Err((error.to_string()).into());
+            }
         }
-        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
-            return Err(
-                (novarocks_query_application::engine_error::EngineError::commit_unknown(
-                    failure.to_string(),
-                )
-                .to_string())
-                .into(),
-            );
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
-            return Err((error.to_string()).into());
-        }
-    }
 
-    Ok(StatementResult::Ok)
+        Ok(StatementResult::Ok)
+    }
 }
 
 fn connector_ref_action(

@@ -28,6 +28,8 @@ use uuid::Uuid;
 pub struct CatalogCreateCommand {
     pub instance_id: ConnectorInstanceId,
     pub display_name: String,
+    /// Exact USING connector. None exists until the legacy CREATE entry retires.
+    pub connector_name: Option<String>,
     pub properties: Vec<(String, String)>,
     pub if_not_exists: bool,
 }

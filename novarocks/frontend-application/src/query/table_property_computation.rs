@@ -20,11 +20,16 @@
 use super::{
     property_cpu_context::PropertyCpuContext, table_mutation_action::PreparedTableMutationInput,
 };
-use novarocks_parser::ast::legacy::CreateTable;
+use novarocks_parser::ast::{AstVec, StatementProperty, TrinoCreateTable, legacy::CreateTable};
 use novarocks_query_application::{
     api::{CatalogTablePropertyBinding, CommandContext},
     session_error::{QueryServiceError, QueryServiceErrorKind},
-    sql::{LegacyCreateTableColumnsPort, prepare_legacy_create_table},
+    sql::{
+        LegacyCreateTableColumnsPort, prepare_legacy_create_table,
+        property_evaluation::table::{
+            prepare_trino_create_table, prepare_trino_set_table_properties,
+        },
+    },
 };
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationRequest,
@@ -33,7 +38,10 @@ use novarocks_spi::connector::{
 };
 use novarocks_sql::{
     compiler::SqlCompileControl,
-    semantic::{TableColumnDef, command::TableColumnSqlCommand},
+    semantic::{
+        TableColumnDef,
+        command::{CreateTableSqlCommand, TableColumnSqlCommand},
+    },
 };
 use novarocks_type_contract::{CompilePhase, PureCompileControl};
 use std::sync::Arc;
@@ -56,17 +64,7 @@ impl TablePropertyCpuInput {
             like_columns,
             context,
         } = self;
-        let command_window = command
-            .result_window_alias()
-            .ok_or_else(|| internal("table property CPU has no original command window"))?;
-        if !context.window.is_for_scope(&context.scope)
-            || !context.window.is_for_scope(command.scope())
-            || !context.window.shares_capacity_with(&command_window)
-        {
-            return Err(internal(
-                "table property CPU differs from its original command Root/window",
-            ));
-        }
+        verify_original_scope(&context, &command)?;
         let mut constants = context.constant_port();
         let mut columns_port = TableColumnsPort::default();
         let prepared = prepare_legacy_create_table(
@@ -89,40 +87,158 @@ impl TablePropertyCpuInput {
                 ));
             }
         };
-        let columns = columns
-            .iter()
-            .map(crate::catalog_application::statement::connector_column)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(legacy_column_error)?;
-        let operation = ConnectorCatalogMutationOperation::CreateTable {
-            table: binding.table().clone(),
-            columns,
-            comment: prepared.comment.map(Arc::from),
-            properties: prepared
-                .properties
-                .into_iter()
-                .map(|(name, value)| (Arc::from(name), value))
-                .collect(),
-            policy: if prepared.if_not_exists {
-                CreatePolicy::NoOpIfExists
-            } else {
-                CreatePolicy::FailIfExists
-            },
-        };
-        let request = ConnectorCatalogMutationRequest {
-            operation_id: ConnectorMutationOperationId::new(),
-            target: ConnectorProviderBindingKey {
-                instance_id: binding.mutation().descriptor().instance_id.clone(),
-                incarnation: binding.planning().binding().incarnation(),
-            },
-            operation,
-            context: command.connector_context().clone(),
-        };
-        // This run method is the real planning CPU case. The necessary owned
-        // execute-request copy is made here, not in the later Action poll.
-        PreparedTableMutationInput::try_new(binding, request)
-            .map_err(super::product_command_service_error)
+        freeze_create(binding, command, prepared, columns)
     }
+}
+
+pub(crate) enum TrinoTablePropertySyntax {
+    Create(TrinoCreateTable),
+    Set(AstVec<StatementProperty>),
+}
+
+pub(crate) struct TrinoTablePropertyCpuInput {
+    pub(crate) source: Arc<str>,
+    pub(crate) syntax: TrinoTablePropertySyntax,
+    pub(crate) binding: CatalogTablePropertyBinding,
+    pub(crate) command: CommandContext,
+    pub(crate) context: PropertyCpuContext,
+}
+
+pub(crate) enum TrinoTablePropertyOutput {
+    Mutation(PreparedTableMutationInput),
+    Like(Box<PreparedTrinoTableLike>),
+}
+
+pub(crate) struct PreparedTrinoTableLike {
+    pub(crate) table: CreateTableSqlCommand,
+    binding: CatalogTablePropertyBinding,
+    command: CommandContext,
+}
+
+impl PreparedTrinoTableLike {
+    pub(crate) fn finish(
+        self,
+        columns: Vec<TableColumnDef>,
+    ) -> Result<PreparedTableMutationInput, QueryServiceError> {
+        freeze_create(self.binding, self.command, self.table, columns)
+    }
+}
+
+impl TrinoTablePropertyCpuInput {
+    pub(crate) fn run(self) -> Result<TrinoTablePropertyOutput, QueryServiceError> {
+        let Self {
+            source,
+            syntax,
+            binding,
+            command,
+            context,
+        } = self;
+        verify_original_scope(&context, &command)?;
+        let mut constants = context.constant_port();
+        match syntax {
+            TrinoTablePropertySyntax::Create(statement) => {
+                let table = prepare_trino_create_table(
+                    &source,
+                    &statement,
+                    binding.mutation(),
+                    &mut constants,
+                    &context.control,
+                )?;
+                if table.like.is_some() {
+                    return Ok(TrinoTablePropertyOutput::Like(Box::new(
+                        PreparedTrinoTableLike {
+                            table,
+                            binding,
+                            command,
+                        },
+                    )));
+                }
+                let columns =
+                    crate::catalog_application::statement::lower_semantic_create_table_columns(
+                        &table.columns,
+                    )
+                    .map_err(legacy_column_error)?;
+                freeze_create(binding, command, table, columns)
+                    .map(TrinoTablePropertyOutput::Mutation)
+            }
+            TrinoTablePropertySyntax::Set(properties) => {
+                let operation = prepare_trino_set_table_properties(
+                    &source,
+                    &properties,
+                    &binding,
+                    &mut constants,
+                    &context.control,
+                )?;
+                freeze_mutation(binding, command, operation).map(TrinoTablePropertyOutput::Mutation)
+            }
+        }
+    }
+}
+
+fn verify_original_scope(
+    context: &PropertyCpuContext,
+    command: &CommandContext,
+) -> Result<(), QueryServiceError> {
+    let command_window = command
+        .result_window_alias()
+        .ok_or_else(|| internal("table property CPU has no original command window"))?;
+    if !context.window.is_for_scope(&context.scope)
+        || !context.window.is_for_scope(command.scope())
+        || !context.window.shares_capacity_with(&command_window)
+    {
+        return Err(internal(
+            "table property CPU differs from its original command Root/window",
+        ));
+    }
+    Ok(())
+}
+
+fn freeze_create(
+    binding: CatalogTablePropertyBinding,
+    command: CommandContext,
+    prepared: CreateTableSqlCommand,
+    columns: Vec<TableColumnDef>,
+) -> Result<PreparedTableMutationInput, QueryServiceError> {
+    let columns = columns
+        .iter()
+        .map(crate::catalog_application::statement::connector_column)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(legacy_column_error)?;
+    let operation = ConnectorCatalogMutationOperation::CreateTable {
+        table: binding.table().clone(),
+        columns,
+        comment: prepared.comment.map(Arc::from),
+        properties: prepared
+            .properties
+            .into_iter()
+            .map(|(name, value)| (Arc::from(name), value))
+            .collect(),
+        policy: if prepared.if_not_exists {
+            CreatePolicy::NoOpIfExists
+        } else {
+            CreatePolicy::FailIfExists
+        },
+    };
+    freeze_mutation(binding, command, operation)
+}
+
+fn freeze_mutation(
+    binding: CatalogTablePropertyBinding,
+    command: CommandContext,
+    operation: ConnectorCatalogMutationOperation,
+) -> Result<PreparedTableMutationInput, QueryServiceError> {
+    let request = ConnectorCatalogMutationRequest {
+        operation_id: ConnectorMutationOperationId::new(),
+        target: ConnectorProviderBindingKey {
+            instance_id: binding.mutation().descriptor().instance_id.clone(),
+            incarnation: binding.planning().binding().incarnation(),
+        },
+        operation,
+        context: command.connector_context().clone(),
+    };
+    // Keep the execution copy on the actual planning CPU.
+    PreparedTableMutationInput::try_new(binding, request)
+        .map_err(super::product_command_service_error)
 }
 
 #[derive(Default)]

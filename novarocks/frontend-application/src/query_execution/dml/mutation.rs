@@ -23,7 +23,50 @@ use novarocks_parser::ast::{
     DmlStatement, MergeClause, MergeMatchedAction, MutationSource, ObjectName as ParsedObjectName,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_sql::planning::dml::{IcebergRefSuffix, split_ref_suffix};
 use novarocks_sql::semantic::ObjectName;
+
+/// The write target before Catalog lookup, independent of parser syntax.
+#[derive(Clone, Debug)]
+pub(crate) struct RowMutationTarget {
+    name: ObjectName,
+    reference: Option<IcebergRefSuffix>,
+}
+
+impl RowMutationTarget {
+    pub(crate) fn from_legacy(name: &ParsedObjectName) -> Self {
+        let (parts, reference) = split_ref_suffix(&lower_object_name(name).parts);
+        Self {
+            name: ObjectName { parts },
+            reference,
+        }
+    }
+
+    pub(crate) fn from_trino(
+        name: ParsedObjectName,
+        branch: Option<novarocks_parser::ast::Ident>,
+    ) -> Self {
+        Self {
+            name: ObjectName {
+                parts: name.parts.into_iter().map(|part| part.value).collect(),
+            },
+            reference: branch.map(|branch| IcebergRefSuffix::Branch(branch.value)),
+        }
+    }
+
+    pub(crate) fn table_and_reference(&self) -> Result<(&ObjectName, &str), String> {
+        let reference = match &self.reference {
+            None => "main",
+            Some(IcebergRefSuffix::Branch(branch)) => branch,
+            Some(IcebergRefSuffix::Tag(tag)) => {
+                return Err(format!(
+                    "iceberg ref: tag '{tag}' is read-only; use a branch as DML target"
+                ));
+            }
+        };
+        Ok((&self.name, reference))
+    }
+}
 
 /// UPDATE and MERGE remain distinct frontend application commands while using
 /// the same narrow core reverse port.
@@ -191,7 +234,7 @@ fn lower_update_statement(
         .map(lower_mutation_source)
         .transpose()?;
     Ok(PreparedUpdateStatement {
-        table: lower_object_name(&statement.target),
+        table: RowMutationTarget::from_legacy(&statement.target),
         alias: statement.alias.as_ref().map(|a| a.name.clone()),
         assignments,
         source: mutation_source,
@@ -266,7 +309,7 @@ fn lower_merge_statement(
     lower_alias(&statement.target_alias)?;
     let mutation_source = lower_mutation_source(&statement.source)?;
     Ok(PreparedMergeStatement {
-        table: lower_object_name(&statement.target),
+        table: RowMutationTarget::from_legacy(&statement.target),
         target_alias: statement.target_alias.as_ref().map(|a| a.name.clone()),
         source: mutation_source,
         on: statement.on.clone(),

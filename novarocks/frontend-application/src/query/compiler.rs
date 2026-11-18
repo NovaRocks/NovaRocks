@@ -231,7 +231,7 @@ impl FrontendQueryCompiler {
     pub(crate) fn catalog_property_input(
         &self,
         source: Arc<str>,
-        statement: novarocks_parser::ast::legacy::CreateCatalog,
+        statement: super::catalog_property_computation::CatalogCreateInput,
         current_database: String,
         sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
         interpreter: Arc<crate::RequiredConstantInterpreter>,
@@ -354,6 +354,63 @@ pub(crate) fn explain_detail_mode(
         ExplainDetail::Logical => (ExplainLevel::Normal, true),
         ExplainDetail::LogicalVerbose => (ExplainLevel::Verbose, true),
         ExplainDetail::LogicalCosts => (ExplainLevel::Costs, true),
+    }
+}
+
+pub(super) struct ExplainInput {
+    pub(super) query: Box<Query>,
+    mode: ExplainInputMode,
+}
+
+enum ExplainInputMode {
+    SessionDetail,
+    Fixed(ExplainLevel, bool),
+    Analyze,
+}
+
+impl ExplainInput {
+    pub(super) fn plan(query: Box<Query>) -> Self {
+        Self {
+            query,
+            mode: ExplainInputMode::SessionDetail,
+        }
+    }
+
+    pub(super) fn analyze(query: Box<Query>) -> Self {
+        Self {
+            query,
+            mode: ExplainInputMode::Analyze,
+        }
+    }
+
+    pub(super) fn from_legacy(explain: ExplainQuery) -> Self {
+        use novarocks_query_application::sql::session::ExplainDetail;
+        if explain.format == ExplainFormat::Analyze {
+            return Self::analyze(explain.query);
+        }
+        if explain.format == ExplainFormat::Default && !explain.logical {
+            return Self::plan(explain.query);
+        }
+        let (level, logical) = explain_mode(&explain, ExplainDetail::Normal);
+        Self {
+            query: explain.query,
+            mode: ExplainInputMode::Fixed(level, logical),
+        }
+    }
+
+    pub(super) fn is_analyze(&self) -> bool {
+        matches!(self.mode, ExplainInputMode::Analyze)
+    }
+
+    fn display(
+        &self,
+        detail: novarocks_query_application::sql::session::ExplainDetail,
+    ) -> (ExplainLevel, bool) {
+        match self.mode {
+            ExplainInputMode::SessionDetail => explain_detail_mode(detail),
+            ExplainInputMode::Fixed(level, logical) => (level, logical),
+            ExplainInputMode::Analyze => (ExplainLevel::Analyze, false),
+        }
     }
 }
 

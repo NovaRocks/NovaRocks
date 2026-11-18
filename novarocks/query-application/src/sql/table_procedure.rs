@@ -17,6 +17,11 @@
 
 //! Table EXECUTE procedure declarations, name resolution and argument custody.
 
+mod retention;
+
+pub use retention::ProcedureRetentionDuration;
+
+use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_parser::{
     Span,
@@ -25,13 +30,15 @@ use novarocks_parser::{
 use novarocks_spi::connector::{
     ConnectorColumnPath, ConnectorProviderId, DdlPropertyType, DdlPropertyValue,
 };
-use novarocks_type_contract::{CompilePhase, PureCompileControl};
+use novarocks_sql::compiler::RequiredConstantTarget;
+use novarocks_type_contract::{CompilePhase, PureCompileControl, ValueKind, ValueLogicalType};
 use novarocks_user_error::{
     ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
 };
 
 use super::property_evaluation::{
-    DdlPropertyConstantPort, copy_string, copy_value, evaluate_required_property_value,
+    DdlPropertyConstantPort, constant_failure, copy_string, copy_value, evaluate_required_constant,
+    evaluate_required_property_value,
 };
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 
@@ -359,19 +366,20 @@ pub enum ProcedureInput<'a> {
     ExplicitDefault,
 }
 
-/// The genuine required-constant evaluator owns evaluation of any
-/// non-literal absolute-time expression. Its output must be one already
-/// evaluated VARCHAR or BIGINT, or NULL for the binder's own rejection.
+/// The original maintenance timestamp parser owns the compatibility spelling
+/// of a direct TIMESTAMP literal. Other expressions use required constants.
 pub trait TableProcedureAbsoluteTimePort {
-    fn evaluate_absolute_time(
+    fn legacy_timestamp_literal_millis(
         &mut self,
-        expression: &Expr,
-    ) -> Result<DdlPropertyValue, QueryServiceError>;
+        text: &str,
+        span: Span,
+    ) -> Result<i64, QueryServiceError>;
 }
 
 #[derive(Debug, PartialEq)]
 pub enum BoundProcedureValue<'a> {
     Value(DdlPropertyValue),
+    RetentionDuration(ProcedureRetentionDuration),
     LegacyEpochMillis(i64),
     LegacyRetainLast(u32),
     LegacyColumnPath(ConnectorColumnPath),
@@ -699,20 +707,28 @@ fn bind_value<'a>(
         _ => {}
     }
     let location = Some((source, span));
-    let mut evaluate = |expression, ty| {
+    let evaluate = |expression, ty, constants: &mut dyn DdlPropertyConstantPort| {
         evaluate_required_property_value(expression, ty, constants, control, |message, cause| {
             error(INVALID_ARGUMENT, location, message, cause)
         })
     };
     let value = match (slot.value_type, input) {
-        (Value(ty), ProcedureInput::Expression(expression)) => evaluate(expression, ty)?,
+        (Value(ty), ProcedureInput::Expression(expression)) => evaluate(expression, ty, constants)?,
         (ProcedureArgumentType::AbsoluteTime, ProcedureInput::Expression(expression)) => {
             let literal = match expression {
                 Expr::Literal(literal) => match &literal.kind {
                     LiteralKind::String(_) => Some(Type::Varchar),
                     LiteralKind::Long { .. } => Some(Type::Bigint),
+                    LiteralKind::Generic(literal)
+                        if literal.type_name.eq_ignore_ascii_case("timestamp") =>
+                    {
+                        return absolute_time
+                            .legacy_timestamp_literal_millis(&literal.value, expression.span())
+                            .map(DdlPropertyValue::Bigint)
+                            .map(BoundProcedureValue::Value);
+                    }
                     LiteralKind::Null => {
-                        return Err(invalid(
+                        return Err(invalid_procedure_argument(
                             source,
                             span,
                             "Table procedure argument 'older_than' cannot be NULL",
@@ -723,8 +739,8 @@ fn bind_value<'a>(
                 _ => None,
             };
             match literal {
-                Some(ty) => evaluate(expression, ty)?,
-                None => absolute_time.evaluate_absolute_time(expression)?,
+                Some(ty) => evaluate(expression, ty, constants)?,
+                None => evaluate_timestamp(expression, source, span, constants, control)?,
             }
         }
         (_, ProcedureInput::Authored(value)) => {
@@ -742,7 +758,72 @@ fn bind_value<'a>(
         }
     };
     validate_supplied_value(slot, &value, location)?;
+    if let DdlPropertyValue::Varchar(text) = &value
+        && slot.name == RETENTION.name
+    {
+        return ProcedureRetentionDuration::parse(source, span, text, control)
+            .map(BoundProcedureValue::RetentionDuration);
+    }
     Ok(BoundProcedureValue::Value(value))
+}
+
+fn evaluate_timestamp(
+    expression: &Expr,
+    source: &str,
+    span: Span,
+    constants: &mut dyn DdlPropertyConstantPort,
+    control: &dyn PureCompileControl,
+) -> Result<DdlPropertyValue, QueryServiceError> {
+    let constant = evaluate_required_constant(
+        expression,
+        RequiredConstantTarget::Timestamp,
+        constants,
+        control,
+        |message, cause| error(INVALID_ARGUMENT, Some((source, span)), message, cause),
+    )?;
+
+    let binding = constant.value_type();
+    let ValueKind::Scalar(ty) = binding.value_type().kind() else {
+        return Err(invariant(
+            "Required timestamp constant has a different complete target type",
+        ));
+    };
+    if binding.logical_type() != ValueLogicalType::Physical || binding.data_type() != ty {
+        return Err(invariant(
+            "Required timestamp constant has a different complete target type",
+        ));
+    }
+    let unit = match ty {
+        DataType::Timestamp(unit, _) => unit,
+        DataType::Null if binding.nullable() => return Ok(DdlPropertyValue::Null),
+        _ => {
+            return Err(invariant(
+                "Required timestamp constant has a different complete target type",
+            ));
+        }
+    };
+    let ticks = constant.try_timestamp().map_err(constant_failure)?;
+    checkpoint(control, 1)?;
+    let Some(ticks) = ticks else {
+        return Ok(DdlPropertyValue::Null);
+    };
+    // The physical timestamp payload already measures from the epoch. An
+    // authored zone describes that instant; an unzoned input uses the same
+    // UTC interpretation as the compatibility literal path.
+    let millis = match unit {
+        TimeUnit::Second => ticks.checked_mul(1_000),
+        TimeUnit::Millisecond => Some(ticks),
+        TimeUnit::Microsecond => Some(ticks.div_euclid(1_000)),
+        TimeUnit::Nanosecond => Some(ticks.div_euclid(1_000_000)),
+    }
+    .ok_or_else(|| {
+        invalid_procedure_argument(
+            source,
+            span,
+            "Table procedure timestamp is outside the epoch-millisecond range",
+        )
+    })?;
+    Ok(DdlPropertyValue::Bigint(millis))
 }
 
 fn validate_supplied_value(
@@ -807,7 +888,12 @@ fn checkpoint(control: &dyn PureCompileControl, units: u32) -> Result<(), QueryS
         .map_err(QueryServiceError::from_compile_control)
 }
 
-fn invalid(source: &str, span: Span, message: impl Into<String>) -> QueryServiceError {
+/// Reject an argument value at its actual SQL location after endpoint validation.
+pub fn invalid_procedure_argument(
+    source: &str,
+    span: Span,
+    message: impl Into<String>,
+) -> QueryServiceError {
     error(INVALID_ARGUMENT, Some((source, span)), message, None)
 }
 
@@ -856,11 +942,12 @@ mod tests {
         }
     }
     impl TableProcedureAbsoluteTimePort for UnreachedEvaluation {
-        fn evaluate_absolute_time(
+        fn legacy_timestamp_literal_millis(
             &mut self,
-            _: &Expr,
-        ) -> Result<DdlPropertyValue, QueryServiceError> {
-            panic!("no non-literal absolute-time evaluation in this subject")
+            _: &str,
+            _: Span,
+        ) -> Result<i64, QueryServiceError> {
+            panic!("argument shape must be refused before parsing a timestamp literal")
         }
     }
 

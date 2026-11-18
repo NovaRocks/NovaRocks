@@ -355,6 +355,10 @@ pub(crate) struct RequestScopedMaintenanceEngine {
     kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
     execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    metadata_target: Option<(
+        MaintenanceTarget,
+        novarocks_spi::connector::ConnectorControlPlanningPin,
+    )>,
 }
 
 impl RequestScopedMaintenanceEngine {
@@ -447,7 +451,17 @@ impl RequestScopedMaintenanceEngine {
             kernel,
             execution,
             connector_context,
+            metadata_target: None,
         }
+    }
+
+    fn with_metadata_target(
+        mut self,
+        target: MaintenanceTarget,
+        planning: novarocks_spi::connector::ConnectorControlPlanningPin,
+    ) -> Self {
+        self.metadata_target = Some((target, planning));
+        self
     }
 
     fn connector_context_for_attempt(
@@ -514,6 +528,19 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceTarget, crate::catalog_application::resolver::TargetResolutionError>
     {
+        if let Some((target, _)) = &self.metadata_target {
+            let retained_parts = [
+                target.catalog.as_str(),
+                target.namespace.as_str(),
+                target.table.as_str(),
+            ];
+            if !name_parts.iter().map(String::as_str).eq(retained_parts) {
+                return Err("metadata action changed its retained target"
+                    .to_string()
+                    .into());
+            }
+            return Ok(target.clone());
+        }
         self.resolve_target_with_provider(name_parts, context)
             .map(|(target, _provider)| target)
     }
@@ -523,6 +550,14 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         target: &MaintenanceTarget,
     ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
         use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
+        if let Some((original, planning)) = &self.metadata_target {
+            if original != target {
+                return Err(crate::mv::domain::readiness::application_error(
+                    "metadata guard changed its retained target".to_owned(),
+                ));
+            }
+            return self.reject_direct_rewrite_on_mv(target, planning).await;
+        }
         let instance_id = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
             crate::mv::domain::readiness::application_error(format!(
                 "parse Iceberg catalog identity for MV guard: {error}"

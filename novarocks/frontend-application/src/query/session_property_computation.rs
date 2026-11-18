@@ -165,7 +165,7 @@ impl SessionPropertyCpuInput {
 }
 pub(crate) struct QuerySessionPropertyCpuInput {
     pub(crate) source: Arc<str>,
-    pub(crate) statement: ast::Statement,
+    pub(super) statement: super::query_session_action::QueryFamily,
     pub(crate) original: SessionSqlState,
     pub(crate) registry: Arc<SessionPropertyRegistry>,
     pub(crate) catalogs: novarocks_query_application::sql::catalog::SessionCatalogService,
@@ -173,21 +173,13 @@ pub(crate) struct QuerySessionPropertyCpuInput {
 }
 
 pub(crate) struct PreparedQuerySession {
-    pub(crate) statement: ast::Statement,
+    pub(super) statement: super::query_session_action::QueryFamily,
     pub(crate) state: SessionSqlState,
 }
 
 impl QuerySessionPropertyCpuInput {
     pub(crate) fn run(self) -> Result<PreparedQuerySession, QueryServiceError> {
-        let query = match &self.statement {
-            ast::Statement::Query(query) => query,
-            ast::Statement::ExplainQuery(explain) => explain.query.as_ref(),
-            _ => {
-                return Err(super::internal_error(
-                    "scoped properties require the original query",
-                ));
-            }
-        };
+        let query = self.statement.query();
         let evaluator = SessionPropertyEvaluation {
             interpreter: &self.context.interpreter,
             control: &self.context.control,
@@ -233,7 +225,7 @@ pub(super) struct QuerySessionPreparation {
 
 pub(super) struct QuerySessionPreparationInput {
     pub(super) source: Arc<str>,
-    pub(super) statement: ast::Statement,
+    pub(super) statement: super::query_session_action::QueryFamily,
     pub(super) original: SessionSqlState,
     pub(super) compiler: super::compiler::FrontendQueryCompiler,
     pub(super) registry: Arc<SessionPropertyRegistry>,
@@ -626,7 +618,7 @@ mod tests {
         );
         let prepared = QuerySessionPropertyCpuInput {
             source: Arc::from(source),
-            statement: ast::Statement::Query(parsed.clone()),
+            statement: super::super::query_session_action::QueryFamily::Read(Box::new(parsed.clone())),
             original: live.clone(),
             registry,
             catalogs,
@@ -642,7 +634,7 @@ mod tests {
                 policy: crate::application::test_constant_policy(),
             },
         }.run().unwrap();
-        assert_eq!(prepared.statement, ast::Statement::Query(parsed));
+        assert_eq!(prepared.statement.query(), &parsed);
         assert_eq!(
             prepared.state.execution_settings().query_timeout_secs(),
             Some(3)

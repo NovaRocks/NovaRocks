@@ -56,6 +56,32 @@ impl StatisticsCommandExecutor {
     pub fn new(application: Arc<dyn StatisticsApplicationPort>) -> Self {
         Self { application }
     }
+    pub(crate) fn prepare_trino_analyze(
+        &self,
+        properties: crate::query::analyze_property_computation::AnalyzeProperties,
+        admission: &novarocks_query_application::admitted_query_context::RequestContext,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::api::CommandError,
+    > {
+        let name =
+            novarocks_query_application::sql::lower_object_name(&properties.syntax.table_name);
+        let target = statistics_application_target(
+            &name.parts,
+            admission.session().current_catalog(),
+            admission.session().current_database(),
+        )?;
+        self.application
+            .prepare_analyze(
+                target,
+                super::attempt_executor::AnalyzeColumns::Declared(Box::new(properties)),
+                admission.execution(),
+                context,
+            )
+            .map_err(crate::statistics::application::StatisticsApplicationError::into_command_error)
+    }
+
     pub(crate) fn prepare_statement_action(
         &self,
         command: &StatisticsSqlCommand,

@@ -19,12 +19,14 @@
 
 use super::*;
 use crate::query::property_cpu_context::PropertyCpuContext;
+use crate::query_execution::completion_facts::FrontendPlanningCpuSource;
 use crate::task_execution::blocking_io::tests::OriginalExecutorsFixture;
 use novarocks_sql::compiler::{SqlCancellationObservation, SqlFunctionCatalog};
 use novarocks_workload_control::{
     ResultCapacityConfig, ResultWindowAlias, ResultWindowClass, RootWork, WorkClass, WorkRequest,
     WorkloadConfig, WorkloadControl,
 };
+use std::future::Future;
 use std::sync::{
     Condvar, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
@@ -131,7 +133,7 @@ impl Fixture {
         );
         CatalogPropertyCpuInput {
             source: Arc::from(source),
-            statement,
+            statement: CatalogCreateInput::Legacy(statement),
             context: PropertyCpuContext {
                 current_database: frozen.current_database().to_owned(),
                 sql_semantics: frozen.sql_semantics().clone(),
@@ -146,14 +148,7 @@ impl Fixture {
         }
     }
     fn tail(&self) -> CatalogNativeTail {
-        CatalogNativeTail {
-            cpu: self.cpu.clone(),
-            preparation: None,
-            prepared: None,
-            inner: None,
-            inner_residual: None,
-            health: None,
-        }
+        CatalogNativeTail::new(self.cpu.clone())
     }
     async fn close(mut self, tail: CatalogNativeTail) {
         drop(tail);
@@ -283,10 +278,13 @@ async fn catalog_duplicate_and_type_refusals_wait_for_real_close_without_partial
         let release = ReleaseGate(gate.clone());
         let mut tail = fixture.tail();
         let input = fixture.input(source, SqlCompileControl::new(None, gate.clone()));
+        let CatalogCreateInput::Legacy(original) = &input.statement else {
+            panic!("legacy CREATE CATALOG fixture");
+        };
         let refused_span = if duplicate {
-            input.statement.properties[1].key.span
+            original.properties[1].key.span
         } else {
-            input.statement.properties[1].value.span
+            original.properties[1].value.span
         };
         let expected_location = refused_span.to_user_error_location(source);
         tail.start(input);

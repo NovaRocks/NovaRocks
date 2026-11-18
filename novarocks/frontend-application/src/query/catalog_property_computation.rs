@@ -18,27 +18,50 @@
 //! CREATE CATALOG property computation on the original supervised planning CPU.
 
 use super::property_cpu_context::PropertyCpuContext;
-use novarocks_parser::ast::legacy::CreateCatalog;
+use novarocks_parser::ast::{TrinoCreateCatalog, legacy::CreateCatalog};
 use novarocks_query_application::{
-    session_error::QueryServiceError, sql::property_evaluation::prepare_legacy_create_catalog,
+    session_error::QueryServiceError,
+    sql::property_evaluation::{prepare_legacy_create_catalog, prepare_trino_create_catalog},
 };
 use novarocks_sql::semantic::command::CatalogCreateCommand;
 use std::sync::Arc;
 
+pub(crate) enum CatalogCreateInput {
+    Legacy(CreateCatalog),
+    Trino(TrinoCreateCatalog),
+}
+
+impl CatalogCreateInput {
+    pub(super) fn name(&self) -> &str {
+        match self {
+            Self::Legacy(statement) => &statement.name.value,
+            Self::Trino(statement) => &statement.catalog_name.value,
+        }
+    }
+}
+
 pub(crate) struct CatalogPropertyCpuInput {
     pub(crate) source: Arc<str>,
-    pub(crate) statement: CreateCatalog,
+    pub(crate) statement: CatalogCreateInput,
     pub(crate) context: PropertyCpuContext,
 }
 impl CatalogPropertyCpuInput {
     pub(crate) fn run(self) -> Result<CatalogCreateCommand, QueryServiceError> {
         let mut port = self.context.constant_port();
-        prepare_legacy_create_catalog(
-            &self.source,
-            &self.statement,
-            &mut port,
-            &self.context.control,
-        )
+        match self.statement {
+            CatalogCreateInput::Legacy(statement) => prepare_legacy_create_catalog(
+                &self.source,
+                &statement,
+                &mut port,
+                &self.context.control,
+            ),
+            CatalogCreateInput::Trino(statement) => prepare_trino_create_catalog(
+                &self.source,
+                &statement,
+                &mut port,
+                &self.context.control,
+            ),
+        }
     }
 }
 
@@ -96,7 +119,7 @@ mod tests {
             let frozen = SessionSqlState::default();
             CatalogPropertyCpuInput {
                 source: Arc::from(source),
-                statement,
+                statement: CatalogCreateInput::Legacy(statement),
                 context: PropertyCpuContext {
                     current_database: frozen.current_database().to_owned(),
                     sql_semantics: frozen.sql_semantics().clone(),

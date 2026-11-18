@@ -86,8 +86,18 @@ pub fn command_from_typed_statement(
     })
 }
 
+pub(crate) struct ResolvedAddFiles {
+    pub(crate) target: crate::catalog_application::resolver::TargetBackend,
+    pub(crate) planning: novarocks_spi::connector::ConnectorControlPlanningPin,
+    pub(crate) location: String,
+}
+
 pub struct PlanAddFilesRequest {
     pub command: AddFilesCommand,
+    pub(crate) retained: Option<(
+        crate::catalog_application::resolver::TargetBackend,
+        novarocks_spi::connector::ConnectorControlPlanningPin,
+    )>,
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub mutation_operation_id: [u8; 16],
@@ -273,64 +283,112 @@ impl AddFilesEngine for DmlExecutionKernel {
         &self,
         request: PlanAddFilesRequest,
     ) -> Result<PreparedAddFiles, AddFilesPlanError> {
-        let target = crate::catalog_application::resolver::resolve_existing_table_target(
-            self,
-            &ObjectName {
-                parts: request.command.table_parts,
-            },
-            request.current_catalog.as_deref(),
-            &request.current_database,
-        )
-        .map_err(|error| match error {
-            crate::catalog_application::resolver::TargetResolutionError::Message(message) => {
-                plan_string_failure(message)
+        let (target, planning) = match request.retained {
+            Some((target, planning)) => (target, Some(planning)),
+            None => {
+                let target = crate::catalog_application::resolver::resolve_existing_table_target(
+                    self,
+                    &ObjectName {
+                        parts: request.command.table_parts,
+                    },
+                    request.current_catalog.as_deref(),
+                    &request.current_database,
+                )
+                .map_err(|error| match error {
+                    crate::catalog_application::resolver::TargetResolutionError::Message(
+                        message,
+                    ) => plan_string_failure(message),
+                    crate::catalog_application::resolver::TargetResolutionError::Unsupported(
+                        error,
+                    ) => plan_connector_failure(error),
+                })?;
+                (target, None)
             }
-            crate::catalog_application::resolver::TargetResolutionError::Unsupported(error) => {
-                plan_connector_failure(error)
-            }
-        })?;
+        };
         if target.provider_id.as_str() != "iceberg" {
             return Err(plan_string_failure(format!(
                 "ADD FILES only supports iceberg tables: {}.{}",
                 target.namespace, target.table
             )));
         }
-        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-            self.connector_control().as_ref(),
-            self.mv_storage_observation().as_ref(),
-            self.mv_readiness().as_ref(),
-            &target,
-            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
-        )
-        .map_err(plan_string_failure)?;
+        if planning.is_none() {
+            crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+                self.connector_control().as_ref(),
+                self.mv_storage_observation().as_ref(),
+                self.mv_readiness().as_ref(),
+                &target,
+                crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
+            )
+            .map_err(plan_string_failure)?;
+        }
         let connector_context = self
             .connector_request_context_for_execution(
                 request.query_options.as_ref(),
                 &request.execution,
             )
             .map_err(plan_string_failure)?;
-        let location = bind_original_add_files_location(
-            &target.provider_id,
-            &request.command.location,
-            &crate::query_execution::planning::sql_compile_control_from_connector_request(
-                &connector_context,
-            ),
-        )
-        .map_err(|error| AddFilesPlanError::ProcedureArgument(Box::new(error)))?;
+        let location = match &planning {
+            Some(planning) => {
+                let descriptor = planning.binding().descriptor();
+                if descriptor.instance_id.as_str() != target.catalog
+                    || descriptor.provider_id != target.provider_id
+                {
+                    return Err(plan_connector_failure(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "ADD FILES target differs from its retained binding",
+                    )));
+                }
+                crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context(
+                    self.mv_storage_observation().as_ref(),
+                    planning,
+                    self.mv_readiness().as_ref(),
+                    &target,
+                    crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
+                    connector_context.clone(),
+                ).map_err(plan_string_failure)?;
+                request.command.location.clone()
+            }
+            None => bind_original_add_files_location(
+                &target.provider_id,
+                &request.command.location,
+                &crate::query_execution::planning::sql_compile_control_from_connector_request(
+                    &connector_context,
+                ),
+            )
+            .map_err(|error| AddFilesPlanError::ProcedureArgument(Box::new(error)))?,
+        };
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| plan_connector_failure(error.into()))?;
-        let session = DataMutationSession::plan(
-            self.connector_control().as_ref(),
-            &instance_id,
-            ConnectorMutationOperationId::from_bytes(request.mutation_operation_id),
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: target.namespace.clone().into(),
-                table: target.table.clone().into(),
-            },
-            DataMutationIntent::register_existing_files(location),
-            connector_context,
-        )
+        let table = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: instance_id.clone(),
+            namespace: target.namespace.clone().into(),
+            table: target.table.clone().into(),
+        };
+        let operation = ConnectorMutationOperationId::from_bytes(request.mutation_operation_id);
+        let intent = DataMutationIntent::register_existing_files(location);
+        let session = match planning {
+            Some(planning) => {
+                let lease = self
+                    .connector_control()
+                    .acquire_exact_data_mutation(planning.control_runtime_id())
+                    .map_err(plan_connector_failure)?;
+                DataMutationSession::plan_on_session(
+                    lease,
+                    operation,
+                    table,
+                    intent,
+                    connector_context,
+                )
+            }
+            None => DataMutationSession::plan(
+                self.connector_control().as_ref(),
+                &instance_id,
+                operation,
+                table,
+                intent,
+                connector_context,
+            ),
+        }
         .map_err(project_plan_error)?;
         let descriptor = session.descriptor_ref();
         let plan = session.plan_ref();

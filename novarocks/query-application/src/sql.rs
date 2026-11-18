@@ -25,7 +25,7 @@ use novarocks_sql::semantic::command::{
     AlterIcebergTableSqlCommand, ColumnPositionSql, CommandLiteral, ExpireSnapshotsOptionSql,
     IcebergColumnSqlAction, IcebergPartitionSqlChange, IcebergPropertiesSqlAction,
     IcebergReferenceKindSql, IcebergReferenceSqlAction, IcebergSchemaSqlChange,
-    IcebergTableSqlAction, MaintenanceValueSql, ProcedureArgumentModeSql, ProcedureArgumentSql,
+    IcebergTableSqlAction, MaintenanceValueSql,
 };
 use novarocks_sql::semantic::{
     CatalogSqlCommand, IcebergPartitionFieldExpr, MaintenanceSqlCommand, ObjectName,
@@ -50,6 +50,9 @@ pub mod session;
 /// Typed session-admission errors and their stable user-error descriptors.
 pub mod session_admit;
 
+/// Typed Trino statement admission shared by syntax-specific callers.
+pub mod trino_admission;
+
 /// Temporary old-parser preparation; final commands contain evaluated facts.
 mod legacy_table;
 pub use legacy_table::{LegacyCreateTableColumnsPort, prepare_legacy_create_table};
@@ -57,9 +60,16 @@ pub use legacy_table::{LegacyCreateTableColumnsPort, prepare_legacy_create_table
 /// Typed user-data errors for DDL property scopes and stable descriptors.
 pub mod property_admit;
 
+mod maintenance_call;
 /// Declared DDL-property evaluation through the original required-constant port.
 pub mod property_evaluation;
 pub mod table_procedure;
+
+/// Typed table and statistics command lowering after Trino parsing.
+pub mod trino_table_command;
+pub use maintenance_call::{
+    PreparedMaintenanceArgument, PreparedMaintenanceCall, PreparedMaintenanceValue,
+};
 
 /// Typed DML statement-shape admission errors and their stable user-error descriptors.
 pub mod dml_admission;
@@ -79,7 +89,7 @@ pub trait SpecializedStatementRoute: Send + Sync {
     /// its normal product consumer.
     fn execute_maintenance_call(
         &self,
-        _statement: &novarocks_parser::ast::CallStatement,
+        _statement: Arc<PreparedMaintenanceCall>,
         _context: &RequestContext,
         _command_context: &CommandContext,
     ) -> OptionalCommandFuture {
@@ -153,6 +163,15 @@ impl ProductCommandRouter {
     {
         self.statistics
             .prepare_statement_action(command, request_context, command_context)
+    }
+
+    pub fn acquire_namespace_property_binding(
+        &self,
+        name: &novarocks_sql::semantic::ObjectName,
+        request_context: &RequestContext,
+    ) -> Result<crate::api::CatalogNamespacePropertyBinding, crate::api::CommandError> {
+        self.catalog
+            .acquire_namespace_property_binding(name, request_context)
     }
 
     pub fn acquire_table_read_binding(
@@ -702,29 +721,12 @@ fn lower_statistics_command(
 fn lower_maintenance_command(
     statement: &novarocks_parser::ast::MaintenanceStatement,
 ) -> Result<MaintenanceSqlCommand, String> {
-    use novarocks_parser::ast::{
-        ExpireSnapshotsOption, MaintenanceStatement, ProcedureArgumentMode,
-    };
+    use novarocks_parser::ast::{ExpireSnapshotsOption, MaintenanceStatement};
 
     Ok(match statement {
-        MaintenanceStatement::Call(statement) => MaintenanceSqlCommand::Call {
-            procedure: lower_object_name(&statement.procedure),
-            arguments: statement
-                .arguments
-                .iter()
-                .map(|argument| {
-                    Ok(ProcedureArgumentSql {
-                        name: argument.name.as_ref().map(|name| name.value.clone()),
-                        value: lower_maintenance_value(&argument.value)?,
-                    })
-                })
-                .collect::<Result<_, String>>()?,
-            argument_mode: match statement.argument_mode {
-                ProcedureArgumentMode::Empty => ProcedureArgumentModeSql::Empty,
-                ProcedureArgumentMode::Positional => ProcedureArgumentModeSql::Positional,
-                ProcedureArgumentMode::Named => ProcedureArgumentModeSql::Named,
-            },
-        },
+        MaintenanceStatement::Call(statement) => {
+            PreparedMaintenanceCall::from_legacy(statement).maintenance_command()?
+        }
         MaintenanceStatement::Optimize(statement) => MaintenanceSqlCommand::Optimize {
             table: lower_object_name(&statement.table),
         },

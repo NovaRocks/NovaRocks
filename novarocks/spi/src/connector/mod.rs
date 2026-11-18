@@ -334,7 +334,7 @@ pub use staged_create::{
     ConnectorStagedCreatePublicationReceiving, ConnectorStagedCreatePublicationRecorder,
     ConnectorStagedCreatePublicationSource, ConnectorStagedCreatePublishOutcome,
     ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
-    ConnectorStagedCreateReceiptPhase, ConnectorStagedCreateSession,
+    ConnectorStagedCreateReceiptPhase, ConnectorStagedCreateSession, ConnectorStagedCtasProperties,
     ConnectorStagedMvStorageProperties, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
     ConnectorStagedWriteProof, ConnectorUnanchoredCtasCleanup,

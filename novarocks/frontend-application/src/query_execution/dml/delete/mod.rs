@@ -26,21 +26,39 @@ use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
-/// One parser-owned DELETE variant admitted by the typed statement router.
+/// One DELETE variant admitted by the typed statement router.
 ///
 /// The source is retained separately in [`DeleteStatementInput`] and may only
-/// be sliced through the selected AST node's [`novarocks_parser::Span`].
+/// be sliced through the authored statement's [`novarocks_parser::Span`].
 #[derive(Clone, Copy, Debug)]
-pub enum DeleteStatement<'a> {
-    Predicate(&'a novarocks_parser::ast::Delete),
+pub(crate) enum DeleteStatement<'a> {
+    Predicate(&'a PreparedPredicateDelete),
     Equality,
 }
 
-/// The exact parser-owned statement retained by the supervised write action.
+/// The authored WHERE and target facts retained by the original DELETE action.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedPredicateDelete {
+    pub(crate) target: super::mutation::RowMutationTarget,
+    pub(crate) selection: Option<novarocks_parser::ast::Expr>,
+    pub(crate) span: novarocks_parser::Span,
+}
+
+impl PreparedPredicateDelete {
+    pub(crate) fn from_legacy(statement: novarocks_parser::ast::Delete) -> Self {
+        Self {
+            target: super::mutation::RowMutationTarget::from_legacy(&statement.target),
+            selection: statement.selection,
+            span: statement.span,
+        }
+    }
+}
+
+/// The admitted statement retained by the supervised write action.
 /// Source text is never reparsed to rediscover the statement or its target.
 #[derive(Clone, Debug)]
 pub(crate) enum OwnedDeleteStatement {
-    Predicate(novarocks_parser::ast::Delete),
+    Predicate(PreparedPredicateDelete),
     Equality(novarocks_parser::ast::AddEqualityDelete),
 }
 
@@ -315,12 +333,13 @@ mod tests {
     fn typed_variant_determines_delete_kind() {
         let statements =
             novarocks_parser::parse("DELETE FROM t WHERE id = 1").expect("parse DELETE");
-        let Statement::Dml(DmlStatement::Delete(delete)) = &statements[0] else {
+        let Statement::Dml(DmlStatement::Delete(delete)) = statements.into_iter().next().unwrap()
+        else {
             panic!("expected DELETE");
         };
 
         assert_eq!(
-            DeleteStatement::Predicate(delete).kind(),
+            DeleteStatement::Predicate(&PreparedPredicateDelete::from_legacy(delete)).kind(),
             DeleteStatementKind::Predicate
         );
     }

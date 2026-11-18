@@ -32,8 +32,7 @@ use novarocks_parser::{SYNTHETIC, ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_sql::planning::dml::{
     DmlChangeStreamCompileRequest, DmlChangeStreamKind, DmlChangeStreamRoute,
-    DmlPreExpandKeyedAssert, DmlWriteSinkMode, IcebergRefSuffix,
-    dml_change_stream_optimizer_settings, split_ref_suffix,
+    DmlPreExpandKeyedAssert, DmlWriteSinkMode, dml_change_stream_optimizer_settings,
 };
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 use novarocks_sql::semantic::ObjectName;
@@ -470,7 +469,7 @@ fn finish_change_stream_write(
 /// Admitted syntax is the sole mutation input.
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedUpdateStatement {
-    pub(crate) table: ObjectName,
+    pub(crate) table: super::mutation::RowMutationTarget,
     pub(crate) alias: Option<novarocks_parser::ast::Ident>,
     pub(crate) assignments: Vec<PreparedMutationAssignment>,
     pub(crate) source: Option<PreparedMutationSource>,
@@ -479,7 +478,7 @@ pub(crate) struct PreparedUpdateStatement {
 impl PreparedUpdateStatement {}
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedMergeStatement {
-    pub(crate) table: ObjectName,
+    pub(crate) table: super::mutation::RowMutationTarget,
     pub(crate) target_alias: Option<novarocks_parser::ast::Ident>,
     pub(crate) source: PreparedMutationSource,
     pub(crate) on: novarocks_parser::ast::Expr,
@@ -580,29 +579,10 @@ pub(super) fn resolve_update_target(
     (crate::catalog_application::resolver::TargetBackend, String),
     crate::catalog_application::resolver::TargetResolutionError,
 > {
-    // Detect branch/tag suffix in the target table name.
-    let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
-    let effective_name;
-    let table_name: &ObjectName = match ref_suffix {
-        Some(IcebergRefSuffix::Tag(ref tag_name)) => {
-            return Err((format!(
-                "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
-            ))
-            .into());
-        }
-        Some(IcebergRefSuffix::Branch(_)) => {
-            effective_name = ObjectName {
-                parts: stripped_parts,
-            };
-            &effective_name
-        }
-        None => &stmt.table,
-    };
-    let target_ref = match &ref_suffix {
-        Some(IcebergRefSuffix::Branch(b)) => b.clone(),
-        _ => "main".to_string(),
-    };
-
+    let (table_name, target_ref) = stmt
+        .table
+        .table_and_reference()
+        .map_err(crate::catalog_application::resolver::TargetResolutionError::from)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         state,
         table_name,
@@ -617,7 +597,7 @@ pub(super) fn resolve_update_target(
         .into());
     }
 
-    Ok((target, target_ref))
+    Ok((target, target_ref.to_owned()))
 }
 
 fn finish_update_mutation_preparation(
@@ -691,27 +671,10 @@ pub(super) fn resolve_merge_target(
     (crate::catalog_application::resolver::TargetBackend, String),
     crate::catalog_application::resolver::TargetResolutionError,
 > {
-    let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
-    let effective_name;
-    let table_name: &ObjectName = match ref_suffix {
-        Some(IcebergRefSuffix::Tag(ref tag_name)) => {
-            return Err((format!(
-                "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
-            ))
-            .into());
-        }
-        Some(IcebergRefSuffix::Branch(_)) => {
-            effective_name = ObjectName {
-                parts: stripped_parts,
-            };
-            &effective_name
-        }
-        None => &stmt.table,
-    };
-    let target_ref = match &ref_suffix {
-        Some(IcebergRefSuffix::Branch(branch)) => branch.clone(),
-        _ => "main".to_string(),
-    };
+    let (table_name, target_ref) = stmt
+        .table
+        .table_and_reference()
+        .map_err(crate::catalog_application::resolver::TargetResolutionError::from)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         state,
         table_name,
@@ -725,7 +688,7 @@ pub(super) fn resolve_merge_target(
         ))
         .into());
     }
-    Ok((target, target_ref))
+    Ok((target, target_ref.to_owned()))
 }
 
 fn finish_merge_mutation_preparation(

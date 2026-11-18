@@ -17,6 +17,8 @@
 
 //! The original governed CTAS statement and its distinct publication frontiers.
 
+pub(crate) mod trino;
+
 use super::statement_computation::{StatementComputation, StatementNativeTail};
 use super::*;
 use crate::dml::{
@@ -180,7 +182,7 @@ struct CtasSource {
     io: Arc<MetadataIoAdmission>,
     _credentials: Arc<InitialComputationCredentials>,
     context: ConnectorRequestContext,
-    sql: String,
+    sql: Arc<str>,
     preflight: PreparedCtasTargetPreflight,
     source_input: Option<Arc<GovernedCtasSourceInput>>,
     controls: Arc<GovernedCtasControlReceiving>,
@@ -254,13 +256,7 @@ pub(crate) fn prepare(
             error.message,
         ))
     })?;
-    let root = input
-        .context
-        .execution()
-        .result_capacity()
-        .ok_or_else(|| DmlError::executor("CTAS has no original Root result capacity"))?
-        .root_scope()
-        .clone();
+    let root = execution_root(&input.context)?;
     let current_catalog = input
         .context
         .session()
@@ -270,6 +266,53 @@ pub(crate) fn prepare(
     let CtasTargetPreflightOutcome::Ready(preflight) = kernel
         .preflight_governed_ctas_target(&command, current_catalog.as_deref(), &current_database)
         .map_err(|error| error.into_governed_dml_error(&input.sql))?;
+    prepare_from_preflight(
+        kernel,
+        command,
+        CtasExecutionInput {
+            sql: Arc::from(input.sql),
+            context: input.context,
+            query_options: input.query_options,
+            launcher: input.launcher,
+            #[cfg(novarocks_dev_controls)]
+            observation: input.observation,
+        },
+        preflight,
+        root,
+    )
+}
+
+pub(crate) struct CtasExecutionInput {
+    pub(crate) sql: Arc<str>,
+    pub(crate) context: RequestContext,
+    pub(crate) query_options: QueryOptions,
+    pub(crate) launcher: Arc<dyn LogicalExecutionLauncher>,
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+}
+
+fn execution_root(context: &RequestContext) -> Result<WorkScope, DmlError> {
+    Ok(context
+        .execution()
+        .result_capacity()
+        .ok_or_else(|| DmlError::executor("CTAS has no original Root result capacity"))?
+        .root_scope()
+        .clone())
+}
+
+fn prepare_from_preflight(
+    kernel: crate::query_execution::kernels::DmlExecutionKernel,
+    command: CtasCommand,
+    input: CtasExecutionInput,
+    preflight: PreparedCtasTargetPreflight,
+    root: WorkScope,
+) -> Result<Box<dyn GovernedStatementAction>, DmlError> {
+    let current_catalog = input
+        .context
+        .session()
+        .current_catalog()
+        .map(ToOwned::to_owned);
+    let current_database = input.context.session().current_database().to_string();
     let policy = if command.if_not_exists {
         CreatePolicy::NoOpIfExists
     } else {

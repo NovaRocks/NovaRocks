@@ -18,13 +18,9 @@
 use super::*;
 
 impl Writer {
-    #[recursive::recursive]
-    pub(super) fn function_specification(&mut self, value: &FunctionSpecification) -> PrintResult {
-        let parameter_start = self.parameter_events.len();
-        self.text("FUNCTION ");
-        self.name(&value.name);
+    pub(super) fn function_parameters(&mut self, parameters: &[FunctionParameter]) -> PrintResult {
         self.character('(');
-        for (index, parameter) in value.parameters.iter().enumerate() {
+        for (index, parameter) in parameters.iter().enumerate() {
             if index != 0 {
                 self.text(", ");
             }
@@ -44,7 +40,17 @@ impl Writer {
             }
             self.data_type(&parameter.data_type)?;
         }
-        self.text(") RETURNS ");
+        self.character(')');
+        Ok(())
+    }
+
+    #[recursive::recursive]
+    pub(super) fn function_specification(&mut self, value: &FunctionSpecification) -> PrintResult {
+        let parameter_start = self.parameter_events.len();
+        self.text("FUNCTION ");
+        self.name(&value.name);
+        self.function_parameters(&value.parameters)?;
+        self.text(" RETURNS ");
         self.data_type(&value.returns)?;
         for characteristic in &value.characteristics {
             self.character(' ');

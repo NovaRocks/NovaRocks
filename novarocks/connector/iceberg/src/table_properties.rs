@@ -32,8 +32,8 @@ pub use legacy::{
 
 mod create;
 pub(crate) use create::{
-    PreparedCreateTableProperties, prepare_create_table_properties, prepare_mv_staged_storage,
-    typed_format_version,
+    PreparedCreateTableProperties, prepare_create_table_properties, prepare_ctas_storage,
+    prepare_mv_staged_storage, typed_format_version,
 };
 
 mod projection;
@@ -91,6 +91,22 @@ pub const UNSUPPORTED_TABLE_PROPERTY_NAMES: &[&str] = &[
 pub fn table_property_declarations()
 -> Result<Vec<DdlPropertyDeclaration>, DdlPropertyDeclarationError> {
     table_property_declarations_for_version(default_create_format_version())
+}
+
+/// Ordinary staged creation uses the original CTAS v3 writer profile.
+pub(crate) fn ctas_property_declarations()
+-> Result<Vec<DdlPropertyDeclaration>, DdlPropertyDeclarationError> {
+    table_property_declarations_for_version(FormatVersion::V3)
+}
+
+pub(crate) fn check_table_property_name(canonical_name: &str) -> Result<(), ConnectorError> {
+    if is_recognized_unsupported_table_property(canonical_name) {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            format!("Iceberg table property '{canonical_name}' is not supported"),
+        ));
+    }
+    Ok(())
 }
 
 /// Document-managed materialized-view storage starts with v3 row lineage.

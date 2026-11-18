@@ -52,15 +52,23 @@ pub(super) fn reconcile_async<'a>(
         let request = &original.request;
         let evidence = &request.evidence;
         let target = validated_reconciliation_target(provider, evidence)?;
-        if evidence.operation_kind() != "create-table"
-            || !matches!(
+        let namespace = evidence.operation_kind() == "create-namespace"
+            && matches!(
+                &target,
+                IcebergMutationEvidenceTarget::Namespace {
+                    should_exist: true,
+                    ..
+                }
+            );
+        let table = evidence.operation_kind() == "create-table"
+            && matches!(
                 &target,
                 IcebergMutationEvidenceTarget::Table { .. }
                     | IcebergMutationEvidenceTarget::HadoopCreate { .. }
-            )
-        {
+            );
+        if !namespace && !table {
             return Err(unsupported(
-                "asynchronous reconciliation supports only ordinary CREATE TABLE evidence",
+                "asynchronous reconciliation requires ordinary CREATE TABLE or CREATE SCHEMA evidence",
             ));
         }
         let (journal, entry, descriptor) = match recover_reconciliation(evidence, &request.context)?
@@ -76,9 +84,14 @@ pub(super) fn reconcile_async<'a>(
             &descriptor.attribution,
             crate::commit::publication_descriptor::AttributionPlan::ObserveOnly
         ) {
-            // REST table presence/absence is not attribution for an ordinary
-            // CREATE. Preserve the original journal without another read.
+            // Namespace and ordinary REST table presence cannot attribute
+            // this publication. Keep the original journal verdict.
             return Ok(journal.catalog_entry_outcome(entry));
+        }
+        if namespace {
+            return Err(internal(
+                "namespace publication has unexpected exact metadata attribution",
+            ));
         }
         let observed = async {
             let Some(plan) =

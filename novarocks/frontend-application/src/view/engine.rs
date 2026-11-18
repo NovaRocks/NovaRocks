@@ -34,7 +34,9 @@ use novarocks_query_application::view::{
     ViewDefinitionAnalysisRequest, ViewEngine, ViewTarget,
 };
 #[cfg(test)]
-use novarocks_query_application::view::{ViewRequestContext, ViewService, ViewStatementResult};
+use novarocks_query_application::view::{
+    ViewCommand, ViewRequestContext, ViewService, ViewStatementResult,
+};
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
@@ -55,10 +57,10 @@ impl ViewService for EmptyViewService {
         novarocks_query_application::view::QueryViewService::new().catalog_snapshot()
     }
 
-    fn execute_statement(
+    fn execute_command(
         &self,
         _engine: &dyn ViewEngine,
-        _statement: &novarocks_parser::ast::ViewStatement,
+        _command: ViewCommand<'_>,
         _context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, novarocks_query_application::api::CommandError> {
         Err("view service is not injected".to_string().into())

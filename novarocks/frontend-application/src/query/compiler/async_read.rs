@@ -42,7 +42,7 @@ impl FrontendQueryCompiler {
 
     pub(crate) async fn prepare_read_async(
         &self,
-        statement: &Statement,
+        query: Query,
         purpose: FrontendQueryPurpose,
         root_session_admitted: bool,
         context: &RequestContext,
@@ -59,12 +59,6 @@ impl FrontendQueryCompiler {
         StatementNativeHealthFailure,
     > {
         let metadata: Result<ReadDistributedMetadata, FrontendQueryCompilerError> = async {
-            purpose.validate(statement)?;
-            let Statement::Query(original) = statement else {
-                return Err(FrontendQueryCompilerError::Engine(
-                    "read preparation requires a query".into(),
-                ));
-            };
             let planning = if root_session_admitted {
                 let request = crate::connector::connector_request_context_for_execution_on_runtime(
                     query_options.as_ref(),
@@ -84,10 +78,7 @@ impl FrontendQueryCompiler {
                 planning.request().clone().with_io_admission(io),
             )
             .map_err(|e| FrontendQueryCompilerError::Engine(e.to_string()))?;
-            Ok(ReadDistributedMetadata {
-                query: original.clone(),
-                planning,
-            })
+            Ok(ReadDistributedMetadata { query, planning })
         }
         .await;
         let (query, planning) = match metadata {

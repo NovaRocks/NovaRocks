@@ -285,36 +285,13 @@ impl FrontendQuerySession {
         .await
     }
 
-    /// Temporary typed statement call site for the P09 parser/admission
-    /// integration. The public legacy statement route continues to call SET.
-    #[allow(dead_code, reason = "P09 owns the public typed statement route.")]
-    pub(super) async fn execute_scoped_session_mutation(
+    pub(super) async fn execute_observed_scoped_session_mutation(
         &self,
         source: Arc<str>,
         mutation: ScopedSessionMutation,
+        deadline: Option<Instant>,
+        statement: GovernedQueryStatementOwner,
     ) -> Result<StatementResult, QueryServiceError> {
-        use novarocks_query_application::session::StatementOutputShape;
-        use novarocks_workload_control::{ResultWindowClass, WorkClass};
-
-        let (deadline, timeout_ms) = {
-            let state = self.state.lock().map_err(poisoned_state)?;
-            novarocks_query_application::session_outcome::governed_query_deadline(&state)?
-        };
-        let token = self.token()?;
-        *self.output_shape.lock().map_err(poisoned_state)? = Some(StatementOutputShape::Empty);
-        let statement = self
-            .service
-            .query_control
-            .begin_governed_statement_with_result(
-                token,
-                &self.service.workload_root_admission,
-                WorkClass::Management,
-                deadline.map(tokio::time::Instant::from_std),
-                timeout_ms,
-                Some(Arc::clone(&source)),
-                ResultWindowClass::Local,
-            )
-            .map_err(|error| self.governed_statement_begin_error(error))?;
         let catalogs: Arc<
             dyn novarocks_query_application::sql::session::registry::SessionCatalogPropertyPort,
         > = self.service.session_catalog_resolver.clone();

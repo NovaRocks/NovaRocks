@@ -53,13 +53,7 @@ pub fn convert_insert_command(insert: &Insert) -> Result<InsertCommand, String> 
     } else {
         InsertOverwriteMode::Append
     };
-    if target_parts.is_empty() {
-        return Err("INSERT target is empty after overwrite normalization".to_string());
-    }
-
-    if legacy_literal_query(&insert.source) {
-        validate_literal_set_operations(&insert.source.body)?;
-    }
+    validate_insert_source(&target_parts, &insert.source)?;
     let source = Box::new(insert.source.clone());
 
     Ok(InsertCommand {
@@ -74,6 +68,19 @@ pub fn convert_insert_command(insert: &Insert) -> Result<InsertCommand, String> 
         source,
         overwrite_mode,
     })
+}
+
+pub(super) fn validate_insert_source(
+    target_parts: &[String],
+    source: &ast::Query,
+) -> Result<(), String> {
+    if target_parts.is_empty() {
+        return Err("INSERT target is empty after overwrite normalization".to_string());
+    }
+    if legacy_literal_query(source) {
+        validate_literal_set_operations(&source.body)?;
+    }
+    Ok(())
 }
 
 /// Classify literal projections by syntax, without evaluating values or CASTs.

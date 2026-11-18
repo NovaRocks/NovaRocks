@@ -19,8 +19,8 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use novarocks_parser::ast::MaterializedViewStatement;
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationSession, ConnectorControlPlanningPin, ConnectorRequestContext,
-    ConnectorTableIdentity,
+    ConnectorCatalogMutationSession, ConnectorControlPlanningPin, ConnectorNamespaceIdentity,
+    ConnectorRequestContext, ConnectorTableIdentity,
 };
 use novarocks_sql::semantic::{CatalogSqlCommand, MaintenanceSqlCommand, StatisticsSqlCommand};
 use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkError, WorkScope};
@@ -481,7 +481,61 @@ impl CatalogTablePropertyBinding {
     }
 }
 
+/// A namespace and the mutation lease derived once from its actual retained
+/// planning generation. Passing this value grants no I/O/publication.
+pub struct CatalogNamespacePropertyBinding {
+    namespace: ConnectorNamespaceIdentity,
+    planning: ConnectorControlPlanningPin,
+    mutation: ConnectorCatalogMutationSession,
+}
+
+impl CatalogNamespacePropertyBinding {
+    pub fn try_new(
+        namespace: ConnectorNamespaceIdentity,
+        planning: ConnectorControlPlanningPin,
+    ) -> Result<Self, CommandError> {
+        use novarocks_failure_contract::SharedFailureCause;
+        if namespace.instance_id != planning.binding().descriptor().instance_id {
+            return Err(CommandError::from_failure_cause(SharedFailureCause::new(
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "Schema property target does not match its original planning instance",
+                ),
+            )));
+        }
+        let mutation = planning
+            .derive_mutation_lease()
+            .map_err(|cause| CommandError::from_failure_cause(SharedFailureCause::new(cause)))?;
+        Ok(Self {
+            namespace,
+            planning,
+            mutation,
+        })
+    }
+
+    pub fn namespace(&self) -> &ConnectorNamespaceIdentity {
+        &self.namespace
+    }
+    pub fn planning(&self) -> &ConnectorControlPlanningPin {
+        &self.planning
+    }
+    pub fn mutation(&self) -> &ConnectorCatalogMutationSession {
+        &self.mutation
+    }
+}
+
 pub trait CatalogCommandConsumer: Send + Sync + 'static {
+    fn acquire_namespace_property_binding(
+        &self,
+        _name: &novarocks_sql::semantic::ObjectName,
+        _request_context: &RequestContext,
+    ) -> Result<CatalogNamespacePropertyBinding, CommandError> {
+        Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "catalog consumer does not provide namespace property bindings",
+        ))
+    }
+
     /// Acquire one real read source without deriving a mutation capability.
     fn acquire_table_read_binding(
         &self,

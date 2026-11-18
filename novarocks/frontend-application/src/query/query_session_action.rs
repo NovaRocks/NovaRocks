@@ -29,11 +29,41 @@ use novarocks_query_application::session_control::{
 };
 use std::task::{Context, Poll};
 
-#[derive(Clone, Copy)]
-pub(super) enum ScopedQueryAssignments {
-    LegacyRootHints,
-    #[allow(dead_code, reason = "P09 supplies the declared WITH SESSION entrance")]
-    DeclaredProperties,
+pub(super) enum QueryFamily {
+    Read(Box<ast::Query>),
+    Explain(compiler::ExplainInput),
+}
+
+impl QueryFamily {
+    pub(super) fn query(&self) -> &ast::Query {
+        match self {
+            Self::Read(query) => query,
+            Self::Explain(input) => &input.query,
+        }
+    }
+
+    fn from_trino(
+        action: novarocks_query_application::sql::trino_admission::TrinoQueryAction,
+    ) -> Self {
+        use novarocks_query_application::sql::trino_admission::TrinoQueryAction;
+        match action {
+            TrinoQueryAction::Read(query) => Self::Read(Box::new(query)),
+            TrinoQueryAction::Explain(query) => {
+                Self::Explain(compiler::ExplainInput::plan(Box::new(query)))
+            }
+            TrinoQueryAction::ExplainAnalyze(query) => {
+                Self::Explain(compiler::ExplainInput::analyze(Box::new(query)))
+            }
+        }
+    }
+
+    fn window_class(&self) -> ResultWindowClass {
+        match self {
+            Self::Read(_) => ResultWindowClass::Client,
+            Self::Explain(input) if input.is_analyze() => ResultWindowClass::Internal,
+            Self::Explain(_) => ResultWindowClass::Local,
+        }
+    }
 }
 
 /// The retired parser folds several hint forms into SessionProperty nodes.
@@ -95,7 +125,10 @@ pub(super) struct QueryActionInputs {
 }
 
 enum QueryFamilyPreparation {
-    Legacy(Option<PreparedQuerySession>),
+    Ready {
+        input: Option<PreparedQuerySession>,
+        root_session_admitted: bool,
+    },
     Declared(QuerySessionPreparation),
 }
 
@@ -123,7 +156,7 @@ impl GovernedStatementAction for ScopedQueryAction {
 
     fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
         let preparation = match &self.preparation {
-            QueryFamilyPreparation::Legacy(_) => None,
+            QueryFamilyPreparation::Ready { .. } => None,
             QueryFamilyPreparation::Declared(preparation) => preparation.local_health_failure(),
         };
         preparation.or_else(|| {
@@ -152,11 +185,14 @@ impl GovernedStatementAction for ScopedQueryAction {
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
         if self.action.is_none() {
             let (prepared, root_session_admitted) = match &mut self.preparation {
-                QueryFamilyPreparation::Legacy(prepared) => (
-                    prepared
+                QueryFamilyPreparation::Ready {
+                    input,
+                    root_session_admitted,
+                } => (
+                    input
                         .take()
-                        .ok_or_else(|| internal_error("legacy query lost its original input"))?,
-                    false,
+                        .ok_or_else(|| internal_error("query lost its original input"))?,
+                    *root_session_admitted,
                 ),
                 QueryFamilyPreparation::Declared(preparation) => {
                     match preparation.poll(owner, cx) {
@@ -191,15 +227,15 @@ impl GovernedStatementAction for ScopedQueryAction {
                     internal_error("scoped query requires an explicit presentation")
                 })?;
             self.action = Some(match prepared.statement {
-                statement @ ParsedStatement::Query(_) => read_action::build_read_action(
+                QueryFamily::Read(query) => read_action::build_read_action(
                     &self.environment,
                     inputs,
                     Arc::clone(&self.source),
-                    statement,
+                    query,
                     prepared.state,
                     FrontendQueryPurpose::ClientRows,
                 )?,
-                ParsedStatement::ExplainQuery(explain) => explain_action::build_explain_action(
+                QueryFamily::Explain(explain) => explain_action::build_explain_action(
                     &self.environment,
                     inputs,
                     self.source.to_string(),
@@ -207,11 +243,6 @@ impl GovernedStatementAction for ScopedQueryAction {
                     prepared.state,
                     family,
                 )?,
-                _ => {
-                    return Poll::Ready(Err(internal_error(
-                        "scoped Action lost its original query",
-                    )));
-                }
             });
         }
         self.action
@@ -222,23 +253,17 @@ impl GovernedStatementAction for ScopedQueryAction {
 }
 
 impl FrontendQuerySession {
-    /// The parser entrance chooses which assignment semantics the original
-    /// read or EXPLAIN Action receives.
-    pub(super) async fn execute_scoped_query_family(
+    pub(super) async fn execute_legacy_scoped_query_family(
         &self,
         source: Arc<str>,
         parsed: ParsedStatement,
-        assignments: ScopedQueryAssignments,
     ) -> Result<StatementResult, QueryServiceError> {
-        let (query, class, plain_explain) = match &parsed {
-            ParsedStatement::Query(query) => (query, ResultWindowClass::Client, false),
-            ParsedStatement::ExplainQuery(explain)
-                if explain.format == ast::ExplainFormat::Analyze =>
-            {
-                (explain.query.as_ref(), ResultWindowClass::Internal, false)
-            }
+        let admitted =
+            novarocks_query_application::session::StatementAdmission::from_statement(&parsed);
+        let family = match parsed {
+            ParsedStatement::Query(query) => QueryFamily::Read(Box::new(query)),
             ParsedStatement::ExplainQuery(explain) => {
-                (explain.query.as_ref(), ResultWindowClass::Local, true)
+                QueryFamily::Explain(compiler::ExplainInput::from_legacy(explain))
             }
             _ => {
                 return Err(internal_error(
@@ -246,35 +271,55 @@ impl FrontendQuerySession {
                 ));
             }
         };
-        let admitted =
-            novarocks_query_application::session::StatementAdmission::from_statement(&parsed);
+        self.execute_query_family(source, family, admitted, true)
+            .await
+    }
+
+    pub(super) async fn execute_trino_query_family(
+        &self,
+        source: Arc<str>,
+        action: novarocks_query_application::sql::trino_admission::TrinoQueryAction,
+    ) -> Result<StatementResult, QueryServiceError> {
+        let family = QueryFamily::from_trino(action);
+        use novarocks_query_application::{
+            session::{StatementAdmission, StatementOutputShape},
+            statement_kind::StatementKind,
+        };
+        let kind = match &family {
+            QueryFamily::Read(_) => StatementKind::Query,
+            QueryFamily::Explain(_) => StatementKind::Explain,
+        };
+        let admitted = StatementAdmission {
+            kind,
+            shape: StatementOutputShape::ResultSet,
+        };
+        self.execute_query_family(source, family, admitted, false)
+            .await
+    }
+
+    async fn execute_query_family(
+        &self,
+        source: Arc<str>,
+        family: QueryFamily,
+        admitted: novarocks_query_application::session::StatementAdmission,
+        legacy: bool,
+    ) -> Result<StatementResult, QueryServiceError> {
         self.admission.publish(admitted);
         *self.output_shape.lock().map_err(poisoned_state)? = Some(admitted.shape);
-        if query.session_properties.is_empty() {
-            return match parsed {
-                ParsedStatement::Query(_) => {
-                    self.execute_governed_read(source.to_string(), parsed).await
-                }
-                _ => {
-                    self.execute_typed_statement(source.to_string(), parsed)
-                        .await
-                }
-            };
-        }
-
+        let class = family.window_class();
+        let plain_explain = class == ResultWindowClass::Local;
+        let needs_properties = !legacy && !family.query().session_properties.is_empty();
         #[cfg(novarocks_dev_controls)]
-        let is_read = matches!(&parsed, ParsedStatement::Query(_));
+        let is_read = class == ResultWindowClass::Client;
         let token = self.token()?;
-        let legacy = matches!(assignments, ScopedQueryAssignments::LegacyRootHints);
-        let (statement, declared_original) = if legacy {
-            // Use the original eager queue admission for legacy hints. This
-            // retains the serving-admission/cancellation error boundary and
-            // the different Read and EXPLAIN deadline diagnostics.
+        let (statement, declared_original) = if !needs_properties {
+            // A known session uses the original eager queue admission.
+            // Preserve Read and EXPLAIN's different deadline diagnostics.
             let (deadline, mut timeout_ms) = {
                 let state = self.state.lock().map_err(poisoned_state)?;
                 governed_query_deadline(&state)?
             };
-            if matches!(&parsed, ParsedStatement::ExplainQuery(_)) {
+            if class != ResultWindowClass::Client {
                 timeout_ms = deadline.map(|end| {
                     timeout_message_millis(end.saturating_duration_since(Instant::now()))
                 });
@@ -339,7 +384,7 @@ impl FrontendQuerySession {
             QueryFamilyPreparation::Declared(QuerySessionPreparation::new(
                 QuerySessionPreparationInput {
                     source: Arc::clone(&source),
-                    statement: parsed,
+                    statement: family,
                     original,
                     compiler: self.service.query_compiler.clone(),
                     registry: Arc::clone(&self.service.session_properties),
@@ -349,10 +394,13 @@ impl FrontendQuerySession {
                 Arc::clone(&planning_cpu),
             ))
         } else {
-            QueryFamilyPreparation::Legacy(Some(PreparedQuerySession {
-                statement: parsed,
-                state: self.state.lock().map_err(poisoned_state)?.clone(),
-            }))
+            QueryFamilyPreparation::Ready {
+                input: Some(PreparedQuerySession {
+                    statement: family,
+                    state: self.state.lock().map_err(poisoned_state)?.clone(),
+                }),
+                root_session_admitted: !legacy,
+            }
         };
         let action = ScopedQueryAction {
             preparation,
@@ -380,6 +428,38 @@ impl FrontendQuerySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_query_admission_moves_the_same_query_through_the_existing_window_classes() {
+        use novarocks_parser::ast::SyntaxEq;
+        use novarocks_query_application::sql::trino_admission::{
+            TrinoStatementAction, admit_trino_statement,
+        };
+        for (sql, query_sql, expected) in [
+            ("SELECT 1", "SELECT 1", ResultWindowClass::Client),
+            (
+                "EXPLAIN (TYPE LOGICAL) SELECT 1",
+                "SELECT 1",
+                ResultWindowClass::Local,
+            ),
+            (
+                "EXPLAIN ANALYZE VERBOSE WITH SESSION pipeline_dop = 2 SELECT 1",
+                "WITH SESSION pipeline_dop = 2 SELECT 1",
+                ResultWindowClass::Internal,
+            ),
+        ] {
+            let statement = novarocks_parser::trino_parser::parse_statement(sql).unwrap();
+            let TrinoStatementAction::Query(action) =
+                admit_trino_statement(sql, statement).unwrap()
+            else {
+                panic!("original query entry: {sql}");
+            };
+            let family = QueryFamily::from_trino(action);
+            assert_eq!(family.window_class(), expected);
+            let query = novarocks_parser::trino_parser::parse_query(query_sql).unwrap();
+            assert!(family.query().syntax_eq(&query));
+        }
+    }
 
     #[test]
     fn parsed_legacy_root_hints_select_only_existing_query_consumers() {

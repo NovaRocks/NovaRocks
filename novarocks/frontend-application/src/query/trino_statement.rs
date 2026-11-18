@@ -1,0 +1,1306 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Temporary typed statement entrance for Trino compatibility tests.
+
+use super::*;
+use novarocks_query_application::{
+    admitted_query_context::QueryResultCapacityBinding,
+    session::{QuerySessionStatement, StatementAdmission, StatementOutputShape},
+    session_control::GovernedQueryStatementOwner,
+    sql::trino_admission::{
+        TrinoQueryAction, TrinoStatementAction, TrinoStatementPreparation, admit_trino_statement,
+    },
+    statement_kind::StatementKind,
+};
+
+struct CommandPlan {
+    admission: StatementAdmission,
+    work_class: WorkClass,
+    window_class: ResultWindowClass,
+    publication_deadline: bool,
+    waits_for_topology: bool,
+}
+
+impl CommandPlan {
+    fn management(kind: StatementKind, shape: StatementOutputShape, publication: bool) -> Self {
+        Self {
+            admission: StatementAdmission { kind, shape },
+            work_class: WorkClass::Management,
+            window_class: ResultWindowClass::Local,
+            publication_deadline: publication,
+            waits_for_topology: false,
+        }
+    }
+
+    fn write(kind: StatementKind, waits_for_topology: bool) -> Self {
+        Self {
+            admission: StatementAdmission {
+                kind,
+                shape: StatementOutputShape::Rows,
+            },
+            work_class: WorkClass::Query,
+            window_class: ResultWindowClass::Internal,
+            publication_deadline: true,
+            waits_for_topology,
+        }
+    }
+}
+
+struct CommandContextInput {
+    request: RequestContext,
+    command: CommandContext,
+    statement_started_at: std::time::SystemTime,
+    options: QueryOptions,
+    cancellation: QueryCancellationView,
+    deadline: Option<Instant>,
+    timeout_duration: Option<Duration>,
+    #[cfg(novarocks_dev_controls)]
+    observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+}
+
+struct CommandEntry {
+    statement: GovernedQueryStatementOwner,
+    input: CommandContextInput,
+}
+
+enum CommandStart {
+    Ready(Box<CommandEntry>),
+    Error(StatementResult),
+}
+
+impl FrontendQuerySession {
+    pub(crate) async fn execute_trino_one_statement(
+        &self,
+        source: Arc<str>,
+    ) -> Result<QuerySessionStatement, QueryServiceError> {
+        let statement_started_at = std::time::SystemTime::now();
+        let statement = novarocks_parser::trino_parser::parse_statement(&source)
+            .map_err(|error| QueryServiceError::from_user_error(error.to_user_error(&source)))?;
+        match admit_trino_statement(&source, statement)? {
+            TrinoStatementAction::Query(action) => {
+                let kind = match &action {
+                    TrinoQueryAction::Read(_) => StatementKind::Query,
+                    TrinoQueryAction::Explain(_) | TrinoQueryAction::ExplainAnalyze(_) => {
+                        StatementKind::Explain
+                    }
+                };
+                let result = self.execute_trino_query_family(source, action).await?;
+                Ok(QuerySessionStatement::output_owned(result, kind))
+            }
+            TrinoStatementAction::Session(action) => {
+                self.execute_trino_session_action(source, action).await
+            }
+            TrinoStatementAction::Product(command) => {
+                let plan = product_plan(&command)?;
+                let kind = plan.admission.kind;
+                let result = match self
+                    .start_trino_command(&source, plan, statement_started_at)
+                    .await?
+                {
+                    CommandStart::Ready(entry) => {
+                        self.execute_trino_product(command, *entry).await?
+                    }
+                    CommandStart::Error(result) => result,
+                };
+                Ok(QuerySessionStatement::output_owned(result, kind))
+            }
+            TrinoStatementAction::Prepare(preparation) => {
+                let plan = preparation_plan(&preparation)?;
+                let kind = plan.admission.kind;
+                let result = match self
+                    .start_trino_command(&source, plan, statement_started_at)
+                    .await?
+                {
+                    CommandStart::Ready(entry) => {
+                        self.execute_trino_preparation(source, preparation, *entry)
+                            .await?
+                    }
+                    CommandStart::Error(result) => result,
+                };
+                Ok(QuerySessionStatement::output_owned(result, kind))
+            }
+        }
+    }
+
+    async fn start_trino_command(
+        &self,
+        source: &Arc<str>,
+        plan: CommandPlan,
+        statement_started_at: std::time::SystemTime,
+    ) -> Result<CommandStart, QueryServiceError> {
+        self.admission.publish(plan.admission);
+        *self.output_shape.lock().map_err(poisoned_state)? = Some(plan.admission.shape);
+        let (session_deadline, _) = {
+            let state = self.state.lock().map_err(poisoned_state)?;
+            governed_query_deadline(&state)?
+        };
+        let deadline = if plan.publication_deadline {
+            Some(
+                self.service
+                    .lake_publication_runtime_policy
+                    .admit_deadline(Instant::now(), session_deadline)
+                    .map_err(internal_error)?,
+            )
+        } else {
+            session_deadline
+        };
+        let timeout_duration =
+            deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let timeout_ms = timeout_duration.map(timeout_message_millis);
+        let token = self.token()?;
+        let statement = if plan.work_class == WorkClass::Query {
+            self.service
+                .query_control
+                .begin_queued_governed_query_statement_with_result(
+                    token,
+                    &self.service.workload_root_admission,
+                    deadline.map(tokio::time::Instant::from_std),
+                    timeout_ms,
+                    Some(source.clone()),
+                    plan.window_class,
+                )
+                .await
+        } else {
+            self.service
+                .query_control
+                .begin_governed_statement_with_result(
+                    token,
+                    &self.service.workload_root_admission,
+                    plan.work_class,
+                    deadline.map(tokio::time::Instant::from_std),
+                    timeout_ms,
+                    Some(source.clone()),
+                    plan.window_class,
+                )
+        }
+        .map_err(|error| self.governed_statement_begin_error(error))?;
+        #[cfg(novarocks_dev_controls)]
+        let observation = match self
+            .service
+            .statement_observation
+            .as_ref()
+            .map(|owner| owner.bind_statement(statement.token(), source))
+            .transpose()
+        {
+            Ok(handle) => handle.flatten(),
+            Err(error) => {
+                return Ok(CommandStart::Error(
+                    self.governed_typed_error(internal_error(error), statement),
+                ));
+            }
+        };
+        let cancellation = QueryCancellationView::governed(
+            statement.cancellation().clone(),
+            statement.timeout_ms(),
+        );
+        let topology = self
+            .service
+            .topology
+            .snapshot()
+            .map_err(|error| internal_error(error.to_string()));
+        let topology = match topology {
+            Ok(snapshot) if plan.waits_for_topology && snapshot.targets().is_empty() => {
+                wait_for_eligible_query_topology_after(
+                    &self.service.topology,
+                    &cancellation,
+                    snapshot.revision(),
+                    deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
+                )
+                .await
+            }
+            other => other,
+        };
+        let topology = match topology {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Ok(CommandStart::Error(
+                    self.governed_typed_error(error, statement),
+                ));
+            }
+        };
+        let state = self.state.lock().map_err(poisoned_state)?.clone();
+        let presentation = state.presentation().copied();
+        let (catalog, database, settings, mut optimizer, semantics, properties) =
+            state.into_query_attempt_inputs();
+        if optimizer.optimizer_query_mem_limit_bytes.is_none() {
+            optimizer.optimizer_query_mem_limit_bytes =
+                Some(self.service.optimizer_query_mem_limit_bytes as f64);
+        }
+        let options = with_query_hints(
+            query_options_from_session_settings(&settings),
+            &semantics,
+            None,
+        );
+        let entered = (|| {
+            let window = statement
+                .result_window_alias()
+                .ok_or_else(|| internal_error("typed statement has no admitted result capacity"))?;
+            let capacity = QueryResultCapacityBinding::try_new(statement.scope(), window.clone())
+                .map_err(|error| internal_error(error.to_string()))?;
+            let request = RequestContext::admit(
+                RequestAdmission::new(
+                    catalog,
+                    database,
+                    self.service.role,
+                    topology,
+                    deadline,
+                    cancellation.clone(),
+                    optimizer,
+                    semantics,
+                    presentation,
+                )
+                .with_session_property_inputs(properties),
+            )
+            .with_result_capacity(capacity)
+            .map_err(|error| internal_error(error.to_string()))?;
+            let connector = crate::connector::connector_request_context_for_execution_on_runtime(
+                Some(&options),
+                request.execution(),
+                self.service.query_compiler.connector_runtime(),
+            )
+            .map_err(|error| internal_error(error.to_string()))?;
+            #[cfg(novarocks_dev_controls)]
+            let request = match observation.as_ref().and_then(|handle| handle.nomination()) {
+                Some(nomination) => {
+                    let installed =
+                        connector.request_scope_extension_or_insert_with(|| nomination.clone());
+                    if installed.as_ref() != &nomination {
+                        return Err(internal_error(
+                            "typed statement nomination conflicts with its request scope",
+                        ));
+                    }
+                    request
+                        .with_test_statement_nomination(Arc::new(nomination))
+                        .map_err(internal_error)?
+                }
+                None => request,
+            };
+            let command = CommandContext::new(
+                statement.scope().clone(),
+                connector,
+                statement.token(),
+                self.principal.clone(),
+            )
+            .with_result_window(window)
+            .map_err(|error| internal_error(error.to_string()))?;
+            Ok(CommandContextInput {
+                request,
+                command,
+                statement_started_at,
+                options,
+                cancellation,
+                deadline,
+                timeout_duration,
+                #[cfg(novarocks_dev_controls)]
+                observation,
+            })
+        })();
+        match entered {
+            Ok(input) => Ok(CommandStart::Ready(Box::new(CommandEntry {
+                statement,
+                input,
+            }))),
+            Err(error) => Ok(CommandStart::Error(
+                self.governed_typed_error(error, statement),
+            )),
+        }
+    }
+}
+
+fn preparation_plan(
+    preparation: &TrinoStatementPreparation,
+) -> Result<CommandPlan, QueryServiceError> {
+    use StatementKind::*;
+    use StatementOutputShape::{Empty, ResultSet, UndeterminedCall};
+    use TrinoStatementPreparation as Prep;
+
+    let management = |kind| CommandPlan::management(kind, Empty, true);
+    let result = match preparation {
+        Prep::CreateCatalog(_) => management(CreateCatalog),
+        Prep::CreateSchema(_) => management(CreateDatabase),
+        Prep::DropSchemaCascade(_) => management(DropDatabase),
+        Prep::RenameSchema(_) => management(CreateDatabase),
+        Prep::CreateTable(_) => management(CreateTable),
+        Prep::CreateTableAsSelect(_) => CommandPlan::write(CreateTable, true),
+        Prep::RenameTable(_) => management(CreateTable),
+        Prep::AddColumn(_) => management(AddColumn),
+        Prep::RenameColumn(_) => management(RenameColumn),
+        Prep::DropColumn(_) => management(DropColumn),
+        Prep::SetColumnType(_) => management(AlterColumnType),
+        Prep::DropNotNullConstraint(_) => management(DropColumnNotNull),
+        Prep::SetTableProperties { .. } => management(SetTableProperties),
+        Prep::CommentTable(_) => management(CommentTable),
+        Prep::CommentColumn(_) => management(CommentColumn),
+        Prep::TableExecute(node) => match node.procedure_name.value.to_ascii_lowercase().as_str() {
+            "optimize" => CommandPlan {
+                admission: StatementAdmission {
+                    kind: Optimize,
+                    shape: ResultSet,
+                },
+                work_class: WorkClass::Query,
+                window_class: ResultWindowClass::Internal,
+                publication_deadline: true,
+                waits_for_topology: false,
+            },
+            "rewrite_manifests" => management(RewriteManifests),
+            "expire_snapshots" => management(ExpireSnapshots),
+            "remove_orphan_files" => management(RemoveOrphanFiles),
+            "add_files" => CommandPlan::management(AddFiles, ResultSet, true),
+            _ => CommandPlan::management(Call, UndeterminedCall, true),
+        },
+        Prep::Analyze(_) => CommandPlan::write(Analyze, false),
+        Prep::CreateBranch(_) => management(CreateBranch),
+        Prep::DropBranch(_) => management(DropBranch),
+        Prep::FastForwardBranch(_) | Prep::ShowBranches(_) => management(Call),
+        Prep::Insert(_) => CommandPlan::write(Insert, true),
+        Prep::Delete(_) => CommandPlan::write(Delete, true),
+        Prep::Update(_) => CommandPlan::write(Update, true),
+        Prep::Merge(_) => CommandPlan::write(Merge, true),
+        Prep::Call(node) => {
+            let mut plan = CommandPlan::management(Call, UndeterminedCall, true);
+            if matches!(node.name.parts.as_slice(), [_, namespace, procedure]
+                if namespace.value.eq_ignore_ascii_case("system")
+                    && (procedure.value.eq_ignore_ascii_case("rewrite_data_files")
+                        || procedure.value.eq_ignore_ascii_case("rewrite_position_delete_files")))
+            {
+                plan.work_class = WorkClass::Query;
+                plan.window_class = ResultWindowClass::Internal;
+            }
+            plan
+        }
+        Prep::CreateView(_) => management(CreateView),
+        Prep::DropView(_) => management(DropView),
+        Prep::ShowCreateView(_) => CommandPlan::management(ShowCreateView, ResultSet, false),
+        Prep::CreateMaterializedView(_) => management(CreateMaterializedView),
+        Prep::DropMaterializedView(_) => management(DropMaterializedView),
+        Prep::RefreshMaterializedView(_) => CommandPlan {
+            admission: StatementAdmission {
+                kind: RefreshMaterializedView,
+                shape: StatementOutputShape::Rows,
+            },
+            work_class: WorkClass::Management,
+            window_class: ResultWindowClass::Internal,
+            publication_deadline: true,
+            waits_for_topology: false,
+        },
+        Prep::ExplainRefreshMaterializedView(_) => {
+            CommandPlan::management(ExplainMaterializedViewRefresh, ResultSet, false)
+        }
+        Prep::SetMaterializedViewProperties { properties, .. } => {
+            let mut plan = management(AlterMaterializedViewProperties);
+            if properties
+                .iter()
+                .any(|property| property.name.value.eq_ignore_ascii_case("partitioning"))
+            {
+                plan.window_class = ResultWindowClass::Internal;
+            }
+            plan
+        }
+    };
+    Ok(result)
+}
+
+fn product_plan(command: &ProductSqlCommand) -> Result<CommandPlan, QueryServiceError> {
+    use StatementKind::*;
+    use StatementOutputShape::{Empty, ResultSet};
+    use novarocks_sql::semantic::{CatalogSqlCommand, StatisticsSqlCommand};
+    match command {
+        ProductSqlCommand::Catalog(command) => {
+            let plan = match command.as_ref() {
+                CatalogSqlCommand::DropCatalog { .. } => {
+                    CommandPlan::management(DropCatalog, Empty, true)
+                }
+                CatalogSqlCommand::DropDatabase { .. } => {
+                    CommandPlan::management(DropDatabase, Empty, true)
+                }
+                CatalogSqlCommand::DropTable { .. } => {
+                    CommandPlan::management(DropTable, Empty, true)
+                }
+                CatalogSqlCommand::TruncateTable { .. } => {
+                    CommandPlan::management(TruncateTable, Empty, true)
+                }
+                CatalogSqlCommand::ShowCreateTable { .. } => {
+                    CommandPlan::management(ShowCreateTable, ResultSet, false)
+                }
+                _ => {
+                    return Err(internal_error(
+                        "Product admission returned an unclassified catalog command",
+                    ));
+                }
+            };
+            Ok(plan)
+        }
+        ProductSqlCommand::Statistics(StatisticsSqlCommand::ShowStats { .. }) => {
+            Ok(CommandPlan::management(ShowStats, ResultSet, false))
+        }
+        _ => Err(internal_error(
+            "Product admission returned an unclassified command",
+        )),
+    }
+}
+
+impl FrontendQuerySession {
+    async fn execute_trino_product(
+        &self,
+        command: ProductSqlCommand,
+        entry: CommandEntry,
+    ) -> Result<StatementResult, QueryServiceError> {
+        use novarocks_sql::semantic::CatalogSqlCommand;
+        let CommandEntry {
+            mut statement,
+            input,
+        } = entry;
+        let router = self.service.product_command_router.clone();
+        let command = match command {
+            ProductSqlCommand::Catalog(command) => match *command {
+                command @ (CatalogSqlCommand::CreateCatalog(_)
+                | CatalogSqlCommand::DropCatalog { .. }) => {
+                    let action = router
+                        .prepare_catalog_statement_action(command, input.request, input.command)
+                        .map_err(product_command_service_error);
+                    return self.run_trino_action(statement, action).await;
+                }
+                CatalogSqlCommand::TruncateTable { table, target_ref } => {
+                    let execution_owner = statement
+                        .take_execution_owner()
+                        .expect("SQL command has one execution owner");
+                    let dml = Arc::clone(&self.service.dml);
+                    let engine = Arc::clone(&self.service.truncate_engine);
+                    let prepare_dml = Arc::clone(&dml);
+                    let prepare_engine = Arc::clone(&engine);
+                    let mut worker = Box::pin(execute_prepared_dml_statement(
+                        self.service.query_blocking_executor.clone(),
+                        input.cancellation.clone(),
+                        execution_owner,
+                        input.command.result_window_alias(),
+                        move || {
+                            prepare_dml
+                                .prepare_truncate(
+                                    prepare_engine.as_ref(),
+                                    crate::query_execution::dml::truncate::TruncateCommand {
+                                        target_parts: table.parts,
+                                        target_ref,
+                                    },
+                                    &input.request,
+                                    Some(&input.options),
+                                )
+                                .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                        },
+                        move |prepared| {
+                            dml.execute_prepared_truncate(engine.as_ref(), prepared)
+                                .map(|()| StatementResult::Ok)
+                                .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                        },
+                    )) as TypedCommandWorker;
+                    return self
+                        .finish_command_worker(
+                            statement,
+                            input.cancellation,
+                            input.timeout_duration,
+                            &mut worker,
+                        )
+                        .await;
+                }
+                command => ProductSqlCommand::Catalog(Box::new(command)),
+            },
+            ProductSqlCommand::Statistics(command) => {
+                let action = router
+                    .prepare_statistics_statement_action(command, input.request, input.command)
+                    .map_err(product_command_service_error);
+                return self.run_trino_action(statement, action).await;
+            }
+            ProductSqlCommand::Maintenance(command)
+                if crate::query_execution::maintenance::command::is_async_metadata_command(
+                    &command,
+                    input.request.session().current_catalog(),
+                    input.request.session().current_database(),
+                )
+                .unwrap_or(false) =>
+            {
+                let action = router
+                    .prepare_maintenance_statement_action(command, input.request, input.command)
+                    .map_err(product_command_service_error);
+                return self.run_trino_action(statement, action).await;
+            }
+            command => command,
+        };
+        let execution_owner = statement
+            .take_execution_owner()
+            .expect("SQL command has one execution owner");
+        let mut worker = Box::pin(execute_product_statement(
+            router,
+            command,
+            input.request,
+            input.command,
+            execution_owner,
+        )) as TypedCommandWorker;
+        self.finish_command_worker(
+            statement,
+            input.cancellation,
+            input.timeout_duration,
+            &mut worker,
+        )
+        .await
+    }
+
+    async fn run_trino_action(
+        &self,
+        statement: GovernedQueryStatementOwner,
+        action: Result<Box<dyn GovernedStatementAction>, QueryServiceError>,
+    ) -> Result<StatementResult, QueryServiceError> {
+        match action {
+            Ok(action) => {
+                self.execute_observed_statement_action(statement, action)
+                    .await
+            }
+            Err(error) => Ok(self.governed_typed_error(error, statement)),
+        }
+    }
+}
+
+type TypedCommandWorker = Pin<
+    Box<
+        dyn Future<
+                Output = Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>,
+            > + Send,
+    >,
+>;
+
+impl FrontendQuerySession {
+    async fn execute_trino_preparation(
+        &self,
+        source: Arc<str>,
+        preparation: TrinoStatementPreparation,
+        entry: CommandEntry,
+    ) -> Result<StatementResult, QueryServiceError> {
+        use super::{
+            mv_property_action::TrinoMvProperties, table_create_action::TablePropertyInput,
+        };
+        use TrinoStatementPreparation as Prep;
+        use novarocks_query_application::sql::{
+            lower_object_name, trino_admission::unsupported_statement, trino_table_command as table,
+        };
+        use novarocks_sql::semantic::CatalogSqlCommand;
+
+        let CommandEntry { statement, input } = entry;
+        let catalog = |value| ProductSqlCommand::Catalog(Box::new(value));
+        let explain_refresh = matches!(&preparation, Prep::ExplainRefreshMaterializedView(_));
+        let command = match preparation {
+            Prep::CreateCatalog(node) => {
+                return self
+                    .execute_observed_trino_catalog_create(
+                        source,
+                        node,
+                        input.request,
+                        input.command,
+                        input.deadline,
+                        statement,
+                    )
+                    .await;
+            }
+            Prep::CreateSchema(node) => {
+                let action = super::schema_create_action::prepare(
+                    &self.service.query_compiler,
+                    self.service.required_constant_interpreter.clone(),
+                    &self.service.product_command_router,
+                    super::schema_create_action::SchemaCreateInput {
+                        statement: node,
+                        source,
+                        context: input.request,
+                        command: input.command,
+                        deadline: input.deadline,
+                        cancellation: input.cancellation,
+                    },
+                );
+                return self.run_trino_action(statement, action).await;
+            }
+            Prep::DropSchemaCascade(node) => Ok(catalog(CatalogSqlCommand::DropDatabase {
+                name: lower_object_name(&node.schema_name),
+                if_exists: node.exists,
+                force: true,
+            })),
+            Prep::RenameSchema(node) => Err(unsupported_statement(
+                &source,
+                node.span,
+                "ALTER SCHEMA RENAME",
+            )),
+            Prep::CreateTable(node) => {
+                return self
+                    .execute_observed_table_properties(
+                        source,
+                        TablePropertyInput::TrinoCreate(node),
+                        input.request,
+                        input.command,
+                        input.deadline,
+                        statement,
+                    )
+                    .await;
+            }
+            Prep::SetTableProperties {
+                name, properties, ..
+            } => {
+                return self
+                    .execute_observed_table_properties(
+                        source,
+                        TablePropertyInput::TrinoSet { name, properties },
+                        input.request,
+                        input.command,
+                        input.deadline,
+                        statement,
+                    )
+                    .await;
+            }
+            Prep::CreateTableAsSelect(node) => {
+                let action = self.service.ctas_engine.prepare_trino_statement_action(
+                    crate::query_execution::dml::ctas::TrinoCtasInput {
+                        statement: node,
+                        execution: super::ctas_action::CtasExecutionInput {
+                            sql: source,
+                            context: input.request,
+                            query_options: input.options,
+                            launcher: self.statement_logical_execution_launcher(),
+                            #[cfg(novarocks_dev_controls)]
+                            observation: input.observation,
+                        },
+                        command: input.command,
+                        deadline: input.deadline,
+                        cancellation: input.cancellation,
+                        compiler: self.service.query_compiler.clone(),
+                        interpreter: self.service.required_constant_interpreter.clone(),
+                    },
+                );
+                return self.run_trino_action(statement, action).await;
+            }
+            Prep::RenameTable(node) => table::lower_trino_rename_table(&source, &node).map(catalog),
+            Prep::AddColumn(node) => table::lower_trino_add_column(&source, &node).map(catalog),
+            Prep::RenameColumn(node) => {
+                table::lower_trino_rename_column(&source, &node).map(catalog)
+            }
+            Prep::DropColumn(node) => table::lower_trino_drop_column(&source, &node).map(catalog),
+            Prep::SetColumnType(node) => {
+                table::lower_trino_set_column_type(&source, &node).map(catalog)
+            }
+            Prep::DropNotNullConstraint(node) => {
+                table::lower_trino_drop_not_null(&source, &node).map(catalog)
+            }
+            Prep::CommentTable(node) | Prep::CommentColumn(node) => {
+                table::lower_trino_table_comment(&source, &node).map(catalog)
+            }
+            Prep::TableExecute(node) => {
+                return self
+                    .execute_trino_table_procedure(source, node, CommandEntry { statement, input })
+                    .await;
+            }
+            Prep::Analyze(node) => {
+                return self
+                    .execute_trino_analyze(source, node, CommandEntry { statement, input })
+                    .await;
+            }
+            Prep::CreateBranch(node) => {
+                return self
+                    .execute_trino_create_branch(source, node, CommandEntry { statement, input })
+                    .await;
+            }
+            Prep::DropBranch(node) => {
+                let mut command = table::lower_trino_drop_branch(&node);
+                let CatalogSqlCommand::AlterIcebergTable(reference) = &mut command else {
+                    unreachable!("DROP BRANCH produces its existing reference action");
+                };
+                match novarocks_types::naming::resolve_catalog_table_name(
+                    &reference.table.parts,
+                    input.request.session().current_catalog(),
+                    input.request.session().current_database(),
+                ) {
+                    Ok(target) => {
+                        reference.table.parts =
+                            vec![target.catalog, target.namespace, target.table];
+                        Ok(catalog(command))
+                    }
+                    Err(error) => Err(internal_error(error)),
+                }
+            }
+            Prep::FastForwardBranch(node) => {
+                table::lower_trino_fast_forward_branch(&source, &node).map(catalog)
+            }
+            Prep::ShowBranches(node) => {
+                table::lower_trino_show_branches(&source, &node).map(catalog)
+            }
+            Prep::Insert(node) => {
+                return self
+                    .execute_trino_write(
+                        source,
+                        TrinoWrite::Insert(node),
+                        CommandEntry { statement, input },
+                    )
+                    .await;
+            }
+            Prep::Delete(node) => {
+                return self
+                    .execute_trino_write(
+                        source,
+                        TrinoWrite::Delete(node),
+                        CommandEntry { statement, input },
+                    )
+                    .await;
+            }
+            Prep::Update(node) => {
+                return self
+                    .execute_trino_write(
+                        source,
+                        TrinoWrite::Update(node),
+                        CommandEntry { statement, input },
+                    )
+                    .await;
+            }
+            Prep::Merge(node) => {
+                return self
+                    .execute_trino_write(
+                        source,
+                        TrinoWrite::Merge(node),
+                        CommandEntry { statement, input },
+                    )
+                    .await;
+            }
+            Prep::Call(node) => {
+                return self
+                    .execute_trino_call(node, CommandEntry { statement, input })
+                    .await;
+            }
+            Prep::CreateView(node) => {
+                return self
+                    .execute_trino_view(
+                        source,
+                        TrinoViewInput::Create(node),
+                        CommandEntry { statement, input },
+                    )
+                    .await;
+            }
+            Prep::DropView(node) => {
+                return self
+                    .execute_trino_view(
+                        source,
+                        TrinoViewInput::Drop(node),
+                        CommandEntry { statement, input },
+                    )
+                    .await;
+            }
+            Prep::ShowCreateView(node) => {
+                return self
+                    .execute_trino_view(
+                        source,
+                        TrinoViewInput::ShowCreate(node),
+                        CommandEntry { statement, input },
+                    )
+                    .await;
+            }
+            Prep::CreateMaterializedView(node) => {
+                return self
+                    .execute_observed_trino_mv_properties(
+                        source,
+                        TrinoMvProperties::Create(node),
+                        input.request,
+                        input.command,
+                        input.deadline,
+                        statement,
+                    )
+                    .await;
+            }
+            Prep::SetMaterializedViewProperties {
+                name,
+                properties,
+                span,
+            } => {
+                return self
+                    .execute_observed_trino_mv_properties(
+                        source,
+                        TrinoMvProperties::Alter {
+                            name,
+                            properties,
+                            span,
+                        },
+                        input.request,
+                        input.command,
+                        input.deadline,
+                        statement,
+                    )
+                    .await;
+            }
+            Prep::DropMaterializedView(node) => {
+                let action = self
+                    .service
+                    .command_executor
+                    .mv_call
+                    .prepare_trino_drop(node, &input.request, &input.command)
+                    .map_err(product_command_service_error);
+                return self.run_trino_action(statement, action).await;
+            }
+            Prep::RefreshMaterializedView(node) | Prep::ExplainRefreshMaterializedView(node) => {
+                let action = self
+                    .service
+                    .command_executor
+                    .mv_call
+                    .prepare_trino_refresh(node, explain_refresh, &input.request, &input.command)
+                    .map_err(product_command_service_error);
+                return self.run_trino_action(statement, action).await;
+            }
+        };
+        match command {
+            Ok(command) => {
+                self.execute_trino_product(command, CommandEntry { statement, input })
+                    .await
+            }
+            Err(error) => Ok(self.governed_typed_error(error, statement)),
+        }
+    }
+}
+
+enum TrinoWrite {
+    Insert(ast::TrinoInsert),
+    Delete(ast::TrinoDelete),
+    Update(ast::TrinoUpdate),
+    Merge(ast::TrinoMerge),
+}
+
+enum TrinoViewInput {
+    Create(ast::TrinoCreateView),
+    Drop(ast::TrinoDropView),
+    ShowCreate(ast::TrinoShowCreate),
+}
+
+impl FrontendQuerySession {
+    async fn execute_trino_write(
+        &self,
+        source: Arc<str>,
+        command: TrinoWrite,
+        entry: CommandEntry,
+    ) -> Result<StatementResult, QueryServiceError> {
+        use crate::dml::{
+            insert::prepare_trino_insert_shape,
+            mutation::{prepare_trino_merge_shape, prepare_trino_update_shape},
+            prepare_trino_delete_shape,
+        };
+        use crate::query_execution::dml::{
+            delete::DeleteStatementInput, insert::InsertStatementInput,
+            mutation::MutationStatementInput,
+        };
+        let CommandEntry { statement, input } = entry;
+        let dml_error =
+            |error| routed_execution_service_error(dml_result::<()>(Err(error)).unwrap_err());
+        let action = (|| {
+            let sql = source.to_string();
+            let launcher = self.statement_logical_execution_launcher();
+            match command {
+                TrinoWrite::Insert(node) => {
+                    let (command, reference) =
+                        prepare_trino_insert_shape(node, &source).map_err(dml_error)?;
+                    self.service
+                        .insert_engine
+                        .prepare_statement_action(InsertStatementInput {
+                            command,
+                            reference,
+                            sql,
+                            context: input.request,
+                            query_options: input.options,
+                            launcher,
+                            #[cfg(novarocks_dev_controls)]
+                            observation: input.observation,
+                        })
+                        .map_err(|error| error.into_service())
+                }
+                TrinoWrite::Delete(node) => {
+                    let statement = prepare_trino_delete_shape(node, &source).map_err(dml_error)?;
+                    self.service
+                        .delete_engine
+                        .prepare_statement_action(DeleteStatementInput {
+                            statement,
+                            sql,
+                            context: input.request,
+                            query_options: input.options,
+                            launcher,
+                            #[cfg(novarocks_dev_controls)]
+                            observation: input.observation,
+                        })
+                        .map_err(|error| error.into_service())
+                }
+                TrinoWrite::Update(_) | TrinoWrite::Merge(_) => {
+                    let statement = match command {
+                        TrinoWrite::Update(node) => prepare_trino_update_shape(node, &source),
+                        TrinoWrite::Merge(node) => prepare_trino_merge_shape(node, &source),
+                        _ => unreachable!("selected row mutation"),
+                    }
+                    .map_err(dml_error)?;
+                    self.service
+                        .mutation_engine
+                        .prepare_statement_action(MutationStatementInput {
+                            statement,
+                            sql,
+                            context: input.request,
+                            query_options: input.options,
+                            launcher,
+                            #[cfg(novarocks_dev_controls)]
+                            observation: input.observation,
+                        })
+                        .map_err(|error| error.into_service())
+                }
+            }
+        })();
+        self.run_trino_action(statement, action).await
+    }
+}
+
+impl FrontendQuerySession {
+    async fn execute_trino_view(
+        &self,
+        source: Arc<str>,
+        command: TrinoViewInput,
+        entry: CommandEntry,
+    ) -> Result<StatementResult, QueryServiceError> {
+        use novarocks_query_application::view::ViewCommand;
+
+        let CommandEntry {
+            mut statement,
+            input,
+        } = entry;
+        let execution_owner = statement
+            .take_execution_owner()
+            .expect("one original View owner");
+        let view = self.service.command_executor.view.clone();
+        let executor = self.service.query_blocking_executor.clone();
+        let mut worker = Box::pin(async move {
+            let body = move |request: &RequestContext, context: &CommandContext| {
+                let command = match &command {
+                    TrinoViewInput::Create(node) => {
+                        ViewCommand::trino_create(&source, node).map_err(procedure_command_error)?
+                    }
+                    TrinoViewInput::Drop(node) => ViewCommand::Drop {
+                        name: &node.name,
+                        if_exists: node.exists,
+                    },
+                    TrinoViewInput::ShowCreate(node) => {
+                        ViewCommand::ShowCreate { name: &node.name }
+                    }
+                };
+                view.execute_command(
+                    command,
+                    request.session().current_catalog(),
+                    request.session().current_database(),
+                    context.connector_context(),
+                )
+                .map_err(|error| error.with_analysis_source(&source))
+            };
+            let result = execute_product_command_edge(executor, input.request, input.command, body)
+                .await
+                .map_err(product_command_error);
+            Ok((result, execution_owner))
+        }) as TypedCommandWorker;
+        self.finish_command_worker(
+            statement,
+            input.cancellation,
+            input.timeout_duration,
+            &mut worker,
+        )
+        .await
+    }
+
+    async fn execute_trino_call(
+        &self,
+        syntax: ast::TrinoCall,
+        entry: CommandEntry,
+    ) -> Result<StatementResult, QueryServiceError> {
+        use novarocks_query_application::sql::PreparedMaintenanceCall;
+        let CommandEntry {
+            mut statement,
+            input,
+        } = entry;
+        let command = match PreparedMaintenanceCall::from_trino(&syntax) {
+            Ok(call) => Arc::new(call),
+            Err(error) => {
+                return Ok(
+                    self.governed_typed_error(product_command_service_error(error), statement)
+                );
+            }
+        };
+        if let Ok(candidate) = command.maintenance_command()
+            && crate::query_execution::maintenance::command::is_async_metadata_command(
+                &candidate,
+                input.request.session().current_catalog(),
+                input.request.session().current_database(),
+            )
+            .unwrap_or(false)
+        {
+            return self
+                .execute_trino_product(
+                    ProductSqlCommand::Maintenance(candidate),
+                    CommandEntry { statement, input },
+                )
+                .await;
+        }
+
+        let execution_owner = statement
+            .take_execution_owner()
+            .expect("one original CALL owner");
+        let specialized = self.service.command_executor.clone();
+        let router = self.service.product_command_router.clone();
+        let mut worker = Box::pin(async move {
+            let result = specialized
+                .execute_maintenance_call(command.clone(), &input.request, &input.command)
+                .await
+                .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
+            match result {
+                Ok(Some(output)) => Ok((Ok(output), execution_owner)),
+                Err(error) => Ok((Err(error), execution_owner)),
+                Ok(None) => match command.maintenance_command() {
+                    Ok(command) => {
+                        execute_product_statement(
+                            router,
+                            ProductSqlCommand::Maintenance(command),
+                            input.request,
+                            input.command,
+                            execution_owner,
+                        )
+                        .await
+                    }
+                    Err(error) => Ok((Err(RoutedExecutionError::Engine(error)), execution_owner)),
+                },
+            }
+        }) as TypedCommandWorker;
+        self.finish_command_worker(
+            statement,
+            input.cancellation,
+            input.timeout_duration,
+            &mut worker,
+        )
+        .await
+    }
+}
+
+impl FrontendQuerySession {
+    async fn execute_trino_analyze(
+        &self,
+        source: Arc<str>,
+        syntax: ast::TrinoAnalyze,
+        entry: CommandEntry,
+    ) -> Result<StatementResult, QueryServiceError> {
+        use super::analyze_property_computation::AnalyzeProperties;
+
+        let CommandEntry { statement, input } = entry;
+        let action = (|| {
+            let window = input.command.result_window_alias().ok_or_else(|| {
+                internal_error("ANALYZE properties have no original result window")
+            })?;
+            let control = novarocks_sql::compiler::SqlCompileControl::new(
+                input.deadline,
+                crate::query_execution::planning::sql_cancellation_observation(input.cancellation),
+            );
+            let compiler = &self.service.query_compiler;
+            let context = compiler.property_cpu_context(
+                input.request.session().current_database().to_owned(),
+                input.request.execution().sql_semantics().clone(),
+                self.service.required_constant_interpreter.clone(),
+                control,
+                input.command.scope().clone(),
+                window,
+            );
+            self.service
+                .statistics_command
+                .prepare_trino_analyze(
+                    AnalyzeProperties {
+                        source,
+                        syntax,
+                        context,
+                        cpu: compiler.new_planning_cpu_source(),
+                    },
+                    &input.request,
+                    input.command.connector_context(),
+                )
+                .map_err(product_command_service_error)
+        })();
+        self.run_trino_action(statement, action).await
+    }
+}
+
+impl FrontendQuerySession {
+    async fn execute_trino_create_branch(
+        &self,
+        source: Arc<str>,
+        node: ast::TrinoCreateBranch,
+        entry: CommandEntry,
+    ) -> Result<StatementResult, QueryServiceError> {
+        let CommandEntry {
+            mut statement,
+            input,
+        } = entry;
+        let Some(window) = input.command.result_window_alias() else {
+            return Ok(self.governed_typed_error(
+                internal_error("CREATE BRANCH has no original result window"),
+                statement,
+            ));
+        };
+        let control = novarocks_sql::compiler::SqlCompileControl::new(
+            input.deadline,
+            crate::query_execution::planning::sql_cancellation_observation(
+                input.cancellation.clone(),
+            ),
+        );
+        let cpu_context = self.service.query_compiler.property_cpu_context(
+            input.request.session().current_database().to_owned(),
+            input.request.execution().sql_semantics().clone(),
+            self.service.required_constant_interpreter.clone(),
+            control,
+            input.command.scope().clone(),
+            window.clone(),
+        );
+        let execution_owner = statement
+            .take_execution_owner()
+            .expect("one original branch owner");
+        let engine = self.service.iceberg_ref_command.clone();
+        let connector = input.command.connector_context().clone();
+        let prepare_connector = connector.clone();
+        let mut worker = Box::pin(execute_prepared_dml_statement(
+            self.service.query_blocking_executor.clone(),
+            input.cancellation.clone(),
+            execution_owner,
+            Some(window),
+            move || {
+                let mut constants = cpu_context.constant_port();
+                engine
+                    .prepare_trino_branch(
+                        &source,
+                        &node,
+                        &input.request,
+                        &prepare_connector,
+                        &mut constants,
+                        &cpu_context.control,
+                    )
+                    .map_err(RoutedExecutionError::Application)
+            },
+            move |prepared| prepared.execute(&connector).map_err(product_command_error),
+        )) as TypedCommandWorker;
+        self.finish_command_worker(
+            statement,
+            input.cancellation,
+            input.timeout_duration,
+            &mut worker,
+        )
+        .await
+    }
+}
+
+impl FrontendQuerySession {
+    async fn execute_trino_table_procedure(
+        &self,
+        source: Arc<str>,
+        node: ast::TrinoTableExecute,
+        entry: CommandEntry,
+    ) -> Result<StatementResult, QueryServiceError> {
+        use super::maintenance_action::{PreparedTrinoTableExecute, prepare_trino_table_execute};
+
+        let CommandEntry {
+            mut statement,
+            input,
+        } = entry;
+        let Some(window) = input.command.result_window_alias() else {
+            return Ok(self.governed_typed_error(
+                internal_error("ALTER TABLE EXECUTE has no original result window"),
+                statement,
+            ));
+        };
+        let control = novarocks_sql::compiler::SqlCompileControl::new(
+            input.deadline,
+            crate::query_execution::planning::sql_cancellation_observation(
+                input.cancellation.clone(),
+            ),
+        );
+        let cpu_context = self.service.query_compiler.property_cpu_context(
+            input.request.session().current_database().to_owned(),
+            input.request.execution().sql_semantics().clone(),
+            self.service.required_constant_interpreter.clone(),
+            control,
+            input.command.scope().clone(),
+            window.clone(),
+        );
+        let maintenance = self.service.maintenance_command.clone();
+        let request = input.request.clone();
+        let command = input.command.clone();
+        let statement_started_at = input.statement_started_at;
+        #[cfg(novarocks_dev_controls)]
+        let observation = input.observation.clone();
+        let (result, execution_owner, window) = execute_synchronous_stage(
+            self.service.query_blocking_executor.clone(),
+            input.cancellation.clone(),
+            statement
+                .take_execution_owner()
+                .expect("one original table-procedure owner"),
+            Some(window),
+            move || {
+                prepare_trino_table_execute(
+                    &maintenance,
+                    &source,
+                    &node,
+                    &request,
+                    &command,
+                    statement_started_at,
+                    &mut cpu_context.constant_port(),
+                    #[cfg(novarocks_dev_controls)]
+                    observation,
+                )
+                .map_err(product_command_error)
+            },
+        )
+        .await
+        .map_err(internal_error)?;
+        statement.restore_execution_owner(execution_owner);
+        let resolved = match result {
+            Ok(PreparedTrinoTableExecute::Action(action)) => {
+                return self
+                    .execute_observed_statement_action(statement, action)
+                    .await;
+            }
+            Ok(PreparedTrinoTableExecute::AddFiles(resolved)) => resolved,
+            Err(error) => {
+                return Ok(
+                    self.governed_typed_error(routed_execution_service_error(error), statement)
+                );
+            }
+        };
+
+        let dml = Arc::clone(&self.service.dml);
+        let engine = Arc::clone(&self.service.add_files_engine);
+        let planner = Arc::clone(&dml);
+        let prepare_engine = Arc::clone(&engine);
+        let mut worker = Box::pin(execute_prepared_dml_statement(
+            self.service.query_blocking_executor.clone(),
+            input.cancellation.clone(),
+            statement
+                .take_execution_owner()
+                .expect("same original ADD FILES owner"),
+            window,
+            move || {
+                planner
+                    .prepare_resolved_add_files(
+                        prepare_engine.as_ref(),
+                        resolved,
+                        &input.request,
+                        Some(&input.options),
+                    )
+                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+            },
+            move |prepared| {
+                dml.execute_prepared_add_files(engine.as_ref(), prepared)
+                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                    .and_then(|count| {
+                        add_files_status(count)
+                            .map(StatementResult::Query)
+                            .map_err(RoutedExecutionError::Engine)
+                    })
+            },
+        )) as TypedCommandWorker;
+        self.finish_command_worker(
+            statement,
+            input.cancellation,
+            input.timeout_duration,
+            &mut worker,
+        )
+        .await
+    }
+}

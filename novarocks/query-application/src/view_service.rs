@@ -22,8 +22,11 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::api::{QueryResult, build_utf8_query_result};
 use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
-use crate::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
-use novarocks_parser::ast::{CreateView, ViewStatement};
+use crate::view::{
+    CreateViewCommand, ViewCommand, ViewEngine, ViewRequestContext, ViewService,
+    ViewStatementResult,
+};
+use novarocks_parser::ast::ObjectName;
 use novarocks_types::naming::normalize_identifier;
 
 pub(crate) const DEFAULT_CATALOG: &str = "default_catalog";
@@ -151,11 +154,11 @@ impl QueryViewService {
     fn handle_create(
         &self,
         engine: &dyn ViewEngine,
-        create_view: &CreateView,
+        create_view: CreateViewCommand<'_>,
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, crate::api::CommandError> {
         let local_views = self.catalog_snapshot()?;
-        let parts = view_object_name_parts(&create_view.name);
+        let parts = view_object_name_parts(create_view.name);
         crate::view_iceberg::require_mutable_view_target(&parts, context)?;
         if let Some(target) =
             crate::view_iceberg::resolve_external_target_parts(engine, &parts, context)?
@@ -168,8 +171,8 @@ impl QueryViewService {
                 &local_views,
             );
         }
-        let key = session_view_key(&create_view.name, context.current_database)?;
-        let definition = query_definition(&create_view.raw_query_source, context)?;
+        let key = session_view_key(create_view.name, context.current_database)?;
+        let definition = query_definition(create_view.raw_query, context)?;
         let target = crate::view::ViewTarget {
             catalog: key.catalog.clone(),
             database: key.database.clone(),
@@ -188,7 +191,7 @@ impl QueryViewService {
                 catalog: &definition.resolution.default_catalog,
                 database: &definition.resolution.default_database,
                 target: &target,
-                query: &create_view.query,
+                query: create_view.query,
                 local_views: &local_views,
             },
             connector_context,
@@ -209,20 +212,18 @@ impl QueryViewService {
     fn handle_drop(
         &self,
         engine: &dyn ViewEngine,
-        drop_view: &novarocks_parser::ast::DropView,
+        name: &ObjectName,
+        if_exists: bool,
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, crate::api::CommandError> {
-        let parts = view_object_name_parts(&drop_view.name);
+        let parts = view_object_name_parts(name);
         crate::view_iceberg::require_mutable_view_target(&parts, context)?;
         if let Some(target) =
             crate::view_iceberg::resolve_external_target_parts(engine, &parts, context)?
         {
-            crate::view_iceberg::drop_external_view(engine, &target, drop_view.if_exists, context)?;
+            crate::view_iceberg::drop_external_view(engine, &target, if_exists, context)?;
         } else {
-            self.drop_session_view(&session_view_key(
-                &drop_view.name,
-                context.current_database,
-            )?)?;
+            self.drop_session_view(&session_view_key(name, context.current_database)?)?;
         }
         Ok(ViewStatementResult::Ok)
     }
@@ -242,17 +243,19 @@ impl ViewService for QueryViewService {
         })
     }
 
-    fn execute_statement(
+    fn execute_command(
         &self,
         engine: &dyn ViewEngine,
-        statement: &ViewStatement,
+        command: ViewCommand<'_>,
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, crate::api::CommandError> {
-        match statement {
-            ViewStatement::Create(create_view) => self.handle_create(engine, create_view, context),
-            ViewStatement::Drop(drop_view) => self.handle_drop(engine, drop_view, context),
-            ViewStatement::ShowCreate(show_create) => {
-                crate::view_iceberg::show_create_view(engine, &show_create.name, context)
+        match command {
+            ViewCommand::Create(create_view) => self.handle_create(engine, create_view, context),
+            ViewCommand::Drop { name, if_exists } => {
+                self.handle_drop(engine, name, if_exists, context)
+            }
+            ViewCommand::ShowCreate { name } => {
+                crate::view_iceberg::show_create_view(engine, name, context)
             }
         }
     }

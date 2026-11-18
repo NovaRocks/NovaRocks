@@ -48,7 +48,7 @@ pub(super) struct ReadPreparationInput {
     pub(super) role: ClusterRole,
     pub(super) optimizer_limit: u64,
     pub(super) sql: Arc<str>,
-    pub(super) parsed: ParsedStatement,
+    pub(super) query: Box<ast::Query>,
     pub(super) root_session_admitted: bool,
     pub(super) state: SessionSqlState,
     pub(super) deadline: Option<Instant>,
@@ -69,7 +69,7 @@ pub(super) async fn prepare_read(
     input: ReadPreparationInput,
 ) -> Result<Result<PreparedQueryOperation, QueryServiceError>, StatementNativeHealthFailure> {
     let prepared: Result<_, QueryServiceError> = async {
-        let parsed = input.parsed;
+        let query = input.query;
         let topology =
             wait_for_initial_query_topology(&input.topology, &input.cancellation, input.deadline)
                 .await?;
@@ -79,7 +79,7 @@ pub(super) async fn prepare_read(
         let semantics = if input.root_session_admitted {
             semantics
         } else {
-            novarocks_sql::sql_mode::statement_sql_semantics(&semantics, &parsed).map_err(|e| {
+            novarocks_sql::sql_mode::query_sql_semantics(&semantics, &query).map_err(|e| {
                 QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql)))
             })?
         };
@@ -89,10 +89,7 @@ pub(super) async fn prepare_read(
         let options = with_query_hints(
             query_options_from_session_settings(&execution),
             &semantics,
-            match &parsed {
-                ParsedStatement::Query(q) if !input.root_session_admitted => Some(q),
-                _ => None,
-            },
+            (!input.root_session_admitted).then_some(query.as_ref()),
         );
         let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
             .map_err(statement_work_error)?;
@@ -119,10 +116,10 @@ pub(super) async fn prepare_read(
                 .map_err(internal_error)?,
             None => context,
         };
-        Ok((parsed, context, options))
+        Ok((query, context, options))
     }
     .await;
-    let (parsed, context, options) = match prepared {
+    let (query, context, options) = match prepared {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
@@ -148,7 +145,7 @@ pub(super) async fn prepare_read(
     let result = input
         .compiler
         .prepare_read_async(
-            &parsed,
+            *query,
             input.purpose,
             input.root_session_admitted,
             &context,
@@ -795,6 +792,12 @@ impl FrontendQuerySession {
         statement: GovernedQueryStatementOwner,
         purpose: FrontendQueryPurpose,
     ) -> Result<StatementResult, QueryServiceError> {
+        let ParsedStatement::Query(query) = parsed else {
+            return Ok(self.governed_typed_error(
+                internal_error("Read preparation requires a query"),
+                statement,
+            ));
+        };
         if state.presentation().is_none() {
             return Ok(self.governed_typed_error(
                 internal_error("Read client result requires an explicit presentation"),
@@ -826,7 +829,7 @@ impl FrontendQuerySession {
                 statement_token: statement.token(),
             },
             sql,
-            parsed,
+            Box::new(query),
             state,
             purpose,
         )?;
@@ -875,7 +878,7 @@ pub(super) fn build_read_action(
     environment: &QueryActionEnvironment,
     inputs: QueryActionInputs,
     sql: Arc<str>,
-    parsed: ParsedStatement,
+    query: Box<ast::Query>,
     state: SessionSqlState,
     purpose: FrontendQueryPurpose,
 ) -> Result<Box<dyn GovernedStatementAction>, QueryServiceError> {
@@ -945,7 +948,7 @@ pub(super) fn build_read_action(
         role: environment.role,
         optimizer_limit: environment.optimizer_limit,
         sql,
-        parsed,
+        query,
         root_session_admitted,
         state,
         deadline,

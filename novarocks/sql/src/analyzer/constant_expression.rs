@@ -336,7 +336,14 @@ fn validate_implicit_target(
     use DataType::*;
     // The semantic value kind owns this decision. A dictionary layout, a
     // nominal Utf8 value, and a physical SQL string are not interchangeable.
-    let allowed = if target == RequiredConstantTarget::ArrayVarchar {
+    let allowed = if target == RequiredConstantTarget::Timestamp {
+        source.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+            && match source.value_type().kind() {
+                ValueKind::Scalar(ty @ Timestamp(..)) => source.data_type() == ty,
+                ValueKind::Scalar(Null) => source.nullable() && source.data_type() == &Null,
+                _ => false,
+            }
+    } else if target == RequiredConstantTarget::ArrayVarchar {
         match source.value_type().kind() {
             ValueKind::Scalar(Null) => source.nullable(),
             ValueKind::List(child) => match child.kind() {
@@ -372,10 +379,12 @@ fn validate_implicit_target(
     if allowed {
         Ok(())
     } else {
-        Err(AnalyzeError::unsupported_expression(
-            "required constant cannot be implicitly converted to the declared property type",
-            span,
-        ))
+        let message = if target == RequiredConstantTarget::Timestamp {
+            "required constant for an absolute time must have a Physical TIMESTAMP type"
+        } else {
+            "required constant cannot be implicitly converted to the declared property type"
+        };
+        Err(AnalyzeError::unsupported_expression(message, span))
     }
 }
 
@@ -406,6 +415,9 @@ fn required_target_value_type(
                     ),
             ))
         }
+        RequiredConstantTarget::Timestamp => source
+            .clone_observed(|| control.checkpoint(CompilePhase::Validate, 1))
+            .map_err(AnalyzeError::control),
         RequiredConstantTarget::ArrayVarchar => {
             if matches!(source.value_type().kind(), ValueKind::List(child) if matches!(child.kind(), ValueKind::String))
             {

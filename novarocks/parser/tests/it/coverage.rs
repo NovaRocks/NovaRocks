@@ -90,7 +90,7 @@ fn grammar_sample_tokens_reconstruct_the_complete_input() {
 }
 
 #[test]
-fn query_expression_type_and_pattern_grammar_samples_use_their_actual_entry() {
+fn grammar_samples_use_their_actual_entry() {
     use novarocks_parser::trino_parser;
     let mut failures = Vec::new();
     for line in include_str!("grammar-coverage.tsv")
@@ -99,10 +99,17 @@ fn query_expression_type_and_pattern_grammar_samples_use_their_actual_entry() {
     {
         let fields: Vec<_> = line.split('\t').collect();
         assert_eq!(fields.len(), 10, "{line}");
-        if !matches!(fields[0], "alternative" | "optional") || fields[6] == "pending-p09" {
+        if !matches!(fields[0], "alternative" | "optional") {
             continue;
         }
         assert!(!fields[5].is_empty(), "missing grammar source: {line}");
+        assert!(
+            matches!(
+                fields[6],
+                "supported" | "parsed-not-supported" | "syntax-rejection"
+            ),
+            "missing grammar ownership: {line}"
+        );
         let source = sample(fields[5]);
         let result = match fields[1] {
             "standaloneExpression" => trino_parser::parse_expression(&source).map(|_| ()),
@@ -111,7 +118,10 @@ fn query_expression_type_and_pattern_grammar_samples_use_their_actual_entry() {
             "standaloneFunctionSpecification" => {
                 trino_parser::parse_function_specification(&source).map(|_| ())
             }
-            _ => trino_parser::parse_query(&source).map(|_| ()),
+            "standalonePathSpecification" => {
+                trino_parser::parse_path_specification(&source).map(|_| ())
+            }
+            _ => trino_parser::parse_statement(&source).map(|_| ()),
         };
         match fields[7] {
             "accept" if result.is_err() => {

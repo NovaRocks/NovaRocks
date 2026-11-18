@@ -68,6 +68,9 @@ pub(super) fn execute_async<'a>(
             return Ok(known_uncommitted(error));
         }
         match &original.request.operation {
+            ConnectorCatalogMutationOperation::CreateNamespace { .. } => {
+                create_namespace(&original, receiving).await
+            }
             ConnectorCatalogMutationOperation::CreateTable { .. } => {
                 create_table(&original, receiving).await
             }
@@ -148,7 +151,6 @@ async fn create_table(
     original: &Arc<Original>,
     receiving: &ConnectorCatalogMutationReceiving,
 ) -> Result<Outcome, ConnectorError> {
-    use crate::catalog::catalog_request::CatalogResponseDocument;
     let provider = &original.provider;
     let request = &original.request;
     let ConnectorCatalogMutationOperation::CreateTable { table, policy, .. } = &request.operation
@@ -182,6 +184,45 @@ async fn create_table(
         }
         Ok(PreparedCreate::Mutation(prepared)) => *prepared,
     };
+    let outcome = publish_catalog_request(original, receiving, frozen, external, receipts).await?;
+    if matches!(outcome, Outcome::KnownCommitted { .. }) {
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
+    }
+    Ok(outcome)
+}
+
+async fn create_namespace(
+    original: &Original,
+    receiving: &ConnectorCatalogMutationReceiving,
+) -> Result<Outcome, ConnectorError> {
+    let (frozen, external, seed) =
+        match prepare_namespace_publication(&original.provider, &original.request) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+    publish_catalog_request(
+        original,
+        receiving,
+        frozen,
+        external,
+        PublicationReceipts::same(seed),
+    )
+    .await
+}
+
+async fn publish_catalog_request(
+    original: &Original,
+    receiving: &ConnectorCatalogMutationReceiving,
+    frozen: crate::catalog::catalog_request::FrozenCatalogPublication,
+    external: ExternalMutationEvidence,
+    receipts: PublicationReceipts<ConnectorCatalogMutationReceipt>,
+) -> Result<Outcome, ConnectorError> {
+    use crate::catalog::catalog_request::CatalogResponseDocument;
+    let provider = &original.provider;
+    let request = &original.request;
     if let Err(error) = original.journal.prepare_catalog_with_receipts(
         external,
         receipts,
@@ -214,17 +255,10 @@ async fn create_table(
             },
         )
         .await;
-    let outcome = match pending {
-        Ok(pending) => finish(original, receiving, pending).await?,
-        Err(error) => original.call_error(error),
-    };
-    if matches!(outcome, Outcome::KnownCommitted { .. }) {
-        provider
-            .runtime()
-            .control_state()
-            .invalidate_table_cache(&table.namespace, &table.table);
+    match pending {
+        Ok(pending) => finish(original, receiving, pending).await,
+        Err(error) => Ok(original.call_error(error)),
     }
-    Ok(outcome)
 }
 
 async fn properties(

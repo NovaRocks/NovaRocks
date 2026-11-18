@@ -1,234 +1,233 @@
 # Grammar SHA-256: 3807c02d664f4eac05081518b5f24fbccdfae93883c9088e3575c472cfdcfc0d
 # kind	rule	alternative	label	clause	sample	ownership	expected	status	reference_disposition
-# Empty samples marked pending-p09 belong to statement-family completion.
 # none in the last column means no reference disposition.
 alternative	singleStatement	1		0	SELECT 1	supported	accept	reviewed-grammar-path	none
 alternative	standaloneExpression	1		0	1	supported	accept	reviewed-grammar-path	none
-alternative	standalonePathSpecification	1		0		pending-p09		pending-p09	none
+alternative	standalonePathSpecification	1		0	ice.db, iceberg."Data"	supported	accept	reviewed-grammar-path	none
 alternative	standaloneType	1		0	integer	supported	accept	reviewed-grammar-path	none
 alternative	standaloneRowPattern	1		0	x	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	standaloneFunctionSpecification	1		0	@file:coverage-sql/routine-standalone.sql	supported	accept	reviewed-grammar-path	none
-alternative	statement	1	statementDefault	0		pending-p09		pending-p09	none
-alternative	statement	2	use	0		pending-p09		pending-p09	none
-alternative	statement	3	use	0		pending-p09		pending-p09	none
-optional	statement	4		1		pending-p09		pending-p09	none
-optional	statement	4		2		pending-p09		pending-p09	none
-optional	statement	4		3		pending-p09		pending-p09	none
-optional	statement	4		4		pending-p09		pending-p09	none
-alternative	statement	4	createCatalog	0		pending-p09		pending-p09	none
-optional	statement	5		1		pending-p09		pending-p09	none
-optional	statement	5		2		pending-p09		pending-p09	none
-alternative	statement	5	dropCatalog	0		pending-p09		pending-p09	none
-optional	statement	6		1		pending-p09		pending-p09	none
-optional	statement	6		2		pending-p09		pending-p09	none
-optional	statement	6		3		pending-p09		pending-p09	none
-alternative	statement	6	createSchema	0		pending-p09		pending-p09	none
-optional	statement	7		1		pending-p09		pending-p09	none
-optional	statement	7		2		pending-p09		pending-p09	none
-alternative	statement	7	dropSchema	0		pending-p09		pending-p09	none
-alternative	statement	8	renameSchema	0		pending-p09		pending-p09	none
-optional	statement	9		1		pending-p09		pending-p09	none
-optional	statement	9		2		pending-p09		pending-p09	none
-optional	statement	9		3		pending-p09		pending-p09	none
-optional	statement	9		4		pending-p09		pending-p09	none
-optional	statement	9		5		pending-p09		pending-p09	none
-optional	statement	9		6		pending-p09		pending-p09	none
-optional	statement	9		7		pending-p09		pending-p09	none
-alternative	statement	9	createTableAsSelect	0		pending-p09		pending-p09	none
-optional	statement	10		1		pending-p09		pending-p09	none
-optional	statement	10		2		pending-p09		pending-p09	none
-optional	statement	10		3		pending-p09		pending-p09	none
-optional	statement	10		4		pending-p09		pending-p09	none
-optional	statement	10		5		pending-p09		pending-p09	none
-alternative	statement	10	createTable	0		pending-p09		pending-p09	none
-optional	statement	11		1		pending-p09		pending-p09	none
-alternative	statement	11	dropTable	0		pending-p09		pending-p09	none
-optional	statement	12		1		pending-p09		pending-p09	none
-optional	statement	12		2		pending-p09		pending-p09	none
-alternative	statement	12	insertInto	0		pending-p09		pending-p09	none
-optional	statement	13		1		pending-p09		pending-p09	none
-optional	statement	13		2		pending-p09		pending-p09	none
-alternative	statement	13	delete	0		pending-p09		pending-p09	none
-alternative	statement	14	truncateTable	0		pending-p09		pending-p09	none
-alternative	statement	15	commentTable	0		pending-p09		pending-p09	none
-alternative	statement	16	commentView	0		pending-p09		pending-p09	none
-alternative	statement	17	commentMaterializedView	0		pending-p09		pending-p09	none
-alternative	statement	18	commentColumn	0		pending-p09		pending-p09	none
-optional	statement	19		1		pending-p09		pending-p09	none
-alternative	statement	19	renameTable	0		pending-p09		pending-p09	none
-optional	statement	20		1		pending-p09		pending-p09	none
-optional	statement	20		2		pending-p09		pending-p09	none
-optional	statement	20		3		pending-p09		pending-p09	none
-alternative	statement	20	addColumn	0		pending-p09		pending-p09	none
-optional	statement	21		1		pending-p09		pending-p09	none
-optional	statement	21		2		pending-p09		pending-p09	none
-alternative	statement	21	renameColumn	0		pending-p09		pending-p09	none
-optional	statement	22		1		pending-p09		pending-p09	none
-optional	statement	22		2		pending-p09		pending-p09	none
-alternative	statement	22	dropColumn	0		pending-p09		pending-p09	none
-optional	statement	23		1		pending-p09		pending-p09	none
-alternative	statement	23	setDefaultValue	0		pending-p09		pending-p09	none
-optional	statement	24		1		pending-p09		pending-p09	none
-alternative	statement	24	dropDefaultValue	0		pending-p09		pending-p09	none
-optional	statement	25		1		pending-p09		pending-p09	none
-alternative	statement	25	setColumnType	0		pending-p09		pending-p09	none
-optional	statement	26		1		pending-p09		pending-p09	none
-alternative	statement	26	dropNotNullConstraint	0		pending-p09		pending-p09	none
-alternative	statement	27	setTableProperties	0		pending-p09		pending-p09	none
-optional	statement	28		1		pending-p09		pending-p09	none
-optional	statement	28		2		pending-p09		pending-p09	none
-optional	statement	28		3		pending-p09		pending-p09	none
-optional	statement	28		4		pending-p09		pending-p09	none
-alternative	statement	28	tableExecute	0		pending-p09		pending-p09	none
-alternative	statement	29	setAuthorization	0		pending-p09		pending-p09	none
-optional	statement	30		1		pending-p09		pending-p09	none
-alternative	statement	30	analyze	0		pending-p09		pending-p09	none
-optional	statement	31		1		pending-p09		pending-p09	none
-optional	statement	31		2		pending-p09		pending-p09	none
-optional	statement	31		3		pending-p09		pending-p09	none
-optional	statement	31		4		pending-p09		pending-p09	none
-optional	statement	31		5		pending-p09		pending-p09	none
-optional	statement	31		6		pending-p09		pending-p09	none
-alternative	statement	31	createMaterializedView	0		pending-p09		pending-p09	none
-optional	statement	32		1		pending-p09		pending-p09	none
-optional	statement	32		2		pending-p09		pending-p09	none
-optional	statement	32		3		pending-p09		pending-p09	none
-optional	statement	32		4		pending-p09		pending-p09	none
-optional	statement	32		5		pending-p09		pending-p09	none
-alternative	statement	32	createView	0		pending-p09		pending-p09	none
-alternative	statement	33	refreshMaterializedView	0		pending-p09		pending-p09	none
-optional	statement	34		1		pending-p09		pending-p09	none
-alternative	statement	34	dropMaterializedView	0		pending-p09		pending-p09	none
-optional	statement	35		1		pending-p09		pending-p09	none
-alternative	statement	35	renameMaterializedView	0		pending-p09		pending-p09	none
-alternative	statement	36	setMaterializedViewProperties	0		pending-p09		pending-p09	none
-optional	statement	37		1		pending-p09		pending-p09	none
-optional	statement	37		2		pending-p09		pending-p09	none
-optional	statement	37		3		pending-p09		pending-p09	none
-optional	statement	37		4		pending-p09		pending-p09	none
-alternative	statement	37	materializedViewExecute	0		pending-p09		pending-p09	none
-optional	statement	38		1		pending-p09		pending-p09	none
-alternative	statement	38	dropView	0		pending-p09		pending-p09	none
-alternative	statement	39	renameView	0		pending-p09		pending-p09	none
-alternative	statement	40	refreshView	0		pending-p09		pending-p09	none
-optional	statement	41		1		pending-p09		pending-p09	none
-optional	statement	41		2		pending-p09		pending-p09	none
-alternative	statement	41	call	0		pending-p09		pending-p09	none
-optional	statement	42		1		pending-p09		pending-p09	none
-alternative	statement	42	createFunction	0		pending-p09		pending-p09	none
-optional	statement	43		1		pending-p09		pending-p09	none
-alternative	statement	43	dropFunction	0		pending-p09		pending-p09	none
-optional	statement	44		1		pending-p09		pending-p09	none
-optional	statement	44		2		pending-p09		pending-p09	none
-optional	statement	44		3		pending-p09		pending-p09	none
-optional	statement	44		4		pending-p09		pending-p09	none
-alternative	statement	44	createBranch	0		pending-p09		pending-p09	none
-optional	statement	45		1		pending-p09		pending-p09	none
-alternative	statement	45	dropBranch	0		pending-p09		pending-p09	none
-alternative	statement	46	fastForwardBranch	0		pending-p09		pending-p09	none
-alternative	statement	47	showBranches	0		pending-p09		pending-p09	none
-optional	statement	48		1		pending-p09		pending-p09	none
-optional	statement	48		2		pending-p09		pending-p09	none
-alternative	statement	48	createRole	0		pending-p09		pending-p09	none
-optional	statement	49		1		pending-p09		pending-p09	none
-optional	statement	49		2		pending-p09		pending-p09	none
-alternative	statement	49	dropRole	0		pending-p09		pending-p09	none
-optional	statement	50		1		pending-p09		pending-p09	none
-optional	statement	50		2		pending-p09		pending-p09	none
-optional	statement	50		3		pending-p09		pending-p09	none
-optional	statement	50		4		pending-p09		pending-p09	none
-optional	statement	50		5		pending-p09		pending-p09	none
-alternative	statement	50	grantRoles	0		pending-p09		pending-p09	none
-optional	statement	51		1		pending-p09		pending-p09	none
-optional	statement	51		2		pending-p09		pending-p09	none
-alternative	statement	51	grantPrivileges	0		pending-p09		pending-p09	none
-optional	statement	52		1		pending-p09		pending-p09	none
-optional	statement	52		2		pending-p09		pending-p09	none
-optional	statement	52		3		pending-p09		pending-p09	none
-optional	statement	52		4		pending-p09		pending-p09	none
-optional	statement	52		5		pending-p09		pending-p09	none
-alternative	statement	52	revokeRoles	0		pending-p09		pending-p09	none
-optional	statement	53		1		pending-p09		pending-p09	none
-optional	statement	53		2		pending-p09		pending-p09	none
-alternative	statement	53	revokePrivileges	0		pending-p09		pending-p09	none
-optional	statement	54		1		pending-p09		pending-p09	none
-alternative	statement	54	deny	0		pending-p09		pending-p09	none
-optional	statement	55		1		pending-p09		pending-p09	none
-alternative	statement	55	setRole	0		pending-p09		pending-p09	none
-optional	statement	56		1		pending-p09		pending-p09	none
-alternative	statement	56	showGrants	0		pending-p09		pending-p09	none
-optional	statement	57		1		pending-p09		pending-p09	none
-optional	statement	57		2		pending-p09		pending-p09	none
-alternative	statement	57	explain	0		pending-p09		pending-p09	none
-optional	statement	58		1		pending-p09		pending-p09	none
-alternative	statement	58	explainAnalyze	0		pending-p09		pending-p09	none
-alternative	statement	59	showCreateTable	0		pending-p09		pending-p09	none
-alternative	statement	60	showCreateSchema	0		pending-p09		pending-p09	none
-alternative	statement	61	showCreateView	0		pending-p09		pending-p09	none
-alternative	statement	62	showCreateMaterializedView	0		pending-p09		pending-p09	none
-alternative	statement	63	showCreateFunction	0		pending-p09		pending-p09	none
-optional	statement	64		1		pending-p09		pending-p09	none
-optional	statement	64		2		pending-p09		pending-p09	none
-optional	statement	64		3		pending-p09		pending-p09	none
-alternative	statement	64	showTables	0		pending-p09		pending-p09	none
-optional	statement	65		1		pending-p09		pending-p09	none
-optional	statement	65		2		pending-p09		pending-p09	none
-optional	statement	65		3		pending-p09		pending-p09	none
-alternative	statement	65	showSchemas	0		pending-p09		pending-p09	none
-optional	statement	66		1		pending-p09		pending-p09	none
-optional	statement	66		2		pending-p09		pending-p09	none
-alternative	statement	66	showCatalogs	0		pending-p09		pending-p09	none
-optional	statement	67		1		pending-p09		pending-p09	none
-optional	statement	67		2		pending-p09		pending-p09	none
-alternative	statement	67	showColumns	0		pending-p09		pending-p09	none
-alternative	statement	68	showStats	0		pending-p09		pending-p09	none
-alternative	statement	69	showStatsForQuery	0		pending-p09		pending-p09	none
-optional	statement	70		1		pending-p09		pending-p09	none
-optional	statement	70		2		pending-p09		pending-p09	none
-alternative	statement	70	showRoles	0		pending-p09		pending-p09	none
-optional	statement	71		1		pending-p09		pending-p09	none
-alternative	statement	71	showRoleGrants	0		pending-p09		pending-p09	none
-alternative	statement	72	showColumns	0		pending-p09		pending-p09	none
-alternative	statement	73	showColumns	0		pending-p09		pending-p09	none
-optional	statement	74		1		pending-p09		pending-p09	none
-optional	statement	74		2		pending-p09		pending-p09	none
-optional	statement	74		3		pending-p09		pending-p09	none
-alternative	statement	74	showFunctions	0		pending-p09		pending-p09	none
-optional	statement	75		1		pending-p09		pending-p09	none
-optional	statement	75		2		pending-p09		pending-p09	none
-alternative	statement	75	showSession	0		pending-p09		pending-p09	none
-alternative	statement	76	setSessionAuthorization	0		pending-p09		pending-p09	none
-alternative	statement	77	resetSessionAuthorization	0		pending-p09		pending-p09	none
-alternative	statement	78	setSession	0		pending-p09		pending-p09	none
-alternative	statement	79	resetSession	0		pending-p09		pending-p09	none
-optional	statement	80		1		pending-p09		pending-p09	none
-optional	statement	80		2		pending-p09		pending-p09	none
-alternative	statement	80	startTransaction	0		pending-p09		pending-p09	none
-optional	statement	81		1		pending-p09		pending-p09	none
-alternative	statement	81	commit	0		pending-p09		pending-p09	none
-optional	statement	82		1		pending-p09		pending-p09	none
-alternative	statement	82	rollback	0		pending-p09		pending-p09	none
-alternative	statement	83	prepare	0		pending-p09		pending-p09	none
-alternative	statement	84	deallocate	0		pending-p09		pending-p09	none
-optional	statement	85		1		pending-p09		pending-p09	none
-optional	statement	85		2		pending-p09		pending-p09	none
-alternative	statement	85	execute	0		pending-p09		pending-p09	none
-optional	statement	86		1		pending-p09		pending-p09	none
-optional	statement	86		2		pending-p09		pending-p09	none
-alternative	statement	86	executeImmediate	0		pending-p09		pending-p09	none
-alternative	statement	87	describeInput	0		pending-p09		pending-p09	none
-alternative	statement	88	describeOutput	0		pending-p09		pending-p09	none
-alternative	statement	89	describeQueryOutput	0		pending-p09		pending-p09	none
-alternative	statement	90	setPath	0		pending-p09		pending-p09	none
-alternative	statement	91	setTimeZone	0		pending-p09		pending-p09	none
-optional	statement	92		1		pending-p09		pending-p09	none
-optional	statement	92		2		pending-p09		pending-p09	none
-optional	statement	92		3		pending-p09		pending-p09	none
-alternative	statement	92	update	0		pending-p09		pending-p09	none
-optional	statement	93		1		pending-p09		pending-p09	none
-optional	statement	93		2		pending-p09		pending-p09	none
-optional	statement	93		3		pending-p09		pending-p09	none
-alternative	statement	93	merge	0		pending-p09		pending-p09	none
+alternative	statement	1	statementDefault	0	SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+alternative	statement	2	use	0	USE tiny	supported	accept	reviewed-grammar-path	none
+alternative	statement	3	use	0	USE tpch.tiny	supported	accept	reviewed-grammar-path	none
+optional	statement	4		1	CREATE CATALOG IF NOT EXISTS lake USING iceberg WITH ("iceberg.catalog.warehouse" = 'file:///tmp/p09-coverage')	supported	accept	reviewed-grammar-path	none
+optional	statement	4		2	CREATE CATALOG lake USING iceberg COMMENT 'note' WITH ("iceberg.catalog.warehouse" = 'file:///tmp/p09-coverage')	supported	accept	reviewed-grammar-path	none
+optional	statement	4		3	CREATE CATALOG lake USING iceberg AUTHORIZATION USER operator	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	4		4	CREATE CATALOG lake USING iceberg WITH ("iceberg.catalog.warehouse" = 'file:///tmp/p09-coverage')	supported	accept	reviewed-grammar-path	none
+alternative	statement	4	createCatalog	0	CREATE CATALOG lake USING iceberg WITH ("iceberg.catalog.warehouse" = 'file:///tmp/p09-coverage')	supported	accept	reviewed-grammar-path	none
+optional	statement	5		1	DROP CATALOG IF EXISTS lake RESTRICT	supported	accept	reviewed-grammar-path	none
+optional	statement	5		2	DROP CATALOG IF EXISTS lake RESTRICT	supported	accept	reviewed-grammar-path	none
+alternative	statement	5	dropCatalog	0	DROP CATALOG IF EXISTS lake RESTRICT	supported	accept	reviewed-grammar-path	none
+optional	statement	6		1	CREATE SCHEMA IF NOT EXISTS lake.ns	supported	accept	reviewed-grammar-path	none
+optional	statement	6		2	CREATE SCHEMA lake.ns AUTHORIZATION ROLE operator	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	6		3	CREATE SCHEMA lake.ns WITH (location = 's3://warehouse/ns')	supported	accept	reviewed-grammar-path	none
+alternative	statement	6	createSchema	0	CREATE SCHEMA IF NOT EXISTS lake.ns	supported	accept	reviewed-grammar-path	none
+optional	statement	7		1	DROP SCHEMA IF EXISTS lake.ns RESTRICT	supported	accept	reviewed-grammar-path	none
+optional	statement	7		2	DROP SCHEMA IF EXISTS lake.ns RESTRICT	supported	accept	reviewed-grammar-path	none
+alternative	statement	7	dropSchema	0	DROP SCHEMA IF EXISTS lake.ns RESTRICT	supported	accept	reviewed-grammar-path	none
+alternative	statement	8	renameSchema	0	ALTER SCHEMA lake.ns RENAME TO next_ns	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	9		1	CREATE OR REPLACE TABLE lake.ns.dst AS SELECT CAST(1 AS bigint) AS id	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	9		2	CREATE TABLE IF NOT EXISTS lake.ns.dst AS SELECT CAST(1 AS bigint) AS id	supported	accept	reviewed-grammar-path	none
+optional	statement	9		3	CREATE TABLE lake.ns.dst (renamed_id) AS SELECT CAST(1 AS bigint) AS id	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	9		4	CREATE TABLE lake.ns.dst COMMENT 'note' AS SELECT CAST(1 AS bigint) AS id	supported	accept	reviewed-grammar-path	none
+optional	statement	9		5	CREATE TABLE lake.ns.dst WITH (format_version = 3) AS SELECT CAST(1 AS bigint) AS id	supported	accept	reviewed-grammar-path	none
+optional	statement	9		6	CREATE TABLE lake.ns.dst AS SELECT CAST(1 AS bigint) AS id WITH NO DATA	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	9		7	CREATE TABLE lake.ns.dst AS SELECT CAST(1 AS bigint) AS id WITH DATA	supported	accept	reviewed-grammar-path	none
+alternative	statement	9	createTableAsSelect	0	CREATE TABLE lake.ns.dst AS SELECT CAST(1 AS bigint) AS id	supported	accept	reviewed-grammar-path	none
+optional	statement	10		1	CREATE OR REPLACE TABLE lake.ns.t (id bigint)	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	10		2	CREATE TABLE IF NOT EXISTS lake.ns.t (id bigint)	supported	accept	reviewed-grammar-path	none
+optional	statement	10		3	CREATE TABLE lake.ns.t (id bigint, k bigint)	supported	accept	reviewed-grammar-path	none
+optional	statement	10		4	CREATE TABLE lake.ns.t (id bigint) COMMENT 'note'	supported	accept	reviewed-grammar-path	none
+optional	statement	10		5	CREATE TABLE lake.ns.t (id bigint) WITH (format_version = 3)	supported	accept	reviewed-grammar-path	none
+alternative	statement	10	createTable	0	CREATE TABLE lake.ns.t (id bigint)	supported	accept	reviewed-grammar-path	none
+optional	statement	11		1	DROP TABLE IF EXISTS lake.ns.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	11	dropTable	0	DROP TABLE IF EXISTS lake.ns.t	supported	accept	reviewed-grammar-path	none
+optional	statement	12		1	INSERT INTO cat.sch.t@"dev branch" VALUES 1	supported	accept	reviewed-grammar-path	none
+optional	statement	12		2	INSERT INTO cat.sch.t (id, value) VALUES (1, 2)	supported	accept	reviewed-grammar-path	none
+alternative	statement	12	insertInto	0	INSERT INTO cat.sch.t SELECT 1	supported	accept	reviewed-grammar-path	none
+optional	statement	13		1	DELETE FROM cat.sch.t@dev	supported	accept	reviewed-grammar-path	none
+optional	statement	13		2	DELETE FROM cat.sch.t WHERE id = ?	supported	accept	reviewed-grammar-path	none
+alternative	statement	13	delete	0	DELETE FROM cat.sch.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	14	truncateTable	0	TRUNCATE TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	15	commentTable	0	COMMENT ON TABLE lake.ns.t IS 'note'	supported	accept	reviewed-grammar-path	none
+alternative	statement	16	commentView	0	COMMENT ON VIEW lake.ns.v IS 'note'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	17	commentMaterializedView	0	COMMENT ON MATERIALIZED VIEW lake.ns.mv IS 'note'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	18	commentColumn	0	COMMENT ON COLUMN lake.ns.t.id IS 'note'	supported	accept	reviewed-grammar-path	none
+optional	statement	19		1	ALTER TABLE IF EXISTS lake.ns.t RENAME TO lake.ns.renamed	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	19	renameTable	0	ALTER TABLE IF EXISTS lake.ns.t RENAME TO lake.ns.renamed	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	20		1	ALTER TABLE IF EXISTS lake.ns.t ADD COLUMN added bigint	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	20		2	ALTER TABLE lake.ns.t ADD COLUMN IF NOT EXISTS added bigint	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	20		3	ALTER TABLE lake.ns.t ADD COLUMN added bigint FIRST	supported	accept	reviewed-grammar-path	none
+alternative	statement	20	addColumn	0	ALTER TABLE lake.ns.t ADD COLUMN added bigint	supported	accept	reviewed-grammar-path	none
+optional	statement	21		1	ALTER TABLE IF EXISTS lake.ns.t RENAME COLUMN id TO id2	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	21		2	ALTER TABLE lake.ns.t RENAME COLUMN IF EXISTS id TO id2	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	21	renameColumn	0	ALTER TABLE lake.ns.t RENAME COLUMN id TO id2	supported	accept	reviewed-grammar-path	none
+optional	statement	22		1	ALTER TABLE IF EXISTS lake.ns.t DROP COLUMN id	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	22		2	ALTER TABLE lake.ns.t DROP COLUMN IF EXISTS id	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	22	dropColumn	0	ALTER TABLE lake.ns.t DROP COLUMN id	supported	accept	reviewed-grammar-path	none
+optional	statement	23		1	ALTER TABLE IF EXISTS lake.ns.t ALTER COLUMN id SET DEFAULT 1	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	23	setDefaultValue	0	ALTER TABLE IF EXISTS lake.ns.t ALTER COLUMN id SET DEFAULT 1	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	24		1	ALTER TABLE IF EXISTS lake.ns.t ALTER COLUMN id DROP DEFAULT	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	24	dropDefaultValue	0	ALTER TABLE IF EXISTS lake.ns.t ALTER COLUMN id DROP DEFAULT	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	25		1	ALTER TABLE IF EXISTS lake.ns.t ALTER COLUMN id SET DATA TYPE bigint	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	25	setColumnType	0	ALTER TABLE lake.ns.t ALTER COLUMN id SET DATA TYPE bigint	supported	accept	reviewed-grammar-path	none
+optional	statement	26		1	ALTER TABLE IF EXISTS lake.ns.t ALTER COLUMN id DROP NOT NULL	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	26	dropNotNullConstraint	0	ALTER TABLE lake.ns.t ALTER COLUMN id DROP NOT NULL	supported	accept	reviewed-grammar-path	none
+alternative	statement	27	setTableProperties	0	ALTER TABLE lake.ns.t SET PROPERTIES format = DEFAULT	supported	accept	reviewed-grammar-path	none
+optional	statement	28		1	ALTER TABLE lake.ns.t EXECUTE expire_snapshots(retention_threshold => '7d', retain_last => 2)	supported	accept	reviewed-grammar-path	none
+optional	statement	28		2	ALTER TABLE lake.ns.t EXECUTE expire_snapshots(retain_last => 2)	supported	accept	reviewed-grammar-path	none
+optional	statement	28		3	ALTER TABLE lake.ns.t EXECUTE optimize_manifests()	supported	accept	reviewed-grammar-path	none
+optional	statement	28		4	ALTER TABLE lake.ns.t EXECUTE optimize_manifests WHERE id > 0	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	28	tableExecute	0	ALTER TABLE lake.ns.t EXECUTE optimize_manifests	supported	accept	reviewed-grammar-path	none
+alternative	statement	29	setAuthorization	0	ALTER MATERIALIZED VIEW cat.sch.v SET AUTHORIZATION ROLE reader	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	30		1	ANALYZE lake.ns.t WITH (columns = ARRAY['id'])	supported	accept	reviewed-grammar-path	none
+alternative	statement	30	analyze	0	ANALYZE lake.ns.t	supported	accept	reviewed-grammar-path	none
+optional	statement	31		1	CREATE OR REPLACE MATERIALIZED VIEW m AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	31		2	CREATE MATERIALIZED VIEW IF NOT EXISTS m AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+optional	statement	31		3	CREATE MATERIALIZED VIEW m GRACE PERIOD INTERVAL '1' DAY AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	31		4	CREATE MATERIALIZED VIEW m WHEN STALE INLINE AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	31		5	CREATE MATERIALIZED VIEW m COMMENT 'note' AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	31		6	CREATE MATERIALIZED VIEW m WITH (refresh_policy = 'MANUAL') AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+alternative	statement	31	createMaterializedView	0	CREATE MATERIALIZED VIEW m WITH (refresh_policy = 'MANUAL') AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+optional	statement	32		1	CREATE OR REPLACE VIEW v AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+optional	statement	32		2	CREATE VIEW IF NOT EXISTS v AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+optional	statement	32		3	CREATE VIEW v COMMENT 'note' AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+optional	statement	32		4	CREATE VIEW v SECURITY INVOKER AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	32		5	CREATE VIEW v WITH (a = DEFAULT) AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	32	createView	0	CREATE VIEW v AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+alternative	statement	33	refreshMaterializedView	0	REFRESH MATERIALIZED VIEW m	supported	accept	reviewed-grammar-path	none
+optional	statement	34		1	DROP MATERIALIZED VIEW IF EXISTS m	supported	accept	reviewed-grammar-path	none
+alternative	statement	34	dropMaterializedView	0	DROP MATERIALIZED VIEW IF EXISTS m	supported	accept	reviewed-grammar-path	none
+optional	statement	35		1	ALTER MATERIALIZED VIEW IF EXISTS m RENAME TO n	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	35	renameMaterializedView	0	ALTER MATERIALIZED VIEW IF EXISTS m RENAME TO n	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	36	setMaterializedViewProperties	0	ALTER MATERIALIZED VIEW m SET PROPERTIES refresh_paused = true	supported	accept	reviewed-grammar-path	none
+optional	statement	37		1	ALTER MATERIALIZED VIEW m EXECUTE p(named => 1, 2) WHERE id > 0	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	37		2	ALTER MATERIALIZED VIEW m EXECUTE p(named => 1, 2) WHERE id > 0	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	37		3	ALTER MATERIALIZED VIEW m EXECUTE p(named => 1, 2) WHERE id > 0	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	37		4	ALTER MATERIALIZED VIEW m EXECUTE p(named => 1, 2) WHERE id > 0	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	37	materializedViewExecute	0	ALTER MATERIALIZED VIEW m EXECUTE p(named => 1, 2) WHERE id > 0	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	38		1	DROP VIEW IF EXISTS v	supported	accept	reviewed-grammar-path	none
+alternative	statement	38	dropView	0	DROP VIEW IF EXISTS v	supported	accept	reviewed-grammar-path	none
+alternative	statement	39	renameView	0	ALTER VIEW v RENAME TO w	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	40	refreshView	0	ALTER VIEW v REFRESH	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	41		1	CALL c.system.proc(?, x => ?)	supported	accept	reviewed-grammar-path	none
+optional	statement	41		2	CALL c.system.proc(?, x => ?)	supported	accept	reviewed-grammar-path	none
+alternative	statement	41	call	0	CALL c.system.proc()	supported	accept	reviewed-grammar-path	none
+optional	statement	42		1	CREATE OR REPLACE FUNCTION f(x bigint) RETURNS bigint RETURN x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	42	createFunction	0	CREATE OR REPLACE FUNCTION f(x bigint) RETURNS bigint RETURN x	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	43		1	DROP FUNCTION IF EXISTS f(x bigint)	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	43	dropFunction	0	DROP FUNCTION IF EXISTS f(x bigint)	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	44		1	CREATE OR REPLACE BRANCH dev IN TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+optional	statement	44		2	CREATE BRANCH IF NOT EXISTS dev IN TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+optional	statement	44		3	CREATE BRANCH dev WITH (snapshot_id = 7) IN TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+optional	statement	44		4	CREATE BRANCH dev IN TABLE lake.ns.t FROM work	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	44	createBranch	0	CREATE BRANCH dev IN TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+optional	statement	45		1	DROP BRANCH IF EXISTS dev IN TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	45	dropBranch	0	DROP BRANCH IF EXISTS dev IN TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	46	fastForwardBranch	0	ALTER BRANCH work IN TABLE lake.ns.t FAST FORWARD TO dev	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	47	showBranches	0	SHOW BRANCHES FROM TABLE lake.ns.t	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	48		1	CREATE ROLE reader WITH ADMIN CURRENT_USER IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	48		2	CREATE ROLE reader WITH ADMIN CURRENT_USER IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	48	createRole	0	CREATE ROLE reader WITH ADMIN CURRENT_USER IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	49		1	DROP ROLE IF EXISTS reader IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	49		2	DROP ROLE IF EXISTS reader IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	49	dropRole	0	DROP ROLE IF EXISTS reader IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	50		1	GRANT r, s TO USER u, ROLE g WITH ADMIN OPTION GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	50		2	GRANT r, s TO USER u, ROLE g WITH ADMIN OPTION GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	50		3	GRANT r, s TO USER u, ROLE g WITH ADMIN OPTION GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	50		4	GRANT r, s TO USER u, ROLE g WITH ADMIN OPTION GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	50		5	GRANT r, s TO USER u, ROLE g WITH ADMIN OPTION GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	50	grantRoles	0	GRANT r, s TO USER u, ROLE g WITH ADMIN OPTION GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	51		1	GRANT SELECT, DELETE ON TABLE cat.sch.t TO USER u WITH GRANT OPTION	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	51		2	GRANT SELECT, DELETE ON TABLE cat.sch.t TO USER u WITH GRANT OPTION	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	51	grantPrivileges	0	GRANT SELECT, DELETE ON TABLE cat.sch.t TO USER u WITH GRANT OPTION	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	52		1	REVOKE ADMIN OPTION FOR r, s FROM USER u, ROLE g GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	52		2	REVOKE ADMIN OPTION FOR r, s FROM USER u, ROLE g GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	52		3	REVOKE ADMIN OPTION FOR r, s FROM USER u, ROLE g GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	52		4	REVOKE ADMIN OPTION FOR r, s FROM USER u, ROLE g GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	52		5	REVOKE ADMIN OPTION FOR r, s FROM USER u, ROLE g GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	52	revokeRoles	0	REVOKE ADMIN OPTION FOR r, s FROM USER u, ROLE g GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	53		1	REVOKE GRANT OPTION FOR SELECT, DELETE ON TABLE cat.sch.t FROM ROLE g	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	53		2	REVOKE GRANT OPTION FOR SELECT, DELETE ON TABLE cat.sch.t FROM ROLE g	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	53	revokePrivileges	0	REVOKE GRANT OPTION FOR SELECT, DELETE ON TABLE cat.sch.t FROM ROLE g	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	54		1	DENY SELECT, DELETE ON TABLE cat.sch.t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	54	deny	0	DENY SELECT, DELETE ON TABLE cat.sch.t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	55		1	SET ROLE ALL IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	55	setRole	0	SET ROLE ALL IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	56		1	SHOW GRANTS ON BRANCH dev IN TABLE cat.sch.t	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	56	showGrants	0	SHOW GRANTS ON BRANCH dev IN TABLE cat.sch.t	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	57		1	EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+optional	statement	57		2	EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+alternative	statement	57	explain	0	EXPLAIN SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+optional	statement	58		1	EXPLAIN ANALYZE VERBOSE SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+alternative	statement	58	explainAnalyze	0	EXPLAIN ANALYZE SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+alternative	statement	59	showCreateTable	0	SHOW CREATE TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	60	showCreateSchema	0	SHOW CREATE SCHEMA lake.ns	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	61	showCreateView	0	SHOW CREATE VIEW lake.ns.v	supported	accept	reviewed-grammar-path	none
+alternative	statement	62	showCreateMaterializedView	0	SHOW CREATE MATERIALIZED VIEW lake.ns.mv	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	63	showCreateFunction	0	SHOW CREATE FUNCTION lake.ns.fn1	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	64		1	SHOW TABLES FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	64		2	SHOW TABLES FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	64		3	SHOW TABLES FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	64	showTables	0	SHOW TABLES FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	65		1	SHOW SCHEMAS FROM lake LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	65		2	SHOW SCHEMAS FROM lake LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	65		3	SHOW SCHEMAS FROM lake LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	65	showSchemas	0	SHOW SCHEMAS FROM lake LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	66		1	SHOW CATALOGS LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	66		2	SHOW CATALOGS LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	66	showCatalogs	0	SHOW CATALOGS LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	67		1	SHOW COLUMNS FROM lake.s.t LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	67		2	SHOW COLUMNS FROM lake.s.t LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	67	showColumns	0	SHOW COLUMNS FROM lake.s.t LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	68	showStats	0	SHOW STATS FOR lake.ns.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	69	showStatsForQuery	0	SHOW STATS FOR (SELECT id FROM lake.ns.t)	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	70		1	SHOW CURRENT ROLES FROM cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	70		2	SHOW CURRENT ROLES FROM cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	70	showRoles	0	SHOW CURRENT ROLES FROM cat	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	71		1	SHOW ROLE GRANTS FROM cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	71	showRoleGrants	0	SHOW ROLE GRANTS FROM cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	72	showColumns	0	DESCRIBE lake.s.t	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	73	showColumns	0	DESC lake.s.t	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	74		1	SHOW FUNCTIONS FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	74		2	SHOW FUNCTIONS FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	74		3	SHOW FUNCTIONS FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	74	showFunctions	0	SHOW FUNCTIONS FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	75		1	SHOW SESSION LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	75		2	SHOW SESSION LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	75	showSession	0	SHOW SESSION LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	76	setSessionAuthorization	0	SET SESSION AUTHORIZATION "Example User"	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	77	resetSessionAuthorization	0	RESET SESSION AUTHORIZATION	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	78	setSession	0	SET SESSION query_timeout = 30000	supported	accept	reviewed-grammar-path	none
+alternative	statement	79	resetSession	0	RESET SESSION query_timeout	supported	accept	reviewed-grammar-path	none
+optional	statement	80		1	START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	80		2	START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	80	startTransaction	0	START TRANSACTION	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	81		1	COMMIT WORK	supported	accept	reviewed-grammar-path	none
+alternative	statement	81	commit	0	COMMIT	supported	accept	reviewed-grammar-path	none
+optional	statement	82		1	ROLLBACK WORK	supported	accept	reviewed-grammar-path	none
+alternative	statement	82	rollback	0	ROLLBACK	supported	accept	reviewed-grammar-path	none
+alternative	statement	83	prepare	0	PREPARE query_name FROM SELECT ?	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	84	deallocate	0	DEALLOCATE PREPARE query_name	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	85		1	EXECUTE query_name USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	85		2	EXECUTE query_name USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	85	execute	0	EXECUTE query_name USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	86		1	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	86		2	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	86	executeImmediate	0	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	87	describeInput	0	DESCRIBE INPUT query_name	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	88	describeOutput	0	DESCRIBE OUTPUT query_name	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	89	describeQueryOutput	0	DESCRIBE OUTPUT (WITH q AS (VALUES ?) SELECT ? FROM q)	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	90	setPath	0	SET PATH lake.s, t	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	91	setTimeZone	0	SET TIME ZONE LOCAL	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	statement	92		1	UPDATE cat.sch.t@dev SET id = ?	supported	accept	reviewed-grammar-path	none
+optional	statement	92		2	UPDATE cat.sch.t SET id = ?, value = ?	supported	accept	reviewed-grammar-path	none
+optional	statement	92		3	UPDATE cat.sch.t SET id = ? WHERE value = ?	supported	accept	reviewed-grammar-path	none
+alternative	statement	92	update	0	UPDATE cat.sch.t SET id = ?	supported	accept	reviewed-grammar-path	none
+optional	statement	93		1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
+optional	statement	93		2	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
+optional	statement	93		3	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
+alternative	statement	93	merge	0	MERGE INTO t USING s ON TRUE WHEN MATCHED THEN DELETE	supported	accept	reviewed-grammar-path	none
 optional	rootQuery	1		1	WITH FUNCTION x ( ) RETURNS x RETURN 1 , FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	supported	accept	reviewed-grammar-path	none
 optional	rootQuery	1		2	WITH FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	supported	accept	reviewed-grammar-path	none
 alternative	rootQuery	1		0	TABLE x	supported	accept	reviewed-grammar-path	none
@@ -241,21 +240,21 @@ alternative	query	1		0	TABLE x	supported	accept	reviewed-grammar-path	none
 optional	with	1		1	WITH RECURSIVE x AS ( TABLE x ) TABLE x	supported	accept	reviewed-grammar-path	none
 optional	with	1		2	WITH x AS ( TABLE x ) , x AS ( TABLE x ) TABLE x	supported	accept	reviewed-grammar-path	none
 alternative	with	1		0	WITH x AS ( TABLE x ) TABLE x	supported	accept	reviewed-grammar-path	none
-alternative	tableElement	1		0		pending-p09		pending-p09	none
-alternative	tableElement	2		0		pending-p09		pending-p09	none
-optional	columnDefinition	1		1		pending-p09		pending-p09	none
-optional	columnDefinition	1		2		pending-p09		pending-p09	none
-optional	columnDefinition	1		3		pending-p09		pending-p09	none
-optional	columnDefinition	1		4		pending-p09		pending-p09	none
-alternative	columnDefinition	1		0		pending-p09		pending-p09	none
-optional	likeClause	1		1		pending-p09		pending-p09	none
-alternative	likeClause	1		0		pending-p09		pending-p09	none
-alternative	properties	1		0		pending-p09		pending-p09	none
-optional	propertyAssignments	1		1		pending-p09		pending-p09	none
-alternative	propertyAssignments	1		0		pending-p09		pending-p09	none
-alternative	property	1		0		pending-p09		pending-p09	none
-alternative	propertyValue	1	defaultPropertyValue	0		pending-p09		pending-p09	none
-alternative	propertyValue	2	nonDefaultPropertyValue	0		pending-p09		pending-p09	none
+alternative	tableElement	1		0	CREATE TABLE lake.ns.t (id bigint)	supported	accept	reviewed-grammar-path	none
+alternative	tableElement	2		0	CREATE TABLE lake.ns.t (LIKE lake.ns.source_table)	supported	accept	reviewed-grammar-path	none
+optional	columnDefinition	1		1	CREATE TABLE lake.ns.t (id bigint DEFAULT 1)	supported	accept	reviewed-grammar-path	none
+optional	columnDefinition	1		2	CREATE TABLE lake.ns.t (id bigint NOT NULL)	supported	accept	reviewed-grammar-path	none
+optional	columnDefinition	1		3	CREATE TABLE lake.ns.t (id bigint COMMENT 'note')	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	columnDefinition	1		4	CREATE TABLE lake.ns.t (id bigint WITH (example_option = 1))	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	columnDefinition	1		0	CREATE TABLE lake.ns.t (id bigint)	supported	accept	reviewed-grammar-path	none
+optional	likeClause	1		1	CREATE TABLE lake.ns.t (LIKE lake.ns.source_table EXCLUDING PROPERTIES)	supported	accept	reviewed-grammar-path	none
+alternative	likeClause	1		0	CREATE TABLE lake.ns.t (LIKE lake.ns.source_table)	supported	accept	reviewed-grammar-path	none
+alternative	properties	1		0	CREATE TABLE lake.ns.t (id bigint) WITH (format_version = 3)	supported	accept	reviewed-grammar-path	none
+optional	propertyAssignments	1		1	CREATE TABLE lake.ns.t (id bigint) WITH (format = 'PARQUET', format_version = 3)	supported	accept	reviewed-grammar-path	none
+alternative	propertyAssignments	1		0	ALTER TABLE lake.ns.t SET PROPERTIES format = 'PARQUET'	supported	accept	reviewed-grammar-path	none
+alternative	property	1		0	ALTER TABLE lake.ns.t SET PROPERTIES format = 'PARQUET'	supported	accept	reviewed-grammar-path	none
+alternative	propertyValue	1	defaultPropertyValue	0	ALTER TABLE lake.ns.t SET PROPERTIES format = DEFAULT	supported	accept	reviewed-grammar-path	none
+alternative	propertyValue	2	nonDefaultPropertyValue	0	ALTER TABLE lake.ns.t SET PROPERTIES format = 'PARQUET'	supported	accept	reviewed-grammar-path	none
 optional	queryNoWith	1		1	TABLE x ORDER BY ?	supported	accept	reviewed-grammar-path	none
 optional	queryNoWith	1		2	TABLE x OFFSET 1 ROW	supported	accept	reviewed-grammar-path	none
 optional	queryNoWith	1		3	TABLE x OFFSET 1	supported	accept	reviewed-grammar-path	none
@@ -574,7 +573,7 @@ alternative	primaryExpression	24	subscript	0	VALUES ? [ ? ]	supported	accept	rev
 alternative	primaryExpression	25	arrayWildcardSubscript	0	VALUES ? [ * ]	parsed-not-supported	accept	reviewed-grammar-path	upstream-formatter-missing
 alternative	primaryExpression	26	columnReference	0	VALUES x	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	27	dereference	0	VALUES ? . x	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	28	stringLiteralDereference	0	VALUES ? . 'x'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	28	stringLiteralDereference	0	VALUES ? . 'x'	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	29	currentDate	0	VALUES CURRENT_DATE	supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	30		1	VALUES CURRENT_TIME ( 1 )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	30	currentTime	0	VALUES CURRENT_TIME	supported	accept	reviewed-grammar-path	none
@@ -744,16 +743,16 @@ alternative	simpleWhenClause	1		0	VALUES CASE ? WHEN < ? THEN ? END	supported	ac
 alternative	simpleWhenClause	2		0	VALUES CASE ? WHEN ? THEN ? END	supported	accept	reviewed-grammar-path	none
 alternative	searchedWhenClause	1		0	VALUES CASE WHEN ? THEN ? END	supported	accept	reviewed-grammar-path	none
 alternative	filter	1		0	VALUES x ( ) FILTER ( WHERE ? )	supported	accept	reviewed-grammar-path	none
-optional	mergeCase	1		1		pending-p09		pending-p09	none
-optional	mergeCase	1		2		pending-p09		pending-p09	none
-alternative	mergeCase	1	mergeUpdate	0		pending-p09		pending-p09	none
-optional	mergeCase	2		1		pending-p09		pending-p09	none
-alternative	mergeCase	2	mergeDelete	0		pending-p09		pending-p09	none
-optional	mergeCase	3		1		pending-p09		pending-p09	none
-optional	mergeCase	3		2		pending-p09		pending-p09	none
-optional	mergeCase	3		3		pending-p09		pending-p09	none
-optional	mergeCase	3		4		pending-p09		pending-p09	none
-alternative	mergeCase	3	mergeInsert	0		pending-p09		pending-p09	none
+optional	mergeCase	1		1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN UPDATE SET id = ?, v = ?	supported	accept	reviewed-grammar-path	none
+optional	mergeCase	1		2	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN UPDATE SET id = ?, v = ?	supported	accept	reviewed-grammar-path	none
+alternative	mergeCase	1	mergeUpdate	0	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN UPDATE SET id = ?, v = ?	supported	accept	reviewed-grammar-path	none
+optional	mergeCase	2		1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
+alternative	mergeCase	2	mergeDelete	0	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
+optional	mergeCase	3		1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id, v) VALUES (?, ?)	supported	accept	reviewed-grammar-path	none
+optional	mergeCase	3		2	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id, v) VALUES (?, ?)	supported	accept	reviewed-grammar-path	none
+optional	mergeCase	3		3	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id, v) VALUES (?, ?)	supported	accept	reviewed-grammar-path	none
+optional	mergeCase	3		4	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id, v) VALUES (?, ?)	supported	accept	reviewed-grammar-path	none
+alternative	mergeCase	3	mergeInsert	0	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id, v) VALUES (?, ?)	supported	accept	reviewed-grammar-path	none
 alternative	over	1		0	VALUES x OVER x	supported	accept	reviewed-grammar-path	none
 optional	windowFrame	1		1	VALUES x OVER ( MEASURES ? AS x , ? AS x ROWS CURRENT ROW )	supported	accept	reviewed-grammar-path	none
 optional	windowFrame	1		2	VALUES x OVER ( MEASURES ? AS x ROWS CURRENT ROW )	supported	accept	reviewed-grammar-path	none
@@ -787,7 +786,7 @@ alternative	rowPattern	3	patternAlternation	0	VALUES x OVER ( ROWS CURRENT ROW P
 alternative	patternPrimary	1	patternVariable	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( x ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	patternPrimary	2	emptyPattern	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( ( ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	patternPrimary	3		1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( PERMUTE ( $ , $ ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	patternPrimary	3	patternPermutation	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( PERMUTE ( $ ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	patternPrimary	3	patternPermutation	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( PERMUTE ( $ , A ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	patternPrimary	4	groupedPattern	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( ( $ ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	patternPrimary	5	partitionStartAnchor	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( ^ ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	patternPrimary	6	partitionEndAnchor	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ ) )	parsed-not-supported	accept	reviewed-grammar-path	none
@@ -804,21 +803,21 @@ optional	patternQuantifier	5		1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { 1
 optional	patternQuantifier	5		2	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { , 1 } ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	patternQuantifier	5		3	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { , } ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	patternQuantifier	5	rangeQuantifier	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { , } ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	updateAssignment	1		0		pending-p09		pending-p09	none
-alternative	explainOption	1	explainFormat	0		pending-p09		pending-p09	none
-alternative	explainOption	2	explainType	0		pending-p09		pending-p09	none
-alternative	transactionMode	1	isolationLevel	0		pending-p09		pending-p09	none
-alternative	transactionMode	2	transactionAccessMode	0		pending-p09		pending-p09	none
-alternative	levelOfIsolation	1	readUncommitted	0		pending-p09		pending-p09	none
-alternative	levelOfIsolation	2	readCommitted	0		pending-p09		pending-p09	none
-alternative	levelOfIsolation	3	repeatableRead	0		pending-p09		pending-p09	none
-alternative	levelOfIsolation	4	serializable	0		pending-p09		pending-p09	none
-alternative	argument	1	positionalArgument	0		pending-p09		pending-p09	none
-alternative	argument	2	namedArgument	0		pending-p09		pending-p09	none
-alternative	pathElement	1	qualifiedArgument	0		pending-p09		pending-p09	none
-alternative	pathElement	2	unqualifiedArgument	0		pending-p09		pending-p09	none
-optional	pathSpecification	1		1		pending-p09		pending-p09	none
-alternative	pathSpecification	1		0		pending-p09		pending-p09	none
+alternative	updateAssignment	1		0	UPDATE cat.sch.t SET "where" = ?	supported	accept	reviewed-grammar-path	none
+alternative	explainOption	1	explainFormat	0	EXPLAIN (FORMAT TEXT) SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+alternative	explainOption	2	explainType	0	EXPLAIN (TYPE DISTRIBUTED) SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+alternative	transactionMode	1	isolationLevel	0	START TRANSACTION ISOLATION LEVEL SERIALIZABLE	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	transactionMode	2	transactionAccessMode	0	START TRANSACTION READ ONLY	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	levelOfIsolation	1	readUncommitted	0	START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	levelOfIsolation	2	readCommitted	0	START TRANSACTION ISOLATION LEVEL READ COMMITTED	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	levelOfIsolation	3	repeatableRead	0	START TRANSACTION ISOLATION LEVEL REPEATABLE READ	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	levelOfIsolation	4	serializable	0	START TRANSACTION ISOLATION LEVEL SERIALIZABLE	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	argument	1	positionalArgument	0	CALL c.system.proc(?)	supported	accept	reviewed-grammar-path	none
+alternative	argument	2	namedArgument	0	CALL c.system.proc(x => ?)	supported	accept	reviewed-grammar-path	none
+alternative	pathElement	1	qualifiedArgument	0	SET PATH lake.s	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	pathElement	2	unqualifiedArgument	0	SET PATH s	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	pathSpecification	1		1	SET PATH lake.s, t	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	pathSpecification	1		0	SET PATH lake.s, t	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	functionSpecification	1		1	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
 alternative	functionSpecification	1		0	@file:coverage-sql/routine-return.sql	supported	accept	reviewed-grammar-path	none
 alternative	functionDefinition	1		0	@file:coverage-sql/routine-external.sql	supported	accept	reviewed-grammar-path	none
@@ -863,42 +862,42 @@ optional	variableDeclaration	1		1	@file:coverage-sql/routine-declarations.sql	su
 optional	variableDeclaration	1		2	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
 alternative	variableDeclaration	1		0	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
 alternative	sqlStatementList	1		0	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
-alternative	privilege	1		0		pending-p09		pending-p09	none
-alternative	privilege	2		0		pending-p09		pending-p09	none
-alternative	privilege	3		0		pending-p09		pending-p09	none
-alternative	privilege	4		0		pending-p09		pending-p09	none
-alternative	privilege	5		0		pending-p09		pending-p09	none
-alternative	privilege	6		0		pending-p09		pending-p09	none
-alternative	privilege	7		0		pending-p09		pending-p09	none
-alternative	entityKind	1		0		pending-p09		pending-p09	none
-alternative	entityKind	2		0		pending-p09		pending-p09	none
-alternative	entityKind	3		0		pending-p09		pending-p09	none
-optional	grantObject	1		1		pending-p09		pending-p09	none
-optional	grantObject	1		2		pending-p09		pending-p09	none
-alternative	grantObject	1		0		pending-p09		pending-p09	none
-alternative	ownedEntityKind	1		0		pending-p09		pending-p09	none
-alternative	ownedEntityKind	2		0		pending-p09		pending-p09	none
-alternative	ownedEntityKind	3		0		pending-p09		pending-p09	none
-alternative	ownedEntityKind	4		0		pending-p09		pending-p09	none
-alternative	ownedEntityKind	5		0		pending-p09		pending-p09	none
+alternative	privilege	1		0	DENY CREATE ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilege	2		0	DENY SELECT ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilege	3		0	DENY DELETE ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilege	4		0	DENY INSERT ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilege	5		0	DENY UPDATE ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilege	6		0	DENY custom ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilege	7		0	DENY CREATE BRANCH ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	entityKind	1		0	SHOW GRANTS ON TABLE a.b	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	entityKind	2		0	SHOW GRANTS ON SCHEMA a.b	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	entityKind	3		0	SHOW GRANTS ON custom a.b	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	grantObject	1		1	SHOW GRANTS ON BRANCH dev IN TABLE cat.sch.t	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	grantObject	1		2	SHOW GRANTS ON BRANCH dev IN TABLE cat.sch.t	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	grantObject	1		0	SHOW GRANTS ON BRANCH dev IN TABLE cat.sch.t	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	ownedEntityKind	1		0	ALTER TABLE a.b SET AUTHORIZATION ROLE reader	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	ownedEntityKind	2		0	ALTER SCHEMA a.b SET AUTHORIZATION ROLE reader	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	ownedEntityKind	3		0	ALTER VIEW a.b SET AUTHORIZATION ROLE reader	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	ownedEntityKind	4		0	ALTER MATERIALIZED VIEW a.b SET AUTHORIZATION ROLE reader	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	ownedEntityKind	5		0	ALTER custom a.b SET AUTHORIZATION ROLE reader	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	qualifiedName	1		1	SELECT * FROM x . x	supported	accept	reviewed-grammar-path	none
 alternative	qualifiedName	1		0	SELECT * FROM x	supported	accept	reviewed-grammar-path	none
 alternative	queryPeriod	1		0	SELECT * FROM x FOR VERSION AS OF ?	supported	accept	reviewed-grammar-path	none
 alternative	rangeType	1		0	SELECT * FROM x FOR TIMESTAMP AS OF ?	supported	accept	reviewed-grammar-path	none
 alternative	rangeType	2		0	SELECT * FROM x FOR VERSION AS OF ?	supported	accept	reviewed-grammar-path	none
-alternative	grantor	1	specifiedPrincipal	0		pending-p09		pending-p09	none
-alternative	grantor	2	currentUserGrantor	0		pending-p09		pending-p09	none
-alternative	grantor	3	currentRoleGrantor	0		pending-p09		pending-p09	none
-alternative	principal	1	unspecifiedPrincipal	0		pending-p09		pending-p09	none
-alternative	principal	2	userPrincipal	0		pending-p09		pending-p09	none
-alternative	principal	3	rolePrincipal	0		pending-p09		pending-p09	none
-alternative	privilegeOrRole	1		0		pending-p09		pending-p09	none
-alternative	privilegeOrRole	2		0		pending-p09		pending-p09	none
-alternative	privilegeOrRole	3		0		pending-p09		pending-p09	none
-alternative	privilegeOrRole	4		0		pending-p09		pending-p09	none
-alternative	privilegeOrRole	5		0		pending-p09		pending-p09	none
-alternative	privilegeOrRole	6		0		pending-p09		pending-p09	none
-alternative	privilegeOrRole	7		0		pending-p09		pending-p09	none
+alternative	grantor	1	specifiedPrincipal	0	CREATE ROLE reader WITH ADMIN USER owner	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	grantor	2	currentUserGrantor	0	CREATE ROLE reader WITH ADMIN CURRENT_USER	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	grantor	3	currentRoleGrantor	0	CREATE ROLE reader WITH ADMIN CURRENT_ROLE	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	principal	1	unspecifiedPrincipal	0	ALTER TABLE a.b SET AUTHORIZATION u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	principal	2	userPrincipal	0	ALTER TABLE a.b SET AUTHORIZATION USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	principal	3	rolePrincipal	0	ALTER TABLE a.b SET AUTHORIZATION ROLE r	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilegeOrRole	1		0	GRANT CREATE ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilegeOrRole	2		0	GRANT SELECT ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilegeOrRole	3		0	GRANT DELETE ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilegeOrRole	4		0	GRANT INSERT ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilegeOrRole	5		0	GRANT UPDATE ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilegeOrRole	6		0	GRANT custom ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	privilegeOrRole	7		0	GRANT CREATE BRANCH ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	identifier	1	unquotedIdentifier	0	SELECT x	supported	accept	reviewed-grammar-path	none
 alternative	identifier	2	quotedIdentifier	0	SELECT "x"	supported	accept	reviewed-grammar-path	none
 alternative	identifier	3	unquotedIdentifier	0	SELECT AT	supported	accept	reviewed-grammar-path	none
@@ -912,8 +911,8 @@ optional	number	2		1	VALUES - 1e2	supported	accept	reviewed-grammar-path	none
 alternative	number	2	doubleLiteral	0	VALUES 1e2	supported	accept	reviewed-grammar-path	none
 optional	number	3		1	VALUES - 1	supported	accept	reviewed-grammar-path	none
 alternative	number	3	integerLiteral	0	VALUES 1	supported	accept	reviewed-grammar-path	none
-alternative	authorizationUser	1	identifierUser	0		pending-p09		pending-p09	none
-alternative	authorizationUser	2	stringUser	0		pending-p09		pending-p09	none
+alternative	authorizationUser	1	identifierUser	0	SET SESSION AUTHORIZATION "Example User"	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	authorizationUser	2	stringUser	0	SET SESSION AUTHORIZATION 'Example User'	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	nonReserved	1		0	SELECT ABSENT	supported	accept	reviewed-grammar-path	none
 alternative	nonReserved	2		0	SELECT ADD	supported	accept	reviewed-grammar-path	none
 alternative	nonReserved	3		0	SELECT ADMIN	supported	accept	reviewed-grammar-path	none
@@ -1832,185 +1831,185 @@ keyword	WRAPPER	0	nonreserved	0	SELECT 1 AS WRAPPER	supported	nonreserved	review
 keyword	WRITE	0	nonreserved	0	SELECT 1 AS WRITE	supported	nonreserved	reviewed-keyword-rule	none
 keyword	YEAR	0	nonreserved	0	SELECT 1 AS YEAR	supported	nonreserved	reviewed-keyword-rule	none
 keyword	ZONE	0	nonreserved	0	SELECT 1 AS ZONE	supported	nonreserved	reviewed-keyword-rule	none
-alternative	statement	4		g1.b1		pending-p09		pending-p09	none
-alternative	statement	4		g2.b1		pending-p09		pending-p09	none
-alternative	statement	4		g3.b1		pending-p09		pending-p09	none
-alternative	statement	4		g4.b1		pending-p09		pending-p09	none
-alternative	statement	5		g1.b1		pending-p09		pending-p09	none
-alternative	statement	5		g2.b1		pending-p09		pending-p09	none
-alternative	statement	5		g2.b2		pending-p09		pending-p09	none
-alternative	statement	6		g1.b1		pending-p09		pending-p09	none
-alternative	statement	6		g2.b1		pending-p09		pending-p09	none
-alternative	statement	6		g3.b1		pending-p09		pending-p09	none
-alternative	statement	7		g1.b1		pending-p09		pending-p09	none
-alternative	statement	7		g2.b1		pending-p09		pending-p09	none
-alternative	statement	7		g2.b2		pending-p09		pending-p09	none
-alternative	statement	9		g1.b1		pending-p09		pending-p09	none
-alternative	statement	9		g2.b1		pending-p09		pending-p09	none
-alternative	statement	9		g3.b1		pending-p09		pending-p09	none
-alternative	statement	9		g4.b1		pending-p09		pending-p09	none
-alternative	statement	9		g5.b1		pending-p09		pending-p09	none
-alternative	statement	9		g5.b2		pending-p09		pending-p09	none
-alternative	statement	9		g6.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	9		g6.b1		pending-p09		pending-p09	none
-alternative	statement	10		g1.b1		pending-p09		pending-p09	none
-alternative	statement	10		g2.b1		pending-p09		pending-p09	none
-alternative	statement	10		g3.b1		pending-p09		pending-p09	none
-alternative	statement	10		g4.b1		pending-p09		pending-p09	none
-alternative	statement	10		g5.b1		pending-p09		pending-p09	none
-alternative	statement	11		g1.b1		pending-p09		pending-p09	none
-alternative	statement	12		g1.b1		pending-p09		pending-p09	none
-alternative	statement	13		g1.b1		pending-p09		pending-p09	none
-alternative	statement	13		g2.b1		pending-p09		pending-p09	none
-alternative	statement	15		g1.b1		pending-p09		pending-p09	none
-alternative	statement	15		g1.b2		pending-p09		pending-p09	none
-alternative	statement	16		g1.b1		pending-p09		pending-p09	none
-alternative	statement	16		g1.b2		pending-p09		pending-p09	none
-alternative	statement	17		g1.b1		pending-p09		pending-p09	none
-alternative	statement	17		g1.b2		pending-p09		pending-p09	none
-alternative	statement	18		g1.b1		pending-p09		pending-p09	none
-alternative	statement	18		g1.b2		pending-p09		pending-p09	none
-alternative	statement	19		g1.b1		pending-p09		pending-p09	none
-alternative	statement	20		g1.b1		pending-p09		pending-p09	none
-alternative	statement	20		g2.b1		pending-p09		pending-p09	none
-alternative	statement	20		g3.b1		pending-p09		pending-p09	none
-alternative	statement	20		g3.b2		pending-p09		pending-p09	none
-alternative	statement	20		g3.b3		pending-p09		pending-p09	none
-alternative	statement	21		g1.b1		pending-p09		pending-p09	none
-alternative	statement	21		g2.b1		pending-p09		pending-p09	none
-alternative	statement	22		g1.b1		pending-p09		pending-p09	none
-alternative	statement	22		g2.b1		pending-p09		pending-p09	none
-alternative	statement	23		g1.b1		pending-p09		pending-p09	none
-alternative	statement	24		g1.b1		pending-p09		pending-p09	none
-alternative	statement	25		g1.b1		pending-p09		pending-p09	none
-alternative	statement	26		g1.b1		pending-p09		pending-p09	none
-alternative	statement	28		g1.b1.g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	28		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	28		g1.b1		pending-p09		pending-p09	none
-alternative	statement	28		g2.b1		pending-p09		pending-p09	none
-alternative	statement	30		g1.b1		pending-p09		pending-p09	none
-alternative	statement	31		g1.b1		pending-p09		pending-p09	none
-alternative	statement	31		g2.b1		pending-p09		pending-p09	none
-alternative	statement	31		g3.b1		pending-p09		pending-p09	none
-alternative	statement	31		g4.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	31		g4.b1.g1.b2		pending-p09		pending-p09	none
-alternative	statement	31		g4.b1		pending-p09		pending-p09	none
-alternative	statement	31		g5.b1		pending-p09		pending-p09	none
-alternative	statement	31		g6.b1		pending-p09		pending-p09	none
-alternative	statement	32		g1.b1		pending-p09		pending-p09	none
-alternative	statement	32		g2.b1		pending-p09		pending-p09	none
-alternative	statement	32		g3.b1		pending-p09		pending-p09	none
-alternative	statement	32		g4.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	32		g4.b1.g1.b2		pending-p09		pending-p09	none
-alternative	statement	32		g4.b1		pending-p09		pending-p09	none
-alternative	statement	32		g5.b1		pending-p09		pending-p09	none
-alternative	statement	34		g1.b1		pending-p09		pending-p09	none
-alternative	statement	35		g1.b1		pending-p09		pending-p09	none
-alternative	statement	37		g1.b1.g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	37		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	37		g1.b1		pending-p09		pending-p09	none
-alternative	statement	37		g2.b1		pending-p09		pending-p09	none
-alternative	statement	38		g1.b1		pending-p09		pending-p09	none
-alternative	statement	41		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	41		g1.b1		pending-p09		pending-p09	none
-alternative	statement	42		g1.b1		pending-p09		pending-p09	none
-alternative	statement	43		g1.b1		pending-p09		pending-p09	none
-alternative	statement	44		g1.b1		pending-p09		pending-p09	none
-alternative	statement	44		g2.b1		pending-p09		pending-p09	none
-alternative	statement	44		g3.b1		pending-p09		pending-p09	none
-alternative	statement	44		g4.b1		pending-p09		pending-p09	none
-alternative	statement	45		g1.b1		pending-p09		pending-p09	none
-alternative	statement	47		g1.b1		pending-p09		pending-p09	none
-alternative	statement	47		g1.b2		pending-p09		pending-p09	none
-alternative	statement	48		g1.b1		pending-p09		pending-p09	none
-alternative	statement	48		g2.b1		pending-p09		pending-p09	none
-alternative	statement	49		g1.b1		pending-p09		pending-p09	none
-alternative	statement	49		g2.b1		pending-p09		pending-p09	none
-alternative	statement	50		g1.b1		pending-p09		pending-p09	none
-alternative	statement	50		g2.b1		pending-p09		pending-p09	none
-alternative	statement	50		g3.b1		pending-p09		pending-p09	none
-alternative	statement	50		g4.b1		pending-p09		pending-p09	none
-alternative	statement	50		g5.b1		pending-p09		pending-p09	none
-alternative	statement	51		g1.b1.g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	51		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	51		g1.b1		pending-p09		pending-p09	none
-alternative	statement	51		g1.b2		pending-p09		pending-p09	none
-alternative	statement	51		g2.b1		pending-p09		pending-p09	none
-alternative	statement	52		g1.b1		pending-p09		pending-p09	none
-alternative	statement	52		g2.b1		pending-p09		pending-p09	none
-alternative	statement	52		g3.b1		pending-p09		pending-p09	none
-alternative	statement	52		g4.b1		pending-p09		pending-p09	none
-alternative	statement	52		g5.b1		pending-p09		pending-p09	none
-alternative	statement	53		g1.b1		pending-p09		pending-p09	none
-alternative	statement	53		g2.b1.g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	53		g2.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	53		g2.b1		pending-p09		pending-p09	none
-alternative	statement	53		g2.b2		pending-p09		pending-p09	none
-alternative	statement	54		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	54		g1.b1		pending-p09		pending-p09	none
-alternative	statement	54		g1.b2		pending-p09		pending-p09	none
-alternative	statement	55		g1.b1		pending-p09		pending-p09	none
-alternative	statement	55		g1.b2		pending-p09		pending-p09	none
-alternative	statement	55		g1.b3		pending-p09		pending-p09	none
-alternative	statement	55		g2.b1		pending-p09		pending-p09	none
-alternative	statement	56		g1.b1		pending-p09		pending-p09	none
-alternative	statement	57		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	57		g1.b1		pending-p09		pending-p09	none
-alternative	statement	64		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	64		g1.b1.g1.b2		pending-p09		pending-p09	none
-alternative	statement	64		g1.b1		pending-p09		pending-p09	none
-alternative	statement	64		g2.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	64		g2.b1		pending-p09		pending-p09	none
-alternative	statement	65		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	65		g1.b1.g1.b2		pending-p09		pending-p09	none
-alternative	statement	65		g1.b1		pending-p09		pending-p09	none
-alternative	statement	65		g2.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	65		g2.b1		pending-p09		pending-p09	none
-alternative	statement	66		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	66		g1.b1		pending-p09		pending-p09	none
-alternative	statement	67		g1.b1		pending-p09		pending-p09	none
-alternative	statement	67		g1.b2		pending-p09		pending-p09	none
-alternative	statement	67		g2.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	67		g2.b1		pending-p09		pending-p09	none
-alternative	statement	70		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	70		g1.b1.g1.b2		pending-p09		pending-p09	none
-alternative	statement	70		g1.b1		pending-p09		pending-p09	none
-alternative	statement	71		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	71		g1.b1.g1.b2		pending-p09		pending-p09	none
-alternative	statement	71		g1.b1		pending-p09		pending-p09	none
-alternative	statement	74		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	74		g1.b1.g1.b2		pending-p09		pending-p09	none
-alternative	statement	74		g1.b1		pending-p09		pending-p09	none
-alternative	statement	74		g2.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	74		g2.b1		pending-p09		pending-p09	none
-alternative	statement	75		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	75		g1.b1		pending-p09		pending-p09	none
-alternative	statement	80		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	80		g1.b1		pending-p09		pending-p09	none
-alternative	statement	85		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	85		g1.b1		pending-p09		pending-p09	none
-alternative	statement	86		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	statement	86		g1.b1		pending-p09		pending-p09	none
-alternative	statement	91		g1.b1		pending-p09		pending-p09	none
-alternative	statement	91		g1.b2		pending-p09		pending-p09	none
-alternative	statement	92		g1.b1		pending-p09		pending-p09	none
-alternative	statement	92		g2.b1		pending-p09		pending-p09	none
-alternative	statement	92		g3.b1		pending-p09		pending-p09	none
-alternative	statement	93		g1.b1		pending-p09		pending-p09	none
-alternative	statement	93		g2.b1		pending-p09		pending-p09	none
+alternative	statement	4		g1.b1	CREATE CATALOG IF NOT EXISTS lake USING iceberg WITH ("iceberg.catalog.warehouse" = 'file:///tmp/p09-coverage')	supported	accept	reviewed-grammar-path	none
+alternative	statement	4		g2.b1	CREATE CATALOG lake USING iceberg COMMENT 'note' WITH ("iceberg.catalog.warehouse" = 'file:///tmp/p09-coverage')	supported	accept	reviewed-grammar-path	none
+alternative	statement	4		g3.b1	CREATE CATALOG lake USING iceberg AUTHORIZATION USER operator	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	4		g4.b1	CREATE CATALOG lake USING iceberg WITH ("iceberg.catalog.warehouse" = 'file:///tmp/p09-coverage')	supported	accept	reviewed-grammar-path	none
+alternative	statement	5		g1.b1	DROP CATALOG IF EXISTS lake RESTRICT	supported	accept	reviewed-grammar-path	none
+alternative	statement	5		g2.b1	DROP CATALOG lake CASCADE	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	5		g2.b2	DROP CATALOG IF EXISTS lake RESTRICT	supported	accept	reviewed-grammar-path	none
+alternative	statement	6		g1.b1	CREATE SCHEMA IF NOT EXISTS lake.ns	supported	accept	reviewed-grammar-path	none
+alternative	statement	6		g2.b1	CREATE SCHEMA lake.ns AUTHORIZATION ROLE operator	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	6		g3.b1	CREATE SCHEMA lake.ns WITH (location = 's3://warehouse/ns')	supported	accept	reviewed-grammar-path	none
+alternative	statement	7		g1.b1	DROP SCHEMA IF EXISTS lake.ns RESTRICT	supported	accept	reviewed-grammar-path	none
+alternative	statement	7		g2.b1	DROP SCHEMA lake.ns CASCADE	supported	accept	reviewed-grammar-path	none
+alternative	statement	7		g2.b2	DROP SCHEMA IF EXISTS lake.ns RESTRICT	supported	accept	reviewed-grammar-path	none
+alternative	statement	9		g1.b1	CREATE OR REPLACE TABLE lake.ns.dst AS SELECT CAST(1 AS bigint) AS id	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	9		g2.b1	CREATE TABLE IF NOT EXISTS lake.ns.dst AS SELECT CAST(1 AS bigint) AS id	supported	accept	reviewed-grammar-path	none
+alternative	statement	9		g3.b1	CREATE TABLE lake.ns.dst COMMENT 'note' AS SELECT CAST(1 AS bigint) AS id	supported	accept	reviewed-grammar-path	none
+alternative	statement	9		g4.b1	CREATE TABLE lake.ns.dst WITH (format_version = 3) AS SELECT CAST(1 AS bigint) AS id	supported	accept	reviewed-grammar-path	none
+alternative	statement	9		g5.b1	CREATE TABLE lake.ns.dst AS SELECT CAST(1 AS bigint) AS id	supported	accept	reviewed-grammar-path	none
+alternative	statement	9		g5.b2	CREATE TABLE lake.ns.dst AS (SELECT CAST(1 AS bigint) AS id)	supported	accept	reviewed-grammar-path	none
+alternative	statement	9		g6.b1.g1.b1	CREATE TABLE lake.ns.dst AS SELECT CAST(1 AS bigint) AS id WITH NO DATA	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	9		g6.b1	CREATE TABLE lake.ns.dst AS SELECT CAST(1 AS bigint) AS id WITH DATA	supported	accept	reviewed-grammar-path	none
+alternative	statement	10		g1.b1	CREATE OR REPLACE TABLE lake.ns.t (id bigint)	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	10		g2.b1	CREATE TABLE IF NOT EXISTS lake.ns.t (id bigint)	supported	accept	reviewed-grammar-path	none
+alternative	statement	10		g3.b1	CREATE TABLE lake.ns.t (id bigint, k bigint)	supported	accept	reviewed-grammar-path	none
+alternative	statement	10		g4.b1	CREATE TABLE lake.ns.t (id bigint) COMMENT 'note'	supported	accept	reviewed-grammar-path	none
+alternative	statement	10		g5.b1	CREATE TABLE lake.ns.t (id bigint) WITH (format_version = 3)	supported	accept	reviewed-grammar-path	none
+alternative	statement	11		g1.b1	DROP TABLE IF EXISTS lake.ns.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	12		g1.b1	INSERT INTO lake.ns.t @dev VALUES (1)	supported	accept	reviewed-grammar-path	none
+alternative	statement	13		g1.b1	DELETE FROM lake.ns.t @dev	supported	accept	reviewed-grammar-path	none
+alternative	statement	13		g2.b1	DELETE FROM lake.ns.t WHERE id = 1	supported	accept	reviewed-grammar-path	none
+alternative	statement	15		g1.b1	COMMENT ON TABLE lake.ns.t IS 'note'	supported	accept	reviewed-grammar-path	none
+alternative	statement	15		g1.b2	COMMENT ON TABLE lake.ns.t IS NULL	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	16		g1.b1	COMMENT ON VIEW lake.ns.v IS 'note'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	16		g1.b2	COMMENT ON VIEW lake.ns.v IS NULL	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	17		g1.b1	COMMENT ON MATERIALIZED VIEW lake.ns.mv IS 'note'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	17		g1.b2	COMMENT ON MATERIALIZED VIEW lake.ns.mv IS NULL	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	18		g1.b1	COMMENT ON COLUMN lake.ns.t.id IS 'note'	supported	accept	reviewed-grammar-path	none
+alternative	statement	18		g1.b2	COMMENT ON COLUMN lake.ns.t.id IS NULL	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	19		g1.b1	ALTER TABLE IF EXISTS lake.ns.t RENAME TO lake.ns.renamed	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	20		g1.b1	ALTER TABLE IF EXISTS lake.ns.t ADD COLUMN added bigint	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	20		g2.b1	ALTER TABLE lake.ns.t ADD COLUMN IF NOT EXISTS added bigint	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	20		g3.b1	ALTER TABLE lake.ns.t ADD COLUMN added bigint FIRST	supported	accept	reviewed-grammar-path	none
+alternative	statement	20		g3.b2	ALTER TABLE lake.ns.t ADD COLUMN added bigint LAST	supported	accept	reviewed-grammar-path	none
+alternative	statement	20		g3.b3	ALTER TABLE lake.ns.t ADD COLUMN added bigint AFTER id	supported	accept	reviewed-grammar-path	none
+alternative	statement	21		g1.b1	ALTER TABLE IF EXISTS lake.ns.t RENAME COLUMN id TO id2	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	21		g2.b1	ALTER TABLE lake.ns.t RENAME COLUMN IF EXISTS id TO id2	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	22		g1.b1	ALTER TABLE IF EXISTS lake.ns.t DROP COLUMN id	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	22		g2.b1	ALTER TABLE lake.ns.t DROP COLUMN IF EXISTS id	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	23		g1.b1	ALTER TABLE IF EXISTS lake.ns.t ALTER COLUMN id SET DEFAULT 1	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	24		g1.b1	ALTER TABLE IF EXISTS lake.ns.t ALTER COLUMN id DROP DEFAULT	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	25		g1.b1	ALTER TABLE IF EXISTS lake.ns.t ALTER COLUMN id SET DATA TYPE bigint	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	26		g1.b1	ALTER TABLE IF EXISTS lake.ns.t ALTER COLUMN id DROP NOT NULL	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	28		g1.b1.g1.b1.g1.b1	ALTER TABLE lake.ns.t EXECUTE expire_snapshots(retention_threshold => '7d', retain_last => 2)	supported	accept	reviewed-grammar-path	none
+alternative	statement	28		g1.b1.g1.b1	ALTER TABLE lake.ns.t EXECUTE expire_snapshots(retain_last => 2)	supported	accept	reviewed-grammar-path	none
+alternative	statement	28		g1.b1	ALTER TABLE lake.ns.t EXECUTE optimize_manifests()	supported	accept	reviewed-grammar-path	none
+alternative	statement	28		g2.b1	ALTER TABLE lake.ns.t EXECUTE optimize_manifests WHERE id > 0	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	30		g1.b1	ANALYZE lake.ns.t WITH (columns = ARRAY['id'])	supported	accept	reviewed-grammar-path	none
+alternative	statement	31		g1.b1	CREATE OR REPLACE MATERIALIZED VIEW m AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	31		g2.b1	CREATE MATERIALIZED VIEW IF NOT EXISTS m AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+alternative	statement	31		g3.b1	CREATE MATERIALIZED VIEW m GRACE PERIOD INTERVAL '1' DAY AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	31		g4.b1.g1.b1	CREATE MATERIALIZED VIEW m WHEN STALE INLINE AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	31		g4.b1.g1.b2	CREATE MATERIALIZED VIEW m WHEN STALE FAIL AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	31		g4.b1	CREATE MATERIALIZED VIEW m WHEN STALE INLINE AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	31		g5.b1	CREATE MATERIALIZED VIEW m COMMENT 'note' AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	31		g6.b1	CREATE MATERIALIZED VIEW m WITH (refresh_policy = 'MANUAL') AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+alternative	statement	32		g1.b1	CREATE OR REPLACE VIEW v AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+alternative	statement	32		g2.b1	CREATE VIEW IF NOT EXISTS v AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+alternative	statement	32		g3.b1	CREATE VIEW v COMMENT 'note' AS SELECT 1 AS x	supported	accept	reviewed-grammar-path	none
+alternative	statement	32		g4.b1.g1.b1	CREATE VIEW v SECURITY INVOKER AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	32		g4.b1.g1.b2	CREATE VIEW v SECURITY DEFINER AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	32		g4.b1	CREATE VIEW v SECURITY INVOKER AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	32		g5.b1	CREATE VIEW v WITH (a = DEFAULT) AS SELECT 1 AS x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	34		g1.b1	DROP MATERIALIZED VIEW IF EXISTS m	supported	accept	reviewed-grammar-path	none
+alternative	statement	35		g1.b1	ALTER MATERIALIZED VIEW IF EXISTS m RENAME TO n	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	37		g1.b1.g1.b1.g1.b1	ALTER MATERIALIZED VIEW m EXECUTE p(named => 1, 2) WHERE id > 0	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	37		g1.b1.g1.b1	ALTER MATERIALIZED VIEW m EXECUTE p(named => 1, 2) WHERE id > 0	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	37		g1.b1	ALTER MATERIALIZED VIEW m EXECUTE p(named => 1, 2) WHERE id > 0	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	37		g2.b1	ALTER MATERIALIZED VIEW m EXECUTE p(named => 1, 2) WHERE id > 0	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	38		g1.b1	DROP VIEW IF EXISTS v	supported	accept	reviewed-grammar-path	none
+alternative	statement	41		g1.b1.g1.b1	CALL c.system.proc(?, x => ?)	supported	accept	reviewed-grammar-path	none
+alternative	statement	41		g1.b1	CALL c.system.proc(?, x => ?)	supported	accept	reviewed-grammar-path	none
+alternative	statement	42		g1.b1	CREATE OR REPLACE FUNCTION f(x bigint) RETURNS bigint RETURN x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	43		g1.b1	DROP FUNCTION IF EXISTS f(x bigint)	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	44		g1.b1	CREATE OR REPLACE BRANCH dev IN TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	44		g2.b1	CREATE BRANCH IF NOT EXISTS dev IN TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	44		g3.b1	CREATE BRANCH dev WITH (snapshot_id = 7) IN TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	44		g4.b1	CREATE BRANCH dev IN TABLE lake.ns.t FROM work	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	45		g1.b1	DROP BRANCH IF EXISTS dev IN TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
+alternative	statement	47		g1.b1	SHOW BRANCHES FROM TABLE lake.ns.t	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	47		g1.b2	SHOW BRANCHES IN TABLE lake.ns.t	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	48		g1.b1	CREATE ROLE reader WITH ADMIN CURRENT_USER IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	48		g2.b1	CREATE ROLE reader WITH ADMIN CURRENT_USER IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	49		g1.b1	DROP ROLE IF EXISTS reader IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	49		g2.b1	DROP ROLE IF EXISTS reader IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	50		g1.b1	GRANT r, s TO USER u, ROLE g WITH ADMIN OPTION GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	50		g2.b1	GRANT r, s TO USER u, ROLE g WITH ADMIN OPTION GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	50		g3.b1	GRANT r, s TO USER u, ROLE g WITH ADMIN OPTION GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	50		g4.b1	GRANT r, s TO USER u, ROLE g WITH ADMIN OPTION GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	50		g5.b1	GRANT r, s TO USER u, ROLE g WITH ADMIN OPTION GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	51		g1.b1.g1.b1.g1.b1	GRANT SELECT, DELETE ON TABLE cat.sch.t TO USER u WITH GRANT OPTION	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	51		g1.b1.g1.b1	GRANT SELECT, DELETE ON TABLE cat.sch.t TO USER u WITH GRANT OPTION	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	51		g1.b1	GRANT SELECT, DELETE ON TABLE cat.sch.t TO USER u WITH GRANT OPTION	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	51		g1.b2	GRANT ALL PRIVILEGES ON TABLE cat.sch.t TO USER u WITH GRANT OPTION	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	51		g2.b1	GRANT SELECT, DELETE ON TABLE cat.sch.t TO USER u WITH GRANT OPTION	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	52		g1.b1	REVOKE ADMIN OPTION FOR r, s FROM USER u, ROLE g GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	52		g2.b1	REVOKE ADMIN OPTION FOR r, s FROM USER u, ROLE g GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	52		g3.b1	REVOKE ADMIN OPTION FOR r, s FROM USER u, ROLE g GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	52		g4.b1	REVOKE ADMIN OPTION FOR r, s FROM USER u, ROLE g GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	52		g5.b1	REVOKE ADMIN OPTION FOR r, s FROM USER u, ROLE g GRANTED BY CURRENT_ROLE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	53		g1.b1	REVOKE GRANT OPTION FOR SELECT, DELETE ON TABLE cat.sch.t FROM ROLE g	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	53		g2.b1.g1.b1.g1.b1	REVOKE GRANT OPTION FOR SELECT, DELETE ON TABLE cat.sch.t FROM ROLE g	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	53		g2.b1.g1.b1	REVOKE GRANT OPTION FOR SELECT, DELETE ON TABLE cat.sch.t FROM ROLE g	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	53		g2.b1	REVOKE GRANT OPTION FOR SELECT, DELETE ON TABLE cat.sch.t FROM ROLE g	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	53		g2.b2	REVOKE GRANT OPTION FOR ALL PRIVILEGES ON TABLE cat.sch.t FROM ROLE g	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	54		g1.b1.g1.b1	DENY SELECT, DELETE ON TABLE cat.sch.t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	54		g1.b1	DENY SELECT, DELETE ON TABLE cat.sch.t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	54		g1.b2	DENY ALL PRIVILEGES ON TABLE cat.sch.t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	55		g1.b1	SET ROLE ALL IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	55		g1.b2	SET ROLE NONE IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	55		g1.b3	SET ROLE reader IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	55		g2.b1	SET ROLE ALL IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	56		g1.b1	SHOW GRANTS ON BRANCH dev IN TABLE cat.sch.t	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	57		g1.b1.g1.b1	EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+alternative	statement	57		g1.b1	EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+alternative	statement	64		g1.b1.g1.b1	SHOW TABLES FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	64		g1.b1.g1.b2	SHOW TABLES IN lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	64		g1.b1	SHOW TABLES FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	64		g2.b1.g1.b1	SHOW TABLES FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	64		g2.b1	SHOW TABLES FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	65		g1.b1.g1.b1	SHOW SCHEMAS FROM lake LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	65		g1.b1.g1.b2	SHOW SCHEMAS IN lake LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	65		g1.b1	SHOW SCHEMAS FROM lake LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	65		g2.b1.g1.b1	SHOW SCHEMAS FROM lake LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	65		g2.b1	SHOW SCHEMAS FROM lake LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	66		g1.b1.g1.b1	SHOW CATALOGS LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	66		g1.b1	SHOW CATALOGS LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	67		g1.b1	SHOW COLUMNS FROM lake.s.t LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	67		g1.b2	SHOW COLUMNS IN lake.s.t LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	67		g2.b1.g1.b1	SHOW COLUMNS FROM lake.s.t LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	67		g2.b1	SHOW COLUMNS FROM lake.s.t LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	70		g1.b1.g1.b1	SHOW CURRENT ROLES FROM cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	70		g1.b1.g1.b2	SHOW CURRENT ROLES IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	70		g1.b1	SHOW CURRENT ROLES FROM cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	71		g1.b1.g1.b1	SHOW ROLE GRANTS FROM cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	71		g1.b1.g1.b2	SHOW ROLE GRANTS IN cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	71		g1.b1	SHOW ROLE GRANTS FROM cat	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	74		g1.b1.g1.b1	SHOW FUNCTIONS FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	74		g1.b1.g1.b2	SHOW FUNCTIONS IN lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	74		g1.b1	SHOW FUNCTIONS FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	74		g2.b1.g1.b1	SHOW FUNCTIONS FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	74		g2.b1	SHOW FUNCTIONS FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	75		g1.b1.g1.b1	SHOW SESSION LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	75		g1.b1	SHOW SESSION LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	80		g1.b1.g1.b1	START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	80		g1.b1	START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	85		g1.b1.g1.b1	EXECUTE query_name USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	85		g1.b1	EXECUTE query_name USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	86		g1.b1.g1.b1	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	86		g1.b1	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	91		g1.b1	SET TIME ZONE LOCAL	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	91		g1.b2	SET TIME ZONE 'UTC'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	92		g1.b1	UPDATE lake.ns.t @dev SET id = 1	supported	accept	reviewed-grammar-path	none
+alternative	statement	92		g2.b1	UPDATE lake.ns.t SET id = 1, label = 'x'	supported	accept	reviewed-grammar-path	none
+alternative	statement	92		g3.b1	UPDATE lake.ns.t SET id = 1 WHERE id = 2	supported	accept	reviewed-grammar-path	none
+alternative	statement	93		g1.b1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
+alternative	statement	93		g2.b1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
 alternative	rootQuery	1		g1.b1.g1.b1	WITH FUNCTION x ( ) RETURNS x RETURN 1 , FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	supported	accept	reviewed-grammar-path	none
 alternative	rootQuery	1		g1.b1	WITH FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	supported	accept	reviewed-grammar-path	none
 alternative	rootQueryWithSession	1		g1.b1.g1.b1	WITH SESSION x = ? , x = ? TABLE x	supported	accept	reviewed-grammar-path	none
 alternative	rootQueryWithSession	1		g1.b1	WITH SESSION x = ? TABLE x	supported	accept	reviewed-grammar-path	none
 alternative	with	1		g1.b1	WITH x AS ( TABLE x ) , x AS ( TABLE x ) TABLE x	supported	accept	reviewed-grammar-path	none
-alternative	columnDefinition	1		g1.b1		pending-p09		pending-p09	none
-alternative	columnDefinition	1		g2.b1		pending-p09		pending-p09	none
-alternative	columnDefinition	1		g3.b1		pending-p09		pending-p09	none
-alternative	columnDefinition	1		g4.b1		pending-p09		pending-p09	none
-alternative	likeClause	1		g1.b1.g1.b1		pending-p09		pending-p09	none
-alternative	likeClause	1		g1.b1.g1.b2		pending-p09		pending-p09	none
-alternative	likeClause	1		g1.b1		pending-p09		pending-p09	none
-alternative	propertyAssignments	1		g1.b1		pending-p09		pending-p09	none
+alternative	columnDefinition	1		g1.b1	CREATE TABLE lake.ns.t (id bigint DEFAULT 1)	supported	accept	reviewed-grammar-path	none
+alternative	columnDefinition	1		g2.b1	CREATE TABLE lake.ns.t (id bigint NOT NULL)	supported	accept	reviewed-grammar-path	none
+alternative	columnDefinition	1		g3.b1	CREATE TABLE lake.ns.t (id bigint COMMENT 'note')	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	columnDefinition	1		g4.b1	CREATE TABLE lake.ns.t (id bigint WITH (example_option = 1))	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	likeClause	1		g1.b1.g1.b1	CREATE TABLE lake.ns.t (LIKE lake.ns.source_table INCLUDING PROPERTIES)	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	likeClause	1		g1.b1.g1.b2	CREATE TABLE lake.ns.t (LIKE lake.ns.source_table EXCLUDING PROPERTIES)	supported	accept	reviewed-grammar-path	none
+alternative	likeClause	1		g1.b1	CREATE TABLE lake.ns.t (LIKE lake.ns.source_table EXCLUDING PROPERTIES)	supported	accept	reviewed-grammar-path	none
+alternative	propertyAssignments	1		g1.b1	CREATE TABLE lake.ns.t (id bigint) WITH (format = 'PARQUET', format_version = 3)	supported	accept	reviewed-grammar-path	none
 alternative	queryNoWith	1		g1.b1.g1.b1	TABLE x OFFSET 1 ROW	supported	accept	reviewed-grammar-path	none
 alternative	queryNoWith	1		g1.b1.g1.b2	TABLE x OFFSET 1 ROWS	supported	accept	reviewed-grammar-path	none
 alternative	queryNoWith	1		g1.b1	TABLE x OFFSET 1	supported	accept	reviewed-grammar-path	none
@@ -2263,13 +2262,13 @@ alternative	intervalQualifier	4		g1.b3	VALUES ( ? - ? ) MINUTE	parsed-not-suppor
 alternative	intervalQualifier	4		g2.b1	VALUES ( ? - ? ) DAY ( 1 )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	intervalQualifier	5		g1.b1.g1.b1	VALUES ( ? - ? ) SECOND ( 1 , 1 )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	intervalQualifier	5		g1.b1	VALUES ( ? - ? ) SECOND ( 1 )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	mergeCase	1		g1.b1		pending-p09		pending-p09	none
-alternative	mergeCase	1		g2.b1		pending-p09		pending-p09	none
-alternative	mergeCase	2		g1.b1		pending-p09		pending-p09	none
-alternative	mergeCase	3		g1.b1		pending-p09		pending-p09	none
-alternative	mergeCase	3		g2.b1.g1.b1		pending-p09		pending-p09	none
-alternative	mergeCase	3		g2.b1		pending-p09		pending-p09	none
-alternative	mergeCase	3		g3.b1		pending-p09		pending-p09	none
+alternative	mergeCase	1		g1.b1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN UPDATE SET id = ?, v = ?	supported	accept	reviewed-grammar-path	none
+alternative	mergeCase	1		g2.b1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN UPDATE SET id = ?, v = ?	supported	accept	reviewed-grammar-path	none
+alternative	mergeCase	2		g1.b1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
+alternative	mergeCase	3		g1.b1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id, v) VALUES (?, ?)	supported	accept	reviewed-grammar-path	none
+alternative	mergeCase	3		g2.b1.g1.b1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id, v) VALUES (?, ?)	supported	accept	reviewed-grammar-path	none
+alternative	mergeCase	3		g2.b1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id, v) VALUES (?, ?)	supported	accept	reviewed-grammar-path	none
+alternative	mergeCase	3		g3.b1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id, v) VALUES (?, ?)	supported	accept	reviewed-grammar-path	none
 alternative	over	1		g1.b1	VALUES x OVER x	supported	accept	reviewed-grammar-path	none
 alternative	over	1		g1.b2	VALUES x OVER ( )	supported	accept	reviewed-grammar-path	none
 alternative	windowFrame	1		g1.b1.g1.b1	VALUES x OVER ( MEASURES ? AS x , ? AS x ROWS CURRENT ROW )	supported	accept	reviewed-grammar-path	none
@@ -2292,16 +2291,16 @@ alternative	patternQuantifier	4		g1.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN 
 alternative	patternQuantifier	5		g1.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { 1 , } ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	patternQuantifier	5		g2.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { , 1 } ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	patternQuantifier	5		g3.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { , } ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	explainOption	1		g1.b1		pending-p09		pending-p09	none
-alternative	explainOption	1		g1.b2		pending-p09		pending-p09	none
-alternative	explainOption	1		g1.b3		pending-p09		pending-p09	none
-alternative	explainOption	2		g1.b1		pending-p09		pending-p09	none
-alternative	explainOption	2		g1.b2		pending-p09		pending-p09	none
-alternative	explainOption	2		g1.b3		pending-p09		pending-p09	none
-alternative	explainOption	2		g1.b4		pending-p09		pending-p09	none
-alternative	transactionMode	2		g1.b1		pending-p09		pending-p09	none
-alternative	transactionMode	2		g1.b2		pending-p09		pending-p09	none
-alternative	pathSpecification	1		g1.b1		pending-p09		pending-p09	none
+alternative	explainOption	1		g1.b1	EXPLAIN (FORMAT TEXT) SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+alternative	explainOption	1		g1.b2	EXPLAIN (FORMAT GRAPHVIZ) SELECT 1 AS answer	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	explainOption	1		g1.b3	EXPLAIN (FORMAT JSON) SELECT 1 AS answer	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	explainOption	2		g1.b1	EXPLAIN (TYPE LOGICAL) SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+alternative	explainOption	2		g1.b2	EXPLAIN (TYPE DISTRIBUTED) SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+alternative	explainOption	2		g1.b3	EXPLAIN (TYPE VALIDATE) SELECT 1 AS answer	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	explainOption	2		g1.b4	EXPLAIN (TYPE IO) SELECT 1 AS answer	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	transactionMode	2		g1.b1	START TRANSACTION READ ONLY	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	transactionMode	2		g1.b2	START TRANSACTION READ WRITE	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	pathSpecification	1		g1.b1	SET PATH lake.s, t	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	functionSpecification	1		g1.b1	@file:coverage-sql/routine-return.sql	supported	accept	reviewed-grammar-path	none
 alternative	functionSpecification	1		g1.b2	@file:coverage-sql/routine-external.sql	supported	accept	reviewed-grammar-path	none
 alternative	functionDeclaration	1		g1.b1.g1.b1	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
@@ -2316,5 +2315,5 @@ alternative	controlStatement	11		g1.b1	@file:coverage-sql/routine-repeat.sql	sup
 alternative	variableDeclaration	1		g1.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
 alternative	variableDeclaration	1		g2.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
 alternative	sqlStatementList	1		g1.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
-alternative	grantObject	1		g1.b1		pending-p09		pending-p09	none
+alternative	grantObject	1		g1.b1	SHOW GRANTS ON BRANCH dev IN TABLE cat.sch.t	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	qualifiedName	1		g1.b1	SELECT * FROM x . x	supported	accept	reviewed-grammar-path	none

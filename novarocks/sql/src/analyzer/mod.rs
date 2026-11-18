@@ -72,6 +72,8 @@ pub(crate) use resolve_expr::{
 mod resolve_from;
 #[cfg(test)]
 mod scalar_rebind_contract_tests;
+#[cfg(test)]
+mod trino_capability_tests;
 mod value_conversion;
 mod view;
 #[cfg(test)]

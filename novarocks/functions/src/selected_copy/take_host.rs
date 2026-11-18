@@ -750,10 +750,10 @@ pub fn take_copy_in<C: Send + Sync + 'static>(
 }
 
 /// Materialize one independent flat result under the original take invoice.
-/// Only these five physical carriers have no borrowed child/value buffers in
-/// Arrow's take. Complete logical typing remains the caller's separate proof.
-/// The same original settlement additionally rejects any nonempty input alias
-/// before releasing the real input owner. Existing take_copy_in keeps its lease.
+/// Arrow's take allocates new values for the admitted flat carriers and
+/// preserves a timestamp's unit and time zone. Complete logical typing remains
+/// the caller's separate proof. Settlement rejects any nonempty input alias
+/// before releasing the original input owner.
 pub fn take_flat_owned_copy_in<C: Send + Sync + 'static>(
     source: ArrayRef,
     indices: CopyIndices,
@@ -763,7 +763,12 @@ pub fn take_flat_owned_copy_in<C: Send + Sync + 'static>(
 ) -> Result<RetainedTakeResult, CopyOperationError> {
     if !matches!(
         source.data_type(),
-        DataType::Boolean | DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Utf8
+        DataType::Boolean
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Timestamp(_, _)
     ) {
         return Err(
             CopyError::Unsupported(novarocks_failure_contract::BoundedDetail::truncating(

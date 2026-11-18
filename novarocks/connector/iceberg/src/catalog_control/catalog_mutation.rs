@@ -152,13 +152,7 @@ impl ConnectorCatalogMutation for IcebergMetadata {
     }
 
     fn check_table_property_name(&self, canonical_name: &str) -> Result<(), ConnectorError> {
-        if crate::table_properties::is_recognized_unsupported_table_property(canonical_name) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                format!("Iceberg table property '{canonical_name}' is not supported"),
-            ));
-        }
-        Ok(())
+        crate::table_properties::check_table_property_name(canonical_name)
     }
 
     fn admit(&self, request: &ConnectorCatalogMutationRequest) -> Result<(), ConnectorError> {
@@ -253,7 +247,8 @@ impl ConnectorCatalogMutation for IcebergMetadata {
     > {
         if matches!(
             &request.operation,
-            ConnectorCatalogMutationOperation::CreateTable { .. }
+            ConnectorCatalogMutationOperation::CreateNamespace { .. }
+                | ConnectorCatalogMutationOperation::CreateTable { .. }
                 | ConnectorCatalogMutationOperation::DropTable { .. }
                 | ConnectorCatalogMutationOperation::AlterProperties { .. }
                 | ConnectorCatalogMutationOperation::SetTableProperties { .. }
@@ -3019,6 +3014,26 @@ fn execute_namespace_publication(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    let (frozen, evidence, seed) = match prepare_namespace_publication(provider, request) {
+        Ok(prepared) => prepared,
+        Err(error) => return Ok(known_uncommitted(error)),
+    };
+    execute_catalog_publication(provider, request, frozen, evidence, seed)
+}
+
+/// Freeze the original namespace request, operation evidence and receipt
+/// before either execution entry advances the journal.
+fn prepare_namespace_publication(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+) -> Result<
+    (
+        crate::catalog::catalog_request::FrozenCatalogPublication,
+        ExternalMutationEvidence,
+        ConnectorCatalogMutationReceipt,
+    ),
+    ConnectorError,
+> {
     use crate::catalog::catalog_request::CatalogPublicationRequest;
     let namespace = match &request.operation {
         ConnectorCatalogMutationOperation::CreateNamespace { namespace, .. }
@@ -3029,66 +3044,53 @@ fn execute_namespace_publication(
             ));
         }
     };
-    if let Err(error) = ensure_owner(provider, &namespace.instance_id) {
-        return Ok(known_uncommitted(error));
-    }
-    // Local setup has proven no publication dispatch. Preserve that fact at
-    // the SPI boundary instead of returning an unqualified provider error.
-    let setup = (|| {
-        let frozen = match &request.operation {
-            ConnectorCatalogMutationOperation::CreateNamespace {
-                namespace,
+    ensure_owner(provider, &namespace.instance_id)?;
+    let frozen = match &request.operation {
+        ConnectorCatalogMutationOperation::CreateNamespace {
+            namespace,
+            properties,
+            policy,
+        } => {
+            use novarocks_spi::connector::DdlPropertyValue;
+            let properties = match properties.as_slice() {
+                [] => HashMap::new(),
+                [(name, DdlPropertyValue::Varchar(location))] if name.as_ref() == "location" => {
+                    HashMap::from([(name.to_string(), location.clone())])
+                }
+                _ => return Err(internal("Malformed evaluated Iceberg schema properties")),
+            };
+            CatalogPublicationRequest::CreateNamespace {
+                namespace: CatalogNamespaceName::new(
+                    normalize_identifier(&namespace.namespace).map_err(invalid)?,
+                ),
                 properties,
-                policy,
-            } => {
-                use novarocks_spi::connector::DdlPropertyValue;
-                let properties = match properties.as_slice() {
-                    [] => HashMap::new(),
-                    [(name, DdlPropertyValue::Varchar(location))]
-                        if name.as_ref() == "location" =>
-                    {
-                        HashMap::from([(name.to_string(), location.clone())])
-                    }
-                    _ => return Err(internal("Malformed evaluated Iceberg schema properties")),
-                };
-                CatalogPublicationRequest::CreateNamespace {
-                    namespace: CatalogNamespaceName::new(
-                        normalize_identifier(&namespace.namespace).map_err(invalid)?,
-                    ),
-                    properties,
-                    no_op_if_exists: *policy == CreatePolicy::NoOpIfExists,
-                }
-            }
-            ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
-                CatalogPublicationRequest::DropNamespace {
-                    namespace: CatalogNamespaceName::new(
-                        normalize_identifier(&namespace.namespace).map_err(invalid)?,
-                    ),
-                    no_op_if_missing: *policy == DropPolicy::NoOpIfMissing,
-                }
-            }
-            _ => {
-                return Err(internal(
-                    "Namespace publication requires a namespace mutation",
-                ));
+                no_op_if_exists: *policy == CreatePolicy::NoOpIfExists,
             }
         }
-        .freeze(request.operation_id.to_bytes())
-        .map_err(|error| invalid(error.to_string()))?;
-        let evidence = mutation_evidence(
-            provider,
-            request.operation_id,
-            &request.operation,
-            &request.context,
-        )?;
-        let seed = receipt(provider, request.operation_id, request.operation.kind())?;
-        Ok::<_, ConnectorError>((frozen, evidence, seed))
-    })();
-    let (frozen, evidence, seed) = match setup {
-        Ok(prepared) => prepared,
-        Err(error) => return Ok(known_uncommitted(error)),
-    };
-    execute_catalog_publication(provider, request, frozen, evidence, seed)
+        ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
+            CatalogPublicationRequest::DropNamespace {
+                namespace: CatalogNamespaceName::new(
+                    normalize_identifier(&namespace.namespace).map_err(invalid)?,
+                ),
+                no_op_if_missing: *policy == DropPolicy::NoOpIfMissing,
+            }
+        }
+        _ => {
+            return Err(internal(
+                "Namespace publication requires a namespace mutation",
+            ));
+        }
+    }
+    .freeze(request.operation_id.to_bytes())
+    .map_err(|error| invalid(error.to_string()))?;
+    let evidence = mutation_evidence(
+        provider,
+        request.operation_id,
+        &request.operation,
+        &request.context,
+    )?;
+    let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+    Ok((frozen, evidence, seed))
 }
 
 fn execute_catalog_publication(
@@ -4913,6 +4915,81 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body, response);
+    }
+
+    #[test]
+    fn async_namespace_keeps_location_and_conditional_outcome_on_the_original_lease() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::{ConnectorCatalogMutationReceiving, DdlPropertyValue};
+
+        let location = "s3://warehouse/other-db";
+        let response =
+            serde_json::json!({"namespace": ["db"], "properties": {"location": location}});
+        for (exists, conditional) in [(false, false), (true, true), (true, false)] {
+            let script = Script::new().on("GET", "/v1/config", Reply::config(&[], &[], None));
+            let server = TestServer::start(if exists {
+                script.on("GET", "/v1/namespaces/db", Reply::json(200, &response))
+            } else {
+                script
+                    .on("GET", "/v1/namespaces/db", Reply::status(404))
+                    .on("POST", "/v1/namespaces", Reply::json(200, &response))
+            });
+            let (executor, provider) = variant_definition_provider(&server.url());
+            let lease = document_control_planning_pin(&provider)
+                .derive_mutation_lease()
+                .unwrap();
+            let mut request = namespace_request(&provider, true, conditional);
+            let ConnectorCatalogMutationOperation::CreateNamespace { properties, .. } =
+                &mut request.operation
+            else {
+                panic!("original namespace request");
+            };
+            properties.push((
+                "location".into(),
+                DdlPropertyValue::Varchar(location.into()),
+            ));
+            let receiving = ConnectorCatalogMutationReceiving::new();
+            executor
+                .block_on(lease.execute_async_in(request, &receiving))
+                .unwrap();
+            let observation = receiving.observation();
+            assert!(observation.provider_exited());
+            let outcome = observation.validated_outcome().unwrap().unwrap();
+            let requests = server.requests_to("POST", "/v1/namespaces");
+            match (exists, conditional, outcome) {
+                (
+                    false,
+                    false,
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        ..
+                    },
+                ) => {
+                    assert!(observation.applied_receipt().is_some());
+                    assert_eq!(requests.len(), 1);
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&requests[0].body).unwrap();
+                    assert_eq!(body, response);
+                }
+                (
+                    true,
+                    true,
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::NoOp,
+                        ..
+                    },
+                ) => {
+                    assert!(observation.applied_receipt().is_none());
+                    assert!(requests.is_empty());
+                }
+                (true, false, ExternalMutationOutcome::KnownUncommitted { failure, .. }) => {
+                    assert_eq!(failure.kind(), ConnectorMutationFailureKind::AlreadyExists);
+                    assert!(observation.applied_receipt().is_none());
+                    assert!(requests.is_empty());
+                }
+                _ => panic!("unexpected namespace outcome: {outcome:?}"),
+            }
+        }
     }
 
     #[test]

@@ -37,6 +37,7 @@ use super::minimal_view::{
     ViewMutationView, ViewRequestError,
 };
 use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome};
+use crate::catalog::staged_metadata_path::StagedMetadataPath;
 use crate::catalog::transaction::CommitProof;
 
 /// The establishment step that failed while acquiring the session binding.
@@ -271,6 +272,7 @@ pub(crate) struct AttributionExpectation {
     /// CTAS supplementary expectations: NovaRocks-named properties.
     properties: Vec<(String, String)>,
     final_table_location: Option<Arc<str>>,
+    final_metadata_path: Option<StagedMetadataPath>,
     /// What the table-response scan must retain; `Some` for table shapes.
     view_request: Option<TableViewRequest>,
     retention: Option<RetentionExpectation>,
@@ -306,6 +308,7 @@ impl AttributionExpectation {
             properties,
             view_request,
             final_table_location: None,
+            final_metadata_path: None,
             retention: None,
         })
     }
@@ -320,6 +323,7 @@ impl AttributionExpectation {
             properties: Vec::new(),
             view_request,
             final_table_location: None,
+            final_metadata_path: None,
             retention: None,
         }
     }
@@ -397,6 +401,11 @@ impl AttributionExpectation {
             self.view_request = self.view_request.map(TableViewRequest::with_table_location);
         }
         self.final_table_location = expected;
+        self
+    }
+
+    pub(crate) fn with_final_metadata_path(mut self, path: Option<StagedMetadataPath>) -> Self {
+        self.final_metadata_path = path;
         self
     }
 
@@ -528,6 +537,7 @@ pub(crate) enum AnomalyCause {
 pub(crate) enum UnattributableCause {
     SnapshotAbsent,
     FinalTableLocationMismatch,
+    FinalMetadataPathMismatch,
     RetentionPostconditionMismatch,
     /// A NovaRocks-named property is absent or differs.
     PropertyMismatch {
@@ -671,13 +681,17 @@ pub(crate) fn classify(
             }
             let rejected = |kind| RestEvidence::Rejected { status: code, kind };
             match code {
-                409 if expect.final_table_location.is_some() => unknown(
-                    expect,
-                    UnknownReason::RemoteMetadataWritePossible,
-                    Some(code),
-                    header_names,
-                    RefRelation::NotTracked,
-                ),
+                409 if expect.final_table_location.is_some()
+                    || expect.final_metadata_path.is_some() =>
+                {
+                    unknown(
+                        expect,
+                        UnknownReason::RemoteMetadataWritePossible,
+                        Some(code),
+                        header_names,
+                        RefRelation::NotTracked,
+                    )
+                }
                 409 if endpoint.creates() => rejected(ConnectorMutationFailureKind::AlreadyExists),
                 409 => rejected(ConnectorMutationFailureKind::Conflict),
                 401 | 419 => rejected(ConnectorMutationFailureKind::Unauthenticated),
@@ -896,6 +910,16 @@ fn attribute_table(
     {
         return Err(Failed::Unattributable(
             UnattributableCause::FinalTableLocationMismatch,
+            relation,
+        ));
+    }
+    if expect.final_metadata_path.as_ref().is_some_and(|path| {
+        view.metadata_location
+            .non_empty()
+            .is_none_or(|uri| !path.contains_metadata_file(uri))
+    }) {
+        return Err(Failed::Unattributable(
+            UnattributableCause::FinalMetadataPathMismatch,
             relation,
         ));
     }
@@ -1638,6 +1662,60 @@ mod tests {
                 BodyRead::NotRead,
                 &expected,
             ),
+            RestEvidence::Unknown {
+                diagnosis: UnknownDiagnosis {
+                    reason: UnknownReason::RemoteMetadataWritePossible,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn final_staged_metadata_path_requires_both_the_property_and_the_actual_file_location() {
+        use crate::catalog::staged_metadata_path::WRITE_METADATA_PATH;
+
+        let path = "s3://storage/warehouse/mv-metadata";
+        let file = "s3://storage/warehouse/mv-metadata/00000-own.metadata.json";
+        let expected = AttributionExpectation::ctas_final_commit(
+            Uuid::parse_str(TABLE_UUID).unwrap(),
+            None,
+            vec![(WRITE_METADATA_PATH.to_string(), path.to_string())],
+        )
+        .unwrap()
+        .with_final_metadata_path(Some(
+            StagedMetadataPath::under_warehouse(path, "s3://storage/warehouse", "_staging")
+                .unwrap(),
+        ));
+        for (uri, property, applied) in [
+            (file, path, true),
+            (file, "s3://storage/warehouse/stage", false),
+            (
+                "s3://storage/warehouse/mv-metadata-other/00000-own.metadata.json",
+                path,
+                false,
+            ),
+            (
+                "s3://storage/warehouse/stage/00000-own.metadata.json",
+                path,
+                false,
+            ),
+        ] {
+            let body = serde_json::json!({
+                "metadata-location":uri,
+                "metadata": {
+                    "table-uuid": TABLE_UUID,
+                    "properties": { (WRITE_METADATA_PATH): property }
+                }
+            });
+            let evidence = classify(&status(200), read(&expected, &body.to_string()), &expected);
+            assert_eq!(matches!(evidence, RestEvidence::Applied { .. }), applied);
+            if !applied {
+                assert!(matches!(evidence, RestEvidence::Unknown { .. }));
+            }
+        }
+        assert!(matches!(
+            classify(&status(409), BodyRead::NotRead, &expected),
             RestEvidence::Unknown {
                 diagnosis: UnknownDiagnosis {
                     reason: UnknownReason::RemoteMetadataWritePossible,

@@ -87,7 +87,7 @@ impl Parser<'_> {
     }
 
     #[recursive::recursive]
-    fn parse_function_parameter(&mut self) -> Result<FunctionParameter, ParserError> {
+    pub(super) fn parse_function_parameter(&mut self) -> Result<FunctionParameter, ParserError> {
         let start = self.current().span;
         let mut named_error = None;
         // Unlike a rowField's `type | identifier type`, this grammar has a

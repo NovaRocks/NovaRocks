@@ -9,13 +9,26 @@ use std::fmt::Write;
 use std::ops::Range;
 
 mod advanced_relation;
+mod branch_statement;
+mod catalog_schema;
+mod ctas_statement;
 mod expression;
 mod json;
 mod literal_type;
+mod merge_call;
+mod metadata_session;
 mod pattern;
+mod permission_statement;
+mod prepared_statement;
 mod query;
 mod routine;
+mod show_statement;
 mod special;
+mod statement;
+mod table_alter;
+mod table_statement;
+mod view_statement;
+mod write_statement;
 
 /// A syntax fact which cannot be faithfully represented as standalone SQL.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +76,23 @@ impl std::fmt::Display for PrintError {
 }
 impl std::error::Error for PrintError {}
 type PrintResult = Result<(), PrintError>;
+
+pub fn print_statement(statement: &TrinoStatement) -> Result<String, PrintError> {
+    let positions = parameter_positions(|visitor| visitor.visit_trino_statement(statement))?;
+    let count = positions.values.len();
+    let mut writer = Writer {
+        parameter_ranges: positions.ranges,
+        ..Writer::default()
+    };
+    writer.statement(statement)?;
+    writer.finish(count)
+}
+
+pub fn print_path_specification(path: &TrinoPathSpecification) -> Result<String, PrintError> {
+    let mut writer = Writer::default();
+    writer.path_specification(path)?;
+    writer.finish(0)
+}
 
 pub fn print_query(query: &Query) -> Result<String, PrintError> {
     let positions = parameter_positions(|visitor| visitor.visit_query(query))?;

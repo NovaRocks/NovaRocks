@@ -29,15 +29,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use novarocks_spi::connector::{
-    ConnectorColumnDefinition, ConnectorMutationFailure, ConnectorPartitionTransform,
-    ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
-    ConnectorStagedCreatePublicationAdjudicationOutcome,
+    ConnectorColumnDefinition, ConnectorControlPlanningPin, ConnectorMutationFailure,
+    ConnectorPartitionTransform, ConnectorStagedCreatePrepareOutcome,
+    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublicationAdjudicationOutcome,
     ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
-    ConnectorStagedCreatePublishRequest, ConnectorStagedCreateSession, ConnectorStagedTableHandle,
-    ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof,
-    ConnectorUnanchoredCtasCleanupSession, ConnectorWrite, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteInputRequest, ConnectorWriteIntent, CreatePolicy, ExternalMutationEvidence,
-    ExternalMutationFinalization, LakePublicationId,
+    ConnectorStagedCreatePublishRequest, ConnectorStagedCreateSession,
+    ConnectorStagedCtasProperties, ConnectorStagedTableHandle, ConnectorStagedWritePlanningRequest,
+    ConnectorStagedWriteProof, ConnectorTableIdentity, ConnectorUnanchoredCtasCleanupSession,
+    ConnectorWrite, ConnectorWriteAdmissionPurpose, ConnectorWriteInputRequest,
+    ConnectorWriteIntent, CreatePolicy, ExternalMutationEvidence, ExternalMutationFinalization,
+    LakePublicationId,
 };
 use novarocks_user_error::UserError;
 
@@ -53,13 +54,21 @@ use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_query_application::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
 use novarocks_sql::semantic::ObjectName;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct CtasCommand {
     pub target_parts: Vec<String>,
     pub if_not_exists: bool,
     pub source: Query,
-    pub partitioning: Vec<ConnectorPartitionTransform>,
-    pub properties: BTreeMap<Arc<str>, Arc<str>>,
+    pub(crate) storage: CtasStorage,
+}
+
+#[derive(Clone)]
+pub(crate) enum CtasStorage {
+    Legacy {
+        partitioning: Vec<ConnectorPartitionTransform>,
+        properties: BTreeMap<Arc<str>, Arc<str>>,
+    },
+    Evaluated(Arc<ConnectorStagedCtasProperties>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,8 +167,10 @@ impl CtasCommand {
                 .collect(),
             if_not_exists: table.if_not_exists,
             source: statement.query.clone(),
-            partitioning,
-            properties,
+            storage: CtasStorage::Legacy {
+                partitioning,
+                properties,
+            },
         })
     }
 }
@@ -254,6 +265,44 @@ pub trait CtasPreparedTargetPreflight: Send + Sync {
 pub struct PreparedCtasTargetPreflight {
     pub facts: CtasTargetPreflightFacts,
     pub handle: Arc<dyn CtasPreparedTargetPreflight>,
+}
+
+impl PreparedCtasTargetPreflight {
+    pub(crate) fn staged_session(&self) -> Result<ConnectorStagedCreateSession, CtasFailure> {
+        Ok(downcast_standard_preflight(self.handle.as_ref())?
+            .staged_session
+            .clone())
+    }
+}
+
+pub(crate) struct CtasTargetBinding {
+    target: crate::catalog_application::resolver::TargetBackend,
+    planning: ConnectorControlPlanningPin,
+}
+
+impl CtasTargetBinding {
+    pub(crate) fn qualified_name(&self) -> String {
+        format!(
+            "{}.{}.{}",
+            self.target.catalog, self.target.namespace, self.target.table
+        )
+    }
+
+    pub(crate) fn read_binding(
+        &self,
+    ) -> Result<
+        novarocks_query_application::api::CatalogTableReadBinding,
+        novarocks_query_application::api::CommandError,
+    > {
+        novarocks_query_application::api::CatalogTableReadBinding::try_new(
+            ConnectorTableIdentity {
+                instance_id: self.planning.binding().descriptor().instance_id.clone(),
+                namespace: Arc::from(self.target.namespace.as_str()),
+                table: Arc::from(self.target.table.as_str()),
+            },
+            self.planning.clone(),
+        )
+    }
 }
 
 pub trait CtasPreparedCatalogAction: Send + Sync {
@@ -533,6 +582,18 @@ pub struct CtasStatementInput {
     pub(crate) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 
+/// The typed CTAS entry borrows the same frontend execution service and
+/// statement Root that are already admitted by the protocol.
+pub struct TrinoCtasInput {
+    pub(crate) statement: novarocks_parser::ast::TrinoCreateTableAsSelect,
+    pub(crate) execution: crate::query::ctas_action::CtasExecutionInput,
+    pub(crate) command: novarocks_query_application::api::CommandContext,
+    pub(crate) deadline: Option<std::time::Instant>,
+    pub(crate) cancellation: novarocks_query_application::cancellation::QueryCancellationView,
+    pub(crate) compiler: crate::query::compiler::FrontendQueryCompiler,
+    pub(crate) interpreter: Arc<crate::RequiredConstantInterpreter>,
+}
+
 pub trait CtasEngine: Send + Sync {
     fn prepare_statement_action(
         &self,
@@ -543,6 +604,22 @@ pub trait CtasEngine: Send + Sync {
     > {
         Err(crate::dml::error::DmlError::executor(
             "connector does not support a governed CTAS statement action",
+        ))
+    }
+
+    fn prepare_trino_statement_action(
+        &self,
+        _input: TrinoCtasInput,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::session_error::QueryServiceError,
+    > {
+        use novarocks_query_application::session_error::{
+            QueryServiceError, QueryServiceErrorKind,
+        };
+        Err(QueryServiceError::new(
+            QueryServiceErrorKind::Unsupported,
+            "connector does not support a governed typed CTAS statement action",
         ))
     }
 
@@ -1046,6 +1123,16 @@ impl CtasEngine for DmlExecutionKernel {
         crate::query::ctas_action::prepare(self.clone(), input)
     }
 
+    fn prepare_trino_statement_action(
+        &self,
+        input: TrinoCtasInput,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::session_error::QueryServiceError,
+    > {
+        crate::query::ctas_action::trino::prepare(self.clone(), input)
+    }
+
     fn prepare_standard_ctas_target(
         &self,
         source: &dyn CtasPreparedSource,
@@ -1064,22 +1151,43 @@ impl CtasEngine for DmlExecutionKernel {
                 user_error: None,
             });
         }
-        let request = source.preflight.staged_session.prepare_request(
-            publication_id,
-            novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
-                publication_id.to_bytes(),
-            ),
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: source.preflight.staged_session.instance_id().clone(),
-                namespace: Arc::from(source.target.namespace.as_str()),
-                table: Arc::from(source.target.table.as_str()),
-            },
-            source.output_columns.clone(),
-            source.command.partitioning.clone(),
-            source.command.properties.clone(),
-            policy,
-            source.connector_context.clone(),
+        let staged = &source.preflight.staged_session;
+        let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
+            publication_id.to_bytes(),
         );
+        let table = ConnectorTableIdentity {
+            instance_id: staged.instance_id().clone(),
+            namespace: Arc::from(source.target.namespace.as_str()),
+            table: Arc::from(source.target.table.as_str()),
+        };
+        let columns = source.output_columns.clone();
+        let context = source.connector_context.clone();
+        let request = match &source.command.storage {
+            CtasStorage::Legacy {
+                partitioning,
+                properties,
+            } => staged.prepare_request(
+                publication_id,
+                operation_id,
+                table,
+                columns,
+                partitioning.clone(),
+                properties.clone(),
+                policy,
+                context,
+            ),
+            CtasStorage::Evaluated(storage) => staged
+                .prepare_typed_request(
+                    publication_id,
+                    operation_id,
+                    table,
+                    columns,
+                    storage.clone(),
+                    policy,
+                    context,
+                )
+                .map_err(connector_failure)?,
+        };
         Ok(PreparedStandardCtasCatalogAction {
             handle: Arc::new(CoreCtasCatalogAction {
                 kind: CoreCtasCatalogActionKind::StandardStage {
@@ -1512,11 +1620,25 @@ impl DmlExecutionKernel {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<CtasTargetPreflightOutcome, CtasFailure> {
-        let target = crate::catalog_application::resolver::resolve_table_target(
-            self,
+        let target = self.retain_governed_ctas_target(
             &ObjectName {
                 parts: command.target_parts.clone(),
             },
+            current_catalog,
+            current_database,
+        )?;
+        self.preflight_governed_ctas_binding(target)
+    }
+
+    pub(crate) fn retain_governed_ctas_target(
+        &self,
+        name: &ObjectName,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<CtasTargetBinding, CtasFailure> {
+        let target = crate::catalog_application::resolver::resolve_table_target(
+            self,
+            name,
             current_catalog,
             current_database,
         )
@@ -1527,6 +1649,14 @@ impl DmlExecutionKernel {
             .connector_control()
             .acquire_current(&instance_id)
             .map_err(connector_failure)?;
+        Ok(CtasTargetBinding { target, planning })
+    }
+
+    pub(crate) fn preflight_governed_ctas_binding(
+        &self,
+        target: CtasTargetBinding,
+    ) -> Result<CtasTargetPreflightOutcome, CtasFailure> {
+        let CtasTargetBinding { target, planning } = target;
         // The standard staged-create capability is the only mutation
         // authority.  Acquiring it before source planning preserves the
         // unsupported-at-zero-side-effect boundary.
@@ -1545,10 +1675,9 @@ impl DmlExecutionKernel {
                 "standard CTAS staged-create, cleanup, and writer leases do not share one exact generation",
             ));
         }
-        // The provider's staged-create publication contract is the only
-        // authority allowed to decide whether IF NOT EXISTS is a no-op. A
-        // frontend metadata read is not a substitute for its exact commit
-        // result and would race the publication frontier.
+        // The typed entry can finish an initial IF NOT EXISTS probe early.
+        // An absent result from that probe does not settle the later race;
+        // the staged Provider still enforces the original publication policy.
         let binding = planning.binding();
         let target_catalog_properties = binding
             .catalog_properties()
@@ -1663,9 +1792,16 @@ impl DmlExecutionKernel {
         let execution_nonce = uuid::Uuid::now_v7();
         let execution_identity =
             sha256(&[b"novarocks.ctas-execution.v1", execution_nonce.as_bytes()]);
+        let source_sql = match &request.command.storage {
+            CtasStorage::Legacy { .. } => printer::print_query(&request.command.source),
+            CtasStorage::Evaluated(_) => {
+                novarocks_parser::trino_printer::print_query(&request.command.source)
+                    .map_err(|error| internal_failure(error.to_string()))?
+            }
+        };
         let plan_digest = sha256(&[
             b"novarocks.ctas-plan.v1",
-            printer::print_query(&request.command.source).as_bytes(),
+            source_sql.as_bytes(),
             optimized_fingerprint.as_slice(),
             settings_material.as_slice(),
             binding_material.as_slice(),
@@ -2075,9 +2211,12 @@ mod tests {
     #[test]
     fn ctas_defaults_to_v3_without_inventing_lineage_properties() {
         let command = admitted_ctas("CREATE TABLE target AS SELECT 1 AS id");
-        assert_eq!(command.properties.len(), 1);
+        let CtasStorage::Legacy { properties, .. } = command.storage else {
+            panic!("legacy SQL must use the existing raw CTAS contract");
+        };
+        assert_eq!(properties.len(), 1);
         assert_eq!(
-            command.properties.get("format-version").map(AsRef::as_ref),
+            properties.get("format-version").map(AsRef::as_ref),
             Some("3")
         );
     }
@@ -2093,10 +2232,13 @@ mod tests {
             let command = admitted_ctas(&format!(
                 "CREATE TABLE target TBLPROPERTIES ('{key}'='{value}') AS SELECT 1 AS id"
             ));
-            assert_eq!(command.properties.len(), 2);
-            assert_eq!(command.properties.get(key).map(AsRef::as_ref), Some(value));
+            let CtasStorage::Legacy { properties, .. } = command.storage else {
+                panic!("legacy SQL must use the existing raw CTAS contract");
+            };
+            assert_eq!(properties.len(), 2);
+            assert_eq!(properties.get(key).map(AsRef::as_ref), Some(value));
             assert_eq!(
-                command.properties.get("format-version").map(AsRef::as_ref),
+                properties.get("format-version").map(AsRef::as_ref),
                 Some("3")
             );
         }

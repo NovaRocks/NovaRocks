@@ -147,6 +147,33 @@ impl CatalogCommandExecutor {
         )
     }
 
+    pub(crate) fn acquire_namespace_property_binding(
+        &self,
+        name: &ObjectName,
+        request_context: &novarocks_query_application::admitted_query_context::RequestContext,
+    ) -> Result<novarocks_query_application::api::CatalogNamespacePropertyBinding, CommandError>
+    {
+        use novarocks_failure_contract::SharedFailureCause;
+        let target = crate::catalog_application::resolver::resolve_namespace_target(
+            self,
+            name,
+            request_context.session().current_catalog(),
+        )?;
+        let instance_id = ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|cause| CommandError::from(cause.to_string()))?;
+        let planning = self
+            .connector_control
+            .acquire_current(&instance_id)
+            .map_err(|cause| CommandError::from_failure_cause(SharedFailureCause::new(cause)))?;
+        novarocks_query_application::api::CatalogNamespacePropertyBinding::try_new(
+            novarocks_spi::connector::ConnectorNamespaceIdentity {
+                instance_id,
+                namespace: Arc::from(target.namespace),
+            },
+            planning,
+        )
+    }
+
     /// Resolve only the semantic target and retain its actual control
     /// generation. This performs no table read or mutation dispatch.
     pub(crate) fn acquire_table_property_binding(
@@ -334,6 +361,7 @@ pub(super) fn lower_semantic_create_catalog(
         .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
     Ok(CatalogCreateCommand {
         instance_id,
+        connector_name: command.connector_name.clone(),
         display_name: command.name.clone(),
         properties,
         if_not_exists: command.if_not_exists,

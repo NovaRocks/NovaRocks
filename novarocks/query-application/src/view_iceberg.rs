@@ -17,9 +17,10 @@
 
 use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::view::{
-    CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewStatementResult, ViewTarget,
+    CreateExternalViewRequest, CreateViewCommand, ViewComment, ViewEngine, ViewRequestContext,
+    ViewStatementResult, ViewTarget,
 };
-use novarocks_parser::ast::{CreateView, ObjectName};
+use novarocks_parser::ast::ObjectName;
 use novarocks_spi::connector::DropPolicy;
 use novarocks_types::naming::normalize_identifier;
 
@@ -83,7 +84,7 @@ pub(crate) fn resolve_external_target_parts(
 pub(crate) fn create_external_view(
     engine: &dyn ViewEngine,
     target: ViewTarget,
-    statement: &CreateView,
+    statement: CreateViewCommand<'_>,
     context: ViewRequestContext<'_>,
     local_views: &crate::view::LocalViewSnapshot,
 ) -> Result<ViewStatementResult, crate::api::CommandError> {
@@ -92,7 +93,7 @@ pub(crate) fn create_external_view(
         .ok_or_else(|| "external view mutation requires connector request context".to_string())?;
 
     let definition = PersistedQueryDefinition::new(
-        statement.raw_query_source.clone(),
+        statement.raw_query,
         PersistedQueryDialect::StarRocks,
         context.current_catalog.unwrap_or(DEFAULT_CATALOG),
         context.current_database,
@@ -102,7 +103,7 @@ pub(crate) fn create_external_view(
             catalog: &definition.resolution.default_catalog,
             database: &definition.resolution.default_database,
             target: &target,
-            query: &statement.query,
+            query: statement.query,
             local_views,
         },
         connector_context,
@@ -114,8 +115,10 @@ pub(crate) fn create_external_view(
             definition,
             comment: statement
                 .comment
-                .as_ref()
-                .map(literal_to_string)
+                .map(|comment| match comment {
+                    ViewComment::Literal(literal) => literal_to_string(literal),
+                    ViewComment::Text(text) => Ok(text.to_owned()),
+                })
                 .transpose()?,
             or_replace: statement.or_replace,
             if_not_exists: statement.if_not_exists,

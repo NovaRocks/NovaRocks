@@ -120,6 +120,7 @@ pub(crate) fn prepare_resolved_optimize(
     kernel: &crate::query_execution::kernels::MaintenanceExecutionKernel,
     engine: RequestScopedMaintenanceEngine,
     target: MaintenanceTarget,
+    planning: Option<&novarocks_spi::connector::ConnectorControlPlanningPin>,
     execution: &QueryExecutionContext,
     family: novarocks_result_contract::ClientPresentationFamily,
     #[cfg(novarocks_dev_controls)] observation: Option<
@@ -133,6 +134,7 @@ pub(crate) fn prepare_resolved_optimize(
         RewriteIntent::Optimize {
             file_size_threshold_bytes: 100 * 1024 * 1024,
         },
+        planning,
         execution,
         family,
         #[cfg(novarocks_dev_controls)]
@@ -162,6 +164,7 @@ fn prepare_intent(
         engine,
         target,
         intent,
+        None,
         execution,
         family,
         #[cfg(novarocks_dev_controls)]
@@ -174,6 +177,7 @@ fn prepare_resolved_intent(
     engine: RequestScopedMaintenanceEngine,
     target: MaintenanceTarget,
     intent: RewriteIntent,
+    planning: Option<&novarocks_spi::connector::ConnectorControlPlanningPin>,
     execution: &QueryExecutionContext,
     family: novarocks_result_contract::ClientPresentationFamily,
     #[cfg(novarocks_dev_controls)] observation: Option<
@@ -194,10 +198,19 @@ fn prepare_resolved_intent(
     }
     let identity = RequestScopedMaintenanceEngine::target_identity(&target)
         .map_err(TerminalError::pre_dispatch_failed)?;
-    let rewrite = kernel
-        .connector_control()
-        .acquire_current_distributed_rewrite(&identity.instance_id)
-        .map_err(TerminalError::from_original_cause)?;
+    let resolver = kernel.connector_control();
+    let rewrite = match planning {
+        Some(planning) => {
+            if planning.binding().descriptor().instance_id != identity.instance_id {
+                return Err(TerminalError::pre_dispatch_failed(
+                    "direct Rewrite target differs from its retained generation",
+                ));
+            }
+            resolver.acquire_exact_distributed_rewrite(planning.control_runtime_id())
+        }
+        None => resolver.acquire_current_distributed_rewrite(&identity.instance_id),
+    }
+    .map_err(TerminalError::from_original_cause)?;
     let mut dependencies = rewrite
         .planning_initial_dependencies()
         .map_err(TerminalError::from_original_cause)?;

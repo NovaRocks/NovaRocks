@@ -17,6 +17,9 @@
 
 //! Closed typed executor for Iceberg MV statements.
 
+mod trino;
+pub(crate) use trino::TrinoMvPropertyPreparation;
+
 use crate::mv::domain::application::{
     MvAlterAction, MvAlterStatement, MvCreatePartitionField, MvCreateStatement, MvCreateStorage,
     MvDropStatement, MvRefreshRequest, MvRepartitionFields,
@@ -28,7 +31,7 @@ use novarocks_mv_application::engine_properties::{
 };
 use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
 use novarocks_parser::ast::{
-    CallStatement, Literal, LiteralKind, MaterializedViewAlterAction as TypedAlterAction,
+    Literal, LiteralKind, MaterializedViewAlterAction as TypedAlterAction,
     MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
     MaterializedViewPartitionField, MaterializedViewRefreshMode,
     MaterializedViewRefreshPolicy as TypedRefreshPolicy, MaterializedViewStatement,
@@ -40,6 +43,7 @@ use novarocks_query_application::api::{
     MaterializedViewCommandConsumer,
 };
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
+use novarocks_query_application::sql::PreparedMaintenanceCall;
 use novarocks_spi::connector::{DdlPropertyChange, DdlPropertyValue, MvStorageObservationPort};
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 use novarocks_types::naming::normalize_identifier;
@@ -101,35 +105,12 @@ impl MvCommandExecutor {
         novarocks_query_application::api::CommandError,
     > {
         if let MaterializedViewStatement::ExplainRefresh(explain) = statement {
-            let services = self.execution_services.clone().ok_or_else(|| {
-                novarocks_query_application::api::CommandError::new(
-                    novarocks_query_application::api::CommandErrorKind::Unsupported,
-                    "MV execution services are unavailable",
-                )
-            })?;
-            let request = Box::new(
-                crate::query_execution::mv_assembly::refresh_explain::MvExplainPreparationInput {
-                    ports: self.ports.clone(),
-                    current_catalog: context.session().current_catalog().map(str::to_owned),
-                    current_database: context.session().current_database().to_owned(),
-                    statement: lower_typed_refresh(&explain.refresh)?,
-                    level: lower_typed_explain_level(
-                        explain.level,
-                        context.session().property_inputs(),
-                    )?,
-                    context: command_context.connector_context().clone(),
-                },
-            );
-            return crate::query::mv_read_action::prepare(
-                services,
-                request,
-                context.execution().clone(),
-                context.session().presentation().copied().ok_or_else(|| {
-                    novarocks_query_application::api::CommandError::new(
-                        novarocks_query_application::api::CommandErrorKind::Rejected,
-                        "MV client result requires an explicit presentation",
-                    )
-                })?,
+            return self.prepare_refresh_explain(
+                context.session().current_catalog(),
+                lower_typed_refresh(&explain.refresh)?,
+                lower_typed_explain_level(explain.level, context.session().property_inputs())?,
+                context,
+                command_context,
             );
         }
         use crate::query::mv_action::{CreateRequest, MvCommandRequest};
@@ -183,10 +164,206 @@ impl MvCommandExecutor {
         self.prepare_command_request(request, context, command_context)
     }
 
-    /// Start the original governed Alter after the final SQL caller has
-    /// completed property evaluation against the admitted target scope.
+    fn prepare_refresh_explain(
+        &self,
+        catalog: Option<&str>,
+        statement: MvRefreshRequest,
+        level: novarocks_sql::compiler::ExplainLevel,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        CommandError,
+    > {
+        let services = self.execution_services.clone().ok_or_else(|| {
+            CommandError::new(
+                CommandErrorKind::Unsupported,
+                "MV execution services are unavailable",
+            )
+        })?;
+        let request = Box::new(
+            crate::query_execution::mv_assembly::refresh_explain::MvExplainPreparationInput {
+                ports: self.ports.clone(),
+                current_catalog: catalog.map(str::to_owned),
+                current_database: context.session().current_database().to_owned(),
+                statement,
+                level,
+                context: command_context.connector_context().clone(),
+            },
+        );
+        let presentation = context.session().presentation().copied().ok_or_else(|| {
+            CommandError::new(
+                CommandErrorKind::Rejected,
+                "MV client result requires an explicit presentation",
+            )
+        })?;
+        crate::query::mv_read_action::prepare(
+            services,
+            request,
+            context.execution().clone(),
+            presentation,
+        )
+    }
+
+    pub(crate) fn prepare_trino_refresh(
+        &self,
+        refresh: novarocks_parser::ast::TrinoRefreshMaterializedView,
+        explain: bool,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        CommandError,
+    > {
+        let (_, target) = trino::resolve_trino_target(
+            &refresh.table.name,
+            context.session().current_catalog(),
+            context.session().current_database(),
+        )
+        .map_err(crate::query::procedure_command_error)?;
+        let statement = MvRefreshRequest {
+            name_parts: vec![target.namespace.clone(), target.table.clone()],
+            full: false,
+        };
+        if explain {
+            return self.prepare_refresh_explain(
+                Some(&target.catalog),
+                statement,
+                lower_typed_explain_level(
+                    MaterializedViewExplainLevel::Default,
+                    context.session().property_inputs(),
+                )?,
+                context,
+                command_context,
+            );
+        }
+        self.prepare_command_request(
+            crate::query::mv_action::MvCommandRequest::Refresh {
+                statement,
+                requested: novarocks_sql::planning::mv::SqlMvTarget {
+                    catalog: Some(target.catalog),
+                    database: target.namespace,
+                    name: target.table,
+                },
+                session_properties: Arc::clone(context.session().property_inputs()),
+            },
+            context,
+            command_context,
+        )
+    }
+
+    pub(crate) fn prepare_trino_drop(
+        &self,
+        drop: novarocks_parser::ast::TrinoDropMaterializedView,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        CommandError,
+    > {
+        let (_, target) = trino::resolve_trino_target(
+            &drop.name,
+            context.session().current_catalog(),
+            context.session().current_database(),
+        )
+        .map_err(crate::query::procedure_command_error)?;
+        let statement = MvDropStatement {
+            name_parts: vec![target.namespace.clone(), target.table.clone()],
+            if_exists: drop.exists,
+        };
+        let target = novarocks_sql::planning::mv::SqlMvTarget {
+            catalog: Some(target.catalog),
+            database: target.namespace,
+            name: target.table,
+        };
+        self.prepare_command_request(
+            crate::query::mv_action::MvCommandRequest::Control(
+                crate::query::mv_action::MvControlRequest::Drop { target, statement },
+            ),
+            context,
+            command_context,
+        )
+    }
+
+    pub(crate) fn trino_property_planning(
+        &self,
+        name: &TypedObjectName,
+        context: &RequestContext,
+        source: &str,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlPlanningPin,
+        novarocks_query_application::session_error::QueryServiceError,
+    > {
+        use novarocks_query_application::session_error::{
+            QueryServiceError, QueryServiceErrorKind,
+        };
+        use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
+        let (_, target) = trino::resolve_trino_target(
+            name,
+            context.session().current_catalog(),
+            context.session().current_database(),
+        )?;
+        if novarocks_sql::system_table::is_system_table_name(&target.catalog, &target.namespace) {
+            return Err(
+                novarocks_query_application::sql::trino_admission::unsupported_statement(
+                    source,
+                    name.span,
+                    "Modifying a system catalog or information_schema",
+                ),
+            );
+        }
+        let services = self.execution_services.as_ref().ok_or_else(|| {
+            QueryServiceError::new(
+                QueryServiceErrorKind::Unsupported,
+                "MV execution services are unavailable",
+            )
+        })?;
+        let instance = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
+            QueryServiceError::new(QueryServiceErrorKind::InvalidValue, error.to_string())
+        })?;
+        services
+            .connector_control
+            .acquire_current(&instance)
+            .map_err(|error| {
+                QueryServiceError::from_failure_cause(
+                    novarocks_failure_contract::SharedFailureCause::new(error),
+                )
+            })
+    }
+
+    /// Send the admitted CREATE properties to the original staged target Action.
+    pub(crate) fn prepare_evaluated_create(
+        &self,
+        statement: MvCreateStatement,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        CommandError,
+    > {
+        use crate::query::mv_action::{CreateRequest, MvCommandRequest};
+        let MvCreateStorage::Evaluated { target, .. } = &statement.storage else {
+            return Err(CommandError::new(
+                CommandErrorKind::Failed,
+                "Typed materialized view create is missing its original evaluated storage scope",
+            ));
+        };
+        let target = novarocks_sql::planning::mv::SqlMvTarget {
+            catalog: Some(target.catalog.clone()),
+            database: target.namespace.clone(),
+            name: target.table.clone(),
+        };
+        self.prepare_command_request(
+            MvCommandRequest::Create(Box::new(CreateRequest { target, statement })),
+            context,
+            command_context,
+        )
+    }
+
+    /// Start the original governed Alter with the exact resolved target.
     pub(crate) fn prepare_evaluated_alter(
         &self,
+        target: novarocks_sql::planning::mv::SqlMvTarget,
         statement: MvAlterStatement,
         context: &RequestContext,
         command_context: &CommandContext,
@@ -194,11 +371,7 @@ impl MvCommandExecutor {
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         CommandError,
     > {
-        let request = alter_command(
-            context.session().current_catalog(),
-            context.session().current_database(),
-            statement,
-        )?;
+        let request = alter_command_for_target(target, statement)?;
         self.prepare_command_request(request, context, command_context)
     }
 
@@ -234,11 +407,11 @@ impl MvCommandExecutor {
     }
 
     /// Executes the MV management procedures and the test-only stateless
-    /// rebuild directly from parser-owned `CALL` syntax. Other procedures
-    /// remain a route miss.
+    /// rebuild from prepared procedure arguments. Other procedures remain a
+    /// route miss.
     pub fn try_execute_typed_call(
         &self,
-        statement: &CallStatement,
+        statement: &PreparedMaintenanceCall,
         current_database: &str,
         session_principal: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -488,8 +661,15 @@ fn alter_command(
     database: &str,
     statement: MvAlterStatement,
 ) -> Result<crate::query::mv_action::MvCommandRequest, CommandError> {
-    use crate::query::mv_action::{MvCommandRequest, MvControlRequest};
     let target = resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
+    alter_command_for_target(target, statement)
+}
+
+fn alter_command_for_target(
+    target: novarocks_sql::planning::mv::SqlMvTarget,
+    statement: MvAlterStatement,
+) -> Result<crate::query::mv_action::MvCommandRequest, CommandError> {
+    use crate::query::mv_action::{MvCommandRequest, MvControlRequest};
     let fields = match &statement.action {
         MvAlterAction::Repartition(fields) => Some(MvRepartitionFields::Legacy(
             fields.iter().map(IcebergPartitionFieldExpr::from).collect(),

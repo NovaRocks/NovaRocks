@@ -54,11 +54,14 @@ const TRINO_STANDARD_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("INVALID_CATALOG_PROPERTY", 124, "USER_ERROR"),
     ("INVALID_SCHEMA_PROPERTY", 33, "USER_ERROR"),
     ("INVALID_TABLE_PROPERTY", 18, "USER_ERROR"),
+    ("NOT_IN_TRANSACTION", 21, "USER_ERROR"),
     ("INVALID_MATERIALIZED_VIEW_PROPERTY", 95, "USER_ERROR"),
     ("INVALID_BRANCH_PROPERTY", 136, "USER_ERROR"),
     ("CATALOG_NOT_FOUND", 44, "USER_ERROR"),
     ("SCHEMA_NOT_FOUND", 45, "USER_ERROR"),
     ("TABLE_NOT_FOUND", 46, "USER_ERROR"),
+    ("TABLE_ALREADY_EXISTS", 50, "USER_ERROR"),
+    ("SCHEMA_ALREADY_EXISTS", 49, "USER_ERROR"),
     ("COLUMN_NOT_FOUND", 47, "USER_ERROR"),
     ("DUPLICATE_NAMED_QUERY", 53, "USER_ERROR"),
     ("DUPLICATE_COLUMN_NAME", 54, "USER_ERROR"),
@@ -91,7 +94,7 @@ fn assert_wire(error: &TrinoQueryError, name: &str) {
     let (_, number, kind) = TRINO_STANDARD_ERROR_CODES
         .iter()
         .find(|(candidate, _, _)| *candidate == name)
-        .expect("name in Trino StandardErrorCode oracle");
+        .unwrap_or_else(|| panic!("{name} is missing from the Trino StandardErrorCode oracle"));
     assert_eq!(
         (error.error_name, error.error_code, error.error_type),
         (name, *number, *kind)
@@ -165,6 +168,8 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.unknown_catalog" => "CATALOG_NOT_FOUND",
         "sql.analyze.unknown_schema" => "SCHEMA_NOT_FOUND",
         "sql.analyze.unknown_table" => "TABLE_NOT_FOUND",
+        "sql.admit.table_already_exists" => "TABLE_ALREADY_EXISTS",
+        "sql.admit.schema_already_exists" => "SCHEMA_ALREADY_EXISTS",
         "sql.analyze.unknown_column" => "COLUMN_NOT_FOUND",
         "sql.analyze.unknown_function" => "FUNCTION_NOT_FOUND",
         "sql.analyze.missing_column_name" => "MISSING_COLUMN_NAME",
@@ -193,7 +198,9 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         | "query.execution.update_target_row_multiple_matches" => {
             "MERGE_TARGET_ROW_MULTIPLE_MATCHES"
         }
+        "sql.admit.not_in_transaction" => "NOT_IN_TRANSACTION",
         "sql.parse.unsupported_statement"
+        | "sql.admit.unsupported_statement"
         | "sql.analyze.unsupported_expression"
         | "sql.analyze.unsupported_query_shape"
         | "sql.analyze.unavailable_implementation"
@@ -293,6 +300,7 @@ fn every_registered_user_descriptor_has_an_explicit_trino_mapping() {
         novarocks_parser::ERROR_CODE_DESCRIPTORS,
         novarocks_sql::analyze_error::ERROR_CODE_DESCRIPTORS,
         novarocks_query_application::sql::session_admit::SESSION_ERROR_CODE_DESCRIPTORS,
+        novarocks_query_application::sql::trino_admission::TRINO_STATEMENT_ERROR_CODE_DESCRIPTORS,
         novarocks_query_application::sql::property_admit::DDL_PROPERTY_ERROR_CODE_DESCRIPTORS,
         novarocks_query_application::sql::table_procedure::TABLE_PROCEDURE_ERROR_CODE_DESCRIPTORS,
         novarocks_query_application::sql::dml_admission::DML_ADMISSION_ERROR_CODE_DESCRIPTORS,
@@ -1425,4 +1433,36 @@ fn table_property_descriptor_with_original_cause_and_late_effect_maps_to_eightee
         service.external_effect_disposition(),
         Some(StatementExternalEffectDisposition::KnownUncommitted)
     );
+}
+
+#[test]
+fn ctas_existing_target_uses_the_original_statement_location_and_trino_code() {
+    use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
+
+    let source = "-- comment before the statement\n  CREATE TABLE test.s.destination AS SELECT 1";
+    let start = source.find("CREATE").unwrap();
+    let user = DmlAdmissionError::TableAlreadyExists.to_user_error(
+        source,
+        novarocks_parser::Span::new(start, source.len()),
+        "Destination table 'test.s.destination' already exists",
+    );
+    assert_eq!(user.code().as_str(), "sql.admit.table_already_exists");
+    assert_eq!(user.retry(), RetryClass::Never);
+    let error = QueryServiceError::from_user_error(user);
+    let wire = query_error(TrinoErrorSource::Service {
+        error: &error,
+        sql: source,
+    });
+    assert_eq!(
+        (wire.error_code, wire.error_name, wire.error_type),
+        (50, "TABLE_ALREADY_EXISTS", "USER_ERROR"),
+    );
+    assert_eq!(
+        wire.error_location,
+        Some(TrinoErrorLocation {
+            line_number: 2,
+            column_number: 3
+        }),
+    );
+    assert!(wire.message.contains("test.s.destination"));
 }

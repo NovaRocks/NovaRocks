@@ -39,48 +39,27 @@ use crate::query_execution::planning::write_sink::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
-use novarocks_parser::ast::{
-    Delete, Expr, FunctionCall, LiteralKind, ObjectName as ParserObjectName, Predicate, Query,
-    UnaryOperator,
-};
+use novarocks_parser::ast::{Expr, FunctionCall, LiteralKind, Predicate, Query, UnaryOperator};
+
+use super::PreparedPredicateDelete;
 use novarocks_parser::{SYNTHETIC, ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
-use novarocks_sql::planning::dml::{DmlWriteSinkMode, IcebergRefSuffix, split_ref_suffix};
+use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-use novarocks_sql::semantic::ObjectName as SqlObjectName;
 use novarocks_types::schema::ColumnDef;
 
 pub(super) fn resolve_target(
     state: &DmlExecutionKernel,
-    stmt: &Delete,
+    stmt: &PreparedPredicateDelete,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<(TargetBackend, String), crate::catalog_application::resolver::TargetResolutionError> {
-    // Detect branch/tag suffix in the target table name.
-    let target_name = sql_object_name(&stmt.target);
-    let (stripped_parts, ref_suffix) = split_ref_suffix(&target_name.parts);
-    let effective_name;
-    let table_name: &SqlObjectName = match ref_suffix {
-        Some(IcebergRefSuffix::Tag(ref tag_name)) => {
-            return Err((format!(
-                "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
-            ))
-            .into());
-        }
-        Some(IcebergRefSuffix::Branch(_)) => {
-            effective_name = SqlObjectName {
-                parts: stripped_parts,
-            };
-            &effective_name
-        }
-        None => &target_name,
-    };
-    let target_ref = match &ref_suffix {
-        Some(IcebergRefSuffix::Branch(b)) => b.clone(),
-        _ => "main".to_string(),
-    };
+    let (table_name, target_ref) = stmt
+        .target
+        .table_and_reference()
+        .map_err(crate::catalog_application::resolver::TargetResolutionError::from)?;
 
     // Resolve only local catalog admission facts.
     let target =
@@ -92,11 +71,11 @@ pub(super) fn resolve_target(
         ))
         .into());
     }
-    Ok((target, target_ref))
+    Ok((target, target_ref.to_owned()))
 }
 
 fn delete_where_expr<'a>(
-    stmt: &'a Delete,
+    stmt: &'a PreparedPredicateDelete,
     target_binding: &crate::connector::write_target::ConnectorWriteTargetBinding,
 ) -> Result<&'a Expr, crate::dml::error::DmlExecutionError> {
     let where_clause = stmt.selection.as_ref().ok_or_else(|| {
@@ -110,7 +89,7 @@ fn delete_where_expr<'a>(
 
 pub(super) async fn prepare_delete_statement_async(
     state: &DmlExecutionKernel,
-    stmt: &Delete,
+    stmt: &PreparedPredicateDelete,
     target: &TargetBackend,
     target_ref: &str,
     planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
@@ -384,12 +363,6 @@ fn write_input_columns(
             logical_type: None,
         })
         .collect()
-}
-
-fn sql_object_name(name: &ParserObjectName) -> SqlObjectName {
-    SqlObjectName {
-        parts: name.parts.iter().map(|part| part.value.clone()).collect(),
-    }
 }
 
 /// Check that a DELETE `WHERE` clause is inside the subset this engine supports.

@@ -67,11 +67,12 @@ use novarocks_query_application::serving_admission::{
     FrontendAdmissionError, FrontendServingAdmission,
 };
 use novarocks_query_application::session::{
-    QuerySession, QuerySessionFactory, StatementSessionRequest,
+    QuerySession, QuerySessionFactory, QuerySessionStatement, StatementAdmission,
+    StatementOutputShape, StatementSessionRequest,
 };
 use novarocks_query_application::session_control::{
-    GovernedQueryStatementBeginError, GovernedStatementAction, QueryControlService,
-    QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
+    GovernedQueryStatementBeginError, GovernedQueryStatementOwner, GovernedStatementAction,
+    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
 };
 use novarocks_query_application::session_effects::SessionEffects;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
@@ -87,12 +88,15 @@ use novarocks_query_application::sql::catalog::SessionCatalogService;
 use novarocks_query_application::sql::dml_admission::validate_table_statement_admission;
 use novarocks_query_application::sql::session::{SessionExecutionSettings, SessionSqlState};
 use novarocks_query_application::sql::session_admit::SessionAdmitError;
+use novarocks_query_application::sql::trino_admission::TrinoSessionAction;
+use novarocks_query_application::sql::{
+    PreparedMaintenanceCall, SpecializedStatementRoute, parse_single_statement,
+    query_service_parse_error,
+};
 use novarocks_query_application::sql::{
     ProductCommandRouter, ProductSqlCommand, lower_product_sql_command,
 };
-use novarocks_query_application::sql::{
-    SpecializedStatementRoute, parse_single_statement, query_service_parse_error,
-};
+use novarocks_query_application::statement_kind::StatementKind;
 use novarocks_type_contract::CompileControlError;
 use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
@@ -104,6 +108,7 @@ use novarocks_workload_control::{
 };
 use novarocks_workload_control::{WorkError, WorkOwner};
 
+pub(crate) mod analyze_property_computation;
 mod catalog_action;
 pub(crate) mod catalog_property_computation;
 pub(crate) mod compiler;
@@ -114,10 +119,13 @@ pub(crate) mod insert_action;
 mod maintenance_action;
 pub(crate) mod mutation_action;
 pub(crate) mod mv_action;
+pub(crate) mod mv_property_action;
 pub(crate) mod mv_read_action;
+mod property_action_tail;
 mod property_cpu_context;
 mod query_session_action;
 pub(crate) mod read_action;
+pub(super) mod schema_create_action;
 pub(crate) mod session_property_computation;
 mod set_action;
 mod statement_action;
@@ -126,6 +134,7 @@ pub(crate) mod statement_publication;
 mod table_create_action;
 pub(crate) mod table_mutation_action;
 pub(crate) mod table_property_computation;
+mod trino_statement;
 pub(crate) mod write_action;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
@@ -248,6 +257,16 @@ struct FrontendCatalogCommandConsumer {
 }
 
 impl CatalogCommandConsumer for FrontendCatalogCommandConsumer {
+    fn acquire_namespace_property_binding(
+        &self,
+        name: &novarocks_sql::semantic::ObjectName,
+        request_context: &RequestContext,
+    ) -> Result<novarocks_query_application::api::CatalogNamespacePropertyBinding, CommandError>
+    {
+        self.catalog
+            .acquire_namespace_property_binding(name, request_context)
+    }
+
     fn acquire_table_read_binding(
         &self,
         name: &novarocks_sql::semantic::ObjectName,
@@ -593,12 +612,11 @@ impl TypedCommandRoute {
 impl SpecializedStatementRoute for TypedCommandRoute {
     fn execute_maintenance_call(
         &self,
-        statement: &novarocks_parser::ast::CallStatement,
+        statement: Arc<PreparedMaintenanceCall>,
         context: &RequestContext,
         command_context: &CommandContext,
     ) -> OptionalCommandFuture {
         let mv_call = self.mv_call.clone();
-        let statement = statement.clone();
         execute_optional_product_command_edge(
             self.executor.clone(),
             context.clone(),
@@ -1015,8 +1033,11 @@ pub struct FrontendQueryService {
         Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
     required_constant_interpreter: Arc<crate::RequiredConstantInterpreter>,
     query_compiler: FrontendQueryCompiler,
-    command_executor: Arc<dyn SpecializedStatementRoute>,
+    command_executor: Arc<TypedCommandRoute>,
     product_command_router: ProductCommandRouter,
+    statistics_command: crate::statistics::command::StatisticsCommandExecutor,
+    iceberg_ref_command: IcebergRefCommandExecutor,
+    maintenance_command: MaintenanceCommandExecutor,
     query_control: QueryControlService,
     logical_execution_launcher: Arc<dyn LogicalExecutionLauncher>,
     workload_root_admission: RootAdmissionHandle,
@@ -1076,6 +1097,9 @@ impl FrontendQueryService {
         required_constant_interpreter: Arc<crate::RequiredConstantInterpreter>,
         query_compiler: FrontendQueryCompiler,
         product_command_router: ProductCommandRouter,
+        statistics_command: crate::statistics::command::StatisticsCommandExecutor,
+        iceberg_ref_command: IcebergRefCommandExecutor,
+        maintenance_command: MaintenanceCommandExecutor,
         view_command_executor: ViewCommandExecutor,
         mv_command_consumer: Arc<dyn MaterializedViewCommandConsumer>,
         mv_command_executor: MvCommandExecutor,
@@ -1113,6 +1137,9 @@ impl FrontendQueryService {
                 query_blocking_executor.clone(),
             )),
             product_command_router,
+            statistics_command,
+            iceberg_ref_command,
+            maintenance_command,
             query_control,
             logical_execution_launcher,
             workload_root_admission,
@@ -1131,14 +1158,12 @@ impl FrontendQueryService {
             serving_admission,
         }
     }
-}
 
-impl QuerySessionFactory for FrontendQueryService {
     // Design: ADR-0203 (docs/adr/ADR-0203-client-result-presentation-and-trino-paged-delivery.md)
-    fn open_statement_session(
+    pub(crate) fn open_frontend_statement_session(
         &self,
         request: StatementSessionRequest,
-    ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
+    ) -> Result<Arc<FrontendQuerySession>, StatementSessionError> {
         let admission = request.admission();
         let (query_id, principal, value) = request.into_parts();
         let state = SessionSqlState::from_session_value(
@@ -1169,6 +1194,15 @@ impl QuerySessionFactory for FrontendQueryService {
             output_shape: Mutex::new(None),
         }))
     }
+}
+
+impl QuerySessionFactory for FrontendQueryService {
+    fn open_statement_session(
+        &self,
+        request: StatementSessionRequest,
+    ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
+        Ok(self.open_frontend_statement_session(request)?)
+    }
 
     fn cancel_all(&self, reason: QueryCancellationReason) {
         self.query_control.cancel_all(reason);
@@ -1187,7 +1221,7 @@ fn query_service_admission_error(error: FrontendAdmissionError) -> QueryServiceE
     }
 }
 
-struct FrontendQuerySession {
+pub(crate) struct FrontendQuerySession {
     origin: novarocks_query_application::session_control::SessionOrigin,
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
@@ -1263,11 +1297,7 @@ impl FrontendQuerySession {
         let kind = admitted.kind;
         if query_session_action::uses_legacy_root_hints(&parsed_statement) {
             return self
-                .execute_scoped_query_family(
-                    Arc::from(source),
-                    parsed_statement,
-                    query_session_action::ScopedQueryAssignments::LegacyRootHints,
-                )
+                .execute_legacy_scoped_query_family(Arc::from(source), parsed_statement)
                 .await
                 .map(|output| {
                     novarocks_query_application::session::QuerySessionStatement::output_owned(
@@ -1306,7 +1336,77 @@ impl FrontendQuerySession {
         source: &str,
         statement: &ast::SessionStatement,
     ) -> Result<StatementResult, QueryServiceError> {
-        let (deadline, timeout_ms) = if matches!(statement, ast::SessionStatement::Set(_)) {
+        let source: Arc<str> = Arc::from(source);
+        let (governed, deadline) =
+            self.begin_session_action(&source, matches!(statement, ast::SessionStatement::Set(_)))?;
+        match statement {
+            ast::SessionStatement::Set(statement) => {
+                self.execute_observed_set(source, statement.clone(), deadline, governed).await
+            }
+            ast::SessionStatement::Use(statement) => {
+                let schema = statement.catalog.as_ref().map_or_else(
+                    || statement.database.value.clone(),
+                    |catalog| format!("{}.{}", catalog.value, statement.database.value),
+                );
+                Ok(self.execute_session_use(SessionNamespace::Legacy(&schema), governed).await)
+            }
+            ast::SessionStatement::Kill(_) => {
+                unreachable!("connection management is refused before statement admission")
+            }
+            ast::SessionStatement::TransactionControl(statement) => Ok(self.governed_typed_error(
+                QueryServiceError::from_user_error(
+                    SessionAdmitError::TransactionUnsupported.to_user_error(
+                        &source,
+                        statement.span,
+                        format!(
+                            "{} is not supported because NovaRocks only provides statement-level autocommit frontiers",
+                            statement.kind.sql()
+                        ),
+                    ),
+                ),
+                governed,
+            )),
+        }
+    }
+
+    pub(super) async fn execute_trino_session_action(
+        &self,
+        source: Arc<str>,
+        action: TrinoSessionAction,
+    ) -> Result<QuerySessionStatement, QueryServiceError> {
+        let (kind, work) = lower_trino_session_action(action);
+        let shape = StatementOutputShape::Empty;
+        *self.output_shape.lock().map_err(poisoned_state)? = Some(shape);
+        self.admission.publish(StatementAdmission { kind, shape });
+
+        let (governed, deadline) =
+            self.begin_session_action(&source, matches!(&work, TrinoSessionWork::Mutation(_)))?;
+        let output = match work {
+            TrinoSessionWork::Use { catalog, schema } => {
+                self.execute_session_use(
+                    SessionNamespace::Trino {
+                        catalog: catalog.as_ref(),
+                        schema: &schema,
+                        source: &source,
+                    },
+                    governed,
+                )
+                .await
+            }
+            TrinoSessionWork::Mutation(mutation) => {
+                self.execute_observed_scoped_session_mutation(source, mutation, deadline, governed)
+                    .await?
+            }
+        };
+        Ok(QuerySessionStatement::output_owned(output, kind))
+    }
+
+    fn begin_session_action(
+        &self,
+        source: &Arc<str>,
+        inherited_timeout: bool,
+    ) -> Result<(GovernedQueryStatementOwner, Option<Instant>), QueryServiceError> {
+        let (deadline, timeout_ms) = if inherited_timeout {
             let state = self.state.lock().map_err(poisoned_state)?;
             governed_query_deadline(&state)?
         } else {
@@ -1322,65 +1422,28 @@ impl FrontendQuerySession {
                 WorkClass::Management,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
-                Some(Arc::from(source)),
+                Some(Arc::clone(source)),
                 ResultWindowClass::Local,
             )
             .map_err(|error| self.governed_statement_begin_error(error))?;
-        let mut effects = SessionEffects::default();
-        let result = match statement {
-            ast::SessionStatement::Set(statement) => {
-                return self.execute_observed_set(Arc::from(source), statement.clone(), deadline, governed).await;
-            }
-            ast::SessionStatement::Use(statement) => {
-                let schema = statement.catalog.as_ref().map_or_else(
-                    || statement.database.value.clone(),
-                    |catalog| format!("{}.{}", catalog.value, statement.database.value),
-                );
-                let cancellation = QueryCancellationView::governed(
-                    governed.cancellation().clone(),
-                    governed.timeout_ms(),
-                );
-                match self.init_database_with_cancellation(&schema, cancellation, &governed).await {
-                    Ok(change) => effects.append(change),
-                    Err(error) => return Ok(self.governed_typed_error(error, governed)),
-                }
-                Ok(StatementResult::Ok)
-            }
-            ast::SessionStatement::Kill(_) => {
-                unreachable!("connection management is refused before statement admission")
-            },
-            ast::SessionStatement::TransactionControl(statement) => Err(
-                QueryServiceError::from_user_error(
-                    SessionAdmitError::TransactionUnsupported.to_user_error(
-                        source,
-                        statement.span,
-                        format!(
-                            "{} is not supported because NovaRocks only provides statement-level autocommit frontiers",
-                            statement.kind.sql()
-                        ),
-                    ),
-                ),
-            ),
-        };
-        match result {
-            Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
+        Ok((governed, deadline))
+    }
+
+    async fn execute_session_use(
+        &self,
+        namespace: SessionNamespace<'_>,
+        governed: GovernedQueryStatementOwner,
+    ) -> StatementResult {
+        let cancellation =
+            QueryCancellationView::governed(governed.cancellation().clone(), governed.timeout_ms());
+        match self
+            .init_database_with_cancellation(namespace, cancellation, &governed)
+            .await
+        {
+            Ok(effects) => StatementResult::GovernedCompletion(
                 GovernedCompletionStatementResult::with_session_effects(governed, effects),
-            )),
-            Ok(StatementResult::Query(result)) => {
-                // Local delivery may still use transitional LRA credits under
-                // this exact scope. Its root exits at the protocol terminal.
-                Ok(self.governed_local_result(result, governed))
-            }
-            Ok(
-                StatementResult::GovernedQuery(_)
-                | StatementResult::StreamingQuery(_)
-                | StatementResult::GovernedCompletion(_)
-                | StatementResult::GovernedError(_),
-            ) => Ok(self.governed_typed_error(
-                internal_error("session statement returned an already-owned protocol result"),
-                governed,
-            )),
-            Err(error) => Ok(self.governed_typed_error(error, governed)),
+            ),
+            Err(error) => self.governed_typed_error(error, governed),
         }
     }
 
@@ -1407,9 +1470,9 @@ impl FrontendQuerySession {
 
     async fn init_database_with_cancellation(
         &self,
-        schema: &str,
+        namespace: SessionNamespace<'_>,
         cancellation: QueryCancellationView,
-        statement: &novarocks_query_application::session_control::GovernedQueryStatementOwner,
+        statement: &GovernedQueryStatementOwner,
     ) -> Result<SessionEffects, QueryServiceError> {
         let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
             statement.scope(),
@@ -1432,7 +1495,7 @@ impl FrontendQuerySession {
         let context = resolve_database_context(
             &self.service.session_catalog_resolver,
             current_catalog.as_deref(),
-            schema,
+            namespace,
             connector_context,
             &capacity,
         )
@@ -1749,7 +1812,14 @@ impl FrontendQuerySession {
             None => command_context,
         };
         let parsed_statement = match parsed_statement {
-            ParsedStatement::Table(ast::TableStatement::Create(create)) => {
+            ParsedStatement::Table(table) => {
+                if let Err(error) = validate_table_statement_admission(&table, &sql) {
+                    return Ok(self.governed_typed_error(
+                        QueryServiceError::from_user_error(error),
+                        statement,
+                    ));
+                }
+                let ast::TableStatement::Create(create) = table;
                 return self
                     .execute_observed_table_create(
                         Arc::from(sql),
@@ -1982,7 +2052,11 @@ impl FrontendQuerySession {
             ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Delete(statement)) => (
                 None,
                 Some(
-                    crate::query_execution::dml::delete::OwnedDeleteStatement::Predicate(statement),
+                    crate::query_execution::dml::delete::OwnedDeleteStatement::Predicate(
+                        crate::query_execution::dml::delete::PreparedPredicateDelete::from_legacy(
+                            statement,
+                        ),
+                    ),
                 ),
             ),
             ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::AddEqualityDelete(
@@ -2186,26 +2260,19 @@ impl FrontendQuerySession {
             ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
                 statement,
             )) => Box::pin(async move {
+                let call = Arc::new(PreparedMaintenanceCall::from_legacy(&statement));
                 let special_result = command_executor
-                    .execute_maintenance_call(&statement, &context, &command_context)
+                    .execute_maintenance_call(call.clone(), &context, &command_context)
                     .await
                     .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
                 match special_result {
                     Err(error) => Ok((Err(error), execution_owner)),
                     Ok(Some(result)) => Ok((Ok(result), execution_owner)),
                     Ok(None) => {
-                        let command = lower_product_sql_command(&ParsedStatement::Maintenance(
-                            novarocks_parser::ast::MaintenanceStatement::Call(statement),
-                        ))
-                        .map_err(RoutedExecutionError::Engine)
-                        .and_then(|command| {
-                            command.ok_or_else(|| {
-                                RoutedExecutionError::Engine(
-                                    "typed statement has no declared product or specialized owner"
-                                        .to_string(),
-                                )
-                            })
-                        });
+                        let command = call
+                            .maintenance_command()
+                            .map(ProductSqlCommand::Maintenance)
+                            .map_err(RoutedExecutionError::Engine);
                         match command {
                             Ok(command) => {
                                 execute_product_statement(
@@ -2255,6 +2322,26 @@ impl FrontendQuerySession {
                 }
             }),
         };
+        self.finish_command_worker(statement, cancellation, timeout_duration, &mut worker)
+            .await
+    }
+
+    async fn finish_command_worker(
+        &self,
+        mut statement: novarocks_query_application::session_control::GovernedQueryStatementOwner,
+        cancellation: QueryCancellationView,
+        timeout_duration: Option<Duration>,
+        mut worker: &mut Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            (Result<StatementResult, RoutedExecutionError>, WorkOwner),
+                            String,
+                        >,
+                    > + Send,
+            >,
+        >,
+    ) -> Result<StatementResult, QueryServiceError> {
         let (result, execution_owner) = if let Some(timeout_duration) = timeout_duration {
             match tokio::time::timeout(timeout_duration, &mut worker).await {
                 Ok(result) => result.map_err(internal_error)?,
@@ -2423,110 +2510,135 @@ struct DatabaseContext {
     database: String,
 }
 
-fn resolve_catalog_name(
-    resolver: &SessionCatalogService,
-    catalog: &str,
-) -> Result<Option<String>, QueryServiceError> {
-    let normalized =
-        normalize_identifier(catalog).map_err(|error| internal_error(error.to_string()))?;
-    if normalized == DEFAULT_CATALOG {
-        return Ok(None);
+enum TrinoSessionWork {
+    Use {
+        catalog: Option<ast::Ident>,
+        schema: ast::Ident,
+    },
+    Mutation(session_property_computation::ScopedSessionMutation),
+}
+
+fn lower_trino_session_action(action: TrinoSessionAction) -> (StatementKind, TrinoSessionWork) {
+    use session_property_computation::ScopedSessionMutation;
+    match action {
+        TrinoSessionAction::Use {
+            catalog,
+            schema,
+            span: _,
+        } => (
+            StatementKind::Use,
+            TrinoSessionWork::Use { catalog, schema },
+        ),
+        TrinoSessionAction::Set { name, value } => (
+            StatementKind::SetSession,
+            TrinoSessionWork::Mutation(ScopedSessionMutation::Set { name, value }),
+        ),
+        TrinoSessionAction::Reset { name, span } => (
+            StatementKind::ResetSession,
+            TrinoSessionWork::Mutation(ScopedSessionMutation::Reset { name, span }),
+        ),
     }
-    // Session catalog context is an admission decision, not a local binding
-    // lookup: a catalog whose durable attachment is absent is unknown, while one
-    // this process has not materialized yet is unavailable.
-    resolver.require_external_catalog_ready(&normalized)?;
-    Ok(Some(normalized))
+}
+
+enum SessionNamespace<'a> {
+    Legacy(&'a str),
+    Trino {
+        catalog: Option<&'a ast::Ident>,
+        schema: &'a ast::Ident,
+        source: &'a str,
+    },
+}
+
+fn normalize_session_namespace_part(raw: &str, typed: bool) -> Result<String, QueryServiceError> {
+    let normalized = normalize_identifier(raw).map_err(|error| {
+        if typed {
+            QueryServiceError::new(QueryServiceErrorKind::BadDatabase, error)
+        } else {
+            internal_error(error)
+        }
+    })?;
+    // The original catalog author canonicalizes simple names. A decoded
+    // identifier must not acquire the legacy string grammar's trim or unquote.
+    if typed && !normalized.eq_ignore_ascii_case(raw) {
+        return Err(QueryServiceError::new(
+            QueryServiceErrorKind::BadDatabase,
+            format!("unsupported identifier `{raw}`"),
+        ));
+    }
+    Ok(normalized)
 }
 
 async fn resolve_database_context(
     resolver: &SessionCatalogService,
     current_catalog: Option<&str>,
-    schema: &str,
+    namespace: SessionNamespace<'_>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<DatabaseContext, QueryServiceError> {
-    let parts = schema
-        .split('.')
-        .map(|part| part.trim().trim_matches('`'))
-        .collect::<Vec<_>>();
-    match parts.as_slice() {
-        [database] => {
-            let database = normalize_identifier(database)
-                .map_err(|error| internal_error(error.to_string()))?;
-            match current_catalog {
-                Some(catalog) => {
-                    if resolver
-                        .external_namespace_exists(connector_context, capacity, catalog, &database)
-                        .await?
-                    {
-                        Ok(DatabaseContext {
-                            catalog: Some(catalog.to_string()),
-                            database,
-                        })
-                    } else {
-                        Err(QueryServiceError::new(
-                            QueryServiceErrorKind::BadDatabase,
-                            format!("unknown database `{schema}`"),
-                        ))
-                    }
+    let (catalog, database, display, typed) = match namespace {
+        SessionNamespace::Legacy(display) => {
+            let mut parts = display.split('.').map(|part| part.trim().trim_matches('`'));
+            let first = parts.next().expect("split returns at least one component");
+            let (catalog, database) = match (parts.next(), parts.next()) {
+                (None, None) => (None, first),
+                (Some(database), None) => (Some(first), database),
+                _ => {
+                    return Err(QueryServiceError::new(
+                        QueryServiceErrorKind::BadDatabase,
+                        format!(
+                            "unknown database `{display}`; expected `<database>` or `<catalog>.<database>`"
+                        ),
+                    ));
                 }
-                None => {
-                    if resolver.database_exists(&database)? {
-                        Ok(DatabaseContext {
-                            catalog: None,
-                            database,
-                        })
-                    } else {
-                        Err(QueryServiceError::new(
-                            QueryServiceErrorKind::BadDatabase,
-                            format!("unknown database `{schema}`"),
-                        ))
-                    }
-                }
+            };
+            (catalog, database, display, false)
+        }
+        SessionNamespace::Trino {
+            catalog,
+            schema,
+            source,
+        } => {
+            let start = catalog.map_or(schema.span.start(), |catalog| catalog.span.start());
+            let display = source.get(start..schema.span.end()).ok_or_else(|| {
+                internal_error("session namespace does not retain its original source range")
+            })?;
+            (
+                catalog.map(|catalog| catalog.value.as_str()),
+                schema.value.as_str(),
+                display,
+                true,
+            )
+        }
+    };
+    let catalog = match catalog {
+        Some(catalog) => {
+            let normalized = normalize_session_namespace_part(catalog, typed)?;
+            if normalized == DEFAULT_CATALOG {
+                None
+            } else {
+                // This is catalog admission, not a process-local lookup.
+                resolver.require_external_catalog_ready(&normalized)?;
+                Some(normalized)
             }
         }
-        [catalog, database] => {
-            let catalog = resolve_catalog_name(resolver, catalog)?;
-            let database = normalize_identifier(database)
-                .map_err(|error| internal_error(error.to_string()))?;
-            match catalog {
-                Some(catalog) => {
-                    if resolver
-                        .external_namespace_exists(connector_context, capacity, &catalog, &database)
-                        .await?
-                    {
-                        Ok(DatabaseContext {
-                            catalog: Some(catalog),
-                            database,
-                        })
-                    } else {
-                        Err(QueryServiceError::new(
-                            QueryServiceErrorKind::BadDatabase,
-                            format!("unknown database `{schema}`"),
-                        ))
-                    }
-                }
-                None => {
-                    if resolver.database_exists(&database)? {
-                        Ok(DatabaseContext {
-                            catalog: None,
-                            database,
-                        })
-                    } else {
-                        Err(QueryServiceError::new(
-                            QueryServiceErrorKind::BadDatabase,
-                            format!("unknown database `{schema}`"),
-                        ))
-                    }
-                }
-            }
+        None => current_catalog.map(ToOwned::to_owned),
+    };
+    let database = normalize_session_namespace_part(database, typed)?;
+    let exists = match &catalog {
+        Some(catalog) => {
+            resolver
+                .external_namespace_exists(connector_context, capacity, catalog, &database)
+                .await?
         }
-        _ => Err(QueryServiceError::new(
+        None => resolver.database_exists(&database)?,
+    };
+    if !exists {
+        return Err(QueryServiceError::new(
             QueryServiceErrorKind::BadDatabase,
-            format!("unknown database `{schema}`; expected `<database>` or `<catalog>.<database>`"),
-        )),
+            format!("unknown database `{display}`"),
+        ));
     }
+    Ok(DatabaseContext { catalog, database })
 }
 
 fn poisoned_state<T>(_error: std::sync::PoisonError<T>) -> QueryServiceError {

@@ -57,3 +57,17 @@ mod trino_access;
 mod trino_advanced_relation;
 mod trino_pattern;
 mod trino_routine;
+
+mod statements_branches;
+mod statements_catalog_schema;
+mod statements_ctas;
+mod statements_merge_call;
+mod statements_metadata_session;
+mod statements_permissions;
+mod statements_prepared;
+mod statements_session;
+mod statements_show_create_stats;
+mod statements_table_alter;
+mod statements_table_create;
+mod statements_views;
+mod statements_write;

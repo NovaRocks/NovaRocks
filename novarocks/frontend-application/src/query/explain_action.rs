@@ -56,7 +56,10 @@ type PreparationFuture = Pin<
 type DiagnosticFuture =
     Pin<Box<dyn Future<Output = Result<QueryResult, QueryServiceError>> + Send>>;
 
-use super::query_session_action::{QueryActionEnvironment, QueryActionInputs};
+use super::{
+    compiler::ExplainInput,
+    query_session_action::{QueryActionEnvironment, QueryActionInputs},
+};
 
 struct ExplainPreparationInput {
     compiler: FrontendQueryCompiler,
@@ -64,7 +67,7 @@ struct ExplainPreparationInput {
     role: ClusterRole,
     optimizer_limit: u64,
     sql: String,
-    explain: ast::ExplainQuery,
+    explain: ExplainInput,
     root_session_admitted: bool,
     state: SessionSqlState,
     deadline: Option<Instant>,
@@ -125,16 +128,15 @@ async fn make_explain_preparation(
             &semantics,
             (!input.root_session_admitted).then_some(input.explain.query.as_ref()),
         );
-        let options =
-            if input.root_session_admitted && input.explain.format != ast::ExplainFormat::Analyze {
-                // The outer EXPLAIN deadline already belongs to RequestContext.
-                // A missing outer deadline uses the original connector bound.
-                let mut raw = *options.as_proto();
-                raw.query_timeout = 0;
-                QueryOptions::from_proto(raw)
-            } else {
-                options
-            };
+        let options = if input.root_session_admitted && !input.explain.is_analyze() {
+            // The outer EXPLAIN deadline already belongs to RequestContext.
+            // A missing outer deadline uses the original connector bound.
+            let mut raw = *options.as_proto();
+            raw.query_timeout = 0;
+            QueryOptions::from_proto(raw)
+        } else {
+            options
+        };
         let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
             .map_err(|e| internal_error(e.to_string()))?;
         let context = RequestContext::admit(
@@ -174,7 +176,7 @@ async fn make_explain_preparation(
     let value = input
         .compiler
         .prepare_explain_async(
-            &input.explain,
+            input.explain,
             detail,
             input.root_session_admitted,
             &context,
@@ -623,7 +625,7 @@ impl FrontendQuerySession {
                 statement_token: statement.token(),
             },
             sql,
-            explain,
+            ExplainInput::from_legacy(explain),
             state,
             family,
         )?;
@@ -636,7 +638,7 @@ pub(super) fn build_explain_action(
     environment: &QueryActionEnvironment,
     inputs: QueryActionInputs,
     sql: String,
-    explain: ast::ExplainQuery,
+    explain: ExplainInput,
     state: SessionSqlState,
     family: novarocks_result_contract::ClientPresentationFamily,
 ) -> Result<Box<dyn GovernedStatementAction>, QueryServiceError> {

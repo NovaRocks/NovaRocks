@@ -205,7 +205,11 @@ mod completion_tests {
             let owned = match parsed.remove(0) {
                 novarocks_parser::ast::Statement::Dml(
                     novarocks_parser::ast::DmlStatement::Delete(statement),
-                ) => OwnedDeleteStatement::Predicate(statement),
+                ) => OwnedDeleteStatement::Predicate(
+                    crate::query_execution::dml::delete::PreparedPredicateDelete::from_legacy(
+                        statement,
+                    ),
+                ),
                 novarocks_parser::ast::Statement::Dml(
                     novarocks_parser::ast::DmlStatement::AddEqualityDelete(statement),
                 ) => OwnedDeleteStatement::Equality(statement),

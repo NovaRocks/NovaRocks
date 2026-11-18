@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use novarocks_parser::ast::{Query, ViewStatement};
+use novarocks_parser::ast::{Literal, ObjectName, Query, TrinoCreateView, ViewStatement};
 use novarocks_spi::connector::{ConnectorRequestContext, DropPolicy};
 
 use crate::api::QueryResult;
@@ -80,6 +80,90 @@ pub struct ResolvedExternalView {
     pub properties: HashMap<String, String>,
 }
 
+/// Semantic input to the existing view service.
+pub enum ViewCommand<'a> {
+    Create(CreateViewCommand<'a>),
+    Drop {
+        name: &'a ObjectName,
+        if_exists: bool,
+    },
+    ShowCreate {
+        name: &'a ObjectName,
+    },
+}
+
+pub struct CreateViewCommand<'a> {
+    pub(crate) name: &'a ObjectName,
+    pub(crate) query: &'a Query,
+    pub(crate) raw_query: &'a str,
+    pub(crate) comment: Option<ViewComment<'a>>,
+    pub(crate) or_replace: bool,
+    pub(crate) if_not_exists: bool,
+}
+
+pub(crate) enum ViewComment<'a> {
+    Literal(&'a Literal),
+    Text(&'a str),
+}
+
+impl<'a> ViewCommand<'a> {
+    pub fn trino_create(
+        source: &'a str,
+        node: &'a TrinoCreateView,
+    ) -> Result<Self, crate::session_error::QueryServiceError> {
+        use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
+        use crate::sql::trino_admission::unsupported_statement;
+        if node.security.is_some() {
+            return Err(unsupported_statement(
+                source,
+                node.span,
+                "CREATE VIEW SECURITY",
+            ));
+        }
+        if !node.properties.is_empty() {
+            return Err(unsupported_statement(
+                source,
+                node.span,
+                "CREATE VIEW WITH properties",
+            ));
+        }
+        let raw_query = source
+            .get(node.query.span.start()..node.query.span.end())
+            .ok_or_else(|| {
+                QueryServiceError::new(
+                    QueryServiceErrorKind::Internal,
+                    "View definition span does not belong to its SQL source",
+                )
+            })?;
+        Ok(Self::Create(CreateViewCommand {
+            name: &node.name,
+            query: &node.query,
+            raw_query,
+            comment: node.comment.as_deref().map(ViewComment::Text),
+            or_replace: node.replace,
+            if_not_exists: node.not_exists,
+        }))
+    }
+
+    pub fn from_legacy(statement: &'a ViewStatement) -> Self {
+        match statement {
+            ViewStatement::Create(node) => Self::Create(CreateViewCommand {
+                name: &node.name,
+                query: &node.query,
+                raw_query: &node.raw_query_source,
+                comment: node.comment.as_ref().map(ViewComment::Literal),
+                or_replace: node.or_replace,
+                if_not_exists: node.if_not_exists,
+            }),
+            ViewStatement::Drop(node) => Self::Drop {
+                name: &node.name,
+                if_exists: node.if_exists,
+            },
+            ViewStatement::ShowCreate(node) => Self::ShowCreate { name: &node.name },
+        }
+    }
+}
+
 /// Query-application-owned view command and declaration service.
 pub trait ViewService: Send + Sync {
     fn catalog_snapshot(&self) -> Result<LocalViewSnapshot, String>;
@@ -88,6 +172,15 @@ pub trait ViewService: Send + Sync {
         &self,
         engine: &dyn ViewEngine,
         statement: &ViewStatement,
+        context: ViewRequestContext<'_>,
+    ) -> Result<ViewStatementResult, crate::api::CommandError> {
+        self.execute_command(engine, ViewCommand::from_legacy(statement), context)
+    }
+
+    fn execute_command(
+        &self,
+        engine: &dyn ViewEngine,
+        command: ViewCommand<'_>,
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, crate::api::CommandError>;
 

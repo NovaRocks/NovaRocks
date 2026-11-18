@@ -96,6 +96,7 @@ enum Code {
     AlreadyExists,
     NotSupported,
     InvalidSessionProperty,
+    NotInTransaction,
     InvalidAnalyzeProperty,
     InvalidCatalogProperty,
     InvalidSchemaProperty,
@@ -110,6 +111,8 @@ enum Code {
     CatalogNotFound,
     SchemaNotFound,
     TableNotFound,
+    SchemaAlreadyExists,
+    TableAlreadyExists,
     ColumnNotFound,
     DuplicateNamedQuery,
     DuplicateColumnName,
@@ -154,6 +157,7 @@ impl Code {
             AlreadyExists => (12, "ALREADY_EXISTS", "USER_ERROR"),
             NotSupported => (13, "NOT_SUPPORTED", "USER_ERROR"),
             InvalidSessionProperty => (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
+            NotInTransaction => (21, "NOT_IN_TRANSACTION", "USER_ERROR"),
             InvalidWindowFrame => (15, "INVALID_WINDOW_FRAME", "USER_ERROR"),
             NumericOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE", "USER_ERROR"),
             QueryTextTooLarge => (35, "QUERY_TEXT_TOO_LARGE", "USER_ERROR"),
@@ -169,6 +173,8 @@ impl Code {
             CatalogNotFound => (44, "CATALOG_NOT_FOUND", "USER_ERROR"),
             SchemaNotFound => (45, "SCHEMA_NOT_FOUND", "USER_ERROR"),
             TableNotFound => (46, "TABLE_NOT_FOUND", "USER_ERROR"),
+            SchemaAlreadyExists => (49, "SCHEMA_ALREADY_EXISTS", "USER_ERROR"),
+            TableAlreadyExists => (50, "TABLE_ALREADY_EXISTS", "USER_ERROR"),
             ColumnNotFound => (47, "COLUMN_NOT_FOUND", "USER_ERROR"),
             DuplicateNamedQuery => (53, "DUPLICATE_NAMED_QUERY", "USER_ERROR"),
             DuplicateColumnName => (54, "DUPLICATE_COLUMN_NAME", "USER_ERROR"),
@@ -537,8 +543,12 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.admit.invalid_branch_property" => InvalidBranchProperty,
         "sql.admit.invalid_session_property" => InvalidSessionProperty,
         "sql.admit.session_catalog_not_found" => CatalogNotFound,
+        "sql.admit.not_in_transaction" => NotInTransaction,
+        "sql.admit.schema_already_exists" => SchemaAlreadyExists,
+        "sql.admit.table_already_exists" => TableAlreadyExists,
         "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => GenericUser,
         "sql.parse.unsupported_statement"
+        | "sql.admit.unsupported_statement"
         | "sql.analyze.unsupported_expression"
         | "sql.analyze.unsupported_query_shape"
         | "sql.analyze.unavailable_implementation"

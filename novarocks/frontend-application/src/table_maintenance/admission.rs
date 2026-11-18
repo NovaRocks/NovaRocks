@@ -382,7 +382,7 @@ fn lower_call_procedure(
     Ok(ParsedMaintenanceStatement::Execute { name_parts, action })
 }
 
-fn parse_timestamp_millis(value: &str) -> Result<i64, String> {
+pub(crate) fn parse_timestamp_millis(value: &str) -> Result<i64, String> {
     if let Ok(value) = DateTime::parse_from_rfc3339(value) {
         return Ok(value.with_timezone(&Utc).timestamp_millis());
     }

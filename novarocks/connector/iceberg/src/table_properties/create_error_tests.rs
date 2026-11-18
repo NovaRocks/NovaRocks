@@ -206,7 +206,8 @@ fn staged_mv_storage_uses_v3_default_and_original_create_projection() {
             Some("16777216".into()),
         )]),
     ));
-    let prepared = prepare_mv_staged_storage(&managed, &Active).unwrap();
+    let (prepared, metadata_path) = prepare_mv_staged_storage(&managed, &Active).unwrap();
+    assert!(metadata_path.is_none());
     assert_eq!(prepared.format_version, FormatVersion::V3);
     assert!(prepared.location.is_none());
     assert!(prepared.partitioning.is_empty());
@@ -234,7 +235,8 @@ fn staged_mv_storage_keeps_data_location_but_requires_managed_metadata_root() {
         "data_location".into(),
         DdlPropertyValue::Varchar("s3://storage/data".into()),
     ));
-    let prepared = prepare_mv_staged_storage(&input, &Active).unwrap();
+    let (prepared, metadata_path) = prepare_mv_staged_storage(&input, &Active).unwrap();
+    assert!(metadata_path.is_none());
     assert_eq!(
         prepared
             .raw_properties
@@ -249,7 +251,8 @@ fn staged_mv_storage_keeps_data_location_but_requires_managed_metadata_root() {
     ));
     let ordinary = prepare_create_table_properties(&input, None, &Active).unwrap();
     assert_eq!(ordinary.location.as_deref(), Some("s3://storage/table"));
-    let managed = prepare_mv_staged_storage(&input, &Active).unwrap();
+    let (managed, metadata_path) = prepare_mv_staged_storage(&input, &Active).unwrap();
+    assert!(metadata_path.is_none());
     assert_eq!(managed.location.as_deref(), Some("s3://storage/table"));
 
     for version in [1, 2] {
@@ -263,7 +266,7 @@ fn staged_mv_storage_keeps_data_location_but_requires_managed_metadata_root() {
 }
 
 #[test]
-fn staged_mv_disallows_metadata_paths_through_extra_properties() {
+fn staged_mv_separates_metadata_path_from_the_initial_properties() {
     let mut input = properties();
     input[1].1 = DdlPropertyValue::Integer(3);
     input.push((
@@ -278,11 +281,9 @@ fn staged_mv_disallows_metadata_paths_through_extra_properties() {
         ordinary.raw_properties["write.metadata.path"],
         "s3://storage/metadata"
     );
-    let error = prepare_mv_staged_storage(&input, &Active)
-        .err()
-        .expect("custom staged metadata location");
-    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-    assert!(error.message().contains("write.metadata.path"));
+    let (managed, metadata_path) = prepare_mv_staged_storage(&input, &Active).unwrap();
+    assert!(!managed.raw_properties.contains_key("write.metadata.path"));
+    assert_eq!(metadata_path.as_deref(), Some("s3://storage/metadata"));
 }
 
 #[test]

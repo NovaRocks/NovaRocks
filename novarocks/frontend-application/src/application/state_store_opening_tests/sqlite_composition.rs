@@ -583,6 +583,7 @@ fn catalog_create(if_not_exists: bool) -> novarocks_sql::semantic::CatalogSqlCom
     novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(CatalogCreateCommand {
         if_not_exists,
         name: "catalog_original".into(),
+        connector_name: None,
         properties: vec![("type".into(), "iceberg".into())],
     })
 }

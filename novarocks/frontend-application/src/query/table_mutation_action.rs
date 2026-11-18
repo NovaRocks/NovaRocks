@@ -31,8 +31,9 @@ use crate::query_execution::{
 };
 use novarocks_query_application::{
     api::{
-        CatalogTablePropertyBinding, CommandContext, CommandError, CommandErrorKind,
-        StatementExternalEffectDisposition as Effect, StatementNativeHealthFailure,
+        CatalogNamespacePropertyBinding, CatalogTablePropertyBinding, CommandContext, CommandError,
+        CommandErrorKind, StatementExternalEffectDisposition as Effect,
+        StatementNativeHealthFailure,
     },
     session_control::{
         GovernedActionContext, GovernedStatementAction, GovernedStatementResidual,
@@ -67,7 +68,7 @@ impl crate::wake::StatusIntakeWake for Wake {
 /// grants no CPU authority: the caller must invoke `try_new` in its actual
 /// Table property CPU work, then transfer it after that work really exits.
 pub(crate) struct PreparedTableMutationInput {
-    binding: CatalogTablePropertyBinding,
+    binding: MutationBinding,
     original_request: ConnectorCatalogMutationRequest,
     execute_request: ConnectorCatalogMutationRequest,
 }
@@ -76,16 +77,45 @@ impl PreparedTableMutationInput {
         binding: CatalogTablePropertyBinding,
         original_request: ConnectorCatalogMutationRequest,
     ) -> Result<Self, CommandError> {
-        let ConnectorCatalogMutationOperation::CreateTable { table, .. } =
+        let table = match &original_request.operation {
+            ConnectorCatalogMutationOperation::CreateTable { table, .. }
+            | ConnectorCatalogMutationOperation::SetTableProperties { table, .. } => table,
+            _ => {
+                return Err(CommandError::new(
+                    CommandErrorKind::Unsupported,
+                    "Table mutation action requires CREATE TABLE or SET PROPERTIES",
+                ));
+            }
+        };
+        if table != binding.table() {
+            return Err(work_command(WorkError::Conflict));
+        }
+        Self::checked(MutationBinding::Table(binding), original_request)
+    }
+
+    pub(crate) fn try_new_namespace(
+        binding: CatalogNamespacePropertyBinding,
+        original_request: ConnectorCatalogMutationRequest,
+    ) -> Result<Self, CommandError> {
+        let ConnectorCatalogMutationOperation::CreateNamespace { namespace, .. } =
             &original_request.operation
         else {
             return Err(CommandError::new(
                 CommandErrorKind::Unsupported,
-                "table mutation action requires ordinary CREATE TABLE",
+                "Namespace mutation action requires CREATE SCHEMA",
             ));
         };
-        if table != binding.table()
-            || original_request.target.instance_id != binding.mutation().descriptor().instance_id
+        if namespace != binding.namespace() {
+            return Err(work_command(WorkError::Conflict));
+        }
+        Self::checked(MutationBinding::Namespace(binding), original_request)
+    }
+
+    fn checked(
+        binding: MutationBinding,
+        original_request: ConnectorCatalogMutationRequest,
+    ) -> Result<Self, CommandError> {
+        if original_request.target.instance_id != binding.mutation().descriptor().instance_id
             || original_request.target.incarnation != binding.planning().binding().incarnation()
         {
             return Err(work_command(WorkError::Conflict));
@@ -107,8 +137,27 @@ impl PreparedTableMutationInput {
     }
 }
 
+enum MutationBinding {
+    Table(CatalogTablePropertyBinding),
+    Namespace(CatalogNamespacePropertyBinding),
+}
+impl MutationBinding {
+    fn mutation(&self) -> &novarocks_spi::connector::ConnectorCatalogMutationSession {
+        match self {
+            Self::Table(binding) => binding.mutation(),
+            Self::Namespace(binding) => binding.mutation(),
+        }
+    }
+    fn planning(&self) -> &novarocks_spi::connector::ConnectorControlPlanningPin {
+        match self {
+            Self::Table(binding) => binding.planning(),
+            Self::Namespace(binding) => binding.planning(),
+        }
+    }
+}
+
 struct Input {
-    binding: CatalogTablePropertyBinding,
+    binding: MutationBinding,
     request: ConnectorCatalogMutationRequest,
 }
 
@@ -221,9 +270,8 @@ struct Source {
     input: Option<Arc<Input>>,
     command: CommandContext,
     window: ResultWindowAlias,
-    cpu: InternalResultCpu,
+    metadata_cpu_source: Option<(InternalResultCpu, tokio::runtime::Handle)>,
     cancellation: QueryCancellationView,
-    runtime: tokio::runtime::Handle,
     wake: Arc<Wake>,
     io: Option<Arc<MetadataIoAdmission>>,
     metadata_cpu: Option<Arc<dyn ProviderMetadataCpuPort>>,
@@ -325,18 +373,22 @@ impl Source {
         // Authenticate the CPU author only after that paid phase is ready.
         let result = (|| {
             let pending = self.pending.as_ref().expect("one original table input");
-            let port = self
-                .cpu
-                .planning_metadata_cpu_port(
-                    self.command.scope(),
-                    self.window.clone(),
-                    pending.binding.planning(),
-                    self.cancellation.clone(),
-                    self.runtime.clone(),
-                    self.wake.clone(),
-                )
-                .map_err(work_command)?;
-            self.metadata_cpu = Some(port.clone());
+            let port = match (&pending.binding, &self.metadata_cpu_source) {
+                (MutationBinding::Table(_), Some((cpu, runtime))) => Some(
+                    cpu.planning_metadata_cpu_port(
+                        self.command.scope(),
+                        self.window.clone(),
+                        pending.binding.planning(),
+                        self.cancellation.clone(),
+                        runtime.clone(),
+                        self.wake.clone(),
+                    )
+                    .map_err(work_command)?,
+                ),
+                (MutationBinding::Namespace(_), None) => None,
+                _ => return Err(work_command(WorkError::Conflict)),
+            };
+            self.metadata_cpu.clone_from(&port);
             let PreparedTableMutationInput {
                 binding,
                 mut original_request,
@@ -344,13 +396,16 @@ impl Source {
             } = self
                 .pending
                 .take()
-                .expect("one original prepared table input");
-            // Both requests keep the CPU-prepared bodies. Only the original
-            // lightweight context is extended with this Source's exact ports.
+                .expect("one original prepared mutation input");
+            // Both requests retain the CPU-prepared bodies. Bind only the
+            // original Source ports required by this operation.
             let context = original_request
                 .context
-                .with_io_admission(self.io.as_ref().unwrap().clone())
-                .with_metadata_cpu(port);
+                .with_io_admission(self.io.as_ref().unwrap().clone());
+            let context = match port {
+                Some(port) => context.with_metadata_cpu(port),
+                None => context,
+            };
             original_request.context = context.clone();
             execute_request.context = context;
             let input = Arc::new(Input {
@@ -671,6 +726,31 @@ fn prepare_owned(
     cancellation: QueryCancellationView,
     runtime: tokio::runtime::Handle,
 ) -> Result<Action, CommandError> {
+    prepare_mutation_owned(
+        prepared,
+        continued_io,
+        command,
+        Some((cpu, runtime)),
+        cancellation,
+    )
+}
+
+pub(crate) fn prepare_namespace(
+    prepared: PreparedTableMutationInput,
+    command: CommandContext,
+    cancellation: QueryCancellationView,
+) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
+    prepare_mutation_owned(prepared, None, command, None, cancellation)
+        .map(|action| Box::new(action) as Box<dyn GovernedStatementAction>)
+}
+
+fn prepare_mutation_owned(
+    prepared: PreparedTableMutationInput,
+    continued_io: Option<Arc<MetadataIoAdmission>>,
+    command: CommandContext,
+    metadata_cpu_source: Option<(InternalResultCpu, tokio::runtime::Handle)>,
+    cancellation: QueryCancellationView,
+) -> Result<Action, CommandError> {
     let window = command
         .result_window_alias()
         .ok_or_else(|| work_command(WorkError::Conflict))?;
@@ -683,9 +763,8 @@ fn prepare_owned(
             input: None,
             command,
             window,
-            cpu,
+            metadata_cpu_source,
             cancellation,
-            runtime,
             wake: Arc::new(Wake::default()),
             io: continued_io,
             metadata_cpu: None,

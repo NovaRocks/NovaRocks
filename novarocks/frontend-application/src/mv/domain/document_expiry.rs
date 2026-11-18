@@ -13,8 +13,9 @@ use novarocks_mv_application::management::{
     ManagementTimestamp,
 };
 use novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents;
-use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue, ProcedureArgumentMode};
+use novarocks_parser::ast::LiteralKind;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
+use novarocks_query_application::sql::PreparedMaintenanceCall;
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorCatalogMutationOperation, ConnectorControlResolver,
     ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
@@ -41,7 +42,7 @@ struct ExpiryCall {
     token: String,
 }
 
-fn decode_call(call: &CallStatement) -> Result<Option<ExpiryCall>, String> {
+fn decode_call(call: &PreparedMaintenanceCall) -> Result<Option<ExpiryCall>, String> {
     if !call
         .procedure
         .parts
@@ -56,7 +57,9 @@ fn decode_call(call: &CallStatement) -> Result<Option<ExpiryCall>, String> {
     if catalog.value.is_empty() || !system.value.eq_ignore_ascii_case("system") {
         return Err(format!("{PROCEDURE} requires catalog.system.{PROCEDURE}"));
     }
-    if call.argument_mode != ProcedureArgumentMode::Named || call.arguments.len() != 3 {
+    if call.argument_mode != novarocks_sql::semantic::command::ProcedureArgumentModeSql::Named
+        || call.arguments.len() != 3
+    {
         return Err(format!(
             "{PROCEDURE} requires exactly table, keep_last and token named arguments"
         ));
@@ -76,7 +79,7 @@ fn decode_call(call: &CallStatement) -> Result<Option<ExpiryCall>, String> {
         }
     }
     let text = |name: &str| -> Result<&str, String> {
-        let Some(MaintenanceValue::Literal(literal)) = arguments.get(name).copied() else {
+        let Some(literal) = arguments.get(name).and_then(|value| value.literal()) else {
             return Err(format!(
                 "MV document expiry {name} must be a string literal"
             ));
@@ -101,7 +104,7 @@ fn decode_call(call: &CallStatement) -> Result<Option<ExpiryCall>, String> {
     if namespace.is_empty() || mv.is_empty() || namespace.trim() != *namespace || mv.trim() != *mv {
         return Err("MV document expiry table must be exactly namespace.mv".into());
     }
-    let Some(MaintenanceValue::Literal(literal)) = arguments.get("keep_last").copied() else {
+    let Some(literal) = arguments.get("keep_last").and_then(|value| value.literal()) else {
         return Err("MV document expiry keep_last must be a positive integer literal".into());
     };
     let LiteralKind::Long {
@@ -176,7 +179,7 @@ fn plan_remove_snapshots(
 
 pub(crate) fn try_execute_document_expiry(
     ports: &IcebergMvCorePorts,
-    call: &CallStatement,
+    call: &PreparedMaintenanceCall,
     _current_database: &str,
     context: &ConnectorRequestContext,
     on_reconciled_current: &dyn Fn(
@@ -434,13 +437,13 @@ mod tests {
     use super::*;
     use novarocks_parser::ast::{MaintenanceStatement, Statement};
 
-    fn call(sql: &str) -> CallStatement {
+    fn call(sql: &str) -> PreparedMaintenanceCall {
         let statements = novarocks_parser::parse(sql).unwrap();
         let [Statement::Maintenance(MaintenanceStatement::Call(call))] = statements.as_slice()
         else {
             panic!("CALL")
         };
-        call.clone()
+        PreparedMaintenanceCall::from_legacy(call)
     }
     #[test]
     fn document_expiry_call_is_strict_and_other_procedures_miss() {
@@ -480,6 +483,48 @@ mod tests {
         duplicate.arguments[2].name = duplicate.arguments[0].name.clone();
         assert!(decode_call(&duplicate).is_err());
     }
+    #[test]
+    fn trino_document_expiry_keeps_the_authored_integer_spelling() {
+        use novarocks_parser::{ast::TrinoStatement, trino_parser};
+        use novarocks_sql::semantic::MaintenanceSqlCommand;
+
+        let legacy = call(
+            "CALL ice.system.novarocks_mv_document_expiry(table => 'sales.mv', keep_last => 2, token => 'once')",
+        );
+        for (spelling, admitted) in [("2", true), ("0b10", false)] {
+            let sql = format!(
+                r#"CALL ice.system.novarocks_mv_document_expiry("table" => 'sales.mv', keep_last => {spelling}, token => 'once')"#
+            );
+            let TrinoStatement::Call(parsed) = trino_parser::parse_statement(&sql).unwrap() else {
+                panic!("expected CALL");
+            };
+            let call = PreparedMaintenanceCall::from_trino(&parsed).unwrap();
+            let literal = call.arguments[1].value.literal().unwrap();
+            let LiteralKind::Long {
+                spelling: authored,
+                parsed_value,
+            } = &literal.kind
+            else {
+                panic!("expected Long literal");
+            };
+            assert_eq!(authored, spelling);
+            assert_eq!(*parsed_value, 2);
+            assert_eq!(&sql[literal.span.start()..literal.span.end()], spelling);
+            let statement = call.maintenance_command().unwrap();
+            assert!(matches!(statement, MaintenanceSqlCommand::Call { .. }));
+            assert_eq!(statement, legacy.maintenance_command().unwrap());
+            let decoded = decode_call(&call);
+            if admitted {
+                assert_eq!(decoded.unwrap(), decode_call(&legacy).unwrap());
+            } else {
+                assert_eq!(
+                    decoded.unwrap_err(),
+                    "MV document expiry keep_last must be a positive integer literal"
+                );
+            }
+        }
+    }
+
     fn snapshot(id: i64, parent: Option<i64>) -> KeyedSnapshotObservation {
         KeyedSnapshotObservation {
             snapshot_id: id,

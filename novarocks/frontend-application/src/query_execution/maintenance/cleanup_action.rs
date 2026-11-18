@@ -153,6 +153,7 @@ pub(crate) fn prepare(
     kernel: &MaintenanceExecutionKernel,
     target: MaintenanceTarget,
     older_than: i64,
+    retained_planning: Option<ConnectorControlPlanningPin>,
     spark_call: bool,
     execution: &QueryExecutionContext,
     connector: &ConnectorRequestContext,
@@ -171,10 +172,20 @@ pub(crate) fn prepare(
     }
     let identity = RequestScopedMaintenanceEngine::target_identity(&target)
         .map_err(TerminalError::pre_dispatch_failed)?;
-    let planning = kernel
-        .connector_control()
-        .acquire_current(&identity.instance_id)
-        .map_err(TerminalError::from_original_cause)?;
+    let planning = match retained_planning {
+        Some(planning) => {
+            if planning.binding().descriptor().instance_id != identity.instance_id {
+                return Err(TerminalError::pre_dispatch_failed(
+                    "cleanup target differs from its retained generation",
+                ));
+            }
+            planning
+        }
+        None => kernel
+            .connector_control()
+            .acquire_current(&identity.instance_id)
+            .map_err(TerminalError::from_original_cause)?,
+    };
     let cleanup_session = kernel
         .connector_control()
         .acquire_exact_cleanup_maintenance(planning.control_runtime_id())

@@ -267,6 +267,24 @@ impl FailureProjection for CatalogMutationCommandFailure {
     }
 }
 
+/// A schema admission code can only be projected from the exact original
+/// uncommitted namespace verdict, never a source or effect-unknown error.
+pub(crate) fn namespace_already_exists(
+    error: &novarocks_query_application::session_error::QueryServiceError,
+) -> bool {
+    let Some(original) = error
+        .failure_cause()
+        .and_then(|cause| cause.downcast_ref::<CatalogMutationCommandFailure>())
+    else {
+        return false;
+    };
+    matches!(
+        &original.outcome,
+        ResolvedCatalogMutation::KnownUncommitted { failure, .. }
+            if failure.kind() == novarocks_spi::connector::ConnectorMutationFailureKind::AlreadyExists
+    )
+}
+
 /// Project the original mutation verdict before any legacy String adapter.
 /// NoOp is an actual effect fact, not an Applied publication.
 pub(crate) fn present_catalog_mutation_command_result(

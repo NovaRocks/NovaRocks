@@ -32,6 +32,8 @@ pub use novarocks_spi::connector::DdlPropertyChange;
 use novarocks_sql::compiler::RequiredConstantTarget;
 use novarocks_type_contract::{CompilePhase, PureCompileControl, ValueKind, ValueLogicalType};
 
+pub mod table;
+
 use super::property_admit::DdlPropertyScope;
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 
@@ -208,6 +210,147 @@ pub fn prepare_legacy_create_catalog(
         port,
         control,
     )?;
+    let properties = catalog_strings(evaluated, control)?;
+    let name = copy_string(&statement.name.value, control)?;
+    checkpoint(control, 0)?;
+    Ok(novarocks_sql::semantic::command::CatalogCreateCommand {
+        if_not_exists: statement.if_not_exists,
+        name,
+        connector_name: None,
+        properties,
+    })
+}
+
+pub(super) fn validate_create_authorization(
+    source: &str,
+    principal: Option<&novarocks_parser::ast::StatementPrincipal>,
+    subject: &str,
+) -> Result<(), QueryServiceError> {
+    if let Some(principal) = principal {
+        return Err(super::trino_admission::unsupported_statement(
+            source,
+            principal.name.span,
+            subject,
+        ));
+    }
+    Ok(())
+}
+
+pub fn prepare_trino_create_catalog(
+    source: &str,
+    statement: &novarocks_parser::ast::TrinoCreateCatalog,
+    port: &mut dyn DdlPropertyConstantPort,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_sql::semantic::command::CatalogCreateCommand, QueryServiceError> {
+    checkpoint(control, 0)?;
+    validate_create_authorization(
+        source,
+        statement.principal.as_ref(),
+        "CREATE CATALOG AUTHORIZATION",
+    )?;
+    let assignments = statement_property_assignments(&statement.properties, control)?;
+    let evaluated = evaluate_properties(
+        DdlPropertyScope::Catalog,
+        DdlPropertyEvaluationMode::Create,
+        source,
+        &[],
+        &assignments,
+        port,
+        control,
+        PropertyNameChecks::CatalogUsing,
+    )?;
+    let properties = catalog_strings(evaluated, control)?;
+    let name = copy_string(&statement.catalog_name.value, control)?;
+    if statement.connector_name.quoted {
+        // The pinned task passes the formatted identifier to ConnectorName.
+        // Its connector-name pattern cannot accept the delimited spelling.
+        return Err(QueryServiceError::new(
+            QueryServiceErrorKind::InvalidValue,
+            "CREATE CATALOG USING requires an undelimited connector name",
+        ));
+    }
+    let connector_name = Some(copy_string(&statement.connector_name.value, control)?);
+    // COMMENT is a syntax fact. The catalog creation owner consumes no comment.
+    Ok(novarocks_sql::semantic::command::CatalogCreateCommand {
+        if_not_exists: statement.not_exists,
+        name,
+        connector_name,
+        properties,
+    })
+}
+
+/// The caller obtains these declarations from its actual namespace mutation
+/// session and retains that session through publication.
+pub fn prepare_trino_create_schema(
+    source: &str,
+    statement: &novarocks_parser::ast::TrinoCreateSchema,
+    declarations: &[DdlPropertyDeclaration],
+    port: &mut dyn DdlPropertyConstantPort,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_sql::semantic::CatalogSqlCommand, QueryServiceError> {
+    checkpoint(control, 0)?;
+    validate_create_authorization(
+        source,
+        statement.principal.as_ref(),
+        "CREATE SCHEMA AUTHORIZATION",
+    )?;
+    let assignments = statement_property_assignments(&statement.properties, control)?;
+    let evaluated = evaluate_ddl_properties(
+        DdlPropertyScope::Schema,
+        DdlPropertyEvaluationMode::Create,
+        source,
+        declarations,
+        &assignments,
+        port,
+        control,
+    )?;
+    let mut properties = Vec::with_capacity(evaluated.properties().len());
+    for property in evaluated.into_properties() {
+        checkpoint(control, 1)?;
+        let value = match property.change {
+            DdlPropertyChange::Set(value) | DdlPropertyChange::Reset(value) => value,
+        };
+        properties.push((property.name, value));
+    }
+    for part in &statement.schema_name.parts {
+        checkpoint(control, 1)?;
+        observe_bytes(&part.value, control)?;
+    }
+    let name = super::lower_object_name(&statement.schema_name);
+    checkpoint(control, 0)?;
+    Ok(novarocks_sql::semantic::CatalogSqlCommand::CreateDatabase {
+        name,
+        if_not_exists: statement.not_exists,
+        properties,
+    })
+}
+
+pub(super) fn statement_property_assignments<'a>(
+    properties: &'a [novarocks_parser::ast::StatementProperty],
+    control: &dyn PureCompileControl,
+) -> Result<Vec<DdlPropertyAssignment<'a>>, QueryServiceError> {
+    let mut assignments = Vec::with_capacity(properties.len());
+    for property in properties {
+        checkpoint(control, 1)?;
+        assignments.push(DdlPropertyAssignment {
+            name: &property.name.value,
+            name_span: property.name.span,
+            span: property.span,
+            value: match &property.value {
+                Some(expression) => DdlPropertyAssignmentValue::Expression(expression),
+                None => DdlPropertyAssignmentValue::Default {
+                    span: property.span,
+                },
+            },
+        });
+    }
+    Ok(assignments)
+}
+
+fn catalog_strings(
+    evaluated: EvaluatedDdlProperties,
+    control: &dyn PureCompileControl,
+) -> Result<Vec<(String, String)>, QueryServiceError> {
     let mut properties = Vec::with_capacity(evaluated.properties().len());
     for property in evaluated.into_properties() {
         checkpoint(control, 1)?;
@@ -218,13 +361,7 @@ pub fn prepare_legacy_create_catalog(
         };
         properties.push((property.name, value));
     }
-    let name = copy_string(&statement.name.value, control)?;
-    checkpoint(control, 0)?;
-    Ok(novarocks_sql::semantic::command::CatalogCreateCommand {
-        if_not_exists: statement.if_not_exists,
-        name,
-        properties,
-    })
+    Ok(properties)
 }
 
 /// Declaration order determines ordinary frozen output order. Catalog has no
@@ -252,6 +389,11 @@ pub fn evaluate_ddl_properties(
     )
 }
 
+enum PropertyNameChecks<'a> {
+    Existing(&'a mut dyn DdlPropertyNamePolicy),
+    CatalogUsing,
+}
+
 /// Evaluate in original assignment order. Only a missing declaration invokes
 /// the name policy, at that assignment, before the original typed Unknown error.
 /// Known names, duplicate known names and dynamic Catalog keys bypass it.
@@ -264,6 +406,28 @@ pub fn evaluate_ddl_properties_with_name_policy(
     port: &mut dyn DdlPropertyConstantPort,
     control: &dyn PureCompileControl,
     policy: &mut dyn DdlPropertyNamePolicy,
+) -> Result<EvaluatedDdlProperties, QueryServiceError> {
+    evaluate_properties(
+        scope,
+        mode,
+        source,
+        declarations,
+        assignments,
+        port,
+        control,
+        PropertyNameChecks::Existing(policy),
+    )
+}
+
+fn evaluate_properties(
+    scope: DdlPropertyScope,
+    mode: DdlPropertyEvaluationMode,
+    source: &str,
+    declarations: &[DdlPropertyDeclaration],
+    assignments: &[DdlPropertyAssignment<'_>],
+    port: &mut dyn DdlPropertyConstantPort,
+    control: &dyn PureCompileControl,
+    mut name_checks: PropertyNameChecks<'_>,
 ) -> Result<EvaluatedDdlProperties, QueryServiceError> {
     checkpoint(control, 0)?;
     let catalog = scope == DdlPropertyScope::Catalog;
@@ -289,6 +453,16 @@ pub fn evaluate_ddl_properties_with_name_policy(
     for assignment in assignments {
         checkpoint(control, 1)?;
         observe_bytes(assignment.name, control)?;
+        if matches!(name_checks, PropertyNameChecks::CatalogUsing)
+            && assignment.name.eq_ignore_ascii_case("type")
+        {
+            return Err(invalid(
+                DdlPropertyScope::Catalog,
+                source,
+                assignment.name_span,
+                "Catalog property 'type' cannot override the USING connector",
+            ));
+        }
         let name = if catalog {
             assignment.name.to_owned()
         } else {
@@ -304,7 +478,9 @@ pub fn evaluate_ddl_properties_with_name_policy(
                     .position(|declaration| declaration.name() == name)
                     .map_or_else(
                         || {
-                            policy.check_unknown_property(&name)?;
+                            if let PropertyNameChecks::Existing(policy) = &mut name_checks {
+                                policy.check_unknown_property(&name)?;
+                            }
                             Err(invalid(
                                 scope,
                                 source,
@@ -470,15 +646,7 @@ pub(super) fn evaluate_required_property_value(
             return Err(invariant("MAP uses its structural owner"));
         }
     };
-    checkpoint(control, 0)?;
-    let constant = match port.evaluate(expression, target) {
-        Ok(constant) => constant,
-        Err(DdlPropertyConstantError::Failure(error)) => return Err(error),
-        Err(DdlPropertyConstantError::InvalidValue { message, cause }) => {
-            return Err(invalid_value(message, cause));
-        }
-    };
-    checkpoint(control, 0)?;
+    let constant = evaluate_required_constant(expression, target, port, control, invalid_value)?;
     // The required-constant port must return the complete declared target,
     // not merely an Arrow carrier that happens to be readable as that target.
     let binding = constant.value_type();
@@ -681,7 +849,26 @@ fn invalid(
 ) -> QueryServiceError {
     QueryServiceError::from_user_error(scope.to_user_error(source, span, message))
 }
-fn constant_failure(error: ConstantError) -> QueryServiceError {
+pub(super) fn evaluate_required_constant(
+    expression: &Expr,
+    target: RequiredConstantTarget,
+    port: &mut dyn DdlPropertyConstantPort,
+    control: &dyn PureCompileControl,
+    invalid_value: impl FnOnce(String, Option<SharedFailureCause>) -> QueryServiceError,
+) -> Result<ConstantValue, QueryServiceError> {
+    checkpoint(control, 0)?;
+    let constant = match port.evaluate(expression, target) {
+        Ok(constant) => constant,
+        Err(DdlPropertyConstantError::Failure(error)) => return Err(error),
+        Err(DdlPropertyConstantError::InvalidValue { message, cause }) => {
+            return Err(invalid_value(message, cause));
+        }
+    };
+    checkpoint(control, 0)?;
+    Ok(constant)
+}
+
+pub(super) fn constant_failure(error: ConstantError) -> QueryServiceError {
     match error {
         ConstantError::Control(error) => QueryServiceError::from_compile_control(error),
         ConstantError::Source(cause) => QueryServiceError::from_failure_cause(cause),

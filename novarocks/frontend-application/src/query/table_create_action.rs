@@ -23,24 +23,39 @@ use super::{
     compiler::FrontendQueryCompiler,
     governed_cancellation_error, internal_error, product_command_service_error,
     table_mutation_action::{self, PreparedTableMutationInput},
-    table_property_computation::{LikeColumnsCpuInput, TablePropertyCpuInput},
+    table_property_computation::{
+        LikeColumnsCpuInput, PreparedTrinoTableLike, TablePropertyCpuInput,
+        TrinoTablePropertyCpuInput, TrinoTablePropertyOutput, TrinoTablePropertySyntax,
+    },
 };
 use crate::query_execution::{
     completion_facts::FrontendPlanningCpuSource, internal_result_cpu::InternalResultCpu,
     like_source_read::LikeSourceRead, planning::sql_cancellation_observation,
-    required_constant_eval::RequiredConstantInterpreter,
+    required_constant_eval::RequiredConstantInterpreter, table_exists_source::TableExistsSource,
 };
-use novarocks_parser::ast::legacy::CreateTable;
+use novarocks_parser::ast::{
+    AstVec, ObjectName as ParsedObjectName, StatementProperty, StatementSaveMode, TrinoCreateTable,
+    legacy::CreateTable,
+};
 use novarocks_query_application::{
     admitted_query_context::RequestContext,
-    api::{CommandContext, StatementExternalEffectDisposition, StatementNativeHealthFailure},
+    api::{
+        CatalogTablePropertyBinding, CatalogTableReadBinding, CommandContext,
+        StatementExternalEffectDisposition, StatementNativeHealthFailure,
+    },
     session_control::{
         GovernedActionContext, GovernedQueryStatementOwner, GovernedStatementAction,
-        GovernedStatementResidual, StatementActionValue,
+        GovernedStatementResidual, StatementActionValue, StatementCommandCompletion,
     },
-    sql::{ProductCommandRouter, lower_object_name},
+    sql::{
+        ProductCommandRouter, dml_admission::DmlAdmissionError, lower_object_name,
+        trino_admission::unsupported_statement,
+    },
 };
-use novarocks_sql::{compiler::SqlCompileControl, semantic::TableColumnDef};
+use novarocks_sql::{
+    compiler::SqlCompileControl,
+    semantic::{ObjectName, TableColumnDef},
+};
 use novarocks_workload_control::WorkError;
 use std::{
     future::Future,
@@ -53,6 +68,7 @@ use std::{
 enum Prepared {
     Like(Vec<TableColumnDef>),
     Table(PreparedTableMutationInput),
+    Trino(TrinoTablePropertyOutput),
 }
 type Preparation = Pin<
     Box<
@@ -143,15 +159,30 @@ impl GovernedStatementResidual for Tail {
     }
 }
 
+pub(super) enum TablePropertyInput {
+    LegacyCreate(CreateTable),
+    TrinoCreate(TrinoCreateTable),
+    TrinoSet {
+        name: ParsedObjectName,
+        properties: AstVec<StatementProperty>,
+    },
+}
+
 enum Phase {
     Start,
+    Probe,
+    TrinoProperties,
+    NoOp,
     Read,
     LikeColumns,
     Properties,
 }
 struct Action {
     source: Arc<str>,
-    pending: Option<CreateTable>,
+    pending: Option<TablePropertyInput>,
+    target: Option<CatalogTableReadBinding>,
+    exists: Option<TableExistsSource>,
+    trino_like: Option<Box<PreparedTrinoTableLike>>,
     compiler: FrontendQueryCompiler,
     interpreter: Arc<RequiredConstantInterpreter>,
     router: ProductCommandRouter,
@@ -171,7 +202,9 @@ impl Action {
         owner: &GovernedActionContext<'_>,
         like_columns: Option<Vec<TableColumnDef>>,
     ) -> Result<(), QueryServiceError> {
-        let pending = self.pending.as_ref().expect("one original table syntax");
+        let Some(TablePropertyInput::LegacyCreate(pending)) = self.pending.take() else {
+            unreachable!("legacy table property preparation has its original syntax");
+        };
         let binding = self
             .router
             .acquire_table_property_binding(&lower_object_name(&pending.name), &self.context)
@@ -181,7 +214,7 @@ impl Action {
             .ok_or_else(|| internal_error("table properties have no original result window"))?;
         let input = TablePropertyCpuInput {
             source: self.source.clone(),
-            statement: self.pending.take().expect("one original table syntax"),
+            statement: pending,
             binding,
             command: self
                 .command
@@ -209,6 +242,110 @@ impl Action {
         self.phase = Phase::Properties;
         Ok(())
     }
+    fn start_trino_properties(
+        &mut self,
+        owner: &GovernedActionContext<'_>,
+        binding: CatalogTablePropertyBinding,
+    ) -> Result<(), QueryServiceError> {
+        let syntax = match self.pending.take().expect("one typed table property input") {
+            TablePropertyInput::TrinoCreate(statement) => {
+                TrinoTablePropertySyntax::Create(statement)
+            }
+            TablePropertyInput::TrinoSet { properties, .. } => {
+                TrinoTablePropertySyntax::Set(properties)
+            }
+            TablePropertyInput::LegacyCreate(_) => unreachable!("original typed table input"),
+        };
+        let window = owner
+            .result_window_alias()
+            .ok_or_else(|| internal_error("table properties have no original result window"))?;
+        let input = TrinoTablePropertyCpuInput {
+            source: self.source.clone(),
+            syntax,
+            binding,
+            command: self
+                .command
+                .as_ref()
+                .expect("original table command")
+                .clone(),
+            context: self.compiler.property_cpu_context(
+                self.context.session().current_database().to_owned(),
+                self.context.execution().sql_semantics().clone(),
+                self.interpreter.clone(),
+                self.control.clone(),
+                owner.scope().clone(),
+                window,
+            ),
+        };
+        let tail = self.tail.as_mut().expect("original table residual");
+        let cpu = tail.cpu.clone();
+        assert!(tail.preparation.is_none() && tail.prepared.is_none());
+        tail.preparation = Some(Box::pin(async move {
+            cpu.trino_table_properties(input)
+                .await
+                .map(|r| r.map(Prepared::Trino))
+        }));
+        self.phase = Phase::TrinoProperties;
+        Ok(())
+    }
+
+    fn start_like(&mut self, source: &ObjectName) -> Result<(), QueryServiceError> {
+        let binding = self
+            .router
+            .acquire_table_read_binding(source, &self.context)
+            .map_err(product_command_service_error)?;
+        let read = LikeSourceRead::try_new(
+            binding,
+            self.command
+                .as_ref()
+                .expect("original table command")
+                .clone(),
+            self.cpu.clone(),
+            self.cancellation.clone(),
+            self.compiler.connector_runtime().clone(),
+        )?;
+        self.tail.as_mut().expect("original table residual").read = Some(read);
+        self.phase = Phase::Read;
+        Ok(())
+    }
+
+    fn start_probe(&mut self, name: ObjectName) -> Result<(), QueryServiceError> {
+        let target = self
+            .router
+            .acquire_table_read_binding(&name, &self.context)
+            .map_err(product_command_service_error)?;
+        let source =
+            CatalogTableReadBinding::try_new(target.table().clone(), target.planning().clone())
+                .map_err(product_command_service_error)?;
+        self.exists = Some(TableExistsSource::try_new(
+            source,
+            self.command
+                .as_ref()
+                .expect("original table command")
+                .clone(),
+            self.cancellation.clone(),
+        )?);
+        self.target = Some(target);
+        self.phase = Phase::Probe;
+        Ok(())
+    }
+
+    fn poll_probe(
+        &mut self,
+        owner: &mut GovernedActionContext<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<bool, QueryServiceError>> {
+        let result = self
+            .exists
+            .as_mut()
+            .expect("original target probe")
+            .poll_result(owner, cx);
+        if result.is_ready() {
+            self.exists.take();
+        }
+        result
+    }
+
     fn advance(
         &mut self,
         owner: &mut GovernedActionContext<'_>,
@@ -216,27 +353,76 @@ impl Action {
     ) -> Poll<Result<(), QueryServiceError>> {
         loop {
             match self.phase {
-                Phase::Start => {
-                    let pending = self.pending.as_ref().expect("same original table syntax");
-                    if let Some(source) = pending.like.as_ref() {
+                Phase::Start => match self.pending.as_ref().expect("one table input") {
+                    TablePropertyInput::LegacyCreate(node) => match node.like.as_ref() {
+                        Some(source) => self.start_like(&lower_object_name(source))?,
+                        None => self.start_properties(owner, None)?,
+                    },
+                    TablePropertyInput::TrinoCreate(node) => {
+                        if node.save_mode == StatementSaveMode::Replace {
+                            return Poll::Ready(Err(unsupported_statement(
+                                &self.source,
+                                node.span,
+                                "CREATE OR REPLACE TABLE",
+                            )));
+                        }
+                        self.start_probe(lower_object_name(&node.name))?;
+                    }
+                    TablePropertyInput::TrinoSet { name, .. } => {
                         let binding = self
                             .router
-                            .acquire_table_read_binding(&lower_object_name(source), &self.context)
+                            .acquire_table_property_binding(&lower_object_name(name), &self.context)
                             .map_err(product_command_service_error)?;
-                        let read = LikeSourceRead::try_new(
-                            binding,
-                            self.command
-                                .as_ref()
-                                .expect("same original command")
-                                .clone(),
-                            self.cpu.clone(),
-                            self.cancellation.clone(),
-                            self.compiler.connector_runtime().clone(),
-                        )?;
-                        self.tail.as_mut().expect("same table residual").read = Some(read);
-                        self.phase = Phase::Read;
-                    } else {
-                        self.start_properties(owner, None)?;
+                        self.start_trino_properties(owner, binding)?;
+                    }
+                },
+                Phase::Probe => {
+                    let exists = std::task::ready!(self.poll_probe(owner, cx))?;
+                    let Some(TablePropertyInput::TrinoCreate(node)) = self.pending.as_ref() else {
+                        unreachable!("same CREATE TABLE for the original target");
+                    };
+                    let target = self.target.take().expect("original table target");
+                    if exists {
+                        if node.save_mode == StatementSaveMode::Ignore {
+                            self.phase = Phase::NoOp;
+                            return Poll::Ready(Ok(()));
+                        }
+                        let table = target.table();
+                        return Poll::Ready(Err(QueryServiceError::from_user_error(
+                            DmlAdmissionError::TableAlreadyExists.to_user_error(
+                                &self.source,
+                                node.span,
+                                format!(
+                                    "Table '{}.{}.{}' already exists",
+                                    table.instance_id.as_str(),
+                                    table.namespace,
+                                    table.table
+                                ),
+                            ),
+                        )));
+                    }
+                    let (table, pin) = target.into_parts();
+                    let binding = CatalogTablePropertyBinding::try_new(table, pin)
+                        .map_err(product_command_service_error)?;
+                    self.start_trino_properties(owner, binding)?;
+                }
+                Phase::NoOp => return Poll::Ready(Ok(())),
+                Phase::TrinoProperties => {
+                    let tail = self.tail.as_mut().expect("original table residual");
+                    std::task::ready!(tail.poll_turn(cx));
+                    let result = tail.prepared.take().expect("typed table property result")?;
+                    let Prepared::Trino(result) = result else {
+                        unreachable!("same typed table property CPU case");
+                    };
+                    match result {
+                        TrinoTablePropertyOutput::Mutation(input) => {
+                            tail.prepared = Some(Ok(Prepared::Table(input)));
+                            self.phase = Phase::Properties;
+                        }
+                        TrinoTablePropertyOutput::Like(input) => {
+                            self.start_like(input.table.like.as_ref().expect("bound LIKE source"))?;
+                            self.trino_like = Some(input);
+                        }
                     }
                 }
                 Phase::Read => {
@@ -267,7 +453,17 @@ impl Action {
                     let Prepared::Like(columns) = prepared else {
                         unreachable!("same finite LIKE CPU case")
                     };
-                    self.start_properties(owner, Some(columns))?;
+                    if let Some(table) = self.trino_like.take() {
+                        let cpu = tail.cpu.clone();
+                        tail.preparation = Some(Box::pin(async move {
+                            cpu.finish_trino_table_like(table, columns)
+                                .await
+                                .map(|r| r.map(Prepared::Table))
+                        }));
+                        self.phase = Phase::Properties;
+                    } else {
+                        self.start_properties(owner, Some(columns))?;
+                    }
                 }
                 Phase::Properties => {
                     let tail = self.tail.as_mut().expect("same table residual");
@@ -309,7 +505,10 @@ impl GovernedStatementAction for Action {
             .and_then(|inner| inner.external_effect_disposition())
     }
     fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
-        self.tail.as_ref().and_then(|tail| tail.health())
+        self.exists
+            .as_ref()
+            .and_then(TableExistsSource::local_health_failure)
+            .or_else(|| self.tail.as_ref().and_then(|tail| tail.health()))
     }
     fn handoff_residual_in(
         &mut self,
@@ -358,6 +557,14 @@ impl GovernedStatementAction for Action {
             match self.advance(owner, cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => self.error = Some(error),
+                Poll::Ready(Ok(())) if matches!(self.phase, Phase::NoOp) => {
+                    let tail = self.tail.as_mut().expect("original table residual");
+                    std::task::ready!(tail.poll_preparation_closed(cx));
+                    self.delivered = true;
+                    return Poll::Ready(Ok(StatementActionValue::Ok(
+                        StatementCommandCompletion::empty(),
+                    )));
+                }
                 Poll::Ready(Ok(())) => {
                     let result = self
                         .tail
@@ -371,6 +578,9 @@ impl GovernedStatementAction for Action {
                     return result;
                 }
             }
+        }
+        if self.exists.is_some() {
+            let _ = std::task::ready!(self.poll_probe(owner, cx));
         }
         std::task::ready!(
             self.tail
@@ -396,6 +606,26 @@ impl FrontendQuerySession {
         deadline: Option<Instant>,
         statement: GovernedQueryStatementOwner,
     ) -> Result<StatementResult, QueryServiceError> {
+        self.execute_observed_table_properties(
+            source,
+            TablePropertyInput::LegacyCreate(pending),
+            context,
+            command,
+            deadline,
+            statement,
+        )
+        .await
+    }
+
+    pub(super) async fn execute_observed_table_properties(
+        &self,
+        source: Arc<str>,
+        pending: TablePropertyInput,
+        context: RequestContext,
+        command: CommandContext,
+        deadline: Option<Instant>,
+        statement: GovernedQueryStatementOwner,
+    ) -> Result<StatementResult, QueryServiceError> {
         let cpu = match self.service.query_compiler.table_metadata_cpu() {
             Ok(cpu) => cpu,
             Err(error) => {
@@ -414,6 +644,9 @@ impl FrontendQuerySession {
         let action = Action {
             source,
             pending: Some(pending),
+            target: None,
+            exists: None,
+            trino_like: None,
             compiler: self.service.query_compiler.clone(),
             interpreter: self.service.required_constant_interpreter.clone(),
             router: self.service.product_command_router.clone(),

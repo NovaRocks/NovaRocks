@@ -125,12 +125,9 @@ pub(super) fn create_prefix(
     prepared: &PreparedOperation,
 ) -> Result<PreparedChange, ConnectorError> {
     let mut updates = prepared.staged.publication_updates.clone();
-    if let Some(properties) = &prepared.document_properties {
-        updates.push(TableUpdate::SetProperties {
-            updates: properties.clone(),
-        });
-    }
-    if let Some(location) = &prepared.staged.final_table_location {
+    let relocated = prepared.staged.final_table_location.is_some()
+        || prepared.staged.final_metadata_path.is_some();
+    if relocated {
         let empty = prepared
             .write
             .as_ref()
@@ -140,6 +137,26 @@ pub(super) fn create_prefix(
                 "Final MV location requires a document-managed create with a zero-row sealed write and no data artifacts",
             ));
         }
+    }
+    if let Some(properties) = &prepared.document_properties {
+        let mut properties = properties.clone();
+        if let Some(metadata_path) = &prepared.staged.final_metadata_path
+            && properties
+                .insert(
+                    WRITE_METADATA_PATH.to_string(),
+                    metadata_path.as_str().to_string(),
+                )
+                .is_some()
+        {
+            return Err(internal(
+                "MV document properties collide with the final metadata path",
+            ));
+        }
+        updates.push(TableUpdate::SetProperties {
+            updates: properties,
+        });
+    }
+    if let Some(location) = &prepared.staged.final_table_location {
         updates.push(TableUpdate::SetLocation {
             location: location.to_string(),
         });
@@ -189,8 +206,19 @@ impl PublicationPreparer for CreatePublisher {
         )?;
         let ident = request.identifier();
         let expected_snapshot_id = request.ref_snapshot_after("main");
-        if let Some(expected) = self.prepared.staged.final_table_location.as_deref() {
-            if request.final_table_location_update() != Some(expected)
+        let final_location = self.prepared.staged.final_table_location.as_deref();
+        let metadata_path = self
+            .prepared
+            .staged
+            .final_metadata_path
+            .as_ref()
+            .map(StagedMetadataPath::as_str);
+        if final_location.is_some() || metadata_path.is_some() {
+            if final_location
+                .is_some_and(|expected| request.final_table_location_update() != Some(expected))
+                || metadata_path.is_some_and(|expected| {
+                    request.final_property_update(WRITE_METADATA_PATH) != Some(expected)
+                })
                 || request.requirements() != [crate::iceberg::TableRequirement::NotExist]
                 || request.updates().iter().any(|update| {
                     matches!(
@@ -218,6 +246,7 @@ impl PublicationPreparer for CreatePublisher {
                 .final_table_location
                 .as_deref()
                 .map(str::to_owned),
+            final_metadata_path: metadata_path.map(str::to_owned),
             handle_digest: self.prepared.handle_digest,
             namespace: ident.namespace.to_url_string(),
             table: ident.name.clone(),
@@ -667,6 +696,7 @@ mod tests {
                         updates: provenance,
                     }],
                     final_table_location: None,
+                    final_metadata_path: None,
                 },
                 policy: CreatePolicy::FailIfExists,
                 planning: None,
@@ -720,11 +750,25 @@ mod tests {
         std::fs::create_dir(sentinel.parent().unwrap()).unwrap();
         std::fs::write(&sentinel, b"outside the operation").unwrap();
         fixture.prepared.staged.final_table_location = Some(custom.as_str().into());
+        let metadata_path = "s3://warehouse/base/final-metadata";
+        fixture.prepared.staged.final_metadata_path = Some(
+            StagedMetadataPath::under_warehouse(
+                metadata_path,
+                "s3://warehouse/base",
+                CTAS_STAGING_NAMESPACE,
+            )
+            .unwrap(),
+        );
+        let file_uri = "s3://warehouse/base/final-metadata/00000-unit.metadata.json";
         let operation_id = fixture.prepared.operation_id();
 
         let mut with_rows = fixture.prepared.clone();
+        with_rows.staged.final_metadata_path = None;
         let write = with_rows.write.as_mut().unwrap();
         write.write = ConnectorStagedWriteProof::try_new(write.write.receipt().clone(), 1).unwrap();
+        assert!(create_prefix(&with_rows).is_err());
+        with_rows.staged.final_table_location = None;
+        with_rows.staged.final_metadata_path = fixture.prepared.staged.final_metadata_path.clone();
         assert!(create_prefix(&with_rows).is_err());
 
         let mut with_artifact = Fixture::new(true).prepared;
@@ -732,6 +776,10 @@ mod tests {
         let write = with_artifact.write.as_mut().unwrap();
         write.write = ConnectorStagedWriteProof::try_new(write.write.receipt().clone(), 0).unwrap();
         assert!(!write.files.is_empty());
+        assert!(create_prefix(&with_artifact).is_err());
+        with_artifact.staged.final_table_location = None;
+        with_artifact.staged.final_metadata_path =
+            fixture.prepared.staged.final_metadata_path.clone();
         assert!(create_prefix(&with_artifact).is_err());
 
         let mut without_documents = fixture.prepared.clone();
@@ -777,6 +825,27 @@ mod tests {
             &[crate::iceberg::TableRequirement::NotExist]
         );
         assert_eq!(request.final_table_location_update(), Some(custom.as_str()));
+        assert_eq!(
+            request.final_property_update(WRITE_METADATA_PATH),
+            Some(metadata_path)
+        );
+        assert_eq!(
+            metadata
+                .properties()
+                .get(WRITE_METADATA_PATH)
+                .map(String::as_str),
+            Some(metadata_path),
+        );
+        assert_eq!(
+            fixture
+                .prepared
+                .staged
+                .table
+                .metadata()
+                .properties()
+                .get(WRITE_METADATA_PATH),
+            None
+        );
         assert!(request.ref_snapshot_after("main").is_none());
         assert!(request.artifacts().attempt_owned().is_empty());
         assert!(request.artifacts().session_references().is_empty());
@@ -809,7 +878,7 @@ mod tests {
                 observation: Default::default(),
             },
         );
-        let fresh_table = |metadata| {
+        let fresh_table = |metadata, uri: &str| {
             crate::iceberg::table::Table::builder()
                 .runtime(
                     fixture
@@ -823,6 +892,7 @@ mod tests {
                 .identifier(fixture.prepared.staged.table.identifier().clone())
                 .file_io(fixture.prepared.staged.table.file_io().clone())
                 .metadata(metadata)
+                .metadata_location(uri)
                 .build()
                 .unwrap()
         };
@@ -834,9 +904,40 @@ mod tests {
                 .build()
                 .unwrap()
                 .metadata,
+            file_uri,
         );
         assert!(!publication_matches(
             &wrong_location,
+            operation_id,
+            &fixture.prepared,
+            None
+        ));
+        let old_folder = fresh_table(
+            metadata.clone(),
+            "s3://warehouse/base/staged/00000-unit.metadata.json",
+        );
+        assert!(!publication_matches(
+            &old_folder,
+            operation_id,
+            &fixture.prepared,
+            None
+        ));
+        let old_property = fresh_table(
+            metadata
+                .clone()
+                .into_builder(None)
+                .set_properties(HashMap::from([(
+                    WRITE_METADATA_PATH.to_string(),
+                    "s3://warehouse/base/foreign".to_string(),
+                )]))
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata,
+            file_uri,
+        );
+        assert!(!publication_matches(
+            &old_property,
             operation_id,
             &fixture.prepared,
             None
@@ -845,7 +946,7 @@ mod tests {
             journal.catalog_entry_outcome(entry),
             ExternalMutationOutcome::CommitUnknown { .. }
         ));
-        let exact_location = fresh_table(metadata);
+        let exact_location = fresh_table(metadata, file_uri);
         assert!(publication_matches(
             &exact_location,
             operation_id,
@@ -1388,6 +1489,12 @@ mod tests {
                         .final_table_location
                         .as_deref()
                         .map(str::to_owned),
+                    final_metadata_path: fixture
+                        .prepared
+                        .staged
+                        .final_metadata_path
+                        .as_ref()
+                        .map(|path| path.as_str().to_owned()),
                     handle_digest: fixture.prepared.handle_digest,
                     namespace: request.identifier().namespace.to_url_string(),
                     table: request.identifier().name.clone(),

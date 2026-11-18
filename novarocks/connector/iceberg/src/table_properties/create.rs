@@ -101,14 +101,38 @@ pub(crate) fn prepare_create_table_properties(
         .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
 }
 
+/// Keep ordinary CTAS on its existing v3, warehouse-rooted staging profile.
+pub(crate) fn prepare_ctas_storage(
+    properties: &[(Arc<str>, DdlPropertyValue)],
+    comment: Option<&str>,
+    control: &dyn ConnectorOperationControl,
+) -> Result<PreparedCreateTableProperties, ConnectorError> {
+    let storage = prepare_create_table_properties(properties, comment, control)?;
+    if storage.format_version != FormatVersion::V3 {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg CTAS requires format_version = 3",
+        ));
+    }
+    if storage.location.is_some() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg CTAS does not support an explicit table location",
+        ));
+    }
+    // A raw metadata path property stays an existing writer property. This
+    // profile does not use the MV-only final table relocation contract.
+    Ok(storage)
+}
+
 /// Validate evaluated user properties for the existing document-managed staged
 /// path. The caller keeps application markers separate and binds partitioning
 /// against the admitted materialized-view output.
 pub(crate) fn prepare_mv_staged_storage(
     properties: &[(Arc<str>, DdlPropertyValue)],
     control: &dyn ConnectorOperationControl,
-) -> Result<PreparedCreateTableProperties, ConnectorError> {
-    let storage = prepare_create_table_properties(properties, None, control)?;
+) -> Result<(PreparedCreateTableProperties, Option<String>), ConnectorError> {
+    let mut storage = prepare_create_table_properties(properties, None, control)?;
     if storage.format_version != FormatVersion::V3 {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
@@ -122,13 +146,10 @@ pub(crate) fn prepare_mv_staged_storage(
             )),
         );
     }
-    if storage.raw_properties.contains_key("write.metadata.path") {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "A custom write.metadata.path is unsupported for staged materialized-view storage",
-        ));
-    }
-    Ok(storage)
+    let metadata_path = storage
+        .raw_properties
+        .remove(crate::catalog::staged_metadata_path::WRITE_METADATA_PATH);
+    Ok((storage, metadata_path))
 }
 
 fn prepare_create_table_properties_inner(

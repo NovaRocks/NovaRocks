@@ -237,6 +237,17 @@ pub enum StatisticsApplicationCommand {
     },
 }
 pub trait StatisticsApplicationPort: Send + Sync {
+    fn prepare_analyze(
+        &self,
+        target: StatisticsTableTarget,
+        columns: super::attempt_executor::AnalyzeColumns,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        context: &ConnectorRequestContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        StatisticsApplicationError,
+    >;
+
     fn prepare_statement_action(
         &self,
         command: StatisticsApplicationCommand,

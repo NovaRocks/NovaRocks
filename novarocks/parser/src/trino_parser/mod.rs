@@ -19,21 +19,37 @@
 
 mod access;
 mod advanced_relation;
+mod branch_statement;
+mod catalog_schema;
+mod ctas_statement;
 mod cursor;
 mod expression;
 mod failure;
 mod json;
 mod literal;
+mod merge_call;
+mod metadata_session;
 mod parameters;
 mod pattern;
+mod permission_statement;
+mod prepared_statement;
 mod query;
 mod relation;
 mod routine;
+mod show_statement;
 mod special;
+mod statement;
+mod table_alter;
+mod table_statement;
 mod types;
+mod view_statement;
 mod window;
+mod write_statement;
 
-use crate::ast::{Expr, Fold, FunctionSpecification, Query, RowPattern, TypeName};
+use crate::ast::{
+    Expr, Fold, FunctionSpecification, Query, RowPattern, TrinoPathSpecification, TrinoStatement,
+    TypeName,
+};
 use crate::trino_token::{Token, TokenKind};
 use crate::{ParserError, Span, trino_lexer};
 use failure::GrammarError;
@@ -127,6 +143,14 @@ impl<'source> Parser<'source> {
     }
 }
 
+/// Parses one complete Trino statement. Script separators belong to its caller.
+pub fn parse_statement(source: &str) -> Result<TrinoStatement, ParserError> {
+    let mut parser = Parser::new(source)?;
+    let statement = parser.parse_statement()?;
+    parser.finish()?;
+    Ok(parser.parameter_numbers().fold_trino_statement(statement))
+}
+
 /// Parses one complete root query, including its session and function prefixes.
 /// Script separators belong to the statement consumer, not this grammar rule.
 pub fn parse_query(source: &str) -> Result<Query, ParserError> {
@@ -168,4 +192,12 @@ pub fn parse_row_pattern(source: &str) -> Result<RowPattern, ParserError> {
     let pattern = parser.parse_row_pattern()?;
     parser.finish()?;
     Ok(pattern)
+}
+
+/// Parses a complete standalone SQL path, with each name kept as an identifier.
+pub fn parse_path_specification(source: &str) -> Result<TrinoPathSpecification, ParserError> {
+    let mut parser = Parser::new(source)?;
+    let path = parser.parse_path_specification()?;
+    parser.finish()?;
+    Ok(path)
 }

@@ -45,9 +45,9 @@ pub(crate) struct PreparedAsyncProfile {
 }
 
 impl FrontendQueryCompiler {
-    pub(crate) async fn prepare_explain_async(
+    pub(in crate::query) async fn prepare_explain_async(
         &self,
-        explain: &ExplainQuery,
+        explain: ExplainInput,
         detail: novarocks_query_application::sql::session::ExplainDetail,
         root_session_admitted: bool,
         context: &RequestContext,
@@ -86,17 +86,18 @@ impl FrontendQueryCompiler {
                         .with_io_admission(Arc::clone(&ports.io)),
                 )
                 .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
-            let query = explain.query.as_ref().clone();
-            Ok((connector_planning_context, query))
+            Ok(connector_planning_context)
         }
         .await;
-        let (connector_planning_context, query) = match metadata {
+        let connector_planning_context = match metadata {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
         let connector_context = connector_planning_context.request();
-        let (level, logical_only) = explain_mode(explain, detail);
-        if explain.format == ExplainFormat::Analyze {
+        let analyze = explain.is_analyze();
+        let (level, logical_only) = explain.display(detail);
+        let query = *explain.query;
+        if analyze {
             return self
                 .complete_async_profile(
                     &query,

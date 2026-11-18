@@ -66,7 +66,33 @@ pub use routine::{
     RoutineBody, RoutineCharacteristic, RoutineProperty, RoutineSecurity, VariableDeclaration,
     WhileStatement,
 };
+mod catalog_schema;
 mod storage;
+pub use catalog_schema::*;
+mod table_alter;
+pub use table_alter::*;
+mod table_statement;
+pub use table_statement::*;
+mod view_statement;
+pub use view_statement::*;
+mod ctas_statement;
+pub use ctas_statement::*;
+mod branch_statement;
+pub use branch_statement::*;
+mod show_statement;
+pub use show_statement::*;
+mod write_statement;
+pub use write_statement::*;
+mod prepared_statement;
+pub use prepared_statement::*;
+mod merge_call;
+pub use merge_call::*;
+mod permission_statement;
+pub use permission_statement::*;
+mod metadata_session;
+pub use metadata_session::*;
+mod trino_statement;
+pub use trino_statement::*;
 mod type_literal;
 pub use type_literal::*;
 mod row_pattern;

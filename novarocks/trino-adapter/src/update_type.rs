@@ -59,6 +59,7 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
         Update => "UPDATE",
         Merge => "MERGE",
         SetSession => "SET SESSION",
+        ResetSession => "RESET SESSION",
         Use => "USE",
         BeginTransaction => "START TRANSACTION",
         Commit => "COMMIT",

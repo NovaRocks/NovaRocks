@@ -33,6 +33,9 @@ use novarocks_query_application::{
 };
 use novarocks_table_maintenance::runtime::TerminalError;
 
+mod table_execute;
+pub(crate) use table_execute::PreparedTableExecute;
+
 /// Foreground maintenance command capability.  Each invocation creates a
 /// short-lived engine carrying only the Frontend-composed maintenance ports
 /// and the already-admitted request execution.  It cannot use the legacy
@@ -99,6 +102,7 @@ impl MaintenanceCommandExecutor {
             &self.kernel,
             engine,
             target,
+            None,
             execution,
             family,
             #[cfg(novarocks_dev_controls)]
@@ -217,6 +221,7 @@ impl MaintenanceCommandExecutor {
             &self.kernel,
             target,
             older_than_ms,
+            None,
             matches!(
                 command,
                 novarocks_sql::semantic::MaintenanceSqlCommand::Call { .. }
@@ -288,6 +293,34 @@ impl MaintenanceCommandExecutor {
             .connector_control()
             .acquire_current_metadata_maintenance(&instance)
             .map_err(|e| e.to_string())?;
+        let spark_call = matches!(
+            command,
+            novarocks_sql::semantic::MaintenanceSqlCommand::Call { .. }
+        );
+        self.prepare_metadata_source(
+            lowered,
+            spark_call,
+            MaintenanceRequestContext {
+                current_catalog,
+                current_database,
+            },
+            execution,
+            connector_context,
+            lease,
+            None,
+        )
+    }
+
+    fn prepare_metadata_source(
+        &self,
+        lowered: crate::table_maintenance::ParsedMaintenanceStatement,
+        spark_call: bool,
+        context: MaintenanceRequestContext<'_>,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        lease: novarocks_spi::connector::ConnectorMetadataMaintenanceSession,
+        retained: Option<table_execute::MetadataPreparation>,
+    ) -> Result<MaintenanceCommandCall, CommandError> {
         let profile = lease.io_profile().map_err(|e| e.to_string())?;
         let capacity = execution.result_capacity().ok_or_else(|| {
             crate::query::maintenance_command_error(TerminalError::failed(
@@ -303,23 +336,36 @@ impl MaintenanceCommandExecutor {
             provider_bytes,
         )
         .map_err(|e| format!("metadata source construction refused: {e:?}"))?;
-        let context = connector_context.clone().with_io_admission(
+        let connector = connector_context.clone().with_io_admission(
             io.clone() as Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>
         );
-        let engine =
-            RequestScopedMaintenanceEngine::new(self.kernel.clone(), execution.clone(), context);
+        let mut engine = RequestScopedMaintenanceEngine::new(
+            self.kernel.clone(),
+            execution.clone(),
+            connector.clone(),
+        );
         let original = MaintenanceActionState::default();
+        if let Some(retained) = retained {
+            let table = RequestScopedMaintenanceEngine::target_identity(&retained.target)
+                .map_err(legacy_lower_error)?;
+            let call = crate::connector::metadata_maintenance::MetadataMaintenanceCall::try_new_on_session(
+                lease,
+                novarocks_spi::connector::ConnectorMutationOperationId::new(),
+                table,
+                retained.intent,
+                connector,
+            )
+            .map_err(|error| legacy_lower_error(format!("{error:?}")))?;
+            original.install_call(call).map_err(legacy_lower_error)?;
+            engine = engine.with_metadata_target(retained.target, retained.planning);
+        }
         original
             .install_engine(engine.clone())
             .map_err(legacy_lower_error)?;
         let retained = original.clone();
         let service = Arc::clone(self.kernel.service());
-        let catalog = current_catalog.map(str::to_owned);
-        let database = current_database.to_owned();
-        let spark_call = matches!(
-            command,
-            novarocks_sql::semantic::MaintenanceSqlCommand::Call { .. }
-        );
+        let catalog = context.current_catalog.map(str::to_owned);
+        let database = context.current_database.to_owned();
         let future = Box::pin(make_metadata_product(MetadataProductInput {
             service,
             engine,

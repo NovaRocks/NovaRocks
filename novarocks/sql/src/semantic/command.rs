@@ -64,6 +64,8 @@ pub enum CatalogSqlCommand {
 pub struct CatalogCreateCommand {
     pub if_not_exists: bool,
     pub name: String,
+    /// Exact USING connector. None belongs to the legacy property-based entry.
+    pub connector_name: Option<String>,
     /// Already evaluated VARCHAR configuration facts, retaining original keys.
     pub properties: Vec<(String, String)>,
 }

@@ -21,6 +21,7 @@
 
 use arrow::{
     array::{Array, UInt64Array},
+    datatypes::DataType,
     record_batch::{RecordBatch, RecordBatchOptions},
 };
 use novarocks_connector_contract::PureProviderProgramCatalog;
@@ -231,7 +232,7 @@ impl RequiredConstantInterpreter {
         let [field] = output_layout.schema().fields().as_ref() else {
             return Err(invariant("required constant output is not one column"));
         };
-        // SQL's five targets are flat physical scalars. Arbitrary external Field
+        // Required constants have an internally authored Field. External field
         // attributes would require their own original ConstantSourceOwner.
         if !field.metadata().is_empty() {
             return Err(invariant(
@@ -294,14 +295,15 @@ impl RequiredConstantInterpreter {
                 "required result differs from its complete frozen carrier",
             ));
         }
-        // ARRAY<VARCHAR> uses the original nested take and keeps its source
-        // lease through every reachable child buffer. Scalar results retain
-        // their original independent-copy path and its no-alias proof.
-        let array_result = matches!(
-            prepared.value_type().value_type().kind(),
-            novarocks_type_contract::ValueKind::List(child)
-                if matches!(child.kind(), novarocks_type_contract::ValueKind::String)
-        );
+        // ARRAY<VARCHAR> can share nested children. Arrow take can also slice
+        // an UNKNOWN result and retain its bufferless root owner. Both use the
+        // source-retaining path. Concrete scalars prove independent backing.
+        let retains_source = *array.data_type() == DataType::Null
+            || matches!(
+                prepared.value_type().value_type().kind(),
+                novarocks_type_contract::ValueKind::List(child)
+                    if matches!(child.kind(), novarocks_type_contract::ValueKind::String)
+            );
         let mut indices_scope = resources.factory.begin_scope()?;
         indices_scope.request_layout(
             std::alloc::Layout::array::<u64>(1)
@@ -337,7 +339,7 @@ impl RequiredConstantInterpreter {
             resources.operation_storage(),
             indices_scope.storage_lifetime(),
         );
-        let copied = if array_result {
+        let copied = if retains_source {
             novarocks_functions::selected_copy::take_copy_in(
                 array,
                 indices,
@@ -368,7 +370,7 @@ impl RequiredConstantInterpreter {
                 },
             )
             .map_err(constant_creation_error)?;
-        if array_result {
+        if retains_source {
             // Bound the actual complete Arrow subtree before to_data creates
             // its metadata. Payload is already held by the original take.
             let metadata = novarocks_functions::source_metadata_bytes_observed::<

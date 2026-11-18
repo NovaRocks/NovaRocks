@@ -260,6 +260,26 @@ impl DataMutationSession {
             .map_err(|error| {
                 contract_failure(error, DataMutationDispatchState::ConfirmedNotDispatched)
             })?;
+        Self::plan_on_session(session, operation_id, table, intent, context)
+    }
+
+    /// Reuse the original data-mutation preparation on a retained generation.
+    pub(crate) fn plan_on_session(
+        session: ConnectorDataMutationSession,
+        operation_id: ConnectorMutationOperationId,
+        table: ConnectorTableIdentity,
+        intent: DataMutationIntent,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ResolvedDataMutation> {
+        if session.descriptor().instance_id != table.instance_id {
+            return Err(contract_failure(
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector data mutation table does not belong to retained instance",
+                ),
+                DataMutationDispatchState::ConfirmedNotDispatched,
+            ));
+        }
         let metadata = session
             .metadata()
             .load_frontend_table(ConnectorTableRequest {

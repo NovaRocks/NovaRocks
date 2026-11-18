@@ -30,7 +30,7 @@ use super::{
     SqlFunctionCatalog,
 };
 
-/// The admitted SQL targets of a required property computation.
+/// The admitted SQL targets of a required constant computation.
 /// This vocabulary carries no application registry or setter authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequiredConstantTarget {
@@ -40,6 +40,9 @@ pub enum RequiredConstantTarget {
     Double,
     Varchar,
     ArrayVarchar,
+    /// Accept an already typed Physical timestamp or an UNKNOWN NULL.
+    /// Preserve its exact timestamp carrier, precision and zone annotation.
+    Timestamp,
 }
 impl RequiredConstantTarget {
     pub const fn scalar_data_type(self) -> Option<DataType> {
@@ -49,7 +52,7 @@ impl RequiredConstantTarget {
             Self::Bigint => Some(DataType::Int64),
             Self::Double => Some(DataType::Float64),
             Self::Varchar => Some(DataType::Utf8),
-            Self::ArrayVarchar => None,
+            Self::ArrayVarchar | Self::Timestamp => None,
         }
     }
 }

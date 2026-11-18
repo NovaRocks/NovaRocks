@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Every completed query/expression grammar witness keeps its full typed AST.
+//! Every accepted grammar witness keeps its full typed AST.
 use novarocks_parser::ast::SyntaxEq;
 use novarocks_parser::{trino_parser, trino_printer};
 
@@ -31,7 +31,14 @@ fn check(rule: &str, source: &str) -> Result<(), String> {
             trino_parser::parse_function_specification,
             trino_printer::print_function_specification
         ),
-        _ => roundtrip!(trino_parser::parse_query, trino_printer::print_query),
+        "standalonePathSpecification" => roundtrip!(
+            trino_parser::parse_path_specification,
+            trino_printer::print_path_specification
+        ),
+        _ => roundtrip!(
+            trino_parser::parse_statement,
+            trino_printer::print_statement
+        ),
     }
 }
 
@@ -44,10 +51,7 @@ fn completed_grammar_samples_strictly_roundtrip_without_losing_typed_facts() {
     {
         let fields: Vec<_> = line.split('\t').collect();
         assert_eq!(fields.len(), 10, "{line}");
-        if !matches!(fields[0], "alternative" | "optional")
-            || fields[6] == "pending-p09"
-            || fields[7] != "accept"
-        {
+        if !matches!(fields[0], "alternative" | "optional") || fields[7] != "accept" {
             continue;
         }
         let source = super::coverage::sample(fields[5]);

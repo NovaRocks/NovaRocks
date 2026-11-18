@@ -71,6 +71,7 @@ mod metadata_read_tests;
 pub(crate) mod publication;
 pub(crate) mod publication_dispatch;
 pub(crate) mod rest;
+pub(crate) mod staged_metadata_path;
 pub(crate) mod table_coordination;
 pub(crate) mod view_request;
 
@@ -268,6 +269,7 @@ pub(crate) struct StagedPublicationExpectation {
     pub(crate) snapshot_id: Option<i64>,
     /// Expected table root for an explicitly relocated empty managed create.
     pub(crate) final_table_location: Option<Arc<str>>,
+    pub(crate) final_metadata_path: Option<staged_metadata_path::StagedMetadataPath>,
     /// Properties NovaRocks itself names: the operation marker and any
     /// document properties.
     pub(crate) properties: Vec<(String, String)>,

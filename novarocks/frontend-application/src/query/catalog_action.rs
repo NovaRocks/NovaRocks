@@ -24,11 +24,12 @@ use super::{
     routed_execution_service_error,
 };
 use crate::query::{
-    catalog_property_computation::CatalogPropertyCpuInput, compiler::FrontendQueryCompiler,
+    catalog_property_computation::{CatalogCreateInput, CatalogPropertyCpuInput},
+    compiler::FrontendQueryCompiler,
+    property_action_tail::PropertyActionTail,
 };
 use crate::query_execution::{
-    completion_facts::FrontendPlanningCpuSource, planning::sql_cancellation_observation,
-    required_constant_eval::RequiredConstantInterpreter,
+    planning::sql_cancellation_observation, required_constant_eval::RequiredConstantInterpreter,
 };
 use novarocks_parser::ast;
 use novarocks_query_application::{
@@ -44,93 +45,23 @@ use novarocks_sql::{
     compiler::SqlCompileControl,
     semantic::{CatalogSqlCommand, command::CatalogCreateCommand},
 };
-use novarocks_workload_control::WorkError;
 use std::{
-    future::Future,
-    pin::Pin,
     sync::Arc,
     task::{Context, Poll},
     time::Instant,
 };
 
-type Preparation = Pin<
-    Box<
-        dyn Future<
-                Output = Result<
-                    Result<CatalogCreateCommand, QueryServiceError>,
-                    StatementNativeHealthFailure,
-                >,
-            > + Send,
-    >,
->;
-struct CatalogNativeTail {
-    cpu: Arc<FrontendPlanningCpuSource>,
-    preparation: Option<Preparation>,
-    prepared: Option<Result<CatalogCreateCommand, QueryServiceError>>,
-    inner: Option<Box<dyn GovernedStatementAction>>,
-    inner_residual: Option<Box<dyn GovernedStatementResidual>>,
-    health: Option<StatementNativeHealthFailure>,
-}
-impl CatalogNativeTail {
-    fn local_health(&self) -> Option<StatementNativeHealthFailure> {
-        self.health
-            .clone()
-            .or_else(|| self.cpu.local_health_failure())
-            .or_else(|| {
-                self.inner
-                    .as_ref()
-                    .and_then(|action| action.local_health_failure())
-            })
-    }
+type CatalogNativeTail = PropertyActionTail<CatalogCreateCommand>;
+
+impl PropertyActionTail<CatalogCreateCommand> {
     fn start(&mut self, input: CatalogPropertyCpuInput) {
-        assert!(self.preparation.is_none() && self.prepared.is_none());
         let cpu = self.cpu.clone();
-        self.preparation = Some(Box::pin(async move { cpu.catalog_properties(input).await }));
-    }
-    fn poll_cpu_closed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if let Some(future) = self.preparation.as_mut() {
-            match future.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(result)) => self.prepared = Some(result),
-                Poll::Ready(Err(health)) => self.health = Some(health),
-            }
-            drop(self.preparation.take());
-        }
-        if self.local_health().is_some() {
-            return Poll::Pending;
-        }
-        match self.cpu.poll_closed(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(health)) => {
-                self.health = Some(health);
-                Poll::Pending
-            }
-            Poll::Ready(Ok(())) => Poll::Ready(()),
-        }
-    }
-}
-impl GovernedStatementResidual for CatalogNativeTail {
-    fn poll_retirement(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
-        if let Some(health) = self.local_health() {
-            return Poll::Ready(Err(health));
-        }
-        let cpu = self.poll_cpu_closed(cx);
-        if let Some(health) = self.local_health() {
-            return Poll::Ready(Err(health));
-        }
-        std::task::ready!(cpu);
-        if let Some(residual) = self.inner_residual.as_mut() {
-            return residual.poll_retirement(cx);
-        }
-        Poll::Ready(Ok(()))
+        self.start_operation(async move { cpu.catalog_properties(input).await });
     }
 }
 struct CatalogCreateAction {
     source: Arc<str>,
-    pending: Option<ast::legacy::CreateCatalog>,
+    pending: Option<CatalogCreateInput>,
     compiler: FrontendQueryCompiler,
     interpreter: Arc<RequiredConstantInterpreter>,
     router: ProductCommandRouter,
@@ -158,18 +89,7 @@ impl GovernedStatementAction for CatalogCreateAction {
         if !self.delivered {
             return Ok(());
         }
-        if target.is_some() {
-            return Err(StatementNativeHealthFailure::actual_exit_unproven(
-                "catalog property residual receiver is occupied",
-                Arc::new(WorkError::Conflict),
-            ));
-        }
-        let tail = self.tail.as_mut().expect("same catalog property residual");
-        if let Some(inner) = tail.inner.as_mut() {
-            inner.handoff_residual_in(&mut tail.inner_residual)?;
-        }
-        *target = Some(self.tail.take().expect("same catalog property residual"));
-        Ok(())
+        PropertyActionTail::handoff(&mut self.tail, target)
     }
     fn poll_action(
         &mut self,
@@ -262,9 +182,49 @@ impl FrontendQuerySession {
         deadline: Option<Instant>,
         statement: GovernedQueryStatementOwner,
     ) -> Result<StatementResult, QueryServiceError> {
-        if let Err(cause) = crate::catalog_application::statement_action::admit_create_catalog_name(
-            &pending.name.value,
-        ) {
+        self.execute_catalog_create(
+            source,
+            CatalogCreateInput::Legacy(pending),
+            context,
+            command_context,
+            deadline,
+            statement,
+        )
+        .await
+    }
+
+    pub(super) async fn execute_observed_trino_catalog_create(
+        &self,
+        source: Arc<str>,
+        pending: ast::TrinoCreateCatalog,
+        context: RequestContext,
+        command_context: CommandContext,
+        deadline: Option<Instant>,
+        statement: GovernedQueryStatementOwner,
+    ) -> Result<StatementResult, QueryServiceError> {
+        self.execute_catalog_create(
+            source,
+            CatalogCreateInput::Trino(pending),
+            context,
+            command_context,
+            deadline,
+            statement,
+        )
+        .await
+    }
+
+    async fn execute_catalog_create(
+        &self,
+        source: Arc<str>,
+        pending: CatalogCreateInput,
+        context: RequestContext,
+        command_context: CommandContext,
+        deadline: Option<Instant>,
+        statement: GovernedQueryStatementOwner,
+    ) -> Result<StatementResult, QueryServiceError> {
+        if let Err(cause) =
+            crate::catalog_application::statement_action::admit_create_catalog_name(pending.name())
+        {
             return Ok(
                 self.governed_typed_error(QueryServiceError::from_failure_cause(cause), statement)
             );
@@ -281,14 +241,9 @@ impl FrontendQuerySession {
             router: self.service.product_command_router.clone(),
             context: Some((context, command_context)),
             control: SqlCompileControl::new(deadline, sql_cancellation_observation(cancellation)),
-            tail: Some(Box::new(CatalogNativeTail {
-                cpu: self.service.query_compiler.new_planning_cpu_source(),
-                preparation: None,
-                prepared: None,
-                inner: None,
-                inner_residual: None,
-                health: None,
-            })),
+            tail: Some(Box::new(CatalogNativeTail::new(
+                self.service.query_compiler.new_planning_cpu_source(),
+            ))),
             error: None,
             delivered: false,
         };

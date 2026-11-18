@@ -306,6 +306,26 @@ impl FrozenRequest {
         })
     }
 
+    /// Last explicit update to one property. A later removal supersedes a set.
+    pub(crate) fn final_property_update(&self, key: &str) -> Option<&str> {
+        for update in self.updates().iter().rev() {
+            match update {
+                TableUpdate::SetProperties { updates } => {
+                    if let Some(value) = updates.get(key) {
+                        return Some(value);
+                    }
+                }
+                TableUpdate::RemoveProperties { removals }
+                    if removals.iter().any(|removed| removed == key) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     pub fn artifacts(&self) -> &AttemptArtifacts {
         &self.parts.artifacts
     }

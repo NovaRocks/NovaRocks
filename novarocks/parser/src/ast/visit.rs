@@ -21,6 +21,244 @@ use super::*;
 
 /// Visits AST nodes by shared reference.
 pub trait Visit {
+    fn visit_trino_merge(&mut self, node: &TrinoMerge) {
+        super::walk_trino_merge(self, node);
+    }
+    fn visit_trino_call(&mut self, node: &TrinoCall) {
+        super::walk_trino_call(self, node);
+    }
+    fn visit_trino_create_role(&mut self, node: &TrinoCreateRole) {
+        super::walk_trino_create_role(self, node);
+    }
+    fn visit_trino_drop_role(&mut self, node: &TrinoDropRole) {
+        super::walk_trino_drop_role(self, node);
+    }
+    fn visit_trino_grant_roles(&mut self, node: &TrinoGrantRoles) {
+        super::walk_trino_grant_roles(self, node);
+    }
+    fn visit_trino_revoke_roles(&mut self, node: &TrinoRevokeRoles) {
+        super::walk_trino_revoke_roles(self, node);
+    }
+    fn visit_trino_grant(&mut self, node: &TrinoGrant) {
+        super::walk_trino_grant(self, node);
+    }
+    fn visit_trino_revoke(&mut self, node: &TrinoRevoke) {
+        super::walk_trino_revoke(self, node);
+    }
+    fn visit_trino_deny(&mut self, node: &TrinoDeny) {
+        super::walk_trino_deny(self, node);
+    }
+    fn visit_trino_set_role(&mut self, node: &TrinoSetRole) {
+        super::walk_trino_set_role(self, node);
+    }
+    fn visit_trino_show_grants(&mut self, node: &TrinoShowGrants) {
+        super::walk_trino_show_grants(self, node);
+    }
+    fn visit_trino_show_roles(&mut self, node: &TrinoShowRoles) {
+        super::walk_trino_show_roles(self, node);
+    }
+    fn visit_trino_show_role_grants(&mut self, node: &TrinoShowRoleGrants) {
+        super::walk_trino_show_role_grants(self, node);
+    }
+    fn visit_trino_set_authorization(&mut self, node: &TrinoSetAuthorization) {
+        super::walk_trino_set_authorization(self, node);
+    }
+    fn visit_trino_show_tables(&mut self, node: &TrinoShowTables) {
+        super::walk_trino_show_tables(self, node);
+    }
+    fn visit_trino_show_schemas(&mut self, node: &TrinoShowSchemas) {
+        super::walk_trino_show_schemas(self, node);
+    }
+    fn visit_trino_show_catalogs(&mut self, _node: &TrinoShowCatalogs) {}
+    fn visit_trino_show_columns(&mut self, node: &TrinoShowColumns) {
+        super::walk_trino_show_columns(self, node);
+    }
+    fn visit_trino_show_functions(&mut self, node: &TrinoShowFunctions) {
+        super::walk_trino_show_functions(self, node);
+    }
+    fn visit_trino_show_session(&mut self, _node: &TrinoShowSession) {}
+    fn visit_trino_set_path(&mut self, node: &TrinoSetPath) {
+        super::walk_trino_set_path(self, node);
+    }
+    fn visit_trino_set_time_zone(&mut self, node: &TrinoSetTimeZone) {
+        super::walk_trino_set_time_zone(self, node);
+    }
+    fn visit_trino_merge_case(&mut self, node: &TrinoMergeCase) {
+        super::walk_trino_merge_case(self, node);
+    }
+    fn visit_trino_merge_assignment(&mut self, node: &TrinoMergeAssignment) {
+        super::walk_trino_merge_assignment(self, node);
+    }
+    fn visit_trino_grantor(&mut self, node: &TrinoGrantor) {
+        super::walk_trino_grantor(self, node);
+    }
+    fn visit_trino_grant_object(&mut self, node: &TrinoGrantObject) {
+        super::walk_trino_grant_object(self, node);
+    }
+    fn visit_trino_prepare(&mut self, node: &TrinoPrepare) {
+        super::walk_trino_prepare(self, node);
+    }
+    fn visit_trino_deallocate(&mut self, node: &TrinoDeallocate) {
+        super::walk_trino_deallocate(self, node);
+    }
+    fn visit_trino_execute(&mut self, node: &TrinoExecute) {
+        super::walk_trino_execute(self, node);
+    }
+    fn visit_trino_execute_immediate(&mut self, node: &TrinoExecuteImmediate) {
+        super::walk_trino_execute_immediate(self, node);
+    }
+    fn visit_trino_describe_input(&mut self, node: &TrinoDescribeInput) {
+        super::walk_trino_describe_input(self, node);
+    }
+    fn visit_trino_describe_output(&mut self, node: &TrinoDescribeOutput) {
+        super::walk_trino_describe_output(self, node);
+    }
+    fn visit_trino_create_function(&mut self, node: &TrinoCreateFunction) {
+        super::walk_trino_create_function(self, node);
+    }
+    fn visit_trino_drop_function(&mut self, node: &TrinoDropFunction) {
+        super::walk_trino_drop_function(self, node);
+    }
+    fn visit_trino_create_branch(&mut self, node: &TrinoCreateBranch) {
+        super::walk_trino_create_branch(self, node);
+    }
+    fn visit_trino_drop_branch(&mut self, node: &TrinoDropBranch) {
+        super::walk_trino_drop_branch(self, node);
+    }
+    fn visit_trino_fast_forward_branch(&mut self, node: &TrinoFastForwardBranch) {
+        super::walk_trino_fast_forward_branch(self, node);
+    }
+    fn visit_trino_show_branches(&mut self, node: &TrinoShowBranches) {
+        super::walk_trino_show_branches(self, node);
+    }
+    fn visit_trino_show_create(&mut self, node: &TrinoShowCreate) {
+        super::walk_trino_show_create(self, node);
+    }
+    fn visit_trino_show_stats(&mut self, node: &TrinoShowStats) {
+        super::walk_trino_show_stats(self, node);
+    }
+    fn visit_trino_insert(&mut self, node: &TrinoInsert) {
+        super::walk_trino_insert(self, node);
+    }
+    fn visit_trino_delete(&mut self, node: &TrinoDelete) {
+        super::walk_trino_delete(self, node);
+    }
+    fn visit_trino_update(&mut self, node: &TrinoUpdate) {
+        super::walk_trino_update(self, node);
+    }
+    fn visit_trino_update_assignment(&mut self, node: &TrinoUpdateAssignment) {
+        super::walk_trino_update_assignment(self, node);
+    }
+    fn visit_trino_rename_table(&mut self, node: &TrinoRenameTable) {
+        super::walk_trino_rename_table(self, node);
+    }
+    fn visit_trino_add_column(&mut self, node: &TrinoAddColumn) {
+        super::walk_trino_add_column(self, node);
+    }
+    fn visit_trino_rename_column(&mut self, node: &TrinoRenameColumn) {
+        super::walk_trino_rename_column(self, node);
+    }
+    fn visit_trino_drop_column(&mut self, node: &TrinoDropColumn) {
+        super::walk_trino_drop_column(self, node);
+    }
+    fn visit_trino_set_default_value(&mut self, node: &TrinoSetDefaultValue) {
+        super::walk_trino_set_default_value(self, node);
+    }
+    fn visit_trino_drop_default_value(&mut self, node: &TrinoDropDefaultValue) {
+        super::walk_trino_drop_default_value(self, node);
+    }
+    fn visit_trino_set_column_type(&mut self, node: &TrinoSetColumnType) {
+        super::walk_trino_set_column_type(self, node);
+    }
+    fn visit_trino_drop_not_null_constraint(&mut self, node: &TrinoDropNotNullConstraint) {
+        super::walk_trino_drop_not_null_constraint(self, node);
+    }
+    fn visit_trino_table_execute(&mut self, node: &TrinoTableExecute) {
+        super::walk_trino_table_execute(self, node);
+    }
+    fn visit_trino_truncate_table(&mut self, node: &TrinoTruncateTable) {
+        super::walk_trino_truncate_table(self, node);
+    }
+    fn visit_trino_comment(&mut self, node: &TrinoComment) {
+        super::walk_trino_comment(self, node);
+    }
+    fn visit_trino_create_table_as_select(&mut self, node: &TrinoCreateTableAsSelect) {
+        super::walk_trino_create_table_as_select(self, node);
+    }
+    fn visit_trino_create_view(&mut self, node: &TrinoCreateView) {
+        super::walk_trino_create_view(self, node);
+    }
+    fn visit_trino_create_materialized_view(&mut self, node: &TrinoCreateMaterializedView) {
+        super::walk_trino_create_materialized_view(self, node);
+    }
+    fn visit_trino_drop_view(&mut self, node: &TrinoDropView) {
+        super::walk_trino_drop_view(self, node);
+    }
+    fn visit_trino_drop_materialized_view(&mut self, node: &TrinoDropMaterializedView) {
+        super::walk_trino_drop_materialized_view(self, node);
+    }
+    fn visit_trino_rename_view(&mut self, node: &TrinoRenameView) {
+        super::walk_trino_rename_view(self, node);
+    }
+    fn visit_trino_rename_materialized_view(&mut self, node: &TrinoRenameMaterializedView) {
+        super::walk_trino_rename_materialized_view(self, node);
+    }
+    fn visit_trino_refresh_view(&mut self, node: &TrinoRefreshView) {
+        super::walk_trino_refresh_view(self, node);
+    }
+    fn visit_trino_refresh_materialized_view(&mut self, node: &TrinoRefreshMaterializedView) {
+        super::walk_trino_refresh_materialized_view(self, node);
+    }
+    fn visit_trino_materialized_view_execute(&mut self, node: &TrinoMaterializedViewExecute) {
+        super::walk_trino_materialized_view_execute(self, node);
+    }
+    fn visit_trino_set_properties(&mut self, node: &TrinoSetProperties) {
+        super::walk_trino_set_properties(self, node);
+    }
+    fn visit_trino_create_table(&mut self, node: &TrinoCreateTable) {
+        super::walk_trino_create_table(self, node);
+    }
+    fn visit_trino_drop_table(&mut self, node: &TrinoDropTable) {
+        super::walk_trino_drop_table(self, node);
+    }
+    fn visit_trino_analyze(&mut self, node: &TrinoAnalyze) {
+        super::walk_trino_analyze(self, node);
+    }
+    fn visit_trino_table_element(&mut self, node: &TrinoTableElement) {
+        super::walk_trino_table_element(self, node);
+    }
+    fn visit_trino_column_definition(&mut self, node: &TrinoColumnDefinition) {
+        super::walk_trino_column_definition(self, node);
+    }
+    fn visit_trino_like_clause(&mut self, node: &TrinoLikeClause) {
+        super::walk_trino_like_clause(self, node);
+    }
+    fn visit_trino_create_catalog(&mut self, node: &TrinoCreateCatalog) {
+        super::walk_trino_create_catalog(self, node);
+    }
+    fn visit_trino_drop_catalog(&mut self, node: &TrinoDropCatalog) {
+        super::walk_trino_drop_catalog(self, node);
+    }
+    fn visit_trino_create_schema(&mut self, node: &TrinoCreateSchema) {
+        super::walk_trino_create_schema(self, node);
+    }
+    fn visit_trino_drop_schema(&mut self, node: &TrinoDropSchema) {
+        super::walk_trino_drop_schema(self, node);
+    }
+    fn visit_trino_rename_schema(&mut self, node: &TrinoRenameSchema) {
+        super::walk_trino_rename_schema(self, node);
+    }
+    fn visit_statement_property(&mut self, node: &StatementProperty) {
+        super::walk_statement_property(self, node);
+    }
+    fn visit_statement_principal(&mut self, node: &StatementPrincipal) {
+        super::walk_statement_principal(self, node);
+    }
+    fn visit_trino_statement(&mut self, node: &TrinoStatement) {
+        super::walk_trino_statement(self, node);
+    }
+    fn visit_trino_explain_option(&mut self, _node: &TrinoExplainOption) {}
+    fn visit_trino_transaction_mode(&mut self, _node: &TrinoTransactionMode) {}
     fn visit_at_local(&mut self, node: &AtLocal) {
         super::walk_at_local(self, node);
     }
@@ -1016,6 +1254,291 @@ pub fn walk_legacy_parenthesized_expr<V: Visit + ?Sized>(
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
 pub trait Fold {
+    fn fold_trino_merge(&mut self, node: TrinoMerge) -> TrinoMerge {
+        super::fold_trino_merge(self, node)
+    }
+    fn fold_trino_call(&mut self, node: TrinoCall) -> TrinoCall {
+        super::fold_trino_call(self, node)
+    }
+    fn fold_trino_create_role(&mut self, node: TrinoCreateRole) -> TrinoCreateRole {
+        super::fold_trino_create_role(self, node)
+    }
+    fn fold_trino_drop_role(&mut self, node: TrinoDropRole) -> TrinoDropRole {
+        super::fold_trino_drop_role(self, node)
+    }
+    fn fold_trino_grant_roles(&mut self, node: TrinoGrantRoles) -> TrinoGrantRoles {
+        super::fold_trino_grant_roles(self, node)
+    }
+    fn fold_trino_revoke_roles(&mut self, node: TrinoRevokeRoles) -> TrinoRevokeRoles {
+        super::fold_trino_revoke_roles(self, node)
+    }
+    fn fold_trino_grant(&mut self, node: TrinoGrant) -> TrinoGrant {
+        super::fold_trino_grant(self, node)
+    }
+    fn fold_trino_revoke(&mut self, node: TrinoRevoke) -> TrinoRevoke {
+        super::fold_trino_revoke(self, node)
+    }
+    fn fold_trino_deny(&mut self, node: TrinoDeny) -> TrinoDeny {
+        super::fold_trino_deny(self, node)
+    }
+    fn fold_trino_set_role(&mut self, node: TrinoSetRole) -> TrinoSetRole {
+        super::fold_trino_set_role(self, node)
+    }
+    fn fold_trino_show_grants(&mut self, node: TrinoShowGrants) -> TrinoShowGrants {
+        super::fold_trino_show_grants(self, node)
+    }
+    fn fold_trino_show_roles(&mut self, node: TrinoShowRoles) -> TrinoShowRoles {
+        super::fold_trino_show_roles(self, node)
+    }
+    fn fold_trino_show_role_grants(&mut self, node: TrinoShowRoleGrants) -> TrinoShowRoleGrants {
+        super::fold_trino_show_role_grants(self, node)
+    }
+    fn fold_trino_set_authorization(
+        &mut self,
+        node: TrinoSetAuthorization,
+    ) -> TrinoSetAuthorization {
+        super::fold_trino_set_authorization(self, node)
+    }
+    fn fold_trino_show_tables(&mut self, node: TrinoShowTables) -> TrinoShowTables {
+        super::fold_trino_show_tables(self, node)
+    }
+    fn fold_trino_show_schemas(&mut self, node: TrinoShowSchemas) -> TrinoShowSchemas {
+        super::fold_trino_show_schemas(self, node)
+    }
+    fn fold_trino_show_catalogs(&mut self, node: TrinoShowCatalogs) -> TrinoShowCatalogs {
+        node
+    }
+    fn fold_trino_show_columns(&mut self, node: TrinoShowColumns) -> TrinoShowColumns {
+        super::fold_trino_show_columns(self, node)
+    }
+    fn fold_trino_show_functions(&mut self, node: TrinoShowFunctions) -> TrinoShowFunctions {
+        super::fold_trino_show_functions(self, node)
+    }
+    fn fold_trino_show_session(&mut self, node: TrinoShowSession) -> TrinoShowSession {
+        node
+    }
+    fn fold_trino_set_path(&mut self, node: TrinoSetPath) -> TrinoSetPath {
+        super::fold_trino_set_path(self, node)
+    }
+    fn fold_trino_set_time_zone(&mut self, node: TrinoSetTimeZone) -> TrinoSetTimeZone {
+        super::fold_trino_set_time_zone(self, node)
+    }
+    fn fold_trino_merge_case(&mut self, node: TrinoMergeCase) -> TrinoMergeCase {
+        super::fold_trino_merge_case(self, node)
+    }
+    fn fold_trino_merge_assignment(&mut self, node: TrinoMergeAssignment) -> TrinoMergeAssignment {
+        super::fold_trino_merge_assignment(self, node)
+    }
+    fn fold_trino_grantor(&mut self, node: TrinoGrantor) -> TrinoGrantor {
+        super::fold_trino_grantor(self, node)
+    }
+    fn fold_trino_grant_object(&mut self, node: TrinoGrantObject) -> TrinoGrantObject {
+        super::fold_trino_grant_object(self, node)
+    }
+    fn fold_trino_prepare(&mut self, node: TrinoPrepare) -> TrinoPrepare {
+        super::fold_trino_prepare(self, node)
+    }
+    fn fold_trino_deallocate(&mut self, node: TrinoDeallocate) -> TrinoDeallocate {
+        super::fold_trino_deallocate(self, node)
+    }
+    fn fold_trino_execute(&mut self, node: TrinoExecute) -> TrinoExecute {
+        super::fold_trino_execute(self, node)
+    }
+    fn fold_trino_execute_immediate(
+        &mut self,
+        node: TrinoExecuteImmediate,
+    ) -> TrinoExecuteImmediate {
+        super::fold_trino_execute_immediate(self, node)
+    }
+    fn fold_trino_describe_input(&mut self, node: TrinoDescribeInput) -> TrinoDescribeInput {
+        super::fold_trino_describe_input(self, node)
+    }
+    fn fold_trino_describe_output(&mut self, node: TrinoDescribeOutput) -> TrinoDescribeOutput {
+        super::fold_trino_describe_output(self, node)
+    }
+    fn fold_trino_create_function(&mut self, node: TrinoCreateFunction) -> TrinoCreateFunction {
+        super::fold_trino_create_function(self, node)
+    }
+    fn fold_trino_drop_function(&mut self, node: TrinoDropFunction) -> TrinoDropFunction {
+        super::fold_trino_drop_function(self, node)
+    }
+    fn fold_trino_create_branch(&mut self, node: TrinoCreateBranch) -> TrinoCreateBranch {
+        super::fold_trino_create_branch(self, node)
+    }
+    fn fold_trino_drop_branch(&mut self, node: TrinoDropBranch) -> TrinoDropBranch {
+        super::fold_trino_drop_branch(self, node)
+    }
+    fn fold_trino_fast_forward_branch(
+        &mut self,
+        node: TrinoFastForwardBranch,
+    ) -> TrinoFastForwardBranch {
+        super::fold_trino_fast_forward_branch(self, node)
+    }
+    fn fold_trino_show_branches(&mut self, node: TrinoShowBranches) -> TrinoShowBranches {
+        super::fold_trino_show_branches(self, node)
+    }
+    fn fold_trino_show_create(&mut self, node: TrinoShowCreate) -> TrinoShowCreate {
+        super::fold_trino_show_create(self, node)
+    }
+    fn fold_trino_show_stats(&mut self, node: TrinoShowStats) -> TrinoShowStats {
+        super::fold_trino_show_stats(self, node)
+    }
+    fn fold_trino_insert(&mut self, node: TrinoInsert) -> TrinoInsert {
+        super::fold_trino_insert(self, node)
+    }
+    fn fold_trino_delete(&mut self, node: TrinoDelete) -> TrinoDelete {
+        super::fold_trino_delete(self, node)
+    }
+    fn fold_trino_update(&mut self, node: TrinoUpdate) -> TrinoUpdate {
+        super::fold_trino_update(self, node)
+    }
+    fn fold_trino_update_assignment(
+        &mut self,
+        node: TrinoUpdateAssignment,
+    ) -> TrinoUpdateAssignment {
+        super::fold_trino_update_assignment(self, node)
+    }
+    fn fold_trino_rename_table(&mut self, node: TrinoRenameTable) -> TrinoRenameTable {
+        super::fold_trino_rename_table(self, node)
+    }
+    fn fold_trino_add_column(&mut self, node: TrinoAddColumn) -> TrinoAddColumn {
+        super::fold_trino_add_column(self, node)
+    }
+    fn fold_trino_rename_column(&mut self, node: TrinoRenameColumn) -> TrinoRenameColumn {
+        super::fold_trino_rename_column(self, node)
+    }
+    fn fold_trino_drop_column(&mut self, node: TrinoDropColumn) -> TrinoDropColumn {
+        super::fold_trino_drop_column(self, node)
+    }
+    fn fold_trino_set_default_value(&mut self, node: TrinoSetDefaultValue) -> TrinoSetDefaultValue {
+        super::fold_trino_set_default_value(self, node)
+    }
+    fn fold_trino_drop_default_value(
+        &mut self,
+        node: TrinoDropDefaultValue,
+    ) -> TrinoDropDefaultValue {
+        super::fold_trino_drop_default_value(self, node)
+    }
+    fn fold_trino_set_column_type(&mut self, node: TrinoSetColumnType) -> TrinoSetColumnType {
+        super::fold_trino_set_column_type(self, node)
+    }
+    fn fold_trino_drop_not_null_constraint(
+        &mut self,
+        node: TrinoDropNotNullConstraint,
+    ) -> TrinoDropNotNullConstraint {
+        super::fold_trino_drop_not_null_constraint(self, node)
+    }
+    fn fold_trino_table_execute(&mut self, node: TrinoTableExecute) -> TrinoTableExecute {
+        super::fold_trino_table_execute(self, node)
+    }
+    fn fold_trino_truncate_table(&mut self, node: TrinoTruncateTable) -> TrinoTruncateTable {
+        super::fold_trino_truncate_table(self, node)
+    }
+    fn fold_trino_comment(&mut self, node: TrinoComment) -> TrinoComment {
+        super::fold_trino_comment(self, node)
+    }
+    fn fold_trino_create_table_as_select(
+        &mut self,
+        node: TrinoCreateTableAsSelect,
+    ) -> TrinoCreateTableAsSelect {
+        super::fold_trino_create_table_as_select(self, node)
+    }
+    fn fold_trino_create_view(&mut self, node: TrinoCreateView) -> TrinoCreateView {
+        super::fold_trino_create_view(self, node)
+    }
+    fn fold_trino_create_materialized_view(
+        &mut self,
+        node: TrinoCreateMaterializedView,
+    ) -> TrinoCreateMaterializedView {
+        super::fold_trino_create_materialized_view(self, node)
+    }
+    fn fold_trino_drop_view(&mut self, node: TrinoDropView) -> TrinoDropView {
+        super::fold_trino_drop_view(self, node)
+    }
+    fn fold_trino_drop_materialized_view(
+        &mut self,
+        node: TrinoDropMaterializedView,
+    ) -> TrinoDropMaterializedView {
+        super::fold_trino_drop_materialized_view(self, node)
+    }
+    fn fold_trino_rename_view(&mut self, node: TrinoRenameView) -> TrinoRenameView {
+        super::fold_trino_rename_view(self, node)
+    }
+    fn fold_trino_rename_materialized_view(
+        &mut self,
+        node: TrinoRenameMaterializedView,
+    ) -> TrinoRenameMaterializedView {
+        super::fold_trino_rename_materialized_view(self, node)
+    }
+    fn fold_trino_refresh_view(&mut self, node: TrinoRefreshView) -> TrinoRefreshView {
+        super::fold_trino_refresh_view(self, node)
+    }
+    fn fold_trino_refresh_materialized_view(
+        &mut self,
+        node: TrinoRefreshMaterializedView,
+    ) -> TrinoRefreshMaterializedView {
+        super::fold_trino_refresh_materialized_view(self, node)
+    }
+    fn fold_trino_materialized_view_execute(
+        &mut self,
+        node: TrinoMaterializedViewExecute,
+    ) -> TrinoMaterializedViewExecute {
+        super::fold_trino_materialized_view_execute(self, node)
+    }
+    fn fold_trino_set_properties(&mut self, node: TrinoSetProperties) -> TrinoSetProperties {
+        super::fold_trino_set_properties(self, node)
+    }
+    fn fold_trino_create_table(&mut self, node: TrinoCreateTable) -> TrinoCreateTable {
+        super::fold_trino_create_table(self, node)
+    }
+    fn fold_trino_drop_table(&mut self, node: TrinoDropTable) -> TrinoDropTable {
+        super::fold_trino_drop_table(self, node)
+    }
+    fn fold_trino_analyze(&mut self, node: TrinoAnalyze) -> TrinoAnalyze {
+        super::fold_trino_analyze(self, node)
+    }
+    fn fold_trino_table_element(&mut self, node: TrinoTableElement) -> TrinoTableElement {
+        super::fold_trino_table_element(self, node)
+    }
+    fn fold_trino_column_definition(
+        &mut self,
+        node: TrinoColumnDefinition,
+    ) -> TrinoColumnDefinition {
+        super::fold_trino_column_definition(self, node)
+    }
+    fn fold_trino_like_clause(&mut self, node: TrinoLikeClause) -> TrinoLikeClause {
+        super::fold_trino_like_clause(self, node)
+    }
+    fn fold_trino_create_catalog(&mut self, node: TrinoCreateCatalog) -> TrinoCreateCatalog {
+        super::fold_trino_create_catalog(self, node)
+    }
+    fn fold_trino_drop_catalog(&mut self, node: TrinoDropCatalog) -> TrinoDropCatalog {
+        super::fold_trino_drop_catalog(self, node)
+    }
+    fn fold_trino_create_schema(&mut self, node: TrinoCreateSchema) -> TrinoCreateSchema {
+        super::fold_trino_create_schema(self, node)
+    }
+    fn fold_trino_drop_schema(&mut self, node: TrinoDropSchema) -> TrinoDropSchema {
+        super::fold_trino_drop_schema(self, node)
+    }
+    fn fold_trino_rename_schema(&mut self, node: TrinoRenameSchema) -> TrinoRenameSchema {
+        super::fold_trino_rename_schema(self, node)
+    }
+    fn fold_statement_property(&mut self, node: StatementProperty) -> StatementProperty {
+        super::fold_statement_property(self, node)
+    }
+    fn fold_statement_principal(&mut self, node: StatementPrincipal) -> StatementPrincipal {
+        super::fold_statement_principal(self, node)
+    }
+    fn fold_trino_statement(&mut self, node: TrinoStatement) -> TrinoStatement {
+        super::fold_trino_statement(self, node)
+    }
+    fn fold_trino_explain_option(&mut self, node: TrinoExplainOption) -> TrinoExplainOption {
+        node
+    }
+    fn fold_trino_transaction_mode(&mut self, node: TrinoTransactionMode) -> TrinoTransactionMode {
+        node
+    }
     fn fold_at_local(&mut self, node: AtLocal) -> AtLocal {
         super::fold_at_local(self, node)
     }

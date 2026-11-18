@@ -166,6 +166,40 @@ fn context<'a>(catalog: Option<&'a str>, database: &'a str) -> ViewRequestContex
     }
 }
 
+#[test]
+fn admitted_trino_view_preserves_the_actual_definition_and_comment() {
+    use crate::view::ViewCommand;
+    use novarocks_parser::{ast::TrinoStatement, trino_parser};
+
+    let source =
+        "CREATE VIEW IF NOT EXISTS ice.demo.v COMMENT 'visible' AS SELECT /* raw */  1 AS a";
+    let TrinoStatement::CreateView(statement) = trino_parser::parse_statement(source).unwrap()
+    else {
+        panic!("typed VIEW");
+    };
+    let engine = FakeViewEngine::default();
+    let command = ViewCommand::trino_create(source, &statement).unwrap();
+    let service = QueryViewService::new();
+    assert!(matches!(
+        service
+            .execute_command(&engine, command, context(Some("ice"), "base"))
+            .unwrap(),
+        ViewStatementResult::Ok
+    ));
+    let calls = engine.created.lock().unwrap();
+    let [create] = calls.as_slice() else {
+        panic!("one actual View command");
+    };
+    assert_eq!(
+        create.definition.raw_query_source,
+        "SELECT /* raw */  1 AS a"
+    );
+    assert_eq!(create.definition.resolution.default_database, "base");
+    assert_eq!(create.target.database, "demo");
+    assert_eq!(create.comment.as_deref(), Some("visible"));
+    assert!(create.if_not_exists && !create.or_replace);
+}
+
 trait ViewServiceTestExt {
     fn try_handle_statement(
         &self,

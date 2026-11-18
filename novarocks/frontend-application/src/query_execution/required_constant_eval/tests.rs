@@ -955,3 +955,135 @@ fn required_array_child_buffers_keep_original_result_custody_until_last_alias_ex
     assert_eq!(fixture.window.retained_payload_bytes(), 0);
     fixture.close();
 }
+
+#[test]
+fn table_procedure_timestamp_uses_the_original_required_constant_interpreter() {
+    use novarocks_parser::{Span, ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_query_application::{
+        session_error::QueryServiceError,
+        sql::{
+            table_procedure::{
+                BoundProcedureArgument, BoundProcedureValue, TableProcedureAbsoluteTimePort,
+            },
+            trino_table_command::bind_trino_table_execute,
+        },
+    };
+    use novarocks_spi::connector::{ConnectorProviderId, DdlPropertyValue};
+
+    struct NoLegacyTimestamp;
+    impl TableProcedureAbsoluteTimePort for NoLegacyTimestamp {
+        fn legacy_timestamp_literal_millis(
+            &mut self,
+            _: &str,
+            _: Span,
+        ) -> Result<i64, QueryServiceError> {
+            panic!("ordinary expressions cannot use the legacy literal parser")
+        }
+    }
+
+    let fixture = Fixture::new();
+    let control = SqlCompileControl::unbounded();
+    let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
+    let scope = fixture.root.owner.scope();
+    let provider = ConnectorProviderId::parse("iceberg").unwrap();
+    let mut port = crate::query_execution::ddl_properties::DdlPropertyConstantEvaluator {
+        catalog: &fixture.catalog,
+        current_database: "db",
+        functions: fixture.metadata.clone(),
+        sql_semantics: &semantics,
+        constant_policy: crate::application::test_constant_policy(),
+        control: &control,
+        interpreter: &fixture.interpreter,
+        scope: &scope,
+        window: &fixture.window,
+    };
+    for (input, expected) in [
+        (
+            "CASE WHEN TRUE THEN CAST('1970-01-01 00:00:07.123456' AS TIMESTAMP(6)) ELSE CAST(NULL AS TIMESTAMP(6)) END",
+            Some(7123),
+        ),
+        (
+            "CAST('1969-12-31 23:59:59.999999' AS TIMESTAMP(6))",
+            Some(-1),
+        ),
+        ("CAST(NULL AS TIMESTAMP(6))", None),
+        (
+            "CASE WHEN TRUE THEN CAST(NULL AS TIMESTAMP(6)) ELSE CAST('1970-01-01 00:00:07.123456' AS TIMESTAMP(6)) END",
+            None,
+        ),
+        ("IF(TRUE, NULL, NULL)", None),
+        ("COALESCE(NULL, NULL)", None),
+        ("1 + 2", None),
+        ("DATE '1970-01-01'", None),
+    ] {
+        let source =
+            format!("ALTER TABLE lake.ns.t EXECUTE expire_snapshots(older_than => {input})");
+        let TrinoStatement::TableExecute(statement) = parse_statement(&source).unwrap() else {
+            panic!("expected ALTER TABLE EXECUTE");
+        };
+        let result = bind_trino_table_execute(
+            &source,
+            &statement,
+            &provider,
+            &mut port,
+            &mut NoLegacyTimestamp,
+            &control,
+        );
+        match expected {
+            Some(millis) => {
+                let bound = result.unwrap_or_else(|cause| panic!("{input}: {cause}"));
+                let (_, value) = bound
+                    .arguments()
+                    .find(|(slot, _)| slot.name == "older_than")
+                    .unwrap();
+                assert!(matches!(value, BoundProcedureArgument::Present {
+                    value: BoundProcedureValue::Value(DdlPropertyValue::Bigint(actual)), ..
+                } if *actual == millis));
+            }
+            None => {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.user_error().unwrap().code().as_str(),
+                    "sql.admit.invalid_table_procedure_argument",
+                    "{input}: {error}",
+                );
+            }
+        }
+    }
+    drop(port);
+    let selected_error = fixture
+        .evaluate(
+            "IF(1 / 0 = 1, NULL, NULL)",
+            RequiredConstantTarget::Timestamp,
+        )
+        .unwrap_err();
+    let SqlConstantEvaluationError::Source(cause) = selected_error else {
+        panic!("expected the actual selected row error: {selected_error}");
+    };
+    let error = cause
+        .downcast_ref::<ExecutionFailure>()
+        .expect("original selected execution failure");
+    let novarocks_execution::runtime::task::ExecutionFailureCause::RequiredRow(selected) =
+        error.cause()
+    else {
+        panic!("expected the original selected row: {error}");
+    };
+    assert_eq!(selected.error().selected_ordinal(), 0);
+    assert_eq!(selected.batch_row(), 0);
+    drop(cause);
+
+    let inactive = fixture
+        .evaluate(
+            "IF(FALSE AND (1 / 0 = 1), NULL, NULL)",
+            RequiredConstantTarget::Timestamp,
+        )
+        .unwrap();
+    assert_eq!(inactive.value_type().data_type(), &DataType::Null);
+    assert!(
+        inactive
+            .is_null_observed(CompilePhase::Validate, &control)
+            .unwrap()
+    );
+    drop(inactive);
+    fixture.close();
+}
