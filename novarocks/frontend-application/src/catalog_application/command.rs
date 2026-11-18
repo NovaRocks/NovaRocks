@@ -118,6 +118,39 @@ impl CatalogCommandExecutor {
         }
     }
 
+    /// Resolve only the semantic target and retain its actual control
+    /// generation. This performs no table read or mutation dispatch.
+    pub(crate) fn acquire_table_property_binding(
+        &self,
+        name: &ObjectName,
+        request_context: &novarocks_query_application::admitted_query_context::RequestContext,
+    ) -> Result<novarocks_query_application::api::CatalogTablePropertyBinding, CommandError> {
+        let target = crate::catalog_application::resolver::resolve_table_target(
+            self,
+            name,
+            request_context.session().current_catalog(),
+            request_context.session().current_database(),
+        )?;
+        let instance_id = ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|cause| CommandError::from(cause.to_string()))?;
+        let planning = self
+            .connector_control
+            .acquire_current(&instance_id)
+            .map_err(|cause| {
+                CommandError::from_failure_cause(
+                    novarocks_failure_contract::SharedFailureCause::new(cause),
+                )
+            })?;
+        novarocks_query_application::api::CatalogTablePropertyBinding::try_new(
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(target.namespace),
+                table: Arc::from(target.table),
+            },
+            planning,
+        )
+    }
+
     /// Executes a complete catalog command lowered by Query Application.
     ///
     /// This role-local adapter deliberately accepts no parser AST and never
@@ -1006,6 +1039,71 @@ mod tests {
             })
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn table_property_binding_keeps_original_generation_until_derived_mutation_exit() {
+        use novarocks_query_application::api::CatalogTablePropertyBinding;
+        let (resolver, original, operation, context) = schema_alter_fixture(None, false);
+        let spi::ConnectorCatalogMutationOperation::AlterSchema { table, .. } = &operation else {
+            panic!("original fixture table");
+        };
+        let releases = Arc::new(AtomicUsize::new(0));
+        let release = releases.clone();
+        let planning =
+            spi::ConnectorControlPlanningPin::new(resolver.bindings[0].clone(), move || {
+                release.fetch_add(1, Ordering::SeqCst);
+            });
+        let mut foreign = table.clone();
+        foreign.instance_id = spi::ConnectorInstanceId::parse("foreign").unwrap();
+        let error = CatalogTablePropertyBinding::try_new(foreign, planning.clone())
+            .err()
+            .expect("foreign instance");
+        assert_eq!(
+            error
+                .failure_cause()
+                .unwrap()
+                .downcast_ref::<spi::ConnectorError>()
+                .unwrap()
+                .kind(),
+            spi::ConnectorErrorKind::Internal
+        );
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+
+        let binding = CatalogTablePropertyBinding::try_new(table.clone(), planning).unwrap();
+        assert_eq!(binding.table(), table);
+        assert!(Arc::ptr_eq(
+            binding.planning().binding(),
+            &resolver.bindings[0]
+        ));
+        assert_eq!(
+            binding.mutation().control_runtime_id(),
+            binding.planning().control_runtime_id()
+        );
+        let operation_id = spi::ConnectorMutationOperationId::new();
+        binding
+            .mutation()
+            .admit_operation(operation_id, operation.clone(), context.clone())
+            .unwrap();
+        schema_alter_metadata_guard(binding.planning(), &operation, &context).unwrap();
+        assert_eq!(
+            *original.calls.lock().unwrap(),
+            [(1, "admit"), (1, "metadata guard")]
+        );
+
+        let (bound_table, planning, mutation) = binding.into_parts();
+        assert_eq!(&bound_table, table);
+        drop(planning);
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        mutation
+            .admit_operation(operation_id, operation, context)
+            .unwrap();
+        assert_eq!(
+            *original.calls.lock().unwrap(),
+            [(1, "admit"), (1, "metadata guard"), (1, "admit")]
+        );
+        drop(mutation);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
     #[test]

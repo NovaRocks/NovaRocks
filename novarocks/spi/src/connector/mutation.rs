@@ -1089,6 +1089,29 @@ pub struct ConnectorCatalogMutationReconcileRequest {
 pub trait ConnectorCatalogMutation: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ProviderBindingEpoch;
+    /// Pure initial route facts from this original mutation generation.
+    /// They grant no I/O, credentials, concurrency, or publication authority.
+    fn initial_dependencies(&self) -> Result<Vec<super::SharedDependency>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector catalog mutation has no original initial dependency facts",
+        ))
+    }
+    /// Temporary legacy preparation, using real ordered rendered inputs and
+    /// the original operation control. Remove this entry and its DTOs at P12.
+    fn prepare_legacy_create_table_property_inputs(
+        &self,
+        _input: &[(Arc<str>, Arc<str>)],
+        _control: &dyn super::ConnectorOperationControl,
+    ) -> Result<Vec<super::LegacyPreparedTableProperty>, super::LegacyTablePropertyPreparationFailure>
+    {
+        Err(super::LegacyTablePropertyPreparationFailure::whole(
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector catalog mutation has no legacy table property preparation",
+            ),
+        ))
+    }
     /// Pure table/storage declarations from this exact control generation.
     /// Absence of this capability is explicit; an empty list is not a default.
     fn table_property_declarations(
@@ -1143,6 +1166,30 @@ pub trait ConnectorCatalogMutation: Send + Sync {
             Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 "connector catalog mutation does not support asynchronous execution",
+            ))
+        })
+    }
+    /// Reconcile through the original asynchronous Provider boundary.
+    /// Missing capability is explicit; this never falls back to sync or execute.
+    fn reconcile_async<'a>(
+        &'a self,
+        _request: ConnectorCatalogMutationReconcileRequest,
+        _receiving: &'a ConnectorCatalogMutationReceiving,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
+                        ConnectorError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector catalog mutation does not support asynchronous reconciliation",
             ))
         })
     }
@@ -1209,6 +1256,23 @@ impl ConnectorCatalogMutationSession {
     }
     pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
         self.control_runtime_id
+    }
+
+    /// Pure route facts from the same original generation lease.
+    pub fn initial_dependencies(&self) -> Result<Vec<super::SharedDependency>, ConnectorError> {
+        self.mutation.initial_dependencies()
+    }
+
+    /// Forward actual legacy input slots and control to this lease's provider.
+    /// Remove with the legacy preparation entry at P12.
+    pub fn prepare_legacy_create_table_property_inputs(
+        &self,
+        input: &[(Arc<str>, Arc<str>)],
+        control: &dyn super::ConnectorOperationControl,
+    ) -> Result<Vec<super::LegacyPreparedTableProperty>, super::LegacyTablePropertyPreparationFailure>
+    {
+        self.mutation
+            .prepare_legacy_create_table_property_inputs(input, control)
     }
 
     /// Borrow declarations through this session's original generation lease.
@@ -2042,6 +2106,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
+            lease.initial_dependencies().unwrap_err().kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        let failure = lease
+            .prepare_legacy_create_table_property_inputs(&[], &context)
+            .unwrap_err();
+        assert_eq!(failure.input_index, None);
+        assert_eq!(failure.error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(
             lease.table_property_declarations().unwrap_err().kind(),
             ConnectorErrorKind::Unsupported
         );
@@ -2075,6 +2148,7 @@ mod tests {
         struct PropertyCapability {
             descriptor: ConnectorInstanceDescriptor,
             epoch: ProviderBindingEpoch,
+            raw_input: Vec<(Arc<str>, Arc<str>)>,
         }
         impl ConnectorCatalogMutation for PropertyCapability {
             fn descriptor(&self) -> &ConnectorInstanceDescriptor {
@@ -2082,6 +2156,35 @@ mod tests {
             }
             fn incarnation(&self) -> ProviderBindingEpoch {
                 self.epoch
+            }
+            fn initial_dependencies(
+                &self,
+            ) -> Result<Vec<crate::connector::SharedDependency>, ConnectorError> {
+                Ok(vec![crate::connector::SharedDependency::LocalHost])
+            }
+            fn prepare_legacy_create_table_property_inputs(
+                &self,
+                input: &[(Arc<str>, Arc<str>)],
+                control: &dyn crate::connector::ConnectorOperationControl,
+            ) -> Result<
+                Vec<crate::connector::LegacyPreparedTableProperty>,
+                crate::connector::LegacyTablePropertyPreparationFailure,
+            > {
+                control
+                    .check_active()
+                    .map_err(crate::connector::LegacyTablePropertyPreparationFailure::whole)?;
+                assert_eq!(input.len(), self.raw_input.len());
+                for (actual, original) in input.iter().zip(&self.raw_input) {
+                    assert!(Arc::ptr_eq(&actual.0, &original.0));
+                    assert!(Arc::ptr_eq(&actual.1, &original.1));
+                }
+                Ok(vec![crate::connector::LegacyPreparedTableProperty {
+                    input_index: 1,
+                    value: crate::connector::LegacyPreparedTablePropertyValue::Extra {
+                        key: input[1].0.to_string(),
+                        value: input[1].1.to_string(),
+                    },
+                }])
             }
             fn table_property_declarations(
                 &self,
@@ -2124,6 +2227,17 @@ mod tests {
             provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
             instance_id: ConnectorInstanceId::parse("analytics").unwrap(),
         };
+        let raw_input: Vec<(Arc<str>, Arc<str>)> = vec![
+            (Arc::from("first.raw"), Arc::from("source zero")),
+            (Arc::from("MiXeD.Second"), Arc::from("source one")),
+        ];
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            crate::connector::ConnectorStopOwner::new().view(),
+            1024,
+            4096,
+        )
+        .unwrap();
         let epoch = ProviderBindingEpoch::from_bytes([9; 16]);
         let runtime = ConnectorControlRuntimeId::new();
         let released = Arc::new(AtomicBool::new(false));
@@ -2135,6 +2249,7 @@ mod tests {
             Arc::new(PropertyCapability {
                 descriptor: descriptor.clone(),
                 epoch,
+                raw_input: raw_input.clone(),
             }),
             move || {
                 release.store(true, Ordering::SeqCst);
@@ -2144,6 +2259,23 @@ mod tests {
         let retained = lease.clone();
         assert_eq!(lease.descriptor(), &descriptor);
         assert_eq!(lease.control_runtime_id(), runtime);
+        assert_eq!(
+            lease.initial_dependencies().unwrap(),
+            vec![crate::connector::SharedDependency::LocalHost]
+        );
+        let expected_preparation = vec![crate::connector::LegacyPreparedTableProperty {
+            input_index: 1,
+            value: crate::connector::LegacyPreparedTablePropertyValue::Extra {
+                key: "MiXeD.Second".into(),
+                value: "source one".into(),
+            },
+        }];
+        assert_eq!(
+            lease
+                .prepare_legacy_create_table_property_inputs(&raw_input, &context)
+                .unwrap(),
+            expected_preparation
+        );
         let properties = lease.table_property_declarations().unwrap();
         assert_eq!(properties.len(), 1);
         assert_eq!(properties[0].name(), "test_limit");
@@ -2167,6 +2299,16 @@ mod tests {
         drop(lease);
         assert!(!released.load(Ordering::SeqCst));
         retained.table_property_declarations().unwrap();
+        assert_eq!(
+            retained.initial_dependencies().unwrap(),
+            vec![crate::connector::SharedDependency::LocalHost]
+        );
+        assert_eq!(
+            retained
+                .prepare_legacy_create_table_property_inputs(&raw_input, &context)
+                .unwrap(),
+            expected_preparation
+        );
         drop(retained);
         assert!(released.load(Ordering::SeqCst));
     }
@@ -3246,4 +3388,268 @@ mod tests {
             assert!(receiving.observation().provider_exited());
         }
     }
+    struct AsyncReconcileCapability {
+        original: Arc<AsyncCatalogCapability>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl super::ConnectorCatalogMutation for AsyncReconcileCapability {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.original.descriptor
+        }
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.original.epoch
+        }
+        fn execute(
+            &self,
+            _: super::ConnectorCatalogMutationRequest,
+        ) -> Result<
+            super::ExternalMutationOutcome<super::ConnectorCatalogMutationReceipt>,
+            super::ConnectorError,
+        > {
+            panic!("reconciliation must never execute the mutation again");
+        }
+        fn reconcile(
+            &self,
+            _: super::ConnectorCatalogMutationReconcileRequest,
+        ) -> Result<
+            super::ExternalMutationOutcome<super::ConnectorCatalogMutationReceipt>,
+            super::ConnectorError,
+        > {
+            panic!("asynchronous reconciliation has no synchronous fallback");
+        }
+        fn reconcile_async<'a>(
+            &'a self,
+            request: super::ConnectorCatalogMutationReconcileRequest,
+            receiving: &'a super::ConnectorCatalogMutationReceiving,
+        ) -> super::CatalogMutationFuture<'a> {
+            assert_eq!(
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            let original = self
+                .original
+                .request
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            assert_eq!(request.evidence.operation_id(), original.operation_id);
+            assert_eq!(request.evidence.operation_kind(), original.operation.kind());
+            Box::pin(AsyncCatalogChild {
+                capability: &self.original,
+                request: original,
+                receiving,
+                needed_recorded: false,
+            })
+        }
+    }
+    fn async_reconciliation_fixture(
+        original: AsyncCatalogCapability,
+    ) -> (
+        Arc<AsyncCatalogCapability>,
+        Arc<AsyncReconcileCapability>,
+        super::ConnectorCatalogMutationSession,
+        super::ConnectorCatalogMutationRequest,
+    ) {
+        let original = Arc::new(original);
+        let capability = Arc::new(AsyncReconcileCapability {
+            original: original.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let lease = super::ConnectorCatalogMutationSession::new(
+            original.descriptor.clone(),
+            crate::connector::ConnectorControlRuntimeId::new(),
+            original.epoch,
+            capability.clone(),
+            || {},
+        )
+        .unwrap();
+        let request = async_request(&lease);
+        *original.request.lock().unwrap() = Some(request.clone());
+        (original, capability, lease, request)
+    }
+    fn async_reconciliation_request(
+        original: &super::ConnectorCatalogMutationRequest,
+    ) -> super::ConnectorCatalogMutationReconcileRequest {
+        super::ConnectorCatalogMutationReconcileRequest {
+            evidence: super::ExternalMutationEvidence::try_new(
+                1,
+                ConnectorInstanceDescriptor {
+                    provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                    instance_id: original.target.instance_id.clone(),
+                },
+                original.target.incarnation,
+                original.operation_id,
+                original.operation.kind(),
+                Bytes::from_static(b"original-reconciliation-evidence"),
+            )
+            .unwrap(),
+            context: original.context.clone(),
+        }
+    }
+    #[test]
+    fn async_reconciliation_rejects_foreign_operation_before_calling_the_provider() {
+        use super::*;
+        let (original, capability, lease, request) =
+            async_reconciliation_fixture(async_capability());
+        for (id, kind) in [
+            (
+                ConnectorMutationOperationId::new(),
+                request.operation.kind(),
+            ),
+            (request.operation_id, "create-table"),
+        ] {
+            let mut recovery = async_reconciliation_request(&request);
+            recovery.evidence = ExternalMutationEvidence::try_new(
+                1,
+                original.descriptor.clone(),
+                original.epoch,
+                id,
+                kind,
+                Bytes::from_static(b"foreign-evidence"),
+            )
+            .unwrap();
+            let receiving = ConnectorCatalogMutationReceiving::new();
+            let mut future = Box::pin(lease.reconcile_async_in(&request, recovery, &receiving));
+            assert!(
+                matches!(poll_async(future.as_mut()),std::task::Poll::Ready(Err(e)) if e.kind()==ConnectorErrorKind::InvalidRequest)
+            );
+            let observed = receiving.observation();
+            assert_eq!(observed.operation_id(), Some(request.operation_id));
+            assert!(!observed.dispatched());
+            assert!(!observed.provider_exited());
+            assert!(observed.raw_outcome().is_none());
+        }
+        assert_eq!(
+            capability.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(original.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut foreign = request.clone();
+        foreign.target.incarnation = ProviderBindingEpoch::from_bytes([8; 16]);
+        let receiving = ConnectorCatalogMutationReceiving::new();
+        let mut future = Box::pin(lease.reconcile_async_in(
+            &foreign,
+            async_reconciliation_request(&request),
+            &receiving,
+        ));
+        assert!(
+            matches!(poll_async(future.as_mut()), std::task::Poll::Ready(Err(e)) if e.kind() == ConnectorErrorKind::InvalidRequest)
+        );
+        assert!(!receiving.observation().dispatched());
+        assert_eq!(
+            capability.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        // A provider implementing only the old synchronous surface retains
+        // the original explicit asynchronous-capability refusal.
+        let sync_only = async_lease(&original);
+        let same = async_request(&sync_only);
+        let receiving = ConnectorCatalogMutationReceiving::new();
+        let mut future = Box::pin(sync_only.reconcile_async_in(
+            &same,
+            async_reconciliation_request(&same),
+            &receiving,
+        ));
+        assert!(
+            matches!(poll_async(future.as_mut()),std::task::Poll::Ready(Err(e)) if e.kind()==ConnectorErrorKind::Unsupported)
+        );
+        let observed = receiving.observation();
+        assert!(observed.provider_exited());
+        assert!(
+            matches!(observed.raw_outcome(),Some(Err(e)) if e.kind()==ConnectorErrorKind::Unsupported)
+        );
+    }
+    #[test]
+    fn async_reconciliation_cancelled_borrow_keeps_original_child_until_actual_exit() {
+        use super::*;
+        let (original, capability, lease, request) =
+            async_reconciliation_fixture(async_capability());
+        let receiving = ConnectorCatalogMutationReceiving::new();
+        let mut future = Box::pin(lease.reconcile_async_in(
+            &request,
+            async_reconciliation_request(&request),
+            &receiving,
+        ));
+        assert!(poll_async(future.as_mut()).is_pending());
+        {
+            let mut borrowed = Box::pin(async { future.as_mut().await });
+            assert!(poll_async(borrowed.as_mut()).is_pending());
+        }
+        assert!(receiving.observation().raw_outcome().is_none());
+        assert!(!receiving.observation().provider_exited());
+        assert_eq!(original.drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        original.gate.open();
+        assert!(matches!(
+            poll_async(future.as_mut()),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        let observed = receiving.observation();
+        assert!(observed.provider_exited());
+        assert!(!receiving.foreign_exit_unproven());
+        let Some(Ok(ExternalMutationOutcome::KnownCommitted { receipt, .. })) =
+            observed.validated_outcome()
+        else {
+            panic!("expected the actual validated recovery result")
+        };
+        assert_eq!(receipt.operation_id(), request.operation_id);
+        assert_eq!(receipt.operation_kind(), request.operation.kind());
+        assert_eq!(receipt.descriptor(), lease.descriptor());
+        assert_eq!(
+            capability.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(original.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(original.drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn async_reconciliation_retains_raw_facts_before_invalid_receipt_or_child_drop_panic() {
+        use super::*;
+        for drop_panic in [false, true] {
+            let mut source = async_capability();
+            source.drop_panic = drop_panic;
+            source.wrong_receipt = !drop_panic;
+            source.gate.open();
+            let (original, capability, lease, request) = async_reconciliation_fixture(source);
+            let receiving = ConnectorCatalogMutationReceiving::new();
+            let mut future = Box::pin(lease.reconcile_async_in(
+                &request,
+                async_reconciliation_request(&request),
+                &receiving,
+            ));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                poll_async(future.as_mut())
+            }));
+            let observed = receiving.observation();
+            assert!(matches!(
+                observed.raw_outcome(),
+                Some(Ok(ExternalMutationOutcome::KnownCommitted { .. }))
+            ));
+            if drop_panic {
+                let panic = result.expect_err("original child Drop panic must propagate");
+                assert_eq!(
+                    panic.downcast_ref::<&'static str>(),
+                    Some(&"original catalog child Drop panic")
+                );
+                assert_eq!(observed.validation(), Some(&Ok(())));
+                assert!(!observed.provider_exited());
+                assert!(receiving.foreign_exit_unproven());
+            } else {
+                assert!(
+                    matches!(result.unwrap(),std::task::Poll::Ready(Err(e)) if e.kind()==ConnectorErrorKind::InvalidRequest)
+                );
+                assert!(matches!(observed.validation(), Some(Err(_))));
+                assert!(observed.provider_exited());
+            }
+            assert_eq!(
+                capability.calls.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(original.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(original.drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
 }
+
+mod async_reconciliation;

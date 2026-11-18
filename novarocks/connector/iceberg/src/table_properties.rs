@@ -20,6 +20,12 @@
 //! Declarations do not grant a setter or publication capability. Dedicated
 //! format-version, partition-spec and location changes retain their owners.
 
+mod legacy;
+pub use legacy::{
+    LegacyPreparedTableProperty, LegacyPreparedTablePropertyValue,
+    LegacyTablePropertyPreparationFailure, prepare_legacy_create_table_property_inputs,
+};
+
 mod create;
 pub(crate) use create::{PreparedCreateTableProperties, prepare_create_table_properties};
 
@@ -135,11 +141,9 @@ pub fn extra_property_sets(
     let mut seen = HashSet::new();
     let mut pairs: Vec<(Arc<str>, Arc<str>)> = Vec::with_capacity(entries.len());
     for (key, value) in entries {
-        let key = key.to_lowercase();
+        let key = normalized_extra_property_key(key);
         if !seen.insert(key.clone()) {
-            return Err(invalid(format!(
-                "duplicate normalized extra property: {key}"
-            )));
+            return Err(duplicate_extra_property(&key));
         }
         let value = value
             .as_ref()
@@ -171,11 +175,9 @@ pub fn extra_property_unsets(
     let mut seen = HashSet::new();
     let mut changes = Vec::with_capacity(keys.len());
     for key in keys {
-        let key = key.to_lowercase();
+        let key = normalized_extra_property_key(key);
         if !seen.insert(key.clone()) {
-            return Err(invalid(format!(
-                "duplicate normalized extra property: {key}"
-            )));
+            return Err(duplicate_extra_property(&key));
         }
         // The original mutation author permits removing an already stored
         // variant key; only Set calls the variant capability guard.
@@ -186,6 +188,13 @@ pub fn extra_property_unsets(
         });
     }
     Ok(changes)
+}
+
+fn normalized_extra_property_key(key: &str) -> String {
+    key.to_lowercase()
+}
+fn duplicate_extra_property(key: &str) -> ConnectorError {
+    invalid(format!("duplicate normalized extra property: {key}"))
 }
 
 fn reject_extra_property_key(

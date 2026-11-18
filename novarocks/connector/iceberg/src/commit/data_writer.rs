@@ -88,23 +88,55 @@ fn row_group_write_batch_rows(max_row_group_bytes: usize) -> usize {
     (max_row_group_bytes / ROW_GROUP_WRITE_BATCH_DIVISOR).clamp(1, MAX_WRITE_BATCH_ROWS)
 }
 
+#[derive(Debug)]
+pub(crate) enum ParquetRowGroupSizeParseError {
+    Integer(std::num::ParseIntError),
+    Zero,
+}
+impl std::fmt::Display for ParquetRowGroupSizeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Iceberg table property {PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY} must be a positive byte count"
+        )?;
+        if let Self::Integer(error) = self {
+            write!(f, ": {error}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for ParquetRowGroupSizeParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Integer(error) => Some(error),
+            Self::Zero => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ParquetRowGroupSizeParseError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::FailureProjection;
+        novarocks_spi::connector::ConnectorErrorKind::InvalidRequest.failure_fact()
+    }
+}
+pub(crate) fn parse_parquet_row_group_size_property(
+    value: &str,
+) -> Result<usize, ParquetRowGroupSizeParseError> {
+    let bytes = value
+        .parse::<usize>()
+        .map_err(ParquetRowGroupSizeParseError::Integer)?;
+    if bytes == 0 {
+        return Err(ParquetRowGroupSizeParseError::Zero);
+    }
+    Ok(bytes)
+}
 pub(crate) fn parquet_row_group_size_bytes(
     table_properties: &HashMap<String, String>,
 ) -> Result<Option<usize>, String> {
     table_properties
         .get(PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY)
         .map(|value| {
-            let max_row_group_bytes = value.parse::<usize>().map_err(|error| {
-            format!(
-                "Iceberg table property {PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY} must be a positive byte count: {error}"
-            )
-        })?;
-            if max_row_group_bytes == 0 {
-                return Err(format!(
-                    "Iceberg table property {PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY} must be a positive byte count"
-                ));
-            }
-            Ok(max_row_group_bytes)
+            parse_parquet_row_group_size_property(value).map_err(|error| error.to_string())
         })
         .transpose()
 }

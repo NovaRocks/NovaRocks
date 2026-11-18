@@ -135,22 +135,31 @@ pub fn normalize_data_size_property(
         _ => return Err(invalid(property, DataSizeFailureReason::ExpectedVarchar)),
     };
     let bytes = parse(property, text, control)?;
-    if property == DataSizeProperty::ParquetWriterRowGroupSize {
-        let reason = if bytes == 0 {
-            Some(DataSizeRangeFailure::ZeroParquetRowGroup)
-        } else if bytes > 2 * (1_i64 << 30) {
-            Some(DataSizeRangeFailure::ParquetRowGroupAboveTwoGiB)
-        } else if usize::try_from(bytes).is_err() {
-            Some(DataSizeRangeFailure::ParquetRowGroupOutsideUsize)
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            return Err(invalid(property, DataSizeFailureReason::Range(reason)));
-        }
+    if let Some(reason) = data_size_range_failure(property, bytes) {
+        return Err(invalid(property, DataSizeFailureReason::Range(reason)));
     }
     control.check_active()?;
     Ok(Some(NormalizedDataSize { property, bytes }))
+}
+
+/// The declared byte range, shared by typed input and legacy representability.
+/// Nonnegative bytes are already established by each original parse author.
+pub(super) fn data_size_range_failure(
+    property: DataSizeProperty,
+    bytes: i64,
+) -> Option<DataSizeRangeFailure> {
+    if property != DataSizeProperty::ParquetWriterRowGroupSize {
+        return None;
+    }
+    if bytes == 0 {
+        Some(DataSizeRangeFailure::ZeroParquetRowGroup)
+    } else if bytes > 2 * (1_i64 << 30) {
+        Some(DataSizeRangeFailure::ParquetRowGroupAboveTwoGiB)
+    } else if usize::try_from(bytes).is_err() {
+        Some(DataSizeRangeFailure::ParquetRowGroupOutsideUsize)
+    } else {
+        None
+    }
 }
 
 fn parse(

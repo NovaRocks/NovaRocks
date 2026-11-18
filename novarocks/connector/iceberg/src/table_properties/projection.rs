@@ -141,22 +141,23 @@ fn raw_key(name: &str) -> Option<&'static str> {
     })
 }
 
+pub(super) fn normalize_declared_format(format: &str) -> Result<String, ConnectorError> {
+    if !format.eq_ignore_ascii_case("PARQUET") {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            format!("Iceberg format '{format}' is not supported"),
+        ));
+    }
+    Ok(DataFileFormat::Parquet.to_string())
+}
+
 fn raw_value(
     name: &str,
     value: &DdlPropertyValue,
     control: &dyn ConnectorOperationControl,
 ) -> Result<String, ConnectorError> {
     match (name, value) {
-        ("format", DdlPropertyValue::Varchar(format)) => {
-            if !format.eq_ignore_ascii_case("PARQUET") {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Unsupported,
-                    format!("Iceberg format '{format}' is not supported"),
-                ));
-            }
-            // Use the original provider format renderer, including its case.
-            Ok(DataFileFormat::Parquet.to_string())
-        }
+        ("format", DdlPropertyValue::Varchar(format)) => normalize_declared_format(format),
         ("max_commit_retry", DdlPropertyValue::Integer(value)) if *value >= 0 => {
             Ok(value.to_string())
         }

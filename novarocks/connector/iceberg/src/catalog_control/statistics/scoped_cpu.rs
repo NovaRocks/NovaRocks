@@ -41,6 +41,7 @@ mod scoped_read;
 #[path = "scoped_snapshot.rs"]
 pub(crate) mod scoped_snapshot;
 enum CpuBody {
+    CatalogCreate(Box<crate::catalog_control::catalog_mutation::create_cpu::Work>),
     ViewListing(Box<crate::catalog_control::views::async_listing::Work>),
     Compaction(crate::catalog_control::metadata_maintenance::observation::CompactionWork),
     PreparedSource(Box<scoped_prepared_source::Work>),
@@ -124,6 +125,27 @@ impl Drop for BodyLoan<'_> {
     }
 }
 impl IcebergMetadataCpuOriginal {
+    pub(in crate::catalog_control) fn catalog_create(
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        incarnation: novarocks_spi::connector::ProviderBindingEpoch,
+        work: crate::catalog_control::catalog_mutation::create_cpu::Work,
+    ) -> Arc<Self> {
+        Self::new(
+            descriptor,
+            incarnation,
+            CpuBody::CatalogCreate(Box::new(work)),
+        )
+    }
+    pub(in crate::catalog_control) fn take_catalog_create_output(
+        &self,
+    ) -> Result<crate::catalog_control::catalog_mutation::create_cpu::Output, ConnectorError> {
+        let mut loan = BodyLoan::take(self);
+        let CpuBody::CatalogCreate(work) = &mut loan.body.as_mut().unwrap().body else {
+            return Err(invalid("CREATE CPU source differs"));
+        };
+        work.take_output()
+    }
+
     pub(crate) fn view_listing(
         provider: IcebergMetadata,
         request: novarocks_spi::connector::ConnectorListViewsRequest,
@@ -358,6 +380,7 @@ impl IcebergMetadataCpuOriginal {
         assert!(!original.started, "one original Statistics CPU execution");
         original.started = true;
         match &mut original.body {
+            CpuBody::CatalogCreate(work) => work.run(),
             CpuBody::ViewListing(work) => work.run(),
             CpuBody::Compaction(work) => work.run(),
             CpuBody::PreparedSource(body) => body.run(),
@@ -700,6 +723,7 @@ impl novarocks_spi::connector::ProviderMetadataCpuSource for IcebergMetadataCpuO
                 matches!(
                     &body.as_ref().expect("same metadata source").body,
                     CpuBody::MetadataBinding { .. }
+                        | CpuBody::CatalogCreate(_)
                         | CpuBody::ViewListing(_)
                         | CpuBody::PreparedSource(_)
                         | CpuBody::PreparedSplit(_)
@@ -730,6 +754,9 @@ pub(crate) fn metadata_cpu_source_bytes() -> Result<usize, ConnectorError> {
     // Read and prepared-source bodies are mutually exclusive; the nested
     // snapshot Source owns neither parent packet.
     let parent_body = std::mem::size_of::<scoped_read::ReadBody>()
+        .max(std::mem::size_of::<
+            crate::catalog_control::catalog_mutation::create_cpu::Work,
+        >())
         .max(std::mem::size_of::<scoped_prepared_source::Work>())
         .max(std::mem::size_of::<scoped_prepared_split::Work>())
         .max(std::mem::size_of::<

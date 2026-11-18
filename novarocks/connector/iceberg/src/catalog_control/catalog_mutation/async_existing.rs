@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Direct async leaves for the original property and table-drop publications.
+//! Direct async leaves for the original table create, property and drop publications.
 
 use super::*;
 use crate::catalog::publication_dispatch::PreparationFailure;
@@ -28,9 +28,9 @@ use novarocks_spi::connector::{
 use std::{future::Future, pin::Pin, sync::OnceLock};
 
 type Outcome = ExternalMutationOutcome<ConnectorCatalogMutationReceipt>;
-struct Original {
-    provider: IcebergMetadata,
-    request: ConnectorCatalogMutationRequest,
+pub(in crate::catalog_control) struct Original {
+    pub(super) provider: IcebergMetadata,
+    pub(super) request: ConnectorCatalogMutationRequest,
     journal: PublicationJournal<ConnectorCatalogMutationReceipt>,
     table: OnceLock<OriginalTable>,
 }
@@ -68,13 +68,16 @@ pub(super) fn execute_async<'a>(
             return Ok(known_uncommitted(error));
         }
         match &original.request.operation {
+            ConnectorCatalogMutationOperation::CreateTable { .. } => {
+                create_table(&original, receiving).await
+            }
             ConnectorCatalogMutationOperation::DropTable { .. } => {
                 drop_table(&original, receiving).await
             }
             ConnectorCatalogMutationOperation::AlterProperties { .. } => {
                 properties(&original, receiving).await
             }
-            _ => unreachable!("only the two closed leaves construct this original"),
+            _ => unreachable!("only the three closed leaves construct this original"),
         }
     })
 }
@@ -136,6 +139,89 @@ async fn finish(
     } = &outcome
     {
         receiving.record_needed_committed(*effect, receipt, finalization)?;
+    }
+    Ok(outcome)
+}
+
+async fn create_table(
+    original: &Arc<Original>,
+    receiving: &ConnectorCatalogMutationReceiving,
+) -> Result<Outcome, ConnectorError> {
+    use crate::catalog::catalog_request::CatalogResponseDocument;
+    let provider = &original.provider;
+    let request = &original.request;
+    let ConnectorCatalogMutationOperation::CreateTable { table, policy, .. } = &request.operation
+    else {
+        unreachable!("only a create request enters create preparation")
+    };
+    let reads = AsyncCreateCatalogReads {
+        original: Arc::clone(original),
+    };
+    let prepared = prepare_ordinary_create(provider, request, *policy, &reads).await;
+    let (frozen, external, receipts) = match prepared {
+        Err(CreatePreparationFailure::Provider(PreparationFailure(failure))) => {
+            return Ok(Outcome::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Complete,
+            });
+        }
+        Err(CreatePreparationFailure::Source(error)) => return Err(error),
+        Ok(PreparedCreate::NoOp(seed)) => {
+            receiving.record_needed_committed(
+                ExternalMutationEffect::NoOp,
+                &seed,
+                &ExternalMutationFinalization::Complete,
+            )?;
+            return Ok(Outcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                receipt: seed,
+                finalization: ExternalMutationFinalization::Complete,
+                cleanup: ExternalMutationFinalization::Complete,
+            });
+        }
+        Ok(PreparedCreate::Mutation(prepared)) => *prepared,
+    };
+    if let Err(error) = original.journal.prepare_catalog_with_receipts(
+        external,
+        receipts,
+        frozen.targets(),
+        frozen.request_bytes().to_vec(),
+        frozen.attribution().clone(),
+        request.context.clone(),
+    ) {
+        return Ok(known_uncommitted(invalid(error.to_string())));
+    }
+    let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+    let policy = catalog.evidence_policy();
+    let read_binding = provider.runtime().resources().planning_binding().clone();
+    let pending = original
+        .journal
+        .publish_once_to_finalization(
+            request.context.clone(),
+            policy,
+            move |descriptor, generation, context| async move {
+                catalog
+                    .prepare_catalog_publication(
+                        frozen,
+                        descriptor,
+                        generation,
+                        context,
+                        CatalogResponseDocument::default(),
+                        read_binding,
+                    )
+                    .await
+            },
+        )
+        .await;
+    let outcome = match pending {
+        Ok(pending) => finish(original, receiving, pending).await?,
+        Err(error) => original.call_error(error),
+    };
+    if matches!(outcome, Outcome::KnownCommitted { .. }) {
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
     }
     Ok(outcome)
 }

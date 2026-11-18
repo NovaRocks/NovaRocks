@@ -24,6 +24,8 @@
 
 use std::{fmt, sync::Arc};
 
+use super::ConnectorError;
+
 /// The finite property types required by the DDL contract, not a general SQL
 /// type system. Nested arbitrary arrays, maps, or rows are not introduced here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +89,44 @@ impl DdlPropertyValue {
 pub enum DdlPropertyChange {
     Set(DdlPropertyValue),
     Reset(DdlPropertyValue),
+}
+
+/// Temporary facts from the original legacy property preparation owner.
+/// Actual input ordinals carry no final AST or command origin. Remove at P12.
+#[derive(Debug, PartialEq)]
+pub struct LegacyPreparedTableProperty {
+    pub input_index: usize,
+    pub value: LegacyPreparedTablePropertyValue,
+}
+#[derive(Debug, PartialEq)]
+pub enum LegacyPreparedTablePropertyValue {
+    Declared {
+        name: &'static str,
+        value: DdlPropertyValue,
+    },
+    Extra {
+        key: String,
+        value: String,
+    },
+}
+#[derive(Debug)]
+pub struct LegacyTablePropertyPreparationFailure {
+    pub input_index: Option<usize>,
+    pub error: ConnectorError,
+}
+impl LegacyTablePropertyPreparationFailure {
+    pub fn whole(error: ConnectorError) -> Self {
+        Self {
+            input_index: None,
+            error,
+        }
+    }
+    pub fn at(input_index: usize, error: ConnectorError) -> Self {
+        Self {
+            input_index: Some(input_index),
+            error,
+        }
+    }
 }
 
 /// Provider/application-authored metadata; this is not a session projector.

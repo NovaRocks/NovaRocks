@@ -151,6 +151,15 @@ impl ProductCommandRouter {
             .prepare_statement_action(command, request_context, command_context)
     }
 
+    pub fn acquire_table_property_binding(
+        &self,
+        name: &novarocks_sql::semantic::ObjectName,
+        request_context: &RequestContext,
+    ) -> Result<crate::api::CatalogTablePropertyBinding, crate::api::CommandError> {
+        self.catalog
+            .acquire_table_property_binding(name, request_context)
+    }
+
     pub fn prepare_catalog_statement_action(
         &self,
         command: CatalogSqlCommand,

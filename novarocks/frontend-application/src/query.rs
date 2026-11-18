@@ -245,6 +245,15 @@ struct FrontendCatalogCommandConsumer {
 }
 
 impl CatalogCommandConsumer for FrontendCatalogCommandConsumer {
+    fn acquire_table_property_binding(
+        &self,
+        name: &novarocks_sql::semantic::ObjectName,
+        request_context: &RequestContext,
+    ) -> Result<novarocks_query_application::api::CatalogTablePropertyBinding, CommandError> {
+        self.catalog
+            .acquire_table_property_binding(name, request_context)
+    }
+
     fn prepare_statement_action(
         &self,
         command: novarocks_sql::semantic::CatalogSqlCommand,

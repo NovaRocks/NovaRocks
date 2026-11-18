@@ -2150,11 +2150,15 @@ fn position_contribution_group(
     Ok((group, writer_input))
 }
 
+pub(crate) fn collect_on_write_property_enabled(value: &str) -> bool {
+    !value.eq_ignore_ascii_case("false")
+}
+
 fn collect_on_write_enabled(metadata: &TableMetadata) -> bool {
     metadata
         .properties()
         .get(crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY)
-        .is_none_or(|value| !value.eq_ignore_ascii_case("false"))
+        .is_none_or(|value| collect_on_write_property_enabled(value))
 }
 
 fn write_statistics_contract(

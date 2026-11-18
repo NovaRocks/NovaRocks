@@ -18,7 +18,10 @@
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use novarocks_parser::ast::MaterializedViewStatement;
-use novarocks_spi::connector::ConnectorRequestContext;
+use novarocks_spi::connector::{
+    ConnectorCatalogMutationSession, ConnectorControlPlanningPin, ConnectorRequestContext,
+    ConnectorTableIdentity,
+};
 use novarocks_sql::semantic::{CatalogSqlCommand, MaintenanceSqlCommand, StatisticsSqlCommand};
 use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkError, WorkScope};
 
@@ -374,7 +377,77 @@ impl Error for CommandError {
     }
 }
 
+/// The original table target and its retained preparation capabilities.
+/// This is not a final semantic command or an I/O/publication authorization.
+/// The mutation lease is derived once from this exact planning pin; neither
+/// callers nor later consumers may supply a different current generation.
+pub struct CatalogTablePropertyBinding {
+    table: ConnectorTableIdentity,
+    planning: ConnectorControlPlanningPin,
+    mutation: ConnectorCatalogMutationSession,
+}
+
+impl CatalogTablePropertyBinding {
+    pub fn try_new(
+        table: ConnectorTableIdentity,
+        planning: ConnectorControlPlanningPin,
+    ) -> Result<Self, CommandError> {
+        if table.instance_id != planning.binding().descriptor().instance_id {
+            return Err(CommandError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::Internal,
+                        "Table property target does not match its original planning instance",
+                    ),
+                ),
+            ));
+        }
+        let mutation = planning.derive_mutation_lease().map_err(|cause| {
+            CommandError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(
+                cause,
+            ))
+        })?;
+        Ok(Self {
+            table,
+            planning,
+            mutation,
+        })
+    }
+
+    pub fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
+    }
+    pub fn planning(&self) -> &ConnectorControlPlanningPin {
+        &self.planning
+    }
+    pub fn mutation(&self) -> &ConnectorCatalogMutationSession {
+        &self.mutation
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        ConnectorTableIdentity,
+        ConnectorControlPlanningPin,
+        ConnectorCatalogMutationSession,
+    ) {
+        (self.table, self.planning, self.mutation)
+    }
+}
+
 pub trait CatalogCommandConsumer: Send + Sync + 'static {
+    /// Acquire the actual target and one retained provider generation for
+    /// property preparation under this immutable admitted request.
+    fn acquire_table_property_binding(
+        &self,
+        _name: &novarocks_sql::semantic::ObjectName,
+        _request_context: &RequestContext,
+    ) -> Result<CatalogTablePropertyBinding, CommandError> {
+        Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "catalog consumer does not provide table property bindings",
+        ))
+    }
+
     fn prepare_statement_action(
         &self,
         _command: CatalogSqlCommand,
