@@ -25,11 +25,13 @@ use std::sync::Arc;
 
 use arrow::array::Int64Array;
 use arrow::record_batch::RecordBatch;
+use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
-    ConstantPools, ExprKind, FragmentId, NodeId, NullOrdering, SortDirection, SortExpr, SortMode,
-    TopNPhase, TopNSequenceId,
+    ConstantPools, FragmentId, NodeId, NullOrdering, SortDirection, SortExpr, SortMode, TopNPhase,
+    TopNSequenceId,
 };
+use novarocks_type_contract::EvaluationDemand;
 
 use super::family_fixture::{cell, compile, int64, int64_rows, package, run, try_compile, values};
 use crate::exec::chunk::{Chunk, ChunkSchema};
@@ -61,7 +63,7 @@ enum Shape {
     TopN { limit: u64, offset: u64 },
 }
 
-fn sort_expr(expr: novarocks_physical_plan::ExprId, key: Key) -> SortExpr {
+fn sort_expr(expr: RootOrdinal, key: Key) -> SortExpr {
     SortExpr {
         expr,
         direction: if key.ascending {
@@ -98,9 +100,16 @@ fn program(keys: &[Key], shape: Shape) -> Arc<LocalProgram> {
         .map(|key| {
             let ty = int64(key.column == 0);
             let expr = builder
-                .add_expression(sort, ty, ExprKind::Value(columns[key.column]))
+                .unit(sort)
+                .unwrap()
+                .add(None, ty, ExprKind::Value(columns[key.column]))
                 .unwrap();
-            sort_expr(expr, *key)
+            let root = builder
+                .unit(sort)
+                .unwrap()
+                .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+                .unwrap();
+            sort_expr(root, *key)
         })
         .collect::<Box<[_]>>();
     match shape {
@@ -423,7 +432,14 @@ fn partial_topn_runs_as_its_instance_prefix() {
         .collect::<Vec<_>>();
     let columns = values(&mut builder, source, &[int64(true), int64(false)], &rows);
     let key = builder
-        .add_expression(topn, int64(true), ExprKind::Value(columns[0]))
+        .unit(topn)
+        .unwrap()
+        .add(None, int64(true), ExprKind::Value(columns[0]))
+        .unwrap();
+    let key = builder
+        .unit(topn)
+        .unwrap()
+        .root(key, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     builder
         .add_top_n(

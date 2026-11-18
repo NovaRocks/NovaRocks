@@ -229,13 +229,22 @@ fn assert_writer_selections(
     functions: &EngineFunctionCatalog,
 ) {
     let control = SqlCompileControl::unbounded();
-    let semantics = novarocks_sql::compiler::author_fragment_package_semantics(
-        source,
-        super::test_support::constant_policy(),
-        &control,
-    )
-    .unwrap();
-    assert_eq!(semantics.len(), source.plan().fragments().len());
+    source
+        .require_statement_constant_policy(super::test_support::constant_policy())
+        .unwrap();
+    let authored = source
+        .plan()
+        .fragments()
+        .values()
+        .map(|fragment| {
+            fragment
+                .calls()
+                .validate_fragment(fragment, &control)
+                .unwrap();
+            fragment
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(authored.len(), source.plan().fragments().len());
     for fragment in source.plan().fragments().values() {
         for node in fragment.nodes().values() {
             let (partial, calls) = match &node.kind {
@@ -255,12 +264,7 @@ fn assert_writer_selections(
                         call: u32::try_from(ordinal).unwrap(),
                     }
                 };
-                let request = fragment
-                    .call_requests()
-                    .get(novarocks_physical_plan::PhysicalCallDefinition::Relational(
-                        site,
-                    ))
-                    .unwrap();
+                let request = fragment.call_requests().get(site).unwrap();
                 let arguments = request
                     .arguments
                     .iter()
@@ -594,24 +598,33 @@ fn wide_collect_true_actual_theta_plan_freezes_with_production_limits() {
         }
     }
     assert_eq!((writers, finishes), (1, 1));
-    let semantics = novarocks_sql::compiler::author_fragment_package_semantics(
-        &owner,
-        FROZEN_CONSTANT_POLICY,
-        &control,
-    )
-    .unwrap_or_else(|e| panic!("collect1024 phase=package-semantics: {e:#?}"));
-    assert_eq!(semantics.len(), owner.plan().fragments().len());
-    let uses = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.expression_uses.clone()))
-        .collect();
-    let calls = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.calls.clone()))
-        .collect();
-    let pruning = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.pruning.clone()))
+    owner
+        .require_statement_constant_policy(FROZEN_CONSTANT_POLICY)
+        .unwrap_or_else(|e| panic!("collect1024 phase=statement-policy: {e:#?}"));
+    let authored = owner
+        .plan()
+        .fragments()
+        .values()
+        .map(|fragment| {
+            fragment
+                .calls()
+                .validate_fragment(fragment, &control)
+                .unwrap();
+            fragment
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(authored.len(), owner.plan().fragments().len());
+    let pruning = owner
+        .plan()
+        .fragments()
+        .keys()
+        .map(|&id| {
+            (
+                id,
+                novarocks_physical_plan::FrozenFragmentPruning::try_new(id, Vec::new(), &control)
+                    .unwrap(),
+            )
+        })
         .collect();
     let admissions = owner
         .plan()
@@ -624,8 +637,6 @@ fn wide_collect_true_actual_theta_plan_freezes_with_production_limits() {
         owner.plan(),
         &BTreeMap::new(),
         &BTreeMap::from([(ordinal, recipe.clone())]),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &control,

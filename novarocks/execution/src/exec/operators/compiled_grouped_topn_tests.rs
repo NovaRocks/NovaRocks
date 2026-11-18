@@ -39,12 +39,13 @@ use arrow::array::{
     TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{ConstantPool, PureKernelAbi};
 use novarocks_physical_plan::{
     AggregateCall, AggregateCallId, AggregateGrouping, AggregatePhase, AggregateSequenceId,
-    ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentId, FragmentSink, NodeId,
-    NodeKind, NullOrdering, OrderingKey, OutputPort, PhysicalNode, PlanVersionId, ResultField,
-    ResultPort, SortDirection, SortExpr, TopNPhase, TopNReduction, TopNSequenceId, ValueOrigin,
+    ConstantPoolId, ConstantPools, ConstantReference, FragmentId, FragmentSink, NodeId, NodeKind,
+    NullOrdering, OrderingKey, OutputPort, PhysicalNode, PlanVersionId, ResultField, ResultPort,
+    SortDirection, SortExpr, TopNPhase, TopNReduction, TopNSequenceId, ValueOrigin,
 };
 use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
 use std::collections::BTreeMap;
@@ -175,7 +176,7 @@ type ScanResidualAuthor = fn(
     &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     NodeId,
     &[novarocks_physical_plan::ValueId],
-) -> Box<[novarocks_physical_plan::ExprId]>;
+) -> Box<[novarocks_expression_contract::RootOrdinal]>;
 fn fixture_with_source_residual(
     key_types: &[FunctionValueType],
     rows: &[Vec<novarocks_functions::ConstantValue>],
@@ -313,14 +314,36 @@ fn fixture_with_source_parameters(
         AggregateGrouping::Partial,
     );
     let grouped = builder.reserve_node_id().unwrap();
-    let keys = key_types
+    let key_definitions = key_types
         .iter()
         .zip(&columns)
         .map(|(ty, value)| {
             builder
-                .add_expression(grouped, ty.clone(), ExprKind::Value(*value))
+                .unit(grouped)
+                .unwrap()
+                .add(None, ty.clone(), ExprKind::Value(*value))
                 .unwrap()
         })
+        .collect::<Vec<_>>();
+    let mut key_occurrence = |definition| {
+        builder
+            .unit(grouped)
+            .unwrap()
+            .root(
+                definition,
+                novarocks_type_contract::EvaluationDemand::Value,
+                novarocks_expression_contract::RootScope::Port(0),
+            )
+            .unwrap()
+    };
+    let group_by = key_definitions
+        .iter()
+        .zip(&columns)
+        .map(|(&definition, &column)| (key_occurrence(definition), column))
+        .collect();
+    let order_roots = ranking
+        .iter()
+        .map(|&(ordinal, _, _)| key_occurrence(key_definitions[ordinal]))
         .collect::<Vec<_>>();
     let mut outputs = columns[..groups].to_vec();
     let mut calls = Vec::new();
@@ -329,13 +352,26 @@ fn fixture_with_source_parameters(
         let phase = AggregatePhase::Intermediate {
             sequence: sequence(ordinal),
         };
-        let argument = builder
-            .add_expression(
-                grouped,
-                bound.intermediate_type(),
-                ExprKind::Value(partial_output[ordinal + groups]),
-            )
-            .unwrap();
+        let argument = {
+            let definition = builder
+                .unit(grouped)
+                .unwrap()
+                .add(
+                    None,
+                    bound.intermediate_type(),
+                    ExprKind::Value(partial_output[ordinal + groups]),
+                )
+                .unwrap();
+            builder
+                .unit(grouped)
+                .unwrap()
+                .root(
+                    definition,
+                    novarocks_type_contract::EvaluationDemand::Value,
+                    novarocks_expression_contract::RootScope::Port(0),
+                )
+                .unwrap()
+        };
         let output = builder
             .add_value(
                 bound.output_type(phase),
@@ -378,6 +414,7 @@ fn fixture_with_source_parameters(
         .collect();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: grouped,
             inputs: Box::from([partial]),
             required_inputs: Box::from([required]),
@@ -389,8 +426,9 @@ fn fixture_with_source_parameters(
             kind: NodeKind::TopN {
                 order_by: ranking
                     .iter()
-                    .map(|&(ordinal, asc, first)| SortExpr {
-                        expr: keys[ordinal],
+                    .zip(order_roots)
+                    .map(|(&(_, asc, first), root)| SortExpr {
+                        expr: root,
                         direction: direction(asc),
                         null_ordering: null_ordering(first),
                     })
@@ -401,7 +439,7 @@ fn fixture_with_source_parameters(
                     sequence: TopNSequenceId::new(42),
                 },
                 reduction: TopNReduction::GroupedStates {
-                    group_by: keys.iter().copied().zip(columns.iter().copied()).collect(),
+                    group_by,
                     calls: calls.into_boxed_slice(),
                     comparator:
                         novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1,
@@ -433,13 +471,26 @@ fn fixture_with_source_parameters(
     let order_by = ranking
         .iter()
         .map(|&(ordinal, asc, first)| {
-            let key = builder
-                .add_expression(
-                    topn,
-                    key_types[ordinal].clone(),
-                    ExprKind::Value(columns[ordinal]),
-                )
-                .unwrap();
+            let key = {
+                let definition = builder
+                    .unit(topn)
+                    .unwrap()
+                    .add(
+                        None,
+                        key_types[ordinal].clone(),
+                        ExprKind::Value(columns[ordinal]),
+                    )
+                    .unwrap();
+                builder
+                    .unit(topn)
+                    .unwrap()
+                    .root(
+                        definition,
+                        novarocks_type_contract::EvaluationDemand::Value,
+                        novarocks_expression_contract::RootScope::Port(0),
+                    )
+                    .unwrap()
+            };
             SortExpr {
                 expr: key,
                 direction: direction(asc),
@@ -464,7 +515,14 @@ fn fixture_with_source_parameters(
             .attach_runtime_filter(ordered_tests::FILTER)
             .unwrap();
     }
-    let definition = finish(builder, topn, FragmentSink::Result, 2);
+    let definition = finish(
+        builder,
+        topn,
+        FragmentSink::Result,
+        2,
+        &catalog,
+        &parameters,
+    );
     let output = definition.nodes()[&topn].output.clone();
     let fields = output
         .columns
@@ -511,7 +569,7 @@ fn fixture_with_source_parameters(
     }
     let plan = plan.finish_observed(&FixtureControl).unwrap();
     let program = if ordered_scan {
-        let package = packages_with_reads(&plan, &catalog, &reads)
+        let package = packages_with_reads(&plan, &reads)
             .remove(&FragmentId::new(1))
             .unwrap();
         compile_with_providers(
@@ -522,9 +580,7 @@ fn fixture_with_source_parameters(
             &crate::runtime::task::scan::compiled_fixture::providers(),
         )
     } else {
-        let package = packages(&plan, &catalog)
-            .remove(&FragmentId::new(1))
-            .unwrap();
+        let package = packages(&plan).remove(&FragmentId::new(1)).unwrap();
         compile(package, &catalog, 2, true)
     };
     let mut source = None;
@@ -680,9 +736,22 @@ fn declared_values(
                         }),
                         None => builder.constant_kind(&types[column], literal),
                     };
-                    builder
-                        .add_expression(source, types[column].clone(), kind)
-                        .unwrap()
+                    {
+                        let definition = builder
+                            .unit(source)
+                            .unwrap()
+                            .add(None, types[column].clone(), kind)
+                            .unwrap();
+                        builder
+                            .unit(source)
+                            .unwrap()
+                            .root(
+                                definition,
+                                novarocks_type_contract::EvaluationDemand::Value,
+                                novarocks_expression_contract::RootScope::AllPorts,
+                            )
+                            .unwrap()
+                    }
                 })
                 .collect::<Box<[_]>>()
         })

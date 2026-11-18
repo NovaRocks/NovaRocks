@@ -18,9 +18,9 @@
 use super::*;
 use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::ArrayRef;
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::UnaryOperator;
 use novarocks_functions::EvaluatedArgument;
-use novarocks_local_program::{ProgramUseRef, StaticExprKind};
-use novarocks_physical_plan::UnaryOperator;
 
 #[derive(Clone, Copy)]
 enum UnaryCase {
@@ -34,8 +34,10 @@ enum UnaryCase {
 
 fn unary(builder: &mut FragmentBuilder, child: ExprId, negated: bool) -> ExprId {
     builder
-        .add_expression(
-            NodeId::new(0),
+        .unit(NodeId::new(0))
+        .unwrap()
+        .add(
+            None,
             FunctionValueType::new(DataType::Boolean, false),
             ExprKind::IsNull {
                 expr: child,
@@ -65,8 +67,10 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(
-                input,
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -74,14 +78,19 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
                 ),
             )
             .unwrap();
+        let root = builder
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *id,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr { node: input, root },
             })
             .unwrap();
-        items.push((expr, *id));
+        items.push((root, *id));
     }
     builder
         .add_project(
@@ -96,15 +105,19 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
     } else {
         Some(
             builder
-                .add_expression(output, bool_type.clone(), ExprKind::Value(flag))
+                .unit(output)
+                .unwrap()
+                .add(None, bool_type.clone(), ExprKind::Value(flag))
                 .unwrap(),
         )
     };
     let mut authors = BTreeMap::new();
     let expression = if matches!(case, UnaryCase::NotFilter) {
         let actual_true = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 (FunctionValueType::new(DataType::Boolean, false)).clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -117,8 +130,10 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
             )
             .unwrap();
         let conjunction = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 bool_type.clone(),
                 ExprKind::Conjunction {
                     args: Box::from([flag_expr.unwrap(), actual_true]),
@@ -126,8 +141,10 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
             )
             .unwrap();
         builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 bool_type.clone(),
                 ExprKind::Unary {
                     op: UnaryOperator::Not,
@@ -137,11 +154,15 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
             .unwrap()
     } else {
         let value = builder
-            .add_expression(output, decimal.clone(), ExprKind::Value(decimal_value))
+            .unit(output)
+            .unwrap()
+            .add(None, decimal.clone(), ExprKind::Value(decimal_value))
             .unwrap();
         let digits = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 integer.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -167,8 +188,10 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
         match case {
             UnaryCase::IsNull | UnaryCase::IsNotNull => test,
             UnaryCase::PureAnd => builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     bool_type.clone(),
                     ExprKind::Conjunction {
                         args: Box::from([test, flag_expr.unwrap()]),
@@ -176,8 +199,10 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
                 )
                 .unwrap(),
             UnaryCase::PureOr => builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     bool_type.clone(),
                     ExprKind::Disjunction {
                         args: Box::from([test, flag_expr.unwrap()]),
@@ -186,8 +211,10 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
                 .unwrap(),
             UnaryCase::StateBoundary => {
                 let seed = builder
-                    .add_expression(
-                        output,
+                    .unit(output)
+                    .unwrap()
+                    .add(
+                        None,
                         integer.clone(),
                         checked_constants::kind(
                             &mut source_pools,
@@ -208,8 +235,10 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
                 );
                 let rand_null = unary(&mut builder, rand, false);
                 builder
-                    .add_expression(
-                        output,
+                    .unit(output)
+                    .unwrap()
+                    .add(
+                        None,
                         bool_type.clone(),
                         ExprKind::Disjunction {
                             args: Box::from([test, rand_null, flag_expr.unwrap()]),
@@ -220,6 +249,19 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
             UnaryCase::NotFilter => unreachable!(),
         }
     };
+    let expression = builder
+        .unit(output)
+        .unwrap()
+        .root(
+            expression,
+            if matches!(case, UnaryCase::NotFilter) {
+                EvaluationDemand::TruthOnly
+            } else {
+                EvaluationDemand::Value
+            },
+            RootScope::Port(0),
+        )
+        .unwrap();
     let mut result_fields = vec![];
     if matches!(case, UnaryCase::NotFilter) {
         builder
@@ -245,7 +287,7 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
                 result_type.clone(),
                 ValueOrigin::Expr {
                     node: output,
-                    expr: expression,
+                    root: expression,
                 },
             )
             .unwrap();
@@ -265,38 +307,30 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
             ty: result_type,
         });
     }
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: result_fields.into_boxed_slice(),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
+    compile_checked_fragment(&functions, builder, output, &authors, result, source_pools)
 }
-fn unary_root(case: UnaryCase) -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(2),
-        role: if matches!(case, UnaryCase::NotFilter) {
-            ProgramNodeExpressionRole::FilterPredicate { predicate: 0 }
-        } else {
-            ProgramNodeExpressionRole::ProjectOutput { expression: 0 }
-        },
+fn unary_root(program: &LocalProgram, case: UnaryCase) -> ProgramRootRef {
+    let kind = program.graph().nodes()[program.graph().root().index()].kind();
+    match (case, kind) {
+        (UnaryCase::NotFilter, ProgramNodeKind::Filter { predicates, .. }) => predicates[0],
+        (_, ProgramNodeKind::Project { exprs, .. }) => exprs[0],
+        _ => panic!("actual unary root owner"),
     }
 }
 fn evaluator(program: &Arc<LocalProgram>, case: UnaryCase) -> CompiledExpressionInstance {
-    CompiledExpressionInstance::try_new(program.clone(), unary_root(case), &Control).unwrap()
+    let reference = unary_root(program, case);
+    CompiledExpressionInstance::try_new(
+        program.unit(reference.unit).unwrap().clone(),
+        reference.root,
+        &Control,
+    )
+    .unwrap()
 }
 fn unary_batch(
     program: &LocalProgram,
@@ -463,15 +497,12 @@ fn actual_rand_null_test_state_boundary_promotes_pending_and_skips_failed_parent
     // Only original rows 2 and 6 reached the same real constant-seed instance.
     // Original row 4 decided TRUE before RAND; row 8 failed at its boundary.
     assert_eq!(next_actual_rand(&mut evaluator), SEED_42[2]);
-    let resolved = program.checked().channels().expressions().resolved_calls();
-    let snapshot = resolved.snapshot();
-    let flow = &snapshot.flows()[&unary_root(UnaryCase::StateBoundary).arena()];
-    let root_use = snapshot.bindings()[&unary_root(UnaryCase::StateBoundary)];
+    let reference = unary_root(&program, UnaryCase::StateBoundary);
+    let unit = program.unit(reference.unit).unwrap();
+    let flow = unit.control_flow();
+    let root_use = unit.root(reference.root).unwrap().use_id;
     let rand_null = flow.uses()[&root_use].arguments[1];
-    let summary = evaluator.effects[&ProgramUseRef {
-        arena: unary_root(UnaryCase::StateBoundary).arena(),
-        use_id: rand_null,
-    }];
+    let summary = evaluator.effects[&rand_null];
     assert!(
         summary
             .for_use(flow.uses()[&rand_null].context)
@@ -513,18 +544,17 @@ fn all_pending_round_errors_stop_before_rand_instantiation_and_do_not_advance_ex
 #[test]
 fn actual_not_filter_requires_value_child_and_keeps_nullable_truth_semantics() {
     let program = unary_program(UnaryCase::NotFilter);
-    let root = unary_root(UnaryCase::NotFilter);
-    let resolved = program.checked().channels().expressions().resolved_calls();
-    let snapshot = resolved.snapshot();
-    let flow = &snapshot.flows()[&root.arena()];
-    let parent = &flow.uses()[&snapshot.bindings()[&root]];
+    let reference = unary_root(&program, UnaryCase::NotFilter);
+    let unit = program.unit(reference.unit).unwrap();
+    let flow = unit.control_flow();
+    let parent = &flow.uses()[&unit.root(reference.root).unwrap().use_id];
     assert_eq!(parent.context.demand, EvaluationDemand::TruthOnly);
     assert_eq!(parent.control, ControlShape::Eager);
     assert_eq!(
         flow.uses()[&parent.arguments[0]].context.demand,
         EvaluationDemand::Value
     );
-    let definitions = &snapshot.roots().arenas()[&root.arena()];
+    let definitions = unit.definitions();
     assert!(matches!(
         definitions.node(parent.definition).unwrap().kind(),
         StaticExprKind::Not(_)

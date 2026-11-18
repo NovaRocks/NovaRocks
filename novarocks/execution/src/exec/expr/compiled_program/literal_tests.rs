@@ -27,7 +27,7 @@ use arrow::{
     datatypes::{IntervalUnit, TimeUnit},
     record_batch::RecordBatchOptions,
 };
-use novarocks_local_program::{ProgramChannelLayoutRole, ProgramChannelSite};
+use novarocks_local_program::{ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId};
 use novarocks_type_contract::ValueLogicalType;
 
 fn literal_program(cases: &[LiteralCase]) -> Arc<LocalProgram> {
@@ -46,11 +46,18 @@ fn literal_program(cases: &[LiteralCase]) -> Arc<LocalProgram> {
         let ty = case.value.value_type();
         let value = ValueId::new(900 + u32::try_from(ordinal).unwrap());
         let expr = builder
-            .add_expression(
-                project,
+            .unit(project)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 checked_source(&mut constants, &case.value),
             )
+            .unwrap();
+        let root = builder
+            .unit(project)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -58,11 +65,11 @@ fn literal_program(cases: &[LiteralCase]) -> Arc<LocalProgram> {
                 ty: ty.clone(),
                 origin: ValueOrigin::Expr {
                     node: project,
-                    expr,
+                    root,
                 },
             })
             .unwrap();
-        assignments.push((expr, value));
+        assignments.push((root, value));
         output.push(value);
         result_fields.push(ResultField {
             domain: crate::test_result_domain::result_value_domain(ty),
@@ -80,6 +87,17 @@ fn literal_program(cases: &[LiteralCase]) -> Arc<LocalProgram> {
             output.into_boxed_slice(),
         )
         .unwrap();
+    let ports = builder.node_ports(project).unwrap();
+    let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
+    let unit = builder
+        .take_unit_builder(project)
+        .unwrap()
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    builder.install_unit(project, Arc::new(unit)).unwrap();
+    work.finish().unwrap();
     let fragment = builder
         .finish_definition(
             project,
@@ -92,36 +110,6 @@ fn literal_program(cases: &[LiteralCase]) -> Arc<LocalProgram> {
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let actual_roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let mut next = 700;
-    let mut uses = Vec::new();
-    let roots = actual_roots
-        .sites()
-        .iter()
-        .map(|(site, root)| {
-            (
-                *site,
-                invocation(&fragment, root.expr, root.demand, &mut next, &mut uses),
-            )
-        })
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: EvaluationRegionId::new(u32::MAX),
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let expression_uses =
-        PhysicalRootUses::try_new(&fragment, flow, roots, &FixtureControl).unwrap();
-    // There are no function calls: retain an explicitly checked empty call table.
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &FixtureControl).unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
@@ -137,8 +125,7 @@ fn literal_program(cases: &[LiteralCase]) -> Arc<LocalProgram> {
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,
-                expression_uses,
-                calls,
+                statement_constant_policy: options(1).constants,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::try_new([]).unwrap(),
@@ -218,7 +205,6 @@ fn check_literal_roots(cases: Vec<LiteralCase>) {
         let ordinal = u32::try_from(ordinal).unwrap();
         assert_eq!(
             program
-                .checked()
                 .channels()
                 .channel_type(ProgramChannelSite::Layout {
                     node: ProgramNodeId::new(1),
@@ -228,14 +214,9 @@ fn check_literal_roots(cases: Vec<LiteralCase>) {
                 .unwrap(),
             ty
         );
-        let root = ProgramExpressionRootSite::Node {
-            node: ProgramNodeId::new(1),
-            role: ProgramNodeExpressionRole::ProjectOutput {
-                expression: ordinal,
-            },
-        };
+        let (unit, root) = project_expression(&program, 1, ordinal);
         let mut evaluator =
-            CompiledExpressionInstance::try_new(program.clone(), root, &RuntimeControl).unwrap();
+            CompiledExpressionInstance::try_new(unit, root, &RuntimeControl).unwrap();
         for _ in 0..2 {
             let result = evaluator
                 .evaluate(&batch, selection, &RuntimeControl)

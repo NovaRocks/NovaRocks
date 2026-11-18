@@ -229,6 +229,7 @@ pub(crate) fn validate_core<'a, H>(
     }
     let mut root_definitions = BTreeSet::new();
     let mut globally_reachable = BTreeSet::new();
+    let mut visible_by_scope = BTreeMap::new();
     for (ordinal, root) in roots.iter().enumerate() {
         let root_id = RootOrdinal::new(
             u32::try_from(ordinal).map_err(|_| CompileControlError::ResourceExhausted)?,
@@ -251,34 +252,42 @@ pub(crate) fn validate_core<'a, H>(
                 "TruthOnly root is not Boolean",
             ));
         }
-        let mut visible = BTreeMap::new();
-        let selected: &[ExprPort] = match root.scope {
+        let (scope, selected) = match root.scope {
             RootScope::Port(index) => {
-                std::slice::from_ref(ports.get(index as usize).ok_or_else(|| {
+                let port = ports.get(index as usize).ok_or_else(|| {
                     ValidationFailure::invalid(
                         Some(root.definition),
                         Some(root_id),
                         "root input port is absent",
                     )
-                })?)
+                })?;
+                (Some(index), std::slice::from_ref(port))
             }
-            RootScope::AllPorts => ports,
+            RootScope::AllPorts => (None, ports),
         };
-        for port in selected {
-            for (value, ty) in &port.values {
-                work.flush()?;
-                let previous = creation.map_insert(&mut visible, *value, ty, work)?;
-                work.step()?;
-                work.flush()?;
-                if previous.is_some() {
-                    return Err(ValidationFailure::invalid(
-                        Some(root.definition),
-                        Some(root_id),
-                        "root scope contains an ambiguous value",
-                    ));
+        // Build each borrowed index at its first root so an ambiguous scope
+        // still reports that root's original definition and ordinal.
+        if !visible_by_scope.contains_key(&scope) {
+            let mut visible = BTreeMap::new();
+            for port in selected {
+                for (value, ty) in &port.values {
+                    work.flush()?;
+                    let previous = creation.map_insert(&mut visible, *value, ty, work)?;
+                    work.step()?;
+                    work.flush()?;
+                    if previous.is_some() {
+                        return Err(ValidationFailure::invalid(
+                            Some(root.definition),
+                            Some(root_id),
+                            "root scope contains an ambiguous value",
+                        ));
+                    }
                 }
             }
+            creation.map_insert(&mut visible_by_scope, scope, visible, work)?;
+            work.step()?;
         }
+        let visible = &visible_by_scope[&scope];
         work.flush()?;
         creation.set_insert(&mut root_definitions, root.definition, work)?;
         work.step()?;

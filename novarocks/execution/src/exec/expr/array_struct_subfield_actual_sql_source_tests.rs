@@ -16,9 +16,9 @@
 // under the License.
 //! Original corpus source author and permanent complete-compiler expectation.
 use arrow::datatypes::DataType;
-use novarocks_physical_plan::{
-    ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
-};
+use novarocks_expression_contract::ExprKind;
+use novarocks_physical_plan::FunctionArgumentType;
+use novarocks_physical_plan::StaticFunctionArgument;
 
 const CORPUS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -71,7 +71,8 @@ fn array_struct_subfield_actual_required_sql_full_binding_source() {
     for source in sources() {
         let mut seen = 0;
         for fragment in source.plan().fragments().values() {
-            for (id, node) in fragment.expressions().iter() {
+            for (_source_node, unit, id, node) in super::sql_test_source::unit_definitions(fragment)
+            {
                 let ExprKind::FunctionCall { function, args } = &node.kind else {
                     continue;
                 };
@@ -82,10 +83,7 @@ fn array_struct_subfield_actual_required_sql_full_binding_source() {
                     function.overload.as_str(),
                     "builtin.scalar/__array_struct_subfield/dynamic-v1"
                 );
-                let request = fragment
-                    .call_requests()
-                    .get(PhysicalCallDefinition::Expression(*id))
-                    .unwrap();
+                let request = unit.requests().get(id).unwrap();
                 assert_eq!(args.len(), 2);
                 assert_eq!(request.logical_argument_count, 2);
                 assert_eq!(request.arguments.len(), 2);
@@ -119,18 +117,12 @@ fn array_struct_subfield_actual_required_sql_full_binding_source() {
                 };
                 assert_eq!(output.data_type(), original.data_type());
                 assert_eq!(
-                    fragment
-                        .expressions()
-                        .get(args[1])
-                        .unwrap()
-                        .ty
-                        .data_type()
-                        .clone(),
+                    unit.definition(args[1]).unwrap().ty.data_type().clone(),
                     DataType::Utf8
                 );
                 eprintln!(
                     "ARRAY_STRUCT_SUBFIELD actual definition={id:?} binding={function:?} request={request:?} fieldNameSource={:?} result={:?}",
-                    fragment.expressions().get(args[1]),
+                    unit.definition(args[1]),
                     node.ty
                 );
                 seen += 1;

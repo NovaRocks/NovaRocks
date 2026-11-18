@@ -22,6 +22,11 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression::{CompiledExprSet, StaticExprKind};
+use novarocks_expression_contract::{
+    BoundFunction, DefinitionControl, ExprKind, ExpressionCallClaim, PhysicalCallRequest,
+    RootOrdinal, RootScope,
+};
 use novarocks_functions::{
     CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
     FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
@@ -32,22 +37,15 @@ use novarocks_functions::{
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
-use novarocks_local_program::{
-    KernelAbiVersion, LocalProgram, ProgramExpressionArena, ProgramExpressionRootSite,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, StaticExprKind,
-};
+use novarocks_local_program::{KernelAbiVersion, LocalProgram, ProgramNodeKind};
 use novarocks_physical_plan::{
-    BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
-    FragmentPackage, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPhysicalCall, NodeId, PhysicalCallSite, PhysicalExpressionRoots,
-    PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
-    ValueDef, ValueId, ValueOrigin,
+    FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageInput, FragmentSink,
+    FrozenFragmentPruning, NodeId, PipelineDopDomain, PlanVersionId, RequiredContracts,
+    ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
-    ExpressionInvocation, ExpressionUseId, FunctionValueType, PureCompileControl,
-    SemanticParameters,
+    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
+    EvaluationDemand, FunctionValueType, PureCompileControl, SemanticParameters,
 };
 use std::{
     collections::BTreeMap,
@@ -122,40 +120,6 @@ fn options(dop: usize) -> LocalCompileOptions {
 pub(crate) enum SeedMode {
     Input,
     DirectConstant,
-}
-
-fn invocation(
-    fragment: &Fragment,
-    expression: ExprId,
-    demand: EvaluationDemand,
-    next: &mut u32,
-    uses: &mut Vec<ExpressionInvocation<ExprId>>,
-) -> ExpressionUseId {
-    let id = ExpressionUseId::new(*next);
-    *next += 17;
-    let definition = fragment.expressions().get(expression).unwrap();
-    let children = match &definition.kind {
-        ExprKind::FunctionCall { function, args } => {
-            assert_eq!(function.function_id.as_str(), "builtin.scalar/rand/v1");
-            assert_eq!(args.len(), 1);
-            args.iter()
-                .map(|child| invocation(fragment, *child, EvaluationDemand::Value, next, uses))
-                .collect::<Vec<_>>()
-        }
-        ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
-        other => panic!("fixture has no exact control protocol for {other:?}"),
-    };
-    uses.push(ExpressionInvocation {
-        context: ExpressionEffectContext {
-            use_id: id,
-            region: EvaluationRegionId::new(u32::MAX),
-            demand,
-        },
-        definition: expression,
-        control: ControlShape::Eager,
-        arguments: children.into_boxed_slice(),
-    });
-    id
 }
 
 fn checked_source(
@@ -284,7 +248,7 @@ fn package_with_dictionary(
             }
         })
         .collect::<Box<[_]>>();
-    let original_request = novarocks_physical_plan::PhysicalCallRequest {
+    let original_request = PhysicalCallRequest {
         arguments: original_arguments,
         logical_argument_count: request.logical_argument_count,
         expected_result_type: request.expected_result_type.cloned(),
@@ -313,23 +277,29 @@ fn package_with_dictionary(
         .unwrap();
     let extra_type = FunctionValueType::new(DataType::Int64, false);
     let extra_expr = builder
-        .add_expression(
-            first_project,
+        .unit(first_project)
+        .unwrap()
+        .add(
+            None,
             extra_type.clone(),
             i64_source(&mut constants, &extra_type, 999),
         )
         .unwrap();
     let seed_expr = builder
-        .add_expression(
-            first_project,
+        .unit(first_project)
+        .unwrap()
+        .add(
+            None,
             seed_type.clone(),
             i64_source(&mut constants, &seed_type, 42),
         )
         .unwrap();
     let bool_type = FunctionValueType::new(DataType::Boolean, false);
     let bool_expr = builder
-        .add_expression(
-            first_project,
+        .unit(first_project)
+        .unwrap()
+        .add(
+            None,
             bool_type.clone(),
             bool_source(&mut constants, &bool_type, true),
         )
@@ -345,26 +315,29 @@ fn package_with_dictionary(
             true,
         );
         let expr = builder
-            .add_expression(first_project, ty.clone(), null_source(&mut constants, &ty))
+            .unit(first_project)
+            .unwrap()
+            .add(None, ty.clone(), null_source(&mut constants, &ty))
             .unwrap();
         first_definitions.push((ValueId::new(400), ty, expr));
     }
-    let first_outputs = first_definitions
-        .iter()
-        .map(|(value, _, expr)| (*expr, *value))
-        .collect::<Vec<_>>();
-    let first_values = first_definitions
-        .iter()
-        .map(|(value, _, _)| *value)
-        .collect::<Vec<_>>();
-    for (id, ty, expr) in first_definitions {
+    let mut first_outputs = Vec::new();
+    let mut first_values = Vec::new();
+    for (id, ty, definition) in first_definitions {
+        let root = builder
+            .unit(first_project)
+            .unwrap()
+            .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
+        first_outputs.push((root, id));
+        first_values.push(id);
         builder
             .insert_value(ValueDef {
                 id,
                 ty,
                 origin: ValueOrigin::Expr {
                     node: first_project,
-                    expr,
+                    root,
                 },
             })
             .unwrap();
@@ -380,14 +353,23 @@ fn package_with_dictionary(
         )
         .unwrap();
     let predicate = builder
-        .add_expression(filter, bool_type, ExprKind::Value(bool_value))
+        .unit(filter)
+        .unwrap()
+        .add(None, bool_type, ExprKind::Value(bool_value))
+        .unwrap();
+    let predicate = builder
+        .unit(filter)
+        .unwrap()
+        .root(predicate, EvaluationDemand::TruthOnly, RootScope::Port(0))
         .unwrap();
     builder
         .add_filter(filter, first_project, Box::from([predicate]))
         .unwrap();
     let call_argument = builder
-        .add_expression(
-            second_project,
+        .unit(second_project)
+        .unwrap()
+        .add(
+            None,
             seed_type.clone(),
             match mode {
                 SeedMode::Input => ExprKind::Value(seed_value),
@@ -410,7 +392,7 @@ fn package_with_dictionary(
         kind: bound.kind,
         argument_types: selected.argument_types.clone(),
         result_type: result_type.clone(),
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: bound.semantics.volatility,
             argument_evaluation: bound.semantics.argument_evaluation,
             failure_behavior: bound.semantics.failure_behavior,
@@ -419,8 +401,10 @@ fn package_with_dictionary(
         }),
     };
     let call = builder
-        .add_expression(
-            second_project,
+        .unit(second_project)
+        .unwrap()
+        .add(
+            None,
             result_type.clone(),
             ExprKind::FunctionCall {
                 function,
@@ -429,46 +413,78 @@ fn package_with_dictionary(
         )
         .unwrap();
     builder
+        .unit(second_project)
+        .unwrap()
+        .request(call, original_request)
+        .unwrap();
+    builder
+        .unit(second_project)
+        .unwrap()
+        .definition_control(
+            call,
+            DefinitionControl {
+                shape: ControlShape::Eager,
+                temporal_sources: None,
+            },
+        )
+        .unwrap();
+    let call_root = builder
+        .unit(second_project)
+        .unwrap()
+        .root(call, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    builder
         .insert_value(ValueDef {
             id: sample_value,
             ty: result_type.clone(),
             origin: ValueOrigin::Expr {
                 node: second_project,
-                expr: call,
+                root: call_root,
             },
         })
         .unwrap();
     let identity_a = builder
-        .add_expression(
-            second_project,
-            seed_type.clone(),
-            ExprKind::Value(seed_value),
-        )
+        .unit(second_project)
+        .unwrap()
+        .add(None, seed_type.clone(), ExprKind::Value(seed_value))
         .unwrap();
     let identity_b = builder
-        .add_expression(
-            second_project,
-            seed_type.clone(),
-            ExprKind::Value(seed_value),
-        )
+        .unit(second_project)
+        .unwrap()
+        .add(None, seed_type.clone(), ExprKind::Value(seed_value))
         .unwrap();
-    let mut project_expressions = vec![(call, sample_value)];
+    let mut project_expressions = vec![(call_root, sample_value)];
     let mut project_output = vec![sample_value];
     if twin {
+        let twin_root = builder
+            .unit(second_project)
+            .unwrap()
+            .root(call, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: twin_value,
                 ty: result_type.clone(),
                 origin: ValueOrigin::Expr {
                     node: second_project,
-                    expr: call,
+                    root: twin_root,
                 },
             })
             .unwrap();
         // One definition, two independent root uses and produced values.
-        project_expressions.push((call, twin_value));
+        project_expressions.push((twin_root, twin_value));
         project_output.push(twin_value);
     }
+    let identity_a = builder
+        .unit(second_project)
+        .unwrap()
+        .root(identity_a, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let identity_b = builder
+        .unit(second_project)
+        .unwrap()
+        .root(identity_b, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     project_expressions.extend([(identity_a, seed_value), (identity_b, seed_value)]);
     project_output.extend([seed_value, seed_value]);
     builder
@@ -482,6 +498,65 @@ fn package_with_dictionary(
     builder
         .add_limit(limit, second_project, Some(1), 0)
         .unwrap();
+    let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
+    for node in [first_project, filter, second_project] {
+        let ports = builder.node_ports(node).unwrap();
+        let sealed = builder
+            .take_unit_builder(node)
+            .unwrap()
+            .seal(ports, &mut work)
+            .unwrap();
+        let mut claims = BTreeMap::new();
+        for (&id, invocation) in sealed.uses() {
+            if !matches!(
+                sealed.definition(invocation.definition).unwrap().kind,
+                ExprKind::FunctionCall { .. }
+            ) {
+                continue;
+            }
+            let argument_uses = [Some(invocation.arguments[0])];
+            let context = invocation.context;
+            let authored = functions
+                .prepare_fresh(
+                    CallEffectInput {
+                        context: context.into(),
+                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
+                            &argument_uses,
+                        ),
+                        function_id: &bound.function_id,
+                        kind: bound.kind,
+                        selected: selected.as_ref(),
+                        request,
+                        environment: &[],
+                        parameters: &parameters,
+                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                        proof_scope: novarocks_type_contract::CallProofScope::Region(
+                            context.region,
+                        ),
+                    },
+                    selected.clone(),
+                    PureCallPreparation::Scalar {
+                        arguments: ScopedExpressionEffects::pure_value(context),
+                    },
+                    &FixtureControl,
+                )
+                .unwrap();
+            claims.insert(
+                id,
+                ExpressionCallClaim {
+                    context,
+                    effects: authored.call_contract().effects().clone(),
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    temporal_source: None,
+                    regexp_count_pattern_source: None,
+                    to_base64_byte_source: None,
+                },
+            );
+        }
+        let unit = sealed.finish(claims, &mut work).unwrap();
+        builder.install_unit(node, Arc::new(unit)).unwrap();
+    }
+    work.finish().unwrap();
     let fragment = builder
         .finish_definition(
             limit,
@@ -493,87 +568,7 @@ fn package_with_dictionary(
             },
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
-        .unwrap()
-        .with_call_requests_observed(
-            vec![(
-                novarocks_physical_plan::PhysicalCallDefinition::Expression(call),
-                original_request,
-            )],
-            &FixtureControl,
-        )
         .unwrap();
-    let actual_roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let mut next = 4096;
-    let mut uses = Vec::new();
-    let roots = actual_roots
-        .sites()
-        .iter()
-        .map(|(site, root)| {
-            (
-                *site,
-                invocation(&fragment, root.expr, root.demand, &mut next, &mut uses),
-            )
-        })
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: EvaluationRegionId::new(u32::MAX),
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let physical_uses = PhysicalRootUses::try_new(&fragment, flow, roots, &FixtureControl).unwrap();
-    let mut call_entries = Vec::new();
-    for (call_use, invocation) in physical_uses
-        .flow()
-        .uses()
-        .iter()
-        .filter(|(_, invocation)| invocation.definition == call)
-    {
-        let argument_uses = [Some(invocation.arguments[0])];
-        let context = invocation.context;
-        let authored = functions
-            .prepare_fresh(
-                CallEffectInput {
-                    context,
-                    argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
-                        &argument_uses,
-                    ),
-                    function_id: &bound.function_id,
-                    kind: bound.kind,
-                    selected: selected.as_ref(),
-                    request,
-                    environment: &[],
-                    parameters: &parameters,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    proof_scope: novarocks_type_contract::CallProofScope::Region(context.region),
-                },
-                selected.clone(),
-                PureCallPreparation::Scalar {
-                    arguments: ScopedExpressionEffects::pure_value(context),
-                },
-                &FixtureControl,
-            )
-            .unwrap();
-        call_entries.push(FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: PhysicalCallSite::Expression(*call_use),
-            context,
-            effects: authored.call_contract().effects().clone(),
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        });
-    }
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &physical_uses, call_entries, &FixtureControl)
-            .unwrap();
     let mut result_fields = vec![ResultField {
         domain: crate::test_result_domain::result_value_domain(&result_type),
         name: "sample".into(),
@@ -621,8 +616,7 @@ fn package_with_dictionary(
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,
-                expression_uses: physical_uses,
-                calls,
+                statement_constant_policy: options(1).constants,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters,
@@ -648,11 +642,19 @@ pub(crate) fn program(mode: SeedMode, twin: bool) -> Arc<LocalProgram> {
     Arc::new(compile_fragment(validated, &functions, options(1), &FixtureControl).unwrap())
 }
 
-fn project_site(expression: u32) -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(3),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression },
-    }
+fn project_expression(
+    program: &LocalProgram,
+    node: usize,
+    expression: u32,
+) -> (Arc<CompiledExprSet>, RootOrdinal) {
+    let ProgramNodeKind::Project { exprs, .. } = program.graph().nodes()[node].kind() else {
+        panic!("actual Project node")
+    };
+    let reference = exprs[expression as usize];
+    (
+        program.unit(reference.unit).unwrap().clone(),
+        reference.root,
+    )
 }
 
 fn batch(program: &LocalProgram, seeds: Vec<Option<i64>>) -> RecordBatch {
@@ -681,8 +683,8 @@ impl KernelEvaluationControl for RuntimeControl {
     }
 }
 fn instance(program: &Arc<LocalProgram>, expression: u32) -> CompiledExpressionInstance {
-    CompiledExpressionInstance::try_new(program.clone(), project_site(expression), &RuntimeControl)
-        .unwrap()
+    let (unit, root) = project_expression(program, 3, expression);
+    CompiledExpressionInstance::try_new(unit, root, &RuntimeControl).unwrap()
 }
 fn bits(result: SelectedValues<'_>) -> Vec<u64> {
     assert!(result.errors().is_empty());
@@ -772,21 +774,20 @@ fn one_definition_with_distinct_actual_root_occurrences_keeps_independent_rng_st
     let ProgramNodeKind::Project { exprs, .. } = graph.nodes()[3].kind() else {
         panic!("actual second Project")
     };
-    assert_eq!(exprs[0], exprs[1]);
+    assert_eq!(exprs[0].unit, exprs[1].unit);
+    assert_ne!(exprs[0].root, exprs[1].root);
+    let unit = program.unit(exprs[0].unit).unwrap();
+    let root_a = unit.root(exprs[0].root).unwrap();
+    let root_b = unit.root(exprs[1].root).unwrap();
+    assert_eq!(root_a.definition, root_b.definition);
     assert!(matches!(
-        graph.expressions().node(exprs[0]).unwrap().kind(),
+        unit.definitions().node(root_a.definition).unwrap().kind(),
         StaticExprKind::BoundCall { .. }
     ));
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let root_a = snapshot.bindings()[&project_site(0)];
-    let root_b = snapshot.bindings()[&project_site(1)];
+    let root_a = root_a.use_id;
+    let root_b = root_b.use_id;
     assert_ne!(root_a, root_b);
-    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
+    let flow = unit.control_flow();
     assert_eq!(
         flow.uses()[&root_a].definition,
         flow.uses()[&root_b].definition
@@ -933,7 +934,11 @@ fn actual_root_rejects_wrong_schema_and_selection_domain_as_invalid_program() {
 fn constructor_rejects_absent_actual_root_instead_of_using_a_definition_or_default_site() {
     let program = program(SeedMode::Input, false);
     assert!(matches!(
-        CompiledExpressionInstance::try_new(program, project_site(u32::MAX), &RuntimeControl),
+        CompiledExpressionInstance::try_new(
+            project_expression(&program, 3, 0).0,
+            RootOrdinal::new(u32::MAX),
+            &RuntimeControl,
+        ),
         Err(KernelFailure::InvalidProgram(_))
     ));
 }
@@ -995,16 +1000,15 @@ fn runtime_causes() -> [KernelFailure; 7] {
 #[test]
 fn every_constructor_control_callback_preserves_original_failure_without_retry() {
     let program = program(SeedMode::Input, false);
+    let (unit, root) = project_expression(&program, 3, 0);
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-    let _instance =
-        CompiledExpressionInstance::try_new(program.clone(), project_site(0), &recorder).unwrap();
+    let _instance = CompiledExpressionInstance::try_new(unit.clone(), root, &recorder).unwrap();
     let successful = recorder.trace.lock().unwrap().clone();
     assert!(!successful.is_empty());
     for index in 1..=successful.len() {
         for cause in runtime_causes() {
             let control = CallbackControl::new(cause.clone(), index);
-            let result =
-                CompiledExpressionInstance::try_new(program.clone(), project_site(0), &control);
+            let result = CompiledExpressionInstance::try_new(unit.clone(), root, &control);
             assert!(
                 matches!(result, Err(actual) if actual == cause),
                 "constructor callback {index}"
@@ -1123,10 +1127,7 @@ fn unused_incoming_dictionary_descriptors_are_not_value_identity_but_layout_and_
 #[test]
 fn oversized_actual_empty_port_domain_is_refused_before_controller_allocation() {
     let program = program(SeedMode::DirectConstant, false);
-    let root = ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(1),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-    };
+    let (unit, root) = project_expression(&program, 1, 0);
     let schema = program.graph().nodes()[0].output_layout().schema().clone();
     assert!(schema.fields().is_empty());
     let input = RecordBatch::try_new_with_options(
@@ -1135,8 +1136,7 @@ fn oversized_actual_empty_port_domain_is_refused_before_controller_allocation() 
         &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(usize::MAX)),
     )
     .unwrap();
-    let mut evaluator =
-        CompiledExpressionInstance::try_new(program, root, &RuntimeControl).unwrap();
+    let mut evaluator = CompiledExpressionInstance::try_new(unit, root, &RuntimeControl).unwrap();
     assert!(matches!(
         evaluator.evaluate(&input, Selection::all(usize::MAX), &RuntimeControl),
         Err(KernelFailure::ResourceExhausted)
@@ -1145,6 +1145,163 @@ fn oversized_actual_empty_port_domain_is_refused_before_controller_allocation() 
     assert!(matches!(
         evaluator.evaluate(&input, Selection::all(usize::MAX), &RuntimeControl),
         Err(KernelFailure::InstanceFailed)
+    ));
+}
+
+#[test]
+fn declared_empty_port_keeps_its_batch_domain_while_zero_port_keeps_one_row() {
+    use super::CompiledFilterConjunctionInstance;
+    use novarocks_expression::{
+        EvaluationEnvironment, ScopeLayout, ScopeLayouts, compile_expr_set_pure,
+    };
+    use novarocks_expression_contract::{BoundExprSetBuilder, ExprPort, UnitLimits};
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+
+    let ty = FunctionValueType::new(DataType::Boolean, false);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
+    let literal = bool_source(&mut constants, &ty, true);
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let catalog = rng_subset();
+    let compile = |ports: Vec<ExprPort>, scope, layouts: ScopeLayouts<'_>| {
+        let mut draft = BoundExprSetBuilder::new(UnitLimits {
+            expression_semantic_depth: novarocks_physical_plan::PlanLimits::FROZEN
+                .expression_semantic_depth,
+        });
+        let definition = draft.add(None, ty.clone(), literal.clone()).unwrap();
+        let value = draft
+            .root(definition, EvaluationDemand::Value, scope)
+            .unwrap();
+        let predicate = draft
+            .root(definition, EvaluationDemand::TruthOnly, scope)
+            .unwrap();
+        let mut work =
+            CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
+        // This actual unit has no call definitions or claims to manufacture.
+        let unit = draft
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        work.finish().unwrap();
+        let mut work =
+            CompileCheckpoints::try_new(&FixtureControl, CompilePhase::LowerProgram).unwrap();
+        let compiled = compile_expr_set_pure(
+            &unit,
+            EvaluationEnvironment {
+                constants: &constants,
+                parameters: &parameters,
+            },
+            layouts,
+            options(1).constants,
+            &catalog,
+            &mut work,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        (compiled, value, predicate)
+    };
+    let schema = Arc::new(Schema::empty());
+    let mut work =
+        CompileCheckpoints::try_new(&FixtureControl, CompilePhase::LowerProgram).unwrap();
+    let layout = ScopeLayout::try_new(
+        schema.clone(),
+        Arc::from([]),
+        Arc::from([]),
+        ValueTypeStorageLifetime::pure(),
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    let (declared, value, predicate) = compile(
+        vec![ExprPort {
+            values: Box::default(),
+        }],
+        RootScope::Port(0),
+        ScopeLayouts {
+            ports: std::slice::from_ref(&layout),
+            all_ports: None,
+        },
+    );
+    assert_eq!(declared.scopes().len(), 1);
+    assert!(declared.scopes()[0].schema().fields().is_empty());
+    assert_eq!(declared.root(value).unwrap().scope, RootScope::Port(0));
+    assert_eq!(
+        declared.root(predicate).unwrap().demand,
+        EvaluationDemand::TruthOnly
+    );
+    let input = RecordBatch::try_new_with_options(
+        schema.clone(),
+        vec![],
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(3)),
+    )
+    .unwrap();
+    let mut scalar =
+        CompiledExpressionInstance::try_new(declared.clone(), value, &RuntimeControl).unwrap();
+    let selected = scalar
+        .evaluate(&input, Selection::all(3), &RuntimeControl)
+        .unwrap();
+    assert_eq!(selected.selection(), Selection::all(3));
+    assert!(selected.errors().is_empty());
+    assert_eq!(
+        selected
+            .values()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(true); 3]
+    );
+    let mut filter =
+        CompiledFilterConjunctionInstance::try_new(&[(declared, predicate)], &RuntimeControl)
+            .unwrap();
+    let filtered = filter
+        .evaluate_required(&input, Selection::all(3), &RuntimeControl)
+        .unwrap();
+    assert_eq!(
+        filtered
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(true); 3]
+    );
+
+    let (zero, value, _) = compile(
+        vec![],
+        RootScope::AllPorts,
+        ScopeLayouts {
+            ports: &[],
+            all_ports: None,
+        },
+    );
+    assert!(zero.scopes().is_empty());
+    assert_eq!(zero.root(value).unwrap().scope, RootScope::AllPorts);
+    let one = RecordBatch::try_new_with_options(
+        schema,
+        vec![],
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(1)),
+    )
+    .unwrap();
+    let mut scalar = CompiledExpressionInstance::try_new(zero, value, &RuntimeControl).unwrap();
+    let selected = scalar
+        .evaluate(&one, Selection::all(1), &RuntimeControl)
+        .unwrap();
+    assert_eq!(selected.values().len(), 1);
+    assert!(selected.errors().is_empty());
+    assert!(
+        selected
+            .values()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0)
+    );
+    assert!(matches!(
+        scalar.evaluate(&input, Selection::all(3), &RuntimeControl),
+        Err(KernelFailure::InvalidProgram(ref detail))
+            if detail.message() == "actual input differs from the root's empty one-row port"
     ));
 }
 

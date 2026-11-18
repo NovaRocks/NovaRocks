@@ -21,32 +21,26 @@ use super::CompiledExpressionInstance;
 use crate::exec::expr::compiled_program::checked_constants;
 use arrow::{array::BooleanArray, datatypes::DataType, record_batch::RecordBatch};
 use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::{ExprId, ExprKind, RootScope};
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
-    InstalledPureKernel, KernelDiagnostic, KernelEvaluationControl, KernelFailure,
-    PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi, ScopedExpressionEffects, Selection,
+    ConstantPolicy, EngineFunctionCatalogBuilder, FunctionArgument, FunctionId, FunctionKind,
+    FunctionOverloadId, InstalledPureKernel, KernelDiagnostic, KernelEvaluationControl,
+    KernelFailure, PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId,
+    PureKernelAbi, Selection,
 };
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
-use novarocks_local_program::{
-    KernelAbiVersion, LocalProgram, ProgramExpressionArena, ProgramExpressionRootSite,
-    ProgramNodeExpressionRole, ProgramNodeId, StaticExprKind,
-};
+use novarocks_local_program::{KernelAbiVersion, LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_physical_plan::{
-    BoundFunction, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts, FragmentId,
-    FragmentPackage, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPhysicalCall, NodeId, PhysicalCallSite, PhysicalExpressionRoots,
-    PhysicalRootUses, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort,
-    RootUseBindingError, ValidationErrors, ValueDef, ValueId, ValueOrigin,
+    Fragment, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageInput,
+    FragmentSink, FrozenFragmentPruning, NodeId, PipelineDopDomain, PlanVersionId,
+    RequiredContracts, ResultField, ResultPort, ValidationErrors, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
-    PureCompileControl, RegionGuard, SemanticParameters, control_argument_semantics,
+    CompileControlError, CompilePhase, ControlShape, EvaluationDemand, FunctionValueType,
+    PureCompileControl, SemanticParameters,
 };
 use std::{
     collections::BTreeMap,
@@ -187,8 +181,10 @@ fn source_columns(
     for &value in &values {
         let ty = FunctionValueType::new(DataType::Boolean, true);
         let definition = builder
-            .add_expression(
-                input,
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 checked_constants::kind(
                     source_pools,
@@ -196,20 +192,27 @@ fn source_columns(
                 ),
             )
             .unwrap();
+        let input_root = builder
+            .unit(input)
+            .unwrap()
+            .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: value,
                 ty: ty.clone(),
                 origin: ValueOrigin::Expr {
                     node: input,
-                    expr: definition,
+                    root: input_root,
                 },
             })
             .unwrap();
-        items.push((definition, value));
+        items.push((input_root, value));
         operands.push(
             builder
-                .add_expression(root, ty, ExprKind::Value(value))
+                .unit(root)
+                .unwrap()
+                .add(None, ty, ExprKind::Value(value))
                 .unwrap(),
         );
     }
@@ -235,7 +238,21 @@ fn fixture(op: Connective, mode: Use, width: usize) -> Result<Fixture, Validatio
         .into_boxed_slice();
     let result_type = boolean;
     let connective = builder
-        .add_expression(root, result_type.clone(), op.kind(args))
+        .unit(root)
+        .unwrap()
+        .add(None, result_type.clone(), op.kind(args))
+        .unwrap();
+    let connective = builder
+        .unit(root)
+        .unwrap()
+        .root(
+            connective,
+            match mode {
+                Use::Value => EvaluationDemand::Value,
+                Use::TruthOnly => EvaluationDemand::TruthOnly,
+            },
+            RootScope::Port(0),
+        )
         .unwrap();
     match mode {
         Use::Value => {
@@ -244,7 +261,7 @@ fn fixture(op: Connective, mode: Use, width: usize) -> Result<Fixture, Validatio
                     result_type,
                     ValueOrigin::Expr {
                         node: root,
-                        expr: connective,
+                        root: connective,
                     },
                 )
                 .unwrap();
@@ -263,6 +280,15 @@ fn fixture(op: Connective, mode: Use, width: usize) -> Result<Fixture, Validatio
                 .unwrap();
         }
     }
+    let source_pools = super::guarded_tests::finish_fixture_units(
+        &functions(),
+        &mut builder,
+        root,
+        &BTreeMap::new(),
+        &SemanticParameters::try_new([]).unwrap(),
+        source_pools,
+        |_, _, children| children,
+    );
     let fragment = builder.finish_definition(
         root,
         FragmentSink::Result,
@@ -278,109 +304,15 @@ fn fixture(op: Connective, mode: Use, width: usize) -> Result<Fixture, Validatio
         constants: source_pools,
     })
 }
-fn uses(fixture: &Fixture) -> Result<PhysicalRootUses, RootUseBindingError> {
-    struct FlowAuthor {
-        next: u32,
-        next_region: u32,
-        output: Vec<ExpressionInvocation<ExprId>>,
-        domains: Vec<ExpressionEvaluationRegion>,
-    }
-    impl FlowAuthor {
-        fn visit(
-            &mut self,
-            fragment: &Fragment,
-            id: ExprId,
-            domain: EvaluationRegionId,
-            demand: EvaluationDemand,
-        ) -> ExpressionUseId {
-            let use_id = ExpressionUseId::new(self.next);
-            self.next += 17;
-            let (control, args) = match &fragment.expressions().get(id).unwrap().kind {
-                ExprKind::Conjunction { args } => (ControlShape::Conjunction, args.as_ref()),
-                ExprKind::Disjunction { args } => (ControlShape::Disjunction, args.as_ref()),
-                ExprKind::FunctionCall { function, args } => {
-                    assert_eq!(function.function_id.as_str(), "builtin.scalar/if/v1");
-                    (ControlShape::If, args.as_ref())
-                }
-                ExprKind::Value(_) | ExprKind::Constant(_) => (ControlShape::Eager, &[][..]),
-                other => panic!("fixture lacks control projection for {other:?}"),
-            };
-            let mut arguments = vec![];
-            for (ordinal, child) in args.iter().enumerate() {
-                let (child_demand, guard) =
-                    control_argument_semantics(control, args.len(), ordinal, demand).unwrap();
-                let child_region = if let Some(kind) = guard {
-                    let child_region = EvaluationRegionId::new(self.next_region);
-                    self.next_region += 13;
-                    self.domains.push(ExpressionEvaluationRegion {
-                        id: child_region,
-                        parent: Some(domain),
-                        guard: Some(RegionGuard {
-                            owner: use_id,
-                            kind,
-                        }),
-                    });
-                    child_region
-                } else {
-                    domain
-                };
-                arguments.push(self.visit(fragment, *child, child_region, child_demand));
-            }
-            self.output.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    region: domain,
-                    demand,
-                },
-                definition: id,
-                control,
-                arguments: arguments.into_boxed_slice(),
-            });
-            use_id
-        }
-    }
-    let roots = PhysicalExpressionRoots::try_new(&fixture.fragment, &Control).unwrap();
-    let domain = EvaluationRegionId::new(u32::MAX);
-    let mut author = FlowAuthor {
-        next: 7,
-        next_region: 8,
-        output: vec![],
-        domains: vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-    };
-    let mut bindings = vec![];
-    for (&site, root) in roots.sites() {
-        bindings.push((
-            site,
-            author.visit(&fixture.fragment, root.expr, domain, root.demand),
-        ));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        author.domains,
-        author.output,
-        fixture.fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(&fixture.fragment, flow, bindings, &Control)
-}
-
 fn package(fixture: Fixture) -> Arc<FragmentPackage> {
-    let expression_uses = uses(&fixture).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fixture.fragment, &expression_uses, vec![], &Control)
-        .unwrap();
-    assert!(calls.entries().is_empty());
-    package_with_calls(fixture, expression_uses, calls)
+    assert!(fixture.fragment.nodes().values().all(|node| {
+        node.expressions
+            .as_ref()
+            .is_none_or(|unit| unit.claims().is_empty())
+    }));
+    package_with_units(fixture)
 }
-fn package_with_calls(
-    fixture: Fixture,
-    expression_uses: PhysicalRootUses,
-    calls: FrozenFragmentCalls,
-) -> Arc<FragmentPackage> {
+fn package_with_units(fixture: Fixture) -> Arc<FragmentPackage> {
     let root = fixture
         .fragment
         .nodes()
@@ -415,8 +347,7 @@ fn package_with_calls(
                 required: RequiredContracts::default(),
                 constants: fixture.constants,
                 fragment: fixture.fragment,
-                expression_uses,
-                calls,
+                statement_constant_policy: options().constants,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::try_new([]).unwrap(),
@@ -443,15 +374,7 @@ fn program(op: Connective, mode: Use, width: usize) -> Arc<LocalProgram> {
         &Control,
     )
     .unwrap();
-    assert!(
-        program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()
-            .is_empty()
-    );
+    assert!(program.units().iter().all(|unit| unit.calls().is_empty()));
     Arc::new(program)
 }
 impl KernelEvaluationControl for Control {
@@ -462,17 +385,24 @@ impl KernelEvaluationControl for Control {
         panic!("intrinsic Boolean roots must not wait")
     }
 }
-fn root(mode: Use) -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(2),
-        role: match mode {
-            Use::Value => ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-            Use::TruthOnly => ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
-        },
+fn root(program: &LocalProgram, mode: Use) -> ProgramRootRef {
+    match (
+        mode,
+        program.graph().nodes()[program.graph().root().index()].kind(),
+    ) {
+        (Use::Value, ProgramNodeKind::Project { exprs, .. }) => exprs[0],
+        (Use::TruthOnly, ProgramNodeKind::Filter { predicates, .. }) => predicates[0],
+        _ => panic!("actual root node differs from the fixture's declared demand"),
     }
 }
 fn instance(program: &Arc<LocalProgram>, mode: Use) -> CompiledExpressionInstance {
-    CompiledExpressionInstance::try_new(program.clone(), root(mode), &Control).unwrap()
+    let reference = root(program, mode);
+    CompiledExpressionInstance::try_new(
+        program.unit(reference.unit).unwrap().clone(),
+        reference.root,
+        &Control,
+    )
+    .unwrap()
 }
 fn batch(program: &LocalProgram, columns: [Vec<Option<bool>>; 3]) -> RecordBatch {
     RecordBatch::try_new(
@@ -608,14 +538,14 @@ fn filter_truth_only_nary_preserves_exact_keep_set_without_claiming_null_and_fal
                     .map(|value| value == Some(true))
                     .collect::<Vec<_>>()
             );
-            let resolved = program.checked().channels().expressions().resolved_calls();
-            let snapshot = resolved.snapshot();
-            let root_use = snapshot.bindings()[&root(Use::TruthOnly)];
-            let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
+            let reference = root(&program, Use::TruthOnly);
+            let unit = program.unit(reference.unit).unwrap();
+            let root_use = unit.root(reference.root).unwrap().use_id;
+            let flow = unit.control_flow();
             let invocation = &flow.uses()[&root_use];
             assert_eq!(invocation.context.demand, EvaluationDemand::TruthOnly);
             assert_eq!(invocation.control, op.shape());
-            let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
+            let arena = unit.definitions();
             let args = match arena.node(invocation.definition).unwrap().kind() {
                 StaticExprKind::NaryAnd { args } | StaticExprKind::NaryOr { args } => args,
                 _ => panic!("actual intrinsic definition"),
@@ -628,7 +558,7 @@ fn filter_truth_only_nary_preserves_exact_keep_set_without_claiming_null_and_fal
                     EvaluationDemand::TruthOnly
                 );
             }
-            assert!(resolved.calls().is_empty());
+            assert!(unit.calls().is_empty());
         }
     }
 }
@@ -698,8 +628,15 @@ fn causes() -> [KernelFailure; 7] {
 fn every_nary_constructor_callback_preserves_all_seven_original_failure_categories() {
     let program = program(Connective::And, Use::Value, 320);
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-    let _ =
-        CompiledExpressionInstance::try_new(program.clone(), root(Use::Value), &recorder).unwrap();
+    let _ = CompiledExpressionInstance::try_new(
+        program
+            .unit(root(&program, Use::Value).unit)
+            .unwrap()
+            .clone(),
+        root(&program, Use::Value).root,
+        &recorder,
+    )
+    .unwrap();
     let trace = recorder.trace.lock().unwrap().clone();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));
@@ -707,7 +644,7 @@ fn every_nary_constructor_callback_preserves_all_seven_original_failure_categori
         for cause in causes() {
             let control = CallbackControl::new(cause.clone(), index);
             assert!(
-                matches!(CompiledExpressionInstance::try_new(program.clone(), root(Use::Value), &control), Err(actual) if actual == cause)
+                matches!(CompiledExpressionInstance::try_new(program.unit(root(&program, Use::Value).unit).unwrap().clone(), root(&program, Use::Value).root, &control), Err(actual) if actual == cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
         }
@@ -804,41 +741,20 @@ fn dual_demand_program() -> Arc<LocalProgram> {
             constant: None,
         },
     ];
-    let request = FunctionBindingRequest {
-        arguments: &arguments,
-        logical_argument_count: 3,
-        expected_result_type: None,
-    };
-    let bound = functions
-        .metadata()
-        .resolve_bound_user("if", FunctionKind::Scalar, request, &Control)
-        .unwrap();
-    let selected = Arc::new(bound.selected.clone());
-    let FunctionResultType::Scalar(result_type) = &selected.result_type else {
-        panic!("actual IF scalar result")
-    };
-    let function = BoundFunction {
-        function_id: bound.function_id.clone(),
-        overload: selected.overload.clone(),
-        kind: bound.kind,
-        argument_types: selected.argument_types.clone(),
-        result_type: result_type.clone(),
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
-            volatility: bound.semantics.volatility,
-            argument_evaluation: bound.semantics.argument_evaluation,
-            failure_behavior: bound.semantics.failure_behavior,
-            intrinsic_row_error: bound.semantics.intrinsic_row_error,
-            semantic_parameters: Box::default(),
-        }),
-    };
+    let owner =
+        super::guarded_tests::author(&functions, "if", arguments.to_vec(), ControlShape::If)
+            .with_decimal_policy(novarocks_type_contract::DecimalOverflowPolicy::OutputNull);
+    let result_type = owner.result();
     let source = NodeId::new(u32::MAX);
     let input = NodeId::new(41);
     let root_node = NodeId::new(0);
     let mut builder = FragmentBuilder::new(FragmentId::new(92));
     let operands = source_columns(&mut builder, source, input, root_node, &mut source_pools);
     let shared = builder
-        .add_expression(
-            root_node,
+        .unit(root_node)
+        .unwrap()
+        .add(
+            None,
             boolean,
             ExprKind::Conjunction {
                 args: Box::from([operands[2], operands[0], operands[1]]),
@@ -846,8 +762,10 @@ fn dual_demand_program() -> Arc<LocalProgram> {
         )
         .unwrap();
     let yes = builder
-        .add_expression(
-            root_node,
+        .unit(root_node)
+        .unwrap()
+        .add(
+            None,
             (FunctionValueType::new(DataType::Boolean, false)).clone(),
             checked_constants::kind(
                 &mut source_pools,
@@ -861,22 +779,30 @@ fn dual_demand_program() -> Arc<LocalProgram> {
         .unwrap();
     // The same physical definition is required first as an IF condition
     // (TruthOnly), and then as its ELSE result (Value) in another domain.
-    let result = builder
-        .add_expression(
-            root_node,
-            result_type.clone(),
-            ExprKind::FunctionCall {
-                function,
-                args: Box::from([shared, yes, shared]),
-            },
-        )
+    let mut authors = BTreeMap::new();
+    let result =
+        super::guarded_tests::call(&mut builder, &mut authors, owner, vec![shared, yes, shared]);
+    let ExprKind::FunctionCall { function, .. } = &builder
+        .construction_unit(root_node)
+        .unwrap()
+        .definition(result)
+        .unwrap()
+        .kind
+    else {
+        panic!("the original IF call definition")
+    };
+    assert_eq!(function.function_id.as_str(), "builtin.scalar/if/v1");
+    let output_root = builder
+        .unit(root_node)
+        .unwrap()
+        .root(result, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let value = builder
         .add_value(
             result_type.clone(),
             ValueOrigin::Expr {
                 node: root_node,
-                expr: result,
+                root: output_root,
             },
         )
         .unwrap();
@@ -884,10 +810,19 @@ fn dual_demand_program() -> Arc<LocalProgram> {
         .add_project(
             root_node,
             input,
-            Box::from([(result, value)]),
+            Box::from([(output_root, value)]),
             Box::from([value]),
         )
         .unwrap();
+    let source_pools = super::guarded_tests::finish_fixture_units(
+        &functions,
+        &mut builder,
+        root_node,
+        &authors,
+        &SemanticParameters::try_new([]).unwrap(),
+        source_pools,
+        |_, _, children| children,
+    );
     let fixture = Fixture {
         constants: source_pools,
         fragment: builder
@@ -901,99 +836,9 @@ fn dual_demand_program() -> Arc<LocalProgram> {
                 },
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
-            .unwrap()
-            .with_call_requests_observed(
-                vec![(
-                    novarocks_physical_plan::PhysicalCallDefinition::Expression(result),
-                    novarocks_physical_plan::PhysicalCallRequest {
-                        arguments: request
-                            .arguments
-                            .iter()
-                            .map(|argument| {
-                                let FunctionArgument::Value {
-                                    value_type,
-                                    constant: None,
-                                } = argument
-                                else {
-                                    panic!("original IF fixture has nonconstant Value channels")
-                                };
-                                novarocks_physical_plan::StaticFunctionArgument::Value {
-                                    value_type: value_type.clone(),
-                                    constant: None,
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice(),
-                        logical_argument_count: request.logical_argument_count,
-                        expected_result_type: request.expected_result_type.cloned(),
-                        constant_policy: options().constants,
-                    },
-                )],
-                &Control,
-            )
             .unwrap(),
     };
-    let expression_uses = uses(&fixture).unwrap();
-    let flow = expression_uses.flow();
-    let invocation = flow
-        .uses()
-        .values()
-        .find(|invocation| invocation.definition == result)
-        .unwrap();
-    let context = invocation.context;
-    let mut effects = ScopedExpressionEffects::pure_value(context);
-    for (ordinal, child) in invocation.arguments.iter().enumerate() {
-        effects = effects
-            .join_control_argument(
-                ScopedExpressionEffects::pure_value(flow.uses()[child].context),
-                flow,
-                ordinal,
-            )
-            .unwrap();
-    }
-    let child_uses = invocation
-        .arguments
-        .iter()
-        .copied()
-        .map(Some)
-        .collect::<Vec<_>>();
-    let parameters = SemanticParameters::try_new([]).unwrap();
-    let token = functions
-        .prepare_fresh(
-            CallEffectInput {
-                context,
-                argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&child_uses),
-                function_id: &bound.function_id,
-                kind: bound.kind,
-                selected: selected.as_ref(),
-                request,
-                environment: &[],
-                parameters: &parameters,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                proof_scope: CallProofScope::Region(context.region),
-            },
-            selected.clone(),
-            PureCallPreparation::ControlIntrinsic { arguments: effects },
-            &Control,
-        )
-        .unwrap();
-    let calls = FrozenFragmentCalls::try_new(
-        &fixture.fragment,
-        &expression_uses,
-        vec![FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: PhysicalCallSite::Expression(context.use_id),
-            context,
-            effects: token.call_contract().effects().clone(),
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        }],
-        &Control,
-    )
-    .unwrap();
-    let package = package_with_calls(fixture, expression_uses, calls);
+    let package = package_with_units(fixture);
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Control).unwrap();
     Arc::new(
@@ -1009,11 +854,11 @@ fn dual_demand_program() -> Arc<LocalProgram> {
 #[test]
 fn same_nary_definition_in_if_truth_only_and_value_domains_does_not_cache_null_as_false() {
     let program = dual_demand_program();
-    let resolved = program.checked().channels().expressions().resolved_calls();
-    assert_eq!(resolved.calls().len(), 1); // Only the actual IF control token.
-    let snapshot = resolved.snapshot();
-    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-    let invocation = &flow.uses()[&snapshot.bindings()[&root(Use::Value)]];
+    let reference = root(&program, Use::Value);
+    let unit = program.unit(reference.unit).unwrap();
+    assert_eq!(unit.calls().len(), 1); // Only the actual IF control token.
+    let flow = unit.control_flow();
+    let invocation = &flow.uses()[&unit.root(reference.root).unwrap().use_id];
     assert_eq!(invocation.control, ControlShape::If);
     let condition = &flow.uses()[&invocation.arguments[0]];
     let otherwise = &flow.uses()[&invocation.arguments[2]];

@@ -18,8 +18,9 @@
 //! Checked scalar fixture sources. Every returned reference is installed in
 //! the caller's explicit table; this helper does not infer an environment.
 use crate::exec::expr::test_support::{HarnessControl, register_constant};
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{ConstantPolicy, ConstantValue};
-use novarocks_physical_plan::{ConstantPools, ExprKind};
+use novarocks_physical_plan::ConstantPools;
 use novarocks_type_contract::{CompilePhase, FunctionValueType};
 use std::sync::Arc;
 

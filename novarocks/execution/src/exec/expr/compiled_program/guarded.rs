@@ -19,10 +19,9 @@
 //! frame. Kernel calls temporarily borrow one stable domain, then erase that
 //! borrow into owned values before resuming the parent continuation.
 use super::boolean_region::BooleanRows;
-use super::node_recipes::{ComparisonPosition, NodeRecipes, ProgramNodeRecipes};
+use super::node_recipes::{ComparisonPosition, NodeRecipes, UnitNodeRecipes};
 use super::*;
 use arrow::array::{Array, BooleanArray};
-use novarocks_local_program::ProgramNodeId;
 use novarocks_type_contract::EvaluationDemand;
 
 pub(super) fn supports_result(ty: &DataType) -> bool {
@@ -247,7 +246,7 @@ struct Child {
     ordinals: Vec<usize>,
     value: OwnedValue,
 }
-pub(super) struct Frame<K = ProgramUseRef> {
+pub(super) struct Frame<K = ExpressionUseId> {
     occurrence: K,
     activation: novarocks_functions::ScalarInvocationActivation,
     rows: Vec<usize>,
@@ -1508,28 +1507,24 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
     reason = "Keep the checked root, exact input port, selected domain, use-owned state/effects and caller control explicit"
 )]
 pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
-    program: &novarocks_local_program::ExpressionProgram,
-    root: ProgramExpressionRootSite,
+    program: &CompiledExprSet,
+    root: RootOrdinal,
     input: CompiledInputLoan<'_>,
-    input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
+    input_scope: RootScope,
     actual_domain: Selection<'a>,
     selection: Selection<'a>,
     activation: novarocks_functions::ScalarInvocationActivation,
-    instances: &mut BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
+    instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-    effects: &BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
+    effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     work: &mut Work<'_, '_>,
 ) -> Result<Value<'a>, E> {
-    let checked = program.checked();
-    let typed = checked.channels().expressions();
-    let resolved = typed.resolved_calls();
-    let snapshot = resolved.snapshot();
-    let flow = &snapshot.flows()[&root.arena()];
-    let definitions = &snapshot.roots().arenas()[&root.arena()];
-    let root_use = ProgramUseRef {
-        arena: root.arena(),
-        use_id: snapshot.bindings()[&root],
-    };
+    let flow = program.control_flow();
+    let definitions = program.definitions();
+    let root_use = program
+        .root(root)
+        .ok_or_else(|| invalid("missing actual compiled expression root"))?
+        .use_id;
     // Admit the controller's per-row storage representation before its first
     // allocation. This is an extent gate, not a host memory grant.
     let element_width = std::mem::size_of::<RowDataError>()
@@ -1565,7 +1560,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         }
         work.step()?;
     }
-    let root_invocation = &flow.uses()[&root_use.use_id];
+    let root_invocation = &flow.uses()[&root_use];
     let root_type = definitions
         .node(root_invocation.definition)
         .ok_or_else(|| invalid("missing actual root definition"))?
@@ -1575,18 +1570,15 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
     // not acquire a whole-domain child policy by sharing a numeric ABI.
     let mut needs_original = BTreeSet::new();
     let mut finished = BTreeSet::new();
-    let mut pending = vec![(root_use.use_id, false)];
+    let mut pending = vec![(root_use, false)];
     while let Some((use_id, expanded)) = pending.pop() {
         if finished.contains(&use_id) {
             continue;
         }
         let invocation = &flow.uses()[&use_id];
         if expanded {
-            let occurrence = ProgramUseRef {
-                arena: root_use.arena,
-                use_id,
-            };
-            let own = matches!(resolved.calls().get(&ProgramCallSite::Expression(occurrence)).map(|call|call.specialization().prepared()),
+            let occurrence = use_id;
+            let own = matches!(program.calls().get(&occurrence).map(|call|call.prepared()),
                 Some(PreparedPureKernel::ScalarInvocation(prepared)) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain);
             let mut required = own;
             for child in &invocation.arguments {
@@ -1614,7 +1606,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         root_type,
         rows,
         domain,
-        needs_original.contains(&root_use.use_id),
+        needs_original.contains(&root_use),
         if E::ACTIVATE_EMPTY {
             activation
         } else {
@@ -1625,19 +1617,20 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
     )?];
     while let Some(mut frame) = frames.pop() {
         work.step()?;
-        let invocation = &flow.uses()[&frame.occurrence.use_id];
+        let invocation = &flow.uses()[&frame.occurrence];
         let definition = definitions
             .node(invocation.definition)
             .ok_or_else(|| invalid("missing compiled definition"))?;
-        let FunctionArgumentType::Value(result_type) = typed
-            .definition_type(frame.occurrence.arena, invocation.definition)
+        let FunctionArgumentType::Value(result_type) = program
+            .types()
+            .get(invocation.definition.index())
             .ok_or_else(|| invalid("missing exact compiled definition type"))?
         else {
             return Err(invalid("ordinary root cannot materialize a lambda definition").into());
         };
         let original_domain = match definition.kind() {
             StaticExprKind::BoundCall { .. } => {
-                matches!(resolved.calls()[&ProgramCallSite::Expression(frame.occurrence)].specialization().prepared(),
+                matches!(program.calls()[&frame.occurrence].prepared(),
                     PreparedPureKernel::ScalarInvocation(prepared) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain)
             }
             _ => false,
@@ -1653,10 +1646,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                 .arguments
                 .get(frame.next)
                 .map(|child| {
-                    let occurrence = ProgramUseRef {
-                        arena: frame.occurrence.arena,
-                        use_id: *child,
-                    };
+                    let occurrence = *child;
                     effects
                         .get(&occurrence)
                         .ok_or_else(|| invalid("missing exact operand effects"))?
@@ -1680,10 +1670,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
             let (rows, child_domain, child_activation) =
                 child_context(&frame, invocation.control, &ordinals, original_domain, work)?;
             let child = Frame::new(
-                ProgramUseRef {
-                    arena: frame.occurrence.arena,
-                    use_id: child_use,
-                },
+                child_use,
                 flow.uses()[&child_use].control,
                 definitions
                     .node(flow.uses()[&child_use].definition)
@@ -1727,32 +1714,22 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                 StaticExprKind::Constant(constant) => {
                     complete_constant_leaf(constant, result_type, local_selection, allocator, work)?
                 }
-                StaticExprKind::SlotId(_) => {
-                    let Some(ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                        node,
-                        role,
-                        ordinal,
-                    })) = checked.slots().get(&frame.occurrence)
-                    else {
-                        return Err(
-                            invalid("slot requires its actual compiled input source").into()
-                        );
-                    };
-                    // An empty-port root has no input source at all; every
-                    // other root reads exactly its own (node, role) port.
-                    if Some((*node, *role)) != input_node {
-                        return Err(
-                            invalid("slot source differs from actual root input port").into()
-                        );
+                StaticExprKind::Input => {
+                    let source = program
+                        .input(frame.occurrence)
+                        .ok_or_else(|| invalid("input requires its actual compiled source"))?;
+                    if source.scope != input_scope {
+                        return Err(invalid("input source differs from actual root scope").into());
                     }
+                    let ordinal = source.ordinal as usize;
                     let column = input
-                        .checked_column(*ordinal as usize)
+                        .checked_column(ordinal)
                         .ok_or_else(|| invalid("slot source ordinal is absent"))?;
                     // Obtain the source at the original checked Slot. Current
                     // kernels still consume only the evaluated array; this
                     // synchronous borrow neither captures nor wraps its owner.
                     let (_original, _source) = column.into_parts();
-                    let array = frame.domain.column(*ordinal as usize).ok_or_else(|| {
+                    let array = frame.domain.column(ordinal).ok_or_else(|| {
                         invalid("actual source domain has no checked Slot ordinal")
                     })?;
                     if !source_captured {
@@ -1770,8 +1747,8 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     OwnedValue::Source(array, frame.domain.clone()).with_continuation(owner)
                 }
                 kind => {
-                    let recipes = ProgramNodeRecipes {
-                        program,
+                    let recipes = UnitNodeRecipes {
+                        unit: program,
                         occurrence: frame.occurrence,
                     };
                     complete_node::<E, _>(
@@ -1806,7 +1783,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         // before any new custody/type-holder allocation can replace the cause.
         if let Some(parent) = frames.last() {
             let parent_requires_original = matches!(
-                resolved.calls().get(&ProgramCallSite::Expression(parent.occurrence)).map(|call|call.specialization().prepared()),
+                program.calls().get(&parent.occurrence).map(|call|call.prepared()),
                 Some(PreparedPureKernel::ScalarInvocation(prepared)) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain
             );
             if parent_requires_original
@@ -1830,7 +1807,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
             work.flush()?;
         }
         if let Some(parent) = frames.last_mut() {
-            let parent_invocation = &flow.uses()[&parent.occurrence.use_id];
+            let parent_invocation = &flow.uses()[&parent.occurrence];
             let shape = parent_invocation.control;
 
             let child_is_pure = effects
@@ -1844,8 +1821,8 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     ordinals: frame.parent_ordinals,
                     value,
                 },
-                &ProgramNodeRecipes {
-                    program,
+                &UnitNodeRecipes {
+                    unit: program,
                     occurrence: parent.occurrence,
                 },
                 shape,

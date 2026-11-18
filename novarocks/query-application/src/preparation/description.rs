@@ -422,23 +422,30 @@ impl FrozenExecutionDescription {
         let plan = self.candidate.plan();
         let result = (|| -> Result<(), SqlCompileError> {
             for fragment in plan.fragments().values() {
-                for (_, definition) in fragment.expressions().iter() {
-                    let checked = (|| -> Result<(), SqlCompileError> {
-                        for reference in definition.kind.intrinsic_parameter_references() {
-                            let value = plan.parameters().require(*reference).map_err(|error| {
-                                SqlCompileError::InvalidRequest(error.to_string())
-                            })?;
-                            if value != &SemanticParameterValue::AllowThrowException(actual) {
-                                return Err(SqlCompileError::InvalidRequest(
+                for node in fragment.nodes().values() {
+                    work.step()?;
+                    let Some(unit) = &node.expressions else {
+                        continue;
+                    };
+                    for definition in unit.definitions() {
+                        let checked = (|| -> Result<(), SqlCompileError> {
+                            for reference in definition.kind.intrinsic_parameter_references() {
+                                let value =
+                                    plan.parameters().require(*reference).map_err(|error| {
+                                        SqlCompileError::InvalidRequest(error.to_string())
+                                    })?;
+                                if value != &SemanticParameterValue::AllowThrowException(actual) {
+                                    return Err(SqlCompileError::InvalidRequest(
                                     "legacy native runtime ALLOW_THROW_EXCEPTION differs from the exact intrinsic parameter".into(),
                                 ));
+                                }
                             }
-                        }
-                        Ok(())
-                    })();
-                    // The lookup/comparison is completed even on ordinary refusal.
-                    work.step()?;
-                    checked?;
+                            Ok(())
+                        })();
+                        // The lookup/comparison is completed even on ordinary refusal.
+                        work.step()?;
+                        checked?;
+                    }
                 }
                 work.step()?;
             }
@@ -731,12 +738,14 @@ mod tests {
 
     fn intrinsic_description(values: &[bool], nonconsumers: usize) -> FrozenExecutionDescription {
         use arrow::datatypes::DataType;
+        use novarocks_expression_contract::{ExprKind, RootScope};
         use novarocks_physical_plan::{
-            ExprKind, FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, PlanBuilder,
+            FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, PlanBuilder,
             PlanVersionId, ValueOrigin, ValueType,
         };
         use novarocks_type_contract::{
-            DecimalOverflowPolicy, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
+            CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
+            SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
             SemanticParameterValue, SemanticParameters,
         };
         let mut fragment = FragmentBuilder::new(FragmentId::new(7));
@@ -776,35 +785,38 @@ mod tests {
             constants.insert(pool, source.pool().clone()).unwrap();
             ExprKind::Constant(reference)
         };
+        let draft = fragment.unit(node).unwrap();
         let mut row = Vec::new();
         for ordinal in 0..nonconsumers {
+            let definition = draft.add(None, ty.clone(), scalar(ordinal as i64)).unwrap();
             row.push(
-                fragment
-                    .add_expression(node, ty.clone(), scalar(ordinal as i64))
+                draft
+                    .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
                     .unwrap(),
             );
         }
         let ids = [0, u32::MAX];
         assert!(values.len() <= ids.len());
         for (ordinal, _) in values.iter().enumerate() {
-            let literal = fragment
-                .add_expression(node, ty.clone(), scalar(13))
+            let literal = draft.add(None, ty.clone(), scalar(13)).unwrap();
+            let definition = draft
+                .add(
+                    None,
+                    ty.clone(),
+                    ExprKind::Cast {
+                        expr: literal,
+                        target: DataType::Int64,
+                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                        allow_throw_exception: SemanticParameterRef {
+                            id: SemanticParameterId::new(ids[ordinal]),
+                            expected_key: SemanticParameterKey::AllowThrowException,
+                        },
+                    },
+                )
                 .unwrap();
             row.push(
-                fragment
-                    .add_expression(
-                        node,
-                        ty.clone(),
-                        ExprKind::Cast {
-                            expr: literal,
-                            target: DataType::Int64,
-                            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                            allow_throw_exception: SemanticParameterRef {
-                                id: SemanticParameterId::new(ids[ordinal]),
-                                expected_key: SemanticParameterKey::AllowThrowException,
-                            },
-                        },
-                    )
+                draft
+                    .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
                     .unwrap(),
             );
         }
@@ -828,6 +840,19 @@ mod tests {
                 output.into_boxed_slice(),
             )
             .unwrap();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let ports = fragment.node_ports(node).unwrap();
+        let unit = fragment
+            .take_unit_builder(node)
+            .unwrap()
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(Default::default(), &mut work)
+            .unwrap();
+        fragment
+            .install_unit(node, std::sync::Arc::new(unit))
+            .unwrap();
+        work.finish().unwrap();
         let fragment = fragment
             .finish_definition(
                 node,
@@ -848,7 +873,7 @@ mod tests {
                 )
             }))
             .unwrap();
-        let mut builder = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap())
+        let mut builder = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap(), policy)
             .with_constant_pools(constants)
             .with_semantic_parameters(parameters);
         builder.add_fragment(fragment).unwrap();

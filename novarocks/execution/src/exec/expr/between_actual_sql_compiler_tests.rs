@@ -22,12 +22,9 @@ use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, BooleanArray, Decimal128Array, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
-use novarocks_local_program::{
-    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind, ProgramRootInput,
-    root_input_layout,
-};
-use novarocks_physical_plan::ExprKind;
+use novarocks_local_program::ProgramNodeKind;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{sync::Arc, time::Duration};
@@ -56,8 +53,8 @@ fn between_count(source: &SqlAuthoredPhysicalPlan) -> usize {
         .plan()
         .fragments()
         .values()
-        .flat_map(|f| f.expressions().iter())
-        .filter(|(_, e)| matches!(e.kind, ExprKind::Between { .. }))
+        .flat_map(|f| super::sql_test_source::unit_definitions(f))
+        .filter(|(_, _, _, e)| matches!(e.kind, ExprKind::Between { .. }))
         .count()
 }
 #[test]
@@ -65,7 +62,7 @@ fn between_sql_source_original_required_native_case_retains_actual_bound_decimal
     let source = sql_source(REQUIRED, DataType::Int64);
     assert_eq!(between_count(&source), 1);
     for fragment in source.plan().fragments().values() {
-        for (_, node) in fragment.expressions().iter() {
+        for (_source_node, unit, _, node) in super::sql_test_source::unit_definitions(fragment) {
             if let ExprKind::Between {
                 expr,
                 low,
@@ -75,18 +72,16 @@ fn between_sql_source_original_required_native_case_retains_actual_bound_decimal
             {
                 assert!(!negated);
                 assert_eq!(node.ty.data_type().clone(), DataType::Boolean);
-                let operand = &fragment.expressions().get(*expr).unwrap().ty;
+                let operand = &unit.definition(*expr).unwrap().ty;
                 assert!(matches!(operand.data_type(), DataType::Decimal128(..)));
                 for child in [low, high] {
-                    assert!(
-                        operand.same_value_domain(&fragment.expressions().get(*child).unwrap().ty)
-                    );
+                    assert!(operand.same_value_domain(&unit.definition(*child).unwrap().ty));
                 }
                 assert_eq!(
                     node.ty.nullable(),
                     operand.nullable()
-                        || fragment.expressions().get(*low).unwrap().ty.nullable()
-                        || fragment.expressions().get(*high).unwrap().ty.nullable()
+                        || unit.definition(*low).unwrap().ty.nullable()
+                        || unit.definition(*high).unwrap().ty.nullable()
                 );
             }
         }
@@ -113,44 +108,29 @@ fn evaluate(sql: &str, input: ArrayRef, expected: &[Option<bool>], truth: bool) 
                         && node.output_layout().schema().field(0).data_type()
                             == &DataType::Boolean =>
                 {
-                    ProgramExpressionRootSite::Node {
-                        node: node.local_id().unwrap(),
-                        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-                    }
+                    exprs[0]
                 }
-                ProgramNodeKind::Filter { .. } if truth => ProgramExpressionRootSite::Node {
-                    node: node.local_id().unwrap(),
-                    role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
-                },
+                ProgramNodeKind::Filter { predicates, .. } if truth => predicates[0],
                 ProgramNodeKind::Scan { residuals, .. } if truth && residuals.len() == 1 => {
-                    ProgramExpressionRootSite::Node {
-                        node: node.local_id().unwrap(),
-                        role: ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
-                    }
+                    residuals[0]
                 }
                 _ => continue,
             };
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            if snapshot.bindings().contains_key(&site) {
+
+            if program
+                .unit(site.unit)
+                .and_then(|unit| unit.root(site.root))
+                .is_some()
+            {
                 assert!(found.is_none(), "fixture owns one actual predicate root");
                 found = Some((program.clone(), site));
             }
         }
     }
     let (program, site) = found.expect("actual SQL predicate producer");
-    let ProgramRootInput::Layout { node, role } = root_input_layout(program.graph(), site).unwrap()
-    else {
-        panic!("fixture owns actual scan input")
-    };
-    let schema = program
-        .checked()
-        .channels()
-        .channel_layout(node, role)
+    let unit = program.unit(site.unit).unwrap();
+    let schema = unit
+        .scope(unit.root(site.root).unwrap().scope)
         .unwrap()
         .schema()
         .clone();
@@ -160,8 +140,12 @@ fn evaluate(sql: &str, input: ArrayRef, expected: &[Option<bool>], truth: bool) 
     let data = RecordBatch::try_new(schema, vec![input.clone()]).unwrap();
     for rows in [(0..input.len()).collect::<Vec<_>>(), vec![0], Vec::new()] {
         let selection = Selection::try_sparse(input.len(), &rows).unwrap();
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &Control,
+        )
+        .unwrap();
         let out = frame.evaluate(&data, selection, &Control).unwrap();
         assert!(out.errors().is_empty());
         // The SQL predicate's value channel is three-valued. Its truth-only

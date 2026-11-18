@@ -23,6 +23,7 @@ use arrow::{
     array::Array,
     datatypes::{DataType, Field, TimeUnit},
 };
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{ConstantPool, ConstantValue};
 use novarocks_physical_plan as p;
 use novarocks_type_contract::{CompilePhase, FunctionValueType, PureCompileControl};
@@ -44,7 +45,7 @@ impl Sources {
     pub(crate) fn snapshot(&self) -> p::ConstantPools {
         self.0.lock().unwrap().clone()
     }
-    fn kind(&self, source: ConstantValue) -> p::ExprKind {
+    fn kind(&self, source: ConstantValue) -> ExprKind {
         insert(&mut self.0.lock().unwrap(), source)
     }
 }
@@ -239,7 +240,7 @@ pub(crate) fn typed(source: &ConstantValue, ty: &FunctionValueType) -> ConstantV
     .value(0)
     .unwrap()
 }
-pub(crate) fn insert(pools: &mut p::ConstantPools, source: ConstantValue) -> p::ExprKind {
+pub(crate) fn insert(pools: &mut p::ConstantPools, source: ConstantValue) -> ExprKind {
     // A selected ordinal keeps the original admitted backing and address when
     // the fixture owner already holds that pool. This is identity, not value
     // equality: separately authored equal scalars remain separate sources.
@@ -248,7 +249,7 @@ pub(crate) fn insert(pools: &mut p::ConstantPools, source: ConstantValue) -> p::
         .iter()
         .find(|(_, pool)| pool.backing_identity() == source.pool().backing_identity())
     {
-        return p::ExprKind::Constant(p::ConstantReference {
+        return ExprKind::Constant(p::ConstantReference {
             pool,
             ordinal: source.ordinal(),
         });
@@ -266,7 +267,7 @@ pub(crate) fn insert(pools: &mut p::ConstantPools, source: ConstantValue) -> p::
         ordinal: source.ordinal(),
     };
     pools.insert(pool, source.pool().clone()).unwrap();
-    p::ExprKind::Constant(reference)
+    ExprKind::Constant(reference)
 }
 pub(crate) fn merge(target: &mut p::ConstantPools, sources: &p::ConstantPools) {
     for (&id, pool) in sources.entries() {
@@ -284,20 +285,14 @@ pub(crate) struct Fragment {
     constants: p::ConstantPools,
 }
 impl Fragment {
+    pub(crate) fn from_parts(physical: p::Fragment, constants: p::ConstantPools) -> Self {
+        Self {
+            physical,
+            constants,
+        }
+    }
     pub(crate) fn into_parts(self) -> (p::Fragment, p::ConstantPools) {
         (self.physical, self.constants)
-    }
-    pub(crate) fn with_call_requests_observed(
-        self,
-        entries: Vec<(p::PhysicalCallDefinition, p::PhysicalCallRequest)>,
-        control: &dyn PureCompileControl,
-    ) -> Result<Self, p::CallRequestError> {
-        Ok(Self {
-            physical: self
-                .physical
-                .with_call_requests_observed(entries, control)?,
-            constants: self.constants,
-        })
     }
 }
 impl Deref for Fragment {
@@ -324,14 +319,6 @@ impl FragmentBuilder {
     ) -> Result<p::ValueId, p::BuildError> {
         self.physical.add_value(ty, origin)
     }
-    pub(crate) fn add_expression(
-        &mut self,
-        node: p::NodeId,
-        ty: p::ValueType,
-        kind: p::ExprKind,
-    ) -> Result<p::ExprId, p::BuildError> {
-        self.physical.add_expression(node, ty, kind)
-    }
     pub(crate) fn new(id: p::FragmentId, sources: &Sources) -> Self {
         Self {
             physical: p::FragmentBuilder::new(id),
@@ -342,7 +329,7 @@ impl FragmentBuilder {
         &mut self,
         ty: &FunctionValueType,
         source: &ConstantValue,
-    ) -> p::ExprKind {
+    ) -> ExprKind {
         self.sources.kind(typed(source, ty))
     }
     pub(crate) fn constant(
@@ -352,7 +339,27 @@ impl FragmentBuilder {
         source: ConstantValue,
     ) -> p::ExprId {
         let kind = self.constant_kind(&ty, &source);
-        self.physical.add_expression(node, ty, kind).unwrap()
+        self.physical
+            .unit(node)
+            .unwrap()
+            .add(None, ty, kind)
+            .unwrap()
+    }
+    pub(crate) fn finish_structure(
+        self,
+        root: p::NodeId,
+        sink: p::FragmentSink,
+        dop: p::PipelineDopDomain,
+        limits: p::PlanLimits,
+        control: &dyn PureCompileControl,
+        placement: p::StagePlacementPolicy,
+    ) -> Result<Fragment, p::FragmentStructureError> {
+        Ok(Fragment {
+            physical: self
+                .physical
+                .finish_structure(root, sink, dop, limits, control, placement)?,
+            constants: self.sources.snapshot(),
+        })
     }
     pub(crate) fn finish_definition(
         self,
@@ -388,7 +395,7 @@ pub(crate) struct PlanBuilder {
 impl PlanBuilder {
     pub(crate) fn new(version: p::PlanVersionId, sources: &Sources) -> Self {
         Self {
-            physical: p::PlanBuilder::new(version),
+            physical: p::PlanBuilder::new(version, constant_policy()),
             _sources: sources.clone(),
         }
     }

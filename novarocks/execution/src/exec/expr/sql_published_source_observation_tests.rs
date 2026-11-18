@@ -290,16 +290,14 @@ fn sql_published_source_query_loans_same_complete_owner_for_compiled() {
             declaration.fields()[0].alias.as_deref(),
             Some("original_name")
         );
-        assert!(
-            source
-                .plan()
-                .fragments()
-                .values()
-                .any(|f| f.expressions().iter().any(|(_, e)| matches!(
+        assert!(source.plan().fragments().values().any(|f| {
+            super::sql_test_source::unit_definitions(f).any(|(_, _, _, e)| {
+                matches!(
                     e.kind,
-                    novarocks_physical_plan::ExprKind::FunctionCall { .. }
-                )))
-        );
+                    novarocks_expression_contract::ExprKind::FunctionCall { .. }
+                )
+            })
+        }));
     }
 }
 #[test]

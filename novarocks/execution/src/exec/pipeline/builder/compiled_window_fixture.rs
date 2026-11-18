@@ -24,49 +24,47 @@
 //! - its original request, with each constant argument's checked pool value;
 //! - its frozen effects, obtained from a fresh preparation by the installed
 //!   owner with the same inputs the BE compiler later uses;
-//! - its frozen context, the `WindowCall` root occurrence itself.
+//! - its frozen context, the actual relational window call slot.
 //!
-//! Every expression root is a leaf except a `WindowCall`, whose occurrence
-//! has one leaf child use per argument and per frame offset, in definition
-//! order. All occurrences share one evaluation domain.
+//! Scalar parameters and sort keys have explicit roots in their actual node
+//! units. Checked frame offsets retain constant addresses without scalar uses;
+//! the SDK owns every scalar occurrence and control region.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field};
+use novarocks_expression_contract::{
+    BoundFunction, ExprKind, PhysicalCallRequest, RootOrdinal, RootScope,
+};
 use novarocks_functions::{
     AggregateKernelPhase, AggregatePreparationOptions, CallEffectInput, ConstantPool,
     EngineFunctionCatalogBuilder, FunctionArgument, FunctionBindingRequest, FunctionKind,
     FunctionResultType, InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
-    ScopedExpressionEffects, WindowCallOptions,
+    ScopedRelationalEffects, WindowCallOptions,
 };
 use novarocks_local_program::LocalProgram;
 use novarocks_physical_plan::{
-    AggregateBinding, AggregatePhase, BoundFunction, ConstantPoolId, ConstantPools,
-    ConstantReference, ExprId, ExprKind, FragmentCuts, FragmentId, FragmentPackage,
-    FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType, NodeId, NodeKind,
-    NullOrdering, PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
+    AggregateBinding, AggregatePhase, ConstantPoolId, ConstantPools, ConstantReference,
+    FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput,
+    FragmentSink, FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType, NodeId,
+    NodeKind, NullOrdering, PhysicalCallSite, PipelineDopDomain, PlanLimits, PlanVersionId,
     PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort, SortDirection,
-    SortExpr, SortMode, StaticFunctionArgument, ValueOrigin, WindowExpression, WindowSpec,
+    SortExpr, SortMode, StaticFunctionArgument, ValueOrigin, WindowCallSpec, WindowSpec,
 };
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CallProofScope, CompilePhase, ControlShape,
-    DecimalOverflowPolicy, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEffects, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError,
-    FunctionNullBehavior, FunctionValueType, FunctionVolatility, ObservableEffects,
-    SemanticParameters, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
+    ArgumentControl, CallEffects, CallProofScope, CompilePhase, DecimalOverflowPolicy,
+    EvaluationDemand, ExpressionEffects, FunctionFailureBehavior, FunctionInstanceState,
+    FunctionIntrinsicRowError, FunctionNullBehavior, FunctionValueType, FunctionVolatility,
+    ObservableEffects, RelationCallId, RelationEffectContext, SemanticParameters, WindowBound,
+    WindowFrame, WindowFrameExclusion, WindowFrameUnits,
 };
 
 use super::family_fixture::{FixtureControl, constant_policy};
 
 /// The frozen decimal policy every fixture call authors explicitly.
 const POLICY: DecimalOverflowPolicy = DecimalOverflowPolicy::ReportError;
-/// Child occurrences of window calls start far above every root occurrence.
-const CHILD_USE_BASE: u32 = 1_000_000;
 const CONSTANT_POOL: u32 = 7;
 pub(super) const VALUES: NodeId = NodeId::new(0);
 pub(super) const SORT: NodeId = NodeId::new(1);
@@ -234,7 +232,7 @@ pub(super) struct Shape {
     pub calls: Vec<Call>,
 }
 
-fn sort_expr(expr: ExprId, ascending: bool, nulls_first: bool) -> SortExpr {
+fn sort_expr(expr: RootOrdinal, ascending: bool, nulls_first: bool) -> SortExpr {
     SortExpr {
         expr,
         direction: if ascending {
@@ -304,11 +302,13 @@ fn typed_literal_values(
             row.iter()
                 .zip(types)
                 .map(|(literal, ty)| {
-                    if needs_cast(literal, ty) {
+                    let definition = if needs_cast(literal, ty) {
                         let source = builder.constant(VALUES, int64(false), literal.clone());
                         builder
-                            .add_expression(
-                                VALUES,
+                            .unit(VALUES)
+                            .unwrap()
+                            .add(
+                                None,
                                 ty.clone(),
                                 ExprKind::Cast {
                                     expr: source,
@@ -320,7 +320,12 @@ fn typed_literal_values(
                             .unwrap()
                     } else {
                         builder.constant(VALUES, ty.clone(), literal.clone())
-                    }
+                    };
+                    builder
+                        .unit(VALUES)
+                        .unwrap()
+                        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+                        .unwrap()
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
@@ -425,13 +430,23 @@ pub(super) fn package_typed(
             .iter()
             .map(|key| {
                 let expr = builder
-                    .add_expression(
-                        SORT,
+                    .unit(SORT)
+                    .unwrap()
+                    .add(
+                        None,
                         types[key.column].clone(),
                         ExprKind::Value(columns[key.column]),
                     )
                     .unwrap();
-                sort_expr(expr, key.ascending, key.nulls_first)
+                sort_expr(
+                    builder
+                        .unit(SORT)
+                        .unwrap()
+                        .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+                        .unwrap(),
+                    key.ascending,
+                    key.nulls_first,
+                )
             })
             .collect::<Box<[_]>>();
         let mode = if shape.partition.is_empty() {
@@ -443,13 +458,23 @@ pub(super) fn package_typed(
                     .iter()
                     .map(|column| {
                         let expr = builder
-                            .add_expression(
-                                SORT,
+                            .unit(SORT)
+                            .unwrap()
+                            .add(
+                                None,
                                 types[*column].clone(),
                                 ExprKind::Value(columns[*column]),
                             )
                             .unwrap();
-                        sort_expr(expr, true, true)
+                        sort_expr(
+                            builder
+                                .unit(SORT)
+                                .unwrap()
+                                .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+                                .unwrap(),
+                            true,
+                            true,
+                        )
                     })
                     .collect(),
             }
@@ -462,13 +487,23 @@ pub(super) fn package_typed(
         .iter()
         .map(|column| {
             let expr = builder
-                .add_expression(
-                    WINDOW,
+                .unit(WINDOW)
+                .unwrap()
+                .add(
+                    None,
                     types[*column].clone(),
                     ExprKind::Value(columns[*column]),
                 )
                 .unwrap();
-            sort_expr(expr, true, true)
+            sort_expr(
+                builder
+                    .unit(WINDOW)
+                    .unwrap()
+                    .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+                    .unwrap(),
+                true,
+                true,
+            )
         })
         .collect::<Box<[_]>>();
     let order_by = shape
@@ -476,17 +511,27 @@ pub(super) fn package_typed(
         .iter()
         .map(|key| {
             let expr = builder
-                .add_expression(
-                    WINDOW,
+                .unit(WINDOW)
+                .unwrap()
+                .add(
+                    None,
                     types[key.column].clone(),
                     ExprKind::Value(columns[key.column]),
                 )
                 .unwrap();
-            sort_expr(expr, key.ascending, key.nulls_first)
+            sort_expr(
+                builder
+                    .unit(WINDOW)
+                    .unwrap()
+                    .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+                    .unwrap(),
+                key.ascending,
+                key.nulls_first,
+            )
         })
         .collect::<Box<[_]>>();
     let mut constant_ordinal = 0u32;
-    let mut expressions = Vec::new();
+    let mut calls = Vec::new();
     let mut requests = Vec::new();
     let mut output = columns.clone();
     for call in &shape.calls {
@@ -498,8 +543,10 @@ pub(super) fn package_typed(
                 Arg::Column(column) => {
                     arguments.push(
                         builder
-                            .add_expression(
-                                WINDOW,
+                            .unit(WINDOW)
+                            .unwrap()
+                            .add(
+                                None,
                                 types[*column].clone(),
                                 ExprKind::Value(columns[*column]),
                             )
@@ -518,8 +565,10 @@ pub(super) fn package_typed(
                         "existing overflow fixture requires its actual BIGINT source"
                     );
                     let value = builder
-                        .add_expression(
-                            WINDOW,
+                        .unit(WINDOW)
+                        .unwrap()
+                        .add(
+                            None,
                             types[*column].clone(),
                             ExprKind::Value(columns[*column]),
                         )
@@ -531,11 +580,13 @@ pub(super) fn package_typed(
                     );
                     arguments.push(
                         builder
-                            .add_expression(
-                                WINDOW,
+                            .unit(WINDOW)
+                            .unwrap()
+                            .add(
+                                None,
                                 int64(true),
                                 ExprKind::Binary {
-                                    op: novarocks_physical_plan::BinaryOperator::Multiply,
+                                    op: novarocks_expression_contract::BinaryOperator::Multiply,
                                     left: value,
                                     right: max,
                                     decimal_overflow_policy: POLICY,
@@ -557,7 +608,9 @@ pub(super) fn package_typed(
                     };
                     arguments.push(
                         builder
-                            .add_expression(WINDOW, int64(false), ExprKind::Constant(reference))
+                            .unit(WINDOW)
+                            .unwrap()
+                            .add(None, int64(false), ExprKind::Constant(reference))
                             .unwrap(),
                     );
                     request.push(FunctionArgument::Value {
@@ -596,7 +649,7 @@ pub(super) fn package_typed(
             bound.selected.argument_types.clone(),
             result_type.clone(),
         );
-        function.legacy_metadata = Some(novarocks_physical_plan::LegacyBindingMetadata {
+        function.legacy_metadata = Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: bound.semantics.volatility,
             argument_evaluation: bound.semantics.argument_evaluation,
             failure_behavior: bound.semantics.failure_behavior,
@@ -625,13 +678,15 @@ pub(super) fn package_typed(
                 WindowBound::CurrentRow => WindowBound::CurrentRow,
                 WindowBound::UnboundedFollowing => WindowBound::UnboundedFollowing,
                 WindowBound::Preceding(offset) | WindowBound::Following(offset) => {
-                    let literal = builder.constant(
-                        WINDOW,
-                        int64(false),
-                        crate::exec::operators::family_fixture::constant_sources::i64(
+                    let literal = builder.constant_kind(
+                        &int64(false),
+                        &crate::exec::operators::family_fixture::constant_sources::i64(
                             i64::try_from(offset).unwrap(),
                         ),
                     );
+                    let ExprKind::Constant(literal) = literal else {
+                        unreachable!("checked frame offset is constant");
+                    };
                     if matches!(bound, WindowBound::Preceding(_)) {
                         WindowBound::Preceding(literal)
                     } else {
@@ -646,37 +701,42 @@ pub(super) fn package_typed(
                 exclusion: WindowFrameExclusion::NoOthers,
             }
         });
-        let expression = builder
-            .add_expression(
-                WINDOW,
-                result_type.clone(),
-                ExprKind::WindowCall {
-                    function,
-                    distinct: call.distinct,
-                    args: arguments.into_boxed_slice(),
-                    function_order_by: Box::default(),
-                    frame,
-                    ignore_nulls: call.ignore_nulls,
-                    aggregate_binding,
-                },
-            )
-            .unwrap();
+        let arguments = arguments
+            .into_iter()
+            .map(|definition| {
+                builder
+                    .unit(WINDOW)
+                    .unwrap()
+                    .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+                    .unwrap()
+            })
+            .collect::<Box<[_]>>();
         let value = builder
             .add_value(
                 result_type,
-                ValueOrigin::Expr {
+                ValueOrigin::NodeOutput {
                     node: WINDOW,
-                    expr: expression,
+                    output_ordinal: u32::try_from(output.len()).unwrap(),
                 },
             )
             .unwrap();
         output.push(value);
-        expressions.push(WindowExpression {
-            expression,
+        let site = PhysicalCallSite::Window {
+            node: WINDOW,
+            call: u32::try_from(calls.len()).unwrap(),
+        };
+        calls.push(WindowCallSpec {
+            binding: function,
+            distinct: call.distinct,
+            arguments,
+            order_by: Box::default(),
+            frame,
+            ignore_nulls: call.ignore_nulls,
+            aggregate_binding,
             output: value,
         });
         requests.push((
-            PhysicalCallDefinition::Expression(expression),
+            site,
             PhysicalCallRequest {
                 arguments: bound
                     .selected
@@ -705,12 +765,13 @@ pub(super) fn package_typed(
             NodeKind::Window(WindowSpec {
                 partition_by,
                 order_by,
-                expressions: expressions.into_boxed_slice(),
+                calls: calls.into_boxed_slice(),
             }),
         )
         .unwrap();
+    super::family_fixture::seal_no_call_units(&mut builder);
     let fragment = builder
-        .finish_definition(
+        .finish_structure(
             WINDOW,
             FragmentSink::Result,
             PipelineDopDomain {
@@ -718,87 +779,16 @@ pub(super) fn package_typed(
                 max: max_dop,
                 requires_power_of_two: false,
             },
+            PlanLimits::FROZEN,
+            &FixtureControl,
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
-        .unwrap()
-        .with_call_requests_observed(requests, &FixtureControl)
         .unwrap();
     let (fragment, sources) = fragment.into_parts();
     crate::exec::operators::family_fixture::constant_sources::merge(&mut pools, &sources);
-    // Root occurrences, then one leaf child per WindowCall reference.
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let domain = EvaluationRegionId::new(0);
-    let context = |id: u32| ExpressionEffectContext {
-        use_id: ExpressionUseId::new(id),
-        region: domain,
-        demand: novarocks_type_contract::EvaluationDemand::Value,
-    };
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    let mut window_uses = Vec::new();
-    let mut next_child = CHILD_USE_BASE;
-    // One eager Value occurrence of `definition` and of each of its children.
-    fn occurrence(
-        fragment: &novarocks_physical_plan::Fragment,
-        definition: ExprId,
-        uses: &mut Vec<ExpressionInvocation<ExprId>>,
-        next: &mut u32,
-        context: &dyn Fn(u32) -> ExpressionEffectContext,
-    ) -> ExpressionUseId {
-        let id = *next;
-        *next += 1;
-        let children = references(fragment, definition)
-            .into_iter()
-            .map(|child| occurrence(fragment, child, uses, next, context))
-            .collect::<Box<[_]>>();
-        uses.push(ExpressionInvocation {
-            context: context(id),
-            definition,
-            control: ControlShape::Eager,
-            arguments: children,
-        });
-        ExpressionUseId::new(id)
-    }
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = u32::try_from(ordinal).unwrap();
-        let definition = &fragment.expressions().get(root.expr).unwrap().kind;
-        let mut children = Vec::new();
-        for reference in references(&fragment, root.expr) {
-            children.push(occurrence(
-                &fragment,
-                reference,
-                &mut uses,
-                &mut next_child,
-                &context,
-            ));
-        }
-        if matches!(definition, ExprKind::WindowCall { .. }) {
-            window_uses.push((ExpressionUseId::new(id), root.expr, children.clone()));
-        }
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                demand: root.demand,
-                ..context(id)
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: children.into_boxed_slice(),
-        });
-        bindings.push((*site, ExpressionUseId::new(id)));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let root_uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &FixtureControl).unwrap();
+    let fragment = fragment
+        .with_call_requests_observed(requests, &FixtureControl)
+        .unwrap();
     let overflowing = shape
         .calls
         .iter()
@@ -813,22 +803,76 @@ pub(super) fn package_typed(
     } else {
         SemanticParameters::try_new([]).unwrap()
     };
+    let NodeKind::Window(spec) = &fragment.nodes()[&WINDOW].kind else {
+        unreachable!()
+    };
+    // This fixture explicitly declares its complete Port(0) layout from the
+    // same Values -> optional Sort columns and their original complete types.
+    // This pure preparation is not a runtime Graph-layout receipt.
+    assert_eq!(
+        fragment.nodes()[&input].output.columns.as_ref(),
+        columns.as_slice()
+    );
+    let scalar_parameters = fragment.unit(WINDOW).map(|unit| {
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            &FixtureControl,
+            CompilePhase::Validate,
+        )
+        .unwrap();
+        let fields = types
+            .iter()
+            .enumerate()
+            .map(|(ordinal, ty)| ty.try_to_field(format!("c{ordinal}")).unwrap())
+            .collect::<Vec<_>>();
+        let canonical = columns
+            .iter()
+            .copied()
+            .zip(types)
+            .enumerate()
+            .map(|(ordinal, (value, ty))| novarocks_expression::ScopeColumn {
+                value,
+                ordinal: u32::try_from(ordinal).unwrap(),
+                ty: ty.clone(),
+            })
+            .collect::<Vec<_>>();
+        let scope = novarocks_expression::ScopeLayout::try_new(
+            Arc::new(arrow::datatypes::Schema::new(fields)),
+            Arc::from(types),
+            Arc::from(canonical),
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut work,
+        )
+        .unwrap();
+        let compiled = novarocks_expression::compile_expr_set_pure(
+            unit,
+            novarocks_expression::EvaluationEnvironment {
+                constants: &pools,
+                parameters: &parameters,
+            },
+            novarocks_expression::ScopeLayouts {
+                ports: std::slice::from_ref(&scope),
+                all_ports: None,
+            },
+            constant_policy(),
+            catalog,
+            &mut work,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        compiled
+    });
     let mut frozen = Vec::new();
-    for ((use_id, expression, children), call) in window_uses.into_iter().zip(&shape.calls) {
-        let ExprKind::WindowCall {
-            function,
-            args,
-            frame,
-            ignore_nulls,
-            aggregate_binding,
-            ..
-        } = &fragment.expressions().get(expression).unwrap().kind
-        else {
-            unreachable!()
+    for (ordinal, (source, call)) in spec.calls.iter().zip(&shape.calls).enumerate() {
+        let site = PhysicalCallSite::Window {
+            node: WINDOW,
+            call: u32::try_from(ordinal).unwrap(),
         };
+        let context =
+            RelationEffectContext::call(RelationCallId::new(u32::try_from(ordinal).unwrap()));
+        let function = &source.binding;
         let request = fragment
             .call_requests()
-            .get(PhysicalCallDefinition::Expression(expression))
+            .get(site)
             .unwrap()
             .arguments
             .iter()
@@ -838,7 +882,11 @@ pub(super) fn package_typed(
                     constant,
                 } => FunctionArgument::Value {
                     value_type: value_type.clone(),
-                    constant: constant.map(|reference| pool_value(reference.ordinal)),
+                    constant: constant.map(|reference| {
+                        pools.entries()[&reference.pool]
+                            .value(reference.ordinal)
+                            .unwrap()
+                    }),
                 },
                 StaticFunctionArgument::Lambda { .. } => panic!("window value channel"),
             })
@@ -847,7 +895,7 @@ pub(super) fn package_typed(
             overload: function.overload.clone(),
             argument_types: function.argument_types.clone(),
             result_type: FunctionResultType::Scalar(function.result_type.clone()),
-            aggregate: aggregate_binding.as_deref().map(|binding| {
+            aggregate: source.aggregate_binding.as_deref().map(|binding| {
                 novarocks_functions::AggregateBindingSelection {
                     state_argument_contract: binding.state_argument_contract,
                     intermediate_type: binding.intermediate_type.clone(),
@@ -855,28 +903,41 @@ pub(super) fn package_typed(
                 }
             }),
         });
-        let argument_uses = children[..args.len()]
+        let argument_uses = source
+            .arguments
             .iter()
-            .map(|child| Some(*child))
+            .map(|root| Some(fragment.unit(WINDOW).unwrap().root_use(*root).unwrap()))
             .collect::<Vec<_>>();
-        let call_context = context(use_id.get());
         if call.uninstalled {
             frozen.push(FrozenPhysicalCall {
                 materialized_writer_input: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                site: PhysicalCallSite::Expression(use_id),
-                context: call_context,
-                effects: declared_aggregate_effects(CallProofScope::Region(domain)),
+                site,
+                context,
+                effects: declared_aggregate_effects(CallProofScope::Relation(context.identity)),
                 decimal_overflow_policy: POLICY,
             });
             continue;
         }
-        let arguments =
-            ScopedExpressionEffects::primitive(call_context, ExpressionEffects::PURE_VALUE);
+        // The actual unit compiler authors primitive own-effects and child
+        // composition, including ALLOW_THROW overflow. Only empty argument
+        // lists start and finish at the neutral pure-value join identity.
+        let mut children = ExpressionEffects::PURE_VALUE;
+        for root in source
+            .arguments
+            .iter()
+            .chain(source.order_by.iter().map(|key| &key.expr))
+        {
+            let unit = fragment.unit(WINDOW).unwrap();
+            let use_id = unit.root_use(*root).unwrap();
+            let scalar_context = unit.control_flow().uses()[&use_id].context;
+            let effects = scalar_parameters.as_ref().unwrap().effects()[&use_id]
+                .for_use(scalar_context)
+                .unwrap();
+            children = children.join(effects);
+        }
+        let arguments = ScopedRelationalEffects::primitive(context, children);
         // A call's frozen effects do not depend on its frame or DISTINCT.
-        let options = if aggregate_binding.is_some() {
+        let options = if source.aggregate_binding.is_some() {
             PureCallPreparation::Aggregate {
                 arguments,
                 options: AggregatePreparationOptions {
@@ -888,9 +949,9 @@ pub(super) fn package_typed(
                 },
             }
         } else {
-            let frame = frame.map(|frame| {
-                let offset = |id: ExprId| match fragment.expressions().get(id).unwrap().kind {
-                    ExprKind::Constant(reference) => u64::try_from(
+            let frame = source.frame.map(|frame| {
+                let offset = |reference: ConstantReference| {
+                    u64::try_from(
                         pools.entries()[&reference.pool]
                             .value(reference.ordinal)
                             .unwrap()
@@ -898,14 +959,13 @@ pub(super) fn package_typed(
                             .unwrap()
                             .unwrap(),
                     )
-                    .unwrap(),
-                    _ => unreachable!("fixture offsets are checked constants"),
+                    .unwrap()
                 };
-                let bound = |bound: WindowBound<ExprId>| match bound {
+                let bound = |bound: WindowBound<ConstantReference>| match bound {
                     WindowBound::UnboundedPreceding => WindowBound::UnboundedPreceding,
-                    WindowBound::Preceding(id) => WindowBound::Preceding(offset(id)),
+                    WindowBound::Preceding(reference) => WindowBound::Preceding(offset(reference)),
                     WindowBound::CurrentRow => WindowBound::CurrentRow,
-                    WindowBound::Following(id) => WindowBound::Following(offset(id)),
+                    WindowBound::Following(reference) => WindowBound::Following(offset(reference)),
                     WindowBound::UnboundedFollowing => WindowBound::UnboundedFollowing,
                 };
                 WindowFrame {
@@ -917,13 +977,14 @@ pub(super) fn package_typed(
             });
             PureCallPreparation::Window {
                 arguments,
-                options: WindowCallOptions::try_new(frame, *ignore_nulls, &FixtureControl).unwrap(),
+                options: WindowCallOptions::try_new(frame, source.ignore_nulls, &FixtureControl)
+                    .unwrap(),
             }
         };
         let token = catalog
             .prepare_fresh(
                 CallEffectInput {
-                    context: call_context,
+                    context: context.into(),
                     argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
                         &argument_uses,
                     ),
@@ -932,13 +993,13 @@ pub(super) fn package_typed(
                     selected: selection.as_ref(),
                     request: FunctionBindingRequest {
                         arguments: &request,
-                        logical_argument_count: args.len(),
+                        logical_argument_count: source.arguments.len(),
                         expected_result_type: None,
                     },
                     environment: &[],
                     parameters: &parameters,
                     decimal_overflow_policy: POLICY,
-                    proof_scope: CallProofScope::Region(domain),
+                    proof_scope: CallProofScope::Relation(context.identity),
                 },
                 Arc::clone(&selection),
                 options,
@@ -947,16 +1008,14 @@ pub(super) fn package_typed(
             .unwrap_or_else(|error| panic!("fixture window call prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
             materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: PhysicalCallSite::Expression(use_id),
-            context: call_context,
+            site,
+            context,
             effects: token.call_contract().effects().clone(),
             decimal_overflow_policy: POLICY,
         });
     }
-    let calls = FrozenFragmentCalls::try_new(&fragment, &root_uses, frozen, &FixtureControl)
+    let fragment = fragment
+        .with_calls_observed(frozen, &FixtureControl)
         .unwrap_or_else(|error| panic!("frozen window calls validate: {error}"));
     let output = fragment.nodes()[&WINDOW].output.clone();
     let result = ResultPort {
@@ -987,8 +1046,7 @@ pub(super) fn package_typed(
                 version: PlanVersionId::try_new([93; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                expression_uses: root_uses,
-                calls,
+                statement_constant_policy: constant_policy(),
                 pruning: FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
@@ -1003,22 +1061,6 @@ pub(super) fn package_typed(
         )
         .unwrap_or_else(|error| panic!("window package validates: {error:?}")),
     )
-}
-
-/// The ordered child definitions of one expression.
-fn references(fragment: &novarocks_physical_plan::Fragment, definition: ExprId) -> Vec<ExprId> {
-    let mut references = Vec::new();
-    fragment
-        .expressions()
-        .get(definition)
-        .unwrap()
-        .kind
-        .expression_references_observed::<std::convert::Infallible>(|id| {
-            references.push(id);
-            Ok(())
-        })
-        .unwrap();
-    references
 }
 
 // Explicit small-fixture admission; these are test inputs, not defaults.

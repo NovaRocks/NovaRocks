@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Evaluation of actual checked root occurrences, without thawing ExprArena.
+//! Evaluation of checked unit-local root occurrences.
 //!
 //! This selected expression controller keeps state per root use and driver. The
 //! host must install its memory scopes and allocation admission before calling
@@ -29,18 +29,16 @@ use arrow::{
     datatypes::DataType,
     record_batch::RecordBatch,
 };
+use novarocks_expression::{ComparisonSite, CompiledExprSet, StaticExprKind};
+use novarocks_expression_contract::{RootOrdinal, RootScope};
 use novarocks_functions::{
     EvaluatedArgument, FunctionArgumentType, KernelDiagnostic, KernelEvaluationControl,
     KernelFailure, PreparedPureKernel, RowDataError, ScopedExpressionEffects, SelectedValues,
     Selection, validate_evaluated_argument_observed, visit_selected_nulls,
 };
-use novarocks_local_program::{
-    ExpressionProgram, LocalProgram, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeId, ProgramRootInput,
-    ProgramUseRef, StaticExprKind, root_input_layout,
-};
 use novarocks_type_contract::{
-    ControlShape, FunctionNullBehavior, arrow_fields_exact_with_nullability_observed,
+    ControlShape, ExpressionUseId, FunctionNullBehavior,
+    arrow_fields_exact_with_nullability_observed,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -54,17 +52,14 @@ use std::{
 /// One operator/driver root owns its instances, even when definitions and
 /// immutable preparation backing are shared with another root or driver.
 pub struct CompiledExpressionInstance {
-    program: Arc<ExpressionProgram>,
-    root: ProgramExpressionRootSite,
-    /// The one input layout this root reads, named by its node and layout
-    /// role, from the same authority the lexical bindings were checked
-    /// against; `None` is the explicit empty port of a root that reads no
-    /// input. A join key reads its own side's layout and a join residual the
-    /// join scope; every other root reads a node output.
-    input: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
-    instances: BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
+    program: Arc<CompiledExprSet>,
+    root: RootOrdinal,
+    /// The actual scope retained by this compiled unit. No graph or channel
+    /// role is consulted by the evaluator, including for an empty scope.
+    input: RootScope,
+    instances: BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
     has_invocation_data: bool,
-    effects: BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
+    effects: BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     failed: bool,
     #[cfg(test)]
     slot_source_observer: Option<Arc<input_source::SlotSourceObserver>>,
@@ -297,15 +292,8 @@ impl CompiledExpressionInstance {
     /// Validate the complete actual root before creating any mutable kernel
     /// instance. Static signatures are not reselected or guessed here.
     pub fn try_new(
-        program: Arc<LocalProgram>,
-        root: ProgramExpressionRootSite,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<Self, KernelFailure> {
-        Self::try_new_expression_program(Arc::clone(program.expressions()), root, control)
-    }
-    pub fn try_new_expression_program(
-        program: Arc<ExpressionProgram>,
-        root: ProgramExpressionRootSite,
+        program: Arc<CompiledExprSet>,
+        root: RootOrdinal,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Self, KernelFailure> {
         let observed = ObservedControl {
@@ -323,65 +311,33 @@ impl CompiledExpressionInstance {
         work.finish(result)
     }
     pub fn try_new_with_allocator(
-        program: Arc<LocalProgram>,
-        root: ProgramExpressionRootSite,
+        program: Arc<CompiledExprSet>,
+        root: RootOrdinal,
         control: &dyn KernelEvaluationControl,
         allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<Self, KernelFailure> {
-        Self::try_new_expression_program_with_allocator(
-            Arc::clone(program.expressions()),
-            root,
-            control,
-            allocator,
-        )
-    }
-    pub fn try_new_expression_program_with_allocator(
-        program: Arc<ExpressionProgram>,
-        root: ProgramExpressionRootSite,
-        control: &dyn KernelEvaluationControl,
-        allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-    ) -> Result<Self, KernelFailure> {
-        let mut instance = Self::try_new_expression_program(program, root, control)?;
+        let mut instance = Self::try_new(program, root, control)?;
         instance.allocator = allocator;
         Ok(instance)
     }
     fn prepare(
-        program: Arc<ExpressionProgram>,
-        root: ProgramExpressionRootSite,
+        program: Arc<CompiledExprSet>,
+        root: RootOrdinal,
         work: &mut Work<'_, '_>,
     ) -> Result<Self, KernelFailure> {
-        let checked = program.checked();
-        let snapshot = checked.channels().expressions().resolved_calls().snapshot();
-        let input = match root_input_layout(program.graph(), root)
-            .map_err(|_| invalid("root has no actual compiled input port"))?
-        {
-            ProgramRootInput::Layout { node, role } => {
-                // The frozen port must exist before any instance is created.
-                checked
-                    .channels()
-                    .channel_layout(node, role)
-                    .ok_or_else(|| invalid("root input port has no frozen layout"))?;
-                Some((node, role))
-            }
-            ProgramRootInput::Empty => None,
-        };
-        let root_use = *snapshot
-            .bindings()
-            .get(&root)
+        let compiled_root = program
+            .root(root)
             .ok_or_else(|| invalid("missing actual compiled expression root"))?;
-        let arena = root.arena();
-        let flow = snapshot
-            .flows()
-            .get(&arena)
-            .ok_or_else(|| invalid("missing actual root control arena"))?;
-        let definitions = snapshot
-            .roots()
-            .arenas()
-            .get(&arena)
-            .ok_or_else(|| invalid("missing actual root definitions"))?;
+        let input = compiled_root.scope;
+        program
+            .scope(input)
+            .ok_or_else(|| invalid("root input scope has no frozen layout"))?;
+        let root_use = compiled_root.use_id;
+        let flow = program.control_flow();
+        let definitions = program.definitions();
         let mut stack = vec![(root_use, false)];
         let mut seen = BTreeSet::new();
-        let mut effects = BTreeMap::<ProgramUseRef, ScopedExpressionEffects>::new();
+        let mut effects = BTreeMap::<ExpressionUseId, ScopedExpressionEffects>::new();
         let mut has_invocation_data = false;
         while let Some((use_id, exiting)) = stack.pop() {
             work.step()?;
@@ -389,27 +345,30 @@ impl CompiledExpressionInstance {
                 .uses()
                 .get(&use_id)
                 .ok_or_else(|| invalid("missing actual expression occurrence"))?;
-            let occurrence = ProgramUseRef { arena, use_id };
+            let occurrence = use_id;
             if exiting {
                 let node = definitions
                     .node(invocation.definition)
                     .ok_or_else(|| invalid("missing actual expression definition"))?;
                 let summary = match node.kind() {
                     StaticExprKind::BoundCall { .. } => {
-                        let call = &checked.channels().expressions().resolved_calls().calls()
-                            [&ProgramCallSite::Expression(occurrence)];
-                        has_invocation_data |= matches!(
-                            call.specialization().prepared(),
-                            PreparedPureKernel::ScalarInvocation(_)
-                        );
-                        let summary = call.effects();
+                        let call = program
+                            .calls()
+                            .get(&occurrence)
+                            .ok_or_else(|| invalid("missing actual prepared scalar occurrence"))?;
+                        has_invocation_data |=
+                            matches!(call.prepared(), PreparedPureKernel::ScalarInvocation(_));
+                        let summary = *program
+                            .effects()
+                            .get(&occurrence)
+                            .ok_or_else(|| invalid("missing prepared call effects"))?;
                         summary.for_use(invocation.context).map_err(|_| {
                             invalid("prepared call effects differ from actual occurrence")
                         })?;
                         summary
                     }
                     StaticExprKind::Constant(_)
-                    | StaticExprKind::SlotId(_)
+                    | StaticExprKind::Input
                     | StaticExprKind::NaryAnd { .. }
                     | StaticExprKind::NaryOr { .. }
                     | StaticExprKind::Not(_)
@@ -433,7 +392,8 @@ impl CompiledExpressionInstance {
                         let mut summary =
                             if matches!(node.kind(), StaticExprKind::PreparedArithmetic { .. }) {
                                 program
-                                    .arithmetic_recipe(occurrence)
+                                    .recipes()
+                                    .arithmetic(occurrence)
                                     .ok_or_else(|| {
                                         invalid("missing mandatory arithmetic effect recipe")
                                     })?
@@ -441,7 +401,8 @@ impl CompiledExpressionInstance {
                             } else if matches!(node.kind(), StaticExprKind::PreparedNativeNegate(_))
                             {
                                 program
-                                    .native_negate_recipe(occurrence)
+                                    .recipes()
+                                    .native_negate(occurrence)
                                     .ok_or_else(|| {
                                         invalid("missing mandatory native negate effect recipe")
                                     })?
@@ -449,41 +410,38 @@ impl CompiledExpressionInstance {
                             } else if matches!(node.kind(), StaticExprKind::PreparedNativeBitNot(_))
                             {
                                 program
-                                    .native_bitnot_recipe(occurrence)
+                                    .recipes()
+                                    .native_bitnot(occurrence)
                                     .ok_or_else(|| {
                                         invalid("missing mandatory native BitwiseNot effect recipe")
                                     })?
                                     .own_effects(invocation.context)
                             } else if matches!(node.kind(), StaticExprKind::PreparedLike { .. }) {
                                 program
-                                    .native_like_recipe(occurrence)
+                                    .recipes()
+                                    .native_like(occurrence)
                                     .ok_or_else(|| invalid("missing mandatory LIKE effect recipe"))?
                                     .own_effects(invocation.context)
                             } else if matches!(node.kind(), StaticExprKind::PreparedInList { .. }) {
                                 program
-                                    .native_inlist_recipe(occurrence)
+                                    .recipes()
+                                    .native_inlist(occurrence)
                                     .ok_or_else(|| invalid("missing mandatory IN effect recipe"))?
                                     .own_effects(invocation.context)
                             } else if let StaticExprKind::PreparedBetween { plan, .. } = node.kind()
                             {
                                 let lower = program
-                                .comparison_recipe(
-                                    novarocks_local_program::ProgramComparisonSite::BetweenLower(
-                                        occurrence,
-                                    ),
-                                )
-                                .ok_or_else(|| {
-                                    invalid("missing mandatory BETWEEN lower effect recipe")
-                                })?;
+                                    .recipes()
+                                    .comparison(ComparisonSite::BetweenLower(occurrence))
+                                    .ok_or_else(|| {
+                                        invalid("missing mandatory BETWEEN lower effect recipe")
+                                    })?;
                                 let upper = program
-                                .comparison_recipe(
-                                    novarocks_local_program::ProgramComparisonSite::BetweenUpper(
-                                        occurrence,
-                                    ),
-                                )
-                                .ok_or_else(|| {
-                                    invalid("missing mandatory BETWEEN upper effect recipe")
-                                })?;
+                                    .recipes()
+                                    .comparison(ComparisonSite::BetweenUpper(occurrence))
+                                    .ok_or_else(|| {
+                                        invalid("missing mandatory BETWEEN upper effect recipe")
+                                    })?;
                                 if lower.operator() != plan.lower()
                                     || upper.operator() != plan.upper()
                                 {
@@ -494,7 +452,8 @@ impl CompiledExpressionInstance {
                                 lower.own_effects(invocation.context)
                             } else if matches!(node.kind(), StaticExprKind::PreparedCast { .. }) {
                                 program
-                                    .cast_recipe(occurrence)
+                                    .recipes()
+                                    .cast(occurrence)
                                     .ok_or_else(|| invalid("missing mandatory cast effect recipe"))?
                                     .own_effects(invocation.context)
                             } else if matches!(
@@ -502,7 +461,8 @@ impl CompiledExpressionInstance {
                                 StaticExprKind::PreparedNullSafeComparison { .. }
                             ) {
                                 program
-                                    .null_safe_comparison_recipe(occurrence)
+                                    .recipes()
+                                    .null_safe_comparison(occurrence)
                                     .ok_or_else(|| {
                                         invalid("missing mandatory null-safe effect recipe")
                                     })?
@@ -511,16 +471,11 @@ impl CompiledExpressionInstance {
                                 ScopedExpressionEffects::pure_value(invocation.context)
                             };
                         for (ordinal, child) in invocation.arguments.iter().enumerate() {
-                            let child = *effects
-                                .get(&ProgramUseRef {
-                                    arena,
-                                    use_id: *child,
-                                })
-                                .ok_or_else(|| {
-                                    invalid("missing prepared ordered operand effects")
-                                })?;
+                            let child = *effects.get(child).ok_or_else(|| {
+                                invalid("missing prepared ordered operand effects")
+                            })?;
                             summary = summary
-                                .join_control_argument(child, flow.shared_flow(), ordinal)
+                                .join_control_argument(child, flow, ordinal)
                                 .map_err(|_| {
                                     invalid("operand effects differ from actual ordered context")
                                 })?;
@@ -540,7 +495,7 @@ impl CompiledExpressionInstance {
                 .ok_or_else(|| invalid("missing actual expression definition"))?;
             admit_node_result(node.data_type())?;
             match node.kind() {
-                StaticExprKind::Constant(_) | StaticExprKind::SlotId(_)
+                StaticExprKind::Constant(_) | StaticExprKind::Input
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.is_empty() => {}
                 StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. }
@@ -558,15 +513,15 @@ impl CompiledExpressionInstance {
                 StaticExprKind::PreparedCast { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1
-                        && program.cast_recipe(occurrence).is_some() => {}
+                        && program.recipes().cast(occurrence).is_some() => {}
                 StaticExprKind::PreparedNativeNegate(_)
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1
-                        && program.native_negate_recipe(occurrence).is_some() => {}
+                        && program.recipes().native_negate(occurrence).is_some() => {}
                 StaticExprKind::PreparedNativeBitNot(_)
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1
-                        && program.native_bitnot_recipe(occurrence).is_some() => {}
+                        && program.recipes().native_bitnot(occurrence).is_some() => {}
                 StaticExprKind::PreparedInList {
                     values, is_not_in, ..
                 } if invocation.control
@@ -574,11 +529,11 @@ impl CompiledExpressionInstance {
                         negated: *is_not_in,
                     })
                     && invocation.arguments.len() == values.len() + 1
-                    && program.native_inlist_recipe(occurrence).is_some() => {}
+                    && program.recipes().native_inlist(occurrence).is_some() => {}
                 StaticExprKind::PreparedLike { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 2
-                        && program.native_like_recipe(occurrence).is_some() => {}
+                        && program.recipes().native_like(occurrence).is_some() => {}
                 StaticExprKind::PreparedBetween { plan, .. }
                     if invocation.control
                         == (ControlShape::Between {
@@ -586,51 +541,37 @@ impl CompiledExpressionInstance {
                         })
                         && invocation.arguments.len() == 4
                         && program
-                            .comparison_recipe(
-                                novarocks_local_program::ProgramComparisonSite::BetweenLower(
-                                    occurrence,
-                                ),
-                            )
+                            .recipes()
+                            .comparison(ComparisonSite::BetweenLower(occurrence))
                             .is_some()
                         && program
-                            .comparison_recipe(
-                                novarocks_local_program::ProgramComparisonSite::BetweenUpper(
-                                    occurrence,
-                                ),
-                            )
+                            .recipes()
+                            .comparison(ComparisonSite::BetweenUpper(occurrence))
                             .is_some() => {}
                 StaticExprKind::PreparedArithmetic { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 2
-                        && program.arithmetic_recipe(occurrence).is_some() => {}
+                        && program.recipes().arithmetic(occurrence).is_some() => {}
                 StaticExprKind::PreparedNullSafeComparison { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 2
-                        && program.null_safe_comparison_recipe(occurrence).is_some() => {}
+                        && program.recipes().null_safe_comparison(occurrence).is_some() => {}
                 kind if kind.ordinary_comparison().is_some()
                     && invocation.control == ControlShape::Eager
                     && invocation.arguments.len() == 2
                     && program
-                        .comparison_recipe(novarocks_local_program::ProgramComparisonSite::Binary(
-                            occurrence,
-                        ))
+                        .recipes()
+                        .comparison(ComparisonSite::Binary(occurrence))
                         .is_some() => {}
                 StaticExprKind::Case { .. }
                     if matches!(invocation.control, ControlShape::Case { .. })
                         && guarded::supports_result(node.data_type()) => {}
                 StaticExprKind::BoundCall { .. } => {
-                    let call = checked
-                        .channels()
-                        .expressions()
-                        .resolved_calls()
+                    let call = program
                         .calls()
-                        .get(&ProgramCallSite::Expression(occurrence))
+                        .get(&occurrence)
                         .ok_or_else(|| invalid("missing actual prepared scalar occurrence"))?;
-                    admit_call_protocol(
-                        invocation.control,
-                        call.specialization().prepared(),
-                        node.data_type(),
-                    )?;
+                    admit_call_protocol(invocation.control, call.prepared(), node.data_type())?;
                 }
                 _ => {
                     return Err(invalid(
@@ -868,9 +809,12 @@ impl CompiledExpressionInstance {
         if input.num_rows() != selection.batch_rows() {
             return Err(invalid("selection differs from actual input batch rows").into());
         }
-        let Some((input_node, input_role)) = self.input else {
-            // The explicit empty port: no field, no metadata and one row, so
-            // the root is evaluated exactly once per call.
+        let layout = self
+            .program
+            .scope(self.input)
+            .ok_or_else(|| invalid("root input scope has no frozen layout"))?;
+        if self.program.scopes().is_empty() {
+            // Preserve the explicit empty one-row input contract.
             let schema = input.schema();
             work.flush()?;
             let empty =
@@ -881,19 +825,8 @@ impl CompiledExpressionInstance {
                     invalid("actual input differs from the root's empty one-row port").into(),
                 );
             }
-            return self.evaluate_root::<E>(
-                input,
-                None,
-                actual_domain,
-                selection,
-                activation,
-                work,
-            );
-        };
-        let channels = self.program.checked().channels();
-        let layout = channels
-            .channel_layout(input_node, input_role)
-            .ok_or_else(|| invalid("root input port has no frozen layout"))?;
+            return self.evaluate_root::<E>(input, actual_domain, selection, activation, work);
+        }
         work.flush()?;
         let schema = input.schema();
         let frozen = layout.schema();
@@ -930,14 +863,9 @@ impl CompiledExpressionInstance {
         // its complete logical declaration was checked above. Missing Slot
         // materialization remains an error, including under empty selection.
         for (ordinal, array) in input.columns_with_ordinals() {
-            let ordinal = u32::try_from(ordinal).map_err(|_| KernelFailure::ResourceExhausted)?;
-            let ty = channels
-                .channel_type(ProgramChannelSite::Layout {
-                    node: input_node,
-                    role: input_role,
-                    ordinal,
-                })
-                .ok_or_else(|| invalid("missing exact incoming channel type"))?;
+            let ty = layout
+                .ordinal_type(ordinal)
+                .ok_or_else(|| invalid("missing exact incoming scope type"))?;
             work.flush()?;
             validate_evaluated_argument_observed(
                 EvaluatedArgument::Column(array),
@@ -947,58 +875,32 @@ impl CompiledExpressionInstance {
             )?;
             work.step()?;
         }
-        self.evaluate_root::<E>(
-            input,
-            Some((input_node, input_role)),
-            actual_domain,
-            selection,
-            activation,
-            work,
-        )
+        self.evaluate_root::<E>(input, actual_domain, selection, activation, work)
     }
     /// Original checked lexical Slot facts for this actual root. Repeated
     /// occurrences may name one ordinal; consumers deduplicate coordinates.
     /// This exposes no evaluator, value algorithm or resource authority.
     pub(crate) fn required_input_columns(&self) -> impl Iterator<Item = usize> + '_ {
-        let checked = self.program.checked();
-        self.effects
-            .keys()
-            .flat_map(move |occurrence| {
-                checked.slots().get(occurrence).copied().into_iter().chain(
-                    checked
-                        .lambdas()
-                        .get(occurrence)
-                        .into_iter()
-                        .flat_map(|binding| binding.captures.iter().copied()),
-                )
-            })
-            .filter_map(|source| match source {
-                ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                    node,
-                    role,
-                    ordinal,
-                }) if Some((node, role)) == self.input => Some(ordinal as usize),
-                _ => None,
-            })
+        self.effects.keys().filter_map(|occurrence| {
+            self.program
+                .input(*occurrence)
+                .filter(|source| source.scope == self.input)
+                .map(|source| source.ordinal as usize)
+        })
     }
     fn evaluate_root<'a, E: scalar_invocation::FrameFailure>(
         &mut self,
         input: CompiledInputLoan<'_>,
-        input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
         actual_domain: Selection<'a>,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
         work: &mut Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, E> {
-        let checked = self.program.checked();
-        let typed = checked.channels().expressions();
-        let snapshot = typed.resolved_calls().snapshot();
-        let flow = &snapshot.flows()[&self.root.arena()];
         let result = guarded::evaluate_tree::<E>(
             &self.program,
             self.root,
             input,
-            input_node,
+            self.input,
             actual_domain,
             selection,
             activation,
@@ -1007,10 +909,14 @@ impl CompiledExpressionInstance {
             &self.effects,
             work,
         )?;
-        let root_use = snapshot.bindings()[&self.root];
-        let invocation = &flow.uses()[&root_use];
-        let FunctionArgumentType::Value(ty) = typed
-            .definition_type(self.root.arena(), invocation.definition)
+        let root = self
+            .program
+            .root(self.root)
+            .ok_or_else(|| invalid("missing actual compiled expression root"))?;
+        let FunctionArgumentType::Value(ty) = self
+            .program
+            .types()
+            .get(root.definition.index())
             .ok_or_else(|| invalid("missing actual root value type"))?
         else {
             return Err(invalid("actual root is not a value").into());

@@ -35,16 +35,13 @@ use arrow::{
     datatypes::DataType,
     record_batch::RecordBatch,
 };
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::PureKernelAbi;
 use novarocks_functions::{FunctionKind, KernelFailure, ScalarInvocationActivation, Selection};
-use novarocks_local_program::{
-    ProgramExpressionRootSite, ProgramNodeKind, ProgramRootInput, ProgramStateTemplate,
-    root_input_layout,
-};
+use novarocks_local_program::{ProgramNodeKind, ProgramRootRef, ProgramUnitId};
 use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TopUpPolicy};
-use novarocks_physical_plan::{
-    ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
-};
+use novarocks_physical_plan::FunctionArgumentType;
+use novarocks_physical_plan::StaticFunctionArgument;
 
 use novarocks_type_contract::ValueLogicalType;
 use novarocks_types::{
@@ -161,7 +158,9 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
     let mut source_calls = 0;
     let mut column_arguments = BTreeMap::new();
     for fragment in source.plan().fragments().values() {
-        for (expression_id, expression) in fragment.expressions().iter() {
+        for (_source_node, unit, expression_id, expression) in
+            super::sql_test_source::unit_definitions(fragment)
+        {
             let ExprKind::FunctionCall { function, args } = &expression.kind else {
                 continue;
             };
@@ -177,10 +176,7 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
                 function.result_type.logical_type(),
                 ValueLogicalType::Physical
             );
-            let request = fragment
-                .call_requests()
-                .get(PhysicalCallDefinition::Expression(*expression_id))
-                .unwrap();
+            let request = unit.requests().get(expression_id).unwrap();
             assert_eq!(request.logical_argument_count, arity(name));
             assert_eq!(request.arguments.len(), arity(name));
             for (argument_ordinal, ((child, bound), requested)) in args
@@ -202,9 +198,8 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
                 assert_eq!(bound, value_type);
                 assert_eq!(value_type.data_type(), &ty);
                 assert_eq!(value_type.logical_type(), ValueLogicalType::Physical);
-                assert_eq!(&fragment.expressions().get(*child).unwrap().ty, bound);
-                let ExprKind::Value(value) = fragment.expressions().get(*child).unwrap().kind
-                else {
+                assert_eq!(&unit.definition(*child).unwrap().ty, bound);
+                let ExprKind::Value(value) = unit.definition(*child).unwrap().kind else {
                     panic!("the original typed column remains a Value child")
                 };
                 let scan = fragment
@@ -236,44 +231,37 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
     let mut found = None;
     for program in compiler_results(&source, &installed_builtin_owner_catalogue()).into_values() {
         let program = Arc::new(program.unwrap());
-        for call in program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()
-            .values()
-        {
-            let ProgramStateTemplate::Scalar { scope, kernel } = call.state_template() else {
-                continue;
-            };
-            if kernel.contract().function_id() != &id {
-                continue;
+        for (unit_index, unit) in program.units().iter().enumerate() {
+            for (use_id, call) in unit.calls() {
+                let novarocks_functions::PreparedPureKernel::Scalar(kernel) = call.prepared()
+                else {
+                    continue;
+                };
+                if kernel.contract().function_id() != &id {
+                    continue;
+                }
+                assert_eq!(call.implementation().abi, PureKernelAbi::ScalarV1);
+                assert!(kernel.invocation_resource_profile().is_some());
+                assert_eq!(kernel.contract().value_argument_types().len(), arity(name));
+                for argument in kernel.contract().value_argument_types() {
+                    assert_eq!(argument.data_type(), &ty);
+                    assert_eq!(argument.logical_type(), ValueLogicalType::Physical);
+                }
+                assert_eq!(kernel.contract().result_type().data_type(), &ty);
+                assert!(kernel.contract().result_type().nullable());
+                assert_eq!(kernel.contract().call(), call.call_contract());
+                assert_eq!(kernel.contract().effects(), call.call_contract().effects());
+                let root = ProgramRootRef::new(
+                    ProgramUnitId::new(unit_index),
+                    unit.root_of_use(*use_id).unwrap(),
+                );
+                assert!(found.replace((program.clone(), root)).is_none());
             }
-            assert_eq!(call.implementation().abi, PureKernelAbi::ScalarV1);
-            assert!(kernel.invocation_resource_profile().is_some());
-            assert_eq!(kernel.contract().value_argument_types().len(), arity(name));
-            for argument in kernel.contract().value_argument_types() {
-                assert_eq!(argument.data_type(), &ty);
-                assert_eq!(argument.logical_type(), ValueLogicalType::Physical);
-            }
-            assert_eq!(kernel.contract().result_type().data_type(), &ty);
-            assert!(kernel.contract().result_type().nullable());
-            assert_eq!(kernel.contract().call(), call.call_contract());
-            assert_eq!(kernel.contract().effects(), call.call_contract().effects());
-            assert!(found.replace((program.clone(), scope.root)).is_none());
         }
     }
     let (program, root) = found.expect("actual SQL installs exactly one bitwise ScalarV1");
-    let ProgramRootInput::Layout { node, role } = root_input_layout(program.graph(), root).unwrap()
-    else {
-        panic!("actual scalar input layout")
-    };
-    let layout = program
-        .checked()
-        .channels()
-        .channel_layout(node, role)
-        .unwrap();
+    let unit = program.unit(root.unit).unwrap();
+    let layout = unit.scope(unit.root(root.root).unwrap().scope).unwrap();
     let input = RecordBatch::try_new(
         layout.schema().clone(),
         layout
@@ -309,8 +297,12 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
         } else {
             Selection::all(4)
         };
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), root, &funded).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(root.unit).unwrap().clone(),
+            root.root,
+            &funded,
+        )
+        .unwrap();
         let mut journal = RuntimeScalarMemoryJournal::default();
         let result = frame
             .evaluate_runtime(
@@ -367,7 +359,12 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
         assert_eq!(journal.body.stopped, Some(Ok(())));
     }
     let missing = control(None);
-    let mut frame = CompiledExpressionInstance::try_new(program.clone(), root, &missing).unwrap();
+    let mut frame = CompiledExpressionInstance::try_new(
+        program.unit(root.unit).unwrap().clone(),
+        root.root,
+        &missing,
+    )
+    .unwrap();
     assert_eq!(
         evaluate_all(&mut frame, root, &input, &missing)
             .unwrap_err()
@@ -381,18 +378,32 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
         ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
     ));
     if filter {
-        let ProgramExpressionRootSite::Node { node, .. } = root else {
-            panic!("actual ordered Filter")
-        };
+        let node = program
+            .graph()
+            .nodes()
+            .iter()
+            .find(|node| match node.kind() {
+                ProgramNodeKind::Filter { predicates, .. } => predicates.contains(&root),
+                ProgramNodeKind::Scan { residuals, .. } => residuals.contains(&root),
+                _ => false,
+            })
+            .expect("actual ordered Filter or Scan owns this root");
         assert!(matches!(
-            program.graph().nodes()[node.index()].kind(),
+            node.kind(),
             ProgramNodeKind::Filter { .. } | ProgramNodeKind::Scan { .. }
         ));
+        let predicates = match node.kind() {
+            ProgramNodeKind::Filter { predicates, .. } => predicates.as_ref(),
+            ProgramNodeKind::Scan { residuals, .. } => residuals.as_slice(),
+            _ => unreachable!("actual filtered node checked above"),
+        };
+        let roots = predicates
+            .iter()
+            .map(|site| (program.unit(site.unit).unwrap().clone(), site.root))
+            .collect::<Vec<_>>();
         for has_binding in [false, true] {
             let control = control(has_binding.then_some(&binding));
-            let mut filter =
-                CompiledFilterConjunctionInstance::try_new(program.clone(), node, &control)
-                    .unwrap();
+            let mut filter = CompiledFilterConjunctionInstance::try_new(&roots, &control).unwrap();
             let mut journal = RuntimeScalarMemoryJournal::default();
             let result = filter.evaluate_required_runtime(
                 &input,

@@ -36,12 +36,10 @@ fn percentile_union_actual_original_required_sql_binding_and_state_source() {
                     }
                     let request = fragment
                         .call_requests()
-                        .get(PhysicalCallDefinition::Relational(
-                            PhysicalCallSite::Aggregate {
-                                node: node.id,
-                                call: ordinal as u32,
-                            },
-                        ))
+                        .get(PhysicalCallSite::Aggregate {
+                            node: node.id,
+                            call: ordinal as u32,
+                        })
                         .unwrap();
                     assert_eq!(request.logical_argument_count, 1);
                     assert_eq!(call.binding.logical_argument_count, 1);

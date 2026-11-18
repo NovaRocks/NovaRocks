@@ -27,22 +27,17 @@ use std::time::Duration;
 use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
 use novarocks_functions::{ConstantPool, KernelFailure, Selection};
-use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind,
-};
+use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_physical_plan::{
-    BinaryOperator, ConstantPoolId, ConstantPools, ConstantReference, ExprId, ExprKind, Fragment,
-    FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput,
-    FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, NodeId, PhysicalExpressionRoots,
-    PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
-    RequiredContracts, ResultField, ResultPort, ValueOrigin,
+    ConstantPoolId, ConstantPools, ConstantReference, FragmentCuts, FragmentId, FragmentPackage,
+    FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentPruning, NodeId,
+    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
+    ResultField, ResultPort, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
-    ExpressionInvocation, ExpressionUseId, FunctionValueType, SemanticParameterId,
+    CompilePhase, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
     arithmetic_result_value_type_with_op,
 };
@@ -161,8 +156,10 @@ fn values_program_with_sources(
             let expr = match cell {
                 Cell::Literal(value) => builder.constant(VALUES, ty, value.clone()),
                 Cell::Constant(source, ordinal) => builder
-                    .add_expression(
-                        VALUES,
+                    .unit(VALUES)
+                    .unwrap()
+                    .add(
+                        None,
                         ty,
                         ExprKind::Constant(ConstantReference {
                             pool: ConstantPoolId::new(*source),
@@ -172,8 +169,10 @@ fn values_program_with_sources(
                     .unwrap(),
                 Cell::Cast(source, ordinal) => {
                     let constant = builder
-                        .add_expression(
-                            VALUES,
+                        .unit(VALUES)
+                        .unwrap()
+                        .add(
+                            None,
                             pools[*source as usize].value_type().clone(),
                             ExprKind::Constant(ConstantReference {
                                 pool: ConstantPoolId::new(*source),
@@ -182,8 +181,10 @@ fn values_program_with_sources(
                         )
                         .unwrap();
                     builder
-                        .add_expression(
-                            VALUES,
+                        .unit(VALUES)
+                        .unwrap()
+                        .add(
+                            None,
                             ty,
                             ExprKind::Cast {
                                 expr: constant,
@@ -217,8 +218,10 @@ fn values_program_with_sources(
                         crate::exec::operators::family_fixture::constant_sources::i64(1),
                     );
                     builder
-                        .add_expression(
-                            VALUES,
+                        .unit(VALUES)
+                        .unwrap()
+                        .add(
+                            None,
                             sum,
                             ExprKind::Binary {
                                 op: BinaryOperator::Add,
@@ -231,7 +234,12 @@ fn values_program_with_sources(
                         .unwrap()
                 }
             };
-            exprs.push(expr);
+            let root = builder
+                .unit(VALUES)
+                .unwrap()
+                .root(expr, EvaluationDemand::Value, RootScope::AllPorts)
+                .unwrap();
+            exprs.push(root);
         }
         cells.push(exprs.into_boxed_slice());
     }
@@ -247,14 +255,21 @@ fn values_program_with_sources(
     for &input in &columns {
         let ty = builder.value(input).unwrap().ty.clone();
         let expr = builder
-            .add_expression(PROJECT, ty.clone(), ExprKind::Value(input))
+            .unit(PROJECT)
+            .unwrap()
+            .add(None, ty.clone(), ExprKind::Value(input))
+            .unwrap();
+        let expr = builder
+            .unit(PROJECT)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         let output = builder
             .add_value(
                 ty,
                 ValueOrigin::Expr {
                     node: PROJECT,
-                    expr,
+                    root: expr,
                 },
             )
             .unwrap();
@@ -269,6 +284,7 @@ fn values_program_with_sources(
             projected.into_boxed_slice(),
         )
         .unwrap();
+    super::family_fixture::seal_no_call_units(&mut builder);
     let fragment = builder
         .finish_definition(
             PROJECT,
@@ -282,39 +298,6 @@ fn values_program_with_sources(
         )
         .unwrap();
     compile(package(fragment, constants), 1)
-}
-
-/// Author one eager use per actual occurrence, children before parents.
-fn visit(
-    fragment: &Fragment,
-    definition: ExprId,
-    demand: EvaluationDemand,
-    next: &mut u32,
-    uses: &mut Vec<ExpressionInvocation<ExprId>>,
-) -> ExpressionUseId {
-    let use_id = ExpressionUseId::new(*next);
-    *next += 1;
-    let children = match &fragment.expressions().get(definition).unwrap().kind {
-        ExprKind::Cast { expr, .. } => vec![*expr],
-        ExprKind::Binary { left, right, .. } => vec![*left, *right],
-        ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
-        other => panic!("fixture authors no control for {other:?}"),
-    };
-    let arguments = children
-        .into_iter()
-        .map(|child| visit(fragment, child, EvaluationDemand::Value, next, uses))
-        .collect::<Vec<_>>();
-    uses.push(ExpressionInvocation {
-        context: ExpressionEffectContext {
-            use_id,
-            region: EvaluationRegionId::new(0),
-            demand,
-        },
-        definition,
-        control: ControlShape::Eager,
-        arguments: arguments.into_boxed_slice(),
-    });
-    use_id
 }
 
 fn package(
@@ -340,30 +323,6 @@ fn package_with_parameters(
     let (fragment, sources) = fragment.into_parts();
     let mut constants = constants;
     crate::exec::operators::family_fixture::constant_sources::merge(&mut constants, &sources);
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let mut next = 0;
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    for (site, root) in roots.sites() {
-        bindings.push((
-            *site,
-            visit(&fragment, root.expr, root.demand, &mut next, &mut uses),
-        ));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: EvaluationRegionId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &FixtureControl).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &FixtureControl).unwrap();
     let output = fragment.nodes()[&fragment.root()].output.clone();
     let result = ResultPort {
         scalar_schema: None,
@@ -393,8 +352,7 @@ fn package_with_parameters(
                 version: PlanVersionId::try_new([57; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: constant_policy(),
                 pruning: FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
@@ -435,11 +393,15 @@ fn oracle(cell: &Cell) -> Option<i64> {
     }
 }
 
-fn cell_site(row: u32, column: u32) -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(0),
-        role: ProgramNodeExpressionRole::ValuesCell { row, column },
-    }
+fn cell_site(program: &LocalProgram, row: u32, column: u32) -> Option<ProgramRootRef> {
+    let ProgramNodeKind::Values { values } = program.graph().nodes()[0].kind() else {
+        panic!("the actual fixture source is Values");
+    };
+    values
+        .dynamic_cells()
+        .iter()
+        .find(|cell| cell.row == row && cell.column == column)
+        .map(|cell| cell.definition)
 }
 
 fn failure(program: &Arc<LocalProgram>) -> ExecutionFailure {
@@ -536,7 +498,7 @@ fn values_failing_cell_is_a_typed_required_error_of_its_own_root() {
         panic!("expected a required-expression row error, got {failure:?}")
     };
     // Row-major evaluation reports the first failing cell, as v1 did.
-    assert_eq!(required.root(), cell_site(1, 0));
+    assert_eq!(required.root(), cell_site(&program, 1, 0).unwrap().root);
     assert_eq!(required.batch_row(), 0);
     assert_eq!(required.error().message(), OVERFLOW);
 }
@@ -562,9 +524,13 @@ fn values_cell_root_is_evaluated_only_over_its_empty_one_row_port() {
         )
         .unwrap()
     };
-    let mut instance =
-        CompiledExpressionInstance::try_new(Arc::clone(&program), cell_site(1, 1), &control)
-            .unwrap();
+    let site = cell_site(&program, 1, 1).unwrap();
+    let mut instance = CompiledExpressionInstance::try_new(
+        program.unit(site.unit).unwrap().clone(),
+        site.root,
+        &control,
+    )
+    .unwrap();
     let output = instance
         .evaluate(&empty(1), Selection::all(1), &control)
         .unwrap();
@@ -585,19 +551,19 @@ fn values_cell_root_is_evaluated_only_over_its_empty_one_row_port() {
     )
     .unwrap();
     for (input, rows) in [(empty(2), 2), (wide, 1)] {
-        let mut instance =
-            CompiledExpressionInstance::try_new(Arc::clone(&program), cell_site(1, 1), &control)
-                .unwrap();
+        let mut instance = CompiledExpressionInstance::try_new(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &control,
+        )
+        .unwrap();
         assert!(matches!(
             instance.evaluate(&input, Selection::all(rows), &control),
             Err(KernelFailure::InvalidProgram(_))
         ));
     }
-    // A constant cell is backing, not a root.
-    assert!(
-        CompiledExpressionInstance::try_new(Arc::clone(&program), cell_site(0, 1), &control)
-            .is_err()
-    );
+    // A constant cell stays in backing rather than the dynamic-cell execution table.
+    assert!(cell_site(&program, 0, 1).is_none());
 }
 
 #[path = "compiled_root_result_boundary_tests.rs"]

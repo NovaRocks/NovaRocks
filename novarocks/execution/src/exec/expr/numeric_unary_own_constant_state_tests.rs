@@ -18,8 +18,7 @@
 //! Mixed independent source: root promotion must never retag an OWN CV.
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
-    FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
-    StaticFunctionArgument,
+    FunctionArgumentType, NodeKind, PhysicalCallSite, StaticFunctionArgument,
 };
 use novarocks_sql::compiler::{
     SqlCompileControl, ordinary_extrema_constant_state_source_for_test,
@@ -50,12 +49,10 @@ fn check(maximum: bool) {
             for (ordinal, call) in calls.iter().enumerate() {
                 let request = fragment
                     .call_requests()
-                    .get(PhysicalCallDefinition::Relational(
-                        PhysicalCallSite::Aggregate {
-                            node: node.id,
-                            call: u32::try_from(ordinal).unwrap(),
-                        },
-                    ))
+                    .get(PhysicalCallSite::Aggregate {
+                        node: node.id,
+                        call: u32::try_from(ordinal).unwrap(),
+                    })
                     .unwrap();
                 let StaticFunctionArgument::Value {
                     value_type,
@@ -75,7 +72,13 @@ fn check(maximum: bool) {
                     );
                     assert_eq!(call.arguments.len(), 1);
                     assert_eq!(
-                        &fragment.expressions().get(call.arguments[0]).unwrap().ty,
+                        {
+                            let unit = fragment.unit(node.id).unwrap();
+                            &unit
+                                .definition(unit.root(call.arguments[0]).unwrap().definition)
+                                .unwrap()
+                                .ty
+                        },
                         value_type,
                         "the request retains the completed producer's full FVT"
                     );

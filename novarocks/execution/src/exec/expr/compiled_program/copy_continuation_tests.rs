@@ -371,7 +371,8 @@ fn alias_prepared(ty: &FunctionValueType) -> Arc<dyn novarocks_functions::Prepar
             use_id: ExpressionUseId::new(1),
             region: EvaluationRegionId::new(17),
             demand: EvaluationDemand::Value,
-        },
+        }
+        .into(),
         argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
         function_id: &function_id,
         kind: FunctionKind::Scalar,

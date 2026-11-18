@@ -29,24 +29,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::datatypes::DataType;
+use novarocks_expression_contract::{BinaryOperator, ExprKind, RootOrdinal, RootScope};
 use novarocks_local_program::{
-    JoinDistributionMode, JoinType, LocalProgram, NestedLoopJoinType, ProgramExpressionRootSite,
-    ProgramNodeExpressionRole, ProgramNodeKind,
+    JoinDistributionMode, JoinType, LocalProgram, NestedLoopJoinType, ProgramNodeKind,
 };
 use novarocks_physical_plan::{
-    BinaryOperator, Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning,
-    EdgeSource, ExprId, ExprKind, Fragment, FragmentId, FragmentPackage, FragmentPackageAdmission,
-    FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, JoinDistribution, JoinKey, JoinKind,
-    JoinSide, NestLoopJoinDistribution, NodeId, NodeKind, PhysicalExpressionRoots, PhysicalPlan,
-    PhysicalRootUses, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField,
+    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId,
+    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink, FrozenFragmentPruning,
+    JoinDistribution, JoinKey, JoinKind, JoinSide, NestLoopJoinDistribution, NodeId, NodeKind,
+    PhysicalPlan, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField,
     ResultPort, RowMultiplicity, ValueId, ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
-    ArithmeticOperator, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
-    ExpressionInvocation, ExpressionUseId, FunctionValueType, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
-    arithmetic_result_value_type_with_op, control_argument_semantics,
+    ArithmeticOperator, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType,
+    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
+    SemanticParameters, arithmetic_result_value_type_with_op,
 };
 use novarocks_types::UniqueId;
 
@@ -331,6 +328,26 @@ fn admission() -> FragmentPackageAdmission {
     }
 }
 
+/// Author one actual input read and declare its explicit node/port root.
+fn value_root(
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+    node: NodeId,
+    ty: FunctionValueType,
+    value: ValueId,
+    scope: RootScope,
+) -> RootOrdinal {
+    let definition = builder
+        .unit(node)
+        .unwrap()
+        .add(None, ty, ExprKind::Value(value))
+        .unwrap();
+    builder
+        .unit(node)
+        .unwrap()
+        .root(definition, EvaluationDemand::Value, scope)
+        .unwrap()
+}
+
 /// Add the join of `left` and `right` and return its physical output.
 fn add_join(
     builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
@@ -344,26 +361,28 @@ fn add_join(
     let (right_node, r) = right;
     let key = match spec.family {
         Family::Hash { null_safe, .. } => Some(JoinKey {
-            left: builder
-                .add_expression(join, int64(true), ExprKind::Value(l[0]))
-                .unwrap(),
-            right: builder
-                .add_expression(join, int64(true), ExprKind::Value(r[0]))
-                .unwrap(),
+            left: value_root(builder, join, int64(true), l[0], RootScope::Port(0)),
+            right: value_root(builder, join, int64(true), r[0], RootScope::Port(1)),
             null_safe,
         }),
         Family::NestLoop => None,
     };
     let residual = spec.residual.then(|| {
         let x = builder
-            .add_expression(join, int64(true), ExprKind::Value(l[1]))
+            .unit(join)
+            .unwrap()
+            .add(None, int64(true), ExprKind::Value(l[1]))
             .unwrap();
         let y = builder
-            .add_expression(join, int64(true), ExprKind::Value(r[1]))
+            .unit(join)
+            .unwrap()
+            .add(None, int64(true), ExprKind::Value(r[1]))
             .unwrap();
         builder
-            .add_expression(
-                join,
+            .unit(join)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Boolean, true),
                 ExprKind::Binary {
                     left: x,
@@ -388,6 +407,44 @@ fn add_join(
         ))
     } else {
         residual
+    };
+    let residual = if matches!(spec.family, Family::Hash { .. }) {
+        residual.map(|definition| {
+            builder
+                .unit(join)
+                .unwrap()
+                .root(
+                    definition,
+                    if spec.kind == JoinKind::NullAwareLeftAnti {
+                        EvaluationDemand::Value
+                    } else {
+                        EvaluationDemand::TruthOnly
+                    },
+                    RootScope::AllPorts,
+                )
+                .unwrap()
+        })
+    } else {
+        None
+    };
+    let nested_predicate = if matches!(spec.family, Family::NestLoop) {
+        nested_predicate.map(|definition| {
+            builder
+                .unit(join)
+                .unwrap()
+                .root(
+                    definition,
+                    if matches!(spec.kind, JoinKind::NullAwareLeftAnti | JoinKind::LeftMark) {
+                        EvaluationDemand::Value
+                    } else {
+                        EvaluationDemand::TruthOnly
+                    },
+                    RootScope::AllPorts,
+                )
+                .unwrap()
+        })
+    } else {
+        None
     };
     let mut extend = |of: ValueId| {
         builder
@@ -639,6 +696,7 @@ pub(super) fn single_plan_with_dop(
         spec,
         Placement::Single,
     );
+    super::family_fixture::seal_no_call_units(&mut builder);
     let fragment = builder
         .finish_definition(
             join,
@@ -680,6 +738,7 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
             &[int64(true), int64(true)],
             &literal_rows(rows),
         );
+        super::family_fixture::seal_no_call_units(&mut builder);
         let fragment = builder
             .finish_definition(
                 node,
@@ -736,6 +795,7 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
         spec,
         placement,
     );
+    super::family_fixture::seal_no_call_units(&mut builder);
     let join_fragment = builder
         .finish_definition(
             join,
@@ -759,6 +819,7 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
         |_| Distribution::Singleton,
         RowMultiplicity::SingleCopy,
     );
+    super::family_fixture::seal_no_call_units(&mut builder);
     let result_fragment = builder
         .finish_definition(
             receiver,
@@ -810,127 +871,31 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
         .unwrap_or_else(|error| panic!("the exchanged join plan validates: {error:?}"))
 }
 
-/// One eager use per actual occurrence: a value or literal leaf, or a binary
-/// comparison over its two ordered operands. Join fragments freeze no call.
-fn freeze(fragment: &Fragment) -> PhysicalRootUses {
-    struct Author<'a> {
-        fragment: &'a Fragment,
-        next: u32,
-        uses: Vec<ExpressionInvocation<ExprId>>,
-        domains: Vec<ExpressionEvaluationRegion>,
-    }
-    impl Author<'_> {
-        fn visit(
-            &mut self,
-            expr: ExprId,
-            domain: EvaluationRegionId,
-            demand: EvaluationDemand,
-        ) -> ExpressionUseId {
-            let id = ExpressionUseId::new(self.next);
-            self.next += 1;
-            let source = &self.fragment.expressions().get(expr).unwrap().kind;
-            let shape = match source {
-                ExprKind::InList { negated, .. } => ControlShape::Membership { negated: *negated },
-                _ => ControlShape::Eager,
-            };
-            let children = match source {
-                ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
-                ExprKind::InList { expr, list, .. } => {
-                    std::iter::once(*expr).chain(list.iter().copied()).collect()
-                }
-                other => panic!("join fixture has no {other:?}"),
-            };
-            let arguments = children
-                .iter()
-                .enumerate()
-                .map(|(ordinal, &child)| {
-                    let (child_demand, guard) =
-                        control_argument_semantics(shape, children.len(), ordinal, demand).unwrap();
-                    let child_region = if let Some(kind) = guard {
-                        let child_region = EvaluationRegionId::new(self.domains.len() as u32);
-                        self.domains.push(ExpressionEvaluationRegion {
-                            id: child_region,
-                            parent: Some(domain),
-                            guard: Some(novarocks_type_contract::RegionGuard { owner: id, kind }),
-                        });
-                        child_region
-                    } else {
-                        domain
-                    };
-                    self.visit(child, child_region, child_demand)
-                })
-                .collect::<Vec<_>>();
-            self.uses.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id: id,
-                    region: domain,
-                    demand,
-                },
-                definition: expr,
-                control: shape,
-                arguments: arguments.into_boxed_slice(),
-            });
-            id
-        }
-    }
-    let domain = EvaluationRegionId::new(0);
-    let mut author = Author {
-        fragment,
-        next: 0,
-        uses: Vec::new(),
-        domains: vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-    };
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let bindings = roots
-        .sites()
-        .iter()
-        .map(|(&site, root)| (site, author.visit(root.expr, domain, root.demand)))
-        .collect::<Vec<_>>();
-    let flow = ExpressionControlFlow::try_new(
-        author.domains,
-        author.uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap()
-}
-
 pub(super) fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
-    let mut pruning = BTreeMap::new();
-    let mut admissions = BTreeMap::new();
-    for (id, fragment) in plan.fragments() {
-        let root_uses = freeze(fragment);
-        calls.insert(
-            *id,
-            FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &FixtureControl).unwrap(),
-        );
-        uses.insert(*id, root_uses);
-        pruning.insert(
-            *id,
-            FrozenFragmentPruning::try_new(*id, vec![], &FixtureControl).unwrap(),
-        );
-        admissions.insert(*id, admission());
-    }
+    let pruning = plan
+        .fragments()
+        .keys()
+        .map(|id| {
+            (
+                *id,
+                FrozenFragmentPruning::try_new(*id, vec![], &FixtureControl).unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let admissions = plan
+        .fragments()
+        .keys()
+        .map(|id| (*id, admission()))
+        .collect::<BTreeMap<_, _>>();
     extract_fragment_packages(
         plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,
     )
-    .unwrap_or_else(|error| panic!("join packages extract: {error:?}"))
+    .unwrap()
 }
 
 pub(super) fn compile(
@@ -941,6 +906,18 @@ pub(super) fn compile(
     let catalog = crate::exec::expr::compiled_program::tests::rng_subset();
     try_compile(package, &catalog, pipeline_dop, result)
         .unwrap_or_else(|error| panic!("join fragment compiles: {error}"))
+}
+
+/// Read the original local join declaration; this does not reconstruct roots.
+fn join_condition(
+    program: &LocalProgram,
+    node: novarocks_local_program::ProgramNodeId,
+) -> &novarocks_local_program::ProgramJoinCondition {
+    let ProgramNodeKind::Join { condition, .. } = program.graph().nodes()[node.index()].kind()
+    else {
+        panic!("actual compiled hash join");
+    };
+    condition
 }
 
 /// Every receiver of `program`, registered for `instance` with `senders`
@@ -1334,7 +1311,9 @@ fn overflowing(
     value: ValueId,
 ) -> ExprId {
     let read = builder
-        .add_expression(owner, int64(true), ExprKind::Value(value))
+        .unit(owner)
+        .unwrap()
+        .add(None, int64(true), ExprKind::Value(value))
         .unwrap();
     let max = builder.constant(
         owner,
@@ -1346,8 +1325,10 @@ fn overflowing(
             .unwrap();
     assert_eq!(ty, int64(true));
     builder
-        .add_expression(
-            owner,
+        .unit(owner)
+        .unwrap()
+        .add(
+            None,
             ty,
             ExprKind::Binary {
                 op: BinaryOperator::Add,
@@ -1386,19 +1367,33 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
     let join = builder.reserve_node_id().unwrap();
     let read = |builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder, value| {
         builder
-            .add_expression(join, int64(true), ExprKind::Value(value))
+            .unit(join).unwrap().add(None, int64(true), ExprKind::Value(value))
             .unwrap()
     };
     let key = JoinKey {
-        left: if at == Overflow::ProbeKey {
-            overflowing(&mut builder, join, l[0])
-        } else {
-            read(&mut builder, l[0])
+        left: {
+            let definition = if at == Overflow::ProbeKey {
+                overflowing(&mut builder, join, l[0])
+            } else {
+                read(&mut builder, l[0])
+            };
+            builder
+                .unit(join)
+                .unwrap()
+                .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+                .unwrap()
         },
-        right: if at == Overflow::BuildKey {
-            overflowing(&mut builder, join, r[0])
-        } else {
-            read(&mut builder, r[0])
+        right: {
+            let definition = if at == Overflow::BuildKey {
+                overflowing(&mut builder, join, r[0])
+            } else {
+                read(&mut builder, r[0])
+            };
+            builder
+                .unit(join)
+                .unwrap()
+                .root(definition, EvaluationDemand::Value, RootScope::Port(1))
+                .unwrap()
         },
         null_safe: false,
     };
@@ -1406,8 +1401,10 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
         let x = overflowing(&mut builder, join, l[1]);
         let y = read(&mut builder, r[1]);
         builder
-            .add_expression(
-                join,
+            .unit(join)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Boolean, true),
                 ExprKind::Binary {
                     left: x,
@@ -1417,6 +1414,13 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
                     allow_throw_exception: None,
                 },
             )
+            .unwrap()
+    });
+    let residual = residual.map(|definition| {
+        builder
+            .unit(join)
+            .unwrap()
+            .root(definition, EvaluationDemand::TruthOnly, RootScope::AllPorts)
             .unwrap()
     });
     let output = vec![l[0], l[1], r[0], r[1]];
@@ -1441,6 +1445,7 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
             },
         )
         .unwrap();
+    super::family_fixture::seal_no_call_units(&mut builder);
     let fragment = builder
         .finish_definition(
             join,
@@ -1469,20 +1474,16 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
 
 #[test]
 fn key_and_residual_row_errors_are_required_errors_of_their_own_roots() {
-    for (at, role) in [
-        (
-            Overflow::ProbeKey,
-            ProgramNodeExpressionRole::JoinProbeKey { key: 0 },
-        ),
-        (
-            Overflow::BuildKey,
-            ProgramNodeExpressionRole::JoinBuildKey { key: 0 },
-        ),
-        (Overflow::Residual, ProgramNodeExpressionRole::JoinResidual),
-    ] {
+    for at in [Overflow::ProbeKey, Overflow::BuildKey, Overflow::Residual] {
         let mut packages = packages(&overflow_plan(at));
         let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
         let join = program.graph().root();
+        let condition = join_condition(&program, join);
+        let expected = match at {
+            Overflow::ProbeKey => condition.keys()[0].probe,
+            Overflow::BuildKey => condition.keys()[0].build,
+            Overflow::Residual => condition.residual_predicate().unwrap(),
+        };
         let output = ResultSinkBuffer::new();
         let prepared = prepare_compiled_program_pipeline_execution(
             Arc::clone(&program),
@@ -1512,11 +1513,7 @@ fn key_and_residual_row_errors_are_required_errors_of_their_own_roots() {
         let ExecutionFailureCause::RequiredRow(required) = failure.cause() else {
             panic!("{at:?}: expected a required-expression row error, got {failure:?}")
         };
-        assert_eq!(
-            required.root(),
-            ProgramExpressionRootSite::Node { node: join, role },
-            "{at:?}"
-        );
+        assert_eq!(required.root(), expected.root, "{at:?}");
         // The first key row, or the first candidate pair, overflows.
         assert_eq!(required.batch_row(), 0, "{at:?}");
         assert!(
@@ -3086,13 +3083,10 @@ fn b3_residual_gathers_only_original_referenced_columns_from_published_pages() {
     control.bind_construction_factory(Arc::clone(&factory));
     control.bind_runtime_memory(&runtime);
     let host = control.allocator().unwrap();
-    let site = ProgramExpressionRootSite::Node {
-        node,
-        role: ProgramNodeExpressionRole::JoinResidual,
-    };
+    let site = join_condition(&program, node).residual_predicate().unwrap();
     let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-        Arc::clone(&program),
-        site,
+        Arc::clone(program.unit(site.unit).unwrap()),
+        site.root,
         &control,
         Some(Arc::clone(&host)),
     )
@@ -3200,12 +3194,20 @@ fn authored_naa_plan(
         columns
             .iter()
             .map(|&(column, null_safe)| JoinKey {
-                left: builder
-                    .add_expression(join, int64(true), ExprKind::Value(l[column]))
-                    .unwrap(),
-                right: builder
-                    .add_expression(join, int64(true), ExprKind::Value(r[column]))
-                    .unwrap(),
+                left: value_root(
+                    &mut builder,
+                    join,
+                    int64(true),
+                    l[column],
+                    RootScope::Port(0),
+                ),
+                right: value_root(
+                    &mut builder,
+                    join,
+                    int64(true),
+                    r[column],
+                    RootScope::Port(1),
+                ),
                 null_safe,
             })
             .collect::<Vec<_>>()
@@ -3229,12 +3231,16 @@ fn authored_naa_plan(
         NaaEligibilityFixture::LateOverflow => {
             let build = overflowing(&mut builder, join, r[0]);
             let probe = builder
-                .add_expression(join, int64(true), ExprKind::Value(l[1]))
+                .unit(join)
+                .unwrap()
+                .add(None, int64(true), ExprKind::Value(l[1]))
                 .unwrap();
             Some(
                 builder
-                    .add_expression(
-                        join,
+                    .unit(join)
+                    .unwrap()
+                    .add(
+                        None,
                         FunctionValueType::new(DataType::Boolean, true),
                         ExprKind::Binary {
                             left: build,
@@ -3248,6 +3254,13 @@ fn authored_naa_plan(
             )
         }
     };
+    let eligibility = eligibility.map(|definition| {
+        builder
+            .unit(join)
+            .unwrap()
+            .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+            .unwrap()
+    });
     let required =
         [left_node, right_node].map(|node| builder.node_output_properties(node).unwrap().clone());
     builder
@@ -3270,6 +3283,7 @@ fn authored_naa_plan(
             },
         )
         .unwrap();
+    super::family_fixture::seal_no_call_units(&mut builder);
     let fragment = builder
         .finish_definition(
             join,
@@ -3493,10 +3507,10 @@ fn b3_naa_required_eligibility_error_keeps_sparse_original_pair_row_after_earlie
     };
     assert_eq!(
         required.root(),
-        ProgramExpressionRootSite::Node {
-            node: program.graph().root(),
-            role: ProgramNodeExpressionRole::NaaEligibility
-        }
+        join_condition(&program, program.graph().root())
+            .residual_predicate()
+            .unwrap()
+            .root
     );
     assert_eq!(
         required.batch_row(),
@@ -3578,10 +3592,24 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
         )[0];
         let join = builder.reserve_node_id().unwrap();
         let probe = builder
-            .add_expression(join, json.clone(), ExprKind::Value(l))
+            .unit(join)
+            .unwrap()
+            .add(None, json.clone(), ExprKind::Value(l))
             .unwrap();
         let build = builder
-            .add_expression(join, json.clone(), ExprKind::Value(r))
+            .unit(join)
+            .unwrap()
+            .add(None, json.clone(), ExprKind::Value(r))
+            .unwrap();
+        let probe = builder
+            .unit(join)
+            .unwrap()
+            .root(probe, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
+        let build = builder
+            .unit(join)
+            .unwrap()
+            .root(build, EvaluationDemand::Value, RootScope::Port(1))
             .unwrap();
         let mark = builder
             .add_value(boolean.clone(), ValueOrigin::JoinMark { node: join })
@@ -3612,6 +3640,7 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
                 },
             )
             .unwrap();
+        super::family_fixture::seal_no_call_units(&mut builder);
         let fragment = builder
             .finish_definition(
                 join,

@@ -243,13 +243,7 @@ impl CompiledJoinFrame {
         let mut columns = funded_vec(work.owner, width)?;
         for (column, key) in scope.iter().enumerate() {
             work.control.checkpoint(1)?;
-            let key_ordinal = u32::try_from(column).map_err(|_| {
-                build_contract("join scope root ordinal exceeds its frozen u32 representation")
-            })?;
-            let site = ProgramExpressionRootSite::Node {
-                node: plan.node,
-                role: ProgramNodeExpressionRole::NaaScopeBuildKey { key: key_ordinal },
-            };
+            let site = key.build;
             types.push(root_value_type(&self.program, site)?);
             modes.push(mode(key.null_safe));
             columns.push(column);

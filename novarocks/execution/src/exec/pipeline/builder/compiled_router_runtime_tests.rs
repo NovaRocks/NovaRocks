@@ -24,10 +24,12 @@ mod router_runtime_tests {
     use crate::runtime::exchange::{ExchangeColumnBinding, ExchangePopResult};
     use crate::runtime::task::io::{ExchangeReceiverKey, ExchangeReceiverRegistration};
     use crate::runtime::task::sink::materialize_compiled_sink_for_pipeline;
+    use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
     use novarocks_physical_plan as p;
     use novarocks_spi::connector::{
         ConnectorRowMutationEffect as Effect, ConnectorWriteFieldToken, ConnectorWriteRouteId,
     };
+    use novarocks_type_contract::EvaluationDemand;
 
     const SOURCE: UniqueId = UniqueId::new(0x761, 1);
     const UPSTREAM: UniqueId = UniqueId::new(0x760, 1);
@@ -104,12 +106,18 @@ mod router_runtime_tests {
         } else {
             let cells = rows
                 .iter()
-                .map(|&value| -> Box<[p::ExprId]> {
-                    Box::from([builder.constant(
+                .map(|&value| -> Box<[RootOrdinal]> {
+                    let definition = builder.constant(
                         values,
                         int64(),
                         crate::exec::operators::family_fixture::constant_sources::i64(value),
-                    )])
+                    );
+                    let root = builder
+                        .unit(values)
+                        .unwrap()
+                        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+                        .unwrap();
+                    Box::from([root])
                 })
                 .collect::<Box<[_]>>();
             builder
@@ -136,8 +144,22 @@ mod router_runtime_tests {
             )
             .unwrap();
         let assignment = builder
-            .add_expression(expand, int64(), p::ExprKind::Value(input))
+            .unit(expand)
+            .unwrap()
+            .add(None, int64(), ExprKind::Value(input))
             .unwrap();
+        let events = [Effect::Insert, Effect::Replace, Effect::Delete].map(|effect| {
+            let root = builder
+                .unit(expand)
+                .unwrap()
+                .root(assignment, EvaluationDemand::Value, RootScope::Port(0))
+                .unwrap();
+            p::ChangeEventSpec {
+                predicate: None,
+                effect,
+                assignments: Box::from([p::ChangeAssignment::exact(data, Some(root))]),
+            }
+        });
         builder
             .add_row_consuming(
                 expand,
@@ -147,18 +169,7 @@ mod router_runtime_tests {
                 Box::from([effect, data]),
                 p::NodeKind::ChangeEventExpand {
                     effect_output: effect,
-                    events: [Effect::Insert, Effect::Replace, Effect::Delete]
-                        .map(|effect| p::ChangeEventSpec {
-                            predicate: None,
-                            effect,
-                            assignments: Box::from([
-                                novarocks_physical_plan::ChangeAssignment::exact(
-                                    data,
-                                    Some(assignment),
-                                ),
-                            ]),
-                        })
-                        .into(),
+                    events: events.into(),
                 },
             )
             .unwrap();
@@ -282,6 +293,7 @@ mod router_runtime_tests {
             columns: summary_columns,
             author: p::SummaryAuthor::RouterSink,
         }]));
+        crate::exec::operators::family_fixture::seal_no_call_units(&mut builder);
         let fragment = builder
             .finish_definition(
                 expand,
@@ -298,17 +310,13 @@ mod router_runtime_tests {
             )
             .unwrap();
         let (fragment, constants) = fragment.into_parts();
-        let uses = root_uses(&fragment);
-        let calls =
-            p::FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &FixtureControl).unwrap();
         let package = p::FragmentPackage::try_new(
             p::FragmentPackageInput {
                 constants,
                 version: p::PlanVersionId::try_new([61; 16]).unwrap(),
                 required: p::RequiredContracts::default(),
                 fragment,
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: options(None).constants,
                 pruning: p::FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 cuts: p::FragmentCuts {
@@ -391,17 +399,24 @@ mod router_runtime_tests {
             .unwrap();
         let cells = rows
             .iter()
-            .map(|value| -> Box<[p::ExprId]> {
-                Box::from([builder.constant(
+            .map(|value| -> Box<[RootOrdinal]> {
+                let definition = builder.constant(
                     values,
                     int64(),
                     crate::exec::operators::family_fixture::constant_sources::i64(*value),
-                )])
+                );
+                let root = builder
+                    .unit(values)
+                    .unwrap()
+                    .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+                    .unwrap();
+                Box::from([root])
             })
             .collect::<Box<[_]>>();
         builder
             .add_values(values, cells, Box::from([value]))
             .unwrap();
+        crate::exec::operators::family_fixture::seal_no_call_units(&mut builder);
         let fragment = builder
             .finish_definition(
                 values,
@@ -421,9 +436,6 @@ mod router_runtime_tests {
     ) -> p::FragmentPackage {
         let (fragment, constants) = fragment.into_parts();
         let fragment_id = fragment.id();
-        let uses = root_uses(&fragment);
-        let calls =
-            p::FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &FixtureControl).unwrap();
         let projected = p::CutValue {
             value: source,
             ty: int64(),
@@ -434,8 +446,7 @@ mod router_runtime_tests {
                 version: p::PlanVersionId::try_new([60; 16]).unwrap(),
                 required: p::RequiredContracts::default(),
                 fragment,
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: options(None).constants,
                 pruning: p::FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 cuts: p::FragmentCuts {

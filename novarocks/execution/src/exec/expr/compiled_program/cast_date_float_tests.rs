@@ -121,16 +121,7 @@ fn date_float_actual_compiler_profiles_sparse_slice_empty_and_native_constants()
                     let rows = [0, 1, 3, 4];
                     let selection = Selection::try_sparse(5, &rows).unwrap();
                     let mut evaluator = instance(&program);
-                    let snapshot = program
-                        .checked()
-                        .channels()
-                        .expressions()
-                        .resolved_calls()
-                        .snapshot();
-                    let occurrence = ProgramUseRef {
-                        arena: root().arena(),
-                        use_id: snapshot.bindings()[&root()],
-                    };
+                    let occurrence = cast_root_use(&program);
                     let summary = evaluator.effects[&occurrence];
                     assert!(
                         summary

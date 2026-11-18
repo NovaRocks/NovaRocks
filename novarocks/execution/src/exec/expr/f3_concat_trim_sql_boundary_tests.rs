@@ -27,19 +27,20 @@ use arrow::{
     datatypes::{DataType, Field},
     record_batch::RecordBatch,
 };
+use novarocks_expression_contract::ExprKind;
+use novarocks_expression_contract::RootScope;
 use novarocks_functions::{
     ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument, FunctionId, FunctionKind,
     InstalledPureKernel, KernelEvaluationControl, KernelFailure, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi, Selection,
 };
-use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind,
-};
+use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_physical_plan::{
-    ExprKind, FragmentBuilder, FragmentId, FragmentSink, NodeId, PipelineDopDomain, ResultField,
-    ResultPort, ValueDef, ValueId, ValueOrigin,
+    FragmentBuilder, FragmentId, NodeId, ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
 };
-use novarocks_type_contract::{CompilePhase, ControlShape, FunctionValueType, SemanticParameters};
+use novarocks_type_contract::{
+    CompilePhase, ControlShape, EvaluationDemand, FunctionValueType, SemanticParameters,
+};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -53,9 +54,9 @@ const WHITE: &str = "\t\n\u{b}\u{c}\r \u{85}\u{a0}\u{1680}\u{2000}\u{2001}\u{200
 #[test]
 fn c12_p2_concat_real_sql_calls_keep_ordered_child_type_correspondence_for_compiled() {
     use crate::exec::expr::sql_test_source::sql_source_with_declared_fields;
-    use novarocks_physical_plan::{
-        ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
-    };
+    use novarocks_expression_contract::ExprKind;
+    use novarocks_physical_plan::FunctionArgumentType;
+    use novarocks_physical_plan::StaticFunctionArgument;
 
     {
         for name in CONCAT_NAMES {
@@ -68,17 +69,14 @@ fn c12_p2_concat_real_sql_calls_keep_ordered_child_type_correspondence_for_compi
             let owner = sql_source_with_declared_fields(sql, &fields);
             let mut count = 0;
             for f in owner.plan().fragments().values() {
-                for (id, node) in f.expressions().iter() {
+                for (_source_node, unit, id, node) in super::sql_test_source::unit_definitions(f) {
                     let ExprKind::FunctionCall { function, args } = &node.kind else {
                         continue;
                     };
                     if function.function_id.as_str() != format!("builtin.scalar/{name}/v1") {
                         continue;
                     }
-                    let request = f
-                        .call_requests()
-                        .get(PhysicalCallDefinition::Expression(*id))
-                        .unwrap();
+                    let request = unit.requests().get(id).unwrap();
                     let arity = if name == "concat" { 3 } else { 4 };
                     assert_eq!(args.len(), arity);
                     assert_eq!(request.logical_argument_count, arity);
@@ -100,7 +98,7 @@ fn c12_p2_concat_real_sql_calls_keep_ordered_child_type_correspondence_for_compi
                         };
                         assert_eq!(value_type, selected);
                         assert_eq!(selected, &FunctionValueType::new(DataType::Utf8, true));
-                        let child = f.expressions().get(*arg).unwrap();
+                        let child = unit.definition(*arg).unwrap();
                         assert_eq!(&child.ty, selected);
                         assert!(!matches!(child.kind, ExprKind::Constant(_)));
                     }
@@ -119,9 +117,9 @@ fn c12_p2_concat_real_sql_calls_keep_ordered_child_type_correspondence_for_compi
 #[test]
 fn c12_p1_trim_real_sql_column_calls_keep_ordered_requests_for_compiled() {
     use crate::exec::expr::sql_test_source::sql_source_with_single_field;
-    use novarocks_physical_plan::{
-        ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
-    };
+    use novarocks_expression_contract::ExprKind;
+    use novarocks_physical_plan::FunctionArgumentType;
+    use novarocks_physical_plan::StaticFunctionArgument;
 
     {
         for name in TRIM_NAMES {
@@ -131,17 +129,14 @@ fn c12_p1_trim_real_sql_column_calls_keep_ordered_requests_for_compiled() {
             );
             let mut count = 0;
             for f in owner.plan().fragments().values() {
-                for (id, node) in f.expressions().iter() {
+                for (_source_node, unit, id, node) in super::sql_test_source::unit_definitions(f) {
                     let ExprKind::FunctionCall { function, args } = &node.kind else {
                         continue;
                     };
                     if function.function_id.as_str() != format!("builtin.scalar/{name}/v1") {
                         continue;
                     }
-                    let request = f
-                        .call_requests()
-                        .get(PhysicalCallDefinition::Expression(*id))
-                        .unwrap();
+                    let request = unit.requests().get(id).unwrap();
                     assert_eq!(args.len(), 1);
                     assert_eq!(request.logical_argument_count, 1);
                     let StaticFunctionArgument::Value {
@@ -157,7 +152,7 @@ fn c12_p1_trim_real_sql_column_calls_keep_ordered_requests_for_compiled() {
                     };
                     assert_eq!(value_type, selected);
                     assert_eq!(selected, &FunctionValueType::new(DataType::Utf8, true));
-                    let child = f.expressions().get(args[0]).unwrap();
+                    let child = unit.definition(args[0]).unwrap();
                     assert_eq!(&child.ty, selected);
                     assert!(
                         !matches!(child.kind, ExprKind::Constant(_)),
@@ -236,7 +231,14 @@ fn compiled_slot_program(
         .unwrap();
         let reference = super::test_support::register_constant(&mut source_pools, &null);
         let literal = builder
-            .add_expression(input, ty.clone(), ExprKind::Constant(reference))
+            .unit(input)
+            .unwrap()
+            .add(None, ty.clone(), ExprKind::Constant(reference))
+            .unwrap();
+        let literal = builder
+            .unit(input)
+            .unwrap()
+            .root(literal, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -244,7 +246,7 @@ fn compiled_slot_program(
                 ty: ty.clone(),
                 origin: ValueOrigin::Expr {
                     node: input,
-                    expr: literal,
+                    root: literal,
                 },
             })
             .unwrap();
@@ -255,7 +257,9 @@ fn compiled_slot_program(
         } else {
             Some(
                 builder
-                    .add_expression(output, ty.clone(), ExprKind::Value(value))
+                    .unit(output)
+                    .unwrap()
+                    .add(None, ty.clone(), ExprKind::Value(value))
                     .unwrap(),
             )
         });
@@ -297,8 +301,10 @@ fn compiled_slot_program(
         // Preserve the actual source table before merging original request backings.
         args[index] = Some(
             builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     ty.clone(),
                     ExprKind::Constant(super::test_support::register_constant(
                         &mut source_pools,
@@ -334,12 +340,17 @@ fn compiled_slot_program(
     let author = host::author(&functions, name, requests, ControlShape::Eager);
     let result_ty = author.result();
     let call = host::call(&mut builder, &mut authors, author, args);
+    let call = builder
+        .unit(output)
+        .unwrap()
+        .root(call, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let value = builder
         .add_value(
             result_ty.clone(),
             ValueOrigin::Expr {
                 node: output,
-                expr: call,
+                root: call,
             },
         )
         .unwrap();
@@ -351,22 +362,10 @@ fn compiled_slot_program(
             Box::from([value]),
         )
         .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&result_ty),
             name: name.into(),
@@ -377,7 +376,8 @@ fn compiled_slot_program(
     };
     host::compile_checked_fragment_with_parameters(
         &functions,
-        fragment,
+        builder,
+        output,
         &authors,
         result,
         SemanticParameters::try_new([]).unwrap(),
@@ -385,10 +385,7 @@ fn compiled_slot_program(
     )
 }
 
-fn compiled_input(
-    program: &LocalProgram,
-    arrays: &[ArrayRef],
-) -> (RecordBatch, ProgramExpressionRootSite) {
+fn compiled_input(program: &LocalProgram, arrays: &[ArrayRef]) -> (RecordBatch, ProgramRootRef) {
     let root_id = program.graph().root();
     let node = program
         .graph()
@@ -396,7 +393,7 @@ fn compiled_input(
         .iter()
         .find(|n| n.local_id() == Some(root_id))
         .unwrap();
-    let ProgramNodeKind::Project { input, .. } = node.kind() else {
+    let ProgramNodeKind::Project { input, exprs, .. } = node.kind() else {
         panic!("actual compiled Project root")
     };
     let input_node = program
@@ -407,13 +404,7 @@ fn compiled_input(
         .unwrap();
     let batch =
         RecordBatch::try_new(input_node.output_layout().schema().clone(), arrays.to_vec()).unwrap();
-    (
-        batch,
-        ProgramExpressionRootSite::Node {
-            node: root_id,
-            role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-        },
-    )
+    (batch, exprs[0])
 }
 
 fn strings(values: &[Option<&str>]) -> ArrayRef {
@@ -433,8 +424,12 @@ fn assert_selections(
             || Selection::all(expected.len()),
             |rows| Selection::try_sparse(expected.len(), rows).unwrap(),
         );
-        let mut instance =
-            CompiledExpressionInstance::try_new(program.clone(), root, &HarnessControl).unwrap();
+        let mut instance = CompiledExpressionInstance::try_new(
+            program.unit(root.unit).unwrap().clone(),
+            root.root,
+            &HarnessControl,
+        )
+        .unwrap();
         let actual = instance
             .evaluate(&batch, selection, &HarnessControl)
             .unwrap();
@@ -603,8 +598,12 @@ fn concat_required_trim_child_control_survives_strict_null_and_latches() {
         let program = compiled_slot_program("concat", &arrays, None, trim_child);
         let (batch, root) = compiled_input(&program, &arrays);
         let good = ChildControl::default();
-        let mut instance =
-            CompiledExpressionInstance::try_new(program.clone(), root, &HarnessControl).unwrap();
+        let mut instance = CompiledExpressionInstance::try_new(
+            program.unit(root.unit).unwrap().clone(),
+            root.root,
+            &HarnessControl,
+        )
+        .unwrap();
         let actual = instance.evaluate(&batch, Selection::all(1), &good).unwrap();
         assert!(actual.errors().is_empty());
         assert!(actual.values().is_null(0));
@@ -628,8 +627,12 @@ fn concat_required_trim_child_control_survives_strict_null_and_latches() {
         trace: Mutex::new(vec![]),
         stop: Some(at),
     };
-    let mut instance =
-        CompiledExpressionInstance::try_new(program.clone(), root, &HarnessControl).unwrap();
+    let mut instance = CompiledExpressionInstance::try_new(
+        program.unit(root.unit).unwrap().clone(),
+        root.root,
+        &HarnessControl,
+    )
+    .unwrap();
     assert_eq!(
         instance
             .evaluate(&batch, Selection::all(1), &control)
@@ -648,7 +651,12 @@ fn concat_required_trim_child_control_survives_strict_null_and_latches() {
 
     // Empty positive-carrier demand must not scan the long child.
     let empty = ChildControl::default();
-    let mut instance = CompiledExpressionInstance::try_new(program, root, &HarnessControl).unwrap();
+    let mut instance = CompiledExpressionInstance::try_new(
+        program.unit(root.unit).unwrap().clone(),
+        root.root,
+        &HarnessControl,
+    )
+    .unwrap();
     let selection = Selection::try_sparse(1, &[]).unwrap();
     let actual = instance.evaluate(&batch, selection, &empty).unwrap();
     assert_eq!(actual.selection(), selection);

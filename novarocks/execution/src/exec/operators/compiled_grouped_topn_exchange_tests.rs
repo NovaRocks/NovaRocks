@@ -89,8 +89,23 @@ fn grouped_stage(
     call_base: u32,
 ) -> (NodeId, Vec<ValueId>) {
     let node = builder.reserve_node_id().unwrap();
-    let key = builder
-        .add_expression(node, int64(true), ExprKind::Value(columns[0]))
+    let unit = builder.unit(node).unwrap();
+    let definition = unit
+        .add(None, int64(true), ExprKind::Value(columns[0]))
+        .unwrap();
+    let group_key = unit
+        .root(
+            definition,
+            novarocks_type_contract::EvaluationDemand::Value,
+            novarocks_expression_contract::RootScope::Port(0),
+        )
+        .unwrap();
+    let order_key = unit
+        .root(
+            definition,
+            novarocks_type_contract::EvaluationDemand::Value,
+            novarocks_expression_contract::RootScope::Port(0),
+        )
         .unwrap();
     let mut output = vec![columns[0]];
     let mut calls = Vec::new();
@@ -99,13 +114,26 @@ fn grouped_stage(
         let phase = AggregatePhase::Intermediate {
             sequence: sequence(ordinal),
         };
-        let argument = builder
-            .add_expression(
-                node,
-                bound.intermediate_type(),
-                ExprKind::Value(columns[ordinal + 1]),
-            )
-            .unwrap();
+        let argument = {
+            let definition = builder
+                .unit(node)
+                .unwrap()
+                .add(
+                    None,
+                    bound.intermediate_type(),
+                    ExprKind::Value(columns[ordinal + 1]),
+                )
+                .unwrap();
+            builder
+                .unit(node)
+                .unwrap()
+                .root(
+                    definition,
+                    novarocks_type_contract::EvaluationDemand::Value,
+                    novarocks_expression_contract::RootScope::Port(0),
+                )
+                .unwrap()
+        };
         let value = builder
             .add_value(
                 bound.output_type(phase),
@@ -131,6 +159,7 @@ fn grouped_stage(
     }]);
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([required]),
@@ -141,7 +170,7 @@ fn grouped_stage(
             },
             kind: NodeKind::TopN {
                 order_by: Box::from([SortExpr {
-                    expr: key,
+                    expr: order_key,
                     direction: SortDirection::Ascending,
                     null_ordering: NullOrdering::First,
                 }]),
@@ -151,7 +180,7 @@ fn grouped_stage(
                     sequence: TopNSequenceId::new(42),
                 },
                 reduction: TopNReduction::GroupedStates {
-                    group_by: Box::from([(key, columns[0])]),
+                    group_by: Box::from([(group_key, columns[0])]),
                     calls: calls.into_boxed_slice(),
                     comparator:
                         novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1,
@@ -189,9 +218,22 @@ fn final_stage(
         AggregateGrouping::Complete,
     );
     let node = builder.reserve_node_id().unwrap();
-    let key = builder
-        .add_expression(node, int64(true), ExprKind::Value(columns[0]))
-        .unwrap();
+    let key = {
+        let definition = builder
+            .unit(node)
+            .unwrap()
+            .add(None, int64(true), ExprKind::Value(columns[0]))
+            .unwrap();
+        builder
+            .unit(node)
+            .unwrap()
+            .root(
+                definition,
+                novarocks_type_contract::EvaluationDemand::Value,
+                novarocks_expression_contract::RootScope::Port(0),
+            )
+            .unwrap()
+    };
     builder
         .add_top_n(
             node,
@@ -239,6 +281,7 @@ fn plan(
     limit: usize,
 ) -> (PhysicalPlan, novarocks_functions::PureEngineFunctionCatalog) {
     let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
 
     let catalog = aggregate_catalog(&[
         ("count", PureKernelAbi::AggregateWindowV1),
@@ -266,7 +309,14 @@ fn plan(
             .map(|(key, value)| vec![cell(*key), cell(*value)])
             .collect::<Vec<_>>(),
     );
-    let source = finish(source, leaf, FragmentSink::Stream { edge: TO_INNER }, 1);
+    let source = finish(
+        source,
+        leaf,
+        FragmentSink::Stream { edge: TO_INNER },
+        1,
+        &catalog,
+        &parameters,
+    );
     let mut inner = crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
         INNER,
         &fixture_sources,
@@ -313,7 +363,8 @@ fn plan(
     let mut result = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([123; 16]).unwrap(),
         &fixture_sources,
-    );
+    )
+    .with_semantic_parameters(parameters.clone());
     result.add_fragment(source).unwrap();
     if staged {
         result
@@ -322,6 +373,8 @@ fn plan(
                 first,
                 FragmentSink::Stream { edge: TO_OUTER },
                 2,
+                &catalog,
+                &parameters,
             ))
             .unwrap();
         let mut outer =
@@ -345,7 +398,7 @@ fn plan(
         let (second, second_output) =
             grouped_stage(&mut outer, receive_outer, &received, &bounds, limit, 40);
         let root = final_stage(&mut outer, second, &second_output, &bounds, limit);
-        let outer = finish(outer, root, FragmentSink::Result, 2);
+        let outer = finish(outer, root, FragmentSink::Result, 2, &catalog, &parameters);
         let port = result_port(&outer);
         result.add_fragment(outer).unwrap();
         result
@@ -360,7 +413,7 @@ fn plan(
         result.set_result_port(port).unwrap();
     } else {
         let root = final_stage(&mut inner, first, &first_output, &bounds, limit);
-        let inner = finish(inner, root, FragmentSink::Result, 2);
+        let inner = finish(inner, root, FragmentSink::Result, 2, &catalog, &parameters);
         let port = result_port(&inner);
         result.add_fragment(inner).unwrap();
         result.set_result_port(port).unwrap();
@@ -490,7 +543,7 @@ fn cross_instance_input(program: &LocalProgram, destinations: usize, limit: usiz
 
 fn execute(staged: bool, limit: usize) -> Vec<Output> {
     let (plan, catalog) = plan(staged, limit);
-    let mut packages = packages(&plan, &catalog);
+    let mut packages = packages(&plan);
     let source = compile(packages.remove(&SOURCE).unwrap(), &catalog, 1, false);
     let inner = compile(packages.remove(&INNER).unwrap(), &catalog, 2, !staged);
     let outer = staged.then(|| compile(packages.remove(&OUTER).unwrap(), &catalog, 2, true));

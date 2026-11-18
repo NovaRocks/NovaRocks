@@ -69,21 +69,21 @@ const BYTE_QUANTUM: usize = RootProfileV1::EMIT_BYTES_PER_TURN;
 const WORK_QUANTUM: usize = RootProfileV1::CELLS_PER_TURN;
 
 enum StatisticsConstantSource {
-    #[cfg(test)]
-    Fixture(Arc<[String]>),
     Compiled(Arc<novarocks_local_program::LocalProgram>),
 }
 impl StatisticsConstantSource {
-    fn blob(&self, expr: novarocks_local_program::ProgramExprId) -> Option<&str> {
+    fn blob(&self, expr: novarocks_local_program::ProgramRootRef) -> Option<&str> {
         match self {
-            #[cfg(test)]
-            Self::Fixture(literals) => literals.get(expr.index()).map(String::as_str),
-            Self::Compiled(program) => match program.graph().expressions().node(expr)?.kind() {
-                novarocks_local_program::StaticExprKind::Constant(value) => {
-                    Self::constant_blob(value)
+            Self::Compiled(program) => {
+                let unit = program.unit(expr.unit)?;
+                let root = unit.root(expr.root)?;
+                match unit.definitions().node(root.definition)?.kind() {
+                    novarocks_expression::StaticExprKind::Constant(value) => {
+                        Self::constant_blob(value)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
+            }
         }
     }
     fn constant_blob(value: &novarocks_functions::ConstantValue) -> Option<&str> {
@@ -145,7 +145,7 @@ pub(crate) struct StatisticsMaterializerFactory(Arc<Definition>);
 impl StatisticsMaterializerFactory {
     #[cfg(test)]
     fn from_test_facts(
-        literals: Arc<[String]>,
+        program: Arc<novarocks_local_program::LocalProgram>,
         value_slot: SlotId,
         literal_slots: Vec<SlotId>,
         mappings: Vec<UnpivotValueMapping>,
@@ -156,7 +156,7 @@ impl StatisticsMaterializerFactory {
         max_bytes: usize,
     ) -> ExecutionResult<Self> {
         Self::try_new_from_source(
-            StatisticsConstantSource::Fixture(literals),
+            StatisticsConstantSource::Compiled(program),
             value_slot,
             literal_slots,
             mappings,
@@ -1327,8 +1327,56 @@ mod tests {
         max_rows: usize,
         mappings: usize,
     ) -> ExecutionResult<StatisticsMaterializerFactory> {
-        let expr_id = novarocks_local_program::ProgramExprId::new(0);
-        let literals = Arc::from([blob]);
+        use crate::exec::operators::family_fixture::{self, constant_sources};
+        use novarocks_expression_contract::RootScope;
+        use novarocks_physical_plan::{ConstantPools, FragmentId, NodeId, ValueOrigin};
+        use novarocks_type_contract::{EvaluationDemand, FunctionValueType};
+
+        // This component still owns its original schema/funding fixture. Its
+        // scalar label now has a real program root, obtained from its author.
+        let sources = constant_sources::Sources::new();
+        let mut builder = constant_sources::FragmentBuilder::new(FragmentId::new(74), &sources);
+        let source = NodeId::new(0);
+        let project = NodeId::new(1);
+        let ty = FunctionValueType::new(DataType::Utf8, false);
+        family_fixture::values(&mut builder, source, &[], &[vec![]]);
+        let definition = builder.constant(
+            project,
+            ty.clone(),
+            constant_sources::utf8(blob.into_boxed_str()),
+        );
+        let root = builder
+            .unit(project)
+            .unwrap()
+            .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
+        let output = builder
+            .add_value(
+                ty,
+                ValueOrigin::Expr {
+                    node: project,
+                    root,
+                },
+            )
+            .unwrap();
+        builder
+            .add_project(
+                project,
+                source,
+                Box::from([(root, output)]),
+                Box::from([output]),
+            )
+            .unwrap();
+        let program = family_fixture::compile(
+            family_fixture::package(builder, project, ConstantPools::empty(), 1),
+            1,
+        );
+        let novarocks_local_program::ProgramNodeKind::Project { exprs, .. } =
+            program.graph().nodes()[program.graph().root().index()].kind()
+        else {
+            panic!("the label author is Project");
+        };
+        let expr_id = exprs[0];
         let mapping = UnpivotValueMapping {
             input_value_slot_id: SlotId::new(99),
             constants: vec![
@@ -1341,7 +1389,7 @@ mod tests {
             ],
         };
         StatisticsMaterializerFactory::from_test_facts(
-            literals,
+            program,
             SlotId::new(3),
             vec![SlotId::new(1), SlotId::new(2), SlotId::new(4)],
             vec![mapping; mappings],
@@ -1824,6 +1872,15 @@ mod tests {
             label_type.clone(),
             crate::exec::operators::family_fixture::constant_sources::utf8("theta".into()),
         );
+        let label = builder
+            .unit(target)
+            .unwrap()
+            .root(
+                label,
+                novarocks_type_contract::EvaluationDemand::Value,
+                novarocks_expression_contract::RootScope::Port(0),
+            )
+            .unwrap();
         let output = [list_binding, label_type, body_type, map_binding]
             .into_iter()
             .enumerate()

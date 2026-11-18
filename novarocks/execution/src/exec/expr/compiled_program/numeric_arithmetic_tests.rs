@@ -82,8 +82,10 @@ fn typed_program(
     let mut projections = Vec::new();
     for (id, ty) in &columns {
         let expression = builder
-            .add_expression(
-                input,
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -91,17 +93,19 @@ fn typed_program(
                 ),
             )
             .unwrap();
+        let root = builder
+            .unit(input)
+            .unwrap()
+            .root(expression, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *id,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr {
-                    node: input,
-                    expr: expression,
-                },
+                origin: ValueOrigin::Expr { node: input, root },
             })
             .unwrap();
-        projections.push((expression, *id));
+        projections.push((root, *id));
     }
     builder
         .add_project(
@@ -112,13 +116,17 @@ fn typed_program(
         )
         .unwrap();
     let left = builder
-        .add_expression(output, left_type.clone(), ExprKind::Value(columns[0].0))
+        .unit(output)
+        .unwrap()
+        .add(None, left_type.clone(), ExprKind::Value(columns[0].0))
         .unwrap();
     let right = if let Some(value) = right_literal {
         literal(&mut builder, &right_type, value, &mut source_pools)
     } else {
         builder
-            .add_expression(output, right_type.clone(), ExprKind::Value(columns[1].0))
+            .unit(output)
+            .unwrap()
+            .add(None, right_type.clone(), ExprKind::Value(columns[1].0))
             .unwrap()
     };
     let mut result_type =
@@ -127,8 +135,10 @@ fn typed_program(
         .with_nullable(true)
         .expect("valid test root nullability");
     let computed = builder
-        .add_expression(
-            output,
+        .unit(output)
+        .unwrap()
+        .add(
+            None,
             result_type.clone(),
             ExprKind::Binary {
                 op,
@@ -152,7 +162,9 @@ fn typed_program(
             );
             let (name, shape, arguments, defs) = if matches!(wrap, Wrap::If) {
                 let flag = builder
-                    .add_expression(output, boolean.clone(), ExprKind::Value(columns[2].0))
+                    .unit(output)
+                    .unwrap()
+                    .add(None, boolean.clone(), ExprKind::Value(columns[2].0))
                     .unwrap();
                 (
                     "if",
@@ -185,8 +197,10 @@ fn typed_program(
         Wrap::IsNull | Wrap::And | Wrap::Or => {
             result_type = FunctionValueType::new(DataType::Boolean, false);
             let is_null = builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     result_type.clone(),
                     ExprKind::IsNull {
                         expr: computed,
@@ -208,8 +222,10 @@ fn typed_program(
                     &mut source_pools,
                 );
                 builder
-                    .add_expression(
-                        output,
+                    .unit(output)
+                    .unwrap()
+                    .add(
+                        None,
                         result_type.clone(),
                         if matches!(wrap, Wrap::Or) {
                             ExprKind::Disjunction {
@@ -225,13 +241,15 @@ fn typed_program(
             }
         }
     };
+    let root = builder
+        .unit(output)
+        .unwrap()
+        .root(root, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let value = builder
         .add_value(
             result_type.clone(),
-            ValueOrigin::Expr {
-                node: output,
-                expr: root,
-            },
+            ValueOrigin::Expr { node: output, root },
         )
         .unwrap();
     builder
@@ -242,22 +260,10 @@ fn typed_program(
             Box::from([value]),
         )
         .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "arithmetic_result".into(),
@@ -266,7 +272,15 @@ fn typed_program(
             ty: result_type,
         }]),
     };
-    compile_arithmetic(&functions, fragment, &authors, result, allow, source_pools)
+    compile_arithmetic(
+        &functions,
+        builder,
+        output,
+        &authors,
+        result,
+        allow,
+        source_pools,
+    )
 }
 fn d128(ty: &FunctionValueType, values: &[Option<i128>]) -> ArrayRef {
     let DataType::Decimal128(p, s) = ty.data_type() else {
@@ -342,18 +356,10 @@ fn large_values(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<
         .collect()
 }
 fn exact_recipe(program: &LocalProgram) -> &PreparedArithmeticRecipe {
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let site = root();
-    program
-        .arithmetic_recipe(ProgramUseRef {
-            arena: site.arena(),
-            use_id: snapshot.bindings()[&site],
-        })
+    let reference = root(program);
+    let unit = program.unit(reference.unit).unwrap();
+    unit.recipes()
+        .arithmetic(unit.root(reference.root).unwrap().use_id)
         .unwrap()
 }
 

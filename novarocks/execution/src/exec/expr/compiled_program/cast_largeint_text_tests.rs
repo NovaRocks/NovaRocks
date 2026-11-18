@@ -46,16 +46,7 @@ fn largeint_text_actual_compiler_sparse_slice_null_empty_and_effects() {
             )
             .unwrap();
             let mut evaluator = instance(&program);
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            let occurrence = ProgramUseRef {
-                arena: root().arena(),
-                use_id: snapshot.bindings()[&root()],
-            };
+            let occurrence = cast_root_use(&program);
             let summary = evaluator.effects[&occurrence];
             assert!(
                 !summary

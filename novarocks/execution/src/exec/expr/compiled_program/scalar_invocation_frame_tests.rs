@@ -109,8 +109,10 @@ fn invocation_program_with(
     let mut items = Vec::new();
     for (value, ty) in &columns {
         let expr = builder
-            .add_expression(
-                input,
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -118,11 +120,19 @@ fn invocation_program_with(
                 ),
             )
             .unwrap();
+        let expr = builder
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *value,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr {
+                    node: input,
+                    root: expr,
+                },
             })
             .unwrap();
         items.push((expr, *value));
@@ -140,7 +150,9 @@ fn invocation_program_with(
         )
         .unwrap();
     let mut data = builder
-        .add_expression(output, source_type.clone(), ExprKind::Value(columns[0].0))
+        .unit(output)
+        .unwrap()
+        .add(None, source_type.clone(), ExprKind::Value(columns[0].0))
         .unwrap();
     let name_type = FunctionValueType::new(DataType::Utf8, false);
     let name = if source_mode == SourceMode::Slot {
@@ -171,8 +183,10 @@ fn invocation_program_with(
         .unwrap()
     };
     let name_expr = builder
-        .add_expression(
-            output,
+        .unit(output)
+        .unwrap()
+        .add(
+            None,
             name_type.clone(),
             ExprKind::Constant(crate::exec::expr::test_support::register_constant(
                 &mut source_pools,
@@ -186,8 +200,10 @@ fn invocation_program_with(
     };
     if source_mode == SourceMode::Computed {
         data = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 source_type.clone(),
                 ExprKind::Cast {
                     expr: data,
@@ -200,12 +216,16 @@ fn invocation_program_with(
             .unwrap();
     } else if source_mode == SourceMode::RequiredError {
         let tail = builder
-            .add_expression(output, tail_type.clone(), ExprKind::Value(columns[2].0))
+            .unit(output)
+            .unwrap()
+            .add(None, tail_type.clone(), ExprKind::Value(columns[2].0))
             .unwrap();
         let one_ty = FunctionValueType::new(DataType::Int64, false);
         let one = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 one_ty.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -223,11 +243,13 @@ fn invocation_program_with(
         )
         .unwrap();
         let remainder = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 remainder_ty,
                 ExprKind::Binary {
-                    op: novarocks_physical_plan::BinaryOperator::Modulo,
+                    op: novarocks_expression_contract::BinaryOperator::Modulo,
                     left: one,
                     right: tail,
                     decimal_overflow_policy:
@@ -238,8 +260,10 @@ fn invocation_program_with(
             .unwrap();
         let bool_ty = FunctionValueType::new(DataType::Boolean, true);
         let condition = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 bool_ty.clone(),
                 ExprKind::Cast {
                     expr: remainder,
@@ -271,11 +295,15 @@ fn invocation_program_with(
         SourceMode::IfThen | SourceMode::IfElse | SourceMode::NestedIf
     ) {
         let flag = builder
-            .add_expression(output, flag_type.clone(), ExprKind::Value(columns[1].0))
+            .unit(output)
+            .unwrap()
+            .add(None, flag_type.clone(), ExprKind::Value(columns[1].0))
             .unwrap();
         let null = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 source_type.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -285,11 +313,15 @@ fn invocation_program_with(
             .unwrap();
         if source_mode == SourceMode::NestedIf {
             let tail = builder
-                .add_expression(output, tail_type.clone(), ExprKind::Value(columns[2].0))
+                .unit(output)
+                .unwrap()
+                .add(None, tail_type.clone(), ExprKind::Value(columns[2].0))
                 .unwrap();
             let inner = builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     flag_type.clone(),
                     ExprKind::Cast {
                         expr: tail,
@@ -350,17 +382,27 @@ fn invocation_program_with(
                 author(&functions, "rand", vec![], ControlShape::Eager),
                 vec![],
             );
-            let ty = builder.expressions().get(random).unwrap().ty.clone();
+            let ty = builder
+                .construction_unit(output)
+                .unwrap()
+                .definition(random)
+                .unwrap()
+                .ty
+                .clone();
             definitions.push(random);
             arguments.push(argument(ty, None));
             continue;
         }
         let tail = builder
-            .add_expression(output, tail_type.clone(), ExprKind::Value(columns[2].0))
+            .unit(output)
+            .unwrap()
+            .add(None, tail_type.clone(), ExprKind::Value(columns[2].0))
             .unwrap();
         let zero = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 (FunctionValueType::new(DataType::Int64, false)).clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -379,11 +421,13 @@ fn invocation_program_with(
         )
         .unwrap();
         let divided = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 divided_type.clone(),
                 ExprKind::Binary {
-                    op: novarocks_physical_plan::BinaryOperator::Divide,
+                    op: novarocks_expression_contract::BinaryOperator::Divide,
                     left: tail,
                     right: zero,
                     decimal_overflow_policy:
@@ -413,13 +457,21 @@ fn invocation_program_with(
         author(&functions, "__array_struct_subfield", arguments, demand),
         definitions,
     );
-    let _ty = builder.expressions().get(projected).unwrap().ty.clone();
+    let _ty = builder
+        .construction_unit(output)
+        .unwrap()
+        .definition(projected)
+        .unwrap()
+        .ty
+        .clone();
     let expr = match guard {
         Guard::Direct => projected,
         Guard::And | Guard::Or => {
             let predicate = builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     FunctionValueType::new(DataType::Boolean, false),
                     ExprKind::IsNull {
                         expr: projected,
@@ -428,8 +480,10 @@ fn invocation_program_with(
                 )
                 .unwrap();
             let decisive = builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     (FunctionValueType::new(DataType::Boolean, false)).clone(),
                     checked_constants::kind(
                         &mut source_pools,
@@ -451,16 +505,16 @@ fn invocation_program_with(
                 }
             };
             builder
-                .add_expression(
-                    output,
-                    FunctionValueType::new(DataType::Boolean, false),
-                    kind,
-                )
+                .unit(output)
+                .unwrap()
+                .add(None, FunctionValueType::new(DataType::Boolean, false), kind)
                 .unwrap()
         }
         Guard::Filter => builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Boolean, false),
                 ExprKind::IsNull {
                     expr: projected,
@@ -473,8 +527,10 @@ fn invocation_program_with(
             // Data escapes before it can mask or produce a Boolean result.
             let predicate_type = FunctionValueType::new(DataType::Boolean, false);
             let predicate = builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     predicate_type.clone(),
                     ExprKind::IsNull {
                         expr: projected,
@@ -484,11 +540,15 @@ fn invocation_program_with(
                 .unwrap();
             let otherwise_type = FunctionValueType::new(DataType::Boolean, true);
             let flag = builder
-                .add_expression(output, flag_type.clone(), ExprKind::Value(columns[1].0))
+                .unit(output)
+                .unwrap()
+                .add(None, flag_type.clone(), ExprKind::Value(columns[1].0))
                 .unwrap();
             let otherwise = builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     otherwise_type.clone(),
                     checked_constants::kind(
                         &mut source_pools,
@@ -519,14 +579,36 @@ fn invocation_program_with(
         }
     };
     let (value, ty) = if matches!(guard, Guard::Filter) {
+        let expr = builder
+            .unit(output)
+            .unwrap()
+            .root(expr, EvaluationDemand::TruthOnly, RootScope::Port(0))
+            .unwrap();
         builder
             .add_filter(output, input, Box::from([expr]))
             .unwrap();
         (columns[0].0, columns[0].1.clone())
     } else {
-        let ty = builder.expressions().get(expr).unwrap().ty.clone();
+        let ty = builder
+            .construction_unit(output)
+            .unwrap()
+            .definition(expr)
+            .unwrap()
+            .ty
+            .clone();
+        let expr = builder
+            .unit(output)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         let value = builder
-            .add_value(ty.clone(), ValueOrigin::Expr { node: output, expr })
+            .add_value(
+                ty.clone(),
+                ValueOrigin::Expr {
+                    node: output,
+                    root: expr,
+                },
+            )
             .unwrap();
         builder
             .add_project(
@@ -538,22 +620,10 @@ fn invocation_program_with(
             .unwrap();
         (value, ty)
     };
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: id,
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: if matches!(guard, Guard::Filter) {
             // Filter preserves the complete three-column original input port.
             columns
@@ -595,7 +665,8 @@ fn invocation_program_with(
     };
     compile_checked_fragment_with_parameters(
         &functions,
-        fragment,
+        builder,
+        output,
         &authors,
         result,
         parameters,
@@ -640,8 +711,8 @@ fn tracked_instance(program: &Arc<LocalProgram>) -> (CompiledExpressionInstance,
     let host = crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
     (
         CompiledExpressionInstance::try_new_with_allocator(
-            program.clone(),
-            root(),
+            root_unit(program).clone(),
+            root(program).root,
             &Control,
             Some(host),
         )
@@ -664,7 +735,7 @@ fn scalar_invocation_case_insensitive_required_result_keeps_exact_type_and_clone
         let (mut instance, tracker) = tracked_instance(&program);
         let output = crate::exec::operators::compiled_expression::evaluate_all(
             &mut instance,
-            root(),
+            root(&program),
             &batch,
             &crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::default()),
         )
@@ -866,8 +937,17 @@ fn scalar_invocation_case_insensitive_result_is_the_same_in_boolean_and_filter_c
     let tracker = MemTracker::new_root("case-insensitive-filter-invocation");
     let host = crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
     let mut filter = super::super::CompiledFilterConjunctionInstance::try_new_with_allocator(
-        program,
-        ProgramNodeId::new(2),
+        &{
+            let ProgramNodeKind::Filter { predicates, .. } =
+                program.graph().nodes()[program.graph().root().index()].kind()
+            else {
+                panic!("actual ARRAY Filter")
+            };
+            predicates
+                .iter()
+                .map(|site| (program.unit(site.unit).unwrap().clone(), site.root))
+                .collect::<Vec<_>>()
+        },
         &Control,
         Some(host),
     )
@@ -899,11 +979,7 @@ fn scalar_invocation_three_compile_causes_remain_typed_at_actual_declaration_loa
     }
     let functions = actual_functions();
     let program = invocation_program(3, Guard::Direct);
-    let call = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
+    let call = root_unit(&program)
         .calls()
         .values()
         .find(|call| {
@@ -1111,7 +1187,7 @@ fn original_domain_required_child_row_outside_demand_stops_before_parent_instant
     let ExecutionFailureCause::RequiredRow(row) = error.cause() else {
         panic!("required child cannot be parent Data or invariant: {error:?}")
     };
-    assert_eq!(row.root(), root());
+    assert_eq!(row.root(), root(&program).root);
     assert_eq!(row.batch_row(), 1);
     assert_eq!(row.error().selected_ordinal(), 0);
     assert!(row.error().message().contains("zero"));

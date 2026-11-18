@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
 use novarocks_connector_contract::*;
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_functions::ConstantPolicy;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
@@ -47,9 +48,7 @@ use novarocks_local_program::{
 use novarocks_physical_plan::*;
 use novarocks_spi::connector::ConnectorScalarValue;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
-    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationRegion,
-    ExpressionInvocation, ExpressionUseId, PureCompileControl, control_argument_semantics,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, PureCompileControl,
 };
 
 use crate::exec::node::scan::ScanOp;
@@ -220,24 +219,45 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
         .unwrap();
     let cells = BUILD_KEYS
         .map(|key| {
-            Box::from([builder.constant(
+            let definition = builder.constant(
                 VALUES,
                 int64(),
                 crate::exec::operators::family_fixture::constant_sources::i64(key),
-            )])
+            );
+            Box::from([builder
+                .unit(VALUES)
+                .unwrap()
+                .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+                .unwrap()])
         })
         .into_iter()
         .collect();
     builder
         .add_values(VALUES, cells, Box::from([build]))
         .unwrap();
+    let probe = builder
+        .unit(JOIN)
+        .unwrap()
+        .add(None, int64(), ExprKind::Value(scan[0]))
+        .unwrap();
+    let build_key = builder
+        .unit(JOIN)
+        .unwrap()
+        .add(None, int64(), ExprKind::Value(build))
+        .unwrap();
+    let probe = builder
+        .unit(JOIN)
+        .unwrap()
+        .root(probe, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let build_key = builder
+        .unit(JOIN)
+        .unwrap()
+        .root(build_key, EvaluationDemand::Value, RootScope::Port(1))
+        .unwrap();
     let key = JoinKey {
-        left: builder
-            .add_expression(JOIN, int64(), ExprKind::Value(scan[0]))
-            .unwrap(),
-        right: builder
-            .add_expression(JOIN, int64(), ExprKind::Value(build))
-            .unwrap(),
+        left: probe,
+        right: build_key,
         null_safe: false,
     };
     builder
@@ -260,6 +280,17 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
         )
         .unwrap();
     builder.attach_runtime_filter(FILTER).unwrap();
+    crate::exec::operators::family_fixture::seal_no_call_units(&mut builder);
+    assert!(
+        builder
+            .construction_nodes()
+            .filter_map(|(_, node)| node.expressions.as_ref())
+            .all(|unit| unit
+                .control_flow()
+                .regions()
+                .values()
+                .all(|region| region.guard.is_none()))
+    );
     let fragment = builder
         .finish_definition(
             JOIN,
@@ -442,76 +473,6 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
     (plan, FrozenConnectorRead::try_new(scan, public).unwrap())
 }
 
-/// One complete eager use tree per physical root site in one root domain.
-fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
-    struct Author<'a> {
-        fragment: &'a Fragment,
-        next: u32,
-        uses: Vec<ExpressionInvocation<ExprId>>,
-    }
-    impl Author<'_> {
-        fn visit(&mut self, expr: ExprId, demand: EvaluationDemand) -> ExpressionUseId {
-            let id = ExpressionUseId::new(self.next);
-            self.next += 1;
-            let args = match &self.fragment.expressions().get(expr).unwrap().kind {
-                ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
-                other => panic!("the join fixture has no {other:?}"),
-            };
-            let arguments = args
-                .iter()
-                .enumerate()
-                .map(|(ordinal, &child)| {
-                    let (child_demand, guard) = control_argument_semantics(
-                        ControlShape::Eager,
-                        args.len(),
-                        ordinal,
-                        demand,
-                    )
-                    .unwrap();
-                    assert!(guard.is_none());
-                    self.visit(child, child_demand)
-                })
-                .collect::<Box<[_]>>();
-            self.uses.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id: id,
-                    region: EvaluationRegionId::new(0),
-                    demand,
-                },
-                definition: expr,
-                control: ControlShape::Eager,
-                arguments,
-            });
-            id
-        }
-    }
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let mut author = Author {
-        fragment,
-        next: 0,
-        uses: vec![],
-    };
-    let bindings = roots
-        .sites()
-        .iter()
-        .map(|(&site, root)| (site, author.visit(root.expr, root.demand)))
-        .collect();
-    let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: EvaluationRegionId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        author.uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap()
-}
-
 /// Keeps the complete frozen read, private bytes included; the public facts
 /// are borrowed unchanged.
 struct Port;
@@ -553,17 +514,9 @@ fn providers() -> PureProviderProgramCatalog<ConnectorError> {
 /// Extract the one package and compile it for `dop` drivers with local-compiler.
 fn compile(dop: usize) -> Arc<LocalProgram> {
     let (plan, read) = plan();
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let root_uses = root_uses(fragment);
-        calls.insert(
-            id,
-            FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &FixtureControl).unwrap(),
-        );
-        uses.insert(id, root_uses);
+    for (&id, _fragment) in plan.fragments() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
@@ -587,8 +540,6 @@ fn compile(dop: usize) -> Arc<LocalProgram> {
         &plan,
         &BTreeMap::from([(ProviderReadOccurrenceId::new(0), read)]),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,

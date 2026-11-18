@@ -58,6 +58,7 @@ fn union_catalog() -> PureEngineFunctionCatalog {
 }
 fn union_program(ty: DataType, two_phase: bool) -> Arc<LocalProgram> {
     let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
 
     let catalog = union_catalog();
     let bound = bind(
@@ -118,12 +119,20 @@ fn union_program(ty: DataType, two_phase: bool) -> Arc<LocalProgram> {
     } else {
         first
     };
-    let definition = finish(builder, root, FragmentSink::Result, 2);
+    let definition = finish(
+        builder,
+        root,
+        FragmentSink::Result,
+        2,
+        &catalog,
+        &parameters,
+    );
     let output = definition.nodes()[&root].output.clone();
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([73; 16]).unwrap(),
         &fixture_sources,
-    );
+    )
+    .with_semantic_parameters(parameters.clone());
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
@@ -145,7 +154,7 @@ fn union_program(ty: DataType, two_phase: bool) -> Arc<LocalProgram> {
     .unwrap();
     let plan = plan.finish_observed(&FixtureControl).unwrap();
     compile(
-        packages(&plan, &catalog).remove(&fragment).unwrap(),
+        packages(&plan).remove(&fragment).unwrap(),
         &catalog,
         2,
         true,

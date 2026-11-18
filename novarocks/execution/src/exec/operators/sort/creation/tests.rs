@@ -22,11 +22,12 @@ use arrow::{
     buffer::{NullBuffer, OffsetBuffer, ScalarBuffer},
     datatypes::{DataType, Field, Schema},
 };
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_physical_plan::{
-    ConstantPools, ExprKind, FragmentId, NodeId, NullOrdering, SortDirection, SortExpr, SortMode,
+    ConstantPools, FragmentId, NodeId, NullOrdering, SortDirection, SortExpr, SortMode,
     SystemRelationData, ValueOrigin,
 };
-use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+use novarocks_type_contract::{EvaluationDemand, FunctionValueType, ValueTypeStorageLifetime};
 use std::{error::Error, sync::Arc};
 
 fn cause_chain(error: &(dyn Error + 'static)) -> String {
@@ -123,11 +124,18 @@ fn list_program(
         let filter = NodeId::new(2);
         let project = NodeId::new(3);
         let predicate = builder
-            .add_expression(
-                filter,
+            .unit(filter)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Boolean, false),
                 ExprKind::Value(values[2]),
             )
+            .unwrap();
+        let predicate = builder
+            .unit(filter)
+            .unwrap()
+            .root(predicate, EvaluationDemand::TruthOnly, RootScope::Port(0))
             .unwrap();
         builder
             .add_filter(filter, source, Box::from([predicate]))
@@ -136,14 +144,21 @@ fn list_program(
         let mut outputs = Vec::new();
         for (source_value, ty) in values.iter().zip(&types).take(2) {
             let expression = builder
-                .add_expression(project, ty.clone(), ExprKind::Value(*source_value))
+                .unit(project)
+                .unwrap()
+                .add(None, ty.clone(), ExprKind::Value(*source_value))
+                .unwrap();
+            let expression = builder
+                .unit(project)
+                .unwrap()
+                .root(expression, EvaluationDemand::Value, RootScope::Port(0))
                 .unwrap();
             let output = builder
                 .add_value(
                     ty.clone(),
                     ValueOrigin::Expr {
                         node: project,
-                        expr: expression,
+                        root: expression,
                     },
                 )
                 .unwrap();
@@ -165,11 +180,18 @@ fn list_program(
     };
     let root = if sort {
         let key = builder
-            .add_expression(
-                sort_node,
+            .unit(sort_node)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Utf8, false),
                 ExprKind::Value(values[0]),
             )
+            .unwrap();
+        let key = builder
+            .unit(sort_node)
+            .unwrap()
+            .root(key, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .add_sort(

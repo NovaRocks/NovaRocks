@@ -21,136 +21,75 @@ use crate::exec::expr::compiled_program::checked_constants;
 use arrow::array::Float32Array;
 use novarocks_functions::CastOperation;
 use novarocks_local_compiler::FragmentCompileError;
+use novarocks_type_contract::{ExpressionEffectContext, ExpressionUseId};
 
 fn package(
     functions: &PureEngineFunctionCatalog,
-    fragment: Fragment,
+    mut builder: FragmentBuilder,
+    root_node: NodeId,
     authors: &BTreeMap<ExprId, Author>,
     result: ResultPort,
     allow: bool,
     source_pools: novarocks_physical_plan::ConstantPools,
 ) -> Arc<FragmentPackage> {
-    let (fragment, constants) = original_request_sources(fragment, authors, source_pools);
-    let fragment_id = fragment.id();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let mut author = FlowAuthor::new();
-    let mut bindings = Vec::new();
-    for (&site, root) in roots.sites() {
-        bindings.push((
-            site,
-            author.visit(
-                &fragment,
-                authors,
-                root.expr,
-                EvaluationRegionId::new(u32::MAX),
-                root.demand,
-            ),
-        ));
-    }
-    let ordered = author.uses;
-    let flow = ExpressionControlFlow::try_new(
-        author.domains,
-        ordered.clone(),
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow.clone(), bindings, &Control).unwrap();
+    let fragment_id = builder.id();
     let parameters = SemanticParameters::try_new([(
         allow_ref().id,
         SemanticParameterValue::AllowThrowException(allow),
     )])
     .unwrap();
-    let mut summaries = BTreeMap::new();
-    let mut frozen = Vec::new();
-    for invocation in ordered {
-        let context = invocation.context;
-        let definition = fragment.expressions().get(invocation.definition).unwrap();
-        let mut children = ScopedExpressionEffects::pure_value(context);
-        for (ordinal, child) in invocation.arguments.iter().enumerate() {
-            children = children
-                .join_control_argument(summaries[child], &flow, ordinal)
-                .unwrap();
-        }
-        let summary = if let Some(owner) = authors.get(&invocation.definition) {
-            let argument_uses = invocation
-                .arguments
-                .iter()
-                .map(|id| Some(*id))
-                .collect::<Vec<_>>();
-            let token = functions
-                .prepare_fresh(
-                    CallEffectInput {
-                        context,
-                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
-                            &argument_uses,
-                        ),
-                        function_id: &owner.function.function_id,
-                        kind: FunctionKind::Scalar,
-                        selected: owner.selected.as_ref(),
-                        request: owner.request(),
-                        environment: &[],
-                        parameters: &parameters,
-                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Region(context.region),
-                    },
-                    owner.selected.clone(),
-                    if matches!(owner.shape, ControlShape::If | ControlShape::Coalesce) {
-                        PureCallPreparation::ControlIntrinsic {
-                            arguments: children,
-                        }
-                    } else {
-                        PureCallPreparation::Scalar {
-                            arguments: children,
-                        }
-                    },
+    let constants = finish_fixture_units(
+        functions,
+        &mut builder,
+        root_node,
+        authors,
+        &parameters,
+        source_pools,
+        |unit, invocation, children| {
+            let definition = unit.definition(invocation.definition).unwrap();
+            if let ExprKind::Binary {
+                op,
+                left,
+                right,
+                decimal_overflow_policy,
+                allow_throw_exception: Some(reference),
+            } = &definition.kind
+            {
+                let value = parameters.require(*reference).unwrap();
+                let SemanticParameterValue::AllowThrowException(allow) = value else {
+                    panic!("exact intrinsic parameter key")
+                };
+                let recipe = PreparedArithmeticRecipe::try_new(
+                    operation(*op),
+                    &unit.definition(*left).unwrap().ty,
+                    &unit.definition(*right).unwrap().ty,
+                    &definition.ty,
+                    *decimal_overflow_policy,
+                    *allow,
                     &Control,
                 )
                 .unwrap();
-            frozen.push(FrozenPhysicalCall {
-                materialized_writer_input: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                site: PhysicalCallSite::Expression(context.use_id),
-                context,
-                effects: token.call_contract().effects().clone(),
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            });
-            token.effects()
-        } else if let ExprKind::Binary {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-            allow_throw_exception: Some(reference),
-        } = &definition.kind
-        {
-            let value = parameters.require(*reference).unwrap();
-            let SemanticParameterValue::AllowThrowException(allow) = value else {
-                panic!("exact intrinsic parameter key")
-            };
-            let recipe = PreparedArithmeticRecipe::try_new(
-                operation(*op),
-                &fragment.expressions().get(*left).unwrap().ty,
-                &fragment.expressions().get(*right).unwrap().ty,
-                &definition.ty,
-                *decimal_overflow_policy,
-                *allow,
-                &Control,
-            )
-            .unwrap();
-            recipe
-                .own_effects(context)
-                .join_same_region(children)
-                .unwrap()
-        } else {
-            children
-        };
-        summaries.insert(context.use_id, summary);
-    }
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, frozen, &Control).unwrap();
+                recipe
+                    .own_effects(invocation.context)
+                    .join_same_region(children)
+                    .unwrap()
+            } else {
+                children
+            }
+        },
+    );
+    let fragment = builder
+        .finish_definition(
+            root_node,
+            FragmentSink::Result,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
     Arc::new(
         FragmentPackage::try_new(
             FragmentPackageInput {
@@ -158,8 +97,7 @@ fn package(
                 required: RequiredContracts::default(),
                 constants,
                 fragment,
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: options().constants,
                 pruning: FrozenFragmentPruning::try_new(fragment_id, Vec::new(), &Control).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
@@ -174,6 +112,11 @@ fn package(
         )
         .unwrap(),
     )
+}
+
+fn cast_root_use(program: &LocalProgram) -> ExpressionUseId {
+    let reference = root(program);
+    root_unit(program).root(reference.root).unwrap().use_id
 }
 
 #[derive(Clone, Copy)]
@@ -214,8 +157,10 @@ fn result_literal(
         source_pools,
     );
     builder
-        .add_expression(
-            NodeId::new(0),
+        .unit(NodeId::new(0))
+        .unwrap()
+        .add(
+            None,
             result.clone(),
             ExprKind::Cast {
                 expr: value,
@@ -256,8 +201,10 @@ fn fixture(
     for (id, ty) in &columns {
         let definition = if !ty.nullable() && *ty.data_type() == DataType::Float32 {
             let exact = builder
-                .add_expression(
-                    input_node,
+                .unit(input_node)
+                .unwrap()
+                .add(
+                    None,
                     (FunctionValueType::new(DataType::Float64, false)).clone(),
                     checked_constants::kind(
                         &mut source_pools,
@@ -270,8 +217,10 @@ fn fixture(
                 )
                 .unwrap();
             builder
-                .add_expression(
-                    input_node,
+                .unit(input_node)
+                .unwrap()
+                .add(
+                    None,
                     ty.clone(),
                     ExprKind::Cast {
                         expr: exact,
@@ -321,20 +270,27 @@ fn fixture(
                 }
             };
             builder
-                .add_expression(
-                    input_node,
+                .unit(input_node)
+                .unwrap()
+                .add(
+                    None,
                     ty.clone(),
                     checked_constants::kind(&mut source_pools, value),
                 )
                 .unwrap()
         };
+        let definition = builder
+            .unit(input_node)
+            .unwrap()
+            .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *id,
                 ty: ty.clone(),
                 origin: ValueOrigin::Expr {
                     node: input_node,
-                    expr: definition,
+                    root: definition,
                 },
             })
             .unwrap();
@@ -362,8 +318,10 @@ fn fixture(
                 &mut source_pools,
             );
             builder
-                .add_expression(
-                    output_node,
+                .unit(output_node)
+                .unwrap()
+                .add(
+                    None,
                     source_type.clone(),
                     ExprKind::Cast {
                         expr: exact,
@@ -418,11 +376,9 @@ fn fixture(
         }
     } else {
         builder
-            .add_expression(
-                output_node,
-                source_type.clone(),
-                ExprKind::Value(columns[0].0),
-            )
+            .unit(output_node)
+            .unwrap()
+            .add(None, source_type.clone(), ExprKind::Value(columns[0].0))
             .unwrap()
     };
     if matches!(source, Source::Add) {
@@ -449,8 +405,10 @@ fn fixture(
         assert_eq!(authors[&child].result(), source_type);
     }
     let cast = builder
-        .add_expression(
-            output_node,
+        .unit(output_node)
+        .unwrap()
+        .add(
+            None,
             result_type.clone(),
             ExprKind::Cast {
                 expr: child,
@@ -483,11 +441,9 @@ fn fixture(
             } else {
                 let flag = if matches!(source, Source::RandCondition) {
                     let seed = builder
-                        .add_expression(
-                            output_node,
-                            seed_type.clone(),
-                            ExprKind::Value(columns[1].0),
-                        )
+                        .unit(output_node)
+                        .unwrap()
+                        .add(None, seed_type.clone(), ExprKind::Value(columns[1].0))
                         .unwrap();
                     let random = call(
                         &mut builder,
@@ -501,8 +457,10 @@ fn fixture(
                         vec![seed],
                     );
                     builder
-                        .add_expression(
-                            output_node,
+                        .unit(output_node)
+                        .unwrap()
+                        .add(
+                            None,
                             FunctionValueType::new(DataType::Boolean, false),
                             ExprKind::IsNull {
                                 expr: random,
@@ -512,7 +470,9 @@ fn fixture(
                         .unwrap()
                 } else {
                     builder
-                        .add_expression(output_node, boolean.clone(), ExprKind::Value(columns[2].0))
+                        .unit(output_node)
+                        .unwrap()
+                        .add(None, boolean.clone(), ExprKind::Value(columns[2].0))
                         .unwrap()
                 };
                 let flag_type = if matches!(source, Source::RandCondition) {
@@ -540,8 +500,10 @@ fn fixture(
         Wrap::IsNull | Wrap::And | Wrap::Or => {
             root_type = FunctionValueType::new(DataType::Boolean, false);
             let is_null = builder
-                .add_expression(
-                    output_node,
+                .unit(output_node)
+                .unwrap()
+                .add(
+                    None,
                     root_type.clone(),
                     ExprKind::IsNull {
                         expr: cast,
@@ -563,8 +525,10 @@ fn fixture(
                     &mut source_pools,
                 );
                 builder
-                    .add_expression(
-                        output_node,
+                    .unit(output_node)
+                    .unwrap()
+                    .add(
+                        None,
                         root_type.clone(),
                         if matches!(wrap, Wrap::Or) {
                             ExprKind::Disjunction {
@@ -581,12 +545,17 @@ fn fixture(
         }
         Wrap::NullParent => panic!("this fixture has no null arithmetic parent"),
     };
+    let expression = builder
+        .unit(output_node)
+        .unwrap()
+        .root(expression, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let value = builder
         .add_value(
             root_type.clone(),
             ValueOrigin::Expr {
                 node: output_node,
-                expr: expression,
+                root: expression,
             },
         )
         .unwrap();
@@ -598,22 +567,14 @@ fn fixture(
             Box::from([value]),
         )
         .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output_node,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fid,
-        output: fragment.nodes()[&output_node].output.clone(),
+        output: builder
+            .construction_node(output_node)
+            .unwrap()
+            .output
+            .clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&root_type),
             name: "cast_result".into(),
@@ -622,7 +583,15 @@ fn fixture(
             ty: root_type,
         }]),
     };
-    let package = package(&functions, fragment, &authors, result, allow, source_pools);
+    let package = package(
+        &functions,
+        builder,
+        output_node,
+        &authors,
+        result,
+        allow,
+        source_pools,
+    );
     (functions, package)
 }
 fn compile(
@@ -645,25 +614,12 @@ fn compiled(
 ) -> Arc<LocalProgram> {
     let (functions, package) = fixture(source.clone(), result.clone(), mode, wrap, policy, allow);
     let program = compile(&functions, package, &Control).unwrap();
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
     let mut count = 0;
-    for (arena, flow) in snapshot.flows() {
-        for (id, invocation) in flow.uses() {
-            let definition = snapshot.roots().arenas()[arena]
-                .node(invocation.definition)
-                .unwrap();
+    for unit in program.units() {
+        for (&id, invocation) in unit.control_flow().uses() {
+            let definition = unit.definitions().node(invocation.definition).unwrap();
             if matches!(definition.kind(), StaticExprKind::PreparedCast { .. }) {
-                let recipe = program
-                    .cast_recipe(ProgramUseRef {
-                        arena: *arena,
-                        use_id: *id,
-                    })
-                    .unwrap();
+                let recipe = unit.recipes().cast(id).unwrap();
                 assert_eq!(recipe.operation(), CastOperation::Carrier);
                 // A narrowed ELSE is itself an authored I64 -> target Cast.
                 // Identify the primary occurrence by both complete source facts.
@@ -1002,12 +958,7 @@ fn cast_literal_broadcast_empty_selection_and_real_round_rand_owners_keep_exact_
             DecimalOverflowPolicy::ReportError,
             true,
         );
-        let calls = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls();
+        let calls = root_unit(&program).calls();
         assert!(
             calls
                 .values()
@@ -1060,13 +1011,18 @@ fn cast_runtime_all_original_failure_categories_stop_at_exact_callback_and_latch
         .collect::<Vec<_>>();
     let batch = sliced_batch(&program, &source);
     let constructor = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-    CompiledExpressionInstance::try_new(program.clone(), root(), &constructor).unwrap();
+    CompiledExpressionInstance::try_new(
+        root_unit(&program).clone(),
+        root(&program).root,
+        &constructor,
+    )
+    .unwrap();
     let constructor_trace = constructor.trace.lock().unwrap().clone();
     for stop_at in 1..=constructor_trace.len() {
         for cause in causes() {
             let control = CallbackControl::new(cause.clone(), stop_at);
             assert!(
-                matches!(CompiledExpressionInstance::try_new(program.clone(), root(), &control), Err(actual) if actual == cause)
+                matches!(CompiledExpressionInstance::try_new(root_unit(&program).clone(), root(&program).root, &control), Err(actual) if actual == cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), constructor_trace[..stop_at]);
         }
@@ -1262,19 +1218,11 @@ fn identity_cast_keeps_a_required_child_binding_and_permissive_source_carrier() 
         DecimalOverflowPolicy::OutputNull,
         false,
     );
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let occurrence = snapshot.bindings()[&root()];
+    let occurrence = cast_root_use(&program);
     assert!(
-        program
-            .cast_recipe(novarocks_local_program::ProgramUseRef {
-                arena: root().arena(),
-                use_id: occurrence,
-            })
+        root_unit(&program)
+            .recipes()
+            .cast(occurrence)
             .unwrap()
             .is_identity()
     );
@@ -1362,8 +1310,8 @@ fn identity_cast_keeps_a_required_child_binding_and_permissive_source_carrier() 
             MemTracker::new_root("permissive identity Cast result"),
         );
         let mut evaluator = CompiledExpressionInstance::try_new_with_allocator(
-            program.clone(),
-            root(),
+            root_unit(&program).clone(),
+            root(&program).root,
             &Control,
             Some(host),
         )

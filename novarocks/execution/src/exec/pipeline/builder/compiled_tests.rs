@@ -95,16 +95,13 @@ fn twin_roots_of_one_definition_keep_independent_instances_in_the_pipeline() {
     }
 }
 
-// The filter factory owns exactly one predicate site: a Filter node's
-// FilterPredicate or a Scan node's ScanResidual. Any other site is refused
-// when the pipeline is built, not discovered while running.
+// The filter factory reads all predicate references from its actual Filter
+// or Scan node. Other node families are refused while building the pipeline.
 #[test]
 fn compiled_filter_factory_accepts_only_an_owned_predicate_site() {
     use crate::exec::operators::compiled_expression::CompiledFilterProcessorFactory;
     use crate::runtime::runtime_state::RuntimeErrorState;
-    use novarocks_local_program::{
-        ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind,
-    };
+    use novarocks_local_program::{ProgramNodeId, ProgramNodeKind};
 
     let program = program(SeedMode::Input, false);
     let filter = ProgramNodeId::new(2);
@@ -114,57 +111,30 @@ fn compiled_filter_factory_accepts_only_an_owned_predicate_site() {
         ProgramNodeKind::Filter { .. }
     ));
     let error = Arc::new(RuntimeErrorState::default());
-    let site = |node, role| ProgramExpressionRootSite::Node { node, role };
     assert!(
-        CompiledFilterProcessorFactory::try_new(
-            Arc::clone(&program),
-            site(
-                filter,
-                ProgramNodeExpressionRole::FilterPredicate { predicate: 0 }
-            ),
-            Arc::clone(&error),
-        )
-        .is_ok()
+        CompiledFilterProcessorFactory::try_new(Arc::clone(&program), filter, Arc::clone(&error))
+            .is_ok()
     );
-    for refused in [
-        site(
-            project,
-            ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
-        ),
-        site(
-            filter,
-            ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
-        ),
-        site(
-            filter,
-            ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-        ),
-    ] {
-        let message = match CompiledFilterProcessorFactory::try_new(
+    // All three references are actual nodes in this fixture: Project, Values,
+    // and the root Limit. A caller supplies no expression-role selector.
+    for refused in [project, ProgramNodeId::new(0), program.graph().root()] {
+        let failure = match CompiledFilterProcessorFactory::try_new(
             Arc::clone(&program),
             refused,
             Arc::clone(&error),
         ) {
-            Ok(_) => panic!("{refused:?} is not an owned predicate site"),
-            Err(message) => message,
+            Ok(_) => panic!("{refused:?} is not a predicate-owning node"),
+            Err(failure) => failure,
         };
         assert!(
-            message
+            failure
                 .to_string()
-                .contains("neither a Filter predicate nor a Scan residual"),
-            "{message}"
+                .contains("compiled filter requires its actual Filter or Scan node"),
+            "{failure}"
+        );
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&failure).class(),
+            novarocks_failure_contract::FailureClass::Invariant
         );
     }
-    let message = match CompiledFilterProcessorFactory::try_new(
-        Arc::clone(&program),
-        ProgramExpressionRootSite::SinkPartition { branch: 0, key: 0 },
-        error,
-    ) {
-        Ok(_) => panic!("a sink partition root is not a node predicate"),
-        Err(message) => message,
-    };
-    assert!(
-        message.to_string().contains("is not a node predicate"),
-        "{message}"
-    );
 }

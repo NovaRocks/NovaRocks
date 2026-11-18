@@ -18,11 +18,11 @@
 //! A depth-one driver over the same Frame and completion owner as program uses.
 use super::super::constant_node::*;
 use super::*;
-use novarocks_functions::{CastOperation, ConstantValue, FunctionResultType, FunctionValueType};
-use novarocks_local_program::{
-    ProgramPrimitiveError, prepare_arithmetic_node, prepare_cast_node, prepare_comparison_node,
-    prepare_null_safe_comparison_node,
+use novarocks_expression::{
+    PrimitiveError as ProgramPrimitiveError, prepare_arithmetic_node, prepare_cast_node,
+    prepare_comparison_node, prepare_null_safe_comparison_node,
 };
+use novarocks_functions::{CastOperation, ConstantValue, FunctionResultType, FunctionValueType};
 use novarocks_type_contract::{
     ArgumentControl, CompilePhase, FunctionInstanceState, FunctionVolatility, PureCompileControl,
     ValueLogicalType,

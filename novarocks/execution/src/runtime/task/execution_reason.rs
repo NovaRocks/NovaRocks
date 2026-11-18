@@ -535,7 +535,7 @@ pub(crate) enum ExecutionReason {
     DistinctSetGatherContract = 472,
     SinkMaterializationContract = 490,
     SinkRootIdentityExtent = 491,
-    SinkKeyIdentityExtent = 492,
+    // 492 is reserved: partition roots carry their checked ordinal directly.
     SortOperationArrow = 493,
     SortOperationAllocation = 494,
     #[cfg(test)]

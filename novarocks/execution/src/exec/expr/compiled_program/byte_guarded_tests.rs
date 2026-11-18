@@ -52,8 +52,10 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(
-                input,
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -61,14 +63,19 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
                 ),
             )
             .unwrap();
+        let root = builder
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *id,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr { node: input, root },
             })
             .unwrap();
-        items.push((expr, *id));
+        items.push((root, *id));
     }
     builder
         .add_project(
@@ -84,18 +91,26 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
         .unwrap();
     let mut authors = BTreeMap::new();
     let left = builder
-        .add_expression(output, bytes.clone(), ExprKind::Value(columns[1].0))
+        .unit(output)
+        .unwrap()
+        .add(None, bytes.clone(), ExprKind::Value(columns[1].0))
         .unwrap();
     let right = builder
-        .add_expression(output, bytes.clone(), ExprKind::Value(columns[2].0))
+        .unit(output)
+        .unwrap()
+        .add(None, bytes.clone(), ExprKind::Value(columns[2].0))
         .unwrap();
     let (condition, matched, otherwise) = if required_error {
         let value = builder
-            .add_expression(output, decimal.clone(), ExprKind::Value(columns[3].0))
+            .unit(output)
+            .unwrap()
+            .add(None, decimal.clone(), ExprKind::Value(columns[3].0))
             .unwrap();
         let digits = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 (FunctionValueType::new(DataType::Int64, false)).clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -122,8 +137,10 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
             vec![value, digits],
         );
         let condition = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Boolean, false),
                 ExprKind::IsNull {
                     expr: rounded,
@@ -134,7 +151,9 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
         (condition, left, right)
     } else {
         let flag = builder
-            .add_expression(output, boolean.clone(), ExprKind::Value(columns[0].0))
+            .unit(output)
+            .unwrap()
+            .add(None, boolean.clone(), ExprKind::Value(columns[0].0))
             .unwrap();
         let matched = call(
             &mut builder,
@@ -165,8 +184,10 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
         (flag, matched, otherwise)
     };
     let expr = builder
-        .add_expression(
-            output,
+        .unit(output)
+        .unwrap()
+        .add(
+            None,
             bytes.clone(),
             ExprKind::Case {
                 operand: None,
@@ -175,8 +196,19 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
             },
         )
         .unwrap();
+    let expr = builder
+        .unit(output)
+        .unwrap()
+        .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let result_value = builder
-        .add_value(bytes.clone(), ValueOrigin::Expr { node: output, expr })
+        .add_value(
+            bytes.clone(),
+            ValueOrigin::Expr {
+                node: output,
+                root: expr,
+            },
+        )
         .unwrap();
     builder
         .add_project(
@@ -186,22 +218,10 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
             Box::from([result_value]),
         )
         .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: FragmentId::new(201),
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&bytes),
             name: "byte_result".into(),
@@ -210,7 +230,7 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
             ty: bytes,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
+    compile_checked_fragment(&functions, builder, output, &authors, result, source_pools)
 }
 
 fn byte_array(ty: &DataType, values: &[Option<&[u8]>]) -> ArrayRef {

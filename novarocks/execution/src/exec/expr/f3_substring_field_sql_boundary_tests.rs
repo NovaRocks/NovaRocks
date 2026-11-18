@@ -28,14 +28,13 @@ use arrow::{
     datatypes::{DataType, Field},
     record_batch::RecordBatch,
 };
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{
     FunctionArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure, Selection,
 };
-use novarocks_local_program::{
-    LocalProgram, ProgramCallSite, ProgramExpressionRootSite, ProgramNodeKind, ProgramUseRef,
-    StaticExprKind,
-};
-use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition, StaticFunctionArgument};
+use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
+use novarocks_physical_plan::StaticFunctionArgument;
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use std::{
     collections::BTreeMap,
@@ -61,17 +60,14 @@ fn c12_p3_substring_index_actual_sql_keeps_ordered_three_child_types_for_compile
         sql_source_with_declared_fields("SELECT substring_index(txt,delim,cnt) FROM t", &fields);
     let mut found = 0;
     for fragment in source.plan().fragments().values() {
-        for (id, node) in fragment.expressions().iter() {
+        for (_source_node, unit, id, node) in super::sql_test_source::unit_definitions(fragment) {
             let ExprKind::FunctionCall { function, args } = &node.kind else {
                 continue;
             };
             if function.function_id.as_str() != "builtin.scalar/substring_index/v1" {
                 continue;
             }
-            let request = fragment
-                .call_requests()
-                .get(PhysicalCallDefinition::Expression(*id))
-                .unwrap();
+            let request = unit.requests().get(id).unwrap();
             assert_eq!(args.len(), 3);
             assert_eq!(request.logical_argument_count, 3);
             assert_eq!(request.arguments.len(), 3);
@@ -93,7 +89,7 @@ fn c12_p3_substring_index_actual_sql_keeps_ordered_three_child_types_for_compile
                     selected,
                     &FunctionValueType::new(fields[i].data_type().clone(), true)
                 );
-                let child = fragment.expressions().get(*arg).unwrap();
+                let child = unit.definition(*arg).unwrap();
                 assert_eq!(&child.ty, selected);
                 assert!(!matches!(child.kind, ExprKind::Constant(_)));
             }
@@ -112,58 +108,60 @@ fn sql_frame(
     fields: &[Field],
     name: &str,
     inputs: &[Option<ArrayRef>],
-) -> (Arc<LocalProgram>, ProgramExpressionRootSite, RecordBatch) {
+) -> (Arc<LocalProgram>, ProgramRootRef, RecordBatch) {
     let source = sql_source_with_declared_fields(sql, fields);
     let functions = installed_builtin_owner_catalogue();
     let mut found = None;
     for program in compiler_results(&source, &functions).into_values() {
         let program = Arc::new(program.expect("original SQL package compiles"));
-        let calls = program.checked().channels().expressions().resolved_calls();
-        let snapshot = calls.snapshot();
-        for (site, use_id) in snapshot.bindings() {
-            let Some(call) = calls
-                .calls()
-                .get(&ProgramCallSite::Expression(ProgramUseRef {
-                    arena: site.arena(),
-                    use_id: *use_id,
-                }))
-            else {
+        for (site, unit, root) in super::sql_test_source::compiled_roots(&program) {
+            let Some(call) = unit.calls().get(&root.use_id) else {
                 continue;
             };
             if call.call_contract().function_id().as_str() != format!("builtin.scalar/{name}/v1") {
                 continue;
             }
-            let arena = &snapshot.roots().arenas()[&site.arena()];
-            let flow = &snapshot.flows()[&site.arena()];
+            let arena = unit.definitions();
+            let flow = unit.control_flow();
+            let invocation = &flow.uses()[&root.use_id];
             let StaticExprKind::BoundCall { args, .. } =
-                arena.node(flow.uses()[use_id].definition).unwrap().kind()
+                arena.node(root.definition).unwrap().kind()
             else {
                 panic!("original bound root")
             };
             assert_eq!(args.len(), inputs.len());
             let mut input_slots = BTreeMap::new();
-            for (argument, values) in args.iter().zip(inputs) {
-                let Some(values) = values else { continue };
-                // The only nested fixture is CONCAT(txt,txt). Observe its real
-                // required first child, rather than replacing it by a slot.
-                let mut definition = *argument;
+            for (argument, values) in invocation.arguments.iter().zip(inputs) {
+                let Some(values) = values else {
+                    continue;
+                };
+                // Follow the real CONCAT child use to the actual compiled Input binding.
+                let mut occurrence = *argument;
                 let slot = loop {
-                    match arena.node(definition).unwrap().kind() {
-                        StaticExprKind::SlotId(slot) => break *slot,
-                        StaticExprKind::BoundCall { args, .. } => definition = args[0],
-                        other => panic!("actual fixture slot or CONCAT child: {other:?}"),
+                    let source = &flow.uses()[&occurrence];
+                    match arena.node(source.definition).unwrap().kind() {
+                        StaticExprKind::Input => {
+                            break super::sql_test_source::project_input_slot_for_use(
+                                &program, site, occurrence,
+                            );
+                        }
+                        StaticExprKind::BoundCall { .. } => occurrence = source.arguments[0],
+                        other => panic!("actual fixture Input or CONCAT child: {other:?}"),
                     }
                 };
                 assert!(input_slots.insert(slot, values.clone()).is_none());
             }
-            let ProgramExpressionRootSite::Node { node, .. } = site else {
-                panic!("actual project site")
-            };
-            let ProgramNodeKind::Project { input, .. } =
-                program.graph().nodes()[node.index()].kind()
-            else {
-                panic!("actual producer project")
-            };
+            let input = program
+                .graph()
+                .nodes()
+                .iter()
+                .find_map(|node| match node.kind() {
+                    ProgramNodeKind::Project { input, exprs, .. } if exprs.contains(&site) => {
+                        Some(*input)
+                    }
+                    _ => None,
+                })
+                .expect("actual producer project");
             let layout = program.graph().nodes()[input.index()].output_layout();
             let arrays = layout
                 .slots()
@@ -177,7 +175,7 @@ fn sql_frame(
             assert!(input_slots.is_empty());
             let batch = RecordBatch::try_new(layout.schema().clone(), arrays).unwrap();
             assert!(
-                found.replace((program.clone(), *site, batch)).is_none(),
+                found.replace((program.clone(), site, batch)).is_none(),
                 "one original producer"
             );
         }
@@ -245,26 +243,21 @@ fn c12_p3_substring_index_actual_compiled_slots_constants_strict_null_and_explic
                     Some(if count_sql == "-1" { -1 } else { 0 }),
                 );
                 let root = program.graph().root();
-                let site = ProgramExpressionRootSite::Node {
-                    node: root,
-                    role: novarocks_local_program::ProgramNodeExpressionRole::ProjectOutput {
-                        expression: 0,
-                    },
+                let ProgramNodeKind::Project { exprs, .. } =
+                    program.graph().nodes()[root.index()].kind()
+                else {
+                    panic!("actual project roots")
                 };
+                let site = exprs[0];
                 let ProgramNodeKind::Project { input, .. } =
                     program.graph().nodes()[root.index()].kind()
                 else {
                     panic!("actual constant-count project")
                 };
-                let snapshot = program
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .resolved_calls()
-                    .snapshot();
-                let use_id = snapshot.bindings()[&site];
-                let arena = &snapshot.roots().arenas()[&site.arena()];
-                let flow = &snapshot.flows()[&site.arena()];
+                let unit = program.unit(site.unit).unwrap();
+                let use_id = unit.root(site.root).unwrap().use_id;
+                let arena = unit.definitions();
+                let flow = unit.control_flow();
                 let StaticExprKind::BoundCall { args, .. } =
                     arena.node(flow.uses()[&use_id].definition).unwrap().kind()
                 else {
@@ -296,9 +289,12 @@ fn c12_p3_substring_index_actual_compiled_slots_constants_strict_null_and_explic
                     } else {
                         Selection::try_sparse(4, rows).unwrap()
                     };
-                    let mut frame =
-                        CompiledExpressionInstance::try_new(program.clone(), site, &HarnessControl)
-                            .unwrap();
+                    let mut frame = CompiledExpressionInstance::try_new(
+                        program.unit(site.unit).unwrap().clone(),
+                        site.root,
+                        &HarnessControl,
+                    )
+                    .unwrap();
                     let output = frame.evaluate(&batch, selection, &HarnessControl).unwrap();
                     assert_eq!(output.selection(), selection);
                     let expected = rows
@@ -362,8 +358,12 @@ fn c12_p3_substring_index_real_required_text_child_control_failure_survives_stri
             &arrays,
         );
         let control = ChildControl::default();
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), site, &HarnessControl).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &HarnessControl,
+        )
+        .unwrap();
         let output = frame.evaluate(&batch, Selection::all(1), &control).unwrap();
         assert!(output.errors().is_empty());
         assert!(output.values().is_null(0));
@@ -381,7 +381,12 @@ fn c12_p3_substring_index_real_required_text_child_control_failure_survives_stri
         trace: Mutex::new(vec![]),
         stop: Some(at),
     };
-    let mut frame = CompiledExpressionInstance::try_new(program, site, &HarnessControl).unwrap();
+    let mut frame = CompiledExpressionInstance::try_new(
+        program.unit(site.unit).unwrap().clone(),
+        site.root,
+        &HarnessControl,
+    )
+    .unwrap();
     assert_eq!(
         frame
             .evaluate(&batch, Selection::all(1), &control)
@@ -408,11 +413,12 @@ fn slot_program(
     constant_count: Option<i32>,
 ) -> Arc<LocalProgram> {
     use super::compiled_program::guarded_tests as host;
+    use novarocks_expression_contract::RootScope;
     use novarocks_physical_plan::{
-        FragmentBuilder, FragmentId, FragmentSink, NodeId, PipelineDopDomain, ResultField,
-        ResultPort, ValueDef, ValueId, ValueOrigin,
+        FragmentBuilder, FragmentId, NodeId, ResultField, ResultPort, ValueDef, ValueId,
+        ValueOrigin,
     };
-    use novarocks_type_contract::{ControlShape, SemanticParameters};
+    use novarocks_type_contract::{ControlShape, EvaluationDemand, SemanticParameters};
     let functions = installed_builtin_owner_catalogue();
     let fragment_id = FragmentId::new(196);
     let output = NodeId::new(0);
@@ -438,7 +444,14 @@ fn slot_program(
         .unwrap();
         let reference = super::test_support::register_constant(&mut source_pools, &null);
         let literal = builder
-            .add_expression(input, ty.clone(), ExprKind::Constant(reference))
+            .unit(input)
+            .unwrap()
+            .add(None, ty.clone(), ExprKind::Constant(reference))
+            .unwrap();
+        let literal = builder
+            .unit(input)
+            .unwrap()
+            .root(literal, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .insert_value(ValueDef {
@@ -446,7 +459,7 @@ fn slot_program(
                 ty: ty.clone(),
                 origin: ValueOrigin::Expr {
                     node: input,
-                    expr: literal,
+                    root: literal,
                 },
             })
             .unwrap();
@@ -454,7 +467,9 @@ fn slot_program(
         values.push(value);
         args.push(
             builder
-                .add_expression(output, ty.clone(), ExprKind::Value(value))
+                .unit(output)
+                .unwrap()
+                .add(None, ty.clone(), ExprKind::Value(value))
                 .unwrap(),
         );
     }
@@ -486,8 +501,10 @@ fn slot_program(
         .unwrap();
         args.push(
             builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     ty.clone(),
                     ExprKind::Constant(super::test_support::register_constant(
                         &mut source_pools,
@@ -516,12 +533,17 @@ fn slot_program(
     );
     let mut authors = BTreeMap::new();
     let call = host::call(&mut builder, &mut authors, author, args);
+    let call = builder
+        .unit(output)
+        .unwrap()
+        .root(call, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let value = builder
         .add_value(
             result_ty.clone(),
             ValueOrigin::Expr {
                 node: output,
-                expr: call,
+                root: call,
             },
         )
         .unwrap();
@@ -533,22 +555,10 @@ fn slot_program(
             Box::from([value]),
         )
         .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&result_ty),
             name: name.into(),
@@ -559,7 +569,8 @@ fn slot_program(
     };
     host::compile_checked_fragment_with_parameters(
         &functions,
-        fragment,
+        builder,
+        output,
         &authors,
         result,
         SemanticParameters::try_new([]).unwrap(),
@@ -577,17 +588,14 @@ fn pure_differential_field_actual_sql_null_coercion_and_generic_nominal_tags() {
     let source = sql_source_with_declared_fields(sql, &fields);
     let mut found = 0;
     for fragment in source.plan().fragments().values() {
-        for (id, node) in fragment.expressions().iter() {
+        for (_source_node, unit, id, node) in super::sql_test_source::unit_definitions(fragment) {
             let ExprKind::FunctionCall { function, args } = &node.kind else {
                 continue;
             };
             if function.function_id.as_str() != "builtin.scalar/field/v1" {
                 continue;
             }
-            let request = fragment
-                .call_requests()
-                .get(PhysicalCallDefinition::Expression(*id))
-                .unwrap();
+            let request = unit.requests().get(id).unwrap();
             assert_eq!(args.len(), 3);
             assert_eq!(request.logical_argument_count, 3);
             assert_eq!(request.arguments.len(), 3);
@@ -603,7 +611,7 @@ fn pure_differential_field_actual_sql_null_coercion_and_generic_nominal_tags() {
                 };
                 assert_eq!(value_type, selected);
                 assert_eq!(selected, &FunctionValueType::new(DataType::Utf8, true));
-                assert_eq!(&fragment.expressions().get(*arg).unwrap().ty, selected);
+                assert_eq!(&unit.definition(*arg).unwrap().ty, selected);
             }
             assert_eq!(node.ty, FunctionValueType::new(DataType::Int32, false));
             found += 1;
@@ -622,8 +630,12 @@ fn pure_differential_field_actual_sql_null_coercion_and_generic_nominal_tags() {
     );
     for rows in [&[0, 1, 2, 3][..], &[0, 2, 3][..], &[][..]] {
         let selection = Selection::try_sparse(4, rows).unwrap();
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), site, &HarnessControl).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &HarnessControl,
+        )
+        .unwrap();
         let output = frame.evaluate(&batch, selection, &HarnessControl).unwrap();
         assert!(output.errors().is_empty());
         assert_eq!(output.selection(), selection);
@@ -655,25 +667,20 @@ fn pure_differential_field_actual_sql_null_coercion_and_generic_nominal_tags() {
                 .unwrap();
         let program = slot_program("field", &[ty.clone(), ty.clone()], None);
         let root = program.graph().root();
-        let site = ProgramExpressionRootSite::Node {
-            node: root,
-            role: novarocks_local_program::ProgramNodeExpressionRole::ProjectOutput {
-                expression: 0,
-            },
+        let ProgramNodeKind::Project { exprs, .. } = program.graph().nodes()[root.index()].kind()
+        else {
+            panic!("actual project roots")
         };
+        let site = exprs[0];
         let ProgramNodeKind::Project { input, .. } = program.graph().nodes()[root.index()].kind()
         else {
             panic!("actual FIELD project")
         };
         let layout = program.graph().nodes()[input.index()].output_layout();
         assert_eq!(layout.schema().fields().len(), 2);
-        let calls = program.checked().channels().expressions().resolved_calls();
-        let snapshot = calls.snapshot();
-        let use_id = snapshot.bindings()[&site];
-        let call = &calls.calls()[&ProgramCallSite::Expression(ProgramUseRef {
-            arena: site.arena(),
-            use_id,
-        })];
+        let unit = program.unit(site.unit).unwrap();
+        let use_id = unit.root(site.root).unwrap().use_id;
+        let call = &unit.calls()[&use_id];
         assert_eq!(
             call.call_contract()
                 .selected()
@@ -690,9 +697,12 @@ fn pure_differential_field_actual_sql_null_coercion_and_generic_nominal_tags() {
             RecordBatch::try_new(layout.schema().clone(), vec![values.clone(), values]).unwrap();
         for rows in [&[0, 1, 2][..], &[1, 2][..], &[][..]] {
             let selection = Selection::try_sparse(3, rows).unwrap();
-            let mut frame =
-                CompiledExpressionInstance::try_new(program.clone(), site, &HarnessControl)
-                    .unwrap();
+            let mut frame = CompiledExpressionInstance::try_new(
+                program.unit(site.unit).unwrap().clone(),
+                site.root,
+                &HarnessControl,
+            )
+            .unwrap();
             let output = frame.evaluate(&batch, selection, &HarnessControl).unwrap();
             assert!(output.errors().is_empty());
             assert_eq!(output.selection(), selection);

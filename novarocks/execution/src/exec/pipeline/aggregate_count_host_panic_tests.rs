@@ -74,23 +74,17 @@ fn prepare_final() -> f::PreparedAggregateHandle {
         )
         .unwrap();
     let selected = Arc::new(resolved.selected);
-    let context = t::ExpressionEffectContext {
-        use_id: t::ExpressionUseId::new(31),
-        region: t::EvaluationRegionId::new(9),
-        demand: t::EvaluationDemand::Value,
-    };
-    let state_context = t::ExpressionEffectContext {
-        use_id: t::ExpressionUseId::new(32),
-        region: t::EvaluationRegionId::new(10),
-        demand: t::EvaluationDemand::Value,
-    };
+    let call = t::RelationCallId::new(31);
+    let context = t::RelationEffectContext::call(call);
+    // CountMergeSource supplies the actual already-materialized Int64 state column.
+    let state_context = t::RelationEffectContext::materialized_input(call);
     let state_type = t::FunctionValueType::new(arrow::datatypes::DataType::Int64, true);
     let parameters = t::SemanticParameters::try_new([]).unwrap();
     let input = f::CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: f::CallArgumentUses::AggregateMerge {
             phase: f::AggregateKernelPhase::Final,
-            state_context,
+            state_context: state_context.into(),
             state_input_type: &state_type,
         },
         function_id: &resolved.function_id,
@@ -104,14 +98,14 @@ fn prepare_final() -> f::PreparedAggregateHandle {
         environment: &[],
         parameters: &parameters,
         decimal_overflow_policy: t::DecimalOverflowPolicy::OutputNull,
-        proof_scope: t::CallProofScope::Region(context.region),
+        proof_scope: t::CallProofScope::Relation(context.identity),
     };
     let result = catalog
         .prepare_fresh_selected(
             input,
             selected.clone(),
             f::PureCallPreparation::Aggregate {
-                arguments: f::ScopedExpressionEffects::pure_value(context),
+                arguments: f::ScopedRelationalEffects::pure_value(context),
                 options: f::AggregatePreparationOptions {
                     state_interpretation: None,
                     phase: f::AggregateKernelPhase::Final,

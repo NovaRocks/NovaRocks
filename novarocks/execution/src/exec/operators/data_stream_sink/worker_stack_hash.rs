@@ -19,23 +19,19 @@
 //! A partition key is a nonempty real root; it is never a marker payload field.
 
 use super::*;
-use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-};
+use novarocks_expression_contract::{ExprKind, RootScope};
+use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_physical_plan::{
     ConstantPoolId, ConstantPools, ConstantReference, DeliveryRequirement, Distribution, Edge,
-    EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId, ExprKind, Fragment,
-    FragmentBuilder, FragmentCuts, FragmentId, FragmentOutputPort, FragmentPackage,
-    FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, NodeId, OutputRole, PhysicalExpressionRoots, PhysicalRootUses,
+    EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, Fragment, FragmentBuilder,
+    FragmentCuts, FragmentId, FragmentOutputPort, FragmentPackage, FragmentPackageAdmission,
+    FragmentPackageInput, FragmentSink, FrozenFragmentPruning, NodeId, OutputRole,
     PipelineDopDomain, PlanBuilder, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
     RequiredContracts, ResultField, ResultPort, ResultValueDomain, RowMultiplicity,
     StagePlacementPolicy, ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    PureCompileControl, SemanticParameters,
+    CompileControlError, CompilePhase, EvaluationDemand, PureCompileControl, SemanticParameters,
 };
 use std::collections::BTreeMap;
 
@@ -64,64 +60,36 @@ fn dop() -> PipelineDopDomain {
         requires_power_of_two: false,
     }
 }
-fn uses(fragment: &Fragment) -> PhysicalRootUses {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &Control).unwrap();
-    let mut ordered = Vec::new();
-    let bindings = roots
-        .sites()
-        .iter()
-        .map(|(site, root)| {
-            let kind = &fragment.expressions().get(root.expr).unwrap().kind;
-            assert!(matches!(kind, ExprKind::Value(_) | ExprKind::Constant(_)));
-            let use_id = ExpressionUseId::new(ordered.len() as u32);
-            ordered.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    region: EvaluationRegionId::new(0),
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (*site, use_id)
-        })
-        .collect();
-    let domains = if ordered.is_empty() {
-        vec![]
-    } else {
-        vec![ExpressionEvaluationRegion {
-            id: EvaluationRegionId::new(0),
-            parent: None,
-            guard: None,
-        }]
-    };
-    let flow = ExpressionControlFlow::<ExprId>::try_new(
-        domains,
-        ordered,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &Control).unwrap()
-}
-fn site() -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(1),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+/// Preserve the original fixture's independent leaf-root property after SDK sealing.
+fn assert_leaf_roots(fragment: &Fragment) {
+    for node in fragment.nodes().values() {
+        if let Some(unit) = &node.expressions {
+            for root in unit.roots() {
+                let kind = &unit.definition(root.definition).unwrap().kind;
+                assert!(matches!(kind, ExprKind::Value(_) | ExprKind::Constant(_)));
+            }
+        }
     }
 }
-fn compile(package: FragmentPackage) -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
+fn site(program: &LocalProgram) -> ProgramRootRef {
+    let ProgramNodeKind::Project { exprs, .. } =
+        program.graph().nodes()[program.graph().root().index()].kind()
+    else {
+        panic!("actual hash fixture output Project");
+    };
+    exprs[0]
+}
+fn compile(package: FragmentPackage) -> (Arc<LocalProgram>, ProgramRootRef) {
     let program = super::super::conditional_compiled_selection::compile_checked(
         Arc::new(package),
         novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
     );
     assert_eq!(program.graph().nodes().len(), 2);
-    (program, site())
+    let site = site(&program);
+    (program, site)
 }
 
-pub(super) fn constant_key() -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
+pub(super) fn constant_key() -> (Arc<LocalProgram>, ProgramRootRef) {
     let fragment_id = FragmentId::new(220);
     let input = NodeId::new(10);
     let output = NodeId::new(20);
@@ -146,8 +114,10 @@ pub(super) fn constant_key() -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
         .add_values(input, Box::from([Box::default()]), Box::default())
         .unwrap();
     let expression = builder
-        .add_expression(
-            output,
+        .unit(output)
+        .unwrap()
+        .add(
+            None,
             integer.clone(),
             ExprKind::Constant(ConstantReference {
                 pool: pool_id,
@@ -155,23 +125,23 @@ pub(super) fn constant_key() -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
             }),
         )
         .unwrap();
+    let root = builder
+        .unit(output)
+        .unwrap()
+        .root(expression, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let value = builder
-        .add_value(
-            integer.clone(),
-            ValueOrigin::Expr {
-                node: output,
-                expr: expression,
-            },
-        )
+        .add_value(integer.clone(), ValueOrigin::Expr { node: output, root })
         .unwrap();
     builder
         .add_project(
             output,
             input,
-            Box::from([(expression, value)]),
+            Box::from([(root, value)]),
             Box::from([value]),
         )
         .unwrap();
+    crate::exec::operators::family_fixture::seal_no_call_units(&mut builder);
     let fragment = builder
         .finish_definition(
             output,
@@ -180,8 +150,7 @@ pub(super) fn constant_key() -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
             StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let uses = uses(&fragment);
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).unwrap();
+    assert_leaf_roots(&fragment);
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
@@ -201,8 +170,7 @@ pub(super) fn constant_key() -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
             required: RequiredContracts::default(),
             constants,
             fragment,
-            expression_uses: uses,
-            calls,
+            statement_constant_policy: policy,
             pruning,
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -228,7 +196,7 @@ pub(super) fn constant_key() -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
     compiled
 }
 
-pub(super) fn id_key(deep: &FunctionValueType) -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
+pub(super) fn id_key(deep: &FunctionValueType) -> (Arc<LocalProgram>, ProgramRootRef) {
     // Model the actual Execution carrier port, not a ProviderSDK schema or a
     // deep constant backing. Only the consumer key program is compiled; the
     // mechanical source later supplies rows with this exact frozen layout.
@@ -261,6 +229,7 @@ pub(super) fn id_key(deep: &FunctionValueType) -> (Arc<LocalProgram>, ProgramExp
             producer_values.clone().into_boxed_slice(),
         )
         .unwrap();
+    crate::exec::operators::family_fixture::seal_no_call_units(&mut producer);
     let producer = producer
         .finish_definition(
             source,
@@ -305,18 +274,19 @@ pub(super) fn id_key(deep: &FunctionValueType) -> (Arc<LocalProgram>, ProgramExp
     let mut fields = Vec::new();
     for ((&input, ty), name) in incoming.iter().zip([&integer, deep]).zip(["id", "deep"]) {
         let expression = consumer
-            .add_expression(output, ty.clone(), ExprKind::Value(input))
+            .unit(output)
+            .unwrap()
+            .add(None, ty.clone(), ExprKind::Value(input))
+            .unwrap();
+        let root = consumer
+            .unit(output)
+            .unwrap()
+            .root(expression, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         let value = consumer
-            .add_value(
-                ty.clone(),
-                ValueOrigin::Expr {
-                    node: output,
-                    expr: expression,
-                },
-            )
+            .add_value(ty.clone(), ValueOrigin::Expr { node: output, root })
             .unwrap();
-        outputs.push((expression, value));
+        outputs.push((root, value));
         fields.push(ResultField {
             domain: ResultValueDomain::Plain,
             name: name.into(),
@@ -333,6 +303,7 @@ pub(super) fn id_key(deep: &FunctionValueType) -> (Arc<LocalProgram>, ProgramExp
     consumer
         .add_project(output, source, outputs.into_boxed_slice(), output_values)
         .unwrap();
+    crate::exec::operators::family_fixture::seal_no_call_units(&mut consumer);
     let consumer = consumer
         .finish_definition(
             output,
@@ -347,7 +318,12 @@ pub(super) fn id_key(deep: &FunctionValueType) -> (Arc<LocalProgram>, ProgramExp
         output: consumer.nodes()[&output].output.clone(),
         fields: fields.into_boxed_slice(),
     };
-    let mut builder = PlanBuilder::new(PlanVersionId::try_new([221; 16]).unwrap());
+    assert_leaf_roots(&producer);
+    assert_leaf_roots(&consumer);
+    let mut builder = PlanBuilder::new(
+        PlanVersionId::try_new([221; 16]).unwrap(),
+        novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+    );
     builder.add_fragment(producer).unwrap();
     builder.add_fragment(consumer).unwrap();
     builder
@@ -377,17 +353,9 @@ pub(super) fn id_key(deep: &FunctionValueType) -> (Arc<LocalProgram>, ProgramExp
         .unwrap();
     builder.set_result_port(result).unwrap();
     let plan = builder.finish().unwrap();
-    let mut root_uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let roots = uses(fragment);
-        calls.insert(
-            id,
-            FrozenFragmentCalls::try_new(fragment, &roots, vec![], &Control).unwrap(),
-        );
-        root_uses.insert(id, roots);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
@@ -398,8 +366,6 @@ pub(super) fn id_key(deep: &FunctionValueType) -> (Arc<LocalProgram>, ProgramExp
         &plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &root_uses,
-        &calls,
         &pruning,
         &admissions,
         &Control,

@@ -194,8 +194,7 @@ fn approx_sql_source_with_semantics(
 
 fn check_actual_approx() {
     use novarocks_physical_plan::{
-        FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
-        StaticFunctionArgument,
+        FunctionArgumentType, NodeKind, PhysicalCallSite, StaticFunctionArgument,
     };
     use novarocks_type_contract::FunctionValueType;
     let statements = [
@@ -223,10 +222,7 @@ fn check_actual_approx() {
                         node: node.id,
                         call: u32::try_from(ordinal).unwrap(),
                     };
-                    let request = fragment
-                        .call_requests()
-                        .get(PhysicalCallDefinition::Relational(site))
-                        .unwrap();
+                    let request = fragment.call_requests().get(site).unwrap();
                     assert_eq!(
                         request.logical_argument_count,
                         call.binding.function.argument_types.len()

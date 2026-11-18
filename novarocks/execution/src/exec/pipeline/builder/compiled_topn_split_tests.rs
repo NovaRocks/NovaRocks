@@ -39,24 +39,21 @@ use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
 use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
 use novarocks_local_program::{KernelAbiVersion, LocalProgram, ProgramNodeKind};
 use novarocks_physical_plan::{
-    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprKind,
-    Fragment, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, HashDefinition, HashPartitionScheme, NodeId,
-    NullOrdering, PartitionCountDomain, PartitionCountParameter, PartitionCountParameterId,
-    PartitionSpaceId, PhysicalExpressionRoots, PhysicalPlan, PhysicalRootUses, PipelineDopDomain,
-    PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort,
-    RowMultiplicity, SortDirection, SortExpr, TopNPhase, TopNSequenceId, ValueId, ValueOrigin,
-    extract_fragment_packages,
+    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource,
+    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink, FrozenFragmentPruning,
+    HashDefinition, HashPartitionScheme, NodeId, NullOrdering, PartitionCountDomain,
+    PartitionCountParameter, PartitionCountParameterId, PartitionSpaceId, PhysicalPlan,
+    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField,
+    ResultPort, RowMultiplicity, SortDirection, SortExpr, TopNPhase, TopNSequenceId, ValueId,
+    ValueOrigin, extract_fragment_packages,
 };
-use novarocks_type_contract::{
-    ControlShape, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-};
+use novarocks_type_contract::EvaluationDemand;
 use novarocks_types::UniqueId;
 
 use super::aggregate_fixture::PreparedUnitRecording;
@@ -227,11 +224,20 @@ fn sort_exprs(
     keys.iter()
         .map(|key| SortExpr {
             expr: builder
-                .add_expression(
-                    node,
+                .unit(node)
+                .unwrap()
+                .add(
+                    None,
                     int64(key.column == 0),
                     ExprKind::Value(columns[key.column]),
                 )
+                .and_then(|definition| {
+                    builder.unit(node).unwrap().root(
+                        definition,
+                        EvaluationDemand::Value,
+                        RootScope::Port(0),
+                    )
+                })
                 .unwrap(),
             direction: if key.ascending {
                 SortDirection::Ascending
@@ -359,6 +365,7 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         &rows,
     );
     let columns = [columns[0], columns[1]];
+    super::family_fixture::seal_no_call_units(&mut source);
     let source = source
         .finish_definition(
             values_node,
@@ -390,6 +397,7 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
             TopNPhase::Partial { sequence: SEQUENCE },
         )
         .unwrap();
+    super::family_fixture::seal_no_call_units(&mut partial);
     let partial = partial
         .finish_definition(
             partial_topn,
@@ -422,6 +430,7 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         TopNPhase::Final { sequence: SEQUENCE },
     )
     .unwrap();
+    super::family_fixture::seal_no_call_units(&mut last);
     let last = last
         .finish_definition(
             final_topn,
@@ -482,41 +491,6 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
         .unwrap_or_else(|error| panic!("the split TopN plan validates: {error:?}"))
 }
 
-/// Every root is a literal cell or a value read; each gets one eager use.
-fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let domain = EvaluationRegionId::new(0);
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                region: domain,
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        novarocks_type_contract::CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap()
-}
-
 // Explicit small-fixture admission; these are test inputs, not defaults.
 fn admission() -> FragmentPackageAdmission {
     FragmentPackageAdmission {
@@ -531,21 +505,6 @@ fn admission() -> FragmentPackageAdmission {
 }
 
 fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
-    let uses = plan
-        .fragments()
-        .iter()
-        .map(|(id, fragment)| (*id, root_uses(fragment)))
-        .collect::<BTreeMap<_, _>>();
-    let calls = plan
-        .fragments()
-        .iter()
-        .map(|(id, fragment)| {
-            (
-                *id,
-                FrozenFragmentCalls::try_new(fragment, &uses[id], vec![], &FixtureControl).unwrap(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     let pruning = plan
         .fragments()
         .keys()
@@ -565,8 +524,6 @@ fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
         plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,

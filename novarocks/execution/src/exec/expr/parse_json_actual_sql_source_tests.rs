@@ -17,7 +17,8 @@
 //! Actual original corpus call subtree with original no-op fold author retained in both modes.
 //! The corpus outer Json -> Struct conversion already fails in Original and is a separate gate.
 use arrow::datatypes::DataType;
-use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition, StaticFunctionArgument};
+use novarocks_expression_contract::ExprKind;
+use novarocks_physical_plan::StaticFunctionArgument;
 
 use novarocks_type_contract::{FunctionArgumentType, FunctionValueType, ValueLogicalType};
 const SQL: &str = "SELECT parse_json('[1,2,3]') AS parsed";
@@ -25,17 +26,14 @@ fn check() {
     let source = super::sql_test_source::sql_source_with_declared_fields(SQL, &[]);
     let mut count = 0;
     for fragment in source.plan().fragments().values() {
-        for (id, node) in fragment.expressions().iter() {
+        for (_source_node, unit, id, node) in super::sql_test_source::unit_definitions(fragment) {
             let ExprKind::FunctionCall { function, args } = &node.kind else {
                 continue;
             };
             if function.function_id.as_str() != "builtin.scalar/parse_json/v1" {
                 continue;
             }
-            let request = fragment
-                .call_requests()
-                .get(PhysicalCallDefinition::Expression(*id))
-                .unwrap();
+            let request = unit.requests().get(id).unwrap();
             assert_eq!(request.logical_argument_count, 1);
             assert_eq!(request.arguments.len(), 1);
             assert_eq!(args.len(), 1);
@@ -47,7 +45,7 @@ fn check() {
                 function.argument_types.as_ref(),
                 [FunctionArgumentType::Value(value_type.clone())]
             );
-            assert_eq!(&fragment.expressions().get(args[0]).unwrap().ty, value_type);
+            assert_eq!(&unit.definition(args[0]).unwrap().ty, value_type);
             let result = FunctionValueType::try_with_logical_type(
                 DataType::Utf8,
                 true,

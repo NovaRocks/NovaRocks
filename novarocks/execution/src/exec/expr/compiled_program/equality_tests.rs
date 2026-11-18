@@ -17,8 +17,9 @@
 
 use super::*;
 use crate::exec::expr::compiled_program::checked_constants;
-use novarocks_local_program::{ProgramComparisonSite, ProgramUseRef};
-use novarocks_physical_plan::BinaryOperator;
+use novarocks_expression::ComparisonSite;
+use novarocks_expression_contract::BinaryOperator;
+use novarocks_type_contract::ExpressionUseId;
 
 #[derive(Clone, Copy)]
 enum EqualityCase {
@@ -37,11 +38,9 @@ fn literal(
     source_pools: &mut novarocks_physical_plan::ConstantPools,
 ) -> ExprId {
     builder
-        .add_expression(
-            NodeId::new(0),
-            ty,
-            checked_constants::kind(source_pools, value),
-        )
+        .unit(NodeId::new(0))
+        .unwrap()
+        .add(None, ty, checked_constants::kind(source_pools, value))
         .unwrap()
 }
 fn random(
@@ -123,8 +122,10 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(
-                input,
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -132,14 +133,19 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
                 ),
             )
             .unwrap();
+        let root = builder
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *id,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr { node: input, root },
             })
             .unwrap();
-        items.push((expr, *id));
+        items.push((root, *id));
     }
     builder
         .add_project(
@@ -155,8 +161,10 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
         .unwrap();
     let value = |builder: &mut FragmentBuilder, index: usize| {
         builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 columns[index].1.clone(),
                 ExprKind::Value(columns[index].0),
             )
@@ -172,8 +180,10 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
         let left = value(&mut builder, 0);
         let right = value(&mut builder, 1);
         builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 result_type.clone(),
                 ExprKind::Binary {
                     op: if matches!(kind, EqualityCase::Eq) {
@@ -275,8 +285,10 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
             &mut source_pools,
         );
         builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 result_type.clone(),
                 ExprKind::Case {
                     operand: Some(operand),
@@ -286,10 +298,18 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
             )
             .unwrap()
     };
+    let expr = builder
+        .unit(output)
+        .unwrap()
+        .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let result_value = builder
         .add_value(
             result_type.clone(),
-            ValueOrigin::Expr { node: output, expr },
+            ValueOrigin::Expr {
+                node: output,
+                root: expr,
+            },
         )
         .unwrap();
     builder
@@ -300,22 +320,10 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
             Box::from([result_value]),
         )
         .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: FragmentId::new(203),
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "equality_result".into(),
@@ -324,7 +332,7 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
             ty: result_type,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
+    compile_checked_fragment(&functions, builder, output, &authors, result, source_pools)
 }
 fn batch(
     program: &LocalProgram,
@@ -379,30 +387,29 @@ fn integers(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<i64>
         .iter()
         .collect()
 }
-fn root_use(program: &LocalProgram) -> ProgramUseRef {
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    ProgramUseRef {
-        arena: root().arena(),
-        use_id: snapshot.bindings()[&root()],
-    }
+fn root_use(program: &LocalProgram) -> ExpressionUseId {
+    let reference = root(program);
+    program
+        .unit(reference.unit)
+        .unwrap()
+        .root(reference.root)
+        .unwrap()
+        .use_id
 }
 fn assert_case_recipes(program: &LocalProgram, ty: DataType) {
     let occurrence = root_use(program);
     for arm in 0..2 {
-        let recipe = program
-            .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm })
+        let recipe = root_unit(program)
+            .recipes()
+            .comparison(ComparisonSite::CaseWhen { occurrence, arm })
             .unwrap();
         assert_eq!(recipe.left_type().data_type().clone(), ty);
         assert_eq!(recipe.right_type().data_type().clone(), ty);
     }
     assert!(
-        program
-            .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm: 2 })
+        root_unit(program)
+            .recipes()
+            .comparison(ComparisonSite::CaseWhen { occurrence, arm: 2 })
             .is_none()
     );
 }
@@ -440,8 +447,9 @@ fn ordinary_eq_and_not_eq_preserve_frozen_float_bits_and_nulls_in_sparse_rows() 
     let rows = [1, 2, 3, 4, 5, 6, 7, 8, 9];
     for kind in [EqualityCase::Eq, EqualityCase::NotEq] {
         let program = equality_program(kind);
-        let recipe = program
-            .comparison_recipe(ProgramComparisonSite::Binary(root_use(&program)))
+        let recipe = root_unit(&program)
+            .recipes()
+            .comparison(ComparisonSite::Binary(root_use(&program)))
             .unwrap();
         assert_eq!(
             recipe.left_type(),

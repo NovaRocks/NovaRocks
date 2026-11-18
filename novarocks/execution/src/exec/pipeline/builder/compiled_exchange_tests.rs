@@ -28,6 +28,7 @@ use std::time::Duration;
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_functions::ConstantPolicy;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
@@ -36,18 +37,15 @@ use novarocks_local_program::{
     DataStreamPartitionType, KernelAbiVersion, LocalProgram, ProgramNodeKind, StaticSinkProgram,
 };
 use novarocks_physical_plan::{
-    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprKind,
-    Fragment, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, HashDefinition, HashPartitionScheme, NodeId,
-    PartitionCountDomain, PartitionCountParameter, PartitionCountParameterId, PartitionSpaceId,
-    PhysicalExpressionRoots, PhysicalPlan, PhysicalRootUses, PipelineDopDomain, PlanLimits,
+    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource,
+    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink, FrozenFragmentPruning,
+    HashDefinition, HashPartitionScheme, NodeId, PartitionCountDomain, PartitionCountParameter,
+    PartitionCountParameterId, PartitionSpaceId, PhysicalPlan, PipelineDopDomain, PlanLimits,
     PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort, RowMultiplicity,
     ValueId, ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationRegionId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-    FunctionValueType, PureCompileControl,
+    CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType, PureCompileControl,
 };
 use novarocks_types::{SlotId, UniqueId};
 
@@ -170,11 +168,22 @@ fn plan_with_local_nullability(
             int64(),
             crate::exec::operators::family_fixture::constant_sources::i64(b_value),
         );
+        let a_cell = producer
+            .unit(values)
+            .unwrap()
+            .root(a_cell, EvaluationDemand::Value, RootScope::AllPorts)
+            .unwrap();
+        let b_cell = producer
+            .unit(values)
+            .unwrap()
+            .root(b_cell, EvaluationDemand::Value, RootScope::AllPorts)
+            .unwrap();
         rows.push(vec![a_cell, b_cell].into_boxed_slice());
     }
     producer
         .add_values(values, rows.into_boxed_slice(), Box::from([a, b]))
         .unwrap();
+    super::family_fixture::seal_no_call_units(&mut producer);
     let producer = producer
         .finish_definition(
             values,
@@ -227,6 +236,7 @@ fn plan_with_local_nullability(
             RowMultiplicity::SingleCopy,
         )
         .unwrap();
+    super::family_fixture::seal_no_call_units(&mut consumer);
     let consumer = consumer
         .finish_definition(
             exchange,
@@ -308,41 +318,6 @@ fn plan_with_local_nullability(
     )
 }
 
-/// Literal cells are the only roots; each gets one eager use.
-fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let domain = EvaluationRegionId::new(0);
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                region: domain,
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap()
-}
-
 // Explicit small-fixture admission; these are test inputs, not defaults.
 fn admission() -> FragmentPackageAdmission {
     FragmentPackageAdmission {
@@ -357,21 +332,6 @@ fn admission() -> FragmentPackageAdmission {
 }
 
 fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
-    let uses = plan
-        .fragments()
-        .iter()
-        .map(|(id, fragment)| (*id, root_uses(fragment)))
-        .collect::<BTreeMap<_, _>>();
-    let calls = plan
-        .fragments()
-        .iter()
-        .map(|(id, fragment)| {
-            (
-                *id,
-                FrozenFragmentCalls::try_new(fragment, &uses[id], vec![], &FixtureControl).unwrap(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     let pruning = plan
         .fragments()
         .keys()
@@ -391,8 +351,6 @@ fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
         plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,
@@ -1169,11 +1127,22 @@ fn drop_distribution_key_project_plan(
             int64(),
             crate::exec::operators::family_fixture::constant_sources::i64(b_value),
         );
+        let a_cell = producer
+            .unit(values)
+            .unwrap()
+            .root(a_cell, EvaluationDemand::Value, RootScope::AllPorts)
+            .unwrap();
+        let b_cell = producer
+            .unit(values)
+            .unwrap()
+            .root(b_cell, EvaluationDemand::Value, RootScope::AllPorts)
+            .unwrap();
         rows.push(vec![a_cell, b_cell].into_boxed_slice());
     }
     producer
         .add_values(values, rows.into_boxed_slice(), Box::from([a, b]))
         .unwrap();
+    super::family_fixture::seal_no_call_units(&mut producer);
     let producer = producer
         .finish_definition(
             values,
@@ -1223,7 +1192,14 @@ fn drop_distribution_key_project_plan(
         .unwrap();
     let project = consumer.reserve_node_id().unwrap();
     let selected = consumer
-        .add_expression(project, int64(), ExprKind::Value(b_import))
+        .unit(project)
+        .unwrap()
+        .add(None, int64(), ExprKind::Value(b_import))
+        .unwrap();
+    let selected = consumer
+        .unit(project)
+        .unwrap()
+        .root(selected, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     consumer
         .add_project(
@@ -1233,6 +1209,7 @@ fn drop_distribution_key_project_plan(
             Box::from([b_import]),
         )
         .unwrap();
+    super::family_fixture::seal_no_call_units(&mut consumer);
     let consumer = consumer
         .finish_definition(
             project,

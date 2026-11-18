@@ -23,14 +23,7 @@ fn to_binary_corrected_called_on_null_eager_both_overloads_compile_and_evaluate(
     for count in [1, 2] {
         let program = fixture::program(count);
         let batch = fixture::source_batch(&program, count);
-        for call in program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()
-            .values()
-        {
+        for call in root_unit(&program).calls().values() {
             assert_eq!(
                 call.call_contract().effects().null_behavior,
                 FunctionNullBehavior::CalledOnNull
@@ -68,8 +61,12 @@ fn to_binary_corrected_called_on_null_eager_both_overloads_compile_and_evaluate(
                 .iter()
                 .map(|row| all_expected[row].clone())
                 .collect();
-            let mut instance =
-                CompiledExpressionInstance::try_new(program.clone(), root(), &Control).unwrap();
+            let mut instance = CompiledExpressionInstance::try_new(
+                root_unit(&program).clone(),
+                root(&program).root,
+                &Control,
+            )
+            .unwrap();
             let out = instance.evaluate(&batch, selection, &Control).unwrap();
             assert_eq!(fixture::binary_values(out.values()), expected);
             assert!(out.errors().is_empty());
@@ -82,7 +79,12 @@ fn to_binary_both_overloads_constructor_preserves_every_callback_cause() {
     for count in [1, 2] {
         let program = fixture::program(count);
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-        let _ = CompiledExpressionInstance::try_new(program.clone(), root(), &recorder).unwrap();
+        let _ = CompiledExpressionInstance::try_new(
+            root_unit(&program).clone(),
+            root(&program).root,
+            &recorder,
+        )
+        .unwrap();
         let trace = recorder.trace.lock().unwrap().clone();
         assert!(!trace.is_empty());
         assert!(trace.iter().all(|n| *n <= 256));
@@ -90,7 +92,7 @@ fn to_binary_both_overloads_constructor_preserves_every_callback_cause() {
             for cause in causes() {
                 let control = CallbackControl::new(cause.clone(), index);
                 assert!(
-                    matches!(CompiledExpressionInstance::try_new(program.clone(),root(),&control),Err(actual) if actual==cause)
+                    matches!(CompiledExpressionInstance::try_new(root_unit(&program).clone(),root(&program).root,&control),Err(actual) if actual==cause)
                 );
                 assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
             }
@@ -132,8 +134,12 @@ fn to_binary_both_overloads_evaluation_preserves_every_callback_cause_and_latch(
         )
         .unwrap();
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-        let mut evaluator =
-            CompiledExpressionInstance::try_new(program.clone(), root(), &Control).unwrap();
+        let mut evaluator = CompiledExpressionInstance::try_new(
+            root_unit(&program).clone(),
+            root(&program).root,
+            &Control,
+        )
+        .unwrap();
         let _ = evaluator
             .evaluate(&batch, Selection::all(321), &recorder)
             .unwrap();
@@ -142,8 +148,12 @@ fn to_binary_both_overloads_evaluation_preserves_every_callback_cause_and_latch(
         assert!(trace.iter().all(|n| *n <= 256));
         for index in 1..=trace.len() {
             for cause in causes() {
-                let mut evaluator =
-                    CompiledExpressionInstance::try_new(program.clone(), root(), &Control).unwrap();
+                let mut evaluator = CompiledExpressionInstance::try_new(
+                    root_unit(&program).clone(),
+                    root(&program).root,
+                    &Control,
+                )
+                .unwrap();
                 let control = CallbackControl::new(cause.clone(), index);
                 assert!(
                     matches!(evaluator.evaluate(&batch,Selection::all(321),&control),Err(actual) if actual==cause)

@@ -90,14 +90,21 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         .add_values(source, Box::from([Box::default()]), Box::default())
         .unwrap();
     let input_expr = builder
-        .add_expression(
-            input,
+        .unit(input)
+        .unwrap()
+        .add(
+            None,
             ty.clone(),
             checked_constants::kind(
                 &mut source_pools,
                 checked_constants::null(&(ty.clone()), options().constants),
             ),
         )
+        .unwrap();
+    let input_root = builder
+        .unit(input)
+        .unwrap()
+        .root(input_expr, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let value = ValueId::new(91);
     builder
@@ -106,7 +113,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             ty: ty.clone(),
             origin: ValueOrigin::Expr {
                 node: input,
-                expr: input_expr,
+                root: input_root,
             },
         })
         .unwrap();
@@ -114,7 +121,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         .add_project(
             input,
             source,
-            Box::from([(input_expr, value)]),
+            Box::from([(input_root, value)]),
             Box::from([value]),
         )
         .unwrap();
@@ -130,8 +137,10 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         .unwrap()
     });
     let leaf = builder
-        .add_expression(
-            output,
+        .unit(output)
+        .unwrap()
+        .add(
+            None,
             ty.clone(),
             if let Some(value) = &cv {
                 ExprKind::Constant(crate::exec::expr::test_support::register_constant(
@@ -156,8 +165,10 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             ControlShape::Eager,
         );
         child = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 owner.result(),
                 ExprKind::FunctionCall {
                     function: owner.function.clone(),
@@ -169,8 +180,10 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
     }
     if matches!(shape, Shape::CastFromBase64) {
         child = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 ExprKind::Cast {
                     expr: child,
@@ -192,8 +205,10 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             ControlShape::Eager,
         );
         child = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 owner.result(),
                 ExprKind::FunctionCall {
                     function: owner.function.clone(),
@@ -210,8 +225,10 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         ControlShape::Eager,
     );
     let call = builder
-        .add_expression(
-            output,
+        .unit(output)
+        .unwrap()
+        .add(
+            None,
             owner.result(),
             ExprKind::FunctionCall {
                 function: owner.function.clone(),
@@ -220,12 +237,17 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         )
         .unwrap();
     authors.insert(call, owner);
+    let output_root = builder
+        .unit(output)
+        .unwrap()
+        .root(call, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let result_value = builder
         .add_value(
             ty.clone(),
             ValueOrigin::Expr {
                 node: output,
-                expr: call,
+                root: output_root,
             },
         )
         .unwrap();
@@ -233,26 +255,14 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
         .add_project(
             output,
             input,
-            Box::from([(call, result_value)]),
+            Box::from([(output_root, result_value)]),
             Box::from([result_value]),
-        )
-        .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&ty),
             name: "base64".into(),
@@ -272,7 +282,8 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
     };
     compile_checked_fragment_with_parameters(
         &functions,
-        fragment,
+        builder,
+        output,
         &authors,
         result,
         parameters,
@@ -359,12 +370,7 @@ fn to_base64_actual_compiler_source_sensitive_full_profile_matches_rfc4648_vecto
         } else {
             Source::Ordinary
         };
-        let records = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls();
+        let records = root_unit(&program).calls();
         let own: Vec<_> = records
             .values()
             .filter(|record| {
@@ -420,7 +426,7 @@ fn to_base64_actual_native_identity_projection_matches_independent_source_table(
         ("upper", Source::Ordinary),
     ] {
         let id = FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap();
-        let emitted = novarocks_physical_plan::native_v1_function_name(&id).unwrap();
+        let emitted = novarocks_expression_contract::native_v1_function_name(&id).unwrap();
         assert_eq!(emitted, name);
         assert_eq!(
             Source::from_immediate_native_function_name(Some(emitted)),
@@ -489,28 +495,33 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
     let catalog =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let utf8 = FunctionValueType::new(DataType::Utf8, true);
-    let owner = NodeId::new(0);
-    let leaf = |id, kind, ty| novarocks_physical_plan::ExprNode {
+    let leaf = |id, kind, ty| novarocks_expression_contract::ExprNode {
         id: ExprId::new(id),
-        owner,
         lambda_scope: None,
         ty,
         kind,
     };
-    let classify = |nodes: Vec<novarocks_physical_plan::ExprNode>, args: &[ExprId]| {
-        let arena = novarocks_physical_plan::ExprArena::try_from_definitions_observed(
-            nodes.into_iter(),
-            &novarocks_physical_plan::PlanLimits::FROZEN,
-            &Control,
-        )
-        .unwrap();
+    let classify = |nodes: Vec<novarocks_expression_contract::ExprNode>, args: &[ExprId]| {
+        let mut draft = novarocks_expression_contract::BoundExprSetBuilder::new(
+            novarocks_expression_contract::UnitLimits {
+                expression_semantic_depth: novarocks_physical_plan::PlanLimits::FROZEN
+                    .expression_semantic_depth,
+            },
+        );
+        for node in nodes {
+            let id = draft.add(node.lambda_scope, node.ty, node.kind).unwrap();
+            assert_eq!(id, node.id);
+        }
         let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
             &Control,
             novarocks_type_contract::CompilePhase::Validate,
         )
         .unwrap();
-        let result =
-            novarocks_physical_plan::to_base64_byte_source_observed(&arena, args, &mut work);
+        let result = novarocks_expression_contract::to_base64_byte_source_from_lookup_observed(
+            |id| draft.definition(id),
+            args,
+            &mut work,
+        );
         work.finish().unwrap();
         result
     };
@@ -533,7 +544,7 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
             &[]
         ),
         Err(
-            novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
+            novarocks_expression_contract::TemporalSourceProjectionError::Invalid(
                 "to_base64 source requires one argument"
             )
         )
@@ -544,7 +555,7 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
             &[ExprId::new(8)]
         ),
         Err(
-            novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
+            novarocks_expression_contract::TemporalSourceProjectionError::Invalid(
                 "to_base64 source definition is absent"
             )
         )
@@ -609,7 +620,7 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
                 matches!(
                     direct,
                     Err(
-                        novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
+                        novarocks_expression_contract::TemporalSourceProjectionError::Invalid(
                             "to_base64 emitted source is not exact Physical Utf8"
                         )
                     )

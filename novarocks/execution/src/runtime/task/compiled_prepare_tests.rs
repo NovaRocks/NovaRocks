@@ -136,8 +136,7 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
     use novarocks_sql::compiler::{
         DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
         SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlSessionContext,
-        SqlStatementInput, author_fragment_package_semantics, builtin_sql_function_catalog,
-        noop_constant_evaluator,
+        SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
     };
 
     // Explicit table-free fixture limits; no scan or runtime creator is mocked.
@@ -188,15 +187,14 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
         .expect("SELECT 1 needs no provider observation")
         .into_parts()
         .0;
-    let semantics = author_fragment_package_semantics(&source, policy, &control).unwrap();
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
+    source.require_statement_constant_policy(policy).unwrap();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (id, authored) in semantics {
-        uses.insert(id, authored.expression_uses);
-        calls.insert(id, authored.calls);
-        pruning.insert(id, authored.pruning);
+    for &id in source.plan().fragments().keys() {
+        pruning.insert(
+            id,
+            novarocks_physical_plan::FrozenFragmentPruning::try_new(id, vec![], &control).unwrap(),
+        );
         admissions.insert(
             id,
             FragmentPackageAdmission {
@@ -226,8 +224,6 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
         source.plan(),
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &control,

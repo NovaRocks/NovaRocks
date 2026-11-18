@@ -245,7 +245,7 @@ fn source_probe() {
                         let input = fragment.nodes().get(&node.inputs[0]).unwrap();
                         assert_eq!(node.output.columns, input.output.columns);
                         for (ordinal, id) in predicates.iter().enumerate() {
-                            let expression = fragment.expressions().get(*id).unwrap();
+                            let expression = fragment.root_expression(node.id, *id).unwrap();
                             assert_eq!(expression.ty.data_type().clone(), DataType::Boolean);
                             eprintln!(
                                 "NDV actual FilterPredicate ordinal={ordinal} id={id:?} expression={expression:?}"
@@ -281,7 +281,9 @@ fn source_probe() {
             }
             // This is diagnostic observation of the already-emitted original
             // arena. It performs no lowering, decoder, rewriter or evaluation.
-            for (id, expression) in fragment.expressions().iter() {
+            for (_source_node, _unit, id, expression) in
+                super::sql_test_source::unit_definitions(fragment)
+            {
                 eprintln!(
                     "NDV actual original definition query={query} mode=compiled id={id:?} expression={expression:?}"
                 );

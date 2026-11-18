@@ -29,8 +29,7 @@ use arrow::{
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_compiler::{FragmentCompileError, compile_fragment};
 use novarocks_local_program::{
-    DiagnosticSourceNodeId, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind,
+    DiagnosticSourceNodeId, LocalProgram, ProgramNodeId, ProgramNodeKind,
 };
 use novarocks_physical_plan::{FragmentId, NodeKind};
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
@@ -92,22 +91,11 @@ fn fixture(sql: &str) -> Fixture {
                     unreachable!()
                 };
                 assert_eq!(local.len(), predicates.len());
-                let snapshot = program
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .resolved_calls()
-                    .snapshot();
-                for (ordinal, definition) in local.iter().enumerate() {
-                    let site = ProgramExpressionRootSite::Node {
-                        node,
-                        role: ProgramNodeExpressionRole::FilterPredicate {
-                            predicate: u32::try_from(ordinal).unwrap(),
-                        },
-                    };
-                    let use_id = snapshot.bindings()[&site];
-                    let invocation = &snapshot.flows()[&site.arena()].uses()[&use_id];
-                    assert_eq!(invocation.definition, *definition);
+                for reference in local {
+                    let unit = program.unit(reference.unit).unwrap();
+                    let root = unit.root(reference.root).unwrap();
+                    let invocation = &unit.control_flow().uses()[&root.use_id];
+                    assert_eq!(invocation.definition, root.definition);
                     assert_eq!(
                         invocation.context.demand,
                         novarocks_type_contract::EvaluationDemand::TruthOnly
@@ -183,9 +171,26 @@ fn bits(array: &ArrayRef) -> Vec<Option<bool>> {
         .iter()
         .collect()
 }
-fn group(f: &Fixture) -> CompiledFilterConjunctionInstance {
-    CompiledFilterConjunctionInstance::try_new(Arc::clone(&f.program), f.node, &Control).unwrap()
+fn predicates(
+    f: &Fixture,
+) -> Vec<(
+    Arc<novarocks_expression::CompiledExprSet>,
+    novarocks_expression_contract::RootOrdinal,
+)> {
+    let ProgramNodeKind::Filter { predicates, .. } =
+        f.program.graph().nodes()[f.node.index()].kind()
+    else {
+        panic!("actual Filter")
+    };
+    predicates
+        .iter()
+        .map(|site| (f.program.unit(site.unit).unwrap().clone(), site.root))
+        .collect()
 }
+fn group(f: &Fixture) -> CompiledFilterConjunctionInstance {
+    CompiledFilterConjunctionInstance::try_new(&predicates(f), &Control).unwrap()
+}
+
 #[test]
 fn filter_conjunction_actual_native_sql_frame_compiled_and_sparse_empty() {
     {
@@ -248,16 +253,12 @@ fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latch
     let error = instance
         .evaluate_required(&input, Selection::try_sparse(3, &[1, 2]).unwrap(), &Control)
         .unwrap_err();
+    let error = error.at_expression_node(f.node);
+    assert_eq!(error.expression_node(), Some(f.node));
     let ExecutionFailureCause::RequiredRow(error) = error.cause() else {
         panic!("actual required row error")
     };
-    assert_eq!(
-        error.root(),
-        ProgramExpressionRootSite::Node {
-            node: f.node,
-            role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 }
-        }
-    );
+    assert_eq!(error.root(), predicates(&f)[0].1);
     assert_eq!(error.batch_row(), 1);
     let second = instance
         .evaluate_required(&input, Selection::all(3), &Control)
@@ -330,16 +331,12 @@ fn filter_conjunction_actual_pending_error_commits_before_rand_boundary() {
     let error = instance
         .evaluate_required(&input, Selection::all(1), &Control)
         .unwrap_err();
+    let error = error.at_expression_node(f.node);
+    assert_eq!(error.expression_node(), Some(f.node));
     let ExecutionFailureCause::RequiredRow(error) = error.cause() else {
         panic!("pending error must become necessary before a nonpure boundary")
     };
-    assert_eq!(
-        error.root(),
-        ProgramExpressionRootSite::Node {
-            node: f.node,
-            role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 }
-        }
-    );
+    assert_eq!(error.root(), predicates(&f)[0].1);
     assert_eq!(error.batch_row(), 0);
     assert_eq!(
         instance.constructed_root_call_instances(1),

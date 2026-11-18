@@ -21,11 +21,13 @@
 
 use std::sync::Arc;
 
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
-    ConstantPools, Distribution, ExprKind, FragmentId, NodeId, NodeKind, NullOrdering,
-    RequiredInputs, SetOperationKind, SortDirection, SortExpr, SortMode, ValueId, ValueOrigin,
+    ConstantPools, Distribution, FragmentId, NodeId, NodeKind, NullOrdering, RequiredInputs,
+    SetOperationKind, SortDirection, SortExpr, SortMode, ValueId, ValueOrigin,
 };
+use novarocks_type_contract::EvaluationDemand;
 use novarocks_type_contract::FunctionValueType;
 
 use super::family_fixture::{cell, compile, int64, int64_rows, package, run, values};
@@ -97,7 +99,14 @@ fn program(branches: usize, sorted: bool, dop: usize) -> (Arc<LocalProgram>, Vec
     let root = if sorted {
         let sort = NodeId::new(200);
         let key = builder
-            .add_expression(sort, int64(false), ExprKind::Value(outputs[1]))
+            .unit(sort)
+            .unwrap()
+            .add(None, int64(false), ExprKind::Value(outputs[1]))
+            .unwrap();
+        let key = builder
+            .unit(sort)
+            .unwrap()
+            .root(key, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .add_sort(

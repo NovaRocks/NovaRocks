@@ -157,6 +157,7 @@ pub(crate) trait FinishStatisticsFactory: Send + Sync {
         &self,
         control: &RuntimeKernelControl,
         final_chunk: Chunk,
+        writer_schema: &crate::exec::chunk::ChunkSchema,
         root_schema: crate::exec::chunk::ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
         factory: Arc<dyn InputConstructionFactory>,
@@ -1041,6 +1042,7 @@ impl TableFinishOperator {
                         crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
                     )?,
                     final_chunk,
+                    self.writer_schema.schema()?.chunk_schema(),
                     Arc::clone(self.prepared_root_schema()?.chunk_schema()),
                     self.output_tracker.as_ref().map(Arc::clone),
                     Arc::clone(self.construction.as_ref().ok_or(
@@ -4790,26 +4792,24 @@ mod tests {
             PureProviderCompileError, PureProviderManifestEntry, PureProviderProgramCatalog,
             PureProviderProgramDefinition,
         };
+        use novarocks_expression_contract::RootScope;
+        use novarocks_expression_contract::{BoundFunction, PhysicalCallRequest};
         use novarocks_functions::{
-            AggregateBindingSelection, AggregateKernelPhase, AggregatePreparationOptions,
-            AggregateStateFormatIdentity, CallArgumentUses, CallEffectInput, ConstantPolicy,
-            EngineFunctionCatalogBuilder, FunctionBindingRequest, FunctionBindingSelection,
-            FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel,
-            PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
-            PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
+            AggregateStateFormatIdentity, ConstantPolicy, EngineFunctionCatalogBuilder,
+            FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId,
+            FunctionResultType, InstalledPureKernel, PureEngineFunctionCatalog,
+            PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
         };
         use novarocks_local_compiler::{
             LocalCompileOptions, compile_fragment, validate_fragment_providers,
         };
         use novarocks_local_program::{KernelAbiVersion, LocalProgram};
         use novarocks_physical_plan::{
-            AggregateBinding, AggregatePhase, AggregateSequenceId, BoundFunction, ConstantPool,
-            ConstantPoolId, ConstantReference, Distribution, Edge, EdgeDestination, EdgeId,
-            EdgeKind, EdgePartitioning, EdgeSource, Fragment, FragmentId, FragmentPackageAdmission,
-            FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, NodeId,
-            NodeKind, OutputPort, PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite,
-            PhysicalExpressionRoots, PhysicalNode, PhysicalPlan, PhysicalProperties,
-            PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
+            AggregateBinding, AggregatePhase, AggregateSequenceId, ConstantPool, ConstantPoolId,
+            ConstantReference, Distribution, Edge, EdgeDestination, EdgeId, EdgeKind,
+            EdgePartitioning, EdgeSource, FragmentId, FragmentPackageAdmission, FragmentSink,
+            FrozenFragmentPruning, NodeId, NodeKind, OutputPort, PhysicalCallSite, PhysicalNode,
+            PhysicalPlan, PhysicalProperties, PipelineDopDomain, PlanLimits, PlanVersionId,
             PropertyProofProjectionLimits, ROOT_WRITE_RESULT_SCHEMA_REVISION, ResultField,
             ResultPort, RowMultiplicity, SetOperationKind, StaticFunctionArgument, UnpivotConstant,
             ValueOrigin, WRITER_MULTIPLEX_SCHEMA_REVISION, WriterAggregateCall, WriterDerivedKind,
@@ -4821,10 +4821,8 @@ mod tests {
             root_write_result_schema, writer_output_schema,
         };
         use novarocks_type_contract::{
-            CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
-            EvaluationDemand, EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
-            ExpressionEffects, ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId,
-            FunctionValueType, PureCompileControl, SemanticParameters,
+            CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType,
+            PureCompileControl, SemanticParameters,
         };
         use std::collections::BTreeMap;
         use std::num::NonZeroUsize;
@@ -5153,196 +5151,35 @@ mod tests {
         fn with_requests<'a>(
             fragment: crate::exec::operators::family_fixture::constant_sources::Fragment,
             sites: impl Iterator<Item = (PhysicalCallSite, &'a AggregateBinding)>,
+            catalog: &PureEngineFunctionCatalog,
+            parameters: &SemanticParameters,
         ) -> crate::exec::operators::family_fixture::constant_sources::Fragment {
+            let (fragment, constants) = fragment.into_parts();
             let mut entries = fragment
                 .call_requests()
                 .entries()
                 .iter()
-                .map(|(definition, request)| (*definition, request.clone()))
+                .map(|(site, request)| (*site, request.clone()))
                 .collect::<Vec<_>>();
             for (site, binding) in sites {
-                entries.push((
-                    PhysicalCallDefinition::Relational(site),
-                    any_value_request(binding),
-                ));
+                entries.push((site, any_value_request(binding)));
             }
-            fragment
+            let fragment = fragment
                 .with_call_requests_observed(entries, &FixtureControl)
-                .unwrap()
-        }
-
-        fn freeze(
-            fragment: &Fragment,
-            catalog: &PureEngineFunctionCatalog,
-        ) -> (PhysicalRootUses, FrozenFragmentCalls) {
-            let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-            let mut uses = Vec::new();
-            let mut bindings = Vec::new();
-            for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-                let id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
-                uses.push(ExpressionInvocation {
-                    context: ExpressionEffectContext {
-                        use_id: id,
-                        region: EvaluationRegionId::new(0),
-                        demand: root.demand,
-                    },
-                    definition: root.expr,
-                    control: ControlShape::Eager,
-                    arguments: Box::default(),
-                });
-                bindings.push((*site, id));
-            }
-            let mut next_use = u32::try_from(uses.len()).unwrap();
-            let mut domains = vec![ExpressionEvaluationRegion {
-                id: EvaluationRegionId::new(0),
-                parent: None,
-                guard: None,
-            }];
-            let mut sites = Vec::new();
-            for node in fragment.nodes().values() {
-                let (calls, partial): (&[WriterAggregateCall], bool) = match &node.kind {
-                    NodeKind::TableWriter { target } => (&target.partial_aggregates, true),
-                    NodeKind::TableFinish(spec) => (&spec.final_aggregates, false),
-                    _ => continue,
-                };
-                for (call, item) in calls.iter().enumerate() {
-                    let site = if partial {
-                        PhysicalCallSite::WriterPartial {
-                            node: node.id,
-                            call: call as u32,
-                        }
-                    } else {
-                        PhysicalCallSite::WriterFinal {
-                            node: node.id,
-                            call: call as u32,
-                        }
-                    };
-                    let mut context = || {
-                        let context = ExpressionEffectContext {
-                            use_id: ExpressionUseId::new(next_use),
-                            region: EvaluationRegionId::new(domains.len() as u32),
-                            demand: EvaluationDemand::Value,
-                        };
-                        domains.push(ExpressionEvaluationRegion {
-                            id: context.region,
-                            parent: None,
-                            guard: None,
-                        });
-                        next_use += 1;
-                        context
-                    };
-                    let relational = context();
-                    let input = context();
-                    sites.push((site, item, relational, input));
-                }
-            }
-            let flow = ExpressionControlFlow::try_new(
-                domains,
-                uses,
-                fragment.expressions(),
-                CompilePhase::Validate,
+                .unwrap();
+            let frozen = crate::exec::operators::family_fixture::freeze_materialized_writer_calls(
+                &fragment,
+                catalog,
+                parameters,
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
                 &FixtureControl,
+            );
+            let fragment = fragment
+                .with_frozen_calls_observed(frozen, &FixtureControl)
+                .unwrap();
+            crate::exec::operators::family_fixture::constant_sources::Fragment::from_parts(
+                fragment, constants,
             )
-            .unwrap();
-            let root_uses =
-                PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap();
-            let parameters = SemanticParameters::try_new([]).unwrap();
-            let frozen = sites
-                .into_iter()
-                .map(|(site, item, context, input)| {
-                    let binding = &item.binding;
-                    let selected = Arc::new(FunctionBindingSelection {
-                        overload: binding.function.overload.clone(),
-                        argument_types: binding.function.argument_types.clone(),
-                        result_type: FunctionResultType::Scalar(
-                            binding.function.result_type.clone(),
-                        ),
-                        aggregate: Some(AggregateBindingSelection {
-                            state_argument_contract: binding.state_argument_contract,
-                            intermediate_type: binding.intermediate_type.clone(),
-                            state_format: binding.state_format.clone(),
-                        }),
-                    });
-                    let request = any_value_request(binding);
-                    let arguments = request
-                        .arguments
-                        .iter()
-                        .map(|argument| match argument {
-                            StaticFunctionArgument::Value { value_type, .. } => {
-                                StaticFunctionArgument::Value {
-                                    value_type: value_type.clone(),
-                                    constant: None,
-                                }
-                            }
-                            StaticFunctionArgument::Lambda { .. } => unreachable!(),
-                        })
-                        .collect::<Vec<_>>();
-                    let state_type = fragment.values()[&item.input].ty.clone();
-                    let argument_uses = [Some(input.use_id)];
-                    let partial = matches!(site, PhysicalCallSite::WriterPartial { .. });
-                    let phase = if partial {
-                        AggregateKernelPhase::Partial
-                    } else {
-                        AggregateKernelPhase::Final
-                    };
-                    let token = catalog
-                        .prepare_fresh(
-                            CallEffectInput {
-                                context,
-                                argument_uses: if partial {
-                                    CallArgumentUses::SelectedChannels(&argument_uses)
-                                } else {
-                                    CallArgumentUses::AggregateMerge {
-                                        phase,
-                                        state_context: input,
-                                        state_input_type: &state_type,
-                                    }
-                                },
-                                function_id: &binding.function.function_id,
-                                kind: FunctionKind::Aggregate,
-                                selected: selected.as_ref(),
-                                request: FunctionBindingRequest {
-                                    arguments: &arguments,
-                                    logical_argument_count: 1,
-                                    expected_result_type: None,
-                                },
-                                environment: &[],
-                                parameters: &parameters,
-                                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                                proof_scope: CallProofScope::Region(context.region),
-                            },
-                            Arc::clone(&selected),
-                            PureCallPreparation::Aggregate {
-                                arguments: ScopedExpressionEffects::primitive(
-                                    context,
-                                    ExpressionEffects::PURE_VALUE,
-                                ),
-                                options: AggregatePreparationOptions {
-                                    state_interpretation: None,
-                                    phase,
-                                    distinct: false,
-                                    order_keys: Arc::from([]),
-                                    state_input_type: (!partial).then(|| state_type.clone()),
-                                },
-                            },
-                            &FixtureControl,
-                        )
-                        .unwrap_or_else(|error| panic!("the frontend prepares {site:?}: {error}"));
-                    FrozenPhysicalCall {
-                        materialized_writer_input: Some(input),
-                        regexp_count_pattern_source: None,
-                        to_base64_byte_source: None,
-                        temporal_source: None,
-                        site,
-                        context,
-                        effects: token.call_contract().effects().clone(),
-                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                    }
-                })
-                .collect();
-            let calls = FrozenFragmentCalls::try_new(fragment, &root_uses, frozen, &FixtureControl)
-                .unwrap_or_else(|error| panic!("frozen writer calls validate: {error}"));
-            (root_uses, calls)
         }
 
         fn plan(
@@ -5359,11 +5196,13 @@ mod tests {
 
             assert!(target_count > 0 && channel_count > 0);
             let catalog = catalog();
+            let parameters = SemanticParameters::try_new([]).unwrap();
             let mut plan =
                 crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
                     PlanVersionId::try_new([29; 16]).unwrap(),
                     &fixture_sources,
-                );
+                )
+                .with_semantic_parameters(parameters.clone());
             let mut consumer =
                 crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
                     FragmentId::new(target_count as u32 + 1),
@@ -5398,6 +5237,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 producer
                     .insert_node_unchecked(PhysicalNode {
+                        expressions: None,
                         id: source,
                         inputs: Box::default(),
                         required_inputs: Box::default(),
@@ -5483,6 +5323,7 @@ mod tests {
                     .collect::<Box<[_]>>();
                 producer
                     .insert_node_unchecked(PhysicalNode {
+                        expressions: None,
                         id: writer,
                         inputs: Box::from([source]),
                         required_inputs: Box::from([property(Distribution::Singleton)]),
@@ -5507,12 +5348,15 @@ mod tests {
                         },
                     })
                     .unwrap();
+                crate::exec::operators::family_fixture::seal_no_call_units(&mut producer);
                 let fragment = with_requests(
                     producer
-                        .finish_definition(
+                        .finish_structure(
                             writer,
                             FragmentSink::Stream { edge },
                             dop(),
+                            PlanLimits::FROZEN,
+                            &FixtureControl,
                             novarocks_physical_plan::StagePlacementPolicy::Singleton,
                         )
                         .unwrap(),
@@ -5525,6 +5369,8 @@ mod tests {
                             &item.binding,
                         )
                     }),
+                    &catalog,
+                    &parameters,
                 );
                 plan.add_fragment(fragment).unwrap();
                 drafts.insert(ordinal, recipe);
@@ -5556,6 +5402,7 @@ mod tests {
                     .collect::<Box<[_]>>();
                 consumer
                     .insert_node_unchecked(PhysicalNode {
+                        expressions: None,
                         id: exchange,
                         inputs: Box::default(),
                         required_inputs: Box::default(),
@@ -5624,6 +5471,7 @@ mod tests {
                     .collect::<Box<[_]>>();
                 consumer
                     .insert_node_unchecked(PhysicalNode {
+                        expressions: None,
                         id: union,
                         inputs: receivers.into_boxed_slice(),
                         required_inputs: (0..target_count)
@@ -5690,6 +5538,11 @@ mod tests {
                             BLOB_TYPE.into(),
                         ),
                     );
+                    let blob = consumer
+                        .unit(finish)
+                        .unwrap()
+                        .root(blob, EvaluationDemand::Value, RootScope::Port(0))
+                        .unwrap();
                     mappings.push(WriterGroupedUnpivotMapping {
                         write_target_ordinal: target(target_index as u32),
                         input: finals[channel].output,
@@ -5713,6 +5566,7 @@ mod tests {
             let grouping_input = input_fields[1].value;
             consumer
                 .insert_node_unchecked(PhysicalNode {
+                    expressions: None,
                     id: finish,
                     inputs: Box::from([input_node]),
                     required_inputs: Box::from([property(Distribution::Singleton)]),
@@ -5757,12 +5611,15 @@ mod tests {
                     }),
                 })
                 .unwrap();
+            crate::exec::operators::family_fixture::seal_no_call_units(&mut consumer);
             let consumer = with_requests(
                 consumer
-                    .finish_definition(
+                    .finish_structure(
                         finish,
                         FragmentSink::Result,
                         dop(),
+                        PlanLimits::FROZEN,
+                        &FixtureControl,
                         novarocks_physical_plan::StagePlacementPolicy::Singleton,
                     )
                     .unwrap(),
@@ -5775,6 +5632,8 @@ mod tests {
                         &item.binding,
                     )
                 }),
+                &catalog,
+                &parameters,
             );
             let consumer_id = consumer.id();
             plan.add_fragment(consumer).unwrap();
@@ -5900,34 +5759,8 @@ mod tests {
             );
             let original_count = unpivot.mappings.len();
             assert_eq!(original_count, channel_count);
-            let checked = first.checked();
-            let channels = checked.channels();
-            let expressions = channels.expressions();
-            let resolved = expressions.resolved_calls();
-            let snapshot = resolved.snapshot();
-            let mut bindings = snapshot
-                .bindings()
-                .iter()
-                .map(|(&site, &use_id)| lp::ProgramRootUseBinding { site, use_id })
-                .collect::<Vec<_>>();
-            let main = snapshot
-                .flows()
-                .get(&lp::ProgramExpressionArena::Main)
-                .unwrap();
-            let mut uses = main.uses().values().cloned().collect::<Vec<_>>();
-            // Relational calls occupy the same use-ID namespace even though
-            // their contexts are not entries in the scalar occurrence forest.
-            let mut next_use =
-                uses.iter()
-                    .map(|item| item.context.use_id.get())
-                    .chain(
-                        resolved.calls().values().map(|call| {
-                            call.specialization().call_contract().context().use_id.get()
-                        }),
-                    )
-                    .max()
-                    .unwrap()
-                    + 1;
+            let mut units = first.units().to_vec();
+            let mut imported_units = BTreeMap::new();
             for (channel, source) in other.mappings.iter().enumerate() {
                 assert_eq!(source.grouping_key, 1);
                 let mut mapping = source.clone();
@@ -5946,16 +5779,23 @@ mod tests {
                     else {
                         panic!("compiled scalar literal positions agree")
                     };
-                    // Explicitly map the second program's scalar definition to
-                    // the first one's checked identical BLOB literal. Foreign
-                    // expression IDs are never copied by numeric coincidence.
-                    let left = graph.expressions().node(*first_id).unwrap();
-                    let right = second.graph().expressions().node(*expr_id).unwrap();
+                    // Validate both actual BLOB roots before retaining the
+                    // second source unit at its new real table position.
+                    // Local definition/use ordinals remain in that unit.
+                    let left_unit = first.unit(first_id.unit).unwrap();
+                    let left_root = left_unit.root(first_id.root).unwrap();
+                    let left = left_unit.definitions().node(left_root.definition).unwrap();
+                    let right_unit = second.unit(expr_id.unit).unwrap();
+                    let right_root = right_unit.root(expr_id.root).unwrap();
+                    let right = right_unit
+                        .definitions()
+                        .node(right_root.definition)
+                        .unwrap();
                     assert_eq!(left.value_type(), right.value_type());
                     assert_eq!(*nullable, *first_nullable);
                     let (
-                        lp::StaticExprKind::Constant(left_value),
-                        lp::StaticExprKind::Constant(right_value),
+                        novarocks_expression::StaticExprKind::Constant(left_value),
+                        novarocks_expression::StaticExprKind::Constant(right_value),
                     ) = (left.kind(), right.kind())
                     else {
                         panic!("LocalCompiler admits physical literals as checked constants")
@@ -5977,24 +5817,12 @@ mod tests {
                             .unwrap(),
                         Some(BLOB_TYPE)
                     );
-                    *expr_id = *first_id;
-                    let role = |mapping| lp::ProgramExpressionRootSite::Node {
-                        node,
-                        role: lp::ProgramNodeExpressionRole::FinishUnpivotConstant {
-                            mapping: mapping as u32,
-                            constant: constant as u32,
-                        },
-                    };
-                    let original_use = snapshot.bindings()[&role(channel)];
-                    let mut invocation = main.uses()[&original_use].clone();
-                    let use_id = ExpressionUseId::new(next_use);
-                    next_use += 1;
-                    invocation.context.use_id = use_id;
-                    uses.push(invocation);
-                    bindings.push(lp::ProgramRootUseBinding {
-                        site: role(original_count + channel),
-                        use_id,
+                    let imported = *imported_units.entry(expr_id.unit).or_insert_with(|| {
+                        let id = lp::ProgramUnitId::new(units.len());
+                        units.push(Arc::clone(right_unit));
+                        id
                     });
+                    *expr_id = lp::ProgramRootRef::new(imported, expr_id.root);
                 }
                 // Array/map constants retain the values admitted by the second
                 // program's actual frozen ConstantReferences without retagging.
@@ -6011,64 +5839,13 @@ mod tests {
             let graph = lp::LocalProgramGraph::try_new_with_sink_for_compile(
                 nodes,
                 node,
-                Arc::clone(graph.expressions()),
+                &units,
                 graph.profile(),
                 graph.requirements().clone(),
                 graph.sink().cloned(),
                 &FixtureControl,
             )
             .expect("component graph validates without changing compiler capability");
-            let mut flows = snapshot.flows().clone();
-            flows.insert(
-                lp::ProgramExpressionArena::Main,
-                lp::ProgramControlFlow::try_new(
-                    main.regions().values().cloned().collect(),
-                    uses,
-                    graph.expressions().nodes().len(),
-                    &FixtureControl,
-                )
-                .unwrap(),
-            );
-            let roots =
-                lp::ProgramRootControlBindings::try_new(graph, flows, bindings, &FixtureControl)
-                    .unwrap();
-            let calls = lp::ProgramResolvedCalls::try_new(
-                roots,
-                resolved
-                    .calls()
-                    .iter()
-                    .map(|(&site, call)| (site, call.specialization().clone()))
-                    .collect(),
-                &FixtureControl,
-            )
-            .unwrap();
-            let types = lp::ProgramTypedExpressions::try_new_guarded(
-                calls,
-                expressions.types().clone(),
-                &FixtureControl,
-            )
-            .unwrap();
-            let channels = lp::ProgramTypedChannels::try_new(
-                types,
-                channels
-                    .channels()
-                    .iter()
-                    .map(|(&site, ty)| (site, ty.clone()))
-                    .collect(),
-                &FixtureControl,
-            )
-            .unwrap();
-            let lexical = lp::ProgramLexicalBindings::try_new(
-                channels,
-                checked.lambdas().values().cloned().collect(),
-                checked
-                    .slots()
-                    .iter()
-                    .map(|(&occurrence, &source)| lp::ProgramSlotBinding { occurrence, source })
-                    .collect(),
-                &FixtureControl,
-            )
-            .unwrap();
             let operators = first
                 .provenance()
                 .operators()
@@ -6081,7 +5858,20 @@ mod tests {
                 .collect();
             Arc::new(
                 lp::LocalProgram::try_new(
-                    lexical,
+                    graph,
+                    units,
+                    first
+                        .resolved_calls()
+                        .calls()
+                        .iter()
+                        .map(|(&site, call)| (site, call.specialization().clone()))
+                        .collect(),
+                    first
+                        .channels()
+                        .channels()
+                        .iter()
+                        .map(|(&site, ty)| (site, ty.clone()))
+                        .collect(),
                     operators,
                     &sources,
                     lp::CompiledProgramFacts {
@@ -6103,14 +5893,9 @@ mod tests {
             let catalog = catalog();
             let target_count = 1;
             let (plan, drafts) = plan(target_count, channel_count, max_output_rows, first_target);
-            let mut uses = BTreeMap::new();
-            let mut calls = BTreeMap::new();
             let mut pruning = BTreeMap::new();
             let mut admissions = BTreeMap::new();
-            for (&id, fragment) in plan.fragments() {
-                let (root_uses, frozen) = freeze(fragment, &catalog);
-                uses.insert(id, root_uses);
-                calls.insert(id, frozen);
+            for &id in plan.fragments().keys() {
                 pruning.insert(
                     id,
                     FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
@@ -6132,8 +5917,6 @@ mod tests {
                 &plan,
                 &BTreeMap::new(),
                 &drafts,
-                &uses,
-                &calls,
                 &pruning,
                 &admissions,
                 &FixtureControl,

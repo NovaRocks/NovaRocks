@@ -197,18 +197,9 @@ fn input_array(
     )
     .unwrap()
 }
-fn context(program: &LocalProgram) -> (ProgramUseRef, ExpressionEffectContext) {
-    let s = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let u = ProgramUseRef {
-        arena: root().arena(),
-        use_id: s.bindings()[&root()],
-    };
-    (u, s.flows()[&u.arena].uses()[&u.use_id].context)
+fn context(program: &LocalProgram) -> (ExpressionUseId, ExpressionEffectContext) {
+    let u = cast_root_use(&program);
+    (u, root_unit(&program).control_flow().uses()[&u].context)
 }
 #[test]
 fn actual_compiled_unsigned_cast_all_seventy_two_profiles_preserve_sparse_slice_nulls_and_policies()
@@ -232,7 +223,7 @@ fn actual_compiled_unsigned_cast_all_seventy_two_profiles_preserve_sparse_slice_
                     allow,
                 );
                 let (u, c) = context(&program);
-                let recipe = program.cast_recipe(u).unwrap();
+                let recipe = root_unit(&program).recipes().cast(u).unwrap();
                 assert_eq!(recipe.source_type(), &source_type);
                 assert_eq!(recipe.result_type(), &target_type);
                 assert_eq!(recipe.allow_throw_exception(), allow);
@@ -366,8 +357,10 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
         let intermediate = FunctionValueType::new(narrow.clone(), true);
         let output = FunctionValueType::new(DataType::UInt64, true);
         let literal = builder
-            .add_expression(
-                node,
+            .unit(node)
+            .unwrap()
+            .add(
+                None,
                 (wide).clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -376,8 +369,10 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
             )
             .unwrap();
         let inner = builder
-            .add_expression(
-                node,
+            .unit(node)
+            .unwrap()
+            .add(
+                None,
                 intermediate,
                 ExprKind::Cast {
                     expr: literal,
@@ -388,8 +383,10 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
             )
             .unwrap();
         let expr = builder
-            .add_expression(
-                node,
+            .unit(node)
+            .unwrap()
+            .add(
+                None,
                 output.clone(),
                 ExprKind::Cast {
                     expr: inner,
@@ -399,8 +396,13 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
                 },
             )
             .unwrap();
+        let expr = builder
+            .unit(node)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         let value = builder
-            .add_value(output.clone(), ValueOrigin::Expr { node, expr })
+            .add_value(output.clone(), ValueOrigin::Expr { node, root: expr })
             .unwrap();
         builder
             .add_project(
@@ -410,22 +412,10 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
                 Box::from([value]),
             )
             .unwrap();
-        let fragment = builder
-            .finish_definition(
-                node,
-                FragmentSink::Result,
-                PipelineDopDomain {
-                    min: 1,
-                    max: 1,
-                    requires_power_of_two: false,
-                },
-                novarocks_physical_plan::StagePlacementPolicy::Singleton,
-            )
-            .unwrap();
         let port = ResultPort {
             scalar_schema: None,
             fragment: fid,
-            output: fragment.nodes()[&node].output.clone(),
+            output: builder.construction_node(node).unwrap().output.clone(),
             fields: Box::from([ResultField {
                 domain: crate::test_result_domain::result_value_domain(&output),
                 name: "narrow_source".into(),
@@ -436,19 +426,21 @@ fn actual_compiled_unsigned_cast_u64_literal_constant_and_narrow_producers_do_no
         };
         let package = package(
             &functions,
-            fragment,
+            builder,
+            node,
             &BTreeMap::new(),
             port,
             false,
             source_pools,
         );
         let program = compile(&functions, package, &Control).unwrap();
-        let site = ProgramExpressionRootSite::Node {
-            node: ProgramNodeId::new(1),
-            role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-        };
-        let mut evaluator =
-            CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+        let site = root(&program);
+        let mut evaluator = CompiledExpressionInstance::try_new(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &Control,
+        )
+        .unwrap();
         let batch = RecordBatch::try_new_with_options(
             program.graph().nodes()[0].output_layout().schema().clone(),
             vec![],

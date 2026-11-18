@@ -207,7 +207,7 @@ use crate::runtime::task::io::{
 use crate::task_execution::domain::ExchangeEdgeId;
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::datatypes::DataType;
-use novarocks_local_program::{LocalProgram, ProgramExpressionRootSite};
+use novarocks_local_program::{LocalProgram, ProgramRootRef};
 use novarocks_types::SlotId;
 use novarocks_types::{UniqueId, format_uuid};
 use std::collections::VecDeque;
@@ -1344,13 +1344,13 @@ pub(crate) enum CompiledPartitionRoute {
 #[derive(Clone)]
 pub(crate) struct CompiledPartitionKeys {
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     route: CompiledPartitionRoute,
-    applies: Option<ProgramExpressionRootSite>,
+    applies: Option<ProgramRootRef>,
 }
 
 impl CompiledPartitionKeys {
-    pub(crate) fn new(program: Arc<LocalProgram>, sites: Vec<ProgramExpressionRootSite>) -> Self {
+    pub(crate) fn new(program: Arc<LocalProgram>, sites: Vec<ProgramRootRef>) -> Self {
         Self {
             program,
             sites,
@@ -1359,10 +1359,7 @@ impl CompiledPartitionKeys {
         }
     }
 
-    pub(crate) fn hierarchical(
-        program: Arc<LocalProgram>,
-        sites: Vec<ProgramExpressionRootSite>,
-    ) -> Self {
+    pub(crate) fn hierarchical(program: Arc<LocalProgram>, sites: Vec<ProgramRootRef>) -> Self {
         Self {
             program,
             sites,
@@ -1373,8 +1370,8 @@ impl CompiledPartitionKeys {
 
     pub(crate) fn conditional(
         program: Arc<LocalProgram>,
-        sites: Vec<ProgramExpressionRootSite>,
-        applies: ProgramExpressionRootSite,
+        sites: Vec<ProgramRootRef>,
+        applies: ProgramRootRef,
     ) -> Self {
         Self {
             program,

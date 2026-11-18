@@ -45,13 +45,22 @@ pub(crate) fn boundary_program(project: Option<bool>) -> Arc<LocalProgram> {
         } else {
             ExprKind::Value(values[0])
         };
-        let expr = builder.add_expression(PROJECT, ty.clone(), kind).unwrap();
+        let expr = builder
+            .unit(PROJECT)
+            .unwrap()
+            .add(None, ty.clone(), kind)
+            .unwrap();
+        let expr = builder
+            .unit(PROJECT)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         let output = builder
             .add_value(
                 ty,
                 ValueOrigin::Expr {
                     node: PROJECT,
-                    expr,
+                    root: expr,
                 },
             )
             .unwrap();
@@ -67,6 +76,7 @@ pub(crate) fn boundary_program(project: Option<bool>) -> Arc<LocalProgram> {
     } else {
         VALUES
     };
+    super::super::family_fixture::seal_no_call_units(&mut builder);
     let fragment = builder
         .finish_definition(
             root,

@@ -24,110 +24,35 @@ use arrow::array::{
 
 fn checked_package(
     functions: &PureEngineFunctionCatalog,
-    fragment: Fragment,
+    mut builder: FragmentBuilder,
+    root_node: NodeId,
     authors: &BTreeMap<ExprId, Author>,
     result: ResultPort,
     source_pools: novarocks_physical_plan::ConstantPools,
 ) -> Arc<FragmentPackage> {
-    let (fragment, constants) = original_request_sources(fragment, authors, source_pools);
-    let fragment_id = fragment.id();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let mut flow_author = FlowAuthor::new();
-    let mut bindings = vec![];
-    for (&site, root) in roots.sites() {
-        let id = flow_author.visit(
-            &fragment,
-            authors,
-            root.expr,
-            EvaluationRegionId::new(u32::MAX),
-            root.demand,
-        );
-        bindings.push((site, id));
-    }
-    let ordered_uses = flow_author.uses;
-    let flow = ExpressionControlFlow::try_new(
-        flow_author.domains,
-        ordered_uses.clone(),
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow.clone(), bindings, &Control).unwrap();
+    let fragment_id = builder.id();
     let parameters = SemanticParameters::try_new([]).unwrap();
-    let mut summaries = BTreeMap::new();
-    let mut frozen = vec![];
-    for invocation in ordered_uses {
-        let context = invocation.context;
-        let scoped = if let Some(owner) = authors.get(&invocation.definition) {
-            let mut children = ScopedExpressionEffects::pure_value(context);
-            for (ordinal, child) in invocation.arguments.iter().enumerate() {
-                children = if matches!(owner.shape, ControlShape::If | ControlShape::Coalesce) {
-                    children
-                        .join_control_argument(summaries[child], &flow, ordinal)
-                        .unwrap()
-                } else {
-                    children.join_same_region(summaries[child]).unwrap()
-                };
-            }
-            let argument_uses = invocation
-                .arguments
-                .iter()
-                .map(|id| Some(*id))
-                .collect::<Vec<_>>();
-            let preparation = if matches!(owner.shape, ControlShape::If | ControlShape::Coalesce) {
-                PureCallPreparation::ControlIntrinsic {
-                    arguments: children,
-                }
-            } else {
-                PureCallPreparation::Scalar {
-                    arguments: children,
-                }
-            };
-            let token = functions
-                .prepare_fresh(
-                    CallEffectInput {
-                        context,
-                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
-                            &argument_uses,
-                        ),
-                        function_id: &owner.function.function_id,
-                        kind: FunctionKind::Scalar,
-                        selected: owner.selected.as_ref(),
-                        request: owner.request(),
-                        environment: &[],
-                        parameters: &parameters,
-                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Region(context.region),
-                    },
-                    owner.selected.clone(),
-                    preparation,
-                    &Control,
-                )
-                .unwrap();
-            frozen.push(FrozenPhysicalCall {
-                materialized_writer_input: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                site: PhysicalCallSite::Expression(context.use_id),
-                context,
-                effects: token.call_contract().effects().clone(),
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            });
-            token.effects()
-        } else {
-            let mut joined = ScopedExpressionEffects::pure_value(context);
-            for (ordinal, child) in invocation.arguments.iter().enumerate() {
-                joined = joined
-                    .join_control_argument(summaries[child], &flow, ordinal)
-                    .unwrap();
-            }
-            joined
-        };
-        summaries.insert(context.use_id, scoped);
-    }
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, frozen, &Control).unwrap();
+    let constants = finish_fixture_units(
+        functions,
+        &mut builder,
+        root_node,
+        authors,
+        &parameters,
+        source_pools,
+        |_, _, children| children,
+    );
+    let fragment = builder
+        .finish_definition(
+            root_node,
+            FragmentSink::Result,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
     Arc::new(
         FragmentPackage::try_new(
             FragmentPackageInput {
@@ -135,8 +60,7 @@ fn checked_package(
                 required: RequiredContracts::default(),
                 constants,
                 fragment,
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: options().constants,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters,
@@ -187,8 +111,10 @@ fn nullsafe_fixture(
     let mut items = vec![];
     for id in ids {
         let expr = builder
-            .add_expression(
-                input,
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -196,25 +122,37 @@ fn nullsafe_fixture(
                 ),
             )
             .unwrap();
+        let input_root = builder
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr {
+                    node: input,
+                    root: input_root,
+                },
             })
             .unwrap();
-        items.push((expr, id));
+        items.push((input_root, id));
     }
     builder
         .add_project(input, source, items.into_boxed_slice(), Box::from(ids))
         .unwrap();
     let mut authors = BTreeMap::new();
     let left = builder
-        .add_expression(output, ty.clone(), ExprKind::Value(ids[0]))
+        .unit(output)
+        .unwrap()
+        .add(None, ty.clone(), ExprKind::Value(ids[0]))
         .unwrap();
     let right = match right_kind {
         Right::Column => builder
-            .add_expression(output, ty.clone(), ExprKind::Value(ids[1]))
+            .unit(output)
+            .unwrap()
+            .add(None, ty.clone(), ExprKind::Value(ids[1]))
             .unwrap(),
         Right::Random => {
             let integer = FunctionValueType::new(DataType::Int64, false);
@@ -238,7 +176,9 @@ fn nullsafe_fixture(
         }
         Right::Round => {
             let source = builder
-                .add_expression(output, ty.clone(), ExprKind::Value(ids[1]))
+                .unit(output)
+                .unwrap()
+                .add(None, ty.clone(), ExprKind::Value(ids[1]))
                 .unwrap();
             let integer = FunctionValueType::new(DataType::Int64, false);
             let digits = literal(
@@ -262,8 +202,10 @@ fn nullsafe_fixture(
     };
     let result_type = FunctionValueType::new(DataType::Boolean, false);
     let expr = builder
-        .add_expression(
-            output,
+        .unit(output)
+        .unwrap()
+        .add(
+            None,
             result_type.clone(),
             ExprKind::Binary {
                 op: BinaryOperator::EqForNull,
@@ -274,36 +216,32 @@ fn nullsafe_fixture(
             },
         )
         .unwrap();
+    let output_root = builder
+        .unit(output)
+        .unwrap()
+        .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let result = builder
         .add_value(
             result_type.clone(),
-            ValueOrigin::Expr { node: output, expr },
+            ValueOrigin::Expr {
+                node: output,
+                root: output_root,
+            },
         )
         .unwrap();
     builder
         .add_project(
             output,
             input,
-            Box::from([(expr, result)]),
+            Box::from([(output_root, result)]),
             Box::from([result]),
-        )
-        .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: FragmentId::new(307),
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&result_type),
             name: "null_safe_result".into(),
@@ -312,7 +250,7 @@ fn nullsafe_fixture(
             ty: result_type,
         }]),
     };
-    let package = checked_package(&functions, fragment, &authors, result, source_pools);
+    let package = checked_package(&functions, builder, output, &authors, result, source_pools);
     (functions, package)
 }
 fn nullsafe_program(ty: FunctionValueType, right_kind: Right) -> Arc<LocalProgram> {
@@ -408,23 +346,14 @@ fn all_fifteen_frozen_nullsafe_profiles_keep_nonnullable_boolean_sparse_rows_and
     for (left, right) in arrays {
         let ty = FunctionValueType::new(left.data_type().clone(), true);
         let program = nullsafe_program(ty.clone(), Right::Column);
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        let root_use = snapshot.bindings()[&root()];
-        let recipe = program
-            .null_safe_comparison_recipe(ProgramUseRef {
-                arena: novarocks_local_program::ProgramExpressionArena::Main,
-                use_id: root_use,
-            })
-            .unwrap();
+        let reference = root(&program);
+        let unit = program.unit(reference.unit).unwrap();
+        let root_use = unit.root(reference.root).unwrap().use_id;
+        let recipe = unit.recipes().null_safe_comparison(root_use).unwrap();
         assert_eq!(recipe.left_type(), &ty);
         assert_eq!(recipe.right_type(), &ty);
         assert!(!recipe.nullable_result());
-        let flow = &snapshot.flows()[&root().arena()];
+        let flow = unit.control_flow();
         let invocation = &flow.uses()[&root_use];
         assert_eq!(invocation.control, ControlShape::Eager);
         assert_eq!(invocation.context.demand, EvaluationDemand::Value);
@@ -434,7 +363,7 @@ fn all_fifteen_frozen_nullsafe_profiles_keep_nonnullable_boolean_sparse_rows_and
             assert_eq!(flow.uses()[child].context.demand, EvaluationDemand::Value);
         }
         assert!(matches!(
-            snapshot.roots().arenas()[&root().arena()]
+            unit.definitions()
                 .node(invocation.definition)
                 .unwrap()
                 .kind(),
@@ -557,12 +486,7 @@ fn null_left_keeps_required_right_random_state_and_round_row_error() {
         FunctionValueType::new(DataType::Float64, true),
         Right::Random,
     );
-    let calls = random
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .calls();
+    let calls = root_unit(&random).calls();
     assert!(calls.values().any(|call| {
         call.effects()
             .for_use(call.effects().context())
@@ -625,13 +549,18 @@ fn nullsafe_controller_preserves_every_primary_refusal_prefix_and_failed_latch()
         Arc::new(Int64Array::from(vec![Some(7); 320])),
     );
     let constructor = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-    CompiledExpressionInstance::try_new(program.clone(), root(), &constructor).unwrap();
+    CompiledExpressionInstance::try_new(
+        root_unit(&program).clone(),
+        root(&program).root,
+        &constructor,
+    )
+    .unwrap();
     let construction = constructor.trace.lock().unwrap().clone();
     for stop_at in 1..=construction.len() {
         for cause in causes() {
             let refusal = CallbackControl::new(cause.clone(), stop_at);
             assert!(
-                matches!(CompiledExpressionInstance::try_new(program.clone(), root(), &refusal), Err(actual) if actual == cause)
+                matches!(CompiledExpressionInstance::try_new(root_unit(&program).clone(), root(&program).root, &refusal), Err(actual) if actual == cause)
             );
             assert_eq!(*refusal.trace.lock().unwrap(), construction[..stop_at]);
         }

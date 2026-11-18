@@ -896,22 +896,24 @@ mod tests {
 
     use super::*;
 
+    use novarocks_expression::{
+        EvaluationEnvironment, ScopeColumn, ScopeLayout, ScopeLayouts, compile_expr_set_pure,
+    };
+    use novarocks_expression_contract::{
+        BoundExprSetBuilder, ExprKind, ExprPort, RootScope, UnitLimits,
+    };
     use novarocks_local_program::{
         BindingRequirement, BindingRequirements, CompiledProgramFacts, FilterConsumerActivation,
-        FilterConsumerAtExpr, FilterNullSemantics, FilterReduction, ImmutableExpressions,
-        LocalOperatorId, LocalOperatorOrigin, LocalOperatorProvenance, LocalProgram,
-        LocalProgramGraph, ProgramChannelLayoutRole, ProgramChannelSite, ProgramControlFlow,
-        ProgramExprId, ProgramExpressionArena, ProgramExpressionRootSite, ProgramExpressionUse,
-        ProgramLexicalBindings, ProgramLexicalSource, ProgramNode, ProgramNodeExpressionRole,
-        ProgramNodeId, ProgramNodeKind, ProgramResolvedCalls, ProgramRootControlBindings,
-        ProgramRootUseBinding, ProgramSlotBinding, ProgramTypedChannels, ProgramTypedExpressions,
-        ProgramUseRef, StaticExprKind, StaticExprNode, StaticFilterConsumer, StaticFilterContract,
+        FilterConsumerAtExpr, FilterNullSemantics, FilterReduction, LocalOperatorId,
+        LocalOperatorOrigin, LocalOperatorProvenance, LocalProgram, LocalProgramGraph,
+        ProgramChannelLayoutRole, ProgramChannelSite, ProgramNode, ProgramNodeId, ProgramNodeKind,
+        ProgramRootRef, ProgramUnitId, StaticFilterConsumer, StaticFilterContract,
     };
     use novarocks_type_contract::{
-        CompileControlError, CompilePhase, EvaluationDemand, ExpressionEffectContext,
-        ExpressionUseId, FunctionValueType, PureCompileControl,
+        CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType,
+        PureCompileControl,
     };
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     struct NoControl;
     impl PureCompileControl for NoControl {
@@ -920,265 +922,21 @@ mod tests {
         }
     }
 
-    /// One added key root: its site, and the existing leaf root whose control,
-    /// definition and lexical source it shares, unless `definition` and `source`
-    /// name its own definition and the slot of its own input port.
-    struct AddedRoot {
-        site: ProgramExpressionRootSite,
-        like: ProgramExpressionRootSite,
-        definition: Option<ProgramExprId>,
-        source: Option<ProgramLexicalSource>,
-    }
-
-    /// What a rebuilt program adds to the compiled one.
-    #[derive(Default)]
-    struct Additions {
-        /// A new root node, when an added node is the new root.
-        root: Option<ProgramNodeId>,
-        /// Definitions appended to the main expression arena, with their types.
-        definitions: Vec<(StaticExprNode, FunctionValueType)>,
-        requirements: Vec<BindingRequirement>,
-        roots: Vec<AddedRoot>,
-        channels: Vec<(ProgramChannelSite, FunctionValueType)>,
-        operators: Vec<LocalOperatorProvenance>,
-    }
-
-    /// `program` with its checked chain rebuilt over `nodes` and `additions`:
-    /// extra requirements, one eager key use per added root, the channels and
-    /// operators of added nodes. Every other checked fact, provider address and
-    /// provenance is carried over as is.
-    fn rebuild(
-        program: &LocalProgram,
-        nodes: Vec<ProgramNode>,
-        additions: Additions,
-    ) -> Result<Arc<LocalProgram>, String> {
-        let Additions {
-            root,
-            definitions: added_definitions,
-            requirements,
-            roots,
-            channels: added_channels,
-            operators: added_operators,
-        } = additions;
-        let control = NoControl;
-        let graph = program.graph();
-        let mut entries = graph.requirements().entries().to_vec();
-        entries.extend(requirements);
-        let main = graph.expressions();
-        let arena = if added_definitions.is_empty() {
-            Arc::clone(main)
-        } else {
-            Arc::new(
-                ImmutableExpressions::try_new_for_compile(
-                    main.nodes()
-                        .iter()
-                        .cloned()
-                        .chain(added_definitions.iter().map(|(node, _)| node.clone()))
-                        .collect(),
-                    &control,
-                )
-                .map_err(|error| format!("{error:?}"))?,
-            )
-        };
-        let rebuilt = LocalProgramGraph::try_new_with_sink(
-            nodes,
-            root.unwrap_or(graph.root()),
-            Arc::clone(&arena),
-            graph.profile(),
-            BindingRequirements::try_new(entries).map_err(|error| format!("{error:?}"))?,
-            graph.sink().cloned(),
-        )
-        .map_err(|error| error.to_string())?;
-        let checked = program.checked();
-        let channels = checked.channels();
-        let expressions = channels.expressions();
-        let calls = expressions.resolved_calls();
-        let snapshot = calls.snapshot();
-        let mut flows = snapshot
-            .flows()
-            .iter()
-            .map(|(arena, flow)| {
-                (
-                    *arena,
-                    (
-                        flow.regions().values().cloned().collect::<Vec<_>>(),
-                        flow.uses().values().cloned().collect::<Vec<_>>(),
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut bindings = snapshot
-            .bindings()
-            .iter()
-            .map(|(site, use_id)| ProgramRootUseBinding {
-                site: *site,
-                use_id: *use_id,
-            })
-            .collect::<Vec<_>>();
-        let mut slots = checked
-            .slots()
-            .iter()
-            .map(|(occurrence, source)| ProgramSlotBinding {
-                occurrence: *occurrence,
-                source: *source,
-            })
-            .collect::<Vec<_>>();
-        for root in &roots {
-            let arena = root.site.arena();
-            let like_use = *snapshot
-                .bindings()
-                .get(&root.like)
-                .ok_or("the template root is bound")?;
-            let like = snapshot.flows()[&arena].uses()[&like_use].clone();
-            if !like.arguments.is_empty() {
-                return Err("a key root template must be a leaf".to_string());
-            }
-            let (_, uses) = flows.get_mut(&arena).ok_or("the root arena has a flow")?;
-            let next = uses
-                .iter()
-                .map(|existing| existing.context.use_id.get())
-                .max()
-                .map_or(0, |max| max + 1);
-            let use_id = ExpressionUseId::new(next);
-            uses.push(ProgramExpressionUse {
-                context: ExpressionEffectContext {
-                    use_id,
-                    region: like.context.region,
-                    demand: EvaluationDemand::Value,
-                },
-                definition: root.definition.unwrap_or(like.definition),
-                control: like.control,
-                arguments: Box::default(),
-            });
-            bindings.push(ProgramRootUseBinding {
-                site: root.site,
-                use_id,
-            });
-            let source = match root.source {
-                Some(source) => source,
-                None => *checked
-                    .slots()
-                    .get(&ProgramUseRef {
-                        arena,
-                        use_id: like_use,
-                    })
-                    .ok_or("the template root reads a slot")?,
-            };
-            slots.push(ProgramSlotBinding {
-                occurrence: ProgramUseRef { arena, use_id },
-                source,
-            });
-        }
-        let prepared_calls = calls
-            .calls()
-            .iter()
-            .map(|(site, call)| (*site, call.specialization().clone()))
-            .collect::<Vec<_>>();
-        let main_definitions = arena.nodes().len();
-        let flows = flows
-            .into_iter()
-            .map(|(arena, (domains, uses))| {
-                let definitions = if arena == ProgramExpressionArena::Main {
-                    main_definitions
-                } else {
-                    snapshot.roots().arenas()[&arena].nodes().len()
-                };
-                ProgramControlFlow::try_new(domains, uses, definitions, &control)
-                    .map(|flow| (arena, flow))
-                    .map_err(|error| format!("{error:?}"))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let snapshot = ProgramRootControlBindings::try_new(rebuilt, flows, bindings, &control)
-            .map_err(|error| format!("{error:?}"))?;
-        let calls = ProgramResolvedCalls::try_new(snapshot, prepared_calls, &control)
-            .map_err(|error| error.to_string())?;
-        let typed = ProgramTypedExpressions::try_new(
-            calls,
-            expressions
-                .types()
-                .iter()
-                .map(|(arena, types)| {
-                    let mut types = types.to_vec();
-                    if *arena == ProgramExpressionArena::Main {
-                        types.extend(added_definitions.iter().map(|(_, value)| {
-                            novarocks_type_contract::FunctionArgumentType::Value(value.clone())
-                        }));
-                    }
-                    (*arena, types)
-                })
-                .collect(),
-            &control,
-        )
-        .map_err(|error| error.to_string())?;
-        let typed_channels = ProgramTypedChannels::try_new(
-            typed,
-            channels
-                .channels()
-                .iter()
-                .map(|(site, value)| (*site, value.clone()))
-                .chain(added_channels)
-                .collect(),
-            &control,
-        )
-        .map_err(|error| error.to_string())?;
-        let lexical = ProgramLexicalBindings::try_new(
-            typed_channels,
-            checked.lambdas().values().cloned().collect(),
-            slots,
-            &control,
-        )
-        .map_err(|error| error.to_string())?;
-        let operators = program
-            .provenance()
-            .operators()
-            .values()
-            .cloned()
-            .chain(added_operators)
-            .collect::<Vec<_>>();
-        let allowed = operators
-            .iter()
-            .flat_map(|operator| operator.sources.iter().copied())
-            .chain(
-                graph
-                    .nodes()
-                    .iter()
-                    .flat_map(|node| node.physical_sources().iter().copied()),
-            )
-            .collect::<BTreeSet<_>>();
-        LocalProgram::try_new(
-            lexical,
-            operators,
-            &allowed,
-            CompiledProgramFacts {
-                writes: program.write_recipes().clone(),
-                exchange_inputs: program.exchange_inputs().clone(),
-                scan_inputs: program.scan_inputs().clone(),
-                aggregates: program.aggregates().clone(),
-            },
-            &control,
-        )
-        .map(Arc::new)
-        .map_err(|error| error.to_string())
-    }
-
     struct CompiledFixture {
         consumers: Arc<CompiledRuntimeFilterConsumers>,
         input_schema: arrow::datatypes::SchemaRef,
     }
 
-    /// LocalCompiler authors the typed Int32 Values and identity Project. As in the existing
-    /// compiled RF fixtures, add only the frozen RF node/root, control occurrence,
-    /// lexical input port, requirement, type and provenance through the real checked
-    /// LocalProgram constructors. No expression or runtime-filter evaluator is copied.
-    /// This fixture exercises the processor factory directly, not whole-program
-    /// admission of RuntimeFilterConsumer nodes by the pipeline builder.
+    /// LocalCompiler authors the typed Values and identity Project. The RF
+    /// processor fixture adds its own unit over that exact Project output and
+    /// publishes the resulting graph through the checked LocalProgram owner.
     fn compiled_consumers(
         error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     ) -> CompiledFixture {
         use crate::exec::pipeline::builder::{compile_family_fixture, family_package_with_sink};
         use novarocks_physical_plan::{
-            ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentId, FragmentSink,
-            NodeId, ValueOrigin,
+            ConstantPoolId, ConstantPools, ConstantReference, FragmentId, FragmentSink, NodeId,
+            ValueOrigin,
         };
         let fixture_sources =
             crate::exec::operators::family_fixture::constant_sources::Sources::new();
@@ -1203,14 +961,21 @@ mod tests {
         )
         .unwrap();
         let cell = builder
-            .add_expression(
-                source,
+            .unit(source)
+            .unwrap()
+            .add(
+                None,
                 declared.clone(),
                 ExprKind::Constant(ConstantReference {
                     pool: pool_id,
                     ordinal: 0,
                 }),
             )
+            .unwrap();
+        let cell = builder
+            .unit(source)
+            .unwrap()
+            .root(cell, EvaluationDemand::Value, RootScope::AllPorts)
             .unwrap();
         let input = builder
             .add_value(
@@ -1224,18 +989,24 @@ mod tests {
         builder
             .add_values(source, Box::from([Box::from([cell])]), Box::from([input]))
             .unwrap();
-        let input_values = [input];
         let mut constants = ConstantPools::empty();
         constants.insert(pool_id, pool).unwrap();
         let expression = builder
-            .add_expression(project, declared.clone(), ExprKind::Value(input_values[0]))
+            .unit(project)
+            .unwrap()
+            .add(None, declared.clone(), ExprKind::Value(input))
             .unwrap();
-        let output = builder
+        let root = builder
+            .unit(project)
+            .unwrap()
+            .root(expression, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
+        let rf_value = builder
             .add_value(
-                declared,
+                declared.clone(),
                 ValueOrigin::Expr {
                     node: project,
-                    expr: expression,
+                    root,
                 },
             )
             .unwrap();
@@ -1243,21 +1014,75 @@ mod tests {
             .add_project(
                 project,
                 source,
-                Box::from([(expression, output)]),
-                Box::from([output]),
+                Box::from([(root, rf_value)]),
+                Box::from([rf_value]),
             )
             .unwrap();
-        let base = compile_family_fixture(
-            family_package_with_sink(builder, project, constants, 1, FragmentSink::Result),
-            1,
-        );
+        let package =
+            family_package_with_sink(builder, project, constants, 1, FragmentSink::Result);
+        let base = compile_family_fixture(Arc::clone(&package), 1);
         let graph = base.graph();
         let input = graph.root();
         let output = graph.nodes()[input.index()].output_layout();
         assert_eq!(output.slots(), &[SlotId::new(1)]);
         let node = ProgramNodeId::new(graph.nodes().len());
-        let expr = ProgramExprId::new(graph.expressions().nodes().len());
-        let value_type = novarocks_type_contract::FunctionValueType::new(DataType::Int32, false);
+        let value_type =
+            FunctionValueType::try_from_typed_binding(output.value_binding_at(0).unwrap().clone())
+                .unwrap();
+        let control = NoControl;
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        let mut draft = BoundExprSetBuilder::new(UnitLimits {
+            expression_semantic_depth: novarocks_physical_plan::PlanLimits::FROZEN
+                .expression_semantic_depth,
+        });
+        let definition = draft
+            .add(None, value_type.clone(), ExprKind::Value(rf_value))
+            .unwrap();
+        let root = draft
+            .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
+        let unit = draft
+            .seal(
+                vec![ExprPort {
+                    values: Box::from([(rf_value, value_type.clone())]),
+                }],
+                &mut work,
+            )
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        let scope = ScopeLayout::try_new(
+            Arc::clone(output.schema()),
+            Arc::from([value_type.clone()]),
+            Arc::from([ScopeColumn {
+                value: rf_value,
+                ordinal: 0,
+                ty: value_type.clone(),
+            }]),
+            output.storage_lifetime(),
+            &mut work,
+        )
+        .unwrap();
+        let catalog = crate::exec::expr::compiled_program::tests::rng_subset();
+        let key_unit = compile_expr_set_pure(
+            &unit,
+            EvaluationEnvironment {
+                constants: package.constants(),
+                parameters: package.parameters(),
+            },
+            ScopeLayouts {
+                ports: std::slice::from_ref(&scope),
+                all_ports: None,
+            },
+            package.statement_constant_policy(),
+            &catalog,
+            &mut work,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        let mut units = base.units().to_vec();
+        let key = ProgramRootRef::new(ProgramUnitId::new(units.len()), root);
+        units.push(key_unit);
         let binding = StaticFilterConsumer::try_new(
             1,
             2,
@@ -1275,30 +1100,12 @@ mod tests {
             ProgramNodeKind::RuntimeFilterConsumer {
                 input,
                 bindings: vec![FilterConsumerAtExpr {
-                    expr_id: expr,
+                    expr_id: key,
                     consumer: binding,
                 }],
             },
             output.clone(),
         ));
-        let snapshot = base
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        let like = *snapshot
-            .bindings()
-            .iter()
-            .find_map(|(site, use_id)| {
-                let occurrence = &snapshot.flows()[&site.arena()].uses()[use_id];
-                matches!(
-                    graph.expressions().nodes()[occurrence.definition.index()].kind(),
-                    StaticExprKind::SlotId(_)
-                )
-                .then_some(site)
-            })
-            .expect("the compiled identity Project has a slot leaf root");
         let owner = base
             .provenance()
             .operators()
@@ -1314,58 +1121,81 @@ mod tests {
                 .unwrap()
                 + 1,
         );
-        let program = rebuild(
-            &base,
+        let input_schema = Arc::clone(output.schema());
+        let mut requirements = graph.requirements().entries().to_vec();
+        requirements.push(BindingRequirement::RuntimeFilter { binding_id: 1 });
+        let rebuilt = LocalProgramGraph::try_new_with_outputs_for_compile(
             nodes,
-            Additions {
-                root: Some(node),
-                definitions: vec![(
-                    StaticExprNode::new_value_typed(
-                        StaticExprKind::SlotId(SlotId::new(1)),
-                        value_type.clone(),
-                    ),
-                    value_type.clone(),
-                )],
-                requirements: vec![BindingRequirement::RuntimeFilter { binding_id: 1 }],
-                roots: vec![AddedRoot {
-                    site: ProgramExpressionRootSite::Node {
-                        node,
-                        role: ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
-                    },
-                    like,
-                    definition: Some(expr),
-                    source: Some(ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                        node: input,
-                        role: ProgramChannelLayoutRole::NodeOutput,
-                        ordinal: 0,
-                    })),
-                }],
-                channels: vec![(
-                    ProgramChannelSite::Layout {
-                        node,
-                        role: ProgramChannelLayoutRole::NodeOutput,
-                        ordinal: 0,
-                    },
-                    value_type,
-                )],
-                operators: vec![LocalOperatorProvenance {
-                    id,
-                    lowered_nodes: Box::from([node]),
-                    sources: sources.into_boxed_slice(),
-                    origin: LocalOperatorOrigin::Split { piece: 1000 },
-                    cost_owner: id,
-                    metrics: owner.metrics,
-                }],
-            },
+            node,
+            &units,
+            graph.profile(),
+            BindingRequirements::try_new(requirements).unwrap(),
+            graph.sink().cloned(),
+            graph.summaries().to_vec(),
+            &control,
         )
-        .expect("checked compiled membership key");
-        let input_schema = Arc::clone(
-            program
-                .checked()
-                .channels()
-                .channel_layout(input, ProgramChannelLayoutRole::NodeOutput)
-                .expect("exact RF input port")
-                .schema(),
+        .unwrap();
+        let mut channels = base
+            .channels()
+            .channels()
+            .iter()
+            .map(|(site, ty)| (*site, ty.clone()))
+            .collect::<Vec<_>>();
+        channels.push((
+            ProgramChannelSite::Layout {
+                node,
+                role: ProgramChannelLayoutRole::NodeOutput,
+                ordinal: 0,
+            },
+            value_type,
+        ));
+        let mut operators = base
+            .provenance()
+            .operators()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        operators.push(LocalOperatorProvenance {
+            id,
+            lowered_nodes: Box::from([node]),
+            sources: sources.into_boxed_slice(),
+            origin: LocalOperatorOrigin::Split { piece: 1000 },
+            cost_owner: id,
+            metrics: owner.metrics,
+        });
+        let allowed = operators
+            .iter()
+            .flat_map(|operator| operator.sources.iter().copied())
+            .chain(
+                graph
+                    .nodes()
+                    .iter()
+                    .flat_map(|node| node.physical_sources().iter().copied()),
+            )
+            .collect::<BTreeSet<_>>();
+        let calls = base
+            .resolved_calls()
+            .calls()
+            .iter()
+            .map(|(site, call)| (*site, call.specialization().clone()))
+            .collect();
+        let program = Arc::new(
+            LocalProgram::try_new(
+                rebuilt,
+                units,
+                calls,
+                channels,
+                operators,
+                &allowed,
+                CompiledProgramFacts {
+                    writes: base.write_recipes().clone(),
+                    exchange_inputs: base.exchange_inputs().clone(),
+                    scan_inputs: base.scan_inputs().clone(),
+                    aggregates: base.aggregates().clone(),
+                },
+                &control,
+            )
+            .expect("checked compiled membership key"),
         );
         CompiledFixture {
             consumers: Arc::new(
@@ -1373,7 +1203,7 @@ mod tests {
                     "Join",
                     program,
                     node,
-                    vec![membership_contract()],
+                    vec![(key, membership_contract())],
                     error,
                 )
                 .expect("actual compiled consumers"),

@@ -73,14 +73,13 @@ use novarocks_local_compiler::{
 };
 use novarocks_local_program::{KernelAbiVersion, LocalProgram};
 use novarocks_physical_plan::{
-    ConstantPools, ExprId, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage,
-    FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, NodeId, PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
-    PropertyProofProjectionLimits, RequiredContracts, ResultPort, StagePlacementPolicy,
+    ConstantPools, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage,
+    FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentPruning, NodeId,
+    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
+    ResultPort, StagePlacementPolicy,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, EvaluationRegionId, ExpressionControlFlow,
-    ExpressionEvaluationRegion, PureCompileControl, SemanticParameters,
+    CompileControlError, CompilePhase, PureCompileControl, SemanticParameters,
 };
 use novarocks_types::{StageId, TaskId, UniqueId};
 use novarocks_worker_protocol::participation::{ParticipationCommand, ParticipationReplyBody};
@@ -126,11 +125,7 @@ fn function_metadata() -> novarocks_functions::FunctionDefinition {
 fn compiled_count_root() -> Arc<LocalProgram> {
     let mut builder = FragmentBuilder::new(FragmentId::new(1));
     builder
-        .add_values(
-            NodeId::new(1),
-            Box::from([Box::<[ExprId]>::default()]),
-            Box::default(),
-        )
+        .add_values(NodeId::new(1), Box::from([Box::default()]), Box::default())
         .unwrap();
     let fragment = builder
         .finish_definition(
@@ -144,26 +139,24 @@ fn compiled_count_root() -> Arc<LocalProgram> {
             StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationRegion {
-            id: EvaluationRegionId::new(1),
-            parent: None,
-            guard: None,
-        }],
-        vec![],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &CompileControl,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, vec![], &CompileControl).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &CompileControl).unwrap();
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &CompileControl).unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment.id(),
         output: fragment.nodes()[&fragment.root()].output.clone(),
         fields: Box::default(),
+    };
+    let policy = novarocks_functions::ConstantPolicy {
+        max_rows: 1,
+        max_array_nodes: 1,
+        max_logical_elements: 1,
+        max_retained_buffer_bytes: 4096,
+        max_type_depth: 1,
+        max_type_nodes: 1,
+        max_dictionary_depth: 1,
+        max_metadata_bytes: 4096,
+        max_library_validation_work: 4096,
+        max_library_validation_bytes: 4096,
     };
     let package = Arc::new(
         FragmentPackage::try_new(
@@ -172,8 +165,7 @@ fn compiled_count_root() -> Arc<LocalProgram> {
                 required: RequiredContracts::default(),
                 constants: ConstantPools::empty(),
                 fragment,
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: policy,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::try_new([]).unwrap(),
@@ -236,18 +228,7 @@ fn compiled_count_root() -> Arc<LocalProgram> {
                 pipeline_dop: NonZeroUsize::new(1).unwrap(),
                 root_sink_dop: NonZeroUsize::new(1),
                 kernel_abi: KernelAbiVersion::CURRENT,
-                constants: novarocks_functions::ConstantPolicy {
-                    max_rows: 1,
-                    max_array_nodes: 1,
-                    max_logical_elements: 1,
-                    max_retained_buffer_bytes: 4096,
-                    max_type_depth: 1,
-                    max_type_nodes: 1,
-                    max_dictionary_depth: 1,
-                    max_metadata_bytes: 4096,
-                    max_library_validation_work: 4096,
-                    max_library_validation_bytes: 4096,
-                },
+                constants: policy,
             },
             &CompileControl,
         )

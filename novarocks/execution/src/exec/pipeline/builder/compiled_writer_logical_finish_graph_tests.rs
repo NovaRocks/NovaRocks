@@ -58,9 +58,6 @@ mod logical_finish_graph {
         for value in fragment.values().values() {
             builder.insert_value(value.clone()).unwrap();
         }
-        for (_, expression) in fragment.expressions().iter() {
-            builder.insert_expression(expression.clone()).unwrap();
-        }
         let imports = source
             .values()
             .iter()
@@ -93,6 +90,32 @@ mod logical_finish_graph {
                 let mut required = node.required_inputs.into_vec();
                 required.push(property(Distribution::Singleton));
                 node.required_inputs = required.into();
+                // The new summary edge adds a port. Re-seal the original
+                // literal declarations against the new actual node inputs.
+                if let Some(unit) = node.expressions.take() {
+                    assert!(unit.requests().is_empty());
+                    let draft = builder.unit(node.id).unwrap();
+                    for definition in unit.definitions() {
+                        assert!(matches!(
+                            definition.kind,
+                            novarocks_expression_contract::ExprKind::Constant(_)
+                        ));
+                        let id = draft
+                            .add(
+                                definition.lambda_scope,
+                                definition.ty.clone(),
+                                definition.kind.clone(),
+                            )
+                            .unwrap();
+                        assert_eq!(id, definition.id);
+                    }
+                    for (ordinal, root) in unit.roots().iter().enumerate() {
+                        let id = draft
+                            .root(root.definition, root.demand, root.scope)
+                            .unwrap();
+                        assert_eq!(id.get() as usize, ordinal);
+                    }
+                }
             }
             builder.insert_node_unchecked(node).unwrap();
         }
@@ -114,14 +137,19 @@ mod logical_finish_graph {
         for filter in fragment.runtime_filters() {
             builder.attach_runtime_filter(*filter).unwrap();
         }
-        let fragment = builder
-            .finish_definition(
+        crate::exec::operators::family_fixture::seal_no_call_units(&mut builder);
+        let definition = builder
+            .finish_structure(
                 fragment.root(),
                 fragment.sink().clone(),
                 fragment.dop_domain(),
+                p::PlanLimits::FROZEN,
+                &FixtureControl,
                 fragment.stage_placement().clone(),
             )
-            .unwrap()
+            .unwrap();
+        let (definition, sources) = definition.into_parts();
+        let fragment = definition
             .with_call_requests_observed(
                 fragment
                     .call_requests()
@@ -131,11 +159,11 @@ mod logical_finish_graph {
                     .collect(),
                 &FixtureControl,
             )
+            .unwrap()
+            .with_frozen_calls_observed(original.calls().clone(), &FixtureControl)
             .unwrap();
-        let (fragment, sources) = fragment.into_parts();
         let mut constants = original.constants().clone();
         crate::exec::operators::family_fixture::constant_sources::merge(&mut constants, &sources);
-        let (uses, calls) = freeze(&fragment, &theta_catalog());
         let mut cuts = original.cuts().clone();
         let mut inbound = cuts.inbound.into_vec();
         inbound.push(p::InboundFragmentCut {
@@ -177,8 +205,7 @@ mod logical_finish_graph {
                 version: original.version(),
                 required: original.required(),
                 fragment,
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: original.statement_constant_policy(),
                 pruning: original.pruning().clone(),
                 cuts,
                 result: original.result().cloned(),

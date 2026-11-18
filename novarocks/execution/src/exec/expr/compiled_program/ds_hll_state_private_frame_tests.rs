@@ -28,7 +28,9 @@ fn ds_scalar_private_adapter_frame_every_declared_arity_true_host_and_no_host_re
     for count in 1..=3 {
         let p = fixture::program(count);
         let batch = fixture::source_batch(&p, count);
-        let mut no_host = CompiledExpressionInstance::try_new(p.clone(), root(), &Control).unwrap();
+        let mut no_host =
+            CompiledExpressionInstance::try_new(root_unit(&p).clone(), root(&p).root, &Control)
+                .unwrap();
         assert!(matches!(
             no_host.evaluate(&batch, Selection::all(3), &Control),
             Err(KernelFailure::InvalidProgram(_))
@@ -36,8 +38,8 @@ fn ds_scalar_private_adapter_frame_every_declared_arity_true_host_and_no_host_re
         let tracker = MemTracker::new_root("ds-scalar-actual-frame");
         tracker.install_limit_once(2 * 1024 * 1024).unwrap();
         let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-            p.clone(),
-            root(),
+            root_unit(&p).clone(),
+            root(&p).root,
             &Control,
             Some(host(tracker.clone())),
         )
@@ -66,8 +68,8 @@ fn ds_scalar_private_adapter_frame_real_tracker_refusal_and_failure_latch() {
     let tracker = MemTracker::new_root("ds-scalar-actual-refusal");
     tracker.install_limit_once(1).unwrap();
     let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-        p,
-        root(),
+        root_unit(&p).clone(),
+        root(&p).root,
         &Control,
         Some(host(tracker.clone())),
     )
@@ -91,8 +93,8 @@ fn ds_scalar_private_adapter_frame_sparse_original_row_identity_and_empty_select
     let tracker = MemTracker::new_root("ds-scalar-sparse-frame");
     tracker.install_limit_once(2 * 1024 * 1024).unwrap();
     let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-        p,
-        root(),
+        root_unit(&p).clone(),
+        root(&p).root,
         &Control,
         Some(host(tracker.clone())),
     )
@@ -124,8 +126,8 @@ fn ds_scalar_if_type_contract_is_unmaskable_and_numeric_value_is_row_data() {
     let tracker = MemTracker::new_root("ds-scalar-if-shape");
     tracker.install_limit_once(4 * 1024 * 1024).unwrap();
     let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-        p,
-        root(),
+        root_unit(&p).clone(),
+        root(&p).root,
         &Control,
         Some(host(tracker.clone())),
     )
@@ -153,8 +155,8 @@ fn ds_scalar_if_type_contract_is_unmaskable_and_numeric_value_is_row_data() {
     let p = if_fixture::row_data_program();
     let batch = if_fixture::row_data_batch(&p);
     let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-        p,
-        root(),
+        root_unit(&p).clone(),
+        root(&p).root,
         &Control,
         Some(host(tracker.clone())),
     )
@@ -267,8 +269,8 @@ fn ds_scalar_private_adapter_frame_all_seven_originating_host_causes_have_no_foo
             refused: std::sync::atomic::AtomicBool::new(false),
         });
         let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-            p,
-            root(),
+            root_unit(&p).clone(),
+            root(&p).root,
             &Control,
             Some(authority.clone()),
         )
@@ -309,8 +311,8 @@ fn ds_scalar_private_adapter_frame_constructor_host_seven_causes_have_no_footer(
                 refused: std::sync::atomic::AtomicBool::new(false),
             });
             let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-                p,
-                root(),
+                root_unit(&p).clone(),
+                root(&p).root,
                 &Control,
                 Some(authority.clone()),
             )

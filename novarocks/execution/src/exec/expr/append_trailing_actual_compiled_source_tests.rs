@@ -20,7 +20,7 @@ use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catal
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
 use super::sql_test_source::sql_source;
 use arrow::datatypes::DataType;
-use novarocks_local_program::ProgramStateTemplate;
+use novarocks_functions::PreparedPureKernel;
 
 const SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -32,17 +32,23 @@ fn check() {
     let lowered = programs_with_catalogue(&source, &functions);
     let mut observed = 0;
     for (fragment, program) in &lowered {
-        let calls = program.checked().channels().expressions().resolved_calls();
-        for (site, call) in calls.calls() {
+        for (site, call) in program
+            .units()
+            .iter()
+            .enumerate()
+            .flat_map(|(unit, source)| {
+                source
+                    .calls()
+                    .iter()
+                    .map(move |(use_id, call)| ((unit, *use_id), call))
+            })
+        {
             let contract = call.call_contract();
             if contract.function_id().as_str() != "builtin.scalar/append_trailing_char_if_absent/v1"
             {
                 continue;
             }
-            assert!(matches!(
-                call.state_template(),
-                ProgramStateTemplate::Scalar { .. }
-            ));
+            assert!(matches!(call.prepared(), PreparedPureKernel::Scalar(_)));
             assert_eq!(contract.selected().argument_types.len(), 2);
             let novarocks_functions::FunctionResultType::Scalar(result) =
                 &contract.selected().result_type

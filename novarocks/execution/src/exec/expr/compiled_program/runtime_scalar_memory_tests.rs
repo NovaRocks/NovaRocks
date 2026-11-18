@@ -32,16 +32,18 @@ use arrow::{
     array::{BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array},
     datatypes::DataType,
 };
+use novarocks_expression::CompiledExprSet;
+use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
 use novarocks_functions::{
     EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel, PureEngineFunctionCatalog,
     ScalarInvocationActivation as Activation,
 };
-use novarocks_local_program::ProgramNodeExpressionRole;
+use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority};
 use novarocks_physical_plan::{
-    ExprKind, FragmentBuilder, FragmentId, FragmentSink, NodeId, ResultField, ResultPort, ValueDef,
-    ValueId, ValueOrigin,
+    FragmentBuilder, FragmentId, NodeId, ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
 };
+use novarocks_type_contract::EvaluationDemand;
 use novarocks_type_contract::{ControlShape, FunctionValueType, SemanticParameters};
 use novarocks_types::{
     QueryId,
@@ -137,8 +139,10 @@ fn fixture_family(
     let mut items = vec![];
     for (id, ty) in &columns {
         let expr = builder
-            .add_expression(
-                input,
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -149,11 +153,19 @@ fn fixture_family(
                 ),
             )
             .unwrap();
+        let expr = builder
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *id,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr {
+                    node: input,
+                    root: expr,
+                },
             })
             .unwrap();
         items.push((expr, *id));
@@ -167,20 +179,26 @@ fn fixture_family(
         )
         .unwrap();
     let value = builder
-        .add_expression(output, integer.clone(), ExprKind::Value(columns[0].0))
+        .unit(output)
+        .unwrap()
+        .add(None, integer.clone(), ExprKind::Value(columns[0].0))
         .unwrap();
     let count = if bitwise && name == "bitnot" && !matches!(shape, Shape::Nested) {
         // NOT has no right child. Do not create an unreachable definition.
         value
     } else {
         builder
-            .add_expression(output, count_type.clone(), ExprKind::Value(columns[1].0))
+            .unit(output)
+            .unwrap()
+            .add(None, count_type.clone(), ExprKind::Value(columns[1].0))
             .unwrap()
     };
     let flag = if matches!(shape, Shape::IfThen | Shape::IfElse | Shape::Filter) {
         Some(
             builder
-                .add_expression(output, boolean.clone(), ExprKind::Value(columns[2].0))
+                .unit(output)
+                .unwrap()
+                .add(None, boolean.clone(), ExprKind::Value(columns[2].0))
                 .unwrap(),
         )
     } else {
@@ -242,8 +260,10 @@ fn fixture_family(
     let result_type = if matches!(shape, Shape::Filter) {
         let zero = if integer.data_type() == &DataType::Int64 {
             builder
-                .add_expression(
-                    output,
+                .unit(output)
+                .unwrap()
+                .add(
+                    None,
                     integer.clone(),
                     checked_constants::kind(
                         &mut source_pools,
@@ -261,11 +281,13 @@ fn fixture_family(
             value
         };
         let compare = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 boolean.clone(),
                 ExprKind::Binary {
-                    op: novarocks_physical_plan::BinaryOperator::Gt,
+                    op: novarocks_expression_contract::BinaryOperator::Gt,
                     left: result,
                     right: zero,
                     decimal_overflow_policy:
@@ -274,18 +296,37 @@ fn fixture_family(
                 },
             )
             .unwrap();
+        let flag = builder
+            .unit(output)
+            .unwrap()
+            .root(
+                flag.unwrap(),
+                EvaluationDemand::TruthOnly,
+                RootScope::Port(0),
+            )
+            .unwrap();
+        let compare = builder
+            .unit(output)
+            .unwrap()
+            .root(compare, EvaluationDemand::TruthOnly, RootScope::Port(0))
+            .unwrap();
         builder
-            .add_filter(output, input, Box::from([flag.unwrap(), compare]))
+            .add_filter(output, input, Box::from([flag, compare]))
             .unwrap();
         integer.clone()
     } else {
+        let result = builder
+            .unit(output)
+            .unwrap()
+            .root(result, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: result_value,
                 ty: integer.clone(),
                 origin: ValueOrigin::Expr {
                     node: output,
-                    expr: result,
+                    root: result,
                 },
             })
             .unwrap();
@@ -304,22 +345,10 @@ fn fixture_family(
     } else {
         result_value
     };
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            novarocks_physical_plan::PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result_port = ResultPort {
         scalar_schema: None,
-        fragment: fragment.id(),
-        output: fragment.nodes()[&output].output.clone(),
+        fragment: builder.id(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: if matches!(shape, Shape::Filter) {
             columns
                 .iter()
@@ -343,19 +372,34 @@ fn fixture_family(
     };
     compile_checked_fragment_with_parameters(
         &functions,
-        fragment,
+        builder,
+        output,
         &authors,
         result_port,
         SemanticParameters::try_new([]).unwrap(),
         source_pools,
     )
 }
-fn root() -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(2),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-    }
+fn root(program: &LocalProgram) -> ProgramRootRef {
+    let ProgramNodeKind::Project { exprs, .. } =
+        program.graph().nodes()[program.graph().root().index()].kind()
+    else {
+        panic!("actual scalar Project")
+    };
+    exprs[0]
 }
+fn predicate_units(program: &LocalProgram) -> Vec<(Arc<CompiledExprSet>, RootOrdinal)> {
+    let ProgramNodeKind::Filter { predicates, .. } =
+        program.graph().nodes()[program.graph().root().index()].kind()
+    else {
+        panic!("actual scalar Filter")
+    };
+    predicates
+        .iter()
+        .map(|site| (program.unit(site.unit).unwrap().clone(), site.root))
+        .collect()
+}
+
 fn batch(
     program: &LocalProgram,
     values: Vec<Option<i64>>,
@@ -443,13 +487,21 @@ fn runtime_scalar_memory_original_frame_nested_and_selected_values_match_old_ent
                 } else {
                     Selection::all(3)
                 };
-                let mut original =
-                    CompiledExpressionInstance::try_new(program.clone(), root(), &Control).unwrap();
+                let mut original = CompiledExpressionInstance::try_new(
+                    program.unit(root(&program).unit).unwrap().clone(),
+                    root(&program).root,
+                    &Control,
+                )
+                .unwrap();
                 let expected = original
                     .evaluate_evaluation(&input, selection, Activation::Activated, &Control)
                     .unwrap();
-                let mut actual =
-                    CompiledExpressionInstance::try_new(program.clone(), root(), &control).unwrap();
+                let mut actual = CompiledExpressionInstance::try_new(
+                    program.unit(root(&program).unit).unwrap().clone(),
+                    root(&program).root,
+                    &control,
+                )
+                .unwrap();
                 let mut journal = RuntimeScalarMemoryJournal::default();
                 let result = actual
                     .evaluate_runtime(
@@ -472,9 +524,13 @@ fn runtime_scalar_memory_required_helper_missing_binding_fails_root_without_scal
     let program = fixture("bit_shift_left", Shape::Direct);
     let input = batch(&program, vec![Some(7)], vec![Some(true)]);
     let control = runtime_control(None);
-    let mut actual =
-        CompiledExpressionInstance::try_new(program.clone(), root(), &control).unwrap();
-    let error = evaluate_all(&mut actual, root(), &input, &control).unwrap_err();
+    let mut actual = CompiledExpressionInstance::try_new(
+        program.unit(root(&program).unit).unwrap().clone(),
+        root(&program).root,
+        &control,
+    )
+    .unwrap();
+    let error = evaluate_all(&mut actual, root(&program), &input, &control).unwrap_err();
     assert_eq!(
         error.cause(),
         &ExecutionFailureCause::RuntimeScalarMemory(RuntimeScalarMemoryRefusal::MissingQueryMemory)
@@ -497,7 +553,7 @@ fn runtime_scalar_memory_required_helper_missing_binding_fails_root_without_scal
     let binding = bound();
     let funded = runtime_control(Some(&binding));
     assert!(matches!(
-        evaluate_all(&mut actual, root(), &input, &funded)
+        evaluate_all(&mut actual, root(&program), &input, &funded)
             .unwrap_err()
             .cause(),
         ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
@@ -513,18 +569,31 @@ fn runtime_scalar_memory_if_undemanded_validate_only_and_strict_null_bypass_rema
         let program = fixture("bit_shift_left", shape);
         let input = batch(&program, values, flags);
         let control = runtime_control(None);
-        let mut actual =
-            CompiledExpressionInstance::try_new(program.clone(), root(), &control).unwrap();
-        evaluate_all(&mut actual, root(), &input, &control).unwrap();
+        let mut actual = CompiledExpressionInstance::try_new(
+            program.unit(root(&program).unit).unwrap().clone(),
+            root(&program).root,
+            &control,
+        )
+        .unwrap();
+        evaluate_all(&mut actual, root(&program), &input, &control).unwrap();
     }
     let program = fixture("bit_shift_left", Shape::Direct);
     let input = batch(&program, vec![], vec![]);
     let control = runtime_control(None);
-    let mut actual =
-        CompiledExpressionInstance::try_new(program.clone(), root(), &control).unwrap();
-    evaluate_all(&mut actual, root(), &input, &control).unwrap();
+    let mut actual = CompiledExpressionInstance::try_new(
+        program.unit(root(&program).unit).unwrap().clone(),
+        root(&program).root,
+        &control,
+    )
+    .unwrap();
+    evaluate_all(&mut actual, root(&program), &input, &control).unwrap();
     // The original strict-zero-row leaf bypass remains outside this invoice.
-    let mut actual = CompiledExpressionInstance::try_new(program, root(), &control).unwrap();
+    let mut actual = CompiledExpressionInstance::try_new(
+        program.unit(root(&program).unit).unwrap().clone(),
+        root(&program).root,
+        &control,
+    )
+    .unwrap();
     let mut journal = RuntimeScalarMemoryJournal::default();
     let result = actual.evaluate_runtime(
         &input,
@@ -544,24 +613,17 @@ fn runtime_scalar_memory_direct_ordered_filter_uses_same_loan_and_first_host_fai
         vec![Some(7), Some(3), None],
         vec![Some(true), Some(false), Some(true)],
     );
-    let mut legacy = CompiledFilterConjunctionInstance::try_new(
-        program.clone(),
-        ProgramNodeId::new(2),
-        &Control,
-    )
-    .unwrap();
+    let mut legacy =
+        CompiledFilterConjunctionInstance::try_new(&predicate_units(&program), &Control).unwrap();
     let expected = legacy
         .evaluate_required(&input, Selection::all(3), &Control)
         .unwrap();
     for funded in [false, true] {
         let binding = bound();
         let control = runtime_control(funded.then_some(&binding));
-        let mut actual = CompiledFilterConjunctionInstance::try_new(
-            program.clone(),
-            ProgramNodeId::new(2),
-            &control,
-        )
-        .unwrap();
+        let mut actual =
+            CompiledFilterConjunctionInstance::try_new(&predicate_units(&program), &control)
+                .unwrap();
         let mut journal = RuntimeScalarMemoryJournal::default();
         let result = actual.evaluate_required_runtime(
             &input,
@@ -633,15 +695,21 @@ fn runtime_scalar_memory_nine_narrow_frames_and_direct_filters_use_original_scop
                     } else {
                         Selection::all(3)
                     };
-                    let mut original =
-                        CompiledExpressionInstance::try_new(program.clone(), root(), &Control)
-                            .unwrap();
+                    let mut original = CompiledExpressionInstance::try_new(
+                        program.unit(root(&program).unit).unwrap().clone(),
+                        root(&program).root,
+                        &Control,
+                    )
+                    .unwrap();
                     let expected = original
                         .evaluate_evaluation(&input, selection, Activation::Activated, &Control)
                         .unwrap();
-                    let mut actual =
-                        CompiledExpressionInstance::try_new(program.clone(), root(), &control)
-                            .unwrap();
+                    let mut actual = CompiledExpressionInstance::try_new(
+                        program.unit(root(&program).unit).unwrap().clone(),
+                        root(&program).root,
+                        &control,
+                    )
+                    .unwrap();
                     let mut journal = RuntimeScalarMemoryJournal::default();
                     let result = actual
                         .evaluate_runtime(
@@ -664,12 +732,9 @@ fn runtime_scalar_memory_nine_narrow_frames_and_direct_filters_use_original_scop
                 vec![Some(7), Some(3), None],
                 vec![Some(true), Some(false), Some(true)],
             );
-            let mut original = CompiledFilterConjunctionInstance::try_new(
-                program.clone(),
-                ProgramNodeId::new(2),
-                &Control,
-            )
-            .unwrap();
+            let mut original =
+                CompiledFilterConjunctionInstance::try_new(&predicate_units(&program), &Control)
+                    .unwrap();
             let expected = original
                 .evaluate_required(&input, Selection::all(3), &Control)
                 .unwrap();
@@ -677,8 +742,7 @@ fn runtime_scalar_memory_nine_narrow_frames_and_direct_filters_use_original_scop
                 let binding = bound();
                 let control = runtime_control(funded.then_some(&binding));
                 let mut actual = CompiledFilterConjunctionInstance::try_new(
-                    program.clone(),
-                    ProgramNodeId::new(2),
+                    &predicate_units(&program),
                     &control,
                 )
                 .unwrap();
@@ -729,10 +793,14 @@ fn runtime_scalar_memory_narrow_roots_keep_missing_latch_and_strict_bypass_bound
             let program = fixture_typed(name, Shape::Direct, ty.clone());
             let input = batch(&program, vec![Some(7)], vec![Some(true)]);
             let missing = runtime_control(None);
-            let mut actual =
-                CompiledExpressionInstance::try_new(program.clone(), root(), &missing).unwrap();
+            let mut actual = CompiledExpressionInstance::try_new(
+                program.unit(root(&program).unit).unwrap().clone(),
+                root(&program).root,
+                &missing,
+            )
+            .unwrap();
             assert_eq!(
-                evaluate_all(&mut actual, root(), &input, &missing)
+                evaluate_all(&mut actual, root(&program), &input, &missing)
                     .unwrap_err()
                     .cause(),
                 &ExecutionFailureCause::RuntimeScalarMemory(
@@ -742,16 +810,20 @@ fn runtime_scalar_memory_narrow_roots_keep_missing_latch_and_strict_bypass_bound
             let binding = bound();
             let funded = runtime_control(Some(&binding));
             assert!(matches!(
-                evaluate_all(&mut actual, root(), &input, &funded)
+                evaluate_all(&mut actual, root(&program), &input, &funded)
                     .unwrap_err()
                     .cause(),
                 ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
             ));
             for rows in [0, 3] {
                 let input = batch(&program, vec![None; rows], vec![Some(true); rows]);
-                let mut bypass =
-                    CompiledExpressionInstance::try_new(program.clone(), root(), &missing).unwrap();
-                let values = evaluate_all(&mut bypass, root(), &input, &missing).unwrap();
+                let mut bypass = CompiledExpressionInstance::try_new(
+                    program.unit(root(&program).unit).unwrap().clone(),
+                    root(&program).root,
+                    &missing,
+                )
+                .unwrap();
+                let values = evaluate_all(&mut bypass, root(&program), &input, &missing).unwrap();
                 assert_eq!(values.data_type(), &ty);
                 assert_eq!(values.len(), rows);
                 assert_eq!(values.null_count(), rows);
@@ -819,8 +891,7 @@ fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_
                         novarocks_local_program::ProgramNodeKind::Filter { .. }
                     ));
                     let mut original = CompiledFilterConjunctionInstance::try_new(
-                        program.clone(),
-                        ProgramNodeId::new(2),
+                        &predicate_units(&program),
                         &Control,
                     )
                     .unwrap();
@@ -830,8 +901,7 @@ fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_
                     for has_binding in [false, true] {
                         let control = runtime_control(has_binding.then_some(&binding));
                         let mut actual = CompiledFilterConjunctionInstance::try_new(
-                            program.clone(),
-                            ProgramNodeId::new(2),
+                            &predicate_units(&program),
                             &control,
                         )
                         .unwrap();
@@ -874,15 +944,21 @@ fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_
                         } else {
                             Selection::all(4)
                         };
-                        let mut original =
-                            CompiledExpressionInstance::try_new(program.clone(), root(), &Control)
-                                .unwrap();
+                        let mut original = CompiledExpressionInstance::try_new(
+                            program.unit(root(&program).unit).unwrap().clone(),
+                            root(&program).root,
+                            &Control,
+                        )
+                        .unwrap();
                         let expected = original
                             .evaluate_evaluation(&input, selection, Activation::Activated, &Control)
                             .unwrap();
-                        let mut actual =
-                            CompiledExpressionInstance::try_new(program.clone(), root(), &funded)
-                                .unwrap();
+                        let mut actual = CompiledExpressionInstance::try_new(
+                            program.unit(root(&program).unit).unwrap().clone(),
+                            root(&program).root,
+                            &funded,
+                        )
+                        .unwrap();
                         let mut journal = RuntimeScalarMemoryJournal::default();
                         let result = actual
                             .evaluate_runtime(
@@ -898,11 +974,14 @@ fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_
                         assert_eq!(journal.body.settlement.as_ref().unwrap().debt, 0);
                     }
                     let missing = runtime_control(None);
-                    let mut actual =
-                        CompiledExpressionInstance::try_new(program.clone(), root(), &missing)
-                            .unwrap();
+                    let mut actual = CompiledExpressionInstance::try_new(
+                        program.unit(root(&program).unit).unwrap().clone(),
+                        root(&program).root,
+                        &missing,
+                    )
+                    .unwrap();
                     assert_eq!(
-                        evaluate_all(&mut actual, root(), &input, &missing)
+                        evaluate_all(&mut actual, root(&program), &input, &missing)
                             .unwrap_err()
                             .cause(),
                         &ExecutionFailureCause::RuntimeScalarMemory(
@@ -910,7 +989,7 @@ fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_
                         )
                     );
                     assert!(matches!(
-                        evaluate_all(&mut actual, root(), &input, &funded)
+                        evaluate_all(&mut actual, root(&program), &input, &funded)
                             .unwrap_err()
                             .cause(),
                         ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
@@ -927,13 +1006,14 @@ fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_
                             )
                             .unwrap();
                             let mut bypass = CompiledExpressionInstance::try_new(
-                                program.clone(),
-                                root(),
+                                program.unit(root(&program).unit).unwrap().clone(),
+                                root(&program).root,
                                 &missing,
                             )
                             .unwrap();
                             let output =
-                                evaluate_all(&mut bypass, root(), &input, &missing).unwrap();
+                                evaluate_all(&mut bypass, root(&program), &input, &missing)
+                                    .unwrap();
                             assert_eq!(output.data_type(), &ty);
                             assert_eq!(output.len(), n);
                             assert_eq!(output.null_count(), n);

@@ -58,8 +58,7 @@ use std::sync::Arc;
 use arrow::array::ArrayRef;
 use arrow::compute::{SortColumn, SortOptions};
 use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind, SortTopNType,
+    LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef, SortTopNType,
 };
 
 use super::compiled_expression::{
@@ -87,7 +86,7 @@ const PRUNE_MIN_ROWS: usize = 4096;
 pub struct CompiledSortProcessorFactory {
     name: String,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     options: Vec<SortOptions>,
     /// `offset + limit` for a TopN; `None` for a full sort.
     keep: Option<usize>,
@@ -184,27 +183,9 @@ impl CompiledSortProcessorFactory {
         let mut sites = Vec::with_capacity(partition_exprs.len() + order_by.len());
         let mut options = Vec::with_capacity(partition_exprs.len() + order_by.len());
         // Partition keys lead, then the order keys within each partition.
-        let keys = partition_exprs
-            .iter()
-            .enumerate()
-            .map(|(ordinal, key)| (ordinal, key, true))
-            .chain(
-                order_by
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, key)| (ordinal, key, false)),
-            );
-        for (ordinal, key, partition) in keys {
-            let key_ordinal = novarocks_local_program::checked_program_ordinal(ordinal)
-                .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
-            sites.push(ProgramExpressionRootSite::Node {
-                node,
-                role: if partition {
-                    ProgramNodeExpressionRole::SortPartition { key: key_ordinal }
-                } else {
-                    ProgramNodeExpressionRole::SortOrder { key: key_ordinal }
-                },
-            });
+        let keys = partition_exprs.iter().chain(order_by.iter());
+        for key in keys {
+            sites.push(key.expr);
             // NULL placement is independent of direction, as in Arrow.
             options.push(SortOptions {
                 descending: !key.asc,
@@ -263,7 +244,8 @@ impl OperatorFactory for CompiledSortProcessorFactory {
             output_node: self.output_node,
             output: None,
             construction: None,
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.output_node),
             instances: None,
             runs: Vec::new(),
             buffered_rows: 0,
@@ -280,7 +262,7 @@ struct SortedRun {
 struct CompiledSortProcessor {
     name: String,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     options: Vec<SortOptions>,
     keep: Option<usize>,
     limit: Option<usize>,

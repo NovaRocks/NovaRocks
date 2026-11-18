@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_local_program::ProgramExprId;
+use novarocks_local_program::ProgramRootRef;
 use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
@@ -33,7 +33,7 @@ pub struct UnpivotValueMapping {
 #[derive(Clone, Debug)]
 pub enum UnpivotConstant {
     Scalar {
-        expr_id: ProgramExprId,
+        expr_id: ProgramRootRef,
         nullable: bool,
     },
     Int32List(Vec<i32>),

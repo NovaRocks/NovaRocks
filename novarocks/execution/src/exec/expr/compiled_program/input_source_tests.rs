@@ -19,8 +19,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::runtime::task::{ExecutionFailureCause, ExecutionResult};
 use arrow::array::{Array, BooleanArray, Int64Array};
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_functions::ScalarInvocationActivation;
-use novarocks_local_program::ProgramNodeExpressionRole;
+use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef};
+use novarocks_type_contract::EvaluationDemand;
 
 use super::input_source::{BorrowedInputSource, CompiledInputLoan, SlotSourceObserver};
 use super::tests::{SeedMode, program};
@@ -30,7 +33,8 @@ use crate::runtime::mem_tracker::MemTracker;
 
 pub(crate) fn input_chunk(program: &LocalProgram, values: Vec<Option<i64>>) -> Chunk {
     let rows = values.len();
-    let layout = program.graph().nodes()[2].output_layout();
+    let (input, _) = input_project(program);
+    let layout = program.graph().nodes()[input.index()].output_layout();
     let batch = RecordBatch::try_new(
         Arc::clone(layout.schema()),
         vec![
@@ -44,11 +48,22 @@ pub(crate) fn input_chunk(program: &LocalProgram, values: Vec<Option<i64>>) -> C
         .unwrap()
 }
 
-fn site() -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(3),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 1 },
-    }
+fn input_project(program: &LocalProgram) -> (ProgramNodeId, &[ProgramRootRef]) {
+    let nodes = program.graph().nodes();
+    let ProgramNodeKind::Limit { input: project, .. } =
+        nodes[program.graph().root().index()].kind()
+    else {
+        panic!("the input fixture publishes its Project through a Limit")
+    };
+    let ProgramNodeKind::Project { input, exprs, .. } = nodes[project.index()].kind() else {
+        panic!("the input fixture's Limit consumes its original Project")
+    };
+    (*input, exprs)
+}
+
+fn site(program: &LocalProgram) -> ProgramRootRef {
+    let (_, exprs) = input_project(program);
+    exprs[1]
 }
 
 struct Control;
@@ -64,9 +79,10 @@ impl KernelEvaluationControl for Control {
 fn evaluator(program: &Arc<LocalProgram>) -> CompiledExpressionInstance {
     let tracker = MemTracker::new_root("input-source-custody-host");
     let host = crate::runtime::tracked_state_allocator::expression_allocation_host(tracker);
+    let root = site(program);
     CompiledExpressionInstance::try_new_with_allocator(
-        Arc::clone(program),
-        site(),
+        program.unit(root.unit).unwrap().clone(),
+        root.root,
         &Control,
         Some(host),
     )
@@ -527,7 +543,12 @@ fn input_source_no_authority_single_creator_lifetime_is_not_a_pure_source() {
         let mut instance = if has_host {
             evaluator(&program)
         } else {
-            CompiledExpressionInstance::try_new(program.clone(), site(), &Control).unwrap()
+            CompiledExpressionInstance::try_new(
+                program.unit(site(&program).unit).unwrap().clone(),
+                site(&program).root,
+                &Control,
+            )
+            .unwrap()
         };
         let result = evaluate(
             &mut instance,
@@ -631,8 +652,12 @@ fn input_source_genuinely_pure_chunk_and_record_batch_keep_no_host_ability() {
         CompiledInputLoan::from_chunk(&chunk),
         CompiledInputLoan::RecordBatch(chunk.record_batch()),
     ] {
-        let mut instance =
-            CompiledExpressionInstance::try_new(program.clone(), site(), &Control).unwrap();
+        let mut instance = CompiledExpressionInstance::try_new(
+            program.unit(site(&program).unit).unwrap().clone(),
+            site(&program).root,
+            &Control,
+        )
+        .unwrap();
         let result = evaluate(&mut instance, input, Selection::all(3)).unwrap();
         assert_eq!(
             result
@@ -787,12 +812,20 @@ fn fixed_binary_case_roots_preserve_values_and_input_lifetime() {
                         assert!(
                             matches!(
                                 program
-                                    .graph()
-                                    .expressions()
-                                    .node(expression)
+                                    .unit(expression.unit)
+                                    .unwrap()
+                                    .definitions()
+                                    .node(
+                                        program
+                                            .unit(expression.unit)
+                                            .unwrap()
+                                            .root(expression.root)
+                                            .unwrap()
+                                            .definition
+                                    )
                                     .unwrap()
                                     .kind(),
-                                novarocks_local_program::StaticExprKind::Case { .. }
+                                StaticExprKind::Case { .. }
                             ),
                             "the real SQL author must preserve both whole CASE roots"
                         );
@@ -880,10 +913,24 @@ fn fixed_binary_case_roots_preserve_values_and_input_lifetime() {
                 host_tracker.clone(),
             );
             let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-                program.clone(),
-                ProgramExpressionRootSite::Node {
-                    node,
-                    role: ProgramNodeExpressionRole::ProjectOutput { expression },
+                {
+                    let ProgramNodeKind::Project { exprs, .. } =
+                        program.graph().nodes()[node.index()].kind()
+                    else {
+                        panic!("actual CASE Project")
+                    };
+                    program
+                        .unit(exprs[expression as usize].unit)
+                        .unwrap()
+                        .clone()
+                },
+                {
+                    let ProgramNodeKind::Project { exprs, .. } =
+                        program.graph().nodes()[node.index()].kind()
+                    else {
+                        panic!("actual CASE Project")
+                    };
+                    exprs[expression as usize].root
                 },
                 &Control,
                 Some(host),
@@ -982,8 +1029,8 @@ fn identity_slot_preserves_required_binding_and_null_parent_carrier() {
     use arrow::datatypes::Field;
     use novarocks_failure_contract::FailureProjection;
     use novarocks_physical_plan::{
-        ConstantPool, ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentId,
-        NodeId, ValueOrigin,
+        ConstantPool, ConstantPoolId, ConstantPools, ConstantReference, FragmentId, NodeId,
+        ValueOrigin,
     };
     use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueTypeStorageLifetime};
 
@@ -1029,33 +1076,45 @@ fn identity_slot_preserves_required_binding_and_null_parent_carrier() {
         .unwrap();
     let rows = (0..2)
         .map(|ordinal| {
-            vec![
-                builder
-                    .add_expression(
-                        source,
-                        source_type.clone(),
-                        ExprKind::Constant(ConstantReference {
-                            pool: pool_id,
-                            ordinal,
-                        }),
-                    )
-                    .unwrap(),
-            ]
-            .into_boxed_slice()
+            let definition = builder
+                .unit(source)
+                .unwrap()
+                .add(
+                    None,
+                    source_type.clone(),
+                    ExprKind::Constant(ConstantReference {
+                        pool: pool_id,
+                        ordinal,
+                    }),
+                )
+                .unwrap();
+            let root = builder
+                .unit(source)
+                .unwrap()
+                .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+                .unwrap();
+            Box::from([root])
         })
         .collect::<Vec<_>>();
     builder
         .add_values(source, rows.into_boxed_slice(), Box::from([input]))
         .unwrap();
     let expression = builder
-        .add_expression(project, source_type, ExprKind::Value(input))
+        .unit(project)
+        .unwrap()
+        .add(None, source_type, ExprKind::Value(input))
+        .unwrap();
+    let expression = builder
+        .unit(project)
+        .unwrap()
+        .root(expression, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let output = builder
         .add_value(
             FunctionValueType::new(admitted.data_type().clone(), true),
             ValueOrigin::Expr {
                 node: project,
-                expr: expression,
+                root: expression,
             },
         )
         .unwrap();
@@ -1162,10 +1221,21 @@ fn identity_slot_preserves_required_binding_and_null_parent_carrier() {
         });
         let host_tracker = MemTracker::new_root("permissive fixed identity result");
         let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-            program.clone(),
-            ProgramExpressionRootSite::Node {
-                node: ProgramNodeId::new(1),
-                role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+            {
+                let ProgramNodeKind::Project { exprs, .. } =
+                    program.graph().nodes()[program.graph().root().index()].kind()
+                else {
+                    panic!("actual identity Project")
+                };
+                program.unit(exprs[0].unit).unwrap().clone()
+            },
+            {
+                let ProgramNodeKind::Project { exprs, .. } =
+                    program.graph().nodes()[program.graph().root().index()].kind()
+                else {
+                    panic!("actual identity Project")
+                };
+                exprs[0].root
             },
             &Control,
             Some(crate::runtime::tracked_state_allocator::expression_allocation_host(host_tracker)),

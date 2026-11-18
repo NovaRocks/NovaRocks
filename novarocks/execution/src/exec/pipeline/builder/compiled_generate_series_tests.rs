@@ -24,16 +24,16 @@ use super::family_fixture::{
 use crate::exec::pipeline::test_driver::TestDriver;
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_functions::{ConstantPool, largeint};
-use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind,
-};
+use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
-    ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentId, FragmentPackage,
-    NodeId, ValueOrigin,
+    ConstantPoolId, ConstantPools, ConstantReference, FragmentId, FragmentPackage, NodeId,
+    ValueOrigin,
 };
-use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
+use novarocks_type_contract::{
+    CompilePhase, EvaluationDemand, FunctionValueType, ValueLogicalType,
+};
 use std::sync::Arc;
 
 pub(super) const SOURCE: NodeId = NodeId::new(0xf1234567);
@@ -63,6 +63,17 @@ pub(super) fn literal_source(
     let start = builder.constant(SOURCE, ty.clone(), cell(values[0]));
     let stop = builder.constant(SOURCE, ty.clone(), cell(values[1]));
     let step = explicit_step.then(|| builder.constant(SOURCE, ty, cell(values[2])));
+    let unit = builder.unit(SOURCE).unwrap();
+    let start = unit
+        .root(start, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let stop = unit
+        .root(stop, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let step = step.map(|definition| {
+        unit.root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+            .unwrap()
+    });
     builder
         .add_generate_series(SOURCE, start, stop, step, output)
         .unwrap();
@@ -141,8 +152,10 @@ pub(super) fn pooled_source(
         .unwrap();
     // Start and stop consume nonzero pool ordinals; ordinal zero is the step.
     let start = builder
-        .add_expression(
-            SOURCE,
+        .unit(SOURCE)
+        .unwrap()
+        .add(
+            None,
             ty.clone(),
             ExprKind::Constant(ConstantReference {
                 pool: id,
@@ -151,8 +164,10 @@ pub(super) fn pooled_source(
         )
         .unwrap();
     let stop = builder
-        .add_expression(
-            SOURCE,
+        .unit(SOURCE)
+        .unwrap()
+        .add(
+            None,
             ty.clone(),
             ExprKind::Constant(ConstantReference {
                 pool: id,
@@ -162,14 +177,27 @@ pub(super) fn pooled_source(
         .unwrap();
     let step = explicit_step.then(|| {
         builder
-            .add_expression(
-                SOURCE,
+            .unit(SOURCE)
+            .unwrap()
+            .add(
+                None,
                 ty,
                 ExprKind::Constant(ConstantReference {
                     pool: id,
                     ordinal: 0,
                 }),
             )
+            .unwrap()
+    });
+    let unit = builder.unit(SOURCE).unwrap();
+    let start = unit
+        .root(start, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let stop = unit
+        .root(stop, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let step = step.map(|definition| {
+        unit.root(definition, EvaluationDemand::Value, RootScope::AllPorts)
             .unwrap()
     });
     builder
@@ -319,25 +347,27 @@ fn roots_preserved(source: &FragmentPackage, program: &LocalProgram, width: usiz
         "literals and pool values stay Frame roots"
     );
     assert!(values.batch().is_none());
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    for (site, use_id) in source.expression_uses().bindings() {
-        let column = match site.role {
-            novarocks_physical_plan::ExpressionRootRole::SeriesStart => 0,
-            novarocks_physical_plan::ExpressionRootRole::SeriesStop => 1,
-            novarocks_physical_plan::ExpressionRootRole::SeriesStep => 2,
-            _ => panic!("only original series roots"),
-        };
+    let original = &source.fragment().nodes()[&SOURCE];
+    let novarocks_physical_plan::NodeKind::GenerateSeries { start, stop, step } = original.kind
+    else {
+        panic!("the original source is GenerateSeries");
+    };
+    let source_unit = original.expressions.as_ref().unwrap();
+    for (column, original_root) in [Some(start), Some(stop), step]
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let cell = values
+            .dynamic_cells()
+            .iter()
+            .find(|cell| cell.row == 0 && cell.column as usize == column)
+            .unwrap();
+        let unit = program.unit(cell.definition.unit).unwrap();
+        assert_eq!(cell.definition.root, original_root);
         assert_eq!(
-            snapshot.bindings().get(&ProgramExpressionRootSite::Node {
-                node: bounds,
-                role: ProgramNodeExpressionRole::ValuesCell { row: 0, column }
-            }),
-            Some(use_id)
+            unit.root(cell.definition.root).unwrap().use_id,
+            source_unit.root_use_ids()[original_root.get() as usize]
         );
     }
     let root = program.graph().root();

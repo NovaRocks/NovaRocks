@@ -18,8 +18,8 @@
 //! Execution-owned failure payloads. These facts own no terminal latch.
 
 use crate::exec::pipeline::operator::input_construction::ConstructionFailure;
+use novarocks_expression_contract::RootOrdinal;
 use novarocks_functions::{KernelDiagnostic, KernelFailure, RowDataError, Selection};
-use novarocks_local_program::ProgramExpressionRootSite;
 use std::{
     error::Error,
     fmt,
@@ -41,14 +41,14 @@ pub trait ExecutionFailureReporter: Send + Sync {
 /// The original selected ordinal and message remain in the original payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequiredExpressionRowError {
-    root: ProgramExpressionRootSite,
+    root: RootOrdinal,
     batch_row: usize,
     error: RowDataError,
 }
 
 impl RequiredExpressionRowError {
     pub fn try_new(
-        root: ProgramExpressionRootSite,
+        root: RootOrdinal,
         selection: Selection<'_>,
         error: RowDataError,
     ) -> Result<Self, KernelFailure> {
@@ -64,7 +64,7 @@ impl RequiredExpressionRowError {
         })
     }
 
-    pub const fn root(&self) -> ProgramExpressionRootSite {
+    pub const fn root(&self) -> RootOrdinal {
         self.root
     }
     pub const fn batch_row(&self) -> usize {
@@ -160,6 +160,7 @@ pub struct ExecutionFailure {
     // and added call-site context retain this same local occurrence identity.
     cause: Arc<FailureOccurrence>,
     context: Option<OperatorFailureSite>,
+    expression_node: Option<novarocks_local_program::ProgramNodeId>,
 }
 
 impl ExecutionFailure {
@@ -172,6 +173,7 @@ impl ExecutionFailure {
                 super::SharedDomainFailure::new(cause),
             )),
             context: None,
+            expression_node: None,
         }
     }
 
@@ -269,6 +271,22 @@ impl ExecutionFailure {
     pub(crate) fn same_occurrence(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.cause, &other.cause)
     }
+    /// Add the actual caller's node without replacing its originating failure.
+    /// The evaluator reports only the unit-local root; this is outer context.
+    pub(crate) fn at_expression_node(
+        mut self,
+        node: novarocks_local_program::ProgramNodeId,
+    ) -> Self {
+        if self.expression_node.is_none()
+            && matches!(self.cause(), ExecutionFailureCause::RequiredRow(_))
+        {
+            self.expression_node = Some(node);
+        }
+        self
+    }
+    pub const fn expression_node(&self) -> Option<novarocks_local_program::ProgramNodeId> {
+        self.expression_node
+    }
     pub const fn site(&self) -> Option<OperatorFailureSite> {
         self.context
     }
@@ -332,6 +350,9 @@ impl ExecutionFailure {
                         context.operator_ordinal, context.operation
                     )?;
                 }
+                if let Some(node) = self.0.expression_node {
+                    write!(f, " at expression node {}", node.index())?;
+                }
                 if let Some(position) = fact.row_position() {
                     write!(
                         f,
@@ -393,6 +414,7 @@ impl From<crate::runtime::preparation_metadata::PreparationMetadataFailure> for 
         Self {
             cause: FailureOccurrence::new(ExecutionFailureCause::PreparationMetadata(error)),
             context: None,
+            expression_node: None,
         }
     }
 }
@@ -402,6 +424,7 @@ impl From<super::connector_failure::ConnectorCallFailure> for ExecutionFailure {
         Self {
             cause: FailureOccurrence::new(ExecutionFailureCause::Connector(error)),
             context: None,
+            expression_node: None,
         }
     }
 }
@@ -410,6 +433,7 @@ impl From<crate::exec::pipeline::writer_failure::WriterFailure> for ExecutionFai
         Self {
             cause: FailureOccurrence::new(ExecutionFailureCause::Writer(error.into())),
             context: None,
+            expression_node: None,
         }
     }
 }
@@ -419,6 +443,7 @@ impl From<crate::runtime::mem_tracker::MemoryAccountingFailure> for ExecutionFai
         Self {
             cause: FailureOccurrence::new(ExecutionFailureCause::MemoryAccounting(error)),
             context: None,
+            expression_node: None,
         }
     }
 }
@@ -433,6 +458,7 @@ impl From<KernelFailure> for ExecutionFailure {
         Self {
             cause: FailureOccurrence::new(ExecutionFailureCause::Kernel(error)),
             context: None,
+            expression_node: None,
         }
     }
 }
@@ -445,6 +471,7 @@ impl From<ConstructionFailure> for ExecutionFailure {
             error => Self {
                 cause: FailureOccurrence::new(ExecutionFailureCause::Construction(error)),
                 context: None,
+                expression_node: None,
             },
         }
     }
@@ -455,6 +482,7 @@ impl From<crate::runtime::exchange::ExchangeFailure> for ExecutionFailure {
             crate::runtime::exchange::ExchangeFailure::Source(source) => Self {
                 cause: FailureOccurrence::new(ExecutionFailureCause::Domain(source)),
                 context: None,
+                expression_node: None,
             },
             crate::runtime::exchange::ExchangeFailure::Execution(source) => source,
         }
@@ -465,6 +493,7 @@ impl From<crate::runtime_filter::RuntimeFilterFailure> for ExecutionFailure {
         Self {
             cause: FailureOccurrence::new(ExecutionFailureCause::RuntimeFilter(error)),
             context: None,
+            expression_node: None,
         }
     }
 }
@@ -475,6 +504,7 @@ impl From<novarocks_functions::EvaluationFailure> for ExecutionFailure {
             novarocks_functions::EvaluationFailure::InvocationData(cause) => Self {
                 cause: FailureOccurrence::new(ExecutionFailureCause::InvocationData(cause)),
                 context: None,
+                expression_node: None,
             },
         }
     }
@@ -486,6 +516,7 @@ impl From<novarocks_functions::ScalarInvocationFailure> for ExecutionFailure {
             novarocks_functions::ScalarInvocationFailure::Data(cause) => Self {
                 cause: FailureOccurrence::new(ExecutionFailureCause::ScalarInvocationData(cause)),
                 context: None,
+                expression_node: None,
             },
         }
     }
@@ -508,6 +539,7 @@ impl From<crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure> for Exe
         Self {
             cause: FailureOccurrence::new(cause),
             context: None,
+            expression_node: None,
         }
     }
 }
@@ -518,6 +550,7 @@ impl From<novarocks_functions::WindowEvaluationFailure> for ExecutionFailure {
             novarocks_functions::WindowEvaluationFailure::InvocationData(cause) => Self {
                 cause: FailureOccurrence::new(ExecutionFailureCause::WindowInvocationData(cause)),
                 context: None,
+                expression_node: None,
             },
         }
     }
@@ -527,6 +560,7 @@ impl From<RequiredExpressionRowError> for ExecutionFailure {
         Self {
             cause: FailureOccurrence::new(ExecutionFailureCause::RequiredRow(error)),
             context: None,
+            expression_node: None,
         }
     }
 }
@@ -538,6 +572,9 @@ impl fmt::Display for ExecutionFailure {
                 "operator[{}] {:?}: ",
                 context.operator_ordinal, context.operation
             )?;
+        }
+        if let Some(node) = self.expression_node {
+            write!(f, "expression node[{}]: ", node.index())?;
         }
         match &self.cause.cause {
             ExecutionFailureCause::Domain(error) => error.fmt(f),
@@ -945,8 +982,8 @@ impl novarocks_failure_contract::FailureProjection for ExecutionFailureCause {
     }
 }
 
-impl From<novarocks_local_program::StaticExpressionError> for ExecutionFailure {
-    fn from(source: novarocks_local_program::StaticExpressionError) -> Self {
+impl From<novarocks_expression::StaticExpressionError> for ExecutionFailure {
+    fn from(source: novarocks_expression::StaticExpressionError) -> Self {
         Self::from_domain(source)
     }
 }
@@ -1010,12 +1047,8 @@ mod required_row_source_properties {
             "out of range",
         );
         let expected = row.failure_fact();
-        let required = RequiredExpressionRowError::try_new(
-            ProgramExpressionRootSite::SinkPartition { branch: 0, key: 1 },
-            selection,
-            row,
-        )
-        .unwrap();
+        let required =
+            RequiredExpressionRowError::try_new(RootOrdinal::new(1), selection, row).unwrap();
         assert_eq!(required.batch_row(), 4);
         let failure = ExecutionFailure::from(required);
         assert_eq!(

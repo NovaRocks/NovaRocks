@@ -27,12 +27,9 @@ use novarocks_functions::*;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
-use novarocks_local_program::{
-    KernelAbiVersion, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeKind,
-};
+use novarocks_local_program::{KernelAbiVersion, LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_physical_plan::*;
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, author_fragment_package_semantics};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, ValueTypeStorageLifetime,
 };
@@ -309,18 +306,16 @@ fn programs_with_original_frozen_reads(
     admit_original_scan_residuals: bool,
     admit_required_inlist_shape: bool,
 ) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
-    let semantics = author_fragment_package_semantics(source, policy(), &Control).unwrap();
-    let uses = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.expression_uses.clone()))
-        .collect();
-    let calls = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.calls.clone()))
-        .collect();
-    let pruning = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.pruning.clone()))
+    let pruning = source
+        .plan()
+        .fragments()
+        .keys()
+        .map(|&id| {
+            (
+                id,
+                FrozenFragmentPruning::try_new(id, Vec::new(), &Control).unwrap(),
+            )
+        })
         .collect();
     let admissions = source
         .plan()
@@ -351,8 +346,6 @@ fn programs_with_original_frozen_reads(
             frozen_reads(source)
         },
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &Control,
@@ -369,6 +362,8 @@ fn programs_with_original_frozen_reads(
                     pipeline_dop: NonZeroUsize::new(1).unwrap(),
                     root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
                     kernel_abi: KernelAbiVersion::CURRENT,
+                    // The package carries the statement's source policy. These
+                    // are the host's fixture admission limits.
                     constants: policy(),
                 },
                 &Control,
@@ -380,51 +375,46 @@ fn programs_with_original_frozen_reads(
 }
 pub fn producer_root(
     programs: &BTreeMap<FragmentId, Arc<LocalProgram>>,
-) -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
+) -> (Arc<LocalProgram>, ProgramRootRef) {
     let mut found = None;
     for program in programs.values() {
         for node in program.graph().nodes() {
             if let ProgramNodeKind::Project { exprs, .. } = node.kind() {
-                let id = node.local_id().unwrap();
-                for ordinal in 0..exprs.len() {
-                    let root = ProgramExpressionRootSite::Node {
-                        node: id,
-                        role: ProgramNodeExpressionRole::ProjectOutput {
-                            expression: u32::try_from(ordinal).unwrap(),
-                        },
+                for &root in exprs {
+                    let unit = program.unit(root.unit).expect("actual Project unit exists");
+                    let compiled = unit.root(root.root).expect("actual Project root exists");
+                    let novarocks_type_contract::FunctionArgumentType::Value(_) =
+                        &unit.types()[compiled.definition.index()]
+                    else {
+                        panic!("actual producer Project root has a complete scalar type")
                     };
-                    let snapshot = program
-                        .checked()
-                        .channels()
-                        .expressions()
-                        .resolved_calls()
-                        .snapshot();
-                    if snapshot.bindings().contains_key(&root) {
-                        assert!(
-                            found.is_none(),
-                            "this closed source must retain one producer project root"
-                        );
-                        found = Some((program.clone(), root));
-                    }
+                    assert!(
+                        found.is_none(),
+                        "this closed source must retain one producer project root"
+                    );
+                    found = Some((program.clone(), root));
                 }
             }
         }
     }
     found.expect("actual SQL source retains its producer projection")
 }
-pub fn batch(
-    program: &LocalProgram,
-    root: ProgramExpressionRootSite,
-    input: ArrayRef,
-) -> RecordBatch {
-    let ProgramExpressionRootSite::Node { node, .. } = root else {
-        unreachable!()
-    };
-    let ProgramNodeKind::Project { input: parent, .. } =
-        program.graph().nodes()[node.index()].kind()
-    else {
-        unreachable!()
-    };
+pub fn batch(program: &LocalProgram, root: ProgramRootRef, input: ArrayRef) -> RecordBatch {
+    let mut parents = program
+        .graph()
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.kind() {
+            ProgramNodeKind::Project { input, exprs, .. } if exprs.contains(&root) => Some(*input),
+            _ => None,
+        });
+    let parent = parents
+        .next()
+        .expect("actual root belongs to its producer Project");
+    assert!(
+        parents.next().is_none(),
+        "this closed root has one producer Project"
+    );
     RecordBatch::try_new(
         program.graph().nodes()[parent.index()]
             .output_layout()

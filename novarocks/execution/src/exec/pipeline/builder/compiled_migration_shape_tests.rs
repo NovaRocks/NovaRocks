@@ -155,6 +155,7 @@ fn compiled_scan_root_override_gathers_the_parallel_consumers_to_one_terminal_dr
 
 fn mixed_phase_program() -> Arc<LocalProgram> {
     let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
 
     let catalog = aggregate_catalog(&[
         ("count", PureKernelAbi::AggregateWindowV1),
@@ -248,9 +249,17 @@ fn mixed_phase_program() -> Arc<LocalProgram> {
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([71; 16]).unwrap(),
         &fixture_sources,
-    );
-    plan.add_fragment(finish(builder, root, FragmentSink::Result, 1))
-        .unwrap();
+    )
+    .with_semantic_parameters(parameters.clone());
+    plan.add_fragment(finish(
+        builder,
+        root,
+        FragmentSink::Result,
+        1,
+        &catalog,
+        &parameters,
+    ))
+    .unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
         fragment,
@@ -275,7 +284,7 @@ fn mixed_phase_program() -> Arc<LocalProgram> {
     let plan = plan
         .finish_observed(&FixtureControl)
         .expect("the complete partial/union/final trace is valid");
-    let package = packages(&plan, &catalog).remove(&fragment).unwrap();
+    let package = packages(&plan).remove(&fragment).unwrap();
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
             .unwrap();

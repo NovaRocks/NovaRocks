@@ -68,8 +68,10 @@ pub(super) fn program(count: usize) -> Arc<LocalProgram> {
     let mut children = vec![];
     for i in 0..count {
         let expr = b
-            .add_expression(
-                input,
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -77,17 +79,27 @@ pub(super) fn program(count: usize) -> Arc<LocalProgram> {
                 ),
             )
             .unwrap();
+        let input_root = b
+            .unit(input)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
         let value = ValueId::new(91 + i as u32);
         b.insert_value(ValueDef {
             id: value,
             ty: ty.clone(),
-            origin: ValueOrigin::Expr { node: input, expr },
+            origin: ValueOrigin::Expr {
+                node: input,
+                root: input_root,
+            },
         })
         .unwrap();
-        projections.push((expr, value));
+        projections.push((input_root, value));
         output_values.push(value);
         children.push(
-            b.add_expression(output, ty.clone(), ExprKind::Value(value))
+            b.unit(output)
+                .unwrap()
+                .add(None, ty.clone(), ExprKind::Value(value))
                 .unwrap(),
         );
     }
@@ -107,8 +119,10 @@ pub(super) fn program(count: usize) -> Arc<LocalProgram> {
     let result_ty = owner.result();
     assert_eq!(result_ty.data_type().clone(), DataType::Binary);
     let call = b
-        .add_expression(
-            output,
+        .unit(output)
+        .unwrap()
+        .add(
+            None,
             result_ty.clone(),
             ExprKind::FunctionCall {
                 function: owner.function.clone(),
@@ -118,38 +132,31 @@ pub(super) fn program(count: usize) -> Arc<LocalProgram> {
         .unwrap();
     let mut authors = BTreeMap::new();
     authors.insert(call, owner);
+    let output_root = b
+        .unit(output)
+        .unwrap()
+        .root(call, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
     let result_value = b
         .add_value(
             result_ty.clone(),
             ValueOrigin::Expr {
                 node: output,
-                expr: call,
+                root: output_root,
             },
         )
         .unwrap();
     b.add_project(
         output,
         input,
-        Box::from([(call, result_value)]),
+        Box::from([(output_root, result_value)]),
         Box::from([result_value]),
     )
     .unwrap();
-    let fragment = b
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
+        output: b.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&result_ty),
             name: "decoded".into(),
@@ -158,7 +165,7 @@ pub(super) fn program(count: usize) -> Arc<LocalProgram> {
             ty: result_ty,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
+    compile_checked_fragment(&functions, b, output, &authors, result, source_pools)
 }
 pub(super) fn source_batch(program: &LocalProgram, count: usize) -> RecordBatch {
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![

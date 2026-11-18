@@ -63,7 +63,8 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
                 assert!(relation.schema()[0].ty.nullable());
                 assert!(relation.predicate_guarantees().is_empty());
                 for (ordinal, id) in residuals.iter().enumerate() {
-                    let e = fragment.expressions().get(*id).unwrap();
+                    let unit = fragment.unit(node.id).unwrap();
+                    let e = unit.definition(unit.root(*id).unwrap().definition).unwrap();
                     println!(
                         "original scan residual ordinal={ordinal} id={id:?} type={:?} kind={:?}",
                         e.ty, e.kind
@@ -114,7 +115,9 @@ fn scan_ordered_required_compiler_conjunction_preserves_true_only_null_and_bound
         Some(20),
     ])) as ArrayRef;
     let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
-    let mut instance = CompiledFilterConjunctionInstance::try_new(program, node, &Control).unwrap();
+    let mut instance =
+        CompiledFilterConjunctionInstance::try_new(&predicate_units(&program, node), &Control)
+            .unwrap();
     let result = instance
         .evaluate_required(&batch, Selection::all(6), &Control)
         .unwrap();
@@ -130,6 +133,23 @@ fn scan_ordered_required_compiler_conjunction_preserves_true_only_null_and_bound
             Some(false)
         ]
     );
+}
+
+fn predicate_units(
+    program: &novarocks_local_program::LocalProgram,
+    node: novarocks_local_program::ProgramNodeId,
+) -> Vec<(
+    Arc<novarocks_expression::CompiledExprSet>,
+    novarocks_expression_contract::RootOrdinal,
+)> {
+    let ProgramNodeKind::Scan { residuals, .. } = program.graph().nodes()[node.index()].kind()
+    else {
+        panic!("actual Scan")
+    };
+    residuals
+        .iter()
+        .map(|site| (program.unit(site.unit).unwrap().clone(), site.root))
+        .collect()
 }
 
 fn prepared_scan() -> (
@@ -196,29 +216,17 @@ fn causes() -> [KernelFailure; 7] {
 }
 #[test]
 fn scan_ordered_required_actual_indexed_roots_and_sparse_empty_slices() {
-    use novarocks_local_program::{ProgramExpressionRootSite, ProgramNodeExpressionRole};
     use novarocks_type_contract::EvaluationDemand;
     let (program, node) = prepared_scan();
     let ProgramNodeKind::Scan { residuals, .. } = program.graph().nodes()[node.index()].kind()
     else {
         panic!("actual scan")
     };
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    for (index, definition) in residuals.iter().enumerate() {
-        let site = ProgramExpressionRootSite::Node {
-            node,
-            role: ProgramNodeExpressionRole::ScanResidual {
-                predicate: u32::try_from(index).unwrap(),
-            },
-        };
-        let id = snapshot.bindings()[&site];
-        let root = &snapshot.flows()[&site.arena()].uses()[&id];
-        assert_eq!(root.definition, *definition);
+    for reference in residuals {
+        let unit = program.unit(reference.unit).unwrap();
+        let compiled = unit.root(reference.root).unwrap();
+        let root = &unit.control_flow().uses()[&compiled.use_id];
+        assert_eq!(root.definition, compiled.definition);
         assert_eq!(root.context.demand, EvaluationDemand::TruthOnly);
     }
     let input = Int32Array::from(vec![
@@ -246,7 +254,8 @@ fn scan_ordered_required_actual_indexed_roots_and_sparse_empty_slices() {
         (Vec::new(), Vec::new()),
     ] {
         let mut instance =
-            CompiledFilterConjunctionInstance::try_new(program.clone(), node, &Control).unwrap();
+            CompiledFilterConjunctionInstance::try_new(&predicate_units(&program, node), &Control)
+                .unwrap();
         let output = instance
             .evaluate_required(&batch, Selection::try_sparse(6, &rows).unwrap(), &Control)
             .unwrap();
@@ -266,13 +275,13 @@ fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
     use crate::runtime::task::ExecutionFailureCause;
     let (program, node) = prepared_scan();
     let record = Callback::new(usize::MAX, KernelFailure::Cancelled);
-    CompiledFilterConjunctionInstance::try_new(program.clone(), node, &record).unwrap();
+    CompiledFilterConjunctionInstance::try_new(&predicate_units(&program, node), &record).unwrap();
     let trace = record.trace.lock().unwrap().clone();
     for stop in 1..=trace.len() {
         for cause in causes() {
             let c = Callback::new(stop, cause.clone());
             assert!(
-                matches!(CompiledFilterConjunctionInstance::try_new(program.clone(),node,&c),Err(actual) if actual==cause)
+                matches!(CompiledFilterConjunctionInstance::try_new(&predicate_units(&program, node),&c),Err(actual) if actual==cause)
             );
             assert_eq!(*c.trace.lock().unwrap(), trace[..stop]);
         }
@@ -298,7 +307,8 @@ fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
         let selection = Selection::try_sparse(513, &rows).unwrap();
         let record = Callback::new(usize::MAX, KernelFailure::Cancelled);
         let mut instance =
-            CompiledFilterConjunctionInstance::try_new(program.clone(), node, &Control).unwrap();
+            CompiledFilterConjunctionInstance::try_new(&predicate_units(&program, node), &Control)
+                .unwrap();
         instance
             .evaluate_required(&batch, selection, &record)
             .unwrap();
@@ -312,9 +322,11 @@ fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
         for stop in 1..=trace.len() {
             for cause in causes() {
                 let c = Callback::new(stop, cause.clone());
-                let mut instance =
-                    CompiledFilterConjunctionInstance::try_new(program.clone(), node, &Control)
-                        .unwrap();
+                let mut instance = CompiledFilterConjunctionInstance::try_new(
+                    &predicate_units(&program, node),
+                    &Control,
+                )
+                .unwrap();
                 let failure = instance
                     .evaluate_required(&batch, selection, &c)
                     .unwrap_err();

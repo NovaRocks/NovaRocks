@@ -61,6 +61,7 @@ fn complete_fixture_with_types(
     payload: FunctionValueType,
 ) -> CompleteFixture {
     let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
 
     assert!(matches!(mode, CompleteMode::ZeroCalls) || payload == int64(true));
     let catalog = aggregate_catalog(&[
@@ -169,9 +170,22 @@ fn complete_fixture_with_types(
         AggregateGrouping::Complete,
     );
     let topn = builder.reserve_node_id().unwrap();
-    let key = builder
-        .add_expression(topn, types[0].clone(), ExprKind::Value(columns[0]))
-        .unwrap();
+    let key = {
+        let definition = builder
+            .unit(topn)
+            .unwrap()
+            .add(None, types[0].clone(), ExprKind::Value(columns[0]))
+            .unwrap();
+        builder
+            .unit(topn)
+            .unwrap()
+            .root(
+                definition,
+                novarocks_type_contract::EvaluationDemand::Value,
+                novarocks_expression_contract::RootScope::Port(0),
+            )
+            .unwrap()
+    };
     builder
         .add_top_n(
             topn,
@@ -187,7 +201,14 @@ fn complete_fixture_with_types(
         )
         .unwrap();
     builder.attach_runtime_filter(FILTER).unwrap();
-    let definition = finish(builder, topn, FragmentSink::Result, 2);
+    let definition = finish(
+        builder,
+        topn,
+        FragmentSink::Result,
+        2,
+        &catalog,
+        &parameters,
+    );
     let output = definition.nodes()[&topn].output.clone();
     let fields = output
         .columns
@@ -226,7 +247,8 @@ fn complete_fixture_with_types(
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([122; 16]).unwrap(),
         &fixture_sources,
-    );
+    )
+    .with_semantic_parameters(parameters.clone());
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
@@ -239,7 +261,6 @@ fn complete_fixture_with_types(
     let plan = plan.finish_observed(&FixtureControl).unwrap();
     let package = packages_with_reads(
         &plan,
-        &catalog,
         &BTreeMap::from([(ProviderReadOccurrenceId::new(0), read)]),
     )
     .remove(&fragment)

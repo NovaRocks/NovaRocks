@@ -23,13 +23,16 @@ use crate::native_type_construction::{
     NativeTypeConstruction, NativeTypeConstructionError, NativeTypeScope,
 };
 use novarocks_execution::runtime::mem_tracker::MemTracker;
-use novarocks_local_program::{
-    ExpressionProgram, LocalProgram, ProgramCreationFailure, ProgramLexicalBindings, ProgramUseRef,
-    StaticExprKind,
+use novarocks_expression::{
+    CompiledExprSet, EvaluationEnvironment, ExprCompileFailure, ExprCreation, ScopeLayouts,
+    StaticExprKind, compile_expr_set,
 };
+use novarocks_expression_contract::RootScope;
+use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramUnitId};
 use novarocks_type_contract::{
-    ValueSchemaCreation, ValueSchemaCreationFactory, ValueSchemaCreationScope,
-    ValueSchemaScopeBeginFailure, ValueTypeStorageLifetime,
+    CompileCheckpoints, ExpressionUseId, ValueSchemaCreation, ValueSchemaCreationFactory,
+    ValueSchemaCreationScope, ValueSchemaScopeBeginFailure, ValueTypeStorageLifetime,
+    owned_resources::layout::arc_layout,
 };
 use std::{
     alloc::Layout,
@@ -39,8 +42,16 @@ use std::{
 const ONE_IN: &str = "SELECT 1 IN (1, NULL) AS original_in";
 const TWO_IN: &str = "SELECT 1 IN (1, NULL) AS original_in, 1 IN (2, NULL) AS unrelated_in";
 
-fn compiled_in_source(sql: &str, scratch_len: usize) -> (CompiledTaskProgram, Arc<MemTracker>) {
-    let (bytes, _) = select_sql_producer(sql);
+struct CompiledInSource {
+    package: FragmentPackage,
+    compiled: CompiledTaskProgram,
+    functions: Arc<PureEngineFunctionCatalog>,
+    tracker: Arc<MemTracker>,
+}
+
+fn compiled_in_source(sql: &str, scratch_len: usize) -> CompiledInSource {
+    let (package, _) = sql_fragment_package(sql, false, false);
+    let bytes = encode_sql_fixture_package(&package);
     let tracker = MemTracker::new_root("actual expression source");
     let actual = NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
     if scratch_len != 0 {
@@ -54,7 +65,8 @@ fn compiled_in_source(sql: &str, scratch_len: usize) -> (CompiledTaskProgram, Ar
     let mut exact = |layout| actual.request_layout(layout);
     let mut opaque = |bytes| actual.request_opaque_upper_bound(bytes);
     let mut creation = ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
-    let compiled = interpreter()
+    let functions = Arc::new(sealed_rand_subset());
+    let compiled = interpreter_with_functions(Arc::clone(&functions))
         .compile(
             &bytes,
             CompiledTaskOptions {
@@ -71,28 +83,47 @@ fn compiled_in_source(sql: &str, scratch_len: usize) -> (CompiledTaskProgram, Ar
     }
     drop(scratch);
     drop(actual);
-    (compiled, tracker)
+    CompiledInSource {
+        package,
+        compiled,
+        functions,
+        tracker,
+    }
 }
 
-fn actual_in_sites(program: &LocalProgram) -> Vec<ProgramUseRef> {
-    let typed = program.checked().channels().expressions();
-    let snapshot = typed.resolved_calls().snapshot();
+#[derive(Clone, Copy)]
+struct InSite {
+    unit: ProgramUnitId,
+    use_id: ExpressionUseId,
+}
+impl InSite {
+    fn recipe(self, program: &LocalProgram) -> &novarocks_functions::PreparedNativeInListRecipe {
+        program
+            .unit(self.unit)
+            .unwrap()
+            .recipes()
+            .native_inlist(self.use_id)
+            .unwrap()
+    }
+}
+
+fn actual_in_sites(program: &LocalProgram) -> Vec<InSite> {
     let mut sites = Vec::new();
-    for (&arena, flow) in snapshot.flows() {
-        let definitions = &snapshot.roots().arenas()[&arena];
-        for (&use_id, invocation) in flow.uses() {
-            let Some(node) = definitions.node(invocation.definition) else {
+    for (index, unit) in program.units().iter().enumerate() {
+        for (&use_id, invocation) in unit.control_flow().uses() {
+            let Some(node) = unit.definitions().node(invocation.definition) else {
                 panic!("real definition");
             };
             let StaticExprKind::PreparedInList { child, values, .. } = node.kind() else {
                 continue;
             };
-            let site = ProgramUseRef { arena, use_id };
-            let recipe = program
-                .native_inlist_recipe(site)
-                .expect("actual IN occurrence has its prepared owner");
+            let site = InSite {
+                unit: ProgramUnitId::new(index),
+                use_id,
+            };
+            let recipe = site.recipe(program);
             let novarocks_functions::FunctionArgumentType::Value(source) =
-                typed.definition_type(arena, *child).unwrap()
+                unit.types().get(child.index()).unwrap()
             else {
                 panic!("complete IN source");
             };
@@ -100,14 +131,14 @@ fn actual_in_sites(program: &LocalProgram) -> Vec<ProgramUseRef> {
             assert_eq!(recipe.candidate_types().len(), values.len());
             for (candidate, definition) in recipe.candidate_types().iter().zip(values) {
                 let novarocks_functions::FunctionArgumentType::Value(expected) =
-                    typed.definition_type(arena, *definition).unwrap()
+                    unit.types().get(definition.index()).unwrap()
                 else {
                     panic!("complete IN candidate");
                 };
                 assert_eq!(candidate, expected);
             }
             let novarocks_functions::FunctionArgumentType::Value(result) =
-                typed.definition_type(arena, invocation.definition).unwrap()
+                unit.types().get(invocation.definition.index()).unwrap()
             else {
                 panic!("complete IN result");
             };
@@ -117,6 +148,7 @@ fn actual_in_sites(program: &LocalProgram) -> Vec<ProgramUseRef> {
     }
     sites
 }
+
 fn late_in(
     sql: &str,
     scratch: usize,
@@ -125,18 +157,16 @@ fn late_in(
     novarocks_functions::PreparedNativeInListRecipe,
     Arc<MemTracker>,
 ) {
-    let (compiled, tracker) = compiled_in_source(sql, scratch);
+    let CompiledInSource {
+        compiled, tracker, ..
+    } = compiled_in_source(sql, scratch);
     let sites = actual_in_sites(compiled.program());
     assert_eq!(
         sites.len(),
         expected_calls,
         "SQL must actually retain PreparedInList, not fold it away"
     );
-    let late = compiled
-        .program()
-        .native_inlist_recipe(sites[0])
-        .unwrap()
-        .clone();
+    let late = sites[0].recipe(compiled.program()).clone();
     drop(compiled);
     assert!(
         tracker.current() > 0,
@@ -354,12 +384,86 @@ impl ValueSchemaCreationFactory<NativeTypeConstructionError> for TracedFactory<'
     }
 }
 
+fn compile_traced_in(
+    source: &CompiledInSource,
+    site: InSite,
+    temporary: &mut TracedTemporary<'_>,
+    factory: &TracedFactory<'_, '_>,
+) -> Result<Arc<CompiledExprSet>, ExprCompileFailure<NativeTypeConstructionError>> {
+    let program = source.compiled.program();
+    let compiled = program.unit(site.unit).unwrap();
+    let root = compiled.root_of_use(site.use_id).unwrap();
+    let physical = program
+        .graph()
+        .nodes()
+        .iter()
+        .find_map(|node| match node.kind() {
+            ProgramNodeKind::Project { exprs, .. }
+                if exprs
+                    .iter()
+                    .any(|candidate| candidate.unit == site.unit && candidate.root == root) =>
+            {
+                let [physical_source] = node.physical_sources() else {
+                    panic!("the actual IN Project has one physical source");
+                };
+                source
+                    .package
+                    .fragment()
+                    .nodes()
+                    .get(&novarocks_physical_plan::NodeId::new(physical_source.get()))
+            }
+            _ => None,
+        })
+        .expect("the selected compiled root retains its original SQL Project");
+    let bound = physical
+        .expressions
+        .as_deref()
+        .expect("the original SQL IN unit");
+    assert_eq!(
+        bound.roots()[root.get() as usize].scope,
+        compiled.root(root).unwrap().scope
+    );
+    let original = &bound.control_flow().uses()[&site.use_id];
+    let lowered = &compiled.control_flow().uses()[&site.use_id];
+    assert_eq!(original.context, lowered.context);
+    assert_eq!(
+        compiled.compiled_definition(original.definition),
+        Some(lowered.definition)
+    );
+    let mut work = CompileCheckpoints::try_new(factory.trace, CompilePhase::LowerProgram)?;
+    let mut retained = factory.begin_scope().map_err(ExprCompileFailure::Creator)?;
+    let result = compile_expr_set(
+        bound,
+        EvaluationEnvironment {
+            constants: source.package.constants(),
+            parameters: source.package.parameters(),
+        },
+        ScopeLayouts {
+            ports: compiled.scopes(),
+            all_ports: if bound.ports().is_empty() {
+                None
+            } else {
+                compiled.scope(RootScope::AllPorts)
+            },
+        },
+        source.package.statement_constant_policy(),
+        &source.functions,
+        ExprCreation {
+            temporary,
+            retained: &mut retained,
+            factory,
+        },
+        &mut work,
+    )?;
+    work.finish()?;
+    Ok(result)
+}
+
 #[test]
 fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
-    let (compiled, source_tracker) = compiled_in_source(ONE_IN, 0);
-    let sites = actual_in_sites(compiled.program());
+    let source = compiled_in_source(ONE_IN, 0);
+    let sites = actual_in_sites(source.compiled.program());
     assert_eq!(sites.len(), 1);
-    let checked = compiled.program().checked().clone();
     let tracker = MemTracker::new_root("actual expression entity scopes");
     let trace = TraceState::default();
     let actual = NativeTypeConstruction::try_with_control(tracker.clone(), &trace).unwrap();
@@ -375,13 +479,23 @@ fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
         tracker: &tracker,
         fail_at: None,
     };
-    let program =
-        ExpressionProgram::try_new_with_creator_in(checked, &mut temporary, &factory, &trace)
-            .unwrap();
-    let late_recipe = program.native_inlist_recipe(sites[0]).unwrap().clone();
+    let unit = compile_traced_in(&source, sites[0], &mut temporary, &factory).unwrap();
+    let original_root = source
+        .compiled
+        .program()
+        .unit(sites[0].unit)
+        .unwrap()
+        .root_of_use(sites[0].use_id)
+        .unwrap();
+    assert_eq!(unit.root_of_use(sites[0].use_id), Some(original_root));
+    let late_recipe = unit
+        .recipes()
+        .native_inlist(sites[0].use_id)
+        .unwrap()
+        .clone();
     let events = trace.events.lock().unwrap().clone();
-    // The original ordered eight families, one independent actual IN parameter
-    // collection and one final entity Arc all have real Native scopes.
+    // One unit scope owns the final Arc, eight scopes own the ordered recipe
+    // maps, and one independent scope owns the actual IN parameters.
     assert_eq!(trace.scopes.load(Ordering::SeqCst), 10);
     assert_eq!(
         events.iter().filter(|event| event.kind == "scope").count(),
@@ -393,7 +507,7 @@ fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
     );
     let recipe_scope = events
         .iter()
-        .find(|event| event.scope == 2 && event.kind == "layout")
+        .find(|event| event.scope == 3 && event.kind == "layout")
         .expect("the actual IN parameter scope has constructor requests")
         .scope;
     let recipe_charge = events
@@ -405,18 +519,20 @@ fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
     assert!(
         events
             .iter()
-            .any(|event| event.scope == 1 && event.kind == "opaque"),
+            .any(|event| event.scope == 2 && event.kind == "opaque"),
         "IN map insertion uses its separate family scope"
     );
+    let final_arc_bytes = arc_layout(Layout::new::<CompiledExprSet>()).unwrap().size();
     assert!(
-        events
-            .iter()
-            .any(|event| event.scope == 9 && event.kind == "layout"),
-        "final Arc uses its own exact constructor request"
+        events.last().is_some_and(|event| {
+            event.scope == 0 && event.kind == "layout" && event.bytes == final_arc_bytes
+        }),
+        "the unit's own scope pays for its final Arc"
     );
-    let late_program = Arc::clone(&program);
-    drop(program);
-    drop(compiled);
+    let late_unit = Arc::clone(&unit);
+    drop(unit);
+    let source_tracker = Arc::clone(&source.tracker);
+    drop(source);
     drop(temporary);
     {
         let _factory = factory;
@@ -426,7 +542,7 @@ fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
         tracker.current() > recipe_charge,
         "all eight family/Arc owners remain with the late entity"
     );
-    drop(late_program);
+    drop(late_unit);
     assert_eq!(
         tracker.current(),
         recipe_charge,
@@ -437,7 +553,7 @@ fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
     assert_eq!(source_tracker.current(), 0);
 }
 
-fn actual_constructor_events(checked: ProgramLexicalBindings) -> Vec<ActualScopeEvent> {
+fn actual_constructor_events(source: &CompiledInSource, site: InSite) -> Vec<ActualScopeEvent> {
     let tracker = MemTracker::new_root("expression request prefix discovery");
     let trace = TraceState::default();
     let actual = NativeTypeConstruction::try_with_control(tracker.clone(), &trace).unwrap();
@@ -453,11 +569,9 @@ fn actual_constructor_events(checked: ProgramLexicalBindings) -> Vec<ActualScope
         tracker: &tracker,
         fail_at: None,
     };
-    let program =
-        ExpressionProgram::try_new_with_creator_in(checked, &mut temporary, &factory, &trace)
-            .unwrap();
+    let unit = compile_traced_in(source, site, &mut temporary, &factory).unwrap();
     let events = trace.events.lock().unwrap().clone();
-    drop(program);
+    drop(unit);
     drop(temporary);
     {
         let _factory = factory;
@@ -468,10 +582,10 @@ fn actual_constructor_events(checked: ProgramLexicalBindings) -> Vec<ActualScope
 }
 #[test]
 fn actual_host_expression_each_first_tracker_refusal_preserves_cause_and_has_no_tail() {
-    let (compiled, source_tracker) = compiled_in_source(ONE_IN, 0);
-    assert_eq!(actual_in_sites(compiled.program()).len(), 1);
-    let checked = compiled.program().checked().clone();
-    let discovered = actual_constructor_events(checked.clone());
+    let source = compiled_in_source(ONE_IN, 0);
+    let sites = actual_in_sites(source.compiled.program());
+    assert_eq!(sites.len(), 1);
+    let discovered = actual_constructor_events(&source, sites[0]);
     assert!(!discovered.is_empty());
     // Every real nonzero scope/header/map request in this actual constructor
     // gets a fresh immutable tracker limit at the original prospective event.
@@ -495,14 +609,8 @@ fn actual_host_expression_each_first_tracker_refusal_preserves_cause_and_has_no_
             tracker: &tracker,
             fail_at: Some(fail_at),
         };
-        let error = ExpressionProgram::try_new_with_creator_in(
-            checked.clone(),
-            &mut temporary,
-            &factory,
-            &trace,
-        )
-        .unwrap_err();
-        let ProgramCreationFailure::Creator(original) = error else {
+        let error = compile_traced_in(&source, sites[0], &mut temporary, &factory).unwrap_err();
+        let ExprCompileFailure::Creator(original) = error else {
             panic!("original Native tracker cause must remain typed");
         };
         assert!(matches!(original, NativeTypeConstructionError::Capacity(_)));
@@ -539,7 +647,7 @@ fn actual_host_expression_each_first_tracker_refusal_preserves_cause_and_has_no_
         drop(actual);
         assert_eq!(tracker.current(), 0);
     }
-    drop(checked);
-    drop(compiled);
+    let source_tracker = Arc::clone(&source.tracker);
+    drop(source);
     assert_eq!(source_tracker.current(), 0);
 }

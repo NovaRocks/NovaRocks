@@ -69,8 +69,10 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
     let values: Vec<_> = (0..arity).map(|i| ValueId::new(91 + i as u32)).collect();
     for value in &values {
         let expr = builder
-            .add_expression(
-                input,
+            .unit(input)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 checked_constants::kind(
                     &mut source_pools,
@@ -78,14 +80,26 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
                 ),
             )
             .unwrap();
+        let input_root = builder
+            .unit(input)
+            .unwrap()
+            .root(
+                expr,
+                EvaluationDemand::Value,
+                novarocks_expression_contract::RootScope::Port(0),
+            )
+            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *value,
                 ty: ty.clone(),
-                origin: ValueOrigin::Expr { node: input, expr },
+                origin: ValueOrigin::Expr {
+                    node: input,
+                    root: input_root,
+                },
             })
             .unwrap();
-        projections.push((expr, *value));
+        projections.push((input_root, *value));
     }
     builder
         .add_project(
@@ -114,8 +128,10 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
             None
         };
         let expr = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 if let Some(value) = &cv {
                     ExprKind::Constant(crate::exec::expr::test_support::register_constant(
@@ -132,8 +148,10 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
     }
     let owner = author(&functions, "parse_url", arguments, ControlShape::Eager);
     let call = builder
-        .add_expression(
-            output,
+        .unit(output)
+        .unwrap()
+        .add(
+            None,
             owner.result(),
             ExprKind::FunctionCall {
                 function: owner.function.clone(),
@@ -143,12 +161,21 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
         .unwrap();
     let mut authors = BTreeMap::new();
     authors.insert(call, owner);
+    let output_root = builder
+        .unit(output)
+        .unwrap()
+        .root(
+            call,
+            EvaluationDemand::Value,
+            novarocks_expression_contract::RootScope::Port(0),
+        )
+        .unwrap();
     let result_value = builder
         .add_value(
             ty.clone(),
             ValueOrigin::Expr {
                 node: output,
-                expr: call,
+                root: output_root,
             },
         )
         .unwrap();
@@ -156,26 +183,14 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
         .add_project(
             output,
             input,
-            Box::from([(call, result_value)]),
+            Box::from([(output_root, result_value)]),
             Box::from([result_value]),
-        )
-        .unwrap();
-    let fragment = builder
-        .finish_definition(
-            output,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
+        output: builder.construction_node(output).unwrap().output.clone(),
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&ty),
             name: "url part".into(),
@@ -184,7 +199,7 @@ fn program(arity: usize, constant_part: Option<&str>) -> Arc<LocalProgram> {
             ty,
         }]),
     };
-    compile_checked_fragment(&functions, fragment, &authors, result, source_pools)
+    compile_checked_fragment(&functions, builder, output, &authors, result, source_pools)
 }
 #[test]
 fn parse_url_actual_compiler_both_profiles_dynamic_and_native_constants_keep_key_null_semantics() {

@@ -3792,6 +3792,8 @@ dependencies = [
  "novarocks-control-runtime",
  "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-failpoint",
  "novarocks-functions",
  "novarocks-local-compiler",

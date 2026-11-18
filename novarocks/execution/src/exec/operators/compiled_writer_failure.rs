@@ -42,8 +42,6 @@ pub(super) fn missing(detail: impl fmt::Display) -> ExecutionFailure {
 pub(super) enum IndexKind {
     PartialCall,
     FinalCall,
-    Mapping,
-    Literal,
 }
 #[derive(Debug)]
 struct WriterIndexFailure {
@@ -98,12 +96,7 @@ mod tests {
     use std::error::Error;
     #[test]
     fn exact_call_and_mapping_identity_failures_retain_original_narrowing() {
-        for kind in [
-            IndexKind::PartialCall,
-            IndexKind::FinalCall,
-            IndexKind::Mapping,
-            IndexKind::Literal,
-        ] {
+        for kind in [IndexKind::PartialCall, IndexKind::FinalCall] {
             assert_eq!(index(kind, u32::MAX as usize).unwrap(), u32::MAX);
             if let Some(required) = (u32::MAX as usize).checked_add(1) {
                 let failure = index(kind, required).unwrap_err();

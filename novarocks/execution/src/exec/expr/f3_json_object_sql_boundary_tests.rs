@@ -131,7 +131,8 @@ fn ancestors(
 }
 #[test]
 fn json_object_legacy_native_oracle_original_sql_metadata_and_error_preservation() {
-    use novarocks_physical_plan::{ExprKind, NodeKind};
+    use novarocks_expression_contract::ExprKind;
+    use novarocks_physical_plan::NodeKind;
 
     let fields = declared_fields();
     let mut records = Vec::new();
@@ -143,7 +144,8 @@ fn json_object_legacy_native_oracle_original_sql_metadata_and_error_preservation
         let mut owners = Vec::new();
         let mut call_metadata = Vec::new();
         for fragment in plan.fragments().values() {
-            for (id, expr) in fragment.expressions().iter() {
+            for (_source_node, unit, id, expr) in super::sql_test_source::unit_definitions(fragment)
+            {
                 let ExprKind::FunctionCall { function, .. } = &expr.kind else {
                     continue;
                 };
@@ -154,15 +156,20 @@ fn json_object_legacy_native_oracle_original_sql_metadata_and_error_preservation
                 assert_eq!(expr.ty.data_type(), &DataType::Utf8);
                 assert_eq!(function.result_type, expr.ty);
                 assert!(
-                    live.contains(&(fragment.id(), expr.owner)),
+                    live.contains(&(fragment.id(), _source_node.id)),
                     "original throwing use remains root-reachable"
                 );
-                let NodeKind::Project { expressions } = &fragment.nodes()[&expr.owner].kind else {
+                let NodeKind::Project { expressions } = &fragment.nodes()[&_source_node.id].kind
+                else {
                     panic!("original throwing projection owner")
                 };
-                assert!(expressions.iter().any(|(root, _)| root == id));
+                assert!(
+                    expressions
+                        .iter()
+                        .any(|(root, _)| unit.root(*root).unwrap().definition == *id)
+                );
                 call_metadata.push(json!({"result_type":type_metadata(&function.result_type),"argument_types":function.argument_types.iter().map(|a| match a { FunctionArgumentType::Value(v) => type_metadata(v), _ => panic!("original value channel") }).collect::<Vec<_>>()}));
-                owners.push((fragment.id(), expr.owner));
+                owners.push((fragment.id(), _source_node.id));
             }
         }
         assert!(!owners.is_empty(), "original JSON call is not pruned");
@@ -235,8 +242,9 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
     use crate::exec::expr::compiled_program::CompiledExpressionInstance;
     use crate::exec::expr::filter_conjunction_actual_sql_compiler_tests::compiler_results;
     use crate::exec::expr::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
-    use novarocks_local_program::{ProgramExpressionRootSite, ProgramNodeKind, StaticExprKind};
-    use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition};
+    use novarocks_expression::StaticExprKind;
+    use novarocks_expression_contract::ExprKind;
+    use novarocks_local_program::ProgramNodeKind;
 
     {
         for scenario in 0..5 {
@@ -259,7 +267,9 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
             let source = sql_source_with_declared_fields(sql, &fields);
             let mut authored = 0;
             for fragment in source.plan().fragments().values() {
-                for (id, expression) in fragment.expressions().iter() {
+                for (_source_node, unit, id, expression) in
+                    super::sql_test_source::unit_definitions(fragment)
+                {
                     let ExprKind::FunctionCall { function, args } = &expression.kind else {
                         continue;
                     };
@@ -269,10 +279,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                     assert_eq!(expression.ty, result());
                     assert_eq!(function.result_type, expression.ty);
                     assert_eq!(args.len(), 2);
-                    let request = fragment
-                        .call_requests()
-                        .get(PhysicalCallDefinition::Expression(*id))
-                        .unwrap();
+                    let request = unit.requests().get(id).unwrap();
                     assert_eq!(request.logical_argument_count, 2);
                     assert_eq!(request.arguments.len(), 2);
                     authored += 1;
@@ -291,7 +298,9 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 }
                 let mut accesses = 0;
                 for fragment in source.plan().fragments().values() {
-                    for (_, expression) in fragment.expressions().iter() {
+                    for (_source_node, unit, _, expression) in
+                        super::sql_test_source::unit_definitions(fragment)
+                    {
                         let ExprKind::FunctionCall { function, args } = &expression.kind else {
                             continue;
                         };
@@ -305,7 +314,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                             &DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
                         );
                         assert!(expression.ty.nullable());
-                        let index = fragment.expressions().get(args[1]).unwrap();
+                        let index = unit.definition(args[1]).unwrap();
                         assert_eq!(index.ty.data_type(), &DataType::Int32);
                         assert!(index.ty.nullable());
                         // The literal IF index now has its native INTEGER
@@ -319,7 +328,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         assert_eq!(function.function_id.as_str(), "builtin.scalar/if/v1");
                         assert_eq!(args.len(), 3);
                         for (arg, value) in args[1..].iter().zip([None, Some(1)]) {
-                            let branch = fragment.expressions().get(*arg).unwrap();
+                            let branch = unit.definition(*arg).unwrap();
                             assert_eq!(branch.ty.data_type(), &DataType::Int32);
                             let actual = match &branch.kind {
                                 ExprKind::Constant(reference) => {
@@ -348,24 +357,9 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
             let mut producer = None;
             for program in programs.into_values() {
                 let program = Arc::new(program.expect("actual complete JSON SQL package compiles"));
-                let snapshot = program
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .resolved_calls()
-                    .snapshot();
-                for (site, use_id) in snapshot.bindings() {
-                    let calls = program.checked().channels().expressions().resolved_calls();
-                    let Some(call) =
-                        calls
-                            .calls()
-                            .get(&novarocks_local_program::ProgramCallSite::Expression(
-                                novarocks_local_program::ProgramUseRef {
-                                    arena: site.arena(),
-                                    use_id: *use_id,
-                                },
-                            ))
-                    else {
+                for (site, unit, root) in super::sql_test_source::compiled_roots(&program) {
+                    let use_id = &root.use_id;
+                    let Some(call) = unit.calls().get(use_id) else {
                         continue;
                     };
                     if call.call_contract().function_id().as_str()
@@ -382,14 +376,9 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         call.call_contract().effects().null_behavior,
                         novarocks_type_contract::FunctionNullBehavior::CalledOnNull
                     );
-                    assert_eq!(
-                        snapshot.flows()[&site.arena()].uses()[use_id]
-                            .arguments
-                            .len(),
-                        2
-                    );
-                    let flow = &snapshot.flows()[&site.arena()];
-                    let arena = &snapshot.roots().arenas()[&site.arena()];
+                    assert_eq!(unit.control_flow().uses()[use_id].arguments.len(), 2);
+                    let flow = unit.control_flow();
+                    let arena = unit.definitions();
                     let StaticExprKind::BoundCall { args, .. } =
                         arena.node(flow.uses()[use_id].definition).unwrap().kind()
                     else {
@@ -398,11 +387,21 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                     let key_slot = if complex_key || scenario == 4 {
                         None
                     } else {
-                        let StaticExprKind::SlotId(slot) = arena.node(args[0]).unwrap().kind()
-                        else {
-                            panic!("real key slot");
-                        };
-                        Some(*slot)
+                        assert!(
+                            matches!(arena.node(args[0]).unwrap().kind(), StaticExprKind::Input),
+                            "real key Input"
+                        );
+                        Some(super::sql_test_source::project_input_slot_for_use(
+                            &program,
+                            site,
+                            flow.uses()[use_id].arguments[0],
+                        ))
+                    };
+                    let value_use = if scenario == 2 {
+                        let inner = flow.uses()[use_id].arguments[1];
+                        flow.uses()[&inner].arguments[1]
+                    } else {
+                        flow.uses()[use_id].arguments[1]
                     };
                     let value = if scenario == 2 {
                         let StaticExprKind::BoundCall { args: inner, .. } =
@@ -414,27 +413,33 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                     } else {
                         args[1]
                     };
-                    let StaticExprKind::SlotId(value_slot) = arena.node(value).unwrap().kind()
-                    else {
-                        panic!("real value slot");
-                    };
+                    assert!(
+                        matches!(arena.node(value).unwrap().kind(), StaticExprKind::Input),
+                        "real value Input"
+                    );
+                    let value_slot = super::sql_test_source::project_input_slot_for_use(
+                        &program, site, value_use,
+                    );
                     assert!(
                         producer
-                            .replace((program.clone(), *site, key_slot, *value_slot))
+                            .replace((program.clone(), site, key_slot, value_slot))
                             .is_none()
                     );
                 }
             }
             let (program, site, key_slot, value_slot) =
                 producer.expect("actual installed JSONObject producer root");
-            let ProgramExpressionRootSite::Node { node, .. } = site else {
-                panic!("project root");
-            };
-            let ProgramNodeKind::Project { input, .. } =
-                program.graph().nodes()[node.index()].kind()
-            else {
-                panic!("original project producer");
-            };
+            let input = program
+                .graph()
+                .nodes()
+                .iter()
+                .find_map(|node| match node.kind() {
+                    ProgramNodeKind::Project { input, exprs, .. } if exprs.contains(&site) => {
+                        Some(*input)
+                    }
+                    _ => None,
+                })
+                .expect("original project producer");
             let schema = program.graph().nodes()[input.index()]
                 .output_layout()
                 .schema()
@@ -472,8 +477,8 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 tracker.clone(),
             );
             let mut frame = CompiledExpressionInstance::try_new_with_allocator(
-                program.clone(),
-                site,
+                program.unit(site.unit).unwrap().clone(),
+                site.root,
                 &FrameControl,
                 Some(host),
             )
@@ -547,8 +552,8 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                     tracker.clone(),
                 );
                 let mut empty = CompiledExpressionInstance::try_new_with_allocator(
-                    program.clone(),
-                    site,
+                    program.unit(site.unit).unwrap().clone(),
+                    site.root,
                     &FrameControl,
                     Some(host),
                 )

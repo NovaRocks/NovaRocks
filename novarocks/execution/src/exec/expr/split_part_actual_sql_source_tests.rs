@@ -18,9 +18,9 @@
 //! Prior native PASS alone does not establish that a call survived real constant folding.
 use super::sql_test_source::sql_source;
 use arrow::datatypes::DataType;
-use novarocks_physical_plan::{
-    ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
-};
+use novarocks_expression_contract::ExprKind;
+use novarocks_physical_plan::FunctionArgumentType;
+use novarocks_physical_plan::StaticFunctionArgument;
 
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 const SQL: &str = include_str!(concat!(
@@ -31,17 +31,14 @@ fn check() {
     let owner = sql_source(SQL, DataType::Int64);
     let mut count = 0;
     for fragment in owner.plan().fragments().values() {
-        for (id, node) in fragment.expressions().iter() {
+        for (_source_node, unit, id, node) in super::sql_test_source::unit_definitions(fragment) {
             let ExprKind::FunctionCall { function, args } = &node.kind else {
                 continue;
             };
             if function.function_id.as_str() != "builtin.scalar/split_part/v1" {
                 continue;
             }
-            let request = fragment
-                .call_requests()
-                .get(PhysicalCallDefinition::Expression(*id))
-                .unwrap();
+            let request = unit.requests().get(id).unwrap();
             assert_eq!(args.len(), 3);
             assert_eq!(request.logical_argument_count, 3);
             assert_eq!(request.arguments.len(), 3);
@@ -69,7 +66,7 @@ fn check() {
                         DataType::Int32
                     }
                 );
-                assert_eq!(&fragment.expressions().get(*child).unwrap().ty, bound);
+                assert_eq!(&unit.definition(*child).unwrap().ty, bound);
             }
             assert_eq!(node.ty, function.result_type);
             assert_eq!(node.ty, FunctionValueType::new(DataType::Utf8, true));

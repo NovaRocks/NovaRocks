@@ -21,7 +21,7 @@ use crate::{
     StaticStreamRouting,
 };
 use novarocks_expression::CompiledExprSet;
-use novarocks_type_contract::FunctionValueType;
+use novarocks_type_contract::{ArrowTypeProfile, FunctionValueType};
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
@@ -127,15 +127,19 @@ where
             if expected.is_nullable() != actual.is_nullable() {
                 return Err((self.invalid)());
             }
-            let equal = novarocks_type_contract::arrow_data_types_exact_borrowed_observed::<
-                SchemaComparisonFailure<E>,
-            >(expected.data_type(), actual.data_type(), || {
-                (self.observe)().map_err(SchemaComparisonFailure::Observed)
-            })
-            .map_err(|failure| match failure {
-                SchemaComparisonFailure::Observed(error) => error,
-                SchemaComparisonFailure::InvalidType => (self.invalid)(),
-            })?;
+            let equal =
+                novarocks_type_contract::arrow_data_types_exact_borrowed_with_profile_observed::<
+                    SchemaComparisonFailure<E>,
+                >(
+                    expected.data_type(),
+                    actual.data_type(),
+                    ArrowTypeProfile::CanonicalValue,
+                    || (self.observe)().map_err(SchemaComparisonFailure::Observed),
+                )
+                .map_err(|failure| match failure {
+                    SchemaComparisonFailure::Observed(error) => error,
+                    SchemaComparisonFailure::InvalidType => (self.invalid)(),
+                })?;
             if !equal {
                 return Err((self.invalid)());
             }

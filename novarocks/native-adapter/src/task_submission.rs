@@ -251,9 +251,8 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         use novarocks_execution_contract::ExchangeDeliveryRequirement;
         use novarocks_local_program::{
-            ImmutableExpressions, ProgramOutputRole, ProgramWriteLayoutPreference, StaticLayout,
-            StaticRouterRoute, StaticSinkProgram, StaticStreamBranch, StaticStreamContract,
-            StaticStreamRouting,
+            ProgramOutputRole, ProgramWriteLayoutPreference, StaticLayout, StaticRouterRoute,
+            StaticSinkProgram, StaticStreamBranch, StaticStreamContract, StaticStreamRouting,
         };
         use std::sync::Arc;
         let slots = [10, 11, 12].map(novarocks_types::SlotId::new);
@@ -313,13 +312,7 @@ mod tests {
                         .unwrap(),
                 },
             )],
-            Arc::new(
-                ImmutableExpressions::try_new_for_compile(
-                    vec![],
-                    &novarocks_sql::compiler::SqlCompileControl::unbounded(),
-                )
-                .unwrap(),
-            ),
+            &[],
             novarocks_types::SlotId::new(1),
             vec![StaticRouterRoute {
                 branch: 0,
@@ -393,13 +386,6 @@ mod tests {
                 },
             )
             .expect("compiled stream branch"),
-            arena: std::sync::Arc::new(
-                novarocks_local_program::ImmutableExpressions::try_new_for_compile(
-                    Vec::new(),
-                    &novarocks_sql::compiler::SqlCompileControl::unbounded(),
-                )
-                .expect("empty sink arena"),
-            ),
         }
     }
 

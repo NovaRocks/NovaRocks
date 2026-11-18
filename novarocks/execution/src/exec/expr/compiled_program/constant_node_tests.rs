@@ -450,31 +450,32 @@ fn numeric_not_actual_sql_program_and_constant_entry_keep_the_same_sparse_values
         let programs = programs_with_catalogue(&source, &functions);
         let mut found = None;
         for program in programs.values() {
-            let snapshot = program
-                .expressions()
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            for (&root, &use_id) in snapshot.bindings() {
-                let flow = &snapshot.flows()[&root.arena()];
-                let definitions = &snapshot.roots().arenas()[&root.arena()];
-                if matches!(
-                    definitions
-                        .node(flow.uses()[&use_id].definition)
-                        .unwrap()
-                        .kind(),
-                    novarocks_local_program::StaticExprKind::Not(_)
-                ) {
-                    assert!(found.is_none());
-                    found = Some((program.clone(), root));
+            for (unit_index, unit) in program.units().iter().enumerate() {
+                for (ordinal, root) in unit.roots().iter().enumerate() {
+                    if matches!(
+                        unit.definitions().node(root.definition).unwrap().kind(),
+                        novarocks_expression::StaticExprKind::Not(_)
+                    ) {
+                        assert!(found.is_none());
+                        let reference = novarocks_local_program::ProgramRootRef {
+                            unit: novarocks_local_program::ProgramUnitId::new(unit_index),
+                            root: novarocks_expression_contract::RootOrdinal::new(
+                                u32::try_from(ordinal).unwrap(),
+                            ),
+                        };
+                        found = Some((program.clone(), reference));
+                    }
                 }
             }
         }
         let (program, root) = found.expect("published numeric NOT root");
         let data = batch(&program, root, input.clone());
-        let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(root.unit).unwrap().clone(),
+            root.root,
+            &Control,
+        )
+        .unwrap();
         let output = frame
             .evaluate(&data, novarocks_functions::Selection::all(4), &Control)
             .unwrap();
@@ -621,7 +622,7 @@ fn unsupported_arithmetic_and_comparison_families_decline_without_reclassifying_
             CompilePhase::FunctionSpecialization,
         ),
         Err(ConstantNodeFailure::Primitive(
-            novarocks_local_program::ProgramPrimitiveError::Arithmetic(
+            novarocks_expression::PrimitiveError::Arithmetic(
                 novarocks_functions::ArithmeticPrepareError::TypeMismatch
             )
         ))

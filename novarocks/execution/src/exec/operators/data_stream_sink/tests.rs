@@ -1767,6 +1767,7 @@ mod conditional_compiled_selection {
     use super::*;
     use arrow::{array::Int64Array, record_batch::RecordBatch};
     use novarocks_connector_contract::PureProviderProgramCatalog;
+    use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
     use novarocks_functions::{
         ConstantPolicy, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
         PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
@@ -1774,21 +1775,17 @@ mod conditional_compiled_selection {
     use novarocks_local_compiler::{
         LocalCompileOptions, compile_fragment, validate_fragment_providers,
     };
-    use novarocks_local_program::{KernelAbiVersion, ProgramNodeExpressionRole, ProgramNodeId};
+    use novarocks_local_program::{KernelAbiVersion, ProgramNodeKind, ProgramRootRef};
     use novarocks_physical_plan::{
-        BinaryOperator, ExprId, ExprKind, Fragment, FragmentCuts, FragmentId, FragmentPackage,
-        FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-        FrozenFragmentPruning, NodeId, PhysicalExpressionRoots, PhysicalRootUses,
-        PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
-        RequiredContracts, ResultField, ResultPort, ResultValueDomain, StagePlacementPolicy,
-        ValueId, ValueOrigin,
+        FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput,
+        FragmentSink, FrozenFragmentPruning, NodeId, PipelineDopDomain, PlanLimits, PlanVersionId,
+        PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort,
+        ResultValueDomain, StagePlacementPolicy, ValueId, ValueOrigin,
     };
     use novarocks_type_contract::{
-        CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-        EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext,
-        ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
-        PureCompileControl, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-        SemanticParameterValue, SemanticParameters,
+        CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
+        FunctionValueType, PureCompileControl, SemanticParameterId, SemanticParameterKey,
+        SemanticParameterRef, SemanticParameterValue, SemanticParameters,
     };
     use std::{collections::BTreeMap, num::NonZeroUsize};
 
@@ -1799,39 +1796,13 @@ mod conditional_compiled_selection {
         }
     }
 
-    fn root(expression: u32) -> ProgramExpressionRootSite {
-        ProgramExpressionRootSite::Node {
-            node: ProgramNodeId::new(2),
-            role: ProgramNodeExpressionRole::ProjectOutput { expression },
-        }
-    }
-
-    fn visit(
-        fragment: &Fragment,
-        definition: ExprId,
-        demand: EvaluationDemand,
-        ordered: &mut Vec<ExpressionInvocation<ExprId>>,
-    ) -> ExpressionUseId {
-        let arguments = match &fragment.expressions().get(definition).unwrap().kind {
-            ExprKind::Binary { left, right, .. } => [*left, *right]
-                .into_iter()
-                .map(|child| visit(fragment, child, EvaluationDemand::Value, ordered))
-                .collect::<Vec<_>>(),
-            ExprKind::Value(_) | ExprKind::Constant(_) => Vec::new(),
-            other => panic!("unexpected conditional exchange fixture expression: {other:?}"),
+    fn root(program: &LocalProgram, expression: usize) -> ProgramRootRef {
+        let ProgramNodeKind::Project { exprs, .. } =
+            program.graph().nodes()[program.graph().root().index()].kind()
+        else {
+            panic!("actual conditional fixture output Project");
         };
-        let use_id = ExpressionUseId::new(u32::try_from(ordered.len()).unwrap());
-        ordered.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id,
-                region: EvaluationRegionId::new(0),
-                demand,
-            },
-            definition,
-            control: ControlShape::Eager,
-            arguments: arguments.into_boxed_slice(),
-        });
-        use_id
+        exprs[expression]
     }
 
     fn program() -> Arc<LocalProgram> {
@@ -1859,10 +1830,15 @@ mod conditional_compiled_selection {
                 ty.clone(),
                 crate::exec::operators::family_fixture::constant_sources::null(),
             );
-            let value = builder
-                .add_value(ty.clone(), ValueOrigin::Expr { node: input, expr })
+            let root = builder
+                .unit(input)
+                .unwrap()
+                .root(expr, EvaluationDemand::Value, RootScope::Port(0))
                 .unwrap();
-            inputs.push((expr, value));
+            let value = builder
+                .add_value(ty.clone(), ValueOrigin::Expr { node: input, root })
+                .unwrap();
+            inputs.push((root, value));
         }
         let input_ids = inputs.iter().map(|(_, id)| *id).collect::<Vec<ValueId>>();
         builder
@@ -1874,18 +1850,24 @@ mod conditional_compiled_selection {
             )
             .unwrap();
         let left = builder
-            .add_expression(output, integer.clone(), ExprKind::Value(input_ids[0]))
+            .unit(output)
+            .unwrap()
+            .add(None, integer.clone(), ExprKind::Value(input_ids[0]))
             .unwrap();
         let right = builder
-            .add_expression(output, integer.clone(), ExprKind::Value(input_ids[1]))
+            .unit(output)
+            .unwrap()
+            .add(None, integer.clone(), ExprKind::Value(input_ids[1]))
             .unwrap();
         let parameter = SemanticParameterRef {
             id: SemanticParameterId::new(0),
             expected_key: SemanticParameterKey::AllowThrowException,
         };
         let key = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 integer.clone(),
                 ExprKind::Binary {
                     op: BinaryOperator::Add,
@@ -1897,15 +1879,22 @@ mod conditional_compiled_selection {
             )
             .unwrap();
         let applies = builder
-            .add_expression(output, boolean.clone(), ExprKind::Value(input_ids[2]))
+            .unit(output)
+            .unwrap()
+            .add(None, boolean.clone(), ExprKind::Value(input_ids[2]))
             .unwrap();
         let mut outputs = Vec::new();
         let mut fields = Vec::new();
         for (expr, ty, name) in [(key, integer, "key"), (applies, boolean, "applies")] {
-            let value = builder
-                .add_value(ty.clone(), ValueOrigin::Expr { node: output, expr })
+            let root = builder
+                .unit(output)
+                .unwrap()
+                .root(expr, EvaluationDemand::Value, RootScope::Port(0))
                 .unwrap();
-            outputs.push((expr, value));
+            let value = builder
+                .add_value(ty.clone(), ValueOrigin::Expr { node: output, root })
+                .unwrap();
+            outputs.push((root, value));
             fields.push(ResultField {
                 domain: ResultValueDomain::Plain,
                 name: name.into(),
@@ -1923,6 +1912,7 @@ mod conditional_compiled_selection {
                 output_ids.into_boxed_slice(),
             )
             .unwrap();
+        crate::exec::operators::family_fixture::seal_no_call_units(&mut builder);
         let fragment = builder
             .finish_definition(
                 output,
@@ -1936,33 +1926,6 @@ mod conditional_compiled_selection {
             )
             .unwrap();
         let (fragment, constants) = fragment.into_parts();
-        let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-        let mut ordered = Vec::new();
-        let bindings = roots
-            .sites()
-            .iter()
-            .map(|(site, expression)| {
-                (
-                    *site,
-                    visit(&fragment, expression.expr, expression.demand, &mut ordered),
-                )
-            })
-            .collect();
-        let flow = ExpressionControlFlow::try_new(
-            vec![ExpressionEvaluationRegion {
-                id: EvaluationRegionId::new(0),
-                parent: None,
-                guard: None,
-            }],
-            ordered,
-            fragment.expressions(),
-            CompilePhase::Validate,
-            &FixtureControl,
-        )
-        .unwrap();
-        let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &FixtureControl).unwrap();
-        let calls =
-            FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &FixtureControl).unwrap();
         let result = ResultPort {
             scalar_schema: None,
             fragment: fragment_id,
@@ -1976,8 +1939,8 @@ mod conditional_compiled_selection {
                     required: RequiredContracts::default(),
                     constants,
                     fragment,
-                    expression_uses: uses,
-                    calls,
+                    statement_constant_policy:
+                        crate::exec::operators::family_fixture::constant_policy(),
                     pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                         .unwrap(),
                     cuts: FragmentCuts::default(),
@@ -2094,8 +2057,10 @@ mod conditional_compiled_selection {
 
     fn sink(fixture: &Fixture, program: Arc<LocalProgram>) -> DataStreamSinkOperator {
         let mut sink = make_test_operator(fixture);
+        let key = root(&program, 0);
+        let applies = root(&program, 1);
         sink.compiled_partition = Some(CompiledPartitionState {
-            keys: CompiledPartitionKeys::conditional(program, vec![root(0)], root(1)),
+            keys: CompiledPartitionKeys::conditional(program, vec![key], applies),
             instances: None,
             applicability_instances: None,
         });
@@ -2130,10 +2095,10 @@ mod conditional_compiled_selection {
         let mut full_sink = sink(&fixture, program.clone());
         let mut instances = None;
         let control = full_sink.compiled_control.as_ref().unwrap();
-        compiled_instances(&mut instances, &program, &[root(0)], control).unwrap();
+        compiled_instances(&mut instances, &program, &[root(&program, 0)], control).unwrap();
         let error = evaluate_all(
             &mut instances.as_mut().unwrap()[0],
-            root(0),
+            root(&program, 0),
             chunk.record_batch(),
             control,
         )

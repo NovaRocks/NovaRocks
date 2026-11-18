@@ -27,33 +27,35 @@ use std::time::Duration;
 
 use arrow::array::ListArray;
 use arrow::datatypes::{DataType, Field, Int64Type};
+use novarocks_expression::{
+    EvaluationEnvironment, ScopeColumn, ScopeLayout, ScopeLayouts, compile_expr_set_pure,
+};
+use novarocks_expression_contract::{
+    BinaryOperator, ExprKind, LegacyBindingMetadata, PhysicalCallRequest, RootScope,
+};
 use novarocks_functions::{
     CallEffectInput, ConstantPool, EngineFunctionCatalogBuilder, FunctionArgument,
     FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
     FunctionResultType, InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
+    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedRelationalEffects,
 };
 use novarocks_local_program::{LocalProgram, ProgramNodeKind};
 use novarocks_physical_plan::{
-    BinaryOperator, BoundTableFunction, ConstantPoolId, ConstantPools, ConstantReference,
-    Distribution, EdgeId, ExprId, ExprKind, ExpressionRootRole, ExpressionRootSite, Fragment,
-    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink, FrozenCallError,
-    FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType,
-    LegacyBindingMetadata, NodeId, NodeKind, NullOrdering, OutputPort, PhysicalCallBinding,
-    PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite, PhysicalExpressionRoots,
-    PhysicalNode, PhysicalPlan, PhysicalProperties, PhysicalRootUses, PipelineDopDomain,
+    BoundTableFunction, ConstantPoolId, ConstantPools, ConstantReference, Distribution, EdgeId,
+    ExprId, Fragment, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
+    FrozenFragmentPruning, FrozenPhysicalCall, NodeId, NodeKind, NullOrdering, OutputPort,
+    PhysicalCallSite, PhysicalNode, PhysicalPlan, PhysicalProperties, PipelineDopDomain,
     PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredInputs, ResultField,
     ResultPort, SetOperationKind, SortDirection, SortExpr, SortMode, StaticFunctionArgument,
     TableFunctionOutput, ValueId, ValueOrigin, extract_fragment_packages, passthrough_requirement,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationRegionId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects,
-    ExpressionEvaluationRegion, ExpressionInvocation, ExpressionUseId, FunctionValueType,
-    RegionGuard, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-    SemanticParameterValue, SemanticParameters, arithmetic_result_value_type_with_op,
-    control_argument_semantics,
+    ExpressionEffects, FunctionValueType, RelationCallId, RelationEffectContext,
+    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
+    SemanticParameters, ValueTypeStorageLifetime, arithmetic_result_value_type_with_op,
 };
+
 use novarocks_types::UniqueId;
 
 use super::aggregate_fixture::{
@@ -76,9 +78,6 @@ const CONSUMER: FragmentId = FragmentId::new(72);
 const TO_CONSUMER: EdgeId = EdgeId::new(9);
 const SOURCE_FINST: UniqueId = UniqueId::new(0xa1, 0x01);
 const CONSUMER_FINST: UniqueId = UniqueId::new(0xa2, 0x01);
-/// Relational use IDs and domains start far above every expression use.
-const RELATIONAL_USE: u32 = 1_000_000;
-const RELATIONAL_DOMAIN: u32 = 500_000;
 const POLICY: DecimalOverflowPolicy = DecimalOverflowPolicy::ReportError;
 const ALLOW: SemanticParameterRef = SemanticParameterRef {
     id: SemanticParameterId::new(3),
@@ -221,8 +220,10 @@ fn values(
         for pool in &pool_ids {
             cell.push(
                 builder
-                    .add_expression(
-                        node,
+                    .unit(node)
+                    .unwrap()
+                    .add(
+                        None,
                         list_type(),
                         ExprKind::Constant(ConstantReference {
                             pool: *pool,
@@ -232,6 +233,16 @@ fn values(
                     .unwrap(),
             );
         }
+        let cell = cell
+            .into_iter()
+            .map(|definition| {
+                builder
+                    .unit(node)
+                    .unwrap()
+                    .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
         cells.push(cell.into_boxed_slice());
     }
     builder
@@ -246,13 +257,19 @@ fn values(
 
 /// Add `UNNEST(args)` over `input`, whose key and list columns are given, with
 /// the spec's outputs and the output properties the physical law derives.
+struct TableSource {
+    functions: PureEngineFunctionCatalog,
+    selected: Arc<FunctionBindingSelection>,
+    arguments: Vec<FunctionArgument>,
+}
+
 fn add_table_function(
     builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     input: NodeId,
     key: ValueId,
     lists: &[ValueId],
     spec: &Spec,
-) -> (NodeId, Vec<ValueId>) {
+) -> (NodeId, Vec<ValueId>, TableSource) {
     let node = builder.reserve_node_id().unwrap();
     let request = spec
         .args
@@ -262,7 +279,8 @@ fn add_table_function(
             constant: None,
         })
         .collect::<Vec<_>>();
-    let bound = unnest_catalog()
+    let functions = unnest_catalog();
+    let bound = functions
         .metadata()
         .resolve_bound_user(
             "unnest",
@@ -296,9 +314,21 @@ fn add_table_function(
         .iter()
         .map(|arg| match *arg {
             Arg::List(list) => builder
-                .add_expression(node, list_type(), ExprKind::Value(lists[list]))
+                .unit(node)
+                .unwrap()
+                .add(None, list_type(), ExprKind::Value(lists[list]))
                 .unwrap(),
             Arg::Faulty(list) => faulty_argument(builder, node, key, lists[list]),
+        })
+        .collect::<Vec<_>>();
+    let arguments = arguments
+        .into_iter()
+        .map(|definition| {
+            builder
+                .unit(node)
+                .unwrap()
+                .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+                .unwrap()
         })
         .collect::<Vec<_>>();
     let mut outputs = Vec::new();
@@ -345,6 +375,7 @@ fn add_table_function(
         .collect::<Vec<_>>();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([passthrough_requirement(&input_properties)]),
@@ -365,7 +396,15 @@ fn add_table_function(
             },
         })
         .unwrap();
-    (node, columns)
+    (
+        node,
+        columns,
+        TableSource {
+            functions,
+            selected: Arc::new(bound.selected.clone()),
+            arguments: request,
+        },
+    )
 }
 
 /// `CASE WHEN k + i64::MAX IS NULL THEN l ELSE l END`: a List argument root
@@ -388,7 +427,9 @@ fn faulty_argument(
         .with_nullable(true)
         .expect("valid test root nullability");
     let left = builder
-        .add_expression(node, operand.clone(), ExprKind::Value(key))
+        .unit(node)
+        .unwrap()
+        .add(None, operand.clone(), ExprKind::Value(key))
         .unwrap();
     let right = builder.constant(
         node,
@@ -396,8 +437,10 @@ fn faulty_argument(
         crate::exec::operators::family_fixture::constant_sources::i64(i64::MAX),
     );
     let sum = builder
-        .add_expression(
-            node,
+        .unit(node)
+        .unwrap()
+        .add(
+            None,
             sum_type,
             ExprKind::Binary {
                 op: BinaryOperator::Add,
@@ -409,8 +452,10 @@ fn faulty_argument(
         )
         .unwrap();
     let condition = builder
-        .add_expression(
-            node,
+        .unit(node)
+        .unwrap()
+        .add(
+            None,
             FunctionValueType::new(DataType::Boolean, false),
             ExprKind::IsNull {
                 expr: sum,
@@ -419,14 +464,20 @@ fn faulty_argument(
         )
         .unwrap();
     let then = builder
-        .add_expression(node, list_type(), ExprKind::Value(list))
+        .unit(node)
+        .unwrap()
+        .add(None, list_type(), ExprKind::Value(list))
         .unwrap();
     let otherwise = builder
-        .add_expression(node, list_type(), ExprKind::Value(list))
+        .unit(node)
+        .unwrap()
+        .add(None, list_type(), ExprKind::Value(list))
         .unwrap();
     builder
-        .add_expression(
-            node,
+        .unit(node)
+        .unwrap()
+        .add(
+            None,
             list_type(),
             ExprKind::Case {
                 operand: None,
@@ -437,16 +488,19 @@ fn faulty_argument(
         .unwrap()
 }
 
-/// Finish a fragment and attach the original request of each table call: its
-/// bound Value arguments.
+/// Finish the original scalar units before authoring relation requests/effects.
 fn finish(
-    builder: crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
+    mut builder: crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     root: NodeId,
     sink: FragmentSink,
     max_dop: u32,
+    sources: BTreeMap<NodeId, TableSource>,
+    source_pools: &ConstantPools,
+    parameters: &SemanticParameters,
 ) -> crate::exec::operators::family_fixture::constant_sources::Fragment {
+    super::family_fixture::seal_no_call_units(&mut builder);
     let fragment = builder
-        .finish_definition(
+        .finish_structure(
             root,
             sink,
             PipelineDopDomain {
@@ -454,253 +508,167 @@ fn finish(
                 max: max_dop,
                 requires_power_of_two: false,
             },
+            PlanLimits::FROZEN,
+            &FixtureControl,
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut entries = fragment
-        .call_requests()
-        .entries()
+    let (fragment, constants) = fragment.into_parts();
+    let mut evaluation_pools = source_pools.clone();
+    super::family_fixture::constant_sources::merge(&mut evaluation_pools, &constants);
+    let entries = sources
         .iter()
-        .map(|(definition, request)| (*definition, request.clone()))
-        .collect::<Vec<_>>();
-    let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
-    novarocks_physical_plan::visit_relational_calls_observed::<FrozenCallError>(
-        &fragment,
-        &mut work,
-        |site, binding, _| {
-            let PhysicalCallBinding::Table(function) = binding else {
-                panic!("fixture relational calls are table calls")
-            };
-            entries.push((
-                PhysicalCallDefinition::Relational(site),
+        .map(|(&node, source)| {
+            (
+                PhysicalCallSite::Table { node },
                 PhysicalCallRequest {
-                    arguments: function
-                        .argument_types
+                    arguments: source
+                        .arguments
                         .iter()
                         .map(|argument| match argument {
-                            FunctionArgumentType::Value(value_type) => {
-                                StaticFunctionArgument::Value {
-                                    value_type: value_type.clone(),
-                                    constant: None,
-                                }
-                            }
-                            FunctionArgumentType::Lambda { .. } => panic!("UNNEST takes values"),
+                            FunctionArgument::Value {
+                                value_type,
+                                constant: None,
+                            } => StaticFunctionArgument::Value {
+                                value_type: value_type.clone(),
+                                constant: None,
+                            },
+                            _ => panic!("UNNEST original requests are nonconstant Values"),
                         })
                         .collect(),
-                    logical_argument_count: function.argument_types.len(),
+                    logical_argument_count: source.arguments.len(),
                     expected_result_type: None,
                     constant_policy: constant_policy(),
                 },
-            ));
-            Ok(())
-        },
-    )
-    .unwrap();
-    work.finish().unwrap();
-    fragment
-        .with_call_requests_observed(entries, &FixtureControl)
-        .unwrap()
-}
-
-/// One use per actual occurrence; a control child gets its own guarded domain
-/// exactly as its shape's argument semantics require.
-struct Author<'a> {
-    fragment: &'a Fragment,
-    next_use: u32,
-    next_region: u32,
-    uses: Vec<ExpressionInvocation<ExprId>>,
-    domains: Vec<ExpressionEvaluationRegion>,
-}
-impl Author<'_> {
-    fn visit(
-        &mut self,
-        expr: ExprId,
-        domain: EvaluationRegionId,
-        demand: EvaluationDemand,
-    ) -> ExpressionUseId {
-        let id = ExpressionUseId::new(self.next_use);
-        self.next_use += 1;
-        let kind = &self.fragment.expressions().get(expr).unwrap().kind;
-        let shape = kind
-            .intrinsic_control_shape()
-            .unwrap()
-            .expect("fixture authors no function call");
-        let mut children = Vec::new();
-        kind.expression_references_observed::<std::convert::Infallible>(|child| {
-            children.push(child);
-            Ok(())
+            )
         })
+        .collect();
+    let fragment = fragment
+        .with_call_requests_observed(entries, &FixtureControl)
         .unwrap();
-        let mut arguments = Vec::new();
-        for (ordinal, child) in children.iter().enumerate() {
-            let (child_demand, guard) =
-                control_argument_semantics(shape, children.len(), ordinal, demand).unwrap();
-            let child_region = match guard {
-                Some(kind) => {
-                    let child_region = EvaluationRegionId::new(self.next_region);
-                    self.next_region += 1;
-                    self.domains.push(ExpressionEvaluationRegion {
-                        id: child_region,
-                        parent: Some(domain),
-                        guard: Some(RegionGuard { owner: id, kind }),
-                    });
-                    child_region
-                }
-                None => domain,
-            };
-            arguments.push(self.visit(*child, child_region, child_demand));
-        }
-        self.uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                region: domain,
-                demand,
-            },
-            definition: expr,
-            control: shape,
-            arguments: arguments.into_boxed_slice(),
-        });
-        id
-    }
-}
-
-/// Root uses and frozen calls of one fragment. Expression roots share domain
-/// 0; table call `k` owns an unguarded domain and a relational use of its own,
-/// with the effects a fresh preparation by the installed owner refines.
-fn freeze(
-    fragment: &Fragment,
-    parameters: &SemanticParameters,
-) -> (PhysicalRootUses, FrozenFragmentCalls) {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let domain = EvaluationRegionId::new(0);
-    let mut author = Author {
-        fragment,
-        next_use: 0,
-        next_region: 1,
-        uses: Vec::new(),
-        domains: vec![ExpressionEvaluationRegion {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-    };
-    let mut bindings = Vec::new();
-    for (site, root) in roots.sites() {
-        bindings.push((*site, author.visit(root.expr, domain, root.demand)));
-    }
-    let Author {
-        uses, mut domains, ..
-    } = author;
-    let mut sites = Vec::new();
-    for node in fragment.nodes().values() {
-        if matches!(node.kind, NodeKind::TableFunction { .. }) {
-            let k = u32::try_from(sites.len()).unwrap();
-            let context = ExpressionEffectContext {
-                use_id: ExpressionUseId::new(RELATIONAL_USE + k),
-                region: EvaluationRegionId::new(RELATIONAL_DOMAIN + k),
-                demand: EvaluationDemand::Value,
-            };
-            domains.push(ExpressionEvaluationRegion {
-                id: context.region,
-                parent: None,
-                guard: None,
-            });
-            sites.push((node.id, context));
-        }
-    }
-    let flow = ExpressionControlFlow::try_new(
-        domains,
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let root_uses = PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap();
-    let catalog = unnest_catalog();
     let mut frozen = Vec::new();
-    for (node, context) in sites {
+    for (ordinal, (&node, source)) in sources.iter().enumerate() {
         let NodeKind::TableFunction {
             function,
             arguments,
             ..
         } = &fragment.nodes()[&node].kind
         else {
-            unreachable!()
+            panic!("actual UNNEST node")
         };
-        let selection = Arc::new(FunctionBindingSelection {
-            overload: function.overload.clone(),
-            argument_types: function.argument_types.clone(),
-            result_type: FunctionResultType::Relation(function.result_types.clone()),
-            aggregate: None,
-        });
-        let request = function
-            .argument_types
+        let unit = fragment.unit(node).unwrap();
+        let input = &fragment.nodes()[&fragment.nodes()[&node].inputs[0]]
+            .output
+            .columns;
+        // Keep the complete physical input order. Canonical value reads select
+        // their first actual publication; repeated ordinals retain full facts.
+        let ordinal_types = input
             .iter()
-            .map(|argument| match argument {
-                FunctionArgumentType::Value(value_type) => FunctionArgument::Value {
-                    value_type: value_type.clone(),
-                    constant: None,
-                },
-                FunctionArgumentType::Lambda { .. } => panic!("UNNEST takes values"),
+            .map(|value| fragment.values()[value].ty.clone())
+            .collect::<Vec<_>>();
+        let schema = Arc::new(arrow::datatypes::Schema::new(
+            ordinal_types
+                .iter()
+                .enumerate()
+                .map(|(ordinal, ty)| ty.try_to_field(format!("input_{ordinal}")).unwrap())
+                .collect::<Vec<_>>(),
+        ));
+        let mut work =
+            CompileCheckpoints::try_new(&FixtureControl, CompilePhase::LowerProgram).unwrap();
+        assert_eq!(unit.ports().len(), 1);
+        let scope = ScopeLayout::try_new(
+            schema,
+            ordinal_types.into(),
+            unit.ports()[0]
+                .values
+                .iter()
+                .map(|(value, ty)| ScopeColumn {
+                    value: *value,
+                    ordinal: u32::try_from(
+                        input.iter().position(|actual| actual == value).unwrap(),
+                    )
+                    .unwrap(),
+                    ty: ty.clone(),
+                })
+                .collect(),
+            ValueTypeStorageLifetime::pure(),
+            &mut work,
+        )
+        .unwrap();
+        let compiled = compile_expr_set_pure(
+            unit,
+            EvaluationEnvironment {
+                constants: &evaluation_pools,
+                parameters,
+            },
+            ScopeLayouts {
+                ports: &[scope],
+                all_ports: None,
+            },
+            constant_policy(),
+            &source.functions,
+            &mut work,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        let context =
+            RelationEffectContext::call(RelationCallId::new(u32::try_from(ordinal).unwrap()));
+        let mut children = ExpressionEffects::PURE_VALUE;
+        let argument_uses = arguments
+            .iter()
+            .map(|root| {
+                let root = compiled.root(*root).unwrap();
+                let invocation = &compiled.control_flow().uses()[&root.use_id];
+                children = children.join(
+                    compiled.effects()[&root.use_id]
+                        .for_use(invocation.context)
+                        .unwrap(),
+                );
+                Some(root.use_id)
             })
             .collect::<Vec<_>>();
-        let argument_uses = (0..arguments.len())
-            .map(|argument| {
-                Some(
-                    root_uses.bindings()[&ExpressionRootSite {
-                        node,
-                        role: ExpressionRootRole::TableFunctionArgument {
-                            argument: u32::try_from(argument).unwrap(),
-                        },
-                    }],
-                )
-            })
-            .collect::<Vec<_>>();
-        let token = catalog
+        let token = source
+            .functions
             .prepare_fresh(
                 CallEffectInput {
-                    context,
+                    context: context.into(),
                     argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
                         &argument_uses,
                     ),
                     function_id: &function.function_id,
                     kind: FunctionKind::Table,
-                    selected: selection.as_ref(),
+                    selected: source.selected.as_ref(),
                     request: FunctionBindingRequest {
-                        arguments: &request,
-                        logical_argument_count: request.len(),
+                        arguments: &source.arguments,
+                        logical_argument_count: source.arguments.len(),
                         expected_result_type: None,
                     },
                     environment: &[],
                     parameters,
                     decimal_overflow_policy: POLICY,
-                    proof_scope: CallProofScope::Region(context.region),
+                    proof_scope: CallProofScope::Relation(context.identity),
                 },
-                Arc::clone(&selection),
+                source.selected.clone(),
                 PureCallPreparation::Table {
-                    arguments: ScopedExpressionEffects::primitive(
-                        context,
-                        ExpressionEffects::PURE_VALUE,
-                    ),
+                    arguments: ScopedRelationalEffects::primitive(context, children),
                 },
                 &FixtureControl,
             )
             .unwrap_or_else(|error| panic!("fixture table call prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
             materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
             site: PhysicalCallSite::Table { node },
             context,
             effects: token.call_contract().effects().clone(),
             decimal_overflow_policy: POLICY,
         });
     }
-    let calls = FrozenFragmentCalls::try_new(fragment, &root_uses, frozen, &FixtureControl)
-        .unwrap_or_else(|error| panic!("frozen table calls validate: {error}"));
-    (root_uses, calls)
+    let fragment = fragment
+        .with_calls_observed(frozen, &FixtureControl)
+        .unwrap();
+    crate::exec::operators::family_fixture::constant_sources::Fragment::from_parts(
+        fragment, constants,
+    )
 }
 
 // Explicit small-fixture admission; these are test inputs, not defaults.
@@ -728,16 +696,9 @@ fn parameters(spec: &Spec) -> SemanticParameters {
 
 /// Every fragment of `plan` as a checked package with its frozen calls.
 fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
-    // The table call's own environment is empty; no parameter reaches it.
-    let parameters = SemanticParameters::try_new([]).unwrap();
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (id, fragment) in plan.fragments() {
-        let (root_uses, frozen) = freeze(fragment, &parameters);
-        uses.insert(*id, root_uses);
-        calls.insert(*id, frozen);
+    for id in plan.fragments().keys() {
         pruning.insert(
             *id,
             FrozenFragmentPruning::try_new(*id, vec![], &FixtureControl).unwrap(),
@@ -748,8 +709,6 @@ fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
         plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,
@@ -800,7 +759,14 @@ fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalPr
     let input = if sorted {
         let sort = builder.reserve_node_id().unwrap();
         let expr = builder
-            .add_expression(sort, int64(false), ExprKind::Value(key))
+            .unit(sort)
+            .unwrap()
+            .add(None, int64(false), ExprKind::Value(key))
+            .unwrap();
+        let expr = builder
+            .unit(sort)
+            .unwrap()
+            .root(expr, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .add_sort(
@@ -818,15 +784,24 @@ fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalPr
     } else {
         values_node
     };
-    let (table, _) = add_table_function(&mut builder, input, key, &lists, spec);
-    let fragment = finish(builder, table, FragmentSink::Result, 1);
+    let (table, _, source_call) = add_table_function(&mut builder, input, key, &lists, spec);
+    let actual_parameters = parameters(spec);
+    let fragment = finish(
+        builder,
+        table,
+        FragmentSink::Result,
+        1,
+        BTreeMap::from([(table, source_call)]),
+        &pools.0,
+        &actual_parameters,
+    );
     let port = result_port(&fragment, table);
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         version(),
         &fixture_sources,
     )
     .with_constant_pools(pools.0)
-    .with_semantic_parameters(parameters(spec));
+    .with_semantic_parameters(actual_parameters);
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(port).unwrap();
     let plan = plan
@@ -1052,7 +1027,6 @@ fn unnest_over_a_global_sort_keeps_the_pass_through_ordering() {
 #[test]
 fn a_guarded_list_argument_preserves_its_required_project_row_error() {
     use crate::runtime::task::{ExecutionFailureCause, OperatorFailureSite, PipelineOperation};
-    use novarocks_local_program::{ProgramExpressionRootSite, ProgramNodeExpressionRole};
     let spec = Spec {
         args: vec![Arg::Faulty(0)],
         ..Spec::unnest(false)
@@ -1077,16 +1051,11 @@ fn a_guarded_list_argument_preserves_its_required_project_row_error() {
         }),
         "{error:?}"
     );
+    assert_eq!(error.expression_node(), Some(*input));
     let ExecutionFailureCause::RequiredRow(required) = error.cause() else {
         panic!("the argument Project must preserve its required row error: {error:?}");
     };
-    assert_eq!(
-        required.root(),
-        ProgramExpressionRootSite::Node {
-            node: *input,
-            role: ProgramNodeExpressionRole::ProjectOutput { expression: 1 },
-        }
-    );
+    assert_eq!(required.root(), exprs[1].root);
     assert_eq!(required.batch_row(), 0);
     assert_eq!(required.error().selected_ordinal(), 0);
     assert_eq!(
@@ -1150,7 +1119,16 @@ fn exchanged_programs(
             },
         )
         .unwrap();
-    let source = finish(source, union, FragmentSink::Stream { edge: TO_CONSUMER }, 1);
+    let actual_parameters = parameters(spec);
+    let source = finish(
+        source,
+        union,
+        FragmentSink::Stream { edge: TO_CONSUMER },
+        1,
+        BTreeMap::new(),
+        &pools.0,
+        &actual_parameters,
+    );
 
     let mut consumer =
         crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
@@ -1169,12 +1147,16 @@ fn exchanged_programs(
             .collect::<Vec<_>>(),
         |imports| hash(&imports[..1]),
     );
-    let (table, _) = add_table_function(&mut consumer, receiver, imports[0], &imports[1..], spec);
+    let (table, _, source_call) =
+        add_table_function(&mut consumer, receiver, imports[0], &imports[1..], spec);
     let consumer = finish(
         consumer,
         table,
         FragmentSink::Result,
         u32::try_from(dop).unwrap(),
+        BTreeMap::from([(table, source_call)]),
+        &pools.0,
+        &actual_parameters,
     );
     let port = result_port(&consumer, table);
 
@@ -1183,7 +1165,7 @@ fn exchanged_programs(
         &fixture_sources,
     )
     .with_constant_pools(pools.0)
-    .with_semantic_parameters(parameters(spec));
+    .with_semantic_parameters(actual_parameters);
     plan.add_fragment(source).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(edge(
