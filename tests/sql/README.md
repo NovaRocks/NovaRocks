@@ -53,7 +53,7 @@ HMS 的 `iceberg-hms` suite 以封闭的 `hms-read-only-compatibility-v1` case �
 
 该 owner 在公共收尾中保管失败、取消和未使用的准备结果；清理首次派发前持久登记，同一次失败或 Unknown 不自动重派。远端 Spark settlement、原 host 进程组及 Server 的真实退出分别取证，未知状态保留原 intent，截止时间不续期。具体 fixture 操作见 [HMS fixture](fixtures/iceberg-hms/README.md)。
 
-`--list-suites` 列出所有注册套件，包括 explicit-only；`--list-declarations` 输出 schema 1 的 suite impact、环境输入、reuse 初始状态/范围、重项依据与 case 清单，不启动集群。`--suite all` 按 suite manifest 排除 explicit-only 和 DISABLED，构成常规 SQL 集合的原生来源。`--list-extensions` 不启动集群。默认配置不提供完整 fixture 端点，不能用旧环境补造缺项。隔离 REST 套件由 runner 启停私有 fixture，准备和测试分离，见 [fixture 操作](../../docker/iceberg-rest/README.md)。
+`--list-suites` 列出所有注册套件，包括 explicit-only；`--list-declarations` 输出 schema 1 的 suite impact、环境输入、reuse 初始状态/范围、重项依据与 case 清单，不启动集群。`--suite all` 按 suite manifest 排除 explicit-only 和 DISABLED，构成常规 SQL 集合的原生来源。`--list-extensions` 只列出 runner 指令，无需启动集群。SQL 文法扩展见 [ADR-0241](../../docs/adr/ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md)。默认配置不提供完整 fixture 端点，不能用旧环境补造缺项。隔离 REST 套件由 runner 启停私有 fixture，准备和测试分离，见 [fixture 操作](../../docker/iceberg-rest/README.md)。
 
 `iceberg`、`iceberg-compatibility`、`iceberg-rest`、`lake-publication`、`lnp-3c-runtime-cut`、`optimizer` 和 `statistics` 的 REST 数据均由本次 SQL 或外部 writer 创建。本地 MinIO 模式下，这七套明确复用原隔离 fixture，由真实 handle 绑定存储权限，保留原预算、进程退出和 fixture 清理；node-local 对象存储继续原 publication 路径，不启动 MinIO，也不改变原成功/拒绝边界。原本强制隔离的 MV suite 继续拒绝 node-local。选择使用原对象存储类型解析结果，未知、空值或冲突 alias 均拒绝。`iceberg` 与 `optimizer` 保持 Hadoop 主 catalog 类型；隔离时 Hadoop 的 catalog/test warehouse 从同一 fixture 生成的 `sql-test.toml` 投影，不能保留旧对象存储的根或猜 URI。REST、对象存储凭据和原 env-file 同步传给 NovaRocks、Spark、Trino；`lake-publication` 仍沿原 publication proxy 与物理 downstream 执行。每个 suite 单独调用 runner，隔离选择不与 `join` 等普通 suite 混跑。外部私有 publication 的端点不授予存储权限，也不会关闭 NamespaceGuard。
 
@@ -62,6 +62,20 @@ HMS 的 `iceberg-hms` suite 以封闭的 `hms-read-only-compatibility-v1` case �
 每次 FE/BE launch/restart 在 spawn 前读真实产物自报，保存原双流、实际退出和角色映射；会话绑定实际 Native process 与准确 statement/动作目标。自报的 profile 声明、binary cfg、package 局部事实及 null/unknown 分列，明确不作发布认证。缺授权、错误产物、原期限到期和实际资源/进程清理失败都保留原始失败，不能用未命中注入的正常结果代替通过。
 
 LNP-3A/LNP-3D 与 `mv-storage-contract` 保留原 SQL、`.result` 和独立文档图，旧 CALL/directive 禁止扩展。当前 whole-family wipe 必须是显式 FE launch/family 授权、一次认领、隔离串行且 MV owner 停止 admission/实际 join 后台；普通裸 CALL 不授予擦除权。唯一后续迁移责任见 [correctness map](correctness/README.md#mv-受控过渡与后续迁移)，不在本次新增恢复或擦除 API。
+
+## SQL 方言与用例作者
+
+正向用例使用 Trino SQL。NovaRocks 保留两种语法扩展 `INSERT OVERWRITE [INTO] t[@branch] [(cols)] query`
+和 `INSERT OVERWRITE PARTITIONS [INTO] t[@branch] [(cols)] query`，分别覆盖整表和本次写入涉及的分区。
+具名属性、过程参数和系统表由消费层核对。文法、AST 与消费层的职责见 [ADR-0241](../../docs/adr/ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md)。
+
+步骤内的 `;` 用于分隔 SQL。runner 分句后逐条提交。文法拒绝用例保留触发错误的原文，并声明
+`SYNTAX_ERROR,USER_ERROR`。文法已接收、能力尚未支持的构造声明 `NOT_SUPPORTED,USER_ERROR`。
+列、属性及其它业务错误按实际具名分类断言。
+
+字符串用单引号，界定标识符用双引号。关系有别名时，用该别名限定列。
+`WITH SESSION` 作用于整条根查询，也适用于被 `EXPLAIN ANALYZE` 解释的查询。例如
+`WITH SESSION pipeline_dop = 1 SELECT CAST(1 AS integer) AS "value";`。
 
 ## Trino 错误断言
 

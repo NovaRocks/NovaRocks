@@ -294,7 +294,7 @@ fn relation_grammar_cases_use_the_first_actual_table_free_analyzer_owner() {
             }
         }
     }
-    assert_eq!((capability, unknown, absent), (99, 14, 2));
+    assert_eq!((capability, unknown, absent), (103, 10, 2));
 }
 
 #[test]

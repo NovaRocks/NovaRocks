@@ -43,8 +43,8 @@ line	rule	alternative	label	clause	sql	gate
 424	relationPrimary	8	nearest	0	SELECT * FROM NEAREST ( FROM x MATCH ? )	nearest
 454	tableFunctionCall	1		1	SELECT * FROM TABLE ( x ( ? , ? ) )	unknown_table_function
 455	tableFunctionCall	1		2	SELECT * FROM TABLE ( x ( ? ) )	unknown_table_function
-456	tableFunctionCall	1		3	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) , ( x , x ) ) )	unknown_table_function
-457	tableFunctionCall	1		4	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) ) )	unknown_table_function
+456	tableFunctionCall	1		3	SELECT * FROM TABLE (generate_series(1, 2 COPARTITION (t, t), (u, u)))	table_function_argument_profile
+457	tableFunctionCall	1		4	SELECT * FROM TABLE (generate_series(1, 2 COPARTITION (t, t)))	table_function_argument_profile
 458	tableFunctionCall	1		0	SELECT * FROM TABLE ( x ( ) )	unknown_table_function
 459	tableFunctionArgument	1		1	SELECT * FROM TABLE ( x ( x => ? ) )	unknown_table_function
 460	tableFunctionArgument	1		0	SELECT * FROM TABLE ( x ( ? ) )	unknown_table_function
@@ -93,8 +93,8 @@ line	rule	alternative	label	clause	sql	gate
 2083	patternRecognition	1		g1.b1	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? )	match_recognize
 2123	tableFunctionCall	1		g1.b1.g1.b1	SELECT * FROM TABLE ( x ( ? , ? ) )	unknown_table_function
 2124	tableFunctionCall	1		g1.b1	SELECT * FROM TABLE ( x ( ? ) )	unknown_table_function
-2125	tableFunctionCall	1		g2.b1.g1.b1	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) , ( x , x ) ) )	unknown_table_function
-2126	tableFunctionCall	1		g2.b1	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) ) )	unknown_table_function
+2125	tableFunctionCall	1		g2.b1.g1.b1	SELECT * FROM TABLE (generate_series(1, 2 COPARTITION (t, t), (u, u)))	table_function_argument_profile
+2126	tableFunctionCall	1		g2.b1	SELECT * FROM TABLE (generate_series(1, 2 COPARTITION (t, t)))	table_function_argument_profile
 2127	tableFunctionArgument	1		g1.b1	SELECT * FROM TABLE ( x ( x => ? ) )	unknown_table_function
 2128	tableFunctionArgument	1		g2.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) ) )	table_function_argument_profile
 2129	tableFunctionArgument	1		g2.b2	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x ) ) )	table_function_argument_profile

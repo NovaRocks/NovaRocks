@@ -69,6 +69,8 @@ query representation。为可靠获得View query source，View command grammar�
 删除并按新DDL重建。第三方Iceberg View仍按provider提供的dialect/default namespace在访问时解析，不视为NovaRocks待迁移
 存量对象。
 
+[ADR-0241](ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md) 规定新查询定义和 Iceberg SQL representation 的持久方言。有效 SQL 原文和创建时解析上下文仍按本 ADR 保存。
+
 ## 接受的妥协（诚实记录）
 
 raw文本比canonical Display更不利于去重：语义相同但排版不同的定义会有不同bytes与content hash，也可能更早触碰durable

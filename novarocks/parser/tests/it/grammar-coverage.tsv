@@ -228,8 +228,8 @@ optional	statement	93		1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id 
 optional	statement	93		2	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
 optional	statement	93		3	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
 alternative	statement	93	merge	0	MERGE INTO t USING s ON TRUE WHEN MATCHED THEN DELETE	supported	accept	reviewed-grammar-path	none
-optional	rootQuery	1		1	WITH FUNCTION x ( ) RETURNS x RETURN 1 , FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	supported	accept	reviewed-grammar-path	none
-optional	rootQuery	1		2	WITH FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	supported	accept	reviewed-grammar-path	none
+optional	rootQuery	1		1	WITH FUNCTION x ( ) RETURNS x RETURN 1 , FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	rootQuery	1		2	WITH FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	rootQuery	1		0	TABLE x	supported	accept	reviewed-grammar-path	none
 optional	rootQueryWithSession	1		1	WITH SESSION x = ? , x = ? TABLE x	supported	accept	reviewed-grammar-path	none
 optional	rootQueryWithSession	1		2	WITH SESSION x = ? TABLE x	supported	accept	reviewed-grammar-path	none
@@ -269,10 +269,10 @@ alternative	rowCount	1		0	TABLE x LIMIT 1	supported	accept	reviewed-grammar-path
 alternative	rowCount	2		0	TABLE x LIMIT ?	supported	accept	reviewed-grammar-path	none
 alternative	queryTerm	1	queryTermDefault	0	TABLE x	supported	accept	reviewed-grammar-path	none
 optional	queryTerm	2		1	TABLE x INTERSECT ALL TABLE x	supported	accept	reviewed-grammar-path	none
-optional	queryTerm	2		2	TABLE x INTERSECT CORRESPONDING TABLE x	supported	accept	reviewed-grammar-path	none
+optional	queryTerm	2		2	TABLE x INTERSECT CORRESPONDING TABLE x	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	queryTerm	2	setOperation	0	TABLE x INTERSECT TABLE x	supported	accept	reviewed-grammar-path	none
 optional	queryTerm	3		1	TABLE x UNION ALL TABLE x	supported	accept	reviewed-grammar-path	none
-optional	queryTerm	3		2	TABLE x UNION CORRESPONDING TABLE x	supported	accept	reviewed-grammar-path	none
+optional	queryTerm	3		2	TABLE x UNION CORRESPONDING TABLE x	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	queryTerm	3	setOperation	0	TABLE x UNION TABLE x	supported	accept	reviewed-grammar-path	none
 alternative	queryPrimary	1	queryPrimaryDefault	0	SELECT *	supported	accept	reviewed-grammar-path	none
 alternative	queryPrimary	2	table	0	TABLE x	supported	accept	reviewed-grammar-path	none
@@ -342,7 +342,7 @@ alternative	joinType	4		0	SELECT * FROM x FULL JOIN x ON ?	supported	accept	revi
 alternative	joinCriteria	1		0	SELECT * FROM x JOIN x ON ?	supported	accept	reviewed-grammar-path	none
 optional	joinCriteria	2		1	SELECT * FROM x JOIN x USING ( x , x )	supported	accept	reviewed-grammar-path	none
 alternative	joinCriteria	2		0	SELECT * FROM x JOIN x USING ( x )	supported	accept	reviewed-grammar-path	none
-optional	sampledRelation	1		1	SELECT * FROM x TABLESAMPLE SYSTEM ( ? )	supported	accept	reviewed-grammar-path	none
+optional	sampledRelation	1		1	SELECT * FROM x TABLESAMPLE SYSTEM ( ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	sampledRelation	1		0	SELECT * FROM x	supported	accept	reviewed-grammar-path	none
 optional	pivot	1		1	SELECT * FROM x PIVOT ( ? , ? FOR x IN ( ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	pivot	1		2	SELECT * FROM x PIVOT ( ? FOR x IN ( ? , ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
@@ -351,7 +351,7 @@ optional	pivot	1		4	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) ) AS x	parsed-not-s
 optional	pivot	1		5	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) ) x ( x )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	pivot	1		6	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) ) x	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	pivot	1		7	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	pivot	1		0	SELECT * FROM x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	pivot	1		0	SELECT * FROM x	supported	accept	reviewed-grammar-path	none
 alternative	pivotAggregation	1		0	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	pivotColumns	1		0	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	pivotColumns	2		1	SELECT * FROM x PIVOT ( ? FOR ( x , x ) IN ( ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
@@ -360,8 +360,8 @@ optional	pivotValueGroup	1		1	SELECT * FROM x PIVOT ( ? FOR x IN ( ( ? , ? ) AS 
 optional	pivotValueGroup	1		2	SELECT * FROM x PIVOT ( ? FOR x IN ( ( ? , ? ) x ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	pivotValueGroup	1		0	SELECT * FROM x PIVOT ( ? FOR x IN ( ( ? , ? ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	pivotValueGroup	2		0	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	sampleType	1		0	SELECT * FROM x TABLESAMPLE BERNOULLI ( ? )	supported	accept	reviewed-grammar-path	none
-alternative	sampleType	2		0	SELECT * FROM x TABLESAMPLE SYSTEM ( ? )	supported	accept	reviewed-grammar-path	none
+alternative	sampleType	1		0	SELECT * FROM x TABLESAMPLE BERNOULLI ( ? )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	sampleType	2		0	SELECT * FROM x TABLESAMPLE SYSTEM ( ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	trimsSpecification	1		0	VALUES TRIM ( LEADING FROM ? )	supported	accept	reviewed-grammar-path	none
 alternative	trimsSpecification	2		0	VALUES TRIM ( TRAILING FROM ? )	supported	accept	reviewed-grammar-path	none
 alternative	trimsSpecification	3		0	VALUES TRIM ( BOTH FROM ? )	supported	accept	reviewed-grammar-path	none
@@ -385,7 +385,7 @@ optional	patternRecognition	1		12	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ 
 optional	patternRecognition	1		13	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? ) x ( x )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	patternRecognition	1		14	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? ) x	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	patternRecognition	1		15	SELECT * FROM x MATCH_RECOGNIZE ( PATTERN ( $ ) DEFINE x AS ? )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	patternRecognition	1		0	SELECT * FROM x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	patternRecognition	1		0	SELECT * FROM x	supported	accept	reviewed-grammar-path	none
 alternative	measureDefinition	1		0	VALUES x OVER ( MEASURES ? AS x ROWS CURRENT ROW )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	rowsPerMatch	1		0	SELECT * FROM x MATCH_RECOGNIZE ( ONE ROW PER MATCH PATTERN ( $ ) DEFINE x AS ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	rowsPerMatch	2		1	SELECT * FROM x MATCH_RECOGNIZE ( ALL ROWS PER MATCH OMIT EMPTY MATCHES PATTERN ( $ ) DEFINE x AS ? )	parsed-not-supported	accept	reviewed-grammar-path	none
@@ -414,13 +414,13 @@ optional	relationPrimary	3		1	SELECT * FROM UNNEST ( ? , ? )	supported	accept	re
 optional	relationPrimary	3		2	SELECT * FROM UNNEST ( ? ) WITH ORDINALITY	supported	accept	reviewed-grammar-path	none
 alternative	relationPrimary	3	unnest	0	SELECT * FROM UNNEST ( ? )	supported	accept	reviewed-grammar-path	none
 alternative	relationPrimary	4	lateral	0	SELECT * FROM LATERAL ( TABLE x )	supported	accept	reviewed-grammar-path	none
-alternative	relationPrimary	5	tableFunctionInvocation	0	SELECT * FROM TABLE ( x ( ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	relationPrimary	5	tableFunctionInvocation	0	SELECT * FROM TABLE ( x ( ) )	supported	accept	reviewed-grammar-path	none
 alternative	relationPrimary	6	parenthesizedRelation	0	SELECT * FROM ( x )	supported	accept	reviewed-grammar-path	none
-optional	relationPrimary	7		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x , x x ) )	supported	accept	reviewed-grammar-path	none
-optional	relationPrimary	7		2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x ) )	supported	accept	reviewed-grammar-path	none
-optional	relationPrimary	7		3	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) EMPTY ON ERROR )	supported	accept	reviewed-grammar-path	none
+optional	relationPrimary	7		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x , x x ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	relationPrimary	7		2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	relationPrimary	7		3	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) EMPTY ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	relationPrimary	7	jsonTable	0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	relationPrimary	8		1	SELECT * FROM NEAREST ( FROM x WHERE ? MATCH ? )	supported	accept	reviewed-grammar-path	none
+optional	relationPrimary	8		1	SELECT * FROM NEAREST ( FROM x WHERE ? MATCH ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	relationPrimary	8	nearest	0	SELECT * FROM NEAREST ( FROM x MATCH ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	jsonTableColumn	1	ordinalityColumn	0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x FOR ORDINALITY ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	jsonTableColumn	2		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x PATH 'x' ) )	parsed-not-supported	accept	reviewed-grammar-path	none
@@ -451,13 +451,13 @@ optional	jsonTableDefaultPlan	1		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( 
 alternative	jsonTableDefaultPlan	1		0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( INNER ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	jsonTableDefaultPlan	2		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS , INNER ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	jsonTableDefaultPlan	2		0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	tableFunctionCall	1		1	SELECT * FROM TABLE ( x ( ? , ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	tableFunctionCall	1		2	SELECT * FROM TABLE ( x ( ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	tableFunctionCall	1		3	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) , ( x , x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	tableFunctionCall	1		4	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	tableFunctionCall	1		0	SELECT * FROM TABLE ( x ( ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	tableFunctionArgument	1		1	SELECT * FROM TABLE ( x ( x => ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	tableFunctionArgument	1		0	SELECT * FROM TABLE ( x ( ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	tableFunctionCall	1		1	SELECT * FROM TABLE ( x ( ? , ? ) )	supported	accept	reviewed-grammar-path	none
+optional	tableFunctionCall	1		2	SELECT * FROM TABLE ( x ( ? ) )	supported	accept	reviewed-grammar-path	none
+optional	tableFunctionCall	1		3	SELECT * FROM TABLE (generate_series(1, 2 COPARTITION (t, t), (u, u)))	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	tableFunctionCall	1		4	SELECT * FROM TABLE (generate_series(1, 2 COPARTITION (t, t)))	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	tableFunctionCall	1		0	SELECT * FROM TABLE ( x ( ) )	supported	accept	reviewed-grammar-path	none
+optional	tableFunctionArgument	1		1	SELECT * FROM TABLE ( x ( x => ? ) )	supported	accept	reviewed-grammar-path	none
+alternative	tableFunctionArgument	1		0	SELECT * FROM TABLE ( x ( ? ) )	supported	accept	reviewed-grammar-path	none
 optional	tableArgument	1		1	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ( a , b ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	tableArgument	1		2	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ( ? ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	tableArgument	1		3	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
@@ -510,8 +510,8 @@ optional	predicate	10		2	VALUES ? MATCH FULL ( TABLE x )	supported	accept	review
 alternative	predicate	10	match	0	VALUES ? MATCH ( TABLE x )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	predicate	11	overlaps	0	VALUES ? OVERLAPS ?	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	valueExpression	1	valueExpressionDefault	0	VALUES ?	supported	accept	reviewed-grammar-path	none
-alternative	valueExpression	2	atTimeZone	0	VALUES ? AT TIME ZONE 'x'	supported	accept	reviewed-grammar-path	none
-alternative	valueExpression	3	atLocal	0	VALUES ? AT LOCAL	supported	accept	reviewed-grammar-path	none
+alternative	valueExpression	2	atTimeZone	0	VALUES ? AT TIME ZONE 'x'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	valueExpression	3	atLocal	0	VALUES ? AT LOCAL	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	valueExpression	4	arithmeticUnary	0	VALUES + ?	supported	accept	reviewed-grammar-path	none
 alternative	valueExpression	5	arithmeticBinary	0	VALUES ? % ?	supported	accept	reviewed-grammar-path	none
 alternative	valueExpression	6	arithmeticBinary	0	VALUES ? + ?	supported	accept	reviewed-grammar-path	none
@@ -528,7 +528,7 @@ optional	primaryExpression	6		3	VALUES LISTAGG ( ? ON OVERFLOW ERROR ) WITHIN GR
 optional	primaryExpression	6		4	VALUES LISTAGG ( ? ) WITHIN GROUP ( ORDER BY ? ) FILTER ( WHERE ? )	supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	6		5	VALUES LISTAGG ( ? ) WITHIN GROUP ( ORDER BY ? ) OVER x	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	6	listagg	0	VALUES LISTAGG ( ? ) WITHIN GROUP ( ORDER BY ? )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	7	jsonConstructor	0	VALUES JSON ( ? )	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	7	jsonConstructor	0	VALUES JSON ( ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	8		1	VALUES FINAL x ( * )	supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	8		2	VALUES x ( x . * )	supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	8		3	VALUES x ( * ) FILTER ( WHERE ? )	supported	accept	reviewed-grammar-path	none
@@ -588,14 +588,14 @@ alternative	primaryExpression	35	currentCatalog	0	VALUES CURRENT_CATALOG	support
 alternative	primaryExpression	36	currentSchema	0	VALUES CURRENT_SCHEMA	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	37	currentPath	0	VALUES CURRENT_PATH	supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	38		1	VALUES TRIM ( BOTH FROM ? )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	38		2	VALUES TRIM ( ? FROM ? )	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	38		2	VALUES TRIM ( ? FROM ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	38		3	VALUES TRIM ( BOTH FROM ? )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	38	trim	0	VALUES TRIM ( ? )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	39	trim	0	VALUES TRIM ( ? , ? )	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	39	trim	0	VALUES TRIM ( ? , ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	40		1	VALUES SUBSTRING ( ? FROM ? FOR ? )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	40	substring	0	VALUES SUBSTRING ( ? FROM ? )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	41		1	VALUES OVERLAY ( ? PLACING ? FROM ? FOR ? )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	41	overlay	0	VALUES OVERLAY ( ? PLACING ? FROM ? )	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	41		1	VALUES OVERLAY ( ? PLACING ? FROM ? FOR ? )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	41	overlay	0	VALUES OVERLAY ( ? PLACING ? FROM ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	42		1	VALUES NORMALIZE ( ? , NFC )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	42	normalize	0	VALUES NORMALIZE ( ? )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	43	extract	0	VALUES EXTRACT ( YEAR FROM ? )	supported	accept	reviewed-grammar-path	none
@@ -604,39 +604,39 @@ alternative	primaryExpression	45	intervalValueExpression	0	VALUES ( ? - ? ) DAY	
 optional	primaryExpression	46		1	VALUES GROUPING ( x , x )	supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	46		2	VALUES GROUPING ( x )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	46	groupingOperation	0	VALUES GROUPING ( x )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	47		1	VALUES JSON_EXISTS ( ? , 'x' TRUE ON ERROR )	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	47		1	VALUES JSON_EXISTS ( ? , 'x' TRUE ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	47	jsonExists	0	VALUES JSON_EXISTS ( ? , 'x' )	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	48		1	VALUES JSON_VALUE ( ? , 'x' RETURNING x )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	48		2	VALUES JSON_VALUE ( ? , 'x' NULL ON EMPTY )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	48		3	VALUES JSON_VALUE ( ? , 'x' NULL ON ERROR )	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	48		1	VALUES JSON_VALUE ( ? , 'x' RETURNING x )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	48		2	VALUES JSON_VALUE ( ? , 'x' NULL ON EMPTY )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	48		3	VALUES JSON_VALUE ( ? , 'x' NULL ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	48	jsonValue	0	VALUES JSON_VALUE ( ? , 'x' )	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	49		1	VALUES JSON_QUERY ( ? , 'x' RETURNING x FORMAT JSON )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	49		2	VALUES JSON_QUERY ( ? , 'x' RETURNING x )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	49		3	VALUES JSON_QUERY ( ? , 'x' WITH WRAPPER )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	49		4	VALUES JSON_QUERY ( ? , 'x' KEEP QUOTES ON SCALAR STRING )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	49		5	VALUES JSON_QUERY ( ? , 'x' KEEP QUOTES )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	49		6	VALUES JSON_QUERY ( ? , 'x' NULL ON EMPTY )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	49		7	VALUES JSON_QUERY ( ? , 'x' NULL ON ERROR )	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	49		1	VALUES JSON_QUERY ( ? , 'x' RETURNING x FORMAT JSON )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	49		2	VALUES JSON_QUERY ( ? , 'x' RETURNING x )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	49		3	VALUES JSON_QUERY ( ? , 'x' WITH WRAPPER )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	49		4	VALUES JSON_QUERY ( ? , 'x' KEEP QUOTES ON SCALAR STRING )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	49		5	VALUES JSON_QUERY ( ? , 'x' KEEP QUOTES )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	49		6	VALUES JSON_QUERY ( ? , 'x' NULL ON EMPTY )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	49		7	VALUES JSON_QUERY ( ? , 'x' NULL ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	49	jsonQuery	0	VALUES JSON_QUERY ( ? , 'x' )	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	50		1	VALUES JSON_SERIALIZE ( ? RETURNING x FORMAT JSON )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	50		2	VALUES JSON_SERIALIZE ( ? RETURNING x )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	50		3	VALUES JSON_SERIALIZE ( ? NULL ON ERROR )	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	50		1	VALUES JSON_SERIALIZE ( ? RETURNING x FORMAT JSON )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	50		2	VALUES JSON_SERIALIZE ( ? RETURNING x )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	50		3	VALUES JSON_SERIALIZE ( ? NULL ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	50	jsonSerialize	0	VALUES JSON_SERIALIZE ( ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	51		1	VALUES JSON_OBJECT ( ? : ? , ? : ? )	supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	51		2	VALUES JSON_OBJECT ( ? : ? NULL ON NULL )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	51		3	VALUES JSON_OBJECT ( ? : ? WITH UNIQUE KEYS )	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	51		3	VALUES JSON_OBJECT ( ? : ? WITH UNIQUE KEYS )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	51		4	VALUES JSON_OBJECT ( ? : ? WITHOUT UNIQUE KEYS )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	51		5	VALUES JSON_OBJECT ( ? : ? WITH UNIQUE )	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	51		5	VALUES JSON_OBJECT ( ? : ? WITH UNIQUE )	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	primaryExpression	51		6	VALUES JSON_OBJECT ( ? : ? )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	51		7	VALUES JSON_OBJECT ( RETURNING x FORMAT JSON )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	51		8	VALUES JSON_OBJECT ( RETURNING x )	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	51		7	VALUES JSON_OBJECT ( RETURNING x FORMAT JSON )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	51		8	VALUES JSON_OBJECT ( RETURNING x )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	51	jsonObject	0	VALUES JSON_OBJECT ( )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	52		1	VALUES JSON_ARRAY ( ? , ? )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	52		2	VALUES JSON_ARRAY ( ? NULL ON NULL )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	52		3	VALUES JSON_ARRAY ( ? )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	52		4	VALUES JSON_ARRAY ( RETURNING x FORMAT JSON )	supported	accept	reviewed-grammar-path	none
-optional	primaryExpression	52		5	VALUES JSON_ARRAY ( RETURNING x )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	52	jsonArray	0	VALUES JSON_ARRAY ( )	supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	52		1	VALUES JSON_ARRAY ( ? , ? )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	52		2	VALUES JSON_ARRAY ( ? NULL ON NULL )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	52		3	VALUES JSON_ARRAY ( ? )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	52		4	VALUES JSON_ARRAY ( RETURNING x FORMAT JSON )	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	primaryExpression	52		5	VALUES JSON_ARRAY ( RETURNING x )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	52	jsonArray	0	VALUES JSON_ARRAY ( )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	literal	1	intervalLiteral	0	VALUES INTERVAL 'x' DAY	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	literal	2	typeConstructor	0	VALUES custom_type 'x'	supported	accept	reviewed-grammar-path	none
 alternative	literal	3	typeConstructor	0	VALUES DOUBLE PRECISION 'x'	supported	accept	reviewed-grammar-path	none
@@ -683,8 +683,8 @@ alternative	nullTreatment	2		0	VALUES x ( ) RESPECT NULLS OVER x	supported	accep
 alternative	string	1	basicStringLiteral	0	VALUES 'x'	supported	accept	reviewed-grammar-path	none
 optional	string	2		1	VALUES U&'\0041' UESCAPE 'x'	supported	accept	reviewed-grammar-path	none
 alternative	string	2	unicodeStringLiteral	0	VALUES U&'\0041'	supported	accept	reviewed-grammar-path	none
-alternative	timeZoneSpecifier	1	timeZoneInterval	0	VALUES ? AT TIME ZONE INTERVAL 'x' DAY	supported	accept	reviewed-grammar-path	none
-alternative	timeZoneSpecifier	2	timeZoneString	0	VALUES ? AT TIME ZONE 'x'	supported	accept	reviewed-grammar-path	none
+alternative	timeZoneSpecifier	1	timeZoneInterval	0	VALUES ? AT TIME ZONE INTERVAL 'x' DAY	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	timeZoneSpecifier	2	timeZoneString	0	VALUES ? AT TIME ZONE 'x'	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	comparisonOperator	1		0	VALUES ? = ?	supported	accept	reviewed-grammar-path	none
 alternative	comparisonOperator	2		0	VALUES ? <> ?	supported	accept	reviewed-grammar-path	none
 alternative	comparisonOperator	3		0	VALUES ? < ?	supported	accept	reviewed-grammar-path	none
@@ -818,50 +818,50 @@ alternative	pathElement	1	qualifiedArgument	0	SET PATH lake.s	parsed-not-support
 alternative	pathElement	2	unqualifiedArgument	0	SET PATH s	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	pathSpecification	1		1	SET PATH lake.s, t	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	pathSpecification	1		0	SET PATH lake.s, t	parsed-not-supported	accept	reviewed-grammar-path	none
-optional	functionSpecification	1		1	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-alternative	functionSpecification	1		0	@file:coverage-sql/routine-return.sql	supported	accept	reviewed-grammar-path	none
-alternative	functionDefinition	1		0	@file:coverage-sql/routine-external.sql	supported	accept	reviewed-grammar-path	none
-optional	functionDeclaration	1		1	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
-optional	functionDeclaration	1		2	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
-alternative	functionDeclaration	1		0	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
-optional	parameterDeclaration	1		1	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
-alternative	parameterDeclaration	1		0	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
-alternative	returnsClause	1		0	@file:coverage-sql/routine-return.sql	supported	accept	reviewed-grammar-path	none
-alternative	routineCharacteristic	1	languageCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-optional	routineCharacteristic	2		1	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-alternative	routineCharacteristic	2	deterministicCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-alternative	routineCharacteristic	3	returnsNullOnNullInputCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-alternative	routineCharacteristic	4	calledOnNullInputCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-alternative	routineCharacteristic	5	securityCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-alternative	routineCharacteristic	6	commentCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-alternative	routineCharacteristic	7	propertiesCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	1	returnStatement	0	@file:coverage-sql/routine-return.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	2	assignmentStatement	0	@file:coverage-sql/routine-assignment.sql	supported	accept	reviewed-grammar-path	none
-optional	controlStatement	3		1	@file:coverage-sql/routine-simple-case.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	3	simpleCaseStatement	0	@file:coverage-sql/routine-simple-case.sql	supported	accept	reviewed-grammar-path	none
-optional	controlStatement	4		1	@file:coverage-sql/routine-searched-case.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	4	searchedCaseStatement	0	@file:coverage-sql/routine-searched-case.sql	supported	accept	reviewed-grammar-path	none
-optional	controlStatement	5		1	@file:coverage-sql/routine-if.sql	supported	accept	reviewed-grammar-path	none
-optional	controlStatement	5		2	@file:coverage-sql/routine-if.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	5	ifStatement	0	@file:coverage-sql/routine-if.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	6	iterateStatement	0	@file:coverage-sql/routine-loop.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	7	leaveStatement	0	@file:coverage-sql/routine-loop.sql	supported	accept	reviewed-grammar-path	none
-optional	controlStatement	8		1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
-optional	controlStatement	8		2	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	8	compoundStatement	0	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
-optional	controlStatement	9		1	@file:coverage-sql/routine-loop.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	9	loopStatement	0	@file:coverage-sql/routine-loop.sql	supported	accept	reviewed-grammar-path	none
-optional	controlStatement	10		1	@file:coverage-sql/routine-while.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	10	whileStatement	0	@file:coverage-sql/routine-while.sql	supported	accept	reviewed-grammar-path	none
-optional	controlStatement	11		1	@file:coverage-sql/routine-repeat.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	11	repeatStatement	0	@file:coverage-sql/routine-repeat.sql	supported	accept	reviewed-grammar-path	none
-alternative	caseStatementWhenClause	1		0	@file:coverage-sql/routine-simple-case.sql	supported	accept	reviewed-grammar-path	none
-alternative	elseIfClause	1		0	@file:coverage-sql/routine-if.sql	supported	accept	reviewed-grammar-path	none
-alternative	elseClause	1		0	@file:coverage-sql/routine-if.sql	supported	accept	reviewed-grammar-path	none
-optional	variableDeclaration	1		1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
-optional	variableDeclaration	1		2	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
-alternative	variableDeclaration	1		0	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
-alternative	sqlStatementList	1		0	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
+optional	functionSpecification	1		1	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	functionSpecification	1		0	@file:coverage-sql/routine-return.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	functionDefinition	1		0	@file:coverage-sql/routine-external.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	functionDeclaration	1		1	@file:coverage-sql/routine-parameters.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	functionDeclaration	1		2	@file:coverage-sql/routine-parameters.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	functionDeclaration	1		0	@file:coverage-sql/routine-parameters.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	parameterDeclaration	1		1	@file:coverage-sql/routine-parameters.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	parameterDeclaration	1		0	@file:coverage-sql/routine-parameters.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	returnsClause	1		0	@file:coverage-sql/routine-return.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	1	languageCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	routineCharacteristic	2		1	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	2	deterministicCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	3	returnsNullOnNullInputCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	4	calledOnNullInputCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	5	securityCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	6	commentCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	7	propertiesCharacteristic	0	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	1	returnStatement	0	@file:coverage-sql/routine-return.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	2	assignmentStatement	0	@file:coverage-sql/routine-assignment.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	controlStatement	3		1	@file:coverage-sql/routine-simple-case.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	3	simpleCaseStatement	0	@file:coverage-sql/routine-simple-case.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	controlStatement	4		1	@file:coverage-sql/routine-searched-case.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	4	searchedCaseStatement	0	@file:coverage-sql/routine-searched-case.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	controlStatement	5		1	@file:coverage-sql/routine-if.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	controlStatement	5		2	@file:coverage-sql/routine-if.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	5	ifStatement	0	@file:coverage-sql/routine-if.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	6	iterateStatement	0	@file:coverage-sql/routine-loop.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	7	leaveStatement	0	@file:coverage-sql/routine-loop.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	controlStatement	8		1	@file:coverage-sql/routine-declarations.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	controlStatement	8		2	@file:coverage-sql/routine-declarations.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	8	compoundStatement	0	@file:coverage-sql/routine-declarations.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	controlStatement	9		1	@file:coverage-sql/routine-loop.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	9	loopStatement	0	@file:coverage-sql/routine-loop.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	controlStatement	10		1	@file:coverage-sql/routine-while.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	10	whileStatement	0	@file:coverage-sql/routine-while.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	controlStatement	11		1	@file:coverage-sql/routine-repeat.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	11	repeatStatement	0	@file:coverage-sql/routine-repeat.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	caseStatementWhenClause	1		0	@file:coverage-sql/routine-simple-case.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	elseIfClause	1		0	@file:coverage-sql/routine-if.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	elseClause	1		0	@file:coverage-sql/routine-if.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	variableDeclaration	1		1	@file:coverage-sql/routine-declarations.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	variableDeclaration	1		2	@file:coverage-sql/routine-declarations.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	variableDeclaration	1		0	@file:coverage-sql/routine-declarations.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	sqlStatementList	1		0	@file:coverage-sql/routine-declarations.sql	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	privilege	1		0	DENY CREATE ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	privilege	2		0	DENY SELECT ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	privilege	3		0	DENY DELETE ON TABLE t TO USER u	parsed-not-supported	accept	reviewed-grammar-path	none
@@ -1997,8 +1997,8 @@ alternative	statement	92		g2.b1	UPDATE lake.ns.t SET id = 1, label = 'x'	support
 alternative	statement	92		g3.b1	UPDATE lake.ns.t SET id = 1 WHERE id = 2	supported	accept	reviewed-grammar-path	none
 alternative	statement	93		g1.b1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
 alternative	statement	93		g2.b1	MERGE INTO c.s.dst@dev AS d USING c.s.src AS s ON d.id = s.id WHEN MATCHED AND s.id > 0 THEN DELETE	supported	accept	reviewed-grammar-path	none
-alternative	rootQuery	1		g1.b1.g1.b1	WITH FUNCTION x ( ) RETURNS x RETURN 1 , FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	supported	accept	reviewed-grammar-path	none
-alternative	rootQuery	1		g1.b1	WITH FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	supported	accept	reviewed-grammar-path	none
+alternative	rootQuery	1		g1.b1.g1.b1	WITH FUNCTION x ( ) RETURNS x RETURN 1 , FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	rootQuery	1		g1.b1	WITH FUNCTION x ( ) RETURNS x RETURN 1 TABLE x	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	rootQueryWithSession	1		g1.b1.g1.b1	WITH SESSION x = ? , x = ? TABLE x	supported	accept	reviewed-grammar-path	none
 alternative	rootQueryWithSession	1		g1.b1	WITH SESSION x = ? TABLE x	supported	accept	reviewed-grammar-path	none
 alternative	with	1		g1.b1	WITH x AS ( TABLE x ) , x AS ( TABLE x ) TABLE x	supported	accept	reviewed-grammar-path	none
@@ -2058,9 +2058,9 @@ alternative	selectItem	2		g1.b1	SELECT ? . * AS ( x )	supported	accept	reviewed-
 alternative	aliasedExpression	1		g1.b1	SELECT ? x	supported	accept	reviewed-grammar-path	none
 alternative	relation	1		g1.b1	SELECT * FROM x CROSS JOIN x	supported	accept	reviewed-grammar-path	none
 alternative	relation	1		g1.b2	SELECT * FROM x JOIN x ON ?	supported	accept	reviewed-grammar-path	none
-alternative	relation	1		g1.b3	SELECT * FROM x NATURAL JOIN x	supported	accept	reviewed-grammar-path	none
+alternative	relation	1		g1.b3	SELECT * FROM x NATURAL JOIN x	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	joinCriteria	2		g1.b1	SELECT * FROM x JOIN x USING ( x , x )	supported	accept	reviewed-grammar-path	none
-alternative	sampledRelation	1		g1.b1	SELECT * FROM x TABLESAMPLE SYSTEM ( ? )	supported	accept	reviewed-grammar-path	none
+alternative	sampledRelation	1		g1.b1	SELECT * FROM x TABLESAMPLE SYSTEM ( ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	pivot	1		g1.b1.g1.b1	SELECT * FROM x PIVOT ( ? , ? FOR x IN ( ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	pivot	1		g1.b1.g2.b1	SELECT * FROM x PIVOT ( ? FOR x IN ( ? , ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	pivot	1		g1.b1.g3.b1	SELECT * FROM x PIVOT ( ? FOR x IN ( ? ) GROUP BY ? )	parsed-not-supported	accept	reviewed-grammar-path	none
@@ -2086,13 +2086,13 @@ alternative	aliasedRelation	1		g1.b1	SELECT * FROM x x	supported	accept	reviewed
 alternative	columnAliases	1		g1.b1	SELECT ? . * AS ( x , x )	supported	accept	reviewed-grammar-path	none
 alternative	relationPrimary	3		g1.b1	SELECT * FROM UNNEST ( ? , ? )	supported	accept	reviewed-grammar-path	none
 alternative	relationPrimary	3		g2.b1	SELECT * FROM UNNEST ( ? ) WITH ORDINALITY	supported	accept	reviewed-grammar-path	none
-alternative	relationPrimary	7		g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x , x x ) )	supported	accept	reviewed-grammar-path	none
-alternative	relationPrimary	7		g2.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x ) )	supported	accept	reviewed-grammar-path	none
-alternative	relationPrimary	7		g2.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS ) )	supported	accept	reviewed-grammar-path	none
-alternative	relationPrimary	7		g3.b1.g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) ERROR ON ERROR )	supported	accept	reviewed-grammar-path	none
-alternative	relationPrimary	7		g3.b1.g1.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) EMPTY ON ERROR )	supported	accept	reviewed-grammar-path	none
-alternative	relationPrimary	7		g3.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) EMPTY ON ERROR )	supported	accept	reviewed-grammar-path	none
-alternative	relationPrimary	8		g1.b1	SELECT * FROM NEAREST ( FROM x WHERE ? MATCH ? )	supported	accept	reviewed-grammar-path	none
+alternative	relationPrimary	7		g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x , x x ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	relationPrimary	7		g2.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	relationPrimary	7		g2.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	relationPrimary	7		g3.b1.g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) ERROR ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	relationPrimary	7		g3.b1.g1.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) EMPTY ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	relationPrimary	7		g3.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) EMPTY ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	relationPrimary	8		g1.b1	SELECT * FROM NEAREST ( FROM x WHERE ? MATCH ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	jsonTableColumn	2		g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x PATH 'x' ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	jsonTableColumn	2		g2.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x NULL ON EMPTY ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	jsonTableColumn	2		g3.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x NULL ON ERROR ) )	parsed-not-supported	accept	reviewed-grammar-path	none
@@ -2120,14 +2120,14 @@ alternative	jsonTableDefaultPlan	2		g1.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COL
 alternative	jsonTableDefaultPlan	2		g2.b1.g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS , OUTER ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	jsonTableDefaultPlan	2		g2.b1.g1.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS , INNER ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	jsonTableDefaultPlan	2		g2.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS , INNER ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	tableFunctionCall	1		g1.b1.g1.b1	SELECT * FROM TABLE ( x ( ? , ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	tableFunctionCall	1		g1.b1	SELECT * FROM TABLE ( x ( ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	tableFunctionCall	1		g2.b1.g1.b1	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) , ( x , x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	tableFunctionCall	1		g2.b1	SELECT * FROM TABLE ( x ( COPARTITION ( x , x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	tableFunctionArgument	1		g1.b1	SELECT * FROM TABLE ( x ( x => ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	tableFunctionCall	1		g1.b1.g1.b1	SELECT * FROM TABLE ( x ( ? , ? ) )	supported	accept	reviewed-grammar-path	none
+alternative	tableFunctionCall	1		g1.b1	SELECT * FROM TABLE ( x ( ? ) )	supported	accept	reviewed-grammar-path	none
+alternative	tableFunctionCall	1		g2.b1.g1.b1	SELECT * FROM TABLE (generate_series(1, 2 COPARTITION (t, t), (u, u)))	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	tableFunctionCall	1		g2.b1	SELECT * FROM TABLE (generate_series(1, 2 COPARTITION (t, t)))	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	tableFunctionArgument	1		g1.b1	SELECT * FROM TABLE ( x ( x => ? ) )	supported	accept	reviewed-grammar-path	none
 alternative	tableFunctionArgument	1		g2.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	tableFunctionArgument	1		g2.b2	SELECT * FROM TABLE ( x ( DESCRIPTOR ( x ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	tableFunctionArgument	1		g2.b3	SELECT * FROM TABLE ( x ( ? ) )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	tableFunctionArgument	1		g2.b3	SELECT * FROM TABLE ( x ( ? ) )	supported	accept	reviewed-grammar-path	none
 alternative	tableArgument	1		g1.b1.g1.b1.g1.b1.g1.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ( a , b ) ) )	parsed-not-supported	accept	reviewed-grammar-path	upstream-formatter-roundtrip
 alternative	tableArgument	1		g1.b1.g1.b1.g1.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ( ? ) ) )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	tableArgument	1		g1.b1.g1.b1	SELECT * FROM TABLE ( x ( TABLE ( x ) PARTITION BY ( ) ) )	parsed-not-supported	accept	reviewed-grammar-path	upstream-formatter-roundtrip
@@ -2187,40 +2187,40 @@ alternative	primaryExpression	32		g1.b1	VALUES LOCALTIME ( 1 )	supported	accept	
 alternative	primaryExpression	33		g1.b1	VALUES LOCALTIMESTAMP ( 1 )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	38		g1.b1	VALUES TRIM ( BOTH FROM ? )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	40		g1.b1	VALUES SUBSTRING ( ? FROM ? FOR ? )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	41		g1.b1	VALUES OVERLAY ( ? PLACING ? FROM ? FOR ? )	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	41		g1.b1	VALUES OVERLAY ( ? PLACING ? FROM ? FOR ? )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	42		g1.b1	VALUES NORMALIZE ( ? , NFC )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	46		g1.b1.g1.b1	VALUES GROUPING ( x , x )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	46		g1.b1	VALUES GROUPING ( x )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	47		g1.b1	VALUES JSON_EXISTS ( ? , 'x' TRUE ON ERROR )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	48		g1.b1	VALUES JSON_VALUE ( ? , 'x' RETURNING x )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	48		g2.b1	VALUES JSON_VALUE ( ? , 'x' NULL ON EMPTY )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	48		g3.b1	VALUES JSON_VALUE ( ? , 'x' NULL ON ERROR )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	49		g1.b1.g1.b1	VALUES JSON_QUERY ( ? , 'x' RETURNING x FORMAT JSON )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	49		g1.b1	VALUES JSON_QUERY ( ? , 'x' RETURNING x )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	49		g2.b1	VALUES JSON_QUERY ( ? , 'x' WITH WRAPPER )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	49		g3.b1.g1.b1	VALUES JSON_QUERY ( ? , 'x' KEEP QUOTES )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	49		g3.b1.g1.b2	VALUES JSON_QUERY ( ? , 'x' OMIT QUOTES )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	49		g3.b1.g2.b1	VALUES JSON_QUERY ( ? , 'x' KEEP QUOTES ON SCALAR STRING )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	49		g3.b1	VALUES JSON_QUERY ( ? , 'x' KEEP QUOTES )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	49		g4.b1	VALUES JSON_QUERY ( ? , 'x' NULL ON EMPTY )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	49		g5.b1	VALUES JSON_QUERY ( ? , 'x' NULL ON ERROR )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	50		g1.b1.g1.b1	VALUES JSON_SERIALIZE ( ? RETURNING x FORMAT JSON )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	50		g1.b1	VALUES JSON_SERIALIZE ( ? RETURNING x )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	50		g2.b1	VALUES JSON_SERIALIZE ( ? NULL ON ERROR )	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	47		g1.b1	VALUES JSON_EXISTS ( ? , 'x' TRUE ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	48		g1.b1	VALUES JSON_VALUE ( ? , 'x' RETURNING x )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	48		g2.b1	VALUES JSON_VALUE ( ? , 'x' NULL ON EMPTY )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	48		g3.b1	VALUES JSON_VALUE ( ? , 'x' NULL ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	49		g1.b1.g1.b1	VALUES JSON_QUERY ( ? , 'x' RETURNING x FORMAT JSON )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	49		g1.b1	VALUES JSON_QUERY ( ? , 'x' RETURNING x )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	49		g2.b1	VALUES JSON_QUERY ( ? , 'x' WITH WRAPPER )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	49		g3.b1.g1.b1	VALUES JSON_QUERY ( ? , 'x' KEEP QUOTES )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	49		g3.b1.g1.b2	VALUES JSON_QUERY ( ? , 'x' OMIT QUOTES )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	49		g3.b1.g2.b1	VALUES JSON_QUERY ( ? , 'x' KEEP QUOTES ON SCALAR STRING )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	49		g3.b1	VALUES JSON_QUERY ( ? , 'x' KEEP QUOTES )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	49		g4.b1	VALUES JSON_QUERY ( ? , 'x' NULL ON EMPTY )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	49		g5.b1	VALUES JSON_QUERY ( ? , 'x' NULL ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	50		g1.b1.g1.b1	VALUES JSON_SERIALIZE ( ? RETURNING x FORMAT JSON )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	50		g1.b1	VALUES JSON_SERIALIZE ( ? RETURNING x )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	50		g2.b1	VALUES JSON_SERIALIZE ( ? NULL ON ERROR )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	51		g1.b1.g1.b1	VALUES JSON_OBJECT ( ? : ? , ? : ? )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	51		g1.b1.g2.b1	VALUES JSON_OBJECT ( ? : ? NULL ON NULL )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	51		g1.b1.g2.b2	VALUES JSON_OBJECT ( ? : ? ABSENT ON NULL )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	51		g1.b1.g3.b1	VALUES JSON_OBJECT ( ? : ? WITH UNIQUE )	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	51		g1.b1.g2.b2	VALUES JSON_OBJECT ( ? : ? ABSENT ON NULL )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	51		g1.b1.g3.b1	VALUES JSON_OBJECT ( ? : ? WITH UNIQUE )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	51		g1.b1.g3.b2	VALUES JSON_OBJECT ( ? : ? WITHOUT UNIQUE )	supported	accept	reviewed-grammar-path	none
 alternative	primaryExpression	51		g1.b1	VALUES JSON_OBJECT ( ? : ? )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	51		g2.b1.g1.b1	VALUES JSON_OBJECT ( RETURNING x FORMAT JSON )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	51		g2.b1	VALUES JSON_OBJECT ( RETURNING x )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	52		g1.b1.g1.b1	VALUES JSON_ARRAY ( ? , ? )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	52		g1.b1.g2.b1	VALUES JSON_ARRAY ( ? NULL ON NULL )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	52		g1.b1.g2.b2	VALUES JSON_ARRAY ( ? ABSENT ON NULL )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	52		g1.b1	VALUES JSON_ARRAY ( ? )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	52		g2.b1.g1.b1	VALUES JSON_ARRAY ( RETURNING x FORMAT JSON )	supported	accept	reviewed-grammar-path	none
-alternative	primaryExpression	52		g2.b1	VALUES JSON_ARRAY ( RETURNING x )	supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	51		g2.b1.g1.b1	VALUES JSON_OBJECT ( RETURNING x FORMAT JSON )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	51		g2.b1	VALUES JSON_OBJECT ( RETURNING x )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	52		g1.b1.g1.b1	VALUES JSON_ARRAY ( ? , ? )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	52		g1.b1.g2.b1	VALUES JSON_ARRAY ( ? NULL ON NULL )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	52		g1.b1.g2.b2	VALUES JSON_ARRAY ( ? ABSENT ON NULL )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	52		g1.b1	VALUES JSON_ARRAY ( ? )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	52		g2.b1.g1.b1	VALUES JSON_ARRAY ( RETURNING x FORMAT JSON )	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	primaryExpression	52		g2.b1	VALUES JSON_ARRAY ( RETURNING x )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	jsonPathInvocation	1		g1.b1	VALUES JSON_VALUE ( ? , 'x' AS x )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	jsonPathInvocation	1		g2.b1.g1.b1	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x , ? AS x )	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	jsonPathInvocation	1		g2.b1	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x )	parsed-not-supported	accept	reviewed-grammar-path	none
@@ -2301,19 +2301,19 @@ alternative	explainOption	2		g1.b4	EXPLAIN (TYPE IO) SELECT 1 AS answer	parsed-n
 alternative	transactionMode	2		g1.b1	START TRANSACTION READ ONLY	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	transactionMode	2		g1.b2	START TRANSACTION READ WRITE	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	pathSpecification	1		g1.b1	SET PATH lake.s, t	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	functionSpecification	1		g1.b1	@file:coverage-sql/routine-return.sql	supported	accept	reviewed-grammar-path	none
-alternative	functionSpecification	1		g1.b2	@file:coverage-sql/routine-external.sql	supported	accept	reviewed-grammar-path	none
-alternative	functionDeclaration	1		g1.b1.g1.b1	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
-alternative	functionDeclaration	1		g1.b1	@file:coverage-sql/routine-parameters.sql	supported	accept	reviewed-grammar-path	none
-alternative	routineCharacteristic	5		g1.b1	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-alternative	routineCharacteristic	5		g1.b2	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-alternative	routineCharacteristic	7		g1.b1	@file:coverage-sql/routine-characteristics.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	8		g1.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	9		g1.b1	@file:coverage-sql/routine-loop.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	10		g1.b1	@file:coverage-sql/routine-while.sql	supported	accept	reviewed-grammar-path	none
-alternative	controlStatement	11		g1.b1	@file:coverage-sql/routine-repeat.sql	supported	accept	reviewed-grammar-path	none
-alternative	variableDeclaration	1		g1.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
-alternative	variableDeclaration	1		g2.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
-alternative	sqlStatementList	1		g1.b1	@file:coverage-sql/routine-declarations.sql	supported	accept	reviewed-grammar-path	none
+alternative	functionSpecification	1		g1.b1	@file:coverage-sql/routine-return.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	functionSpecification	1		g1.b2	@file:coverage-sql/routine-external.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	functionDeclaration	1		g1.b1.g1.b1	@file:coverage-sql/routine-parameters.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	functionDeclaration	1		g1.b1	@file:coverage-sql/routine-parameters.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	5		g1.b1	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	5		g1.b2	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	routineCharacteristic	7		g1.b1	@file:coverage-sql/routine-characteristics.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	8		g1.b1	@file:coverage-sql/routine-declarations.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	9		g1.b1	@file:coverage-sql/routine-loop.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	10		g1.b1	@file:coverage-sql/routine-while.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	controlStatement	11		g1.b1	@file:coverage-sql/routine-repeat.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	variableDeclaration	1		g1.b1	@file:coverage-sql/routine-declarations.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	variableDeclaration	1		g2.b1	@file:coverage-sql/routine-declarations.sql	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	sqlStatementList	1		g1.b1	@file:coverage-sql/routine-declarations.sql	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	grantObject	1		g1.b1	SHOW GRANTS ON BRANCH dev IN TABLE cat.sch.t	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	qualifiedName	1		g1.b1	SELECT * FROM x . x	supported	accept	reviewed-grammar-path	none
