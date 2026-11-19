@@ -150,7 +150,7 @@ impl ViewEngine for FrontendViewEngine {
                     view: Arc::from(request.target.view),
                 },
                 definition: ConnectorViewDefinition {
-                    dialect: ConnectorViewDialect::StarRocks,
+                    dialect: ConnectorViewDialect::Trino,
                     raw_sql: Arc::from(request.definition.raw_query_source),
                     default_catalog: Some(Arc::from(request.definition.resolution.default_catalog)),
                     default_namespace: Arc::from(request.definition.resolution.default_database),
@@ -309,7 +309,7 @@ fn resolved_external_view(
     let definition = PersistedQueryDefinition::new(
         view.definition.raw_sql.to_string(),
         match view.definition.dialect {
-            ConnectorViewDialect::StarRocks => PersistedQueryDialect::StarRocks,
+            ConnectorViewDialect::Trino => PersistedQueryDialect::Trino,
         },
         default_catalog,
         &view.definition.default_namespace,
@@ -388,7 +388,7 @@ mod tests {
             }],
             definition: PersistedQueryDefinition::new(
                 "SELECT COUNT(*) AS sale_count FROM sales",
-                PersistedQueryDialect::StarRocks,
+                PersistedQueryDialect::Trino,
                 "rest",
                 "analytics",
             )
@@ -423,13 +423,17 @@ mod tests {
             current_database: "db",
             connector_context: None,
         };
-        let statements = novarocks_parser::parse("CREATE VIEW v AS SELECT 1").expect("parse");
-        let [novarocks_parser::ast::Statement::View(statement)] = statements.as_slice() else {
+        let sql = "CREATE VIEW v AS SELECT 1";
+        let novarocks_parser::ast::TrinoStatement::CreateView(statement) =
+            novarocks_parser::parser::parse_statement(sql).expect("parse")
+        else {
             panic!("expected view statement");
         };
+        let command =
+            novarocks_query_application::view::ViewCommand::trino_create(sql, &statement).unwrap();
         assert!(
             service
-                .execute_statement(&engine, statement, ctx)
+                .execute_command(&engine, command, ctx)
                 .unwrap_err()
                 .to_string()
                 .contains("view service is not injected")

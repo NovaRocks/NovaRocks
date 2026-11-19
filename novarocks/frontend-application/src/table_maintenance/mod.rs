@@ -96,11 +96,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         spark_procedure: bool,
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceStatementResult, TerminalError> {
-        let ParsedMaintenanceStatement::Execute { name_parts, action } = statement else {
-            return Err(TerminalError::pre_dispatch_failed(
-                "OPTIMIZE requires its original statement action",
-            ));
-        };
+        let ParsedMaintenanceStatement { name_parts, action } = statement;
         let target = engine.resolve_target(&name_parts, context)?;
         let request = action.into_request(engine, target)?;
         let outcome = self

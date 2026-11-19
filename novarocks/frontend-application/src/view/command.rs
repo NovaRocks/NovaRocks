@@ -32,22 +32,6 @@ impl ViewCommandExecutor {
         Self { kernel }
     }
 
-    /// Execute a View command already admitted by `novarocks-parser`.
-    pub(crate) fn execute(
-        &self,
-        statement: &novarocks_parser::ast::ViewStatement,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        connector_context: &ConnectorRequestContext,
-    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
-        self.execute_command(
-            ViewCommand::from_legacy(statement),
-            current_catalog,
-            current_database,
-            connector_context,
-        )
-    }
-
     pub(crate) fn execute_command(
         &self,
         command: ViewCommand<'_>,

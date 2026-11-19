@@ -134,13 +134,15 @@ mod tests {
     #[test]
     fn statistics_commands_keep_session_target_and_column_intent() {
         let statement = novarocks_query_application::sql::parse_single_statement(
-            "ANALYZE TABLE orders (order_id)",
+            "ANALYZE orders WITH (columns = ARRAY['order_id'])",
         )
         .unwrap();
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Statistics(command)) =
-            novarocks_query_application::sql::lower_product_sql_command(&statement).unwrap()
-        else {
+        let novarocks_parser::ast::TrinoStatement::Analyze(statement) = statement else {
             panic!("statistics command")
+        };
+        let command = novarocks_sql::semantic::StatisticsSqlCommand::AnalyzeTable {
+            table: novarocks_query_application::sql::lower_object_name(&statement.table_name),
+            columns: Some(vec!["order_id".into()]),
         };
         assert_eq!(
             lower_application_command(&command, Some("ice"), "analytics").unwrap(),

@@ -435,20 +435,19 @@ fn disposition(resolved: &ResolvedCatalogMutation) -> EffectDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::ast::{MaintenanceStatement, Statement};
 
     fn call(sql: &str) -> PreparedMaintenanceCall {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [Statement::Maintenance(MaintenanceStatement::Call(call))] = statements.as_slice()
-        else {
-            panic!("CALL")
+        use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
+
+        let TrinoStatement::Call(call) = parse_statement(sql).unwrap() else {
+            panic!("CALL");
         };
-        PreparedMaintenanceCall::from_legacy(call)
+        PreparedMaintenanceCall::from_trino(&call).unwrap()
     }
     #[test]
     fn document_expiry_call_is_strict_and_other_procedures_miss() {
         let valid = call(
-            "CALL ice.system.novarocks_mv_document_expiry(table => 'sales.mv', keep_last => 2, token => 'once')",
+            "CALL ice.system.novarocks_mv_document_expiry(\"table\" => 'sales.mv', keep_last => 2, token => 'once')",
         );
         assert_eq!(
             decode_call(&valid).unwrap(),
@@ -461,21 +460,21 @@ mod tests {
             })
         );
         assert!(
-            decode_call(&call("CALL ice.system.other(table => 'sales.mv')"))
+            decode_call(&call("CALL ice.system.other(\"table\" => 'sales.mv')"))
                 .unwrap()
                 .is_none()
         );
         for sql in [
-            "CALL novarocks_mv_document_expiry(table => 'sales.mv', keep_last => 2, token => 'once')",
-            "CALL ice.other.novarocks_mv_document_expiry(table => 'sales.mv', keep_last => 2, token => 'once')",
+            "CALL novarocks_mv_document_expiry(\"table\" => 'sales.mv', keep_last => 2, token => 'once')",
+            "CALL ice.other.novarocks_mv_document_expiry(\"table\" => 'sales.mv', keep_last => 2, token => 'once')",
             "CALL ice.system.novarocks_mv_document_expiry('sales.mv', 2, 'once')",
-            "CALL ice.system.novarocks_mv_document_expiry(table => 'mv', keep_last => 2, token => 'once')",
-            "CALL ice.system.novarocks_mv_document_expiry(table => 'ice.sales.mv', keep_last => 2, token => 'once')",
-            "CALL ice.system.novarocks_mv_document_expiry(table => 'sales.mv', keep_last => 0, token => 'once')",
-            "CALL ice.system.novarocks_mv_document_expiry(table => 'sales.mv', keep_last => 1.5, token => 'once')",
-            "CALL ice.system.novarocks_mv_document_expiry(table => 'sales.mv', keep_last => '2', token => 'once')",
-            "CALL ice.system.novarocks_mv_document_expiry(table => 'sales.mv', keep_last => 2, token => '')",
-            "CALL ice.system.novarocks_mv_document_expiry(table => 'sales.mv', keep_last => 2, directory => '/tmp')",
+            "CALL ice.system.novarocks_mv_document_expiry(\"table\" => 'mv', keep_last => 2, token => 'once')",
+            "CALL ice.system.novarocks_mv_document_expiry(\"table\" => 'ice.sales.mv', keep_last => 2, token => 'once')",
+            "CALL ice.system.novarocks_mv_document_expiry(\"table\" => 'sales.mv', keep_last => 0, token => 'once')",
+            "CALL ice.system.novarocks_mv_document_expiry(\"table\" => 'sales.mv', keep_last => 1.5, token => 'once')",
+            "CALL ice.system.novarocks_mv_document_expiry(\"table\" => 'sales.mv', keep_last => '2', token => 'once')",
+            "CALL ice.system.novarocks_mv_document_expiry(\"table\" => 'sales.mv', keep_last => 2, token => '')",
+            "CALL ice.system.novarocks_mv_document_expiry(\"table\" => 'sales.mv', keep_last => 2, directory => '/tmp')",
         ] {
             assert!(decode_call(&call(sql)).is_err(), "{sql}");
         }
@@ -485,17 +484,17 @@ mod tests {
     }
     #[test]
     fn trino_document_expiry_keeps_the_authored_integer_spelling() {
-        use novarocks_parser::{ast::TrinoStatement, trino_parser};
+        use novarocks_parser::{ast::TrinoStatement, parser};
         use novarocks_sql::semantic::MaintenanceSqlCommand;
 
         let legacy = call(
-            "CALL ice.system.novarocks_mv_document_expiry(table => 'sales.mv', keep_last => 2, token => 'once')",
+            "CALL ice.system.novarocks_mv_document_expiry(\"table\" => 'sales.mv', keep_last => 2, token => 'once')",
         );
         for (spelling, admitted) in [("2", true), ("0b10", false)] {
             let sql = format!(
                 r#"CALL ice.system.novarocks_mv_document_expiry("table" => 'sales.mv', keep_last => {spelling}, token => 'once')"#
             );
-            let TrinoStatement::Call(parsed) = trino_parser::parse_statement(&sql).unwrap() else {
+            let TrinoStatement::Call(parsed) = parser::parse_statement(&sql).unwrap() else {
                 panic!("expected CALL");
             };
             let call = PreparedMaintenanceCall::from_trino(&parsed).unwrap();

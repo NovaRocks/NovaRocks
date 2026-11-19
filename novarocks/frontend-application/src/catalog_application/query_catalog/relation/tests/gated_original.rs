@@ -219,10 +219,7 @@ async fn drive<F: Future>(gate: &Arc<MvRefreshPreparationIo>, future: F) -> F::O
     .expect("named gate/reader watchdog")
 }
 fn preparation(sql: &str) -> novarocks_sql::compiler::SqlCapturedCatalogPreparation {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query fixture")
-    };
+    let query = novarocks_parser::parser::parse_query(sql).unwrap();
     novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
         query.clone(),
         Some("ice"),
@@ -439,10 +436,7 @@ async fn original_gate_preserves_provider_failures_without_entering_a_view_or_re
 }
 
 fn system_definition(sql: &str) -> novarocks_sql::compiler::SqlCapturedCatalogPreparation {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("definition query fixture")
-    };
+    let query = novarocks_parser::parser::parse_query(sql).unwrap();
     novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new_definition(
         query.clone(),
         "default_catalog",

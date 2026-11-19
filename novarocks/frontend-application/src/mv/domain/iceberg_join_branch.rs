@@ -82,16 +82,7 @@ pub(crate) fn is_append_only_join_delta_eligible(query: &ast::Query) -> bool {
     {
         return false;
     }
-    matches!(
-        join.kind,
-        ast::JoinType::Inner
-            | ast::JoinType::Cross
-            | ast::JoinType::Legacy(
-                ast::legacy::JoinOperator::Inner
-                    | ast::legacy::JoinOperator::InnerExplicit
-                    | ast::legacy::JoinOperator::Cross
-            )
-    )
+    matches!(join.kind, ast::JoinType::Inner | ast::JoinType::Cross)
 }
 
 #[cfg(test)]
@@ -150,30 +141,26 @@ mod tests {
     #[test]
     fn join_delta_append_only_join_type_eligibility() {
         assert!(is_append_only_join_delta_eligible(&parse_query(
-            "select l.id from ice.ns.left l join ice.ns.right r on l.id = r.id"
+            "select l.id from ice.ns.\"left\" l join ice.ns.\"right\" r on l.id = r.id"
         )));
         assert!(is_append_only_join_delta_eligible(&parse_query(
-            "select l.id from ice.ns.left l inner join ice.ns.right r on l.id = r.id"
+            "select l.id from ice.ns.\"left\" l inner join ice.ns.\"right\" r on l.id = r.id"
         )));
         assert!(is_append_only_join_delta_eligible(&parse_query(
-            "select l.id from ice.ns.left l cross join ice.ns.right r"
+            "select l.id from ice.ns.\"left\" l cross join ice.ns.\"right\" r"
         )));
 
         assert!(!is_append_only_join_delta_eligible(&parse_query(
-            "select l.id from ice.ns.left l left join ice.ns.right r on l.id = r.id"
+            "select l.id from ice.ns.\"left\" l left join ice.ns.\"right\" r on l.id = r.id"
         )));
         assert!(!is_append_only_join_delta_eligible(&parse_query(
-            "select l.id from ice.ns.left l right join ice.ns.right r on l.id = r.id"
+            "select l.id from ice.ns.\"left\" l right join ice.ns.\"right\" r on l.id = r.id"
         )));
         assert!(!is_append_only_join_delta_eligible(&parse_query(
-            "select l.id from ice.ns.left l full outer join ice.ns.right r on l.id = r.id"
+            "select l.id from ice.ns.\"left\" l full outer join ice.ns.\"right\" r on l.id = r.id"
         )));
     }
     fn parse_query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
-        query.clone()
+        novarocks_parser::parser::parse_query(sql).expect("parse")
     }
 }

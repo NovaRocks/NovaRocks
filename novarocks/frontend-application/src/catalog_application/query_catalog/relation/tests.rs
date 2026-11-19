@@ -194,7 +194,7 @@ impl ObservedView {
         ConnectorViewMetadataValue::try_new(
             request.view,
             ConnectorViewDefinition {
-                dialect: ConnectorViewDialect::StarRocks,
+                dialect: ConnectorViewDialect::Trino,
                 raw_sql: "SELECT 1 AS x".into(),
                 default_catalog: Some(self.descriptor.instance_id.as_str().into()),
                 default_namespace: "db".into(),
@@ -331,10 +331,7 @@ fn fixture(
     }
 }
 fn need(sql: &str) -> CatalogRelationNeed {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query")
-    };
+    let query = novarocks_parser::parser::parse_query(sql).unwrap();
     let source = novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
         query.clone(),
         Some("ice"),
@@ -641,10 +638,7 @@ async fn legacy_and_explicit_snapshot_names_share_one_input_without_sharing_the_
         let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
         let mut first = None;
         for sql in inputs {
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-                panic!("query")
-            };
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
             let preparation = novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
                 query.clone(),
                 Some("ice"),

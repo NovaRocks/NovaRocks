@@ -611,18 +611,17 @@ mod context_tests;
 #[cfg(test)]
 #[test]
 fn metadata_from_qualifiers_do_not_strip_generic_delete_target_names() {
-    use novarocks_parser::ast::{DmlStatement, Relation, SetExpr, Statement};
+    use novarocks_parser::{
+        ast::{Relation, SetExpr, TrinoStatement},
+        parser,
+    };
     let target = MvDependencyTarget {
         catalog: "ice".into(),
         namespace: "sales".into(),
         table: "orders".into(),
     };
-    let source = "SELECT ice.sales.orders.* FROM ice.sales.orders$files";
-    let [Statement::Query(query)]: [Statement; 1] =
-        novarocks_parser::parse(source).unwrap().try_into().unwrap()
-    else {
-        panic!("query");
-    };
+    let source = "SELECT ice.sales.orders.* FROM ice.sales.\"orders$files\"";
+    let query = parser::parse_query(source).expect("SELECT");
     assert!(query_projects_target_wildcard(&query, &target));
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("SELECT");
@@ -637,34 +636,22 @@ fn metadata_from_qualifiers_do_not_strip_generic_delete_target_names() {
     );
     let last = table.name.parts.last().unwrap();
     assert_eq!(last.value, "orders$files");
-    assert_eq!(&source[last.span.start()..last.span.end()], "orders$files");
-    for source in [
-        "DELETE FROM ice.sales.orders$files WHERE id=1",
-        "DELETE FROM ice.sales.`orders$files` WHERE id=1",
-    ] {
-        let [Statement::Dml(DmlStatement::Delete(delete))]: [Statement; 1] =
-            novarocks_parser::parse(source).unwrap().try_into().unwrap()
-        else {
-            panic!("DELETE target");
-        };
-        let last = delete.target.parts.last().unwrap();
-        assert_eq!(last.value, "orders$files");
-        assert!(!name_parts_match_target(
-            delete.target.parts.iter().map(|part| part.value.as_str()),
-            &target
-        ));
-        assert!(
-            name_parts_qualifier_keys(delete.target.parts.iter().map(|part| part.value.as_str()))
-                .is_empty()
-        );
-    }
-    let [Statement::Query(query)]: [Statement; 1] =
-        novarocks_parser::parse("SELECT * FROM ice.sales.`orders$files`")
-            .unwrap()
-            .try_into()
-            .unwrap()
-    else {
-        panic!("quoted ordinary FROM");
+    assert_eq!(
+        &source[last.span.start()..last.span.end()],
+        r#""orders$files""#
+    );
+    let source = r#"DELETE FROM ice.sales."orders$files" WHERE id=1"#;
+    let TrinoStatement::Delete(delete) = parser::parse_statement(source).unwrap() else {
+        panic!("DELETE target");
     };
+    let parts = delete.table.name.parts;
+    let last = parts.last().unwrap();
+    assert_eq!(last.value, "orders$files");
+    assert!(!name_parts_match_target(
+        parts.iter().map(|part| part.value.as_str()),
+        &target
+    ));
+    assert!(name_parts_qualifier_keys(parts.iter().map(|part| part.value.as_str())).is_empty());
+    let query = parser::parse_query(r#"SELECT * FROM ice.sales."orders$files""#).unwrap();
     assert!(!query_projects_target_wildcard(&query, &target));
 }

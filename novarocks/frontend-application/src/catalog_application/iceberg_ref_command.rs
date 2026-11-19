@@ -99,7 +99,7 @@ impl IcebergRefCommandExecutor {
         let IcebergTableSqlAction::Reference(action) = command.action else {
             unreachable!("CREATE BRANCH produces its existing reference action");
         };
-        crate::mv::domain::ref_flow::prepare_action(binding, &action, connector).map_err(project)
+        crate::mv::domain::ref_flow::prepare_action(binding, &action).map_err(project)
     }
 
     pub fn execute_command(

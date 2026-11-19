@@ -29,10 +29,8 @@ use novarocks_query_application::{
     protocol_delivery::QuerySessionOutput as StatementResult,
     session_error::{QueryServiceError, QueryServiceErrorKind},
     sql::table_procedure::{
-        BoundProcedureArgument, BoundProcedureValue, BoundTableProcedure, LegacyProcedureValue,
-        ProcedureArgumentDefault, TableProcedureArgument, TableProcedureKind,
-        bind_legacy_procedure_arguments, invalid_procedure_argument,
-        resolve_legacy_table_procedure,
+        BoundProcedureArgument, BoundProcedureValue, BoundTableProcedure, ProcedureArgumentDefault,
+        TableProcedureArgument, TableProcedureKind, invalid_procedure_argument,
     },
 };
 use novarocks_spi::connector::{
@@ -51,7 +49,7 @@ use crate::catalog_application::resolver::{TargetBackend, require_external_targe
 use crate::mv::domain::readiness::MvReadinessPort;
 
 pub(crate) struct RefMutationBinding {
-    pin: ConnectorControlPlanningPin,
+    _planning: ConnectorControlPlanningPin,
     mutation: ConnectorCatalogMutationSession,
     table: ConnectorTableIdentity,
 }
@@ -75,7 +73,7 @@ pub(crate) fn project_trino_tag(
     span: Span,
     bound: BoundTableProcedure<'_>,
 ) -> Result<TrinoTagAction, QueryServiceError> {
-    project_tag(bound, Some((source, span))).map(TrinoTagAction)
+    project_tag(source, span, bound).map(TrinoTagAction)
 }
 
 /// The procedure binder and the ref mutation retain the same planning pin.
@@ -132,7 +130,7 @@ pub(crate) fn execute_with_ports(
         &stmt.table,
         connector_context,
     )?;
-    prepare_action(binding, action, connector_context)?.execute(connector_context)
+    prepare_action(binding, action)?.execute(connector_context)
 }
 
 pub(crate) fn prepare_target(
@@ -191,7 +189,7 @@ fn bind_resolved_target(
         .derive_mutation_lease()
         .map_err(|error| error.to_string())?;
     Ok(RefMutationBinding {
-        pin: planning,
+        _planning: planning,
         mutation,
         table: ConnectorTableIdentity {
             instance_id,
@@ -204,16 +202,8 @@ fn bind_resolved_target(
 pub(crate) fn prepare_action(
     binding: RefMutationBinding,
     action: &IcebergReferenceSqlAction,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedRefMutation, CommandError> {
-    let control = crate::query_execution::planning::sql_compile_control_from_connector_request(
-        connector_context,
-    );
-    let action = connector_ref_action(
-        action,
-        &binding.pin.binding().descriptor().provider_id,
-        &control,
-    )?;
+    let action = connector_branch_action(action)?;
     Ok(PreparedRefMutation { binding, action })
 }
 
@@ -275,95 +265,57 @@ impl PreparedRefMutation {
     }
 }
 
-fn connector_ref_action(
+fn connector_branch_action(
     action: &IcebergReferenceSqlAction,
-    provider: &ConnectorProviderId,
-    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ConnectorRefAction, CommandError> {
-    match action {
+    let action = match action {
         IcebergReferenceSqlAction::Create {
-            kind,
+            kind: IcebergReferenceKindSql::Branch,
             name,
             snapshot_id,
             if_not_exists,
             or_replace,
-        } => {
-            if *kind == IcebergReferenceKindSql::Branch {
-                return Ok(create_ref(
-                    ConnectorRefKind::Branch,
-                    Arc::from(name.as_str()),
-                    *snapshot_id,
-                    *or_replace,
-                    *if_not_exists,
-                ));
-            }
-            let mut inputs = Vec::with_capacity(4);
-            inputs.push(("name", LegacyProcedureValue::Varchar(name)));
-            if let Some(snapshot_id) = snapshot_id {
-                inputs.push(("snapshot_id", LegacyProcedureValue::Bigint(*snapshot_id)));
-            }
-            inputs.push(("replace", LegacyProcedureValue::Boolean(*or_replace)));
-            inputs.push((
-                "if_not_exists",
-                LegacyProcedureValue::Boolean(*if_not_exists),
-            ));
-            bind_tag(provider, "create_tag", &inputs, control)
-        }
+        } => create_ref(
+            ConnectorRefKind::Branch,
+            Arc::from(name.as_str()),
+            *snapshot_id,
+            *or_replace,
+            *if_not_exists,
+        ),
         IcebergReferenceSqlAction::Drop {
-            kind,
+            kind: IcebergReferenceKindSql::Branch,
             name,
             if_exists,
-        } => {
-            if *kind == IcebergReferenceKindSql::Branch {
-                return Ok(drop_ref(
-                    ConnectorRefKind::Branch,
-                    Arc::from(name.as_str()),
-                    *if_exists,
-                ));
-            }
-            bind_tag(
-                provider,
-                "drop_tag",
-                &[
-                    ("name", LegacyProcedureValue::Varchar(name)),
-                    ("if_exists", LegacyProcedureValue::Boolean(*if_exists)),
-                ],
-                control,
-            )
+        } => drop_ref(
+            ConnectorRefKind::Branch,
+            Arc::from(name.as_str()),
+            *if_exists,
+        ),
+        _ => {
+            return Err(CommandError::new(
+                CommandErrorKind::Failed,
+                "A branch mutation received a different reference kind",
+            ));
         }
-    }
-}
-
-fn bind_tag(
-    provider: &ConnectorProviderId,
-    procedure: &str,
-    inputs: &[(&str, LegacyProcedureValue<'_>)],
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<ConnectorRefAction, CommandError> {
-    let procedure = resolve_legacy_table_procedure(provider, procedure)
-        .map_err(crate::query::procedure_command_error)?;
-    let bound = bind_legacy_procedure_arguments(procedure, inputs, control)
-        .map_err(crate::query::procedure_command_error)?;
-    project_tag(bound, None).map_err(crate::query::procedure_command_error)
+    };
+    Ok(action)
 }
 
 fn project_tag(
+    source: &str,
+    span: Span,
     bound: BoundTableProcedure<'_>,
-    location: Option<(&str, Span)>,
 ) -> Result<ConnectorRefAction, QueryServiceError> {
     let declaration = bound.declaration();
     let mut slots = bound.into_arguments();
     let name = match tag_argument(&mut slots, "name")? {
         Some(DdlPropertyValue::Varchar(name)) => Arc::from(name),
         None => {
-            return Err(match location {
-                Some((source, span)) => invalid_procedure_argument(
-                    source,
-                    span,
-                    format!("Table procedure {} requires 'name'", declaration.name()),
-                ),
-                None => tag_binding_invariant(),
-            });
+            return Err(invalid_procedure_argument(
+                source,
+                span,
+                format!("Table procedure {} requires 'name'", declaration.name()),
+            ));
         }
         _ => return Err(tag_binding_invariant()),
     };
@@ -491,23 +443,34 @@ fn resolve_table_parts(name: &ObjectName) -> Result<(String, String, String), St
 mod tests {
     use super::*;
 
-    use novarocks_query_application::sql::{
-        ProductSqlCommand, lower_product_sql_command, parse_single_statement,
-    };
-    use novarocks_sql::semantic::CatalogSqlCommand;
-
     #[test]
     fn semantic_create_ref_preserves_anchor_and_policy() {
-        let statement = parse_single_statement(
-            "ALTER TABLE ice.db.orders CREATE BRANCH IF NOT EXISTS release AS OF VERSION 42",
+        use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
+        use novarocks_query_application::sql::trino_table_command::prepare_trino_create_branch;
+        use novarocks_spi::connector::{DdlPropertyDeclaration, DdlPropertyType};
+        use novarocks_sql::semantic::CatalogSqlCommand;
+
+        let source =
+            "CREATE BRANCH IF NOT EXISTS release WITH (snapshot_id = 42) IN TABLE ice.db.orders";
+        let TrinoStatement::CreateBranch(statement) = parse_statement(source).unwrap() else {
+            panic!("expected a branch statement");
+        };
+        let declarations = [DdlPropertyDeclaration::new(
+            "snapshot_id",
+            DdlPropertyType::Bigint,
+            DdlPropertyValue::Null,
+            false,
+        )
+        .unwrap()];
+        let command = prepare_trino_create_branch(
+            source,
+            &statement,
+            &declarations,
+            &mut LiteralConstants,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
-        let Some(ProductSqlCommand::Catalog(command)) =
-            lower_product_sql_command(&statement).unwrap()
-        else {
-            panic!("expected a catalog command");
-        };
-        let CatalogSqlCommand::AlterIcebergTable(command) = *command else {
+        let CatalogSqlCommand::AlterIcebergTable(command) = command else {
             panic!("expected an Iceberg table command");
         };
         let IcebergTableSqlAction::Reference(action) = command.action else {
@@ -519,12 +482,7 @@ mod tests {
             snapshot_id,
             policy,
             ..
-        } = connector_ref_action(
-            &action,
-            &ConnectorProviderId::parse("iceberg").unwrap(),
-            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
-        )
-        .unwrap()
+        } = connector_branch_action(&action).unwrap()
         else {
             panic!("expected create ref action");
         };
@@ -532,51 +490,6 @@ mod tests {
         assert_eq!(name.as_ref(), "release");
         assert_eq!(snapshot_id, Some(42));
         assert_eq!(policy, CreateOrReplacePolicy::NoOpIfExists);
-    }
-
-    #[test]
-    fn legacy_tag_binding_keeps_bigint_snapshot_and_drop_policy() {
-        let provider = ConnectorProviderId::parse("iceberg").unwrap();
-        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
-        let action = |sql| {
-            let statement = parse_single_statement(sql).unwrap();
-            let Some(ProductSqlCommand::Catalog(command)) =
-                lower_product_sql_command(&statement).unwrap()
-            else {
-                panic!("expected catalog command");
-            };
-            let CatalogSqlCommand::AlterIcebergTable(command) = *command else {
-                panic!("reference command");
-            };
-            let IcebergTableSqlAction::Reference(action) = command.action else {
-                panic!("reference action");
-            };
-            connector_ref_action(&action, &provider, &control).unwrap()
-        };
-        let ConnectorRefAction::Create {
-            kind,
-            name,
-            snapshot_id,
-            policy,
-            ..
-        } = action(
-            "ALTER TABLE ice.db.orders CREATE TAG IF NOT EXISTS release AS OF VERSION 9223372036854775806",
-        )
-        else {
-            panic!("create tag");
-        };
-        assert_eq!(kind, ConnectorRefKind::Tag);
-        assert_eq!(name.as_ref(), "release");
-        assert_eq!(snapshot_id, Some(i64::MAX - 1));
-        assert_eq!(policy, CreateOrReplacePolicy::NoOpIfExists);
-        let ConnectorRefAction::Drop { kind, name, policy } =
-            action("ALTER TABLE ice.db.orders DROP TAG IF EXISTS release")
-        else {
-            panic!("drop tag");
-        };
-        assert_eq!(kind, ConnectorRefKind::Tag);
-        assert_eq!(name.as_ref(), "release");
-        assert_eq!(policy, DropPolicy::NoOpIfMissing);
     }
 
     struct LiteralConstants;
@@ -644,7 +557,7 @@ mod tests {
     }
 
     fn project_sql(source: &str) -> Result<ConnectorRefAction, QueryServiceError> {
-        use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+        use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
         use novarocks_query_application::sql::trino_table_command::bind_trino_table_execute;
 
         let TrinoStatement::TableExecute(statement) = parse_statement(source).unwrap() else {
@@ -726,24 +639,12 @@ mod tests {
     }
 
     #[test]
-    fn semantic_ref_rejects_non_numeric_version_anchor() {
-        let statement =
-            parse_single_statement("ALTER TABLE ice.db.orders CREATE TAG v1 AS OF VERSION '42'")
-                .unwrap();
+    fn retired_ref_retention_syntax_is_rejected_before_binding() {
+        let source = "ALTER TABLE ice.db.orders CREATE BRANCH release RETAIN 7 DAYS";
+        let error = novarocks_parser::parser::parse_statement(source).unwrap_err();
         assert_eq!(
-            lower_product_sql_command(&statement).unwrap_err(),
-            "Iceberg reference version must be a numeric literal"
-        );
-    }
-
-    #[test]
-    fn semantic_ref_rejects_uninterpreted_retention_options() {
-        let statement =
-            parse_single_statement("ALTER TABLE ice.db.orders CREATE BRANCH release RETAIN 7 DAYS")
-                .unwrap();
-        assert_eq!(
-            lower_product_sql_command(&statement).unwrap_err(),
-            "Iceberg reference retention options are not supported"
+            error.to_user_error(source).code().as_str(),
+            "sql.parse.unexpected_token"
         );
     }
 }

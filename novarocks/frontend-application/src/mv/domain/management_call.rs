@@ -583,16 +583,14 @@ fn positional_text_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::ast::{MaintenanceStatement, Statement};
-    use novarocks_parser::parse;
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
 
     fn call(source: &str) -> PreparedMaintenanceCall {
-        let statements = parse(source).expect("CALL should parse");
-        let [Statement::Maintenance(MaintenanceStatement::Call(statement))] = statements.as_slice()
+        let TrinoStatement::Call(statement) = parse_statement(source).expect("CALL should parse")
         else {
             panic!("expected one CALL statement for {source}");
         };
-        PreparedMaintenanceCall::from_legacy(statement)
+        PreparedMaintenanceCall::from_trino(&statement).unwrap()
     }
 
     fn decode(source: &str) -> Result<Option<ManagementCall>, String> {
@@ -601,10 +599,10 @@ mod tests {
 
     #[test]
     fn trino_call_retains_the_management_target_and_original_authority_gate() {
-        use novarocks_parser::{ast::TrinoStatement, trino_parser};
+        use novarocks_parser::{ast::TrinoStatement, parser};
 
         let sql = "CALL novarocks_mv_management_status('ice', 'db.with.dots', 'orders.mv')";
-        let TrinoStatement::Call(parsed) = trino_parser::parse_statement(sql).unwrap() else {
+        let TrinoStatement::Call(parsed) = parser::parse_statement(sql).unwrap() else {
             panic!("expected CALL");
         };
         let modern = PreparedMaintenanceCall::from_trino(&parsed).unwrap();
@@ -637,7 +635,7 @@ mod tests {
     #[test]
     fn another_procedure_is_a_route_miss_not_an_error() {
         assert_eq!(
-            decode("CALL ice.system.novarocks_imv_stateless_rebuild(table => 'db.mv')")
+            decode("CALL ice.system.novarocks_imv_stateless_rebuild(\"table\" => 'db.mv')")
                 .expect("another procedure decodes as a miss"),
             None
         );

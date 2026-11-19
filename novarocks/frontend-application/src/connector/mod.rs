@@ -38,7 +38,6 @@ pub use application::{
     metadata_read_reference_facts_with_planning_pin, validate_request_context,
 };
 pub(crate) use application::{
-    connector_planning_context_for_query_on_runtime,
     connector_request_context_for_execution_on_runtime,
     connector_request_context_for_query_on_runtime, connector_write_column, connector_write_input,
     context_for_planning_pin, context_for_planning_pin_typed, metadata_binding_typed,

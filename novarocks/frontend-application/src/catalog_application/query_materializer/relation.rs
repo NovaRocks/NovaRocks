@@ -756,10 +756,7 @@ mod tests {
         novarocks_parser::ast::Query,
         novarocks_sql::compiler::SqlCapturedCatalogPreparation,
     ) {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query")
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         let source = novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
             query.clone(),
             catalog,
@@ -997,10 +994,7 @@ mod tests {
     }
 
     fn orders_need(sql: &str) -> CatalogRelationNeed {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query")
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         let source = novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
             query.clone(),
             Some("ice"),

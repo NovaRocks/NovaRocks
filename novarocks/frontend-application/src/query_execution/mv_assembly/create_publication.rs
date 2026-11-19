@@ -19,9 +19,7 @@
 
 use crate::mv::domain::{
     application::{MvApplicationError, MvApplicationErrorKind, MvCreateProjectionSeed},
-    iceberg_refresh::{
-        IcebergMvCreatePlan, MvStagedStorage, build_create_documents_for_prepared_target,
-    },
+    iceberg_refresh::{IcebergMvCreatePlan, build_create_documents_for_prepared_target},
 };
 use crate::query_execution::write_session::{
     ConnectorWriteSession, WriteBeginReceiving, WritePublicationCall,
@@ -38,10 +36,10 @@ use novarocks_spi::connector::write_stack::{
 };
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
-    ConnectorPartitionTransform, ConnectorRequestContext, ConnectorStagedCreateSession,
-    ConnectorStagedTableHandle, ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteInputRequest, ConnectorWriteIntent,
-    ConnectorWriteTargetRef, DdlPropertyValue, ExternalMutationFinalization,
+    ConnectorRequestContext, ConnectorStagedCreateSession, ConnectorStagedTableHandle,
+    ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteTargetRef, DdlPropertyValue,
+    ExternalMutationFinalization,
 };
 use std::{
     collections::BTreeMap,
@@ -70,12 +68,9 @@ pub(crate) enum CreatePublicationInput {
         context: ConnectorRequestContext,
     },
 }
-pub(crate) enum CreateStorageDeclarations {
-    Legacy(Vec<ConnectorPartitionTransform>),
-    Evaluated {
-        visible_partition_sources: Vec<Arc<str>>,
-        properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
-    },
+pub(crate) struct CreateStorageDeclarations {
+    pub(crate) visible_partition_sources: Vec<Arc<str>>,
+    pub(crate) properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
 }
 
 #[expect(
@@ -105,21 +100,9 @@ impl CreatePublicationInput {
                     .map(crate::catalog_application::statement::connector_column)
                     .collect::<Result<_, _>>()
                     .map_err(invalid)?,
-                storage: match &plan.storage {
-                    MvStagedStorage::Legacy(partitioning) => CreateStorageDeclarations::Legacy(
-                        partitioning
-                            .iter()
-                            .map(novarocks_query_application::sql::connector_partition_transform)
-                            .collect(),
-                    ),
-                    MvStagedStorage::Evaluated {
-                        visible_partition_sources,
-                        properties,
-                        ..
-                    } => CreateStorageDeclarations::Evaluated {
-                        visible_partition_sources: visible_partition_sources.clone(),
-                        properties: properties.clone(),
-                    },
+                storage: CreateStorageDeclarations {
+                    visible_partition_sources: plan.storage.visible_partition_sources.clone(),
+                    properties: plan.storage.properties.clone(),
                 },
                 application_properties: plan
                     .application_properties

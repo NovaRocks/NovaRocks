@@ -28,14 +28,16 @@ use crate::table_maintenance::{ParsedMaintenanceAction, ParsedMaintenanceStateme
 use novarocks_parser::{Span, ast::TrinoTableExecute};
 use novarocks_query_application::{
     admitted_query_context::QueryExecutionContext,
+    api::CommandErrorKind,
     session_control::GovernedStatementAction,
     session_error::{QueryServiceError, QueryServiceErrorKind},
     sql::{
         lower_object_name,
         property_evaluation::DdlPropertyConstantPort,
         table_procedure::{
-            BoundTableProcedure, ProcedureArgumentDefault, ProcedureRetentionDuration,
-            TableProcedureAbsoluteTimePort, invalid_procedure_argument,
+            BoundProcedureArgument, BoundProcedureValue, BoundTableProcedure,
+            ProcedureArgumentDefault, ProcedureRetentionDuration, TableProcedureAbsoluteTimePort,
+            TableProcedureKind, invalid_procedure_argument,
         },
         trino_table_command::bind_trino_table_execute,
     },
@@ -104,7 +106,7 @@ impl MaintenanceCommandExecutor {
             context.current_catalog,
             context.current_database,
         )
-        .map_err(legacy_target_error)?;
+        .map_err(maintenance_target_error)?;
         let instance = ConnectorInstanceId::parse(&target.catalog)
             .map_err(TerminalError::from_original_cause)
             .map_err(crate::query::maintenance_command_error)?;
@@ -307,7 +309,7 @@ impl MaintenanceCommandExecutor {
             target.table.clone(),
         ];
         self.prepare_metadata_source(
-            ParsedMaintenanceStatement::Execute { name_parts, action },
+            ParsedMaintenanceStatement { name_parts, action },
             false,
             context,
             execution,
@@ -708,7 +710,7 @@ mod tests {
     use novarocks_functions::{ConstantPool, ConstantValue};
     use novarocks_parser::{
         ast::{Expr, LiteralKind, TrinoStatement},
-        trino_parser::parse_statement,
+        parser::parse_statement,
     };
     use novarocks_query_application::sql::property_evaluation::DdlPropertyConstantError;
     use novarocks_spi::connector::{ConnectorColumnPath, ConnectorProviderId};
@@ -800,6 +802,41 @@ mod tests {
             source,
             SystemTime::UNIX_EPOCH + Duration::from_millis(800_000_123),
         )
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn development_equality_procedure_keeps_original_rows_for_the_typed_sink() {
+        use crate::query_execution::dml::delete::equality::{
+            PreparedEqualityDelete, tests::assert_prepared_equality_delete_sink,
+        };
+
+        let sql = "ALTER TABLE t EXECUTE add_equality_delete(columns => ARRAY['key'], rows => ARRAY[ROW(9007199254740993.125), ROW(-9007199254740993.125)])";
+        let TrinoStatement::TableExecute(statement) = parse_statement(sql).unwrap() else {
+            panic!("expected the equality-delete table procedure");
+        };
+        let statement = Arc::new(statement);
+        let control = SqlCompileControl::unbounded();
+        let bind = |provider: &ConnectorProviderId| {
+            bind_trino_table_execute(
+                sql,
+                &statement,
+                provider,
+                &mut LiteralValues,
+                &mut OriginalTimestamp { source: sql },
+                &control,
+            )
+        };
+        let bound = bind(&ConnectorProviderId::parse("iceberg").unwrap()).unwrap();
+        let prepared =
+            PreparedEqualityDelete::from_bound(sql, &statement, bound, &control).unwrap();
+        assert_prepared_equality_delete_sink(sql, &statement, &prepared);
+
+        let error = bind(&ConnectorProviderId::parse("paimon").unwrap()).unwrap_err();
+        assert_eq!(
+            error.user_error().unwrap().code().as_str(),
+            "sql.admit.table_procedure_not_found",
+        );
     }
 
     #[test]

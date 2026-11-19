@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorListNamespacesRequest,
-    ConnectorNamespaceIdentity, ConnectorPlanningContext, ConnectorReadReferenceFacts,
-    ConnectorReadReferenceFactsRequest, ConnectorRequestContext, ConnectorStopOwner,
-    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorNamespaceIdentity, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
+    ConnectorRequestContext, ConnectorStopOwner, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution,
 };
 
 struct QueryStopRelay {
@@ -115,19 +115,6 @@ pub(crate) fn connector_request_context_for_query_on_runtime(
         Instant::now() + query_expire_duration(query_options),
         cancellation,
     )
-}
-
-pub(crate) fn connector_planning_context_for_query_on_runtime(
-    runtime: &tokio::runtime::Handle,
-    query_options: Option<&QueryOptions>,
-    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-) -> Result<ConnectorPlanningContext, String> {
-    ConnectorPlanningContext::try_from_request(query_connector_request_context_on_runtime(
-        runtime,
-        Instant::now() + query_expire_duration(query_options),
-        cancellation,
-    )?)
-    .map_err(|error| error.to_string())
 }
 
 /// Derive connector admission from the immutable query execution captured by

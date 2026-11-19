@@ -3,10 +3,10 @@
 use super::*;
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_mv_application::engine_properties::{
-    MvEnginePropertyError, MvEnginePropertyErrorKind, engine_property_declarations,
-    prepare_create_engine_properties,
+    MvEnginePropertyError, MvEnginePropertyErrorKind, MvRefreshPropertyChanges,
+    engine_property_declarations, prepare_create_engine_properties,
 };
-use novarocks_parser::ast::{StatementProperty, TrinoCreateMaterializedView};
+use novarocks_parser::ast::{ObjectName, StatementProperty, TrinoCreateMaterializedView};
 use novarocks_query_application::{
     session_error::{QueryServiceError, QueryServiceErrorKind},
     sql::{
@@ -25,6 +25,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_type_contract::PureCompileControl;
 
+use crate::mv::domain::application::MvCreateStorage;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
 
 pub(crate) struct TrinoMvPropertyPreparation<'a> {
@@ -55,21 +56,14 @@ impl TrinoMvPropertyPreparation<'_> {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let range = statement.query.span.start()..statement.query.span.end();
-        let select_sql = self
-            .source
-            .get(range)
-            .ok_or_else(|| {
-                invariant("Materialized view definition span does not belong to its SQL source")
-            })?
-            .to_owned();
+        let select_sql = create_query_source(self.source, &statement)?.to_owned();
         Ok(MvCreateStatement {
             if_not_exists: statement.not_exists,
             refresh: prepared.refresh,
             primary_key: prepared.primary_key,
             select_sql,
             select_query: statement.query,
-            storage: MvCreateStorage::Evaluated {
+            storage: MvCreateStorage {
                 target,
                 binding,
                 properties: properties.into(),
@@ -79,7 +73,7 @@ impl TrinoMvPropertyPreparation<'_> {
 
     pub(crate) fn alter(
         &mut self,
-        name: TypedObjectName,
+        name: ObjectName,
         properties: novarocks_parser::ast::AstVec<StatementProperty>,
         span: novarocks_parser::Span,
     ) -> Result<(novarocks_sql::planning::mv::SqlMvTarget, MvAlterStatement), QueryServiceError>
@@ -114,7 +108,7 @@ impl TrinoMvPropertyPreparation<'_> {
 
     fn target(
         &self,
-        name: &TypedObjectName,
+        name: &ObjectName,
     ) -> Result<(Vec<String>, IcebergMvTarget, ConnectorProviderBindingKey), QueryServiceError>
     {
         let (parts, target) =
@@ -217,13 +211,29 @@ impl TrinoMvPropertyPreparation<'_> {
     }
 }
 
-pub(super) fn resolve_trino_target(
-    name: &TypedObjectName,
+pub(crate) fn create_query_source<'a>(
+    source: &'a str,
+    statement: &TrinoCreateMaterializedView,
+) -> Result<&'a str, QueryServiceError> {
+    source
+        .get(statement.query.span.start()..statement.query.span.end())
+        .ok_or_else(|| {
+            invariant("Materialized view definition span does not belong to its SQL source")
+        })
+}
+
+pub(crate) fn resolve_trino_target(
+    name: &ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<(Vec<String>, IcebergMvTarget), QueryServiceError> {
-    let parts = lower_typed_name_parts(name)
-        .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::InvalidValue, error))?;
+    if name.parts.is_empty() {
+        return Err(QueryServiceError::new(
+            QueryServiceErrorKind::InvalidValue,
+            "materialized view name must not be empty",
+        ));
+    }
+    let parts: Vec<_> = name.parts.iter().map(|part| part.value.clone()).collect();
     let (catalog, local_parts) = match parts.as_slice() {
         [catalog, _, _] => (Some(catalog.as_str()), &parts[1..]),
         _ => (current_catalog, parts.as_slice()),

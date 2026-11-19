@@ -475,11 +475,11 @@ mod tests {
             novarocks_types::naming::TableIdentity::new("iceberg", "published", "broken_mv");
         let error = crate::mv::domain::refresh::definition::read_stored_mv_query(source, &target)
             .expect_err("stored query must fail in the real parser");
-        let parser = novarocks_parser::parse(source)
+        let parser = novarocks_parser::parser::parse_query(source)
             .unwrap_err()
             .to_user_error(source);
         let location = parser.location().expect("parser source position");
-        assert_eq!((location.line(), location.column()), (2, 3));
+        assert_eq!((location.line(), location.column()), (2, 7));
 
         let capture = Capture::default();
         tracing::subscriber::with_default(capture.clone(), || {
@@ -501,7 +501,7 @@ mod tests {
         assert!(event.fields["mv"].contains(&target.fqn()));
         assert!(event.fields["error"].contains(&target.fqn()));
         assert!(event.fields["error"].contains(parser.code().as_str()));
-        assert!(event.fields["error"].contains(" at 2:3: "));
+        assert!(event.fields["error"].contains(" at 2:7: "));
         assert!(event.fields["error"].contains(parser.message()));
     }
 

@@ -551,11 +551,7 @@ mod tests {
     use novarocks_parser::printer::print_query;
 
     fn parse_select_for_test(sql: &str) -> novarocks_parser::ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("test SQL must parse");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("test SQL must be a query");
-        };
-        query.clone()
+        novarocks_parser::parser::parse_query(sql).expect("test SQL must parse")
     }
 
     fn make_pin(entries: &[(u32, &str, i64, &[u8])]) -> RefreshSnapshotPin {
@@ -658,8 +654,12 @@ mod tests {
         use crate::mv::domain::{analysis, flow};
         use novarocks_parser::ast::{Relation, SetExpr};
         for (sql, expected_table, quoted) in [
-            ("SELECT * FROM ice.db.orders$files", "orders", false),
-            ("SELECT * FROM ice.db.`orders$files`", "orders$files", true),
+            ("SELECT * FROM ice.db.\"orders$files\"", "orders", false),
+            (
+                "SELECT * FROM ice.db.\"orders$files\"",
+                "orders$files",
+                true,
+            ),
         ] {
             let mut query = parse_select_for_test(sql);
             let original = query.clone();
@@ -737,7 +737,10 @@ mod tests {
                 .expect("inject must succeed");
 
         assert_eq!(count, 0);
-        assert_eq!(print_query(&query), "SELECT * FROM ice.db.orders");
+        assert_eq!(
+            print_query(&query).unwrap(),
+            print_query(&parse_select_for_test("SELECT * FROM ice.db.orders")).unwrap(),
+        );
     }
 
     #[test]
@@ -756,8 +759,11 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(
-            print_query(&query),
-            "SELECT * FROM db.orders JOIN ice.db.customers FOR VERSION AS OF 99 ON TRUE"
+            print_query(&query).unwrap(),
+            print_query(&parse_select_for_test(
+                "SELECT * FROM db.orders JOIN ice.db.customers FOR VERSION AS OF 99 ON TRUE",
+            ))
+            .unwrap(),
         );
     }
 
@@ -778,8 +784,11 @@ mod tests {
 
         assert_eq!(count, 2);
         assert_eq!(
-            print_query(&query),
-            "WITH recent AS (SELECT * FROM ice.db.orders FOR VERSION AS OF 11) SELECT * FROM recent UNION ALL SELECT * FROM ice.db.orders FOR VERSION AS OF 22"
+            print_query(&query).unwrap(),
+            print_query(&parse_select_for_test(
+                "WITH recent AS (SELECT * FROM ice.db.orders FOR VERSION AS OF 11) SELECT * FROM recent UNION ALL SELECT * FROM ice.db.orders FOR VERSION AS OF 22",
+            ))
+            .unwrap(),
         );
     }
 
@@ -797,7 +806,7 @@ mod tests {
             inject_pin_as_for_version_as_of(&mut query, &pin, &HashSet::new(), Some("ice"), "db")
                 .expect("inject must preserve both occurrences");
 
-        let sql = print_query(&query);
+        let sql = print_query(&query).unwrap();
         assert_eq!(count, 2);
         assert_eq!(sql.matches("VERSION AS OF 11").count(), 1, "{sql}");
         assert_eq!(sql.matches("VERSION AS OF 22").count(), 1, "{sql}");
@@ -852,8 +861,11 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(
-            print_query(&query),
-            "SELECT * FROM (SELECT * FROM ice.db.orders JOIN ice.db.customers FOR VERSION AS OF 99 ON TRUE) AS joined"
+            print_query(&query).unwrap(),
+            print_query(&parse_select_for_test(
+                "SELECT * FROM (SELECT * FROM ice.db.orders JOIN ice.db.customers FOR VERSION AS OF 99 ON TRUE) AS joined",
+            ))
+            .unwrap(),
         );
     }
 }

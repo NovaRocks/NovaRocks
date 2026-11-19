@@ -220,13 +220,11 @@ impl InstalledIcebergCatalog {
         &self,
         bindings: &QueryTableBindingStore,
     ) -> SqlCapturedCatalogPreparation {
-        let statements = novarocks_parser::parse(r#"SELECT x FROM ice.db."orders$files""#).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("one actual SQL query");
-        };
+        let query = novarocks_parser::parser::parse_query(r#"SELECT x FROM ice.db."orders$files""#)
+            .unwrap();
         let compile_control = SqlCompileControl::unbounded();
         let candidates =
-            quoted_metadata_catalogs(query, Some("ice"), "db", &compile_control).unwrap();
+            quoted_metadata_catalogs(&query, Some("ice"), "db", &compile_control).unwrap();
         assert_eq!(candidates, [ice()]);
         let qualifications = bindings
             .observe_catalog_qualifications(&candidates, Some(self.application.as_ref()))

@@ -18,14 +18,13 @@
 //! Materialized-view query-analysis vocabulary and pure staged contract.
 
 pub mod refresh_property;
-use std::collections::HashSet;
 
 use novarocks_parser::ast::{Ident, Query, Relation, SetExpr};
 use novarocks_sql::planning::mv::{
     SqlMvOutputColumnFacts, SqlResolvedMvRefreshInput, SqlResolvedMvRefreshInputSource,
     strip_catalog_from_three_part_names,
 };
-use novarocks_sql::semantic::{IcebergPartitionFieldExpr, ObjectName, TableColumnDef};
+use novarocks_sql::semantic::{ObjectName, TableColumnDef};
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,9 +212,6 @@ fn validate_mv_select_raw_select_clauses(
     if !select.windows.is_empty() {
         return Err(unsupported_mv_select_clause("named WINDOW clauses"));
     }
-    if select.legacy.qualify.is_some() {
-        return Err(unsupported_mv_select_clause("QUALIFY"));
-    }
     Ok(())
 }
 
@@ -235,7 +231,7 @@ fn validate_mv_select_raw_clauses_in_factor(factor: &Relation) -> Result<(), Str
         Relation::TableSubquery(node) => validate_mv_select_raw_query_clauses(&node.query),
         Relation::Lateral(_) => Err(unsupported_mv_from_clause("LATERAL derived tables")),
         Relation::JsonTable(_) => Err(unsupported_mv_from_clause("JSON_TABLE")),
-        Relation::TableFunction(_) | Relation::LegacyTableFunction(_) | Relation::Unnest(_) => {
+        Relation::TableFunction(_) | Relation::Unnest(_) => {
             Err(unsupported_mv_from_clause("table functions"))
         }
         _ => Err(unsupported_mv_from_clause("relation modifiers")),
@@ -406,63 +402,6 @@ pub(crate) fn resolve_mv_name(
     }
 }
 
-pub fn validate_mv_partition_columns(
-    partition_by: Option<&[IcebergPartitionFieldExpr]>,
-    output_columns: &[SqlMvOutputColumnFacts],
-) -> Result<(), String> {
-    let Some(partition_by) = partition_by else {
-        return Ok(());
-    };
-    let output_names = output_columns
-        .iter()
-        .map(|column| normalize_identifier(&column.name))
-        .collect::<Result<HashSet<_>, _>>()?;
-    for field in partition_by {
-        let column = mv_partition_source_column(field);
-        let normalized = normalize_identifier(column)?;
-        if !output_names.contains(&normalized) {
-            return Err(format!(
-                "materialized view PARTITION BY column `{column}` must be an output column"
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn validate_starrocks_mv_partition_columns(
-    partition_by: Option<&[IcebergPartitionFieldExpr]>,
-    output_columns: &[SqlMvOutputColumnFacts],
-) -> Result<(), String> {
-    if let Some(fields) = partition_by {
-        for field in fields {
-            if !matches!(field, IcebergPartitionFieldExpr::Identity { .. }) {
-                return Err(
-                    "StarRocks table materialized view PARTITION BY only supports identity columns"
-                        .to_string(),
-                );
-            }
-        }
-    }
-    validate_mv_partition_columns(partition_by, output_columns)
-}
-
-fn mv_partition_source_column(field: &IcebergPartitionFieldExpr) -> &str {
-    match field {
-        IcebergPartitionFieldExpr::Identity { column }
-        | IcebergPartitionFieldExpr::Year { column }
-        | IcebergPartitionFieldExpr::Month { column }
-        | IcebergPartitionFieldExpr::Day { column }
-        | IcebergPartitionFieldExpr::Hour { column }
-        | IcebergPartitionFieldExpr::Bucket { column, .. }
-        | IcebergPartitionFieldExpr::Truncate { column, .. }
-        | IcebergPartitionFieldExpr::Void { column } => column,
-    }
-}
-
 fn collect_table_refs_from_query(
     query: &Query,
     current_catalog: Option<&str>,
@@ -629,18 +568,14 @@ pub(crate) fn output_column_to_table_column(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::printer::Printer;
+    use novarocks_parser::printer::print_query;
 
     fn parse_query(sql: &str) -> Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
-        query.clone()
+        novarocks_parser::parser::parse_query(sql).expect("parse query")
     }
 
     fn render_query(query: &Query) -> String {
-        Printer::new().statement(&novarocks_parser::ast::Statement::Query(query.clone()))
+        print_query(query).expect("print fixture query")
     }
 
     #[test]

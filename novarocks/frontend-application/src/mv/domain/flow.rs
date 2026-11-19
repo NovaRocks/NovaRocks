@@ -242,11 +242,7 @@ mod tests {
     }
 
     fn parse_query(sql: &str) -> novarocks_parser::ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
-        query.clone()
+        novarocks_parser::parser::parse_query(sql).expect("parse query")
     }
 
     fn base_ref() -> novarocks_types::naming::TableIdentity {

@@ -37,7 +37,6 @@ use crate::catalog_application::resolver::{CatalogAdmission, TargetBackend};
 use crate::catalog_application::statement::{
     CatalogDropContext, CatalogMutationContext, ColumnPath, execute_create_database_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
-    lower_semantic_iceberg_partition_change, lower_semantic_iceberg_properties_action,
     lower_semantic_iceberg_schema_change,
 };
 use crate::mv::domain::readiness::MvReadinessPort;
@@ -308,20 +307,10 @@ impl CatalogCommandExecutor {
                 current_database,
                 connector_context,
             ),
-            IcebergTableSqlAction::Properties(action) => execute_alter_iceberg_properties(
+            IcebergTableSqlAction::Comment(comment) => execute_iceberg_table_comment(
                 self,
-                crate::catalog_application::statement::AlterIcebergPropertiesStmt {
-                    table: command.table.clone(),
-                    op: lower_semantic_iceberg_properties_action(action)?,
-                },
-                current_catalog,
-                current_database,
-                connector_context,
-            ),
-            IcebergTableSqlAction::Partition(change) => execute_alter_partition_spec(
-                self,
-                command.table.clone(),
-                lower_semantic_iceberg_partition_change(change)?,
+                &command.table,
+                comment,
                 current_catalog,
                 current_database,
                 connector_context,
@@ -330,9 +319,6 @@ impl CatalogCommandExecutor {
                 ("Iceberg reference command belongs to the ref command executor".to_string())
                     .into(),
             ),
-            IcebergTableSqlAction::AddFiles { .. } => {
-                Err(("ADD FILES belongs to the DML lifecycle executor".to_string()).into())
-            }
         }
     }
 
@@ -367,16 +353,17 @@ pub(super) fn lower_semantic_create_catalog(
     })
 }
 
-fn execute_alter_iceberg_properties(
+fn execute_iceberg_table_comment(
     executor: &CatalogCommandExecutor,
-    statement: crate::catalog_application::statement::AlterIcebergPropertiesStmt,
+    table: &ObjectName,
+    comment: &str,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, CommandError> {
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         executor,
-        &statement.table,
+        table,
         current_catalog,
         current_database,
     )?;
@@ -389,30 +376,9 @@ fn execute_alter_iceberg_properties(
     )?;
     if target.provider_id.as_str() != "iceberg" {
         return Err(
-            ("ALTER TABLE TBLPROPERTIES only supports standalone iceberg catalogs".to_string())
-                .into(),
+            ("COMMENT ON TABLE only supports standalone Iceberg catalogs".to_string()).into(),
         );
     }
-    let changes = match statement.op {
-        crate::catalog_application::statement::PropertiesOp::Set { entries } => entries
-            .into_iter()
-            .map(
-                |(key, value)| novarocks_spi::connector::ConnectorPropertyChange::Set {
-                    key: Arc::from(key),
-                    value: Arc::from(value),
-                },
-            )
-            .collect(),
-        crate::catalog_application::statement::PropertiesOp::Unset { keys, if_exists } => keys
-            .into_iter()
-            .map(
-                |key| novarocks_spi::connector::ConnectorPropertyChange::Unset {
-                    key: Arc::from(key),
-                    if_exists,
-                },
-            )
-            .collect(),
-    };
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
     crate::connector::mutation::execute_catalog_mutation(
@@ -424,7 +390,10 @@ fn execute_alter_iceberg_properties(
                 namespace: Arc::from(target.namespace.as_str()),
                 table: Arc::from(target.table.as_str()),
             },
-            changes,
+            changes: vec![ConnectorPropertyChange::Set {
+                key: Arc::from("comment"),
+                value: Arc::from(comment),
+            }],
             authority: novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
             expected_committed_partitioning: None,
         },
@@ -525,10 +494,6 @@ fn execute_alter_iceberg_schema(
             comment: Arc::from(comment),
         },
     };
-    let control = crate::query_execution::planning::sql_compile_control_from_connector_request(
-        connector_context,
-    );
-    let change = bind_legacy_column_procedure(&target.provider_id, change, &control)?;
     let planning = executor
         .connector_control
         .acquire_current(&instance_id)
@@ -643,118 +608,6 @@ impl PreparedIcebergTableMutation {
     }
 }
 
-fn bind_legacy_column_procedure(
-    provider: &novarocks_spi::connector::ConnectorProviderId,
-    change: novarocks_spi::connector::ConnectorSchemaChange,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<novarocks_spi::connector::ConnectorSchemaChange, CommandError> {
-    use novarocks_query_application::sql::table_procedure::{
-        BoundProcedureArgument, BoundProcedureValue, LegacyProcedureValue,
-        bind_legacy_procedure_arguments, resolve_legacy_table_procedure,
-    };
-    use novarocks_spi::connector::{
-        ConnectorColumnPosition, ConnectorSchemaChange, DdlPropertyValue,
-    };
-
-    // Other providers retain their original schema admission and error owner.
-    if provider.as_str() != "iceberg" {
-        return Ok(change);
-    }
-    let (name, path, position) = match &change {
-        ConnectorSchemaChange::ReorderColumn { path, position } => {
-            let position = match position {
-                ConnectorColumnPosition::First => ("FIRST", None),
-                ConnectorColumnPosition::After { column } => ("AFTER", Some(column.as_ref())),
-                ConnectorColumnPosition::Before { column } => ("BEFORE", Some(column.as_ref())),
-                ConnectorColumnPosition::Default => return Ok(change),
-            };
-            ("move_column", path, Some(position))
-        }
-        ConnectorSchemaChange::SetColumnNullability {
-            path,
-            nullable: false,
-        } => ("set_column_not_null", path, None),
-        _ => return Ok(change),
-    };
-    let mut arguments = vec![("column", LegacyProcedureValue::ColumnPath(path))];
-    if let Some((position, reference)) = position {
-        arguments.push(("position", LegacyProcedureValue::Varchar(position)));
-        if let Some(reference) = reference {
-            arguments.push(("reference", LegacyProcedureValue::Varchar(reference)));
-        }
-    }
-
-    let procedure = resolve_legacy_table_procedure(provider, name)
-        .map_err(crate::query::procedure_command_error)?;
-    let bound = bind_legacy_procedure_arguments(procedure, &arguments, control)
-        .map_err(crate::query::procedure_command_error)?;
-    let mismatch = || {
-        CommandError::new(
-            novarocks_query_application::api::CommandErrorKind::Failed,
-            "Legacy column arguments differ from their original procedure declaration",
-        )
-    };
-    let mut slots = bound
-        .into_arguments()
-        .map(|(slot, argument)| (slot.name, argument));
-    let Some((
-        "column",
-        BoundProcedureArgument::Present {
-            value: BoundProcedureValue::LegacyColumnPath(path),
-            ..
-        },
-    )) = slots.next()
-    else {
-        return Err(mismatch());
-    };
-    if position.is_none() {
-        if slots.len() != 0 {
-            return Err(mismatch());
-        }
-        return Ok(ConnectorSchemaChange::SetColumnNullability {
-            path,
-            nullable: false,
-        });
-    }
-    let Some((
-        "position",
-        BoundProcedureArgument::Present {
-            value: BoundProcedureValue::Value(DdlPropertyValue::Varchar(position)),
-            ..
-        },
-    )) = slots.next()
-    else {
-        return Err(mismatch());
-    };
-    let position = match (position.as_str(), slots.next()) {
-        ("FIRST", Some(("reference", BoundProcedureArgument::Omitted))) => {
-            ConnectorColumnPosition::First
-        }
-        (
-            position @ ("AFTER" | "BEFORE"),
-            Some((
-                "reference",
-                BoundProcedureArgument::Present {
-                    value: BoundProcedureValue::Value(DdlPropertyValue::Varchar(column)),
-                    ..
-                },
-            )),
-        ) => {
-            let column = Arc::from(column);
-            if position == "AFTER" {
-                ConnectorColumnPosition::After { column }
-            } else {
-                ConnectorColumnPosition::Before { column }
-            }
-        }
-        _ => return Err(mismatch()),
-    };
-    if slots.len() != 0 {
-        return Err(mismatch());
-    }
-    Ok(ConnectorSchemaChange::ReorderColumn { path, position })
-}
-
 /// Admit the complete schema mutation before any metadata-dependent guard.
 /// Both guards and publication retain the same control generation even if the
 /// catalog's current generation changes while the statement is in progress.
@@ -792,66 +645,6 @@ fn execute_admitted_table_mutation_on_pin(
         operation,
         context,
     )
-}
-
-fn execute_alter_partition_spec(
-    executor: &CatalogCommandExecutor,
-    table_name: ObjectName,
-    statement: crate::catalog_application::statement::IcebergPartitionSpecChange,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, CommandError> {
-    let target = crate::catalog_application::resolver::resolve_table_target(
-        executor,
-        &table_name,
-        current_catalog,
-        current_database,
-    )?;
-    if target.provider_id.as_str() != "iceberg" {
-        return Err((format!(
-            "ALTER TABLE ADD/DROP PARTITION COLUMN only supports iceberg backends, got `{}`",
-            target.provider_id.as_str()
-        ))
-        .into());
-    }
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-        executor.connector_control.as_ref(),
-        executor.mv_storage_observation.as_ref(),
-        executor.mv_readiness.as_ref(),
-        &target,
-        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
-    )?;
-    let (adding, transform) = match statement {
-        crate::catalog_application::statement::IcebergPartitionSpecChange::Add(transform) => {
-            (true, transform)
-        }
-        crate::catalog_application::statement::IcebergPartitionSpecChange::Drop(transform) => {
-            (false, transform)
-        }
-    };
-    let instance_id =
-        ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
-    crate::connector::mutation::execute_catalog_mutation(
-        executor.connector_control.as_ref(),
-        &instance_id,
-        novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterPartitionSpec {
-            table: novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: Arc::from(target.namespace.as_str()),
-                table: Arc::from(target.table.as_str()),
-            },
-            add: if adding {
-                vec![transform.clone()]
-            } else {
-                Vec::new()
-            },
-            drop: if adding { Vec::new() } else { vec![transform] },
-        },
-        connector_context.clone(),
-    )?;
-    crate::catalog_application::resolver::invalidate_iceberg_caches(executor, &target)?;
-    Ok(StatementResult::Ok)
 }
 
 /// Copy the source's complete declaration. A shared Arrow carrier alone
@@ -930,7 +723,6 @@ fn execute_show_create_table(
 
 #[cfg(test)]
 mod tests {
-    use novarocks_parser::ast::Statement;
 
     use super::{CatalogCommandExecutor, lower_semantic_create_catalog};
 
@@ -939,120 +731,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn legacy_column_procedure_arguments_keep_authored_segments_and_sibling_position() {
-        use crate::catalog_application::statement::{
-            IcebergSchemaChange, connector_schema_path, connector_schema_position,
-            lower_semantic_iceberg_schema_change,
-        };
-        use novarocks_query_application::sql::{
-            ProductSqlCommand, lower_product_sql_command, parse_single_statement,
-        };
-        use novarocks_sql::compiler::SqlCompileControl;
-
-        let provider = spi::ConnectorProviderId::parse("iceberg").unwrap();
-        let control = SqlCompileControl::unbounded();
-        for (suffix, expected_segments, expected_position, expected_nullable) in [
-            (
-                "parent_field.child_field AFTER parent_field.sibling",
-                &["parent_field", "child_field"][..],
-                Some(spi::ConnectorColumnPosition::After {
-                    column: Arc::from("sibling"),
-                }),
-                None,
-            ),
-            (
-                "`dot.name` FIRST",
-                &["dot.name"][..],
-                Some(spi::ConnectorColumnPosition::First),
-                None,
-            ),
-            (
-                "parent_field.child_field BEFORE parent_field.sibling",
-                &["parent_field", "child_field"][..],
-                Some(spi::ConnectorColumnPosition::Before {
-                    column: Arc::from("sibling"),
-                }),
-                None,
-            ),
-            (
-                "`dot.name` SET NOT NULL",
-                &["dot.name"][..],
-                None,
-                Some(false),
-            ),
-            (
-                "`dot.name` DROP NOT NULL",
-                &["dot.name"][..],
-                None,
-                Some(true),
-            ),
-        ] {
-            let source = format!("ALTER TABLE ice.db.orders ALTER COLUMN {suffix}");
-            let parsed = parse_single_statement(&source).unwrap();
-            let Some(ProductSqlCommand::Catalog(command)) =
-                lower_product_sql_command(&parsed).unwrap()
-            else {
-                panic!("original ALTER TABLE lowerer");
-            };
-            let super::CatalogSqlCommand::AlterIcebergTable(command) = *command else {
-                panic!("original Iceberg ALTER TABLE lowerer");
-            };
-            let super::IcebergTableSqlAction::Schema(change) = command.action else {
-                panic!("original column change lowerer");
-            };
-            let (original_segments, change) =
-                match lower_semantic_iceberg_schema_change(&change).unwrap() {
-                    IcebergSchemaChange::Reorder { path, position } => {
-                        let path = connector_schema_path(path);
-                        (
-                            path.segments.clone(),
-                            spi::ConnectorSchemaChange::ReorderColumn {
-                                path,
-                                position: connector_schema_position(position),
-                            },
-                        )
-                    }
-                    IcebergSchemaChange::SetNullable { path, nullable } => {
-                        let path = connector_schema_path(path);
-                        (
-                            path.segments.clone(),
-                            spi::ConnectorSchemaChange::SetColumnNullability { path, nullable },
-                        )
-                    }
-                    _ => panic!("expected the original position or nullable change"),
-                };
-            let bound = super::bind_legacy_column_procedure(&provider, change, &control).unwrap();
-            let path = match bound {
-                spi::ConnectorSchemaChange::ReorderColumn { path, position } => {
-                    assert_eq!(Some(position), expected_position);
-                    assert_eq!(expected_nullable, None);
-                    path
-                }
-                spi::ConnectorSchemaChange::SetColumnNullability { path, nullable } => {
-                    assert_eq!(Some(nullable), expected_nullable);
-                    assert_eq!(expected_position, None);
-                    path
-                }
-                _ => panic!("expected the bound position or nullable change"),
-            };
-            assert_eq!(
-                path.segments.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
-                expected_segments
-            );
-            assert!(
-                path.segments
-                    .iter()
-                    .zip(original_segments)
-                    .all(|(bound, original)| Arc::ptr_eq(bound, &original)),
-                "binding retains the original segment allocations"
-            );
-        }
-    }
-
-    // These correctness tests exercise the FE sequencing boundary through real
-    // SPI leases. Metadata and mutation calls record their own observations;
-    // the guard is a metadata consumer, without duplicating MV policy here.
     struct SchemaAlterGeneration {
         descriptor: spi::ConnectorInstanceDescriptor,
         marker: u8,
@@ -1632,15 +1310,14 @@ mod tests {
         // Construction is unnecessary for an unsupported family because the
         // parser gate must reject it before any port is read.
         let sql = "SELECT 'CREATE TABLE t AS SELECT 1'";
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        assert!(matches!(statements.as_slice(), [Statement::Query(_)]));
+        novarocks_parser::parser::parse_query(sql).expect("parse query");
         let _ = std::any::type_name::<CatalogCommandExecutor>();
     }
 
     #[test]
     fn typed_create_catalog_lowers_without_the_legacy_sql_facade() {
-        let statement = crate::query::catalog_property_computation::prepare_legacy_catalog_for_test(
-            "CREATE EXTERNAL CATALOG IF NOT EXISTS Warehouse PROPERTIES ('type'='iceberg')",
+        let statement = crate::query::catalog_property_computation::prepare_catalog_for_test(
+            "CREATE CATALOG IF NOT EXISTS Warehouse USING iceberg",
         );
 
         let command = lower_semantic_create_catalog(&statement).expect("lower catalog command");

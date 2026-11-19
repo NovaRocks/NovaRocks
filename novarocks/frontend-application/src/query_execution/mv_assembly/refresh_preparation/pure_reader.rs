@@ -397,9 +397,7 @@ async fn prepare_managed_repartition_transition(
         table: contract.target.name.clone(),
     };
     validate_retained_target_identity(&target, retained_target.binding.identity())?;
-    if let MvRepartitionFields::Property { owner, .. } = fields
-        && *owner != execution_binding_key_for_target(retained_target.binding.planning_pin())
-    {
+    if fields.owner != execution_binding_key_for_target(retained_target.binding.planning_pin()) {
         return Err(MvApplicationError::new(
             crate::mv::domain::application::MvApplicationErrorKind::BindingInvalidated,
             "MV partition property scope belongs to a different connector generation",
@@ -475,9 +473,6 @@ async fn prepare_managed_repartition_transition(
         source.constant_policy(),
         completion_control.clone(),
     )?;
-    if let MvRepartitionFields::Legacy(fields) = fields {
-        validate_mv_partition_columns(Some(fields), &analysis.output_columns)?;
-    }
     if derive_fragment_property(&analysis, &completion_control)?
         .is_composed_aggregate_schema_contract_fallback()
     {
@@ -511,102 +506,58 @@ async fn prepare_managed_repartition_transition(
         )
         .map_err(|error| error.to_string())?;
     let target_field_id_by_name = retained_target_field_id_by_name(retained_target)?;
-    let derive_write_lease = || {
-        retained_target
-            .binding
-            .planning_pin()
-            .derive_write_lease()
-            .map_err(PreparationError::from)
+    let MvRepartitionFields {
+        properties,
+        partitioning_index,
+        configuration,
+        ..
+    } = fields;
+    use novarocks_spi::connector::{DdlPropertyChange, DdlPropertyValue};
+    let (_, change) = properties.get(*partitioning_index).ok_or_else(|| {
+        PreparationError::user("MV repartition lost its evaluated partition property")
+    })?;
+    let value = match change {
+        DdlPropertyChange::Set(value) | DdlPropertyChange::Reset(value) => value,
     };
-    let (replacement_fields, typed_write_lease) = match fields {
-        MvRepartitionFields::Legacy(fields) => {
-            let fields = fields
-        .iter()
-        .enumerate()
-        .map(|(position, field)| {
-            let (column, transform) = managed_repartition_field(field);
-            let source_field_id = target_field_id_by_name
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(column))
-                .map(|(_, field_id)| *field_id)
-                .ok_or_else(|| {
-                    format!(
-                        "MV repartition source column `{column}` is missing from the exact target observation"
-                    )
-                })?;
-            novarocks_spi::connector::ConnectorManagedPartitionField::try_new(
-                source_field_id,
-                u32::try_from(position)
-                    .map_err(|_| "MV repartition field count exceeds u32".to_string())?,
-                transform,
-            )
-            .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-            (fields, None)
-        }
-        MvRepartitionFields::Property {
-            properties,
-            partitioning_index,
-            ..
-        } => {
-            use novarocks_spi::connector::{DdlPropertyChange, DdlPropertyValue};
-            let (_, change) = properties.get(*partitioning_index).ok_or_else(|| {
-                PreparationError::user("MV repartition lost its evaluated partition property")
-            })?;
-            let value = match change {
-                DdlPropertyChange::Set(value) | DdlPropertyChange::Reset(value) => value,
-            };
-            let DdlPropertyValue::ArrayVarchar(fields) = value else {
-                return Err(PreparationError::user(
-                    "MV repartition requires array(varchar)",
-                ));
-            };
-            let mut visible_sources = std::collections::HashSet::new();
-            for column in &analysis.output_columns {
-                novarocks_spi::connector::ConnectorOperationControl::check_active(
-                    connector_context,
-                )?;
-                visible_sources
-                    .insert(novarocks_types::naming::normalize_identifier(&column.name)?);
-            }
-            let write_lease = derive_write_lease()?;
-            let fields = bind_property_repartition_fields(
-                fields,
-                &visible_sources,
-                &target_field_id_by_name,
+    let DdlPropertyValue::ArrayVarchar(fields) = value else {
+        return Err(PreparationError::user(
+            "MV repartition requires array(varchar)",
+        ));
+    };
+    let mut visible_sources = std::collections::HashSet::new();
+    for column in &analysis.output_columns {
+        novarocks_spi::connector::ConnectorOperationControl::check_active(connector_context)?;
+        visible_sources.insert(novarocks_types::naming::normalize_identifier(&column.name)?);
+    }
+    let write_lease = retained_target
+        .binding
+        .planning_pin()
+        .derive_write_lease()
+        .map_err(PreparationError::from)?;
+    let replacement_fields = bind_property_repartition_fields(
+        fields,
+        &visible_sources,
+        &target_field_id_by_name,
+        connector_context,
+        |field, index| {
+            write_lease.parse_managed_partitioning_element(
+                retained_target.binding.handle(),
+                field,
+                index,
                 connector_context,
-                |field, index| {
-                    write_lease.parse_managed_partitioning_element(
-                        retained_target.binding.handle(),
-                        field,
-                        index,
-                        connector_context,
-                    )
-                },
-            )?;
-            (fields, Some(write_lease))
-        }
-    };
+            )
+        },
+    )?;
     let replacement = novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement::try_new(
         operation_id,
         expected_prior,
         replacement_fields,
     )
     .map_err(|error| error.to_string())?;
-    let replacement = match fields {
-        MvRepartitionFields::Property {
-            properties,
-            partitioning_index,
-            ..
-        } if properties.len() > 1 => {
-            replacement.with_storage_properties(Arc::clone(properties), *partitioning_index)?
-        }
-        _ => replacement,
-    };
-    let write_lease = match typed_write_lease {
-        Some(lease) => lease,
-        None => derive_write_lease()?,
+    let replacement = if properties.len() > 1 {
+        replacement.with_storage_properties(Arc::clone(properties), *partitioning_index)?
+    } else {
+        replacement
     };
     let preview = write_lease
         .preview_managed_partition_spec(ConnectorManagedPartitionSpecPreviewRequest::new(
@@ -619,10 +570,7 @@ async fn prepare_managed_repartition_transition(
     Ok(PreparedManagedRepartitionTransition {
         replacement,
         preview,
-        configuration: match fields {
-            MvRepartitionFields::Legacy(_) => None,
-            MvRepartitionFields::Property { configuration, .. } => configuration.clone(),
-        },
+        configuration: configuration.clone(),
     })
 }
 

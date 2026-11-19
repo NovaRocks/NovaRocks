@@ -150,28 +150,18 @@ mod tests {
         let family =
             novarocks_result_contract::ClientPresentationFamily::TrinoJson(Default::default());
         for (sql, catalog, namespace) in [
-            (
-                "ANALYZE TABLE system.metadata.materialized_views",
-                None,
-                "db",
-            ),
-            ("ANALYZE TABLE SYSTEM.INFORMATION_SCHEMA.TABLES", None, "db"),
-            (
-                "ANALYZE TABLE catalog.information_schema.tables",
-                None,
-                "db",
-            ),
-            (
-                "ANALYZE TABLE tables",
-                Some("catalog"),
-                "information_schema",
-            ),
+            ("ANALYZE system.metadata.materialized_views", None, "db"),
+            ("ANALYZE SYSTEM.INFORMATION_SCHEMA.TABLES", None, "db"),
+            ("ANALYZE catalog.information_schema.tables", None, "db"),
+            ("ANALYZE tables", Some("catalog"), "information_schema"),
         ] {
             let statement = novarocks_query_application::sql::parse_single_statement(sql).unwrap();
-            let Some(novarocks_query_application::sql::ProductSqlCommand::Statistics(command)) =
-                novarocks_query_application::sql::lower_product_sql_command(&statement).unwrap()
-            else {
+            let novarocks_parser::ast::TrinoStatement::Analyze(statement) = statement else {
                 panic!("typed statistics command")
+            };
+            let command = novarocks_sql::semantic::StatisticsSqlCommand::AnalyzeTable {
+                table: novarocks_query_application::sql::lower_object_name(&statement.table_name),
+                columns: None,
             };
             let error = executor
                 .prepare_statement_action(

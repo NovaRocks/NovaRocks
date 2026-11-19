@@ -309,10 +309,7 @@ impl CreateOriginal {
             .planning
             .derive_staged_create_lease()
             .map_err(provider)?;
-        if let crate::mv::domain::iceberg_refresh::MvStagedStorage::Evaluated { binding, .. } =
-            &input.plan.storage
-            && staged_session.owner() != binding
-        {
+        if staged_session.owner() != &input.plan.storage.binding {
             return Err(MvApplicationError::new(
                 MvApplicationErrorKind::BindingInvalidated,
                 "MV storage property declarations belong to a replaced catalog binding",
@@ -854,38 +851,21 @@ impl Body {
             .as_ref()
             .ok_or_else(|| invalid("CREATE management admission is absent"))?
             .clone();
-        use crate::query_execution::mv_assembly::create_publication::CreateStorageDeclarations;
-        let request = match storage {
-            CreateStorageDeclarations::Legacy(partitioning) => {
-                self.staged_session.prepare_document_managed_request(
-                    publication,
-                    self.operation,
-                    self.table.clone(),
-                    columns,
-                    partitioning,
-                    application_properties,
-                    CreatePolicy::FailIfExists,
-                    admission,
-                    self.input.context.clone(),
-                )
-            }
-            CreateStorageDeclarations::Evaluated {
-                visible_partition_sources,
-                properties,
-            } => self.staged_session.prepare_document_managed_typed_request(
+        let request = self
+            .staged_session
+            .prepare_document_managed_typed_request(
                 publication,
                 self.operation,
                 self.table.clone(),
                 columns,
-                visible_partition_sources,
-                properties,
+                storage.visible_partition_sources,
+                storage.properties,
                 application_properties,
                 CreatePolicy::FailIfExists,
                 admission,
                 self.input.context.clone(),
-            ),
-        }
-        .map_err(provider)?;
+            )
+            .map_err(provider)?;
         self.request = Some(request);
         self.management_mut()?
             .mark_create_intent_dispatched(super::now_management_timestamp().map_err(invalid)?)
@@ -1567,21 +1547,23 @@ mod original_stage_tests {
 
     fn plan(
         context: &ConnectorRequestContext,
+        binding: ConnectorProviderBindingKey,
     ) -> (Arc<IcebergMvCreatePlan>, Arc<MvCreateProjectionSeed>) {
         let sql = "SELECT id, count(*) AS n FROM iceberg.db.orders GROUP BY id";
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query fixture");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         let statement = crate::mv::domain::application::MvCreateStatement {
             if_not_exists: false,
             refresh: novarocks_mv_application::repository::InitialMvRefreshConfiguration::default(),
             select_sql: sql.into(),
-            select_query: query.clone(),
-            storage: crate::mv::domain::application::MvCreateStorage::Legacy {
-                name_parts: vec!["new_mv".into()],
-                partition_by: None,
-                properties: Vec::new(),
+            select_query: query,
+            storage: crate::mv::domain::application::MvCreateStorage {
+                target: crate::mv::domain::refresh::target::IcebergMvTarget {
+                    catalog: binding.instance_id.as_str().into(),
+                    namespace: "db".into(),
+                    table: "new_mv".into(),
+                },
+                binding,
+                properties: Arc::from([]),
             },
             primary_key: None,
         };
@@ -1596,7 +1578,6 @@ mod original_stage_tests {
     ) -> (Arc<IcebergMvCreatePlan>, Arc<MvCreateProjectionSeed>) {
         use crate::mv::domain::iceberg_refresh::{
             finish_mv_create_preparation, prepare_mv_create_properties, prepare_mv_create_shape,
-            prepare_mv_create_target,
         };
         use novarocks_sql::compiler::{
             CatalogRelationFact, SqlCapturedCatalogPreparation, SqlCompileControl,
@@ -1658,9 +1639,9 @@ mod original_stage_tests {
                 control.clone(),
             )
             .unwrap();
-        let target =
-            prepare_mv_create_target(Some(current_catalog), current_database, statement).unwrap();
-        let shape = prepare_mv_create_shape(target, statement, query, analysis, &control).unwrap();
+        let shape =
+            prepare_mv_create_shape(statement.storage.target.clone(), query, analysis, &control)
+                .unwrap();
         let (property, persistence) = prepare_mv_create_properties(&shape, &control).unwrap();
         let object_id =
             ConnectorTableObjectId::try_new(Bytes::from_static(b"orders-object")).unwrap();
@@ -1746,10 +1727,7 @@ mod original_stage_tests {
         )
         .unwrap();
         let sql = "SELECT id, count(*) AS n FROM iceberg.db.orders GROUP BY id";
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query fixture");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         let properties: Arc<[(Arc<str>, DdlPropertyValue)]> = vec![
             ("format_version".into(), DdlPropertyValue::Integer(3)),
             (
@@ -1762,8 +1740,8 @@ mod original_stage_tests {
             if_not_exists: false,
             refresh: Default::default(),
             select_sql: sql.into(),
-            select_query: query.clone(),
-            storage: MvCreateStorage::Evaluated {
+            select_query: query,
+            storage: MvCreateStorage {
                 target: IcebergMvTarget {
                     catalog: "iceberg".into(),
                     namespace: "db".into(),
@@ -1781,7 +1759,7 @@ mod original_stage_tests {
         let CreatePublicationOutput::StageDeclarations {
             columns,
             storage:
-                CreateStorageDeclarations::Evaluated {
+                CreateStorageDeclarations {
                     visible_partition_sources,
                     properties: staged_properties,
                 },
@@ -1813,25 +1791,35 @@ mod original_stage_tests {
             decode_definition, encode_configuration, encode_definition,
         };
         use novarocks_parser::ast::SyntaxEq;
-        let expected_source = "select id /* 保留原文：多字节注释 */ ,\n\tcount(*) AS n -- 保留排版\n  from orders\n group by id";
+        let expected_source = "select id /* 保留原文：多字节注释 */ ,\n\tcount() AS n -- 保留排版\n  from orders\n group by id";
         let sql = format!(
-            "CREATE MATERIALIZED VIEW published.saved DISTRIBUTED BY HASH(id) BUCKETS 4 REFRESH MANUAL AS /* outside */ {expected_source} /* outside */;"
+            "CREATE MATERIALIZED VIEW published.saved AS /* outside */ {expected_source} /* outside */"
         );
-        let statements = novarocks_parser::parse(&sql).unwrap();
-        let [
-            novarocks_parser::ast::Statement::MaterializedView(
-                novarocks_parser::ast::MaterializedViewStatement::Create(create),
-            ),
-        ] = statements.as_slice()
+        let novarocks_parser::ast::TrinoStatement::CreateMaterializedView(create) =
+            novarocks_parser::parser::parse_statement(&sql).unwrap()
         else {
             panic!("CREATE fixture");
         };
-        let statement = crate::mv::command::lower_typed_create_for_tests(create).unwrap();
-        assert_eq!(
-            create.raw_query_source.as_bytes(),
-            expected_source.as_bytes()
-        );
-        assert_eq!(statement.select_sql.as_bytes(), expected_source.as_bytes());
+        let (_, target) =
+            crate::mv::command::resolve_trino_target(&create.name, Some("iceberg"), "session_db")
+                .unwrap();
+        let select_sql = crate::mv::command::create_query_source(&sql, &create).unwrap();
+        assert_eq!(select_sql.as_bytes(), expected_source.as_bytes());
+        let statement = crate::mv::domain::application::MvCreateStatement {
+            if_not_exists: create.not_exists,
+            refresh: Default::default(),
+            select_sql: select_sql.into(),
+            select_query: create.query,
+            storage: crate::mv::domain::application::MvCreateStorage {
+                target,
+                binding: ConnectorProviderBindingKey {
+                    instance_id: ConnectorInstanceId::parse("iceberg").unwrap(),
+                    incarnation: ProviderBindingEpoch::new(),
+                },
+                properties: Arc::from([]),
+            },
+            primary_key: None,
+        };
         let stop = ConnectorStopOwner::new();
         let context = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(5),
@@ -1916,7 +1904,7 @@ mod original_stage_tests {
             reloaded.query.effective_sql.as_bytes(),
             expected_source.as_bytes()
         );
-        assert_eq!(reloaded.query.dialect, QueryDialect::StarRocks);
+        assert_eq!(reloaded.query.dialect, QueryDialect::Trino);
         assert_eq!(reloaded.query.resolution.default_catalog, "iceberg");
         assert_eq!(reloaded.query.resolution.default_namespace, "session_db");
         assert_ne!(
@@ -2028,7 +2016,6 @@ mod original_stage_tests {
             )
             .unwrap()
             .with_io_admission(io.clone());
-            let (plan, seed) = plan(&context);
             let instance_id = ConnectorInstanceId::parse("iceberg").unwrap();
             let base = novarocks_catalog_application::test_support::test_control_binding_for(
                 instance_id.clone(),
@@ -2036,6 +2023,13 @@ mod original_stage_tests {
             );
             let descriptor = base.descriptor().clone();
             let incarnation = base.incarnation();
+            let (plan, seed) = plan(
+                &context,
+                ConnectorProviderBindingKey {
+                    instance_id: instance_id.clone(),
+                    incarnation,
+                },
+            );
             let entrance = Arc::new(ManagementEntrance::new(
                 DeploymentOwner::parse("deployment-test").unwrap(),
                 ProcessIncarnation::parse("process-test").unwrap(),

@@ -25,7 +25,7 @@ use crate::mv::domain::{
     application::{MvApplicationError, MvCreateStatement},
     iceberg_refresh::{
         IcebergMvCorePorts, IcebergMvCreatePlan, finish_mv_create_preparation,
-        prepare_mv_create_properties, prepare_mv_create_shape, prepare_mv_create_target,
+        prepare_mv_create_properties, prepare_mv_create_shape,
     },
 };
 use novarocks_spi::connector::{
@@ -58,11 +58,7 @@ async fn prepare_create_inner(
     io: &MvRefreshPreparationIo,
 ) -> Result<Arc<IcebergMvCreatePlan>, PreparationError> {
     input.context.original_operation_control().check_active()?;
-    let target = prepare_mv_create_target(
-        input.current_catalog.as_deref(),
-        &input.current_database,
-        &input.statement,
-    )?;
+    let target = input.statement.storage.target.clone();
     let lease = input.planning;
     if lease.binding().descriptor().instance_id.as_str() != target.catalog {
         return Err("CREATE reader planning pin does not match its original target".into());
@@ -130,7 +126,7 @@ async fn prepare_create_inner(
         input.ports.constant_policy(),
         control.clone(),
     )?;
-    let shape = prepare_mv_create_shape(target, &input.statement, canonical, analysis, &control)?;
+    let shape = prepare_mv_create_shape(target, canonical, analysis, &control)?;
     let dependency_target = novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
         &shape.target.catalog,
         &shape.target.namespace,
@@ -380,6 +376,19 @@ mod tests {
             )
         };
         let sql = "SELECT 1 AS id FROM ice.db.orders";
+        let planning = ConnectorControlPlanningPin::new(
+            Arc::new(
+                novarocks_catalog_application::test_support::test_control_binding_for(
+                    novarocks_spi::connector::ConnectorInstanceId::parse("ice").unwrap(),
+                    8,
+                ),
+            ),
+            || {},
+        );
+        let owner = novarocks_spi::connector::ConnectorProviderBindingKey {
+            instance_id: planning.binding().descriptor().instance_id.clone(),
+            incarnation: planning.binding().incarnation(),
+        };
         let statement = MvCreateStatement {
             if_not_exists: false,
             refresh: Default::default(),
@@ -393,25 +402,21 @@ mod tests {
                 },
             )
             .unwrap(),
-            storage: crate::mv::domain::application::MvCreateStorage::Legacy {
-                name_parts: vec!["mv".into()],
-                partition_by: None,
-                properties: Vec::new(),
+            storage: crate::mv::domain::application::MvCreateStorage {
+                target: crate::mv::domain::refresh::target::IcebergMvTarget {
+                    catalog: "ice".into(),
+                    namespace: "db".into(),
+                    table: "mv".into(),
+                },
+                binding: owner,
+                properties: Arc::from([]),
             },
             primary_key: None,
         };
         let source = MvRefreshPreparationOriginal::for_create(
             MvCreatePreparationInput {
                 ports,
-                planning: ConnectorControlPlanningPin::new(
-                    Arc::new(
-                        novarocks_catalog_application::test_support::test_control_binding_for(
-                            novarocks_spi::connector::ConnectorInstanceId::parse("ice").unwrap(),
-                            8,
-                        ),
-                    ),
-                    || {},
-                ),
+                planning,
                 current_catalog: Some("ice".into()),
                 current_database: "db".into(),
                 statement,

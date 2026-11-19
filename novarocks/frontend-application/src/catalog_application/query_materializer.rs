@@ -1779,10 +1779,10 @@ mod tests {
         }
         for partitioned in [true, false] {
             for sql in [
-                "SELECT * FROM orders$partitions",
-                "SELECT p.* FROM DB.ORDERS$partitions p",
-                "SELECT * FROM ICE.DB.ORDERS$partitions",
-                "WITH orders AS (SELECT 7 AS content) SELECT p.* FROM orders$partitions p",
+                "SELECT * FROM \"orders$partitions\"",
+                "SELECT p.* FROM DB.\"ORDERS$partitions\" p",
+                "SELECT * FROM ICE.DB.\"ORDERS$partitions\"",
+                "WITH orders AS (SELECT 7 AS content) SELECT p.* FROM \"orders$partitions\" p",
             ] {
                 let service =
                     crate::catalog_application::query_catalog::new_query_catalog_service();
@@ -1800,12 +1800,7 @@ mod tests {
                     }),
                 );
                 let control = SqlCompileControl::unbounded();
-                let mut statements = novarocks_parser::parse(sql).unwrap();
-                assert_eq!(statements.len(), 1);
-                let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap()
-                else {
-                    panic!("expected one query");
-                };
+                let query = novarocks_parser::parser::parse_query(sql).unwrap();
                 let request = SqlFinalPlanCompileRequest::new(
                     novarocks_physical_plan::PlanVersionId::try_new([71; 16]).unwrap(),
                     SqlStatementInput::parsed_query(Box::new(query)),
@@ -2345,10 +2340,7 @@ mod tests {
         );
     }
     fn original_schema_need(sql: &str) -> novarocks_sql::compiler::SqlCapturedCatalogPreparation {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("actual SQL query fixture");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
             query.clone(),
             Some("ice"),
@@ -2378,7 +2370,7 @@ mod tests {
             Arc::clone(&bindings),
             Box::new(OverlayLoader),
         );
-        let preparation = original_schema_need("SELECT * FROM ice.db.orders$files");
+        let preparation = original_schema_need("SELECT * FROM ice.db.\"orders$files\"");
         let [need] = preparation.needs() else {
             panic!("one actual relation need");
         };
@@ -2694,10 +2686,7 @@ mod async_observation_tests {
             }),
         );
         let key = QueryTableBindingKey::analysis_lookup("ice", "db", "orders");
-        let statements = novarocks_parser::parse("SELECT * FROM ice.db.orders").unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query")
-        };
+        let query = novarocks_parser::parser::parse_query("SELECT * FROM ice.db.orders").unwrap();
         let preparation = novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
             query.clone(),
             Some("ice"),
