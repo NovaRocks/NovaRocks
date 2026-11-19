@@ -192,8 +192,8 @@ SQL client
   `system` 与各 catalog 的 `information_schema` 保持只读，见 ADR-0226。
 
 - `novarocks/parser/src/**`
-  Hand-written lexer, parser and AST, including the StarRocks-compatible
-  surface for catalogs, tables, materialized views, Iceberg refs and drops.
+  Owns the Trino SQL lexer, parser, typed AST and printer. The grammar includes
+  the documented NovaRocks extensions for SQL statements and Iceberg operations.
 
 - `novarocks/sql/src/{analysis,analyzer,semantic}/**`
   Name and expression resolution, type rules and semantic validation.
@@ -209,8 +209,8 @@ SQL client
   `distributed/`, `pipeline/`, `runtime_filter/`).
 
 - `novarocks/query-application/src/sql.rs`, `novarocks/query-application/src/sql/**`
-  Query-application ownership of parser-admitted statement shape: statement
-  admission and DDL/DML routing.
+  Query Application admits the Trino statement AST and routes typed DDL and DML
+  commands to their semantic owners.
 
 - `novarocks/frontend-application/src/query_execution/dml/**`
   DML flows — `insert.rs`, `delete/**`, `mutation.rs` / `mutation_flow.rs`,
@@ -739,7 +739,8 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `user`、MV scheduler 与 Iceberg maintenance 设置。Trino 固定监听 `127.0.0.1`，
   使用配置用户；Host 仅接受 `localhost`、`127.0.0.1`、`[::1]`（可带数字端口）。
   `mysql_port` 与旧 MySQL 载体配置明确拒绝，不转换为 Trino 配置。
-  Trino 是客户端协议入口，SQL 仍使用当前方言；客户端 TLS、非本机访问与非空认证不在此入口范围。
+  此入口使用 Trino HTTP 协议和 Trino SQL 文法，支持文档中声明的 NovaRocks 扩展。
+  客户端 TLS、非本机访问与非空认证不在此入口范围。
 
 - `[connector.object_store]`
   Iceberg Connector 执行使用的进程本地对象存储凭据，不定义 native 内部表存储。
@@ -1193,7 +1194,8 @@ differ.
   裸启动禁令查根 `clippy.toml`，近邻配置不合并；先确认实际 owner 与生命周期，
   不把协议 terminal、取消请求、guard 计数或源码形状当退出证明。
 
-- **SQL / parser / planner changes**: start with `novarocks/parser/src/**`,
+- **SQL / parser / planner changes**: use `novarocks/parser/src/{parser,printer}/`
+  and `novarocks/parser/tests/it/` for syntax. Analysis and planning start in
   `novarocks/sql/src/{analysis,analyzer,semantic}/**`,
   `novarocks/sql/src/optimizer/**` and `novarocks/sql/src/planner/**`.
   完成物理计划的 C/B 等待图、输入消费分类与 SCC 的单一作者是

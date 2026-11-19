@@ -24,7 +24,7 @@ under the License.
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | INSERT INTO（VALUES / SELECT） | ✅ | |
-| INSERT OVERWRITE（静态分区 + 全表） | ✅ | |
+| INSERT OVERWRITE（全表） | ✅ | 覆盖目标 ref 的整表数据 |
 | DELETE FROM（V2 position-delete + V3 DV 双路径） | ✅ | |
 | UPDATE（MOR + UPDATE FROM source） | ✅ | PR #76 |
 | MERGE INTO（matched UPDATE / matched DELETE / not matched INSERT） | ✅ | PR #78 |
@@ -76,11 +76,13 @@ v3 新逻辑行在提交时分配 `first_row_id`，snapshot 的 row range 取实
 -- 全表覆盖
 INSERT OVERWRITE orders SELECT * FROM orders_staging;
 
--- 静态分区覆盖
+-- 退役写法，解析阶段拒绝
 INSERT OVERWRITE orders PARTITION (country = 'CN') SELECT * FROM orders_cn;
 ```
 
 实现：写出新 data file，由 canonical preparer 将目标 ref 的旧条目标为 DELETED 并发布完整请求。
+
+原入口将 `PARTITION (country = 'CN')` 写法作为全表覆盖处理。切换后，指定此子句会返回语法错误。
 
 ### ✅ 动态分区 OVERWRITE
 
@@ -106,17 +108,17 @@ V2 / V3 双路径：
 
 入口：`novarocks/frontend-application/src/query_execution/dml/delete/`。
 
-## ✅ UPDATE（MOR + UPDATE FROM source）
+## ✅ UPDATE 与关联更新（MOR）
 
 ```sql
 -- 简单 UPDATE
 UPDATE orders SET amount = amount * 1.1 WHERE user_id = 1001;
 
--- UPDATE FROM source（关联其他表）
-UPDATE orders t
-   SET t.amount = s.new_amount
-  FROM (SELECT id, new_amount FROM repricing_staging) s
- WHERE t.id = s.id;
+-- 关联其他表更新，按 id 匹配
+MERGE INTO orders t
+USING (SELECT id, new_amount FROM repricing_staging) s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET amount = s.new_amount;
 ```
 
 NovaRocks 的 UPDATE 与所有 MERGE 形状只走 MOR。有删除效果时按上述逐文件规则物化：部分覆盖写 DV，完整覆盖移除数据文件及独占旧位置删除项；更新分支另写 after-image。完整覆盖移除属于同一 MOR 路径，不是 COW 整文件重写。

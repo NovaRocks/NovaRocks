@@ -56,15 +56,10 @@ trino --server http://127.0.0.1:8080 --user root
 
 ## 3. 创建一个 Iceberg v3 表
 
-```sql
-CREATE EXTERNAL CATALOG ice
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "warehouse" = "file:///tmp/iceberg-warehouse"
-);
+``` sql
+CREATE CATALOG ice USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "warehouse" = 'file:///tmp/iceberg-warehouse');
 
-CREATE DATABASE ice.demo;
+CREATE SCHEMA ice.demo;
 
 USE ice.demo;
 
@@ -73,10 +68,7 @@ CREATE TABLE orders (
   user_id BIGINT,
   amount  DECIMAL(18, 2),
   ts      TIMESTAMP
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 ```
 
 > 后面的 branch DML / MERGE INTO 要求 v3；无需声明 `write.row-lineage`。
@@ -127,18 +119,18 @@ SELECT COUNT(*) FROM orders FOR VERSION AS OF 'main';
 
 ## 7. Branch / Tag DDL
 
-```sql
-ALTER TABLE orders CREATE BRANCH dev;
-ALTER TABLE orders CREATE TAG release_v1;
+``` sql
+CREATE BRANCH dev IN TABLE orders;
+ALTER TABLE orders EXECUTE create_tag(name => 'release_v1', replace => false, if_not_exists => false);
 
-INSERT INTO orders.branch_dev VALUES (5, 1004, 8.80, '2026-05-04 09:00:00');
+INSERT INTO orders @dev VALUES (5, 1004, 8.80, '2026-05-04 09:00:00');
 
 -- 验证 main 没有被影响
 SELECT COUNT(*) FROM orders FOR VERSION AS OF 'main';
 SELECT COUNT(*) FROM orders FOR VERSION AS OF 'dev';
 
-ALTER TABLE orders DROP BRANCH dev;
-ALTER TABLE orders DROP TAG release_v1;
+DROP BRANCH dev IN TABLE orders;
+ALTER TABLE orders EXECUTE drop_tag(name => 'release_v1', if_exists => false);
 ```
 
 > 写指定 branch 的语法是 `<table>.branch_<name>`，**不是 Spark 的 `<table>@<branch>`**。

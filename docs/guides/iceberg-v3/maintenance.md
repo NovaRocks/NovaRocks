@@ -58,8 +58,8 @@ publication 仍区分 KnownUncommitted、KnownCommitted 与 CommitUnknown；未�
 
 ## ✅ OPTIMIZE
 
-```sql
-ALTER TABLE orders OPTIMIZE;
+``` sql
+ALTER TABLE orders EXECUTE optimize;
 ```
 
 现有写法直接在原语句内执行；结果为 `(metric_name varchar, metric_value bigint)`，依次返回：
@@ -110,10 +110,10 @@ Trino `updateType` 为 `ALTER TABLE EXECUTE`，不填 `updateCount`；客户端�
 
 ### 示例
 
-```sql
-ALTER TABLE orders EXPIRE SNAPSHOTS OLDER THAN '2026-04-01 00:00:00';
-ALTER TABLE orders EXPIRE SNAPSHOTS RETAIN LAST 5;
-ALTER TABLE orders EXPIRE SNAPSHOTS OLDER THAN '2026-04-01 00:00:00' RETAIN LAST 5;
+``` sql
+ALTER TABLE orders EXECUTE expire_snapshots(older_than => '2026-04-01 00:00:00');
+ALTER TABLE orders EXECUTE expire_snapshots(retain_last => 5);
+ALTER TABLE orders EXECUTE expire_snapshots(older_than => '2026-04-01 00:00:00', retain_last => 5);
 ```
 
 ### 支持的子集
@@ -161,9 +161,9 @@ SQL 手动调用与自动入口使用同一判据，用户指定删除阈值不�
 
 ### SQL 形状与候选保护
 
-```sql
+``` sql
 -- SQL 形状仍保留；未取得安全能力的 catalog 应明确拒绝。
-ALTER TABLE orders REMOVE ORPHAN FILES OLDER THAN '2026-04-01 00:00:00';
+ALTER TABLE orders EXECUTE remove_orphan_files(older_than => '2026-04-01 00:00:00');
 ```
 
 OLDER THAN 是必需的候选过滤条件，不能据“至少三天”推断安全。现有实现还保护当前和
@@ -247,8 +247,8 @@ owned-ref 选择位于同目录的 `owned_ref_cleanup.rs`，first-observation �
 
 ### 示例
 
-```sql
-ALTER TABLE orders REWRITE MANIFESTS;
+``` sql
+ALTER TABLE orders EXECUTE optimize_manifests;
 ```
 
 ### 支持的子集
@@ -266,9 +266,9 @@ ALTER TABLE orders REWRITE MANIFESTS;
 
 ## ✅ REWRITE POSITION DELETE FILES
 
-```sql
+``` sql
 CALL iceberg_catalog.system.rewrite_position_delete_files(
-  table => 'database.orders',
+  "table" => 'database.orders',
   options => map('rewrite-all', 'true')
 );
 ```

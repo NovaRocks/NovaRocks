@@ -27,12 +27,12 @@ under the License.
 | `SELECT … FOR TIMESTAMP AS OF '<ts>'` | ✅ | epoch-ms 整数或字符串字面量（RFC 3339 / `YYYY-MM-DD HH:MM:SS` UTC） |
 | `SELECT … FOR VERSION AS OF '<branch_or_tag>'` | ✅ | 字符串 ref 名 |
 | 跨 ref 自连接 / 多 ref join | ✅ | 同一张表两次扫不同 ref 也可以 |
-| 表达式形式时间戳（`CURRENT_TIMESTAMP() - INTERVAL ...`） | ❌ | phase 1 只接受字面量 |
+| 表达式形式时间戳（`CURRENT_TIMESTAMP - INTERVAL '1' HOUR`） | ❌ | phase 1 只接受字面量 |
 | 快照保留期读侧拒绝（拿过期 snapshot 报错） | ❌ | |
 
 实现入口：
-- `src/sql/analyzer/iceberg_ref.rs`（IcebergRefBinding 解析与校验）
-- `novarocks/parser/src/parser/query.rs`（typed grammar 保留 `FOR VERSION AS OF '<string>'`）
+- `novarocks/sql/src/analyzer/iceberg_ref.rs`（IcebergRefBinding 解析与校验）
+- `novarocks/parser/src/parser/relation.rs`（typed grammar 保留 `FOR VERSION AS OF '<string>'`）
 - `src/connector/iceberg/read.rs`（`build_read_snapshot_at` 按 snapshot_id 加载历史 schema）
 
 ---
@@ -68,7 +68,7 @@ resolver 逻辑：在 `metadata.history()` 中找 `timestamp_ms ≤ requested_ms
 
 ```sql
 -- 暂不支持
-SELECT * FROM t FOR TIMESTAMP AS OF (CURRENT_TIMESTAMP() - INTERVAL 1 HOUR);
+SELECT * FROM t FOR TIMESTAMP AS OF (CURRENT_TIMESTAMP - INTERVAL '1' HOUR);
 ```
 
 phase 1 只接受字面量。如果你需要"1 小时前"，目前必须在客户端先算好再传字符串字面量。
