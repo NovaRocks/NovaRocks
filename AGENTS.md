@@ -229,6 +229,10 @@ SQL client
   `columns`、`data`、`updateType` 与 `updateCount`。普通/MOR 取同 Session 完整冻结的 Root
   计数，CTAS 等取最终 CREATE；无真实计数时为 NULL，不能填零。
   计数数据页之后仍须请求终页确认；完成数据不替代原 visibility、取消与实际退出。见 ADR-0217。
+  Iceberg 的根记录由 `novarocks/frontend-application/src/query_execution/write_result.rs` 组装，
+  `novarocks/frontend-application/src/query_execution/write_session/computation.rs` 在原 CPU 范围内逐记录
+  解码并交给 Provider。完整写集仍须通过根 EOF、参与方成功与取消/期限检查才交给原发布方。
+  Provider 的接收保管与滚动提交见 [ADR-0239](docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)。
 
 - `novarocks/frontend-application/src/statistics/{application,attempt_executor,service,read,publication}.rs`
   ANALYZE 在原语句的 Internal Root、冻结会话设置与 query permit 下完成 capture、计算与发布，
@@ -561,11 +565,18 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `commit/write_stack/control.rs` 冻结成形设置，`commit/data_writer/streaming.rs` 与
   `commit/data_writer/staged_paths.rs` 保管 rolling writer、闲置关闭与每文件成功写出字节。
   `commit/write_stack/execution.rs` 向原 Task 账本预留尚未落盘的 Parquet 编码估计。
-  写集的载体和解码对象分别由 FE Internal 结果窗口计费，Provider 回执随对象实际退出。
+  写集载体与解码对象沿 FE Internal 结果窗口计费。紧凑条目承接解码回执，
+  索引键、删除效果与转换并存峰沿同一作者申请。回执随实际保管退出。
   根结果 32 MiB 分帧仍由原载体约束。文件政策与容量作者见
   [ADR-0235](docs/adr/ADR-0235-iceberg-write-layout-and-data-plane-capacity.md)。
 
-  Iceberg 意图、依赖与字段契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)，产物责任、复用与有界发布事实见 [ADR-0234](docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)。修改前先读：
+  Iceberg 意图、依赖与字段契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)，产物责任、复用与有界发布事实见 [ADR-0234](docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)。
+  紧凑接收、滚动写出与条目覆盖见 [ADR-0239](docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)。
+  - `novarocks/connector/iceberg/src/commit/write_stack/receiving.rs` 保管所有 flavor 的接收状态。
+    `novarocks/connector/iceberg/src/commit/write_stack/receiving/validation.rs` 核对片段的准确身份与归属。
+    紧凑模式逐记录核对索引和删除效果，完整接收前没有新增 manifest。
+  - `novarocks/connector/iceberg/src/commit/new_manifests.rs` 消费 operation 的紧凑 stage，
+    按 spec 和内容类型顺序滚动写出并释放已写条目。首次完整核对条目覆盖，各轮保留 manifest 级核对。
   - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑/物理身份与继承字段；对象来源、写入与退休状态、覆盖记录及准确发布引用分别保留。
   - `novarocks/connector/iceberg/src/commit/dependency/**`：按类别惰性读取 metadata、目标 ref 存活集和连续历史窗口，验证操作依赖。
   - `novarocks/connector/iceberg/src/commit/staging/**`：updates 前缀事实、ID 规范化、requirements 折算及 manifest-list 的实际 row-ID 分配。
@@ -1303,11 +1314,15 @@ the guide differ.
   在 LocalCompiler `lowering.rs` 冻结局部布局，由 Native Adapter `compiled_writer_binding.rs` 绑定执行能力，
   由 Execution 的 `write_layout_key.rs`、`write_spread.rs` 与原写入交换消费。
   配置和 writer 生命周期见 Iceberg `catalog_config.rs`、`commit/write_stack/{control,execution}.rs`。
-  FE 回执看 `query_execution/write_computation.rs` 与 `write_result.rs`。
+  FE 回执见 `novarocks/frontend-application/src/query_execution/write_result.rs` 与
+  `novarocks/frontend-application/src/query_execution/write_session/computation.rs`。
   写集回执、operation 账本及建表回执附件各自保留真实所有权和退出边界。
 
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
   `commit/attempt.rs`、`commit/operation.rs` 和 `commit/write_stack/control/publication.rs` 开始。
+  紧凑接收先读 [ADR-0239](docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)，
+  对照 `novarocks/connector/iceberg/src/commit/write_stack/receiving.rs` 的交接与
+  `novarocks/connector/iceberg/src/commit/new_manifests.rs` 的 stage 持有、滚动写出和沿用。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
   读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。

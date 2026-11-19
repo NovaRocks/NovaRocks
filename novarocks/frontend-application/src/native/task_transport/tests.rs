@@ -558,6 +558,7 @@ struct SingleRootLifecycle {
     released: bool,
     abort_cause: Option<AbortCause>,
     close_finished_tasks_on_abort: bool,
+    defer_release_until_abort: bool,
 }
 
 impl SingleRootLifecycle {
@@ -1045,23 +1046,28 @@ impl TaskWirePeer {
                             "single-root release precedes its fence",
                         ));
                     }
-                    release = !script.released;
-                    script.released = true;
-                    if release {
-                        script.participation_revision = Some(script.next_revision());
+                    if script.defer_release_until_abort && script.abort_cause.is_none() {
+                        outcome = OperationOutcome::ReleaseNotReady;
+                        None
+                    } else {
+                        release = !script.released;
+                        script.released = true;
+                        if release {
+                            script.participation_revision = Some(script.next_revision());
+                        }
+                        let mut receipt = codec::encode_release_ack(
+                            original.participation(),
+                            ReleaseOutcome::Released,
+                            ParticipationState::TerminalRetained,
+                            None,
+                        )
+                        .expect("the original single-root release encodes");
+                        receipt.termination_cause =
+                            script.abort_cause.map(codec::encode_abort_cause_field);
+                        Some(proto::task_operation_verdict::Ack::ReleaseParticipation(
+                            receipt,
+                        ))
                     }
-                    let mut receipt = codec::encode_release_ack(
-                        original.participation(),
-                        ReleaseOutcome::Released,
-                        ParticipationState::TerminalRetained,
-                        None,
-                    )
-                    .expect("the original single-root release encodes");
-                    receipt.termination_cause =
-                        script.abort_cause.map(codec::encode_abort_cause_field);
-                    Some(proto::task_operation_verdict::Ack::ReleaseParticipation(
-                        receipt,
-                    ))
                 }
                 D::AbortParticipation(abort) => {
                     if let Err(error) = script.require_participation(abort.participation()) {
@@ -2103,6 +2109,7 @@ impl Loopback {
             released: false,
             abort_cause: None,
             close_finished_tasks_on_abort: false,
+            defer_release_until_abort: false,
         });
     }
 
@@ -2176,6 +2183,23 @@ impl Loopback {
             ));
         }
         script.close_finished_tasks_on_abort = true;
+        Ok(())
+    }
+
+    /// Keep the original participation live for the failure-path Abort.
+    /// Ordinary Release observes the native NotReady verdict until Abort.
+    pub(crate) fn defer_single_root_release_until_abort(&self) -> Result<(), Status> {
+        let mut state = self.peer.state.lock().expect("peer state");
+        let script = state
+            .single_root
+            .as_mut()
+            .ok_or_else(|| Status::failed_precondition("declare original Root first"))?;
+        if script.created || script.defer_release_until_abort {
+            return Err(Status::failed_precondition(
+                "original Release fence freezes before Create",
+            ));
+        }
+        script.defer_release_until_abort = true;
         Ok(())
     }
 

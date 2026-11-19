@@ -47,7 +47,8 @@ pub use novarocks_connector_contract::ConnectorWriteBinding;
 // Provider value before returning its original caller-owned retention.
 struct WritePayloadOwner<T> {
     value: T,
-    _retention: Option<crate::connector::ConnectorPayloadRetentionGuard>,
+    retention: Option<crate::connector::ConnectorPayloadRetentionGuard>,
+    measured_bytes: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -57,17 +58,20 @@ impl OpaqueWritePayload {
     pub(super) fn new<T: Send + Sync + 'static>(value: T) -> Self {
         Self(Arc::new(WritePayloadOwner {
             value,
-            _retention: None,
+            retention: None,
+            measured_bytes: None,
         }))
     }
 
     pub(super) fn retained<T: Send + Sync + 'static>(
         value: T,
         retention: crate::connector::ConnectorPayloadRetentionGuard,
+        measured_bytes: Option<usize>,
     ) -> Self {
         Self(Arc::new(WritePayloadOwner {
             value,
-            _retention: Some(retention),
+            retention: Some(retention),
+            measured_bytes,
         }))
     }
 
@@ -75,6 +79,34 @@ impl OpaqueWritePayload {
         self.0
             .downcast_ref::<WritePayloadOwner<T>>()
             .map(|owner| &owner.value)
+    }
+
+    pub(super) fn measured<T: 'static>(&self) -> Option<(&T, usize)> {
+        let owner = self.0.downcast_ref::<WritePayloadOwner<T>>()?;
+        Some((&owner.value, owner.measured_bytes?))
+    }
+
+    pub(super) fn is_unique(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+    }
+
+    /// Caller checked exact type, measurement and unique ownership before
+    /// taking the neutral value out of its original slot.
+    pub(super) fn into_measured<T: Send + Sync + 'static>(
+        self,
+    ) -> (T, crate::connector::ConnectorPayloadRetentionGuard) {
+        let owner = self
+            .0
+            .downcast::<WritePayloadOwner<T>>()
+            .unwrap_or_else(|_| unreachable!("checked provider write payload type"));
+        let owner = Arc::try_unwrap(owner)
+            .unwrap_or_else(|_| unreachable!("checked unique provider write payload"));
+        (
+            owner.value,
+            owner
+                .retention
+                .expect("measured payload has its paid receipt"),
+        )
     }
 }
 
@@ -207,6 +239,10 @@ impl ConnectorCommitFragment {
 
     pub(super) const fn payload(&self) -> &OpaqueWritePayload {
         &self.payload
+    }
+
+    pub(super) fn into_payload(self) -> OpaqueWritePayload {
+        self.payload
     }
 
     pub const fn binding(&self) -> &ConnectorWriteBinding {

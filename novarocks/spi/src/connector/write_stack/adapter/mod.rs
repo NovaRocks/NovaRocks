@@ -34,6 +34,7 @@ use crate::connector::write_stack::runtime::{
 };
 use crate::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+    ConnectorPayloadRetentionGuard,
 };
 
 /// One provider's concrete write domain, bound to one exact catalog generation.
@@ -112,7 +113,21 @@ impl<P: ProviderWriteRuntime> WriteRuntimeAdapter<P> {
     ) -> ConnectorCommitFragment {
         ConnectorCommitFragment::from_parts(
             self.binding.clone(),
-            OpaqueWritePayload::retained(fragment, retention),
+            OpaqueWritePayload::retained(fragment, retention, None),
+        )
+    }
+
+    /// Attach the exact amount already reserved by the provider's decode
+    /// author. The amount describes this receipt and grants no budget.
+    pub fn wrap_measured_commit_fragment(
+        &self,
+        fragment: P::CommitFragment,
+        bytes: usize,
+        receipt: ConnectorPayloadRetentionGuard,
+    ) -> ConnectorCommitFragment {
+        ConnectorCommitFragment::from_parts(
+            self.binding.clone(),
+            OpaqueWritePayload::retained(fragment, receipt, Some(bytes)),
         )
     }
 
@@ -150,6 +165,48 @@ impl<P: ProviderWriteRuntime> WriteRuntimeAdapter<P> {
             return Err(binding_error());
         }
         fragment.payload().downcast_ref().ok_or_else(type_error)
+    }
+
+    /// Inspect the original paid value after checking that it can move.
+    pub fn measured_commit_fragment<'a>(
+        &self,
+        fragment: &'a ConnectorCommitFragment,
+    ) -> Result<(&'a P::CommitFragment, usize), ConnectorError> {
+        if fragment.binding() != &self.binding {
+            return Err(binding_error());
+        }
+        if !fragment.payload().is_unique() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cannot move a commit fragment while its original payload has another owner",
+            ));
+        }
+        fragment.payload().measured().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write value has no measured decode receipt for this provider",
+            )
+        })
+    }
+
+    /// Move the uniquely owned domain value and its original paid receipt.
+    /// A refused extraction leaves the original slot and holder intact.
+    pub fn take_measured_commit_fragment(
+        &self,
+        slot: &mut Option<ConnectorCommitFragment>,
+    ) -> Result<(P::CommitFragment, ConnectorPayloadRetentionGuard), ConnectorError> {
+        let fragment = slot.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "empty commit fragment slot",
+            )
+        })?;
+        self.measured_commit_fragment(fragment)?;
+        Ok(slot
+            .take()
+            .expect("checked commit fragment slot")
+            .into_payload()
+            .into_measured())
     }
 }
 
@@ -294,6 +351,49 @@ mod tests {
         );
         drop(opaque_alias);
         assert_eq!(*events.lock().unwrap(), vec!["payload", "retention"]);
+    }
+
+    #[test]
+    fn measured_fragment_extraction_moves_the_exact_original_holder() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter =
+            WriteRuntimeAdapter::new(Arc::new(TrackedProvider(FakeProvider::new("unit", 1))));
+        let foreign =
+            WriteRuntimeAdapter::new(Arc::new(TrackedProvider(FakeProvider::new("unit", 2))));
+        let mut fragment = Some(adapter.wrap_measured_commit_fragment(
+            TrackedFragment {
+                value: 9,
+                events: Arc::clone(&events),
+            },
+            67,
+            ConnectorPayloadRetentionGuard::new(TrackedRetention(Arc::clone(&events))),
+        ));
+        let (_, bytes) = adapter
+            .measured_commit_fragment(fragment.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(bytes, 67);
+        assert!(
+            foreign
+                .take_measured_commit_fragment(&mut fragment)
+                .is_err()
+        );
+        let alias = fragment.as_ref().unwrap().payload().clone();
+        assert!(
+            adapter
+                .take_measured_commit_fragment(&mut fragment)
+                .is_err()
+        );
+        assert!(events.lock().unwrap().is_empty());
+        drop(alias);
+        let (payload, receipt) = adapter
+            .take_measured_commit_fragment(&mut fragment)
+            .unwrap();
+        assert!(fragment.is_none());
+        assert_eq!(payload.value, 9);
+        drop(payload);
+        assert_eq!(events.lock().unwrap().as_slice(), ["payload"]);
+        drop(receipt);
+        assert_eq!(events.lock().unwrap().as_slice(), ["payload", "retention"]);
     }
 
     #[test]

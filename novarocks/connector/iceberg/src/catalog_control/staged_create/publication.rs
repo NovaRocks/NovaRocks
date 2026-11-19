@@ -1218,9 +1218,9 @@ mod tests {
                         .references()
                         .contains(&provenance_object)
                 );
-                let retained = request.artifacts().references().to_vec();
+                let retained = request.artifacts().references();
                 assert!(matches!(
-                    operation.cleanup_after_commit(&retained).await,
+                    operation.cleanup_after_commit(retained.iter()).await,
                     crate::commit::model::IcebergCleanupReport::Complete { .. }
                 ));
                 assert!(fixture.provenance_path().exists());

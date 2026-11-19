@@ -456,7 +456,13 @@ mod tests {
         assert_ne!(current.manifest_list(), parent.manifest_list());
         assert_eq!(request.artifacts().references().len(), 1);
         assert_eq!(
-            request.artifacts().references()[0].path(),
+            request
+                .artifacts()
+                .references()
+                .iter()
+                .next()
+                .unwrap()
+                .path(),
             current.manifest_list()
         );
         assert!(

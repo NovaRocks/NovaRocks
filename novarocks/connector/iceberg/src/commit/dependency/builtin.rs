@@ -145,7 +145,8 @@ mod tests {
         fn record_manifest(
             &self,
             _object: &crate::commit::model::ObjectIdentity,
-            _live_paths: &[String],
+            _added_paths: &[String],
+            _existing_paths: &[String],
             _replaces: &[String],
         ) -> crate::iceberg::Result<()> {
             panic!("Validation must not record a manifest")
@@ -154,6 +155,7 @@ mod tests {
         fn record_manifest_list(
             &self,
             _object: &crate::commit::model::ObjectIdentity,
+            _snapshot_id: i64,
             _paths: &[String],
         ) -> crate::iceberg::Result<()> {
             panic!("Validation must not record a manifest list")

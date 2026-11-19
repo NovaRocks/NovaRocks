@@ -522,7 +522,7 @@ impl MaintenanceEngine {
                         retired: None,
                         artifact_cleanup: Some((
                             operation.clone(),
-                            request.artifacts().references().to_vec(),
+                            request.artifacts().references().iter().cloned().collect(),
                         )),
                         reclamation: Arc::new(Mutex::new(None)),
                     },

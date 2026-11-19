@@ -147,7 +147,7 @@ enum Receiving {
 }
 struct Holder {
     #[cfg(all(test, novarocks_dev_controls))]
-    pre_union_gate: Mutex<Option<Arc<component_tests::OriginalPreUnionGate>>>,
+    pre_union_gate: Mutex<Option<Arc<tests::OriginalPreUnionGate>>>,
     #[cfg(all(test, novarocks_dev_controls))]
     body_applied: std::sync::OnceLock<()>,
     #[cfg(all(test, novarocks_dev_controls))]
@@ -475,8 +475,8 @@ impl InternalComputationConsumer for WriteComputationConsumer {
                                 delivery.fail(error.clone());
                                 return Err(error);
                             }
-                            // EOF includes the original generation's one CPU
-                            // interpretation. A bad fragment still fails End.
+                            // The CPU job checks End and root facts. Every
+                            // complete fragment was handed off before ACK.
                             if let Err(error) = holder.cpu.finish_eof(delivery.end()).await {
                                 delivery.fail(error.clone());
                                 return Err(error);
@@ -513,8 +513,8 @@ impl InternalComputationConsumer for WriteComputationConsumer {
                         gate.wait().await;
                     }
                 }
-                // Pure receiving/union work executes in the existing finite
-                // CPU lane and moves the SAME payload into the stable session.
+                // Only this successful barrier confirms the Provider's
+                // provisional receipts and the FE's final root facts.
                 holder
                     .cpu
                     .accept_write(holder.session.receiving_port())
@@ -623,5 +623,4 @@ async fn wait_write(
 }
 
 #[cfg(all(test, novarocks_dev_controls))]
-#[path = "write_component_tests.rs"]
-mod component_tests;
+mod tests;

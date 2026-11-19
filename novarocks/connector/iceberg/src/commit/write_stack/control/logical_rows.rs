@@ -21,6 +21,33 @@
 use super::*;
 use novarocks_spi::connector::write_stack::ConnectorWriteRowChange;
 
+pub(super) fn project_compact(
+    handle: &IcebergWriteCommitSession,
+    counts: crate::commit::write_stack::receiving::compact::AddedCounters,
+) -> Result<Option<ConnectorWriteRowChange>, ConnectorError> {
+    if handle.document_publication().is_none() {
+        return Ok(None);
+    }
+    match handle.commit_op_kind() {
+        CommitOpKind::FastAppend
+            if counts.position_deletes.files == 0 && counts.newly_deleted_rows == 0 =>
+        {
+            Ok(Some(ConnectorWriteRowChange::Delta {
+                inserted: counts.data.rows,
+                deleted: 0,
+            }))
+        }
+        CommitOpKind::MaterializedRowDelta => Ok(Some(ConnectorWriteRowChange::Delta {
+            inserted: counts.data.rows,
+            deleted: counts.newly_deleted_rows,
+        })),
+        CommitOpKind::FastAppend => Err(invalid(
+            "Iceberg prepared artifact contradicts its logical publication operation",
+        )),
+        _ => Ok(None),
+    }
+}
+
 pub(super) fn project(
     handle: &IcebergWriteCommitSession,
     validated: &[ValidatedFragment<'_>],

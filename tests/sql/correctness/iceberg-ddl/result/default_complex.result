@@ -5,7 +5,7 @@ id	name	tags	counts
 2	bob	[]	{}
 
 -- query 8
--- legacy
+-- types	integer	varchar	array(integer)	map(varchar, integer)
 id	name	tags	counts
 1	alice	[]	{}
 2	bob	[]	{}

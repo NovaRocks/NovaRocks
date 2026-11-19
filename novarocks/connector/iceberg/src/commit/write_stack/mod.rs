@@ -44,13 +44,14 @@ pub(crate) mod flavor;
 pub mod old_delete;
 pub mod planning;
 pub(crate) mod program_recipe;
+pub(crate) mod receiving;
 pub(crate) mod repartition;
 pub(crate) mod runtime;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
-mod tests;
+pub(in crate::commit) mod tests;
 
 pub use control::{
     ICEBERG_WRITE_SESSION_EVIDENCE_VERSION, ICEBERG_WRITE_SESSION_MARKER_PROPERTY,

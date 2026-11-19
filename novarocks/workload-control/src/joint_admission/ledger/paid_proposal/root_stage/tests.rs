@@ -479,7 +479,7 @@ fn root_stage_original_batch_also_installs_its_roots_unknown_production_domains(
             Poll::Ready(Ok(ready)) => ready,
             _ => panic!("actual production Ready"),
         };
-    let mut facts = Some(vec![45; 8].into_boxed_slice());
+    let mut facts = Some(Arc::<[u8]>::from([45; 8]));
     let mut production = None;
     production_ready
         .register_in(&mut facts, &mut production)
@@ -619,7 +619,7 @@ fn internal_manifest_binding_reuses_all_four_originals_and_productions_without_n
         else {
             panic!("original production admission")
         };
-        let mut facts = Some(vec![45; 8].into_boxed_slice());
+        let mut facts = Some(Arc::<[u8]>::from([45; 8]));
         let mut production = None;
         production_ready
             .register_in(&mut facts, &mut production)

@@ -19,12 +19,17 @@
 use super::*;
 use crate::query_execution::artifact::TaskManifestBinding;
 use novarocks_query_application::api::PlanSeal;
+use novarocks_spi::connector::write_stack::{
+    ConnectorWriteProductionProof, ConnectorWriterPhysicalContext,
+};
 use novarocks_types::QueryExecutionId;
 use novarocks_workload_control::joint_admission::{
     UnreceivedProductionGrant, UnreceivedProductionOwner, UnreceivedProductionQuote,
+    UnreceivedProductionReady,
 };
-use novarocks_workload_control::{WorkError, WorkScope};
+use novarocks_workload_control::{WorkError, WorkScope, WorkloadProgressNotification};
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 // Creation membership prefix: query16, attempt8, task key16, target4,
 // writer ordinal4. Original plan, stage, task, backend, fragment and node
@@ -96,13 +101,18 @@ impl ConnectorWriteSession {
         let Some(quote) = WriteProductionQuote::from_manifest(manifest)? else {
             return Ok(());
         };
+        let targets = manifest.write_root_targets().ok_or_else(|| {
+            production_error("Native writer manifest has no original frozen TableFinish targets")
+        })?;
         // Register the complete actual cohort before the first writer effect.
         // No per-dependency occurrence quota truncates its responsibility.
         for cohort in manifest.writer_cohorts() {
-            if !self
-                .targets()
-                .iter()
-                .any(|target| target.ordinal() == cohort.writer().target())
+            let ordinal = cohort.writer().target();
+            if !targets.contains(&ordinal)
+                || !self
+                    .targets()
+                    .iter()
+                    .any(|target| target.ordinal() == ordinal)
             {
                 return Err(production_error(
                     "writer target is outside the original write session",
@@ -134,85 +144,109 @@ impl ConnectorWriteSession {
             .map_err(|failure| production_work_error(failure.error))?;
         // The original grant is held before the first metadata allocation.
         let mut facts = Some(encode_cohorts(manifest, quote)?);
-        let notification = self.register_production_ready_in(
+        let (notification, registration) = self.register_production_ready_in(
             manifest.execution(),
             manifest.plan(),
+            targets,
             &mut ready,
             &mut facts,
         )?;
-        drop(ready);
-        drop(facts);
-        // The exact original record/grant is stable before this callback.
+        drop((ready, facts));
+        // The exact original record or its pre-dispatch withdrawal is stable
+        // before the callback can wake any control owner.
         notification.notify();
-        Ok(())
+        registration
     }
+
     fn register_production_ready_in(
         &self,
         execution: QueryExecutionId,
         plan: PlanSeal,
-        ready: &mut novarocks_workload_control::joint_admission::UnreceivedProductionReady,
-        facts: &mut Option<Box<[u8]>>,
-    ) -> Result<novarocks_workload_control::WorkloadProgressNotification, ConnectorError> {
-        // A terminal decision can win while the paid grant is pending. Its
-        // exact receiving cut must precede every metadata move and dispatch.
-        let _terminal = self.receiving_terminal_guard()?;
+        targets: &[WriteTargetOrdinal],
+        ready: &mut UnreceivedProductionReady,
+        facts: &mut Option<Arc<[u8]>>,
+    ) -> Result<(WorkloadProgressNotification, Result<(), ConnectorError>), ConnectorError> {
+        let query = super::write_query_identity(execution, plan)?;
+        let proof = Arc::new(WriterCreationProof(Arc::clone(facts.as_ref().ok_or_else(
+            || production_error("write registration lost its paid cohort facts"),
+        )?)));
+        // A terminal decision may win while the grant is pending. Serialize
+        // installation and the synchronous, effect-free provider registration
+        // against that decision. No production or workload lock crosses the
+        // provider call, and nothing can dispatch until this method returns.
+        let terminal = self.receiving_terminal_guard()?;
+        let notification = {
+            let mut production = self
+                .productions
+                .lock()
+                .map_err(|_| production_error("write production state is poisoned"))?;
+            if production.current.is_some() {
+                return Err(production_error(
+                    "write production registration raced an existing attempt",
+                ));
+            }
+            if production
+                .owner
+                .as_ref()
+                .is_some_and(|owner| !ready.is_for_owner(owner))
+            {
+                return Err(production_error(
+                    "write session crossed workload authorities",
+                ));
+            }
+            let mut registration = Registration {
+                execution,
+                plan,
+                grant: None,
+            };
+            let notification = ready
+                .register_in(facts, &mut registration.grant)
+                .map_err(production_work_error)?;
+            production.current = Some(registration);
+            notification
+        };
+
+        let result = match catch_unwind(AssertUnwindSafe(|| {
+            self.write_stack_pin.session().begin_write_query(
+                self.plan.commit_session(),
+                &query,
+                targets,
+                Some(proof),
+            )
+        })) {
+            Ok(result) => result,
+            Err(panic) => {
+                // A panic cannot attest that the provider refused this
+                // registration. Keep the paid original and leave the FE
+                // terminal guard usable by its actual failure owner.
+                drop(terminal);
+                resume_unwind(panic)
+            }
+        };
         let mut production = self
             .productions
             .lock()
             .map_err(|_| production_error("write production state is poisoned"))?;
-        if production.current.is_some() {
-            return Err(production_error(
-                "write production registration raced an existing attempt",
-            ));
-        }
-        if production
-            .owner
-            .as_ref()
-            .is_some_and(|owner| !ready.is_for_owner(owner))
-        {
-            return Err(production_error(
-                "write session crossed workload authorities",
-            ));
-        }
-        production.current = Some(Registration {
-            execution,
-            plan,
-            grant: None,
-        });
-        let result = ready.register_in(facts, &mut production.current.as_mut().unwrap().grant);
-        match result {
-            Ok(notification) => {
-                let owner = production
-                    .current
-                    .as_ref()
-                    .unwrap()
-                    .grant
-                    .as_ref()
-                    .unwrap()
-                    .owner();
-                production.owner = Some(owner);
-                Ok(notification)
+        let registration = production.current.as_mut().unwrap();
+        let notification = match &result {
+            Ok(()) => {
+                production.owner = Some(registration.grant.as_ref().unwrap().owner());
+                notification
             }
-            Err(error) => {
-                production.current = None;
-                Err(production_work_error(error))
-            }
-        }
-    }
-    pub(super) fn received_creation_proof(
-        &self,
-    ) -> Result<
-        Option<Arc<dyn novarocks_spi::connector::write_stack::ConnectorWriteProductionProof>>,
-        ConnectorError,
-    > {
-        let production = self
-            .productions
-            .lock()
-            .map_err(|_| production_error("write production state is poisoned"))?;
-        Ok(production.owner.clone().map(|owner| {
-            Arc::new(ReceivedCreationProof(owner))
-                as Arc<dyn novarocks_spi::connector::write_stack::ConnectorWriteProductionProof>
-        }))
+            Err(_) => match ready.reject_before_dispatch_in(&mut registration.grant) {
+                Ok(withdrawn) => {
+                    production.current = None;
+                    withdrawn
+                }
+                Err(error) => {
+                    // Retain the original claim if its exact withdrawal
+                    // cannot be proven. The provider refusal stays primary.
+                    tracing::error!(%error, "Could not withdraw refused write production registration");
+                    notification
+                }
+            },
+        };
+        Ok((notification, result))
     }
 
     pub(super) fn production_never_registered(&self) -> Result<bool, ConnectorError> {
@@ -289,15 +323,15 @@ impl ConnectorWriteSession {
             .transpose()
     }
 }
-struct ReceivedCreationProof(UnreceivedProductionOwner);
+/// Shares the paid immutable cohort bytes with the original production
+/// record. The provider drops this view before the record can be settled.
+struct WriterCreationProof(Arc<[u8]>);
 
-impl novarocks_spi::connector::write_stack::ConnectorWriteProductionProof
-    for ReceivedCreationProof
-{
+impl ConnectorWriteProductionProof for WriterCreationProof {
     fn admits(
         &self,
-        target: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
-        physical: &novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext,
+        target: WriteTargetOrdinal,
+        physical: &ConnectorWriterPhysicalContext,
     ) -> Result<bool, ConnectorError> {
         let mut prefix = [0u8; CREATION_PREFIX_BYTES];
         prefix[..16].copy_from_slice(&physical.execution_query_id());
@@ -305,25 +339,27 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteProductionProof
         prefix[24..40].copy_from_slice(&physical.task_key());
         prefix[40..44].copy_from_slice(&target.get().to_be_bytes());
         prefix[44..48].copy_from_slice(&physical.writer_ordinal().to_be_bytes());
-        self.0
-            .received_facts_have_prefix(NonZeroUsize::new(COHORT_BYTES).unwrap(), &prefix)
-            .map_err(production_work_error)
+        let (cohorts, _) = self.0.as_chunks::<COHORT_BYTES>();
+        Ok(cohorts
+            .binary_search_by(|cohort| cohort[..CREATION_PREFIX_BYTES].cmp(&prefix))
+            .is_ok())
     }
 }
 
 fn encode_cohorts(
     manifest: &TaskManifestBinding,
     quote: WriteProductionQuote,
-) -> Result<Box<[u8]>, ConnectorError> {
+) -> Result<Arc<[u8]>, ConnectorError> {
     encode_occurrences(manifest.writer_cohorts(), quote)
 }
 fn encode_occurrences(
     cohorts: impl Iterator<Item = crate::query_execution::artifact::BoundWriterCohort>,
     quote: WriteProductionQuote,
-) -> Result<Box<[u8]>, ConnectorError> {
-    // One exact Box allocation, after its original metadata grant. Every byte
-    // is initialized below before assume_init; no Vec growth/copy allocation.
-    let mut bytes = Box::<[u8]>::new_uninit_slice(quote.metadata_bytes());
+) -> Result<Arc<[u8]>, ConnectorError> {
+    // One exact slice allocation after the original metadata grant. Fill it
+    // before sharing with either owner, then sort in place for binary lookup.
+    let mut bytes = Arc::<[u8]>::new_uninit_slice(quote.metadata_bytes());
+    let destination = Arc::get_mut(&mut bytes).unwrap();
     let mut offset = 0;
     for cohort in cohorts {
         let mut fact = [0u8; COHORT_BYTES];
@@ -349,20 +385,29 @@ fn encode_occurrences(
         put(&task.backend_process_id().to_bytes());
         put(&cohort.fragment().to_le_bytes());
         put(&cohort.writer().node().get().to_le_bytes());
-        if cursor != COHORT_BYTES || offset + COHORT_BYTES > bytes.len() {
+        if cursor != COHORT_BYTES || offset + COHORT_BYTES > destination.len() {
             return Err(production_error("frozen writer occurrence layout changed"));
         }
-        for (target, source) in bytes[offset..offset + COHORT_BYTES].iter_mut().zip(fact) {
+        for (target, source) in destination[offset..offset + COHORT_BYTES]
+            .iter_mut()
+            .zip(fact)
+        {
             target.write(source);
         }
         offset += COHORT_BYTES;
     }
-    if offset != bytes.len() {
+    if offset != destination.len() {
         return Err(production_error("frozen writer occurrence count changed"));
     }
-    // SAFETY: each byte in this exact Box has been written once above; error
-    // paths drop only MaybeUninit<u8>. The source is an immutable manifest.
-    Ok(unsafe { bytes.assume_init() })
+    // SAFETY: each byte in the exact slice has been written once above.
+    let mut bytes = unsafe { bytes.assume_init() };
+    let (cohorts, _) = Arc::get_mut(&mut bytes)
+        .unwrap()
+        .as_chunks_mut::<COHORT_BYTES>();
+    cohorts.sort_unstable_by(|left, right| {
+        left[..CREATION_PREFIX_BYTES].cmp(&right[..CREATION_PREFIX_BYTES])
+    });
+    Ok(bytes)
 }
 
 #[cfg(all(test, novarocks_dev_controls))]

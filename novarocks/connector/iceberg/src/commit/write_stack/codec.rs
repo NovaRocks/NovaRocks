@@ -181,22 +181,23 @@ impl IcebergWriteCodec {
         )
     }
 
+    fn envelope_header(&self, category: ConnectorCodecCategory) -> ConnectorEnvelopeHeader {
+        let binding = self.adapter.binding();
+        ConnectorEnvelopeHeader::new(
+            binding.descriptor().provider_id.clone(),
+            binding.catalog_handle().clone(),
+            category,
+            ConnectorCodecRevision::try_new(crate::wire::write::WRITE_CODEC_REVISION)
+                .expect("Iceberg write codec revision is non-zero"),
+        )
+    }
+
     fn envelope(
         &self,
         category: ConnectorCodecCategory,
         payload: Bytes,
     ) -> ConnectorEncodedPayload {
-        let binding = self.adapter.binding();
-        ConnectorEncodedPayload::new(
-            ConnectorEnvelopeHeader::new(
-                binding.descriptor().provider_id.clone(),
-                binding.catalog_handle().clone(),
-                category,
-                ConnectorCodecRevision::try_new(crate::wire::write::WRITE_CODEC_REVISION)
-                    .expect("Iceberg write codec revision is non-zero"),
-            ),
-            payload,
-        )
+        ConnectorEncodedPayload::new(self.envelope_header(category), payload)
     }
 }
 
@@ -1714,6 +1715,187 @@ impl IcebergWriteFragmentDecoder {
     }
 }
 
+/// The compact projection keeps only the artifact used to build an added
+/// manifest entry. The caller already admitted the original fragment.
+fn projected_addition_len(mut wire: dto::IcebergCommitFragment) -> Option<usize> {
+    use dto::iceberg_commit_fragment::Artifact;
+    use dto::iceberg_final_delete_effect::Effect;
+    let artifact = match wire.artifact.take()? {
+        artifact @ Artifact::DataFile(_) => artifact,
+        Artifact::PositionDeleteFile(file) if file.merged_old_references.is_empty() => {
+            Artifact::PositionDeleteFile(file)
+        }
+        Artifact::DeletionVector(file) if file.merged_old_references.is_empty() => {
+            Artifact::DeletionVector(file)
+        }
+        Artifact::FinalDelete(effect) => match effect.effect? {
+            Effect::RemoveDataFile(_) => return Some(0),
+            Effect::ReplacePositions(file) => {
+                let mut file = *file;
+                file.merged_old_references = Vec::new();
+                Artifact::DeletionVector(file)
+            }
+        },
+        _ => return None,
+    };
+    Some(
+        dto::IcebergCommitFragment {
+            artifact: Some(artifact),
+            creation: None,
+        }
+        .encoded_len(),
+    )
+}
+
+/// Reuse the existing artifact DTO, moving the decoded strings, metrics and
+/// buffers rather than projecting a second owned graph from borrowed values.
+pub(super) fn encode_compact_addition(
+    artifact: IcebergCommitArtifact,
+    bytes: usize,
+) -> Result<Box<[u8]>, ConnectorError> {
+    use dto::iceberg_commit_fragment::Artifact;
+    let artifact = match artifact {
+        IcebergCommitArtifact::DataFile(file) => Artifact::DataFile(dto::IcebergDataFileArtifact {
+            path: file.path,
+            file_format: dto::IcebergWriteFileFormat::Parquet as i32,
+            partition: Some(move_partition(file.partition)),
+            metrics: Some(move_metrics(file.metrics)),
+            first_row_id: file.first_row_id,
+        }),
+        IcebergCommitArtifact::PositionDeleteFile(file) => {
+            Artifact::PositionDeleteFile(dto::IcebergPositionDeleteFileArtifact {
+                path: file.path,
+                partition: Some(move_partition(file.partition)),
+                metrics: Some(move_metrics(file.metrics)),
+                referenced_data_file: file.referenced_data_file,
+                merged_old_references: Vec::new(),
+            })
+        }
+        IcebergCommitArtifact::DeletionVector(file) => {
+            Artifact::DeletionVector(dto::IcebergDeletionVectorArtifact {
+                path: file.path,
+                partition: Some(move_partition(file.partition)),
+                metrics: Some(move_metrics(file.metrics)),
+                referenced_data_file: file.referenced_data_file,
+                content_range: Some(dto::IcebergContentRange {
+                    offset: file.content_range.offset(),
+                    size_in_bytes: file.content_range.size_in_bytes(),
+                }),
+                cardinality: file.cardinality,
+                merged_old_references: Vec::new(),
+            })
+        }
+        _ => {
+            return Err(compact_encoding_error(
+                "compact entry is not a data or position artifact",
+            ));
+        }
+    };
+    let mut backing = vec![0; bytes].into_boxed_slice();
+    let mut buffer = backing.as_mut();
+    dto::IcebergCommitFragment {
+        artifact: Some(artifact),
+        creation: None,
+    }
+    .encode(&mut buffer)
+    .map_err(|_| compact_encoding_error("compact entry exceeded its exact encoding allocation"))?;
+    if !buffer.is_empty() {
+        return Err(compact_encoding_error(
+            "compact entry did not fill its exact encoding allocation",
+        ));
+    }
+    Ok(backing)
+}
+
+fn compact_encoding_error(detail: &str) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Internal, detail)
+}
+
+fn move_partition(partition: IcebergArtifactPartition) -> dto::IcebergArtifactPartition {
+    let mut values = Vec::with_capacity(partition.descriptor.values.len());
+    values.extend(partition.descriptor.values.into_iter().map(|value| {
+        dto::IcebergPartitionValueDescriptor {
+            is_null: value.is_null,
+            datum_bytes: value.datum_bytes,
+        }
+    }));
+    dto::IcebergArtifactPartition {
+        partition_path: partition.partition_path,
+        null_fingerprint: partition.null_fingerprint,
+        partition_spec_id: partition.partition_spec_id,
+        descriptor: Some(dto::IcebergPartitionDescriptor { values }),
+    }
+}
+
+fn move_metrics(metrics: IcebergArtifactMetrics) -> dto::IcebergArtifactMetrics {
+    dto::IcebergArtifactMetrics {
+        record_count: metrics.record_count,
+        file_size_in_bytes: metrics.file_size_in_bytes,
+        split_offsets: metrics.split_offsets,
+        column_stats: metrics.column_stats.map(|stats| dto::IcebergColumnStats {
+            column_sizes: stats.column_sizes,
+            value_counts: stats.value_counts,
+            null_value_counts: stats.null_value_counts,
+            nan_value_counts: stats.nan_value_counts,
+            lower_bounds: stats.lower_bounds,
+            upper_bounds: stats.upper_bounds,
+        }),
+    }
+}
+
+/// Frozen private decode environment for entries already admitted by this
+/// exact generation. It owns no live adapter, provider session or I/O.
+pub(crate) struct CompactFragmentCodec {
+    header: ConnectorEnvelopeHeader,
+    values: IcebergWriteValueCodec,
+}
+
+impl CompactFragmentCodec {
+    pub(crate) fn for_adapter(adapter: &IcebergWriteAdapter) -> Self {
+        let codec = IcebergWriteCodec::new(adapter.clone());
+        Self {
+            header: codec.envelope_header(ConnectorCodecCategory::CommitFragment),
+            values: codec.values,
+        }
+    }
+
+    /// Rehydrate one checked entry with its temporary decode receipt. Its
+    /// encoded bytes remain owned by the caller until their actual last use.
+    pub(crate) fn decode(
+        &self,
+        payload: &[u8],
+        author: &ConnectorPayloadRetentionGuard,
+    ) -> Result<(IcebergCommitFragment, ConnectorPayloadRetentionGuard), ConnectorCodecError> {
+        let mut ledger =
+            ConnectorDecodeLedger::new(crate::wire::write::fragment_decode_limits(payload.len()));
+        let mut context = ConnectorDecodeContext::new(&self.header, &mut ledger);
+        let wire = crate::wire::write::decode_commit_fragment(payload, &mut context)?;
+        let (_, receipt) = reserve_decoded_fragment(&mut context, author)?;
+        let value = self
+            .values
+            .decode_commit_fragment_value(&wire, &mut context)?;
+        Ok((value, receipt))
+    }
+}
+
+fn reserve_decoded_fragment(
+    context: &mut ConnectorDecodeContext<'_>,
+    author: &ConnectorPayloadRetentionGuard,
+) -> Result<(usize, ConnectorPayloadRetentionGuard), ConnectorCodecError> {
+    // Reserve for the decoded provider graph while the structural DTO is live.
+    let bytes = context
+        .ledger()
+        .retained_bytes()
+        .max(std::mem::size_of::<IcebergCommitFragment>());
+    let receipt = author.reserve_owned_bytes(bytes).map_err(|error| {
+        ConnectorCodecError::from_domain(
+            ConnectorFieldPath::root("commit_fragment").field("iceberg"),
+            error,
+        )
+    })?;
+    Ok((bytes, receipt))
+}
+
 impl ConnectorWriteFragmentWireDecoder for IcebergWriteFragmentDecoder {
     fn owner(&self) -> &str {
         &self.0.values.owner
@@ -1729,23 +1911,19 @@ impl ConnectorWriteFragmentWireDecoder for IcebergWriteFragmentDecoder {
         ));
         let mut context = ConnectorDecodeContext::new(envelope.header(), &mut ledger);
         let wire = self.decode_private_wire(envelope.payload(), &mut context)?;
-        // The domain graph mirrors the private DTO's owned strings and containers.
-        // Reserve its estimate before projecting the graph while the wire value is live.
-        let bytes = context
-            .ledger()
-            .retained_bytes()
-            .max(std::mem::size_of::<IcebergCommitFragment>());
-        let receipt = author.reserve_owned_bytes(bytes).map_err(|error| {
-            ConnectorCodecError::from_domain(
-                ConnectorFieldPath::root("commit_fragment").field("iceberg"),
-                error,
-            )
-        })?;
+        let (bytes, receipt) = reserve_decoded_fragment(&mut context, author)?;
         let value = self
             .0
             .values
             .decode_commit_fragment_value(&wire, &mut context)?;
-        Ok(self.0.adapter.wrap_retained_commit_fragment(value, receipt))
+        // Reuse the structural DTO to measure the exact compact encoding
+        // without constructing another decoded graph. This is process-local
+        // metadata and does not change the private wire artifact.
+        let value = value.with_compact_payload_bytes(projected_addition_len(wire.into_dto()));
+        Ok(self
+            .0
+            .adapter
+            .wrap_measured_commit_fragment(value, bytes, receipt))
     }
 }
 

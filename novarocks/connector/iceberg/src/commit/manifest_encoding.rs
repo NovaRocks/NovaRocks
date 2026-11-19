@@ -221,15 +221,15 @@ impl ManifestWriteEncoding {
         )
         .ok_or_else(|| invalid("Data file partition does not fit the selected manifest schema"))?;
         let bounds = normalize_bounds(self.version, &self.schema, original)?;
-        let copy = |first_row_id| {
+        let project = |original: DataFile, first_row_id| {
             if original.partition() == &partition
                 && original.first_row_id() == first_row_id
                 && bounds.is_none()
             {
-                return Ok(original.clone());
+                return Ok(original);
             }
             super::data_file::clone_data_file_with_manifest_values(
-                original,
+                &original,
                 self.spec.spec_id(),
                 partition,
                 first_row_id,
@@ -237,17 +237,21 @@ impl ManifestWriteEncoding {
             )
             .map_err(invalid)
         };
-        Ok(match &entry {
-            ManifestEntryWrite::Added(added) => EncodedManifestEntry::Added {
-                file: copy(original.first_row_id())?,
-                data_sequence: added.data_sequence(),
-            },
-            ManifestEntryWrite::Existing { frozen, .. } => EncodedManifestEntry::Existing {
-                file: copy(frozen.facts().first_row_id)?,
+        Ok(match entry {
+            ManifestEntryWrite::Added(added) => {
+                let first_row_id = added.file().first_row_id();
+                let data_sequence = added.data_sequence();
+                EncodedManifestEntry::Added {
+                    file: project(added.into_file(), first_row_id)?,
+                    data_sequence,
+                }
+            }
+            ManifestEntryWrite::Existing { file, frozen } => EncodedManifestEntry::Existing {
+                file: project(file, frozen.facts().first_row_id)?,
                 facts: frozen.facts().clone(),
             },
-            ManifestEntryWrite::Deleted { frozen, .. } => EncodedManifestEntry::Deleted {
-                file: copy(frozen.facts().first_row_id)?,
+            ManifestEntryWrite::Deleted { file, frozen } => EncodedManifestEntry::Deleted {
+                file: project(file, frozen.facts().first_row_id)?,
                 facts: frozen.facts().clone(),
             },
         })

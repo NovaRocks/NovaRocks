@@ -244,6 +244,9 @@ async fn run_original_recipe_shape(
         } else {
             peer.enable_single_root_lifecycle(root_task, kind);
         }
+        if failure_during_read_close {
+            peer.defer_single_root_release_until_abort().unwrap();
+        }
         if let Some(roster) = three_task_roster {
             peer.enable_three_task_roster(roster).unwrap();
         }
@@ -549,6 +552,7 @@ async fn run_original_recipe_shape(
             }
             gate.release();
         } else {
+            assert!(!peer.single_root_release_observed());
             let original = logical.binding.bound().unwrap();
             let publications =
                 crate::statistics::attempt_executor::StatisticsLateSupervisionProbes::arm(

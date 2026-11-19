@@ -1337,18 +1337,21 @@ mod tests {
         fn record_manifest(
             &self,
             object: &crate::commit::model::ObjectIdentity,
-            live_paths: &[String],
+            added_paths: &[String],
+            existing_paths: &[String],
             replaces: &[String],
         ) -> crate::iceberg::Result<()> {
-            self.inner.record_manifest(object, live_paths, replaces)
+            self.inner
+                .record_manifest(object, added_paths, existing_paths, replaces)
         }
 
         fn record_manifest_list(
             &self,
             object: &crate::commit::model::ObjectIdentity,
+            snapshot_id: i64,
             paths: &[String],
         ) -> crate::iceberg::Result<()> {
-            self.inner.record_manifest_list(object, paths)
+            self.inner.record_manifest_list(object, snapshot_id, paths)
         }
         fn stage_snapshot_id(
             &self,

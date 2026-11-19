@@ -55,6 +55,7 @@ pub(crate) struct TestStorageRequest {
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static TEST_STORAGE_REQUESTS: std::sync::Arc<std::sync::Mutex<Vec<TestStorageRequest>>>;
+    pub(crate) static TEST_AVRO_WRITES_BEFORE_FAILURE: std::cell::Cell<usize>;
 }
 #[cfg(test)]
 pub(crate) fn note_test_storage_request(operation: &'static str, path: &str) {
@@ -599,6 +600,22 @@ impl Storage for IcebergFsStorage {
         Self::ensure_parent_dir(&op, &relative_path).await?;
         if let Some(permit) = &permit {
             permit.check_active()?;
+        }
+        #[cfg(test)]
+        if path.ends_with(".avro")
+            && TEST_AVRO_WRITES_BEFORE_FAILURE
+                .try_with(|remaining| {
+                    let before = remaining.get();
+                    remaining.set(before.saturating_sub(1));
+                    before == 0
+                })
+                .unwrap_or(false)
+        {
+            note_test_storage_request("write-refused", path);
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                "injected Avro store refusal",
+            ));
         }
         let stream = phase
             .as_ref()
@@ -2732,18 +2749,22 @@ pub(crate) mod manifest_stream_tests {
         fn record_manifest(
             &self,
             object: &crate::commit::model::ObjectIdentity,
-            live_paths: &[String],
+            added_paths: &[String],
+            existing_paths: &[String],
             replaces: &[String],
         ) -> crate::iceberg::Result<()> {
-            self.attempt.record_manifest(object, live_paths, replaces)
+            self.attempt
+                .record_manifest(object, added_paths, existing_paths, replaces)
         }
 
         fn record_manifest_list(
             &self,
             object: &crate::commit::model::ObjectIdentity,
+            snapshot_id: i64,
             paths: &[String],
         ) -> crate::iceberg::Result<()> {
-            self.attempt.record_manifest_list(object, paths)
+            self.attempt
+                .record_manifest_list(object, snapshot_id, paths)
         }
         fn stage_snapshot_id(
             &self,

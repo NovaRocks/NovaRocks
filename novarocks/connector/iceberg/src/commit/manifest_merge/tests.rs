@@ -770,3 +770,34 @@ async fn merge_reuses_exact_ordered_inputs_but_rewrites_changed_order_or_encodin
         crate::commit::model::IcebergCleanupReport::Complete { deleted: 5 }
     );
 }
+
+#[test]
+fn rolled_full_manifests_are_kept_alone_and_small_tail_uses_the_existing_merge_policy() {
+    let data = ManifestContentType::Data;
+    let pending = |name, bytes| MergeCandidate::pending(descriptor(name, bytes, 0, data));
+    let policy = ManifestMergePolicy {
+        enabled: true,
+        min_count: 3,
+        target_bytes: 100,
+    };
+    let retained = || candidate("retained", 25, 0, data);
+    let rolled = vec![
+        pending("first", 103),
+        pending("second", 101),
+        pending("tail", 70),
+        retained(),
+    ];
+    assert_eq!(
+        inspect(plan(rolled, policy).unwrap()),
+        [
+            (false, vec!["first".into()]),
+            (false, vec!["second".into()]),
+            (true, vec!["tail".into(), "retained".into()]),
+        ],
+    );
+    let first_short = vec![pending("tail", 70), retained()];
+    assert_eq!(
+        inspect(plan(first_short, policy).unwrap()),
+        [(false, vec!["tail".into(), "retained".into()])],
+    );
+}

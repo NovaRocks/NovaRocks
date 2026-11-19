@@ -878,7 +878,10 @@ impl Core {
                 .map_err(|_| schedule("QA settlement still has an observed acknowledgement"))?;
             let failure = result
                 .err()
-                .map(|error| AttemptFailure::TaskProtocol(Box::new(error)))
+                .map(|error| match error {
+                    TaskExecutionError::Workload(original) => AttemptFailure::Host(original),
+                    error => AttemptFailure::TaskProtocol(Box::new(error)),
+                })
                 .or(self.round_failure.take())
                 .or(self.authorizations.take_observer_failure());
             return Ok(AckSettlementProgress::Complete(failure.map_or(Ok(()), Err)));
