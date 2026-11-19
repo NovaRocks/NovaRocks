@@ -124,7 +124,7 @@ SELECT k1, v2 FROM orders LIMIT 1;
 -- Snapshot 0 is not a real revision of this table, so the request must fail
 -- closed rather than yielding a plan that looks executable.
 -- @expect_error=iceberg snapshot 0 does not exist
-EXPLAIN VERBOSE SELECT k1, v2 FROM __nr_ivm_delta('ice_pfcut_${uuid0}.ns_${uuid0}.orders', 0, 0) WHERE v2 > 0;
+EXPLAIN VERBOSE SELECT /*+ SET_VAR(explain_detail='VERBOSE') */ k1, v2 FROM __nr_ivm_delta('ice_pfcut_${uuid0}.ns_${uuid0}.orders', 0, 0) WHERE v2 > 0;
 
 -- query 8
 -- @cleanup=true
