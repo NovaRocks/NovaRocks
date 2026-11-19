@@ -307,6 +307,7 @@ mod calendar_slice_owner;
 pub mod array_append_core;
 mod array_append_owner;
 mod array_append_selected;
+mod array_concat;
 
 pub mod regexp_count;
 pub(crate) mod regexp_count_owner;

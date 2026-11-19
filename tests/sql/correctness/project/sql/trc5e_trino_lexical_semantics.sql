@@ -120,3 +120,11 @@ SELECT /* ordinary */ CAST(9 AS integer) AS result;
 
 -- query 34
 SELECT /* outer /* inner */ CAST(10 AS integer) AS result;
+
+-- query 35
+SELECT l || r AS result FROM (
+    VALUES
+        (CAST(1 AS integer), ARRAY[CAST(1 AS integer), CAST(NULL AS integer)], ARRAY[CAST(2 AS integer)]),
+        (CAST(2 AS integer), CAST(NULL AS ARRAY(integer)), ARRAY[CAST(3 AS integer)]),
+        (CAST(3 AS integer), CAST(ARRAY[] AS ARRAY(integer)), ARRAY[CAST(4 AS integer)])
+) AS t(id, l, r) ORDER BY id;

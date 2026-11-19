@@ -38,9 +38,7 @@ REFRESH MATERIALIZED VIEW reject_mv WITH BROKEN;
 SHOW MATERIALIZED VIEWS LIKE 'reject%';
 
 -- Backend membership is owned by external orchestration, so ADD BACKEND and
--- DROP BACKEND no longer exist as a command family. They are rejected as
--- recognized-but-unsupported statements rather than by a backend-address
--- grammar.
+-- DROP BACKEND are outside the Trino statement grammar.
 -- query 6
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 ADD BACKEND 127.0.0.1:1234;
@@ -94,7 +92,7 @@ DROP CATALOG reject_scope CASCADE;
 
 -- query 18
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-CREATE SCHEMA reject_ice.reject_ns AUTHORIZATION ROLE operator;
+CREATE SCHEMA reject_ice.p14_schema_authorization_witness AUTHORIZATION ROLE operator;
 
 -- query 19
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR

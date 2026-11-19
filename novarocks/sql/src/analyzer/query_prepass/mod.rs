@@ -122,11 +122,23 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                         list.span,
                     ));
                 }
-                Expr::JsonConstructor(_)
-                | Expr::JsonExists(_)
-                | Expr::JsonValue(_)
-                | Expr::JsonSerialize(_) => {
+                Expr::JsonConstructor(_) => {
                     self.0 = Some(("SQL/JSON constructor is not supported", expression.span()));
+                }
+                Expr::JsonExists(_) => {
+                    self.0 = Some(("JSON_EXISTS is not supported", expression.span()))
+                }
+                Expr::JsonValue(_) => {
+                    self.0 = Some(("JSON_VALUE is not supported", expression.span()))
+                }
+                Expr::JsonSerialize(_) => {
+                    self.0 = Some(("JSON_SERIALIZE is not supported", expression.span()))
+                }
+                Expr::IntervalValueExpression(_) => {
+                    self.0 = Some((
+                        "INTERVAL value expressions are not supported",
+                        expression.span(),
+                    ));
                 }
                 Expr::JsonObject(node) if !super::is_supported_json_object_profile(node) => {
                     self.0 = Some((
@@ -203,11 +215,17 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                 ast::Relation::JsonTable(_) => {
                     self.0 = Some(("JSON_TABLE is not supported", relation.span()))
                 }
-                ast::Relation::Sampled(_)
-                | ast::Relation::Pivot(_)
-                | ast::Relation::Nearest(_)
-                | ast::Relation::PatternRecognition(_) => {
-                    self.0 = Some(("relation profile is not supported", relation.span()))
+                ast::Relation::Sampled(_) => {
+                    self.0 = Some(("TABLESAMPLE is not supported", relation.span()))
+                }
+                ast::Relation::Pivot(_) => {
+                    self.0 = Some(("PIVOT is not supported", relation.span()))
+                }
+                ast::Relation::Nearest(_) => {
+                    self.0 = Some(("NEAREST is not supported", relation.span()))
+                }
+                ast::Relation::PatternRecognition(_) => {
+                    self.0 = Some(("MATCH_RECOGNIZE is not supported", relation.span()))
                 }
                 ast::Relation::TableFunction(node)
                     if !node.copartitioning.is_empty()

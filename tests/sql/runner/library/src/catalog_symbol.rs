@@ -561,6 +561,13 @@ impl Visit for CatalogEdits<'_> {
         walk_trino_statement(self, statement);
     }
 
+    fn visit_session_property(&mut self, property: &SessionProperty) {
+        if let [catalog, _] = property.name.parts.as_slice() {
+            self.ident(catalog);
+        }
+        self.visit_expr(&property.value);
+    }
+
     fn visit_object_name(&mut self, name: &ObjectName) {
         if name.parts.len() >= 3 {
             self.ident(&name.parts[0]);
