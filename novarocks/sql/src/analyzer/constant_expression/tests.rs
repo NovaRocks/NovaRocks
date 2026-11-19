@@ -214,26 +214,18 @@ fn required_materialized_value_keeps_its_pool_and_nonzero_ordinal() {
 
 #[test]
 fn required_preparation_does_not_fold_and_preserves_original_publication_source() {
-    use crate::compiler::{
-        SqlFoldDependencyInput, SqlFoldDependencyObserver, SqlFoldEvaluationOutcome,
-    };
+    use crate::compiler::SqlFoldDependencyObserver;
     use novarocks_type_contract::CompileControlError;
     struct RejectPublication {
         cause: CompileControlError,
     }
     impl SqlFoldDependencyObserver for RejectPublication {
-        fn before_fold_dependency_observed(
+        fn observe_fold_unit_observed(
             &self,
-            _: SqlFoldDependencyInput<'_>,
+            _: &crate::compiler::SqlAuthoredScalarUnit,
+            _: Option<&novarocks_functions::ConstantValue>,
             _: &dyn PureCompileControl,
         ) -> Result<(), CompileControlError> {
-            panic!("required preparation must not enter optional folding")
-        }
-        fn after_fold_dependency_observed(
-            &self,
-            _: SqlFoldDependencyInput<'_>,
-            _: SqlFoldEvaluationOutcome<'_>,
-        ) {
             panic!("required preparation must not enter optional folding")
         }
         fn observe_required_scalar_source_observed(

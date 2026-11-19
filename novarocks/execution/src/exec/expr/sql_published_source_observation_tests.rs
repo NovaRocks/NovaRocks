@@ -121,11 +121,16 @@ fn query(
     sql: &str,
     control: SqlCompileControl,
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileProgressError> {
+    let mut session = session();
+    session
+        .optimizer_settings
+        .disabled_rules
+        .push("FoldConstant".into());
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([97; 16]).unwrap(),
         SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
         SqlCompileIntent::Query,
-        session(),
+        session,
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),

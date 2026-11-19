@@ -23,9 +23,9 @@ mod support;
 #[cfg(novarocks_dev_controls)]
 pub use catalogue::installed_builtin_owner_catalogue;
 pub use source::{
-    sql_source, sql_source_with_declared_fields, sql_source_with_semantics,
-    sql_source_with_single_field, sql_source_with_single_field_and_core_residuals,
-    try_sql_source_with_declared_fields,
+    sql_source, sql_source_with_declared_fields, sql_source_with_folding,
+    sql_source_with_semantics, sql_source_with_single_field,
+    sql_source_with_single_field_and_core_residuals, try_sql_source_with_declared_fields,
 };
 pub use support::{parse_query, sql_fixture_constant_policy};
 

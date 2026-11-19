@@ -1434,6 +1434,7 @@ mod tests {
     ) -> SqlFinalPlanCompileRequest {
         let optimizer_settings = SessionOptimizerSettings {
             enable_materialized_view_rewrite: Some(mv_enabled),
+            disabled_rules: vec!["FoldConstant".into()],
             ..SessionOptimizerSettings::default()
         };
         SqlFinalPlanCompileRequest::new(

@@ -367,7 +367,10 @@ fn wide_collect_true_source() -> (
     let functions = builder.seal_bound().unwrap();
     let catalog = PlannerMemoryCatalog::default();
     let catalog = SqlPlannerTableSnapshot::new(&catalog);
-    let settings = SessionOptimizerSettings::default();
+    let settings = SessionOptimizerSettings {
+        disabled_rules: vec!["FoldConstant".into()],
+        ..Default::default()
+    };
     let control = SqlCompileControl::unbounded();
     let columns = (0..1024)
         .map(|i| ColumnDef {

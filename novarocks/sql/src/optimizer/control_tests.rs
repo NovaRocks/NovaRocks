@@ -73,7 +73,7 @@ fn environment<'a>(
 }
 #[test]
 fn optimizer_control_entry_preserves_all_three_categories() {
-    let settings = options::SessionOptimizerSettings::default();
+    let settings = without_constant_folding(options::SessionOptimizerSettings::default());
     for error in errors() {
         let control = Control::fail(error.clone(), 0);
         let result = optimize(
@@ -90,7 +90,7 @@ fn optimizer_control_entry_preserves_all_three_categories() {
 }
 #[test]
 fn optimizer_control_observes_actual_wide_statistics_validation() {
-    let settings = options::SessionOptimizerSettings::default();
+    let settings = without_constant_folding(options::SessionOptimizerSettings::default());
     for error in errors() {
         let control = Control::fail(error.clone(), 256);
         let plan = OptExpr::new(
@@ -195,7 +195,7 @@ fn optimizer_control_successful_product_does_not_retain_request_observation() {
     let observation = Arc::new(Observation);
     let weak = Arc::downgrade(&observation);
     let control = crate::compiler::SqlCompileControl::new(None, observation.clone());
-    let settings = options::SessionOptimizerSettings::default();
+    let settings = without_constant_folding(options::SessionOptimizerSettings::default());
     let output = optimize(
         OptExpr::leaf(values()),
         ScalarArena::new(),

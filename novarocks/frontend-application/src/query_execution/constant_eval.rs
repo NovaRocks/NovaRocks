@@ -45,6 +45,11 @@ pub(crate) fn constant_evaluator() -> &'static dyn SqlConstantEvaluator {
 }
 
 impl SqlConstantEvaluator for ExecutionConstantEvaluator {
+    #[cfg(debug_assertions)]
+    fn is_legacy_fold_reference(&self) -> bool {
+        true
+    }
+
     fn eval_scalar(
         &self,
         request: &FoldRequest,
@@ -369,15 +374,3 @@ fn fold_value_type_supported(
     }
     supported(value_type.value_type(), true, work)
 }
-
-#[cfg(test)]
-#[path = "constant_eval/cv_tests.rs"]
-mod cv_tests;
-
-#[cfg(test)]
-#[path = "constant_eval/sql_fold_dependency_observation_tests.rs"]
-mod sql_fold_dependency_observation_tests;
-
-#[cfg(test)]
-#[path = "constant_eval/sql_dependency_resolved_binding_source_tests.rs"]
-mod sql_dependency_resolved_binding_source_tests;

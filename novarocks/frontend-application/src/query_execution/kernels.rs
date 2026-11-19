@@ -74,6 +74,10 @@ impl SystemTableQueryKernel {
 }
 
 impl QueryPreparationKernel {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The query preparation kernel consumes separately owned topology, catalogue, connector, and compile capabilities."
+    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -499,6 +503,10 @@ pub(crate) struct MaintenanceRewriteRuntime {
 }
 
 impl MaintenanceExecutionKernel {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Maintenance assembles independently owned connector, catalogue, statistics, and compile capabilities."
+    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,

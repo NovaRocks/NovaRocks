@@ -93,6 +93,7 @@ fn sql_source_with_columns_and_semantics(
             current_catalog: None,
             current_database: "fixture".into(),
             optimizer_settings: SessionOptimizerSettings {
+                disabled_rules: vec!["FoldConstant".into()],
                 enable_materialized_view_rewrite: Some(false),
                 enable_common_subexpr_reuse: Some(false),
                 ..SessionOptimizerSettings::default()

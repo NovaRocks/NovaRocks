@@ -15,18 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Actual installed lifecycle/static-profile admission. This is not the full E08s1 seal.
-use super::sql_fold_observation_test_source::{EVALUATOR, SERIAL, fold_count, reset, session};
 use arrow::datatypes::{DataType, Field};
 use novarocks_functions::{
     FunctionArgument, FunctionBindingError, FunctionValueType, PureCallLifecycle as Lifecycle,
     PureKernelAbi,
 };
-use novarocks_sql::analyze_error::AnalyzeErrorKind;
-use novarocks_sql::compiler::{
-    SqlAnalyzeRequest, SqlCompileControl, SqlCompileError, SqlCompileIntent, SqlCompiler,
-    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlStatementInput,
-    builtin_sql_function_catalog,
-};
+use novarocks_sql::compiler::{SqlCompileControl, builtin_sql_function_catalog};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::sync::{
     Arc,
@@ -37,25 +31,6 @@ fn arg(ty: DataType) -> FunctionArgument {
         value_type: FunctionValueType::new(ty, true),
         constant: None,
     }
-}
-fn analyze(sql: &str) -> Result<(), SqlCompileError> {
-    let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
-    let tables = SqlPlannerTableSnapshot::new(&catalog);
-    let request = SqlAnalyzeRequest::new(
-        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
-        SqlCompileIntent::Query,
-        session(),
-        SqlPlanningEnvironment::Distributed,
-        &tables,
-        builtin_sql_function_catalog(),
-        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        None,
-        super::test_support::constant_policy(),
-        SqlCompileControl::unbounded(),
-    )
-    .with_legacy_fold_evaluator(&EVALUATOR);
-    SqlCompiler::analyze(request)?.into_pending()?;
-    Ok(())
 }
 #[test]
 fn e08s1_selected_loan_checks_actual_five_lifecycles_without_preparing_a_value() {
@@ -117,43 +92,6 @@ fn e08s1_selected_loan_checks_actual_five_lifecycles_without_preparing_a_value()
         matches!(scoped.admit_bound_lifecycle_observed(&scalar, Lifecycle::Table, &c),
         Err(FunctionBindingError::UnavailableImplementation(id)) if id == scalar.selected.overload)
     );
-}
-#[test]
-fn e08s1_missing_aggregate_window_and_over_keep_unavailable_span_before_any_fold() {
-    let _serial = SERIAL.lock().unwrap();
-    for (sql, name) in [
-        ("SELECT dict_merge('x', 1)", "builtin.aggregate/dict_merge/"),
-        (
-            "SELECT session_number(1, 2) OVER (ORDER BY 1)",
-            "builtin.window/session_number/",
-        ),
-    ] {
-        reset();
-        let error = analyze(sql).unwrap_err();
-        let SqlCompileError::Analyze(error) = error else {
-            panic!("typed analyze failure: {error}")
-        };
-        assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
-        assert!(error.span().is_some());
-        assert!(error.message().contains(name), "{}", error.message());
-        assert!(error.control_error().is_none());
-        assert_eq!(fold_count(), 0);
-    }
-}
-#[test]
-fn e08s1_supported_over_and_invalid_regexp_data_are_not_evaluated_by_static_gate() {
-    let _serial = SERIAL.lock().unwrap();
-    for sql in [
-        "SELECT count(1) OVER ()",
-        "SELECT max_by(1, 2) OVER ()",
-        "SELECT min_by(1, 2) OVER ()",
-        "SELECT row_number() OVER ()",
-        "SELECT regexp_count('x', '[')",
-    ] {
-        reset();
-        analyze(sql).unwrap();
-        assert_eq!(fold_count(), 0);
-    }
 }
 struct Refuse {
     cause: CompileControlError,

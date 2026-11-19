@@ -801,9 +801,8 @@ fn own_effects(
                 recipe.own_effects(context)
             } else {
                 return Err(CallAuthorError::effects(format!(
-                    "UnsupportedExpression({:?}, {})",
-                    source.id,
-                    format!("Binary({op:?})")
+                    "UnsupportedExpression({:?}, Binary({op:?}))",
+                    source.id
                 )));
             }
         }
@@ -826,7 +825,7 @@ fn expression_kind_label(kind: &ExprKind) -> String {
     }
 }
 
-fn definition<'a>(unit: &'a SealedUnit, id: ExprId) -> Result<&'a ExprNode, CallAuthorError> {
+fn definition(unit: &SealedUnit, id: ExprId) -> Result<&ExprNode, CallAuthorError> {
     unit.definition(id).ok_or(CallAuthorError::effects_invalid(
         "missing primitive operand",
     ))

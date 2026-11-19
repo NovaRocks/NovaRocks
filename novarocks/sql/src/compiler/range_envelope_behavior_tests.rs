@@ -83,6 +83,7 @@ fn compile(score_type: DataType, predicate: &str) -> SqlOptimizedOutput {
             optimizer_settings: SessionOptimizerSettings {
                 enable_materialized_view_rewrite: Some(false),
                 enable_common_subexpr_reuse: Some(false),
+                disabled_rules: vec!["FoldConstant".into()],
                 ..Default::default()
             },
         },

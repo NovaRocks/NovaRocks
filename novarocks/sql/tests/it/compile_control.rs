@@ -122,3 +122,33 @@ mod result_declaration {
         }
     }
 }
+
+mod table_fold_parent {
+    use crate::fixtures::table_parent::{Outcome, optimize, source};
+    use crate::fold_observation::FoldProbe;
+    use novarocks_sql::compiler::SqlCompileError;
+    use novarocks_type_contract::CompileControlError;
+    use std::sync::{Arc, atomic::Ordering};
+
+    #[test]
+    fn e08s1_table_fold_parent_three_control_causes_keep_origin_and_no_child_tail() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let probe = Arc::new(FoldProbe::default());
+            let catalog = source(Outcome::Control(cause.clone()));
+            assert_eq!(
+                optimize(&catalog, &probe).unwrap_err(),
+                SqlCompileError::from(cause)
+            );
+            assert_eq!(catalog.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(catalog.sources.lock().unwrap().len(), 1);
+            assert!(
+                probe.receipts.lock().unwrap().is_empty(),
+                "control refuses this actual Table parent before children"
+            );
+        }
+    }
+}

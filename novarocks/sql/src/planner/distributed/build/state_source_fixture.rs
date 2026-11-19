@@ -460,3 +460,6 @@ pub fn ordered_array_state_source_for_test(
         e => SqlCompileError::Compilation(e.to_string()),
     })
 }
+
+#[cfg(test)]
+mod call_dependency_tests;

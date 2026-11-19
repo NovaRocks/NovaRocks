@@ -101,9 +101,6 @@ mod sql_dependency_context_tests;
 mod sql_scalar_presence_candidate_tests;
 
 #[cfg(test)]
-mod sql_fold_observation_test_source;
-
-#[cfg(test)]
 mod sql_dependency_artifact_storage_tests;
 
 #[cfg(test)]
@@ -141,9 +138,6 @@ mod percentile_hash_corpus_sql_source_tests;
 
 #[cfg(test)]
 mod between_actual_sql_compiler_tests;
-
-#[cfg(test)]
-mod percentile_hash_native_n1_availability_tests;
 
 #[cfg(test)]
 mod inlist_required_actual_sql_tests;
@@ -231,21 +225,6 @@ mod environment_sql_source_tests;
 
 #[cfg(test)]
 mod e08s1_environment_tests;
-
-#[cfg(test)]
-mod fold_environment_sql_test_source;
-
-#[cfg(test)]
-mod e08s1_fold_environment_tests;
-
-#[cfg(test)]
-mod logical_environment_sql_test_source;
-
-#[cfg(test)]
-mod e08s1_logical_environment_tests;
-
-#[cfg(test)]
-mod e08s1_table_fold_parent_tests;
 
 #[cfg(test)]
 mod append_trailing_sql_source_tests;

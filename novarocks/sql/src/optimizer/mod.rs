@@ -186,6 +186,15 @@ pub(crate) fn optimize_with_root_distribution(
     )
 }
 
+// Planner fixtures that inspect scalar structure use the actual optimizer rule switch.
+#[cfg(test)]
+fn without_constant_folding(
+    mut settings: options::SessionOptimizerSettings,
+) -> options::SessionOptimizerSettings {
+    settings.disabled_rules.push("FoldConstant".into());
+    settings
+}
+
 #[cfg(test)]
 pub(crate) fn optimize_with_test_table_statistics(
     plan_expr: OptExpr,
@@ -199,6 +208,7 @@ pub(crate) fn optimize_with_test_table_statistics(
     // Production query planning always uses `optimize` with query-scoped
     // connector evidence.
     let stats_input = OptimizerStatsInput::from_test_table_statistics(table_stats);
+    let settings = without_constant_folding(settings.clone());
     optimize_with_root_property(
         plan_expr,
         scalar_arena,
@@ -207,7 +217,7 @@ pub(crate) fn optimize_with_test_table_statistics(
         mv_candidates,
         PhysicalPropertySet::gather(),
         OptimizerEnvironment::new(
-            settings,
+            &settings,
             None,
             crate::functions::test_function_catalog_snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
@@ -234,6 +244,7 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
         ordering: OrderingSpec::Any,
     };
     let stats_input = OptimizerStatsInput::from_test_table_statistics(table_stats);
+    let settings = without_constant_folding(settings.clone());
     optimize_with_root_property(
         plan_expr,
         scalar_arena,
@@ -242,7 +253,7 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
         Vec::new(),
         root_required,
         OptimizerEnvironment::new(
-            settings,
+            &settings,
             None,
             crate::functions::test_function_catalog_snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
@@ -1566,7 +1577,9 @@ mod is_known_rule_name_tests {
             ColumnRefFactory::new(),
             vec![candidate],
             OptimizerEnvironment::new(
-                &crate::optimizer::options::SessionOptimizerSettings::default(),
+                &without_constant_folding(
+                    crate::optimizer::options::SessionOptimizerSettings::default(),
+                ),
                 None,
                 crate::functions::test_function_catalog_snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
@@ -1905,7 +1918,7 @@ mod is_known_rule_name_tests {
         )
         .expect("logical to opt expr");
         let mut rewrite_ctx =
-            crate::optimizer::rewrite::context::RewriteContext::for_query(Vec::new());
+            crate::optimizer::rewrite::context::RewriteContext::for_query(["FoldConstant".into()]);
         rewrite_ctx.set_query_stats_input(
             crate::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &HashMap::new(),

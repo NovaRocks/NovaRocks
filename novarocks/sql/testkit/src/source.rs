@@ -64,6 +64,21 @@ pub fn sql_source_with_semantics(
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     sql_source_with_explicit_single_field(sql, Field::new("k", dtype, false), sql_semantics, None)
 }
+/// Compile the same fixture with the normal SQL constant-folding rule enabled.
+pub fn sql_source_with_folding(
+    sql: &str,
+    dtype: DataType,
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    try_sql_source_with_explicit_fields(
+        sql,
+        &[Field::new("k", dtype, false)],
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        None,
+        true,
+    )
+    .unwrap()
+}
+
 /// A fixture source fact is explicit; it is never inferred from test data.
 pub fn sql_source_with_single_field(
     sql: &str,
@@ -116,7 +131,8 @@ fn sql_source_with_explicit_fields(
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     static_predicate_offer: Option<bool>,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
-    try_sql_source_with_explicit_fields(sql, fields, sql_semantics, static_predicate_offer).unwrap()
+    try_sql_source_with_explicit_fields(sql, fields, sql_semantics, static_predicate_offer, false)
+        .unwrap()
 }
 
 pub fn try_sql_source_with_declared_fields(
@@ -131,6 +147,7 @@ pub fn try_sql_source_with_declared_fields(
         fields,
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         None,
+        false,
     )
 }
 
@@ -139,6 +156,7 @@ fn try_sql_source_with_explicit_fields(
     fields: &[Field],
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     static_predicate_offer: Option<bool>,
+    fold_constants: bool,
 ) -> Result<
     novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
     novarocks_sql::compiler::SqlCompileProgressError,
@@ -153,6 +171,11 @@ fn try_sql_source_with_explicit_fields(
             current_catalog: None,
             current_database: "fixture".into(),
             optimizer_settings: SessionOptimizerSettings {
+                disabled_rules: if fold_constants {
+                    Vec::new()
+                } else {
+                    vec!["FoldConstant".into()]
+                },
                 enable_materialized_view_rewrite: Some(false),
                 enable_common_subexpr_reuse: Some(false),
                 enable_connector_static_predicate_pushdown: static_predicate_offer,

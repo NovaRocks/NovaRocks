@@ -1007,6 +1007,10 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The dev fold probe borrows the reference evaluator alongside the exact production catalogue."
+)]
 fn canonical_incremental_change_stream_request<'a>(
     query: ast::Query,
     imv_rewrite: &'a crate::compiler::SqlImvPlanningInput,

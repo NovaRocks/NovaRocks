@@ -9451,7 +9451,10 @@ pub(crate) mod tests {
                     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
                     current_catalog: Some("iceberg".to_string()),
                     current_database: "db".to_string(),
-                    optimizer_settings: SessionOptimizerSettings::default(),
+                    optimizer_settings: SessionOptimizerSettings {
+                        disabled_rules: vec!["FoldConstant".into()],
+                        ..Default::default()
+                    },
                 },
                 SqlPlanningEnvironment::Distributed,
                 builtin_sql_function_catalog().snapshot(),

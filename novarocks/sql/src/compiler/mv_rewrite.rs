@@ -3978,9 +3978,8 @@ mod tests {
     #[test]
     fn candidate_and_query_signed_integer_ranges_survive_fold_policy() {
         use crate::compiler::{
-            ConversionPlan, FoldRequest, FrozenFoldIntrinsic, FrozenFoldNode, SqlAnalyzeRequest,
-            SqlCompiler, SqlConstantEvaluationError, SqlConstantEvaluator, SqlPlannerTableSnapshot,
-            SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+            SqlAnalyzeRequest, SqlAuthoredScalarUnit, SqlCompiler, SqlFoldDependencyObserver,
+            SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
         };
         use crate::optimizer::rewrite::{
             context::RewriteContext,
@@ -3988,57 +3987,66 @@ mod tests {
             pipeline::{RewritePipeline, RewriteStage},
             rules,
         };
+        use novarocks_expression_contract::ExprKind;
+        use novarocks_functions::ConstantValue;
+        use novarocks_type_contract::{
+            CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+        };
         use std::cell::RefCell;
         use std::rc::Rc;
+        use std::sync::Mutex;
 
-        struct SignedCastFoldPort(AtomicUsize);
-        impl SqlConstantEvaluator for SignedCastFoldPort {
-            fn eval_scalar(
+        #[derive(Default)]
+        struct SignedCastReceipts(Mutex<Vec<i64>>);
+
+        impl SqlFoldDependencyObserver for SignedCastReceipts {
+            fn observe_fold_unit_observed(
                 &self,
-                request: &FoldRequest,
-                control: &dyn novarocks_type_contract::PureCompileControl,
-            ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
-            {
-                let FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast {
-                    plan: ConversionPlan::Carrier(step),
-                }) = &request.kind
-                else {
-                    return Ok(None);
+                source: &SqlAuthoredScalarUnit,
+                result: Option<&ConstantValue>,
+                control: &dyn PureCompileControl,
+            ) -> Result<(), CompileControlError> {
+                let unit = source.unit();
+                let root = unit
+                    .definition(unit.root(source.root()).unwrap().definition)
+                    .unwrap();
+                let ExprKind::Cast { expr, .. } = &root.kind else {
+                    return Ok(());
                 };
-                let [argument] = request.args.as_slice() else {
-                    panic!("the original CAST fold request has one argument");
+                let input = unit.definition(*expr).unwrap();
+                let ExprKind::Constant(reference) = &input.kind else {
+                    return Ok(());
                 };
                 if !crate::optimizer::scalar_expr::nonnull_signed_literal_widening(
-                    &argument.value_type,
-                    &request.result_type,
+                    &input.ty, &root.ty,
                 ) {
-                    return Ok(None);
+                    return Ok(());
                 }
-                assert_eq!(step.target(), &request.result_type);
-                assert_eq!(argument.value.value_type(), &argument.value_type);
-                let Some(value) = argument.value.signed_integer_observed(
-                    novarocks_type_contract::CompilePhase::FunctionSpecialization,
-                    control,
-                )?
-                else {
-                    return Ok(None);
-                };
-                self.0.fetch_add(1, Ordering::SeqCst);
-                // This test port models an already admitted lossless signed CAST.
-                // The production FoldConstant rule still owns the CV publication.
-                Ok(Some(crate::constant::admit_syntax_constant(
-                    &crate::analysis::LiteralValue::Int(value),
-                    &request.result_type,
-                    request.constant_policy,
-                    control,
-                )?))
+                let result = result.expect("signed literal widening folds to a typed constant");
+                let phase = CompilePhase::FunctionSpecialization;
+                let mut work = CompileCheckpoints::try_new(control, phase)?;
+                let original = source
+                    .constants()
+                    .resolve_source_observed(*reference, &mut work)
+                    .expect("checked fold unit retains its original constant");
+                work.finish()?;
+                assert_eq!(original.value_type(), &input.ty);
+                assert_eq!(result.value_type().data_type(), root.ty.data_type());
+                let original = original
+                    .signed_integer_observed(phase, control)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    result.signed_integer_observed(phase, control).unwrap(),
+                    Some(original)
+                );
+                self.0.lock().unwrap().push(original);
+                Ok(())
             }
         }
 
-        for (disabled, port_absent) in [(false, false), (true, false), (false, true)] {
+        for disabled in [false, true] {
             for minimum in [98, 99] {
-                let evaluator: &'static SignedCastFoldPort =
-                    Box::leak(Box::new(SignedCastFoldPort(AtomicUsize::new(0))));
                 let catalog = CandidateCatalog::new();
                 let snapshot = SqlPlannerTableSnapshot::new(&catalog);
                 let mut definitions = candidate_index();
@@ -4049,7 +4057,7 @@ mod tests {
                     settings.disabled_rules.push("FoldConstant".into());
                 }
                 let control = crate::compiler::SqlCompileControl::unbounded();
-                let mut request = SqlAnalyzeRequest::new(
+                let request = SqlAnalyzeRequest::new(
                     SqlStatementInput::parsed_query(Box::new(test_query(&format!(
                         "SELECT k FROM iceberg.db.base WHERE k > {minimum}"
                     )))),
@@ -4067,11 +4075,7 @@ mod tests {
                     Some(&definitions),
                     crate::constant::test_constant_policy(),
                     control.clone(),
-                )
-                .with_legacy_fold_evaluator(evaluator);
-                if port_absent {
-                    request.constant_evaluator = None;
-                }
+                );
                 let analyzed = SqlCompiler::analyze(request)
                     .unwrap()
                     .into_pending()
@@ -4098,11 +4102,10 @@ mod tests {
                 );
                 context.set_root_allow_throw_exception(analyzed.root_allow_throw_exception);
                 context.set_function_catalog(Arc::clone(&analyzed.function_catalog));
-                context.set_fold_dependency_observer(control.fold_dependency_observer().cloned());
+                context.set_sealed_functions(Arc::clone(&analyzed.sealed_functions));
+                let receipts = Arc::new(SignedCastReceipts::default());
+                context.set_fold_dependency_observer(Some(receipts.clone()));
                 context.set_scalar_arena(Rc::clone(&arena));
-                if let Some(port) = analyzed.constant_evaluator {
-                    context.set_constant_evaluator(port);
-                }
                 let plan = RewritePipeline::from_stages(vec![RewriteStage::new(
                     "ConstantFold",
                     RewritePhase::LogicalNormalize,
@@ -4128,16 +4131,17 @@ mod tests {
                     .unwrap();
                 assert!(
                     contained.is_some(),
-                    "signed range containment must survive minimum={minimum}, FoldConstant disabled={disabled}, port absent={port_absent}"
+                    "signed range containment must survive minimum={minimum}, FoldConstant disabled={disabled}"
                 );
                 let contained = contained.unwrap();
                 assert_eq!(contained.compensation.len(), usize::from(minimum > 98));
-                if disabled || port_absent {
-                    assert_eq!(evaluator.0.load(Ordering::SeqCst), 0);
+                let signed_literals = receipts.0.lock().unwrap();
+                if disabled {
+                    assert!(signed_literals.is_empty());
                 } else {
                     assert!(
-                        evaluator.0.load(Ordering::SeqCst) >= 1,
-                        "the query must consume the original FoldConstant port and publish a typed CV"
+                        signed_literals.contains(&minimum),
+                        "the real fold must preserve the signed lower bound {minimum}"
                     );
                 }
             }

@@ -125,8 +125,9 @@ code-anchors:
 
 ### pipeline-execution
 
-- [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排）
-- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，其余规则保留）
+- [ADR-0241](ADR-0241-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件）
+- [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排；单节点折叠的退役条件由 ADR-0241 承接）
+- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，标量调用撰写所有权由 ADR-0241 部分替代）
 
 领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
 
@@ -141,7 +142,7 @@ code-anchors:
 - [ADR-0208](ADR-0208-logical-write-counts-and-strict-stream-delivery.md) — 逻辑写计数、物理分布与严格消费为何各守独立契约，summary与writer结果为何公平推进（active；当前装配由 ADR-0206 补充，不重放传输的阶段规则由 ADR-0209 部分替代，其余写入规则保留）
 
 - [ADR-0192](ADR-0192-provider-work-units-share-one-runtime-split-path.md) — Provider 工作单元为何统一走 runtime split，单例提示为何只影响放置，分布聚合与恢复为何各守原 owner（active）
-- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）（COW 专属声明、物化与赋值接缝由 ADR-0233 部分替代，共享折叠、CAST 与错误保真保留）
+- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何保留真实 binding、共享转换与 typed 失败，兼容材料为何只保留真实 owner（active；COW 专属声明、物化与赋值接缝由 ADR-0233 部分替代；专用折叠请求、FE 投影与单节点入口由 ADR-0241 部分替代）
 - [ADR-0193](ADR-0193-task-conclusion-proposals-and-settled-points.md) — Task 结论为何只交接提议、以结算屏障支撑定局，并由唯一 owner 推进终止（active；仅部分替代 ADR-0187 规则 5 的隐含同步收据；同步 Worker/就地结算通知与无角色凭证登记由 ADR-0211 部分替代，提议全序、裁决、最新退役读取与原来源保留）
 - [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留；规则 5 的隐含同步收据由 ADR-0193 部分替代，单一接受事务、细化及其余规则保留）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
@@ -273,7 +274,7 @@ code-anchors:
 - [ADR-0206](ADR-0206-frozen-write-placement-and-task-completion-assembly.md) — change-stream 写入为何从同一冻结图独立绑定放置、实际 driver、准确 summary 来源和 strict 成功尾部，再交原 FE publication（active；补充 ADR-0208 与 ADR-0198，不替代 Provider 或发布 owner）
 - [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对；FE Native attempt 的决定 owner 由 ADR-0230 部分替代）（异步逻辑 actor 与分散授权的妥协由 ADR-0237 部分替代）
 - [ADR-0230](ADR-0230-frontend-attempt-decisions-and-transport-custody.md) — FE Native attempt 使用同一共用控制运行时推进纯协议决定，宿主负责原传输与退出。按物理发送代次准入，进程及后端键的配额统一入账。（异步 QA 桥的描述由 ADR-0237 部分替代，纯 attempt 与原传输/准入规则保留）
-- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）（COW 专属声明、物化与赋值接缝由 ADR-0233 部分替代，共享折叠、CAST 与错误保真保留）
+- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何保留真实 binding、共享转换与 typed 失败，兼容材料为何只保留真实 owner（active；COW 专属声明、物化与赋值接缝由 ADR-0233 部分替代；专用折叠请求、FE 投影与单节点入口由 ADR-0241 部分替代）
 - [ADR-0193](ADR-0193-task-conclusion-proposals-and-settled-points.md) — Task 结论为何只交接提议、以结算屏障支撑定局，并由唯一 owner 推进终止（active；仅部分替代 ADR-0187 规则 5 的隐含同步收据；同步 Worker/就地结算通知与无角色凭证登记由 ADR-0211 部分替代，提议全序、裁决、最新退役读取与原来源保留）
 - [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留；规则 5 的隐含同步收据由 ADR-0193 部分替代，单一接受事务、细化及其余规则保留）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
@@ -316,8 +317,9 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
-- [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排）
-- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，其余规则保留）
+- [ADR-0241](ADR-0241-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件）
+- [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排；单节点折叠的退役条件由 ADR-0241 承接）
+- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，标量调用撰写所有权由 ADR-0241 部分替代）
 
 
 领域哲学：SQL compiler 只消费一次 statement admission 冻结的 SQL 事实，并只产出 SQL facts；application owner 保留 session、目录观察、topology、native encoding 与 lifecycle assembly。catalog、statistics 与 scan preparation 对同一表必须复用同一 exact Connector binding，缺失事实必须显式失败或保守降级，不能重新读取 latest。
@@ -328,13 +330,13 @@ code-anchors:
 - [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）
 - [ADR-0218](ADR-0218-sql-output-declarations-and-stored-view-analysis.md) — SQL 为何分离自然名称、内部标签与冻结根，并从同版本完整事实分析视图声明（active；应用接线与验证状态独立核对，部分替代 ADR-0095 的 MV String 例外）
 - [ADR-0192](ADR-0192-provider-work-units-share-one-runtime-split-path.md) — Provider 工作单元为何统一走 runtime split，单例提示为何只影响放置，分布聚合与恢复为何各守原 owner（active）
-- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）（COW 专属声明、物化与赋值接缝由 ADR-0233 部分替代，共享折叠、CAST 与错误保真保留）
+- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何保留真实 binding、共享转换与 typed 失败，兼容材料为何只保留真实 owner（active；COW 专属声明、物化与赋值接缝由 ADR-0233 部分替代；专用折叠请求、FE 投影与单节点入口由 ADR-0241 部分替代）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
 - [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — ProviderRead 命名空间为何保留版本累计事实而撤销独立字节配额，冻结策略变化为何沿既有 plan revision 隔离原生岛（active；其余资源门、单值表示与唯一 compiled 路径保留；薄清单条目/名字/token固定界由 ADR-0227 部分替代，其余文档与后端边界保留）
 - ADR-0073 — SQL compiler 为何先完成全部 binding 分析物化、再冻结 statistics 并以无 catalog 的第二阶段优化封存（active）
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
 - ADR-0153 — 完成的 PhysicalPlan 为何是唯一静态执行权威，首次 Task 提交为何关闭替换窗口（active；其中「首次提交关闭替换窗口 / DispatchSeal」规则已由 ADR-0161 的一次激活与固定版本恢复替换，其余仍有效）
-- ADR-0100 — 常量折叠为何经注入端口复用执行 kernel，并对无法一致表示的结果拒绝折叠（active；请求词汇与旧实现映射由 ADR-0191 部分替代，端口、无状态生命周期、optional-fold 与原拒折门继续有效）
+- [ADR-0100](ADR-0100-constant-folding-reuses-execution-kernels-through-an-injected-port.md) — 常量折叠为何复用执行语义，并对无法一致表示的结果拒绝折叠（active；请求词汇与旧实现映射由 ADR-0191 部分替代，端口和无状态单例由 ADR-0241 部分替代；规则阶段、可选求值和结果准入保留）
 - ADR-0145 — 查询语义为何先于 per-attempt execution access 冻结，重试为何不得重新规划或携带秘密（active）
 
 - [ADR-0161](ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md) — 纯本地程序为何分离 Task 接管、安装、覆盖观察与实际收敛（active；读取封口与逻辑业务结论边界由 ADR-0198 扩为通用计算就绪及独立语句结果，准确身份、Accepted/Installed、覆盖观察与真实收敛保留）
@@ -484,7 +486,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - [ADR-0206](ADR-0206-frozen-write-placement-and-task-completion-assembly.md) — change-stream 写入为何从同一冻结图独立绑定放置、实际 driver、准确 summary 来源和 strict 成功尾部，再交原 FE publication（active；补充 ADR-0208 与 ADR-0198，不替代 Provider 或发布 owner）
 - [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对；FE Native attempt 的决定 owner 由 ADR-0230 部分替代）（异步逻辑 actor 与分散授权的妥协由 ADR-0237 部分替代）
 - [ADR-0230](ADR-0230-frontend-attempt-decisions-and-transport-custody.md) — FE Native attempt 使用同一共用控制运行时推进纯协议决定，宿主负责原传输与退出。按物理发送代次准入，进程及后端键的配额统一入账。（异步 QA 桥的描述由 ADR-0237 部分替代，纯 attempt 与原传输/准入规则保留）
-- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）（COW 专属声明、物化与赋值接缝由 ADR-0233 部分替代，共享折叠、CAST 与错误保真保留）
+- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何保留真实 binding、共享转换与 typed 失败，兼容材料为何只保留真实 owner（active；COW 专属声明、物化与赋值接缝由 ADR-0233 部分替代；专用折叠请求、FE 投影与单节点入口由 ADR-0241 部分替代）
 - ADR-0020 — DELETE/equality-delete application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
 - ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 external StarRocks connector 隔离（active）
 - [ADR-0110](ADR-0110-lake-publication-crash-only-contract.md) — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active；本地期限推导外部效果上界及无条件年龄窗回收由 ADR-0198 部分替代，target OCC、autocommit 与无持久接管规则保留）
@@ -574,8 +576,9 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 ### crate-boundary
 
 - [ADR-0237](ADR-0237-pure-logical-execution-and-original-host-custody.md) — 逻辑执行与 attempt 为何分别由纯核心决定、QA 为何只监督执行器并保管原注册/退出、FA 为何只承接原载体，以及共享运行时来源/失败交接和宿主一次性清理切点（active；部分替代 ADR-0198 的异步逻辑 actor 妥协及 ADR-0230 的桥，其余业务、协议与原传输规则保留）
-- [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排）
-- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，其余规则保留）
+- [ADR-0241](ADR-0241-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件）
+- [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排；单节点折叠的退役条件由 ADR-0241 承接）
+- [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，标量调用撰写所有权由 ADR-0241 部分替代）
 - [ADR-0229](ADR-0229-rust-test-placement-dependency-direction-and-fixture-ownership.md) — Rust 测试为何按断言 owner 放置、为何先找公开边界、测试依赖为何只向显式登记的输入契约生产者放宽、无生产边的组合为何进接缝测试 package、测试支持为何按性质暴露，以及 fixture、增长规则与存量随改动迁移（active；沿用 ADR-0056/0069/0140、测试控制 ADR-0175、ADR-0181/0190，不替代其中任何一条）
 - [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — MV 文档为何不自设容量额度、读方为何覆盖写方、StateStore 为何声明真实能力、REST 为何按期望值核验并把 413 归为确定拒绝（active；部分替代 ADR-0180 的额度与首条重评条件，以及 REST 会话版 ADR-0175 的属性保留量与拒绝集；原存放、身份、生命周期、认证与路由保留；薄清单条目/名字/token固定界由 ADR-0227 部分替代，其余文档与后端边界保留）
 - [ADR-0218](ADR-0218-work-credentials-and-credentialed-entries.md) — 查询工作为何把原义务留在 join owner，由身份 owner 签发窄入口，并分开捕获析构、报告退休与真实收敛（active；补充 ADR-0211/0216/0194，第三方内部作业与监督覆盖边界另列）

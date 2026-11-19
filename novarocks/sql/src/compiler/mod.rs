@@ -561,11 +561,11 @@ pub use materialized_values::{
     SqlExpressionConstant, SqlExpressionConstants,
 };
 mod fold_observation;
+pub(crate) use fold_observation::evaluate_fold_dependency_observed;
 pub use fold_observation::{
     SqlFoldDependencyInput, SqlFoldDependencyObserver, SqlFoldDependencySource,
     SqlFoldEvaluationOutcome,
 };
-pub(crate) use fold_observation::{SqlFoldEvaluatorLoan, evaluate_fold_dependency_observed};
 
 mod fold_node;
 pub use fold_node::{
@@ -620,6 +620,11 @@ pub struct FoldRequest {
 ///   compilation stops with that exact category, never an optimization decline.
 // Design: ADR-0100 (docs/adr/ADR-0100-constant-folding-reuses-execution-kernels-through-an-injected-port.md)
 pub trait SqlConstantEvaluator: Send + Sync {
+    #[cfg(debug_assertions)]
+    fn is_legacy_fold_reference(&self) -> bool {
+        false
+    }
+
     fn eval_scalar(
         &self,
         request: &FoldRequest,
@@ -3051,7 +3056,10 @@ mod tests {
                     sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                     current_catalog: None,
                     current_database: "default".into(),
-                    optimizer_settings: SessionOptimizerSettings::default(),
+                    optimizer_settings: SessionOptimizerSettings {
+                        disabled_rules: vec!["FoldConstant".into()],
+                        ..Default::default()
+                    },
                 },
                 SqlPlanningEnvironment::Distributed,
                 &catalog_snapshot,
@@ -3171,7 +3179,10 @@ mod tests {
                 sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: None,
                 current_database: "default".into(),
-                optimizer_settings: SessionOptimizerSettings::default(),
+                optimizer_settings: SessionOptimizerSettings {
+                    disabled_rules: vec!["FoldConstant".into()],
+                    ..Default::default()
+                },
             },
             SqlPlanningEnvironment::Distributed,
             &catalog_snapshot,
@@ -3532,7 +3543,10 @@ mod tests {
                 sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: None,
                 current_database: "default".to_string(),
-                optimizer_settings: SessionOptimizerSettings::default(),
+                optimizer_settings: SessionOptimizerSettings {
+                    disabled_rules: vec!["FoldConstant".into()],
+                    ..Default::default()
+                },
             },
             SqlPlanningEnvironment::Distributed,
             &snapshot,
@@ -3594,7 +3608,10 @@ mod tests {
                     sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                     current_catalog: None,
                     current_database: "default".into(),
-                    optimizer_settings: SessionOptimizerSettings::default(),
+                    optimizer_settings: SessionOptimizerSettings {
+                        disabled_rules: vec!["FoldConstant".into()],
+                        ..Default::default()
+                    },
                 },
                 SqlPlanningEnvironment::Distributed,
                 &catalog_snapshot,
@@ -3837,23 +3854,6 @@ mod tests {
 
     #[test]
     fn analyzed_root_allow_mode_freezes_only_the_numeric_fold_eligibility() {
-        struct NullableEvaluator;
-        impl SqlConstantEvaluator for NullableEvaluator {
-            fn eval_scalar(
-                &self,
-                request: &FoldRequest,
-                control: &dyn novarocks_type_contract::PureCompileControl,
-            ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
-            {
-                Ok(Some(crate::constant::admit_syntax_constant(
-                    &LiteralValue::Null,
-                    &request.result_type,
-                    request.constant_policy,
-                    control,
-                )?))
-            }
-        }
-        static EVALUATOR: NullableEvaluator = NullableEvaluator;
         for (session_mode, sql, disabled) in [
             ("32", "SELECT CAST(1000 AS DECIMAL(3,0))", false),
             (
@@ -3876,7 +3876,6 @@ mod tests {
             let request_control = control(None, &cancellation);
             let mut input = request(request_control.clone());
             input.statement = SqlStatementInput::parsed_query(mv_analysis_query(sql));
-            input.constant_evaluator = Some(&EVALUATOR);
             input.session.sql_semantics = input
                 .session
                 .sql_semantics
@@ -3884,25 +3883,24 @@ mod tests {
                 .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
             let pending = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
             assert_eq!(pending.root_allow_throw_exception(), disabled);
-            let result = pending
-                .constant_evaluator
-                .unwrap()
-                .eval_scalar(
-                    &FoldRequest {
-                        constant_policy: crate::constant::test_constant_policy(),
-                        kind: FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast {
-                            plan: ConversionPlan::Identity,
-                        }),
-                        args: Vec::new(),
-                        result_type: novarocks_type_contract::FunctionValueType::new(
-                            arrow::datatypes::DataType::Decimal128(3, 0),
-                            true,
-                        ),
-                    },
-                    &request_control,
-                )
-                .unwrap();
-            assert_eq!(result.is_none(), disabled);
+            let optimized = SqlCompiler::optimize(SqlOptimizeRequest::new(
+                pending,
+                &STATISTICS,
+                request_control,
+            ))
+            .unwrap()
+            .into_optimized_output()
+            .unwrap();
+            let physical =
+                crate::planner::optimizer_bridge::to_physical_plan(&optimized.optimized_tree)
+                    .unwrap();
+            fn projection_retains_cast(node: &crate::planner::physical::PhysicalPlanNode) -> bool {
+                use crate::analysis::ExprKind;
+                use crate::planner::physical::PhysicalPlanKind;
+                matches!(&node.kind, PhysicalPlanKind::Project(project) if project.items.iter().any(|item| matches!(item.expr.kind, ExprKind::Cast { .. })))
+                    || node.children.iter().any(projection_retains_cast)
+            }
+            assert_eq!(projection_retains_cast(&physical), disabled);
         }
     }
 }

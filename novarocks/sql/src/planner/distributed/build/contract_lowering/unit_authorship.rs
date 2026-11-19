@@ -81,6 +81,10 @@ pub(super) fn admit_scalar_unit_sources_observed<'source>(
 /// SQL still pairs each call with its source journal and statement policy.
 /// Ports are authored at their original point after definition controls; this
 /// closure supplies declarations only, never capacity or source credentials.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Call authorship borrows both the original SQL source and the sealed function and unit facts."
+)]
 pub(super) fn finish_scalar_unit_observed(
     site: ScalarSourceSite,
     mut draft: novarocks_expression_contract::BoundExprSetBuilder,

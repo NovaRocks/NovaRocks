@@ -1623,6 +1623,10 @@ pub fn compile_final_dml_change_stream(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The seal consumes separate frozen producer, route, statistics, and policy facts."
+)]
 pub(crate) fn seal_final_change_stream_producer(
     mut producer: crate::optimizer::OptimizedOperatorNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,

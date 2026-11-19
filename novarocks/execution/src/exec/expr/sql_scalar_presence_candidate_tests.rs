@@ -15,92 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Actual analysis/request-snapshot admission probes; not a complete support seal.
-use super::sql_fold_observation_test_source::{EVALUATOR, SERIAL, fold_count, reset, session};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     FunctionArgument, FunctionBindingError, FunctionKind, FunctionSpecializationFailure,
     FunctionValueType, ResolvedFunctionBinding,
 };
-use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
-use novarocks_sql::analyze_error::AnalyzeErrorKind;
 use novarocks_sql::compiler::{
-    DEFAULT_COMPLETION_LIMITS, SqlAnalyzeRequest, SqlCompileControl, SqlCompileError,
-    SqlCompileIntent, SqlCompiler, SqlFinalPlanCompileRequest, SqlFunctionCatalog,
-    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlStatementInput,
-    builtin_sql_function_catalog,
+    SqlCompileControl, SqlFunctionCatalog, builtin_sql_function_catalog,
 };
 use novarocks_type_contract::{CompileControlError, PureCompileControl};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-
-fn analyze(sql: &str) -> Result<(), SqlCompileError> {
-    let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
-    let catalog = SqlPlannerTableSnapshot::new(&catalog);
-    let request = SqlAnalyzeRequest::new(
-        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
-        SqlCompileIntent::Query,
-        session(),
-        SqlPlanningEnvironment::Distributed,
-        &catalog,
-        builtin_sql_function_catalog(),
-        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        None,
-        super::test_support::constant_policy(),
-        SqlCompileControl::unbounded(),
-    )
-    .with_legacy_fold_evaluator(&EVALUATOR);
-    SqlCompiler::analyze(request)?.into_pending()?;
-    Ok(())
-}
-fn unavailable(error: SqlCompileError, expected: &str) {
-    let SqlCompileError::Analyze(error) = error else {
-        panic!("expected typed FE analyze refusal: {error}");
-    };
-    assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
-    assert_eq!(
-        error.code(),
-        AnalyzeErrorKind::UnavailableImplementation
-            .descriptor()
-            .code
-    );
-    assert!(
-        error.span().is_some(),
-        "retain the actual parser-owned function span"
-    );
-    assert!(error.message().contains(expected), "{}", error.message());
-    assert!(error.control_error().is_none());
-}
-
-#[test]
-fn sql_presence_candidate_hour_literal_and_projected_column_refuse_before_fold() {
-    let _serial = SERIAL.lock().unwrap();
-    for sql in [
-        "SELECT hour_from_unixtime(CAST(1700000000 AS BIGINT)) AS h",
-        "SELECT hour_from_unixtime(t.k) AS h FROM (SELECT CAST(1700000000 AS BIGINT) AS k) t",
-    ] {
-        reset();
-        assert_eq!(fold_count(), 0);
-        unavailable(
-            analyze(sql).err().unwrap(),
-            "builtin.scalar/hour_from_unixtime/(i64)->i32;strict;legacy",
-        );
-        assert_eq!(fold_count(), 0);
-        assert_eq!(fold_count(), 0);
-    }
-}
-
-#[test]
-fn sql_presence_candidate_invalid_pattern_is_not_prepared_or_evaluated_by_admission() {
-    let _serial = SERIAL.lock().unwrap();
-    reset();
-    {
-        analyze("SELECT regexp_count('x', '[') AS n").unwrap();
-        analyze("SELECT regexp_count('x', t.pattern) AS n FROM (SELECT '[' AS pattern) t").unwrap();
-        assert_eq!(fold_count(), 0);
-    }
-}
 
 fn argument(dtype: DataType) -> FunctionArgument {
     FunctionArgument::Value {
@@ -212,44 +139,6 @@ fn sql_presence_candidate_exact_selected_loan_cannot_bypass_missing_owner() {
     assert!(matches!(scoped.select_exact_overload_observed(
         &bound.function_id, bound.kind, &bound.selected.overload, request, &control,
     ), Err(FunctionBindingError::UnavailableImplementation(ref id)) if id == &bound.selected.overload));
-}
-
-#[test]
-fn sql_presence_candidate_completion_uses_actual_request_mode_before_fold_or_publication() {
-    let _serial = SERIAL.lock().unwrap();
-    reset();
-    let request = SqlFinalPlanCompileRequest::new(
-        PlanVersionId::try_new([87; 16]).unwrap(),
-        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(
-            "SELECT hour_from_unixtime(CAST(1700000000 AS BIGINT)) AS h",
-        )),
-        SqlCompileIntent::Query,
-        session(),
-        SqlPlanningEnvironment::Distributed,
-        builtin_sql_function_catalog().snapshot(),
-        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        super::test_support::constant_policy(),
-        SqlCompileControl::unbounded(),
-        PipelineDopDomain {
-            min: 1,
-            max: 8,
-            requires_power_of_two: true,
-        },
-        ScanReadBudget {
-            max_batch_rows: 64,
-            max_batch_bytes: 1 << 20,
-        },
-        DEFAULT_COMPLETION_LIMITS,
-    )
-    .with_legacy_fold_evaluator(&EVALUATOR);
-    unavailable(
-        request
-            .try_into_completion()
-            .err()
-            .expect("unavailable before completed source"),
-        "builtin.scalar/hour_from_unixtime/(i64)->i32;strict;legacy",
-    );
-    assert_eq!(fold_count(), 0);
 }
 
 #[derive(Clone, Debug)]

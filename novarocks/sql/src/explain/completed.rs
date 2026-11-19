@@ -5371,7 +5371,8 @@ mod tests {
 
     #[test]
     fn provider_guarantee_and_residual_facts_change_the_complete_explain() {
-        let sql = "select order_key from orders where order_key > 10";
+        // Use a BIGINT literal to isolate provider negotiation from cast folding.
+        let sql = "select order_key from orders where order_key > 2147483648";
         let exact = completed_external_sql(sql, 60, PredicateGuaranteeKind::Exact)
             .render_explain_lines()
             .expect("exact provider explain")

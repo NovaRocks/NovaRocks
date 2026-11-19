@@ -822,6 +822,10 @@ pub(crate) struct MvBackgroundPorts {
 }
 
 impl MvBackgroundPorts {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The background owner borrows independently composed view, catalogue, management, and compile capabilities."
+    )]
     pub(crate) fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,

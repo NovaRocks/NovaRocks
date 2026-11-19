@@ -62,15 +62,29 @@ pub trait SqlFoldDependencyObserver: Send + Sync {
     /// Admit the complete observation receipt before the original calculation.
     fn before_fold_dependency_observed(
         &self,
-        input: SqlFoldDependencyInput<'_>,
-        control: &dyn PureCompileControl,
-    ) -> Result<(), novarocks_type_contract::CompileControlError>;
+        _input: SqlFoldDependencyInput<'_>,
+        _control: &dyn PureCompileControl,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
+    }
     /// Only complete the already-admitted receipt; no new fallible work is allowed.
     fn after_fold_dependency_observed(
         &self,
-        input: SqlFoldDependencyInput<'_>,
-        outcome: SqlFoldEvaluationOutcome<'_>,
-    );
+        _input: SqlFoldDependencyInput<'_>,
+        _outcome: SqlFoldEvaluationOutcome<'_>,
+    ) {
+    }
+
+    /// Borrow the original standalone unit and its optional admitted result.
+    /// A kept node has no result. The receipt may refuse through the same control.
+    fn observe_fold_unit_observed(
+        &self,
+        _source: &super::SqlAuthoredScalarUnit,
+        _result: Option<&ConstantValue>,
+        _control: &dyn PureCompileControl,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
+    }
 
     /// Borrow the complete source only after its original publication succeeds.
     /// This loans no kernel coverage, resource grant, or statement-success proof.
@@ -92,74 +106,6 @@ pub trait SqlFoldDependencyObserver: Send + Sync {
         _control: &dyn PureCompileControl,
     ) -> Result<(), novarocks_type_contract::CompileControlError> {
         Ok(())
-    }
-}
-
-/// Short-lived calculator/observer loan. Neither enters IR or published plans.
-pub(crate) struct SqlFoldEvaluatorLoan<'a> {
-    calculator: &'static dyn SqlConstantEvaluator,
-    observer: Option<&'a dyn SqlFoldDependencyObserver>,
-    catalog: Option<&'a dyn super::SqlFunctionCatalog>,
-}
-impl<'a> SqlFoldEvaluatorLoan<'a> {
-    pub(crate) fn with_catalog(mut self, catalog: &'a dyn super::SqlFunctionCatalog) -> Self {
-        self.catalog = Some(catalog);
-        self
-    }
-    pub(crate) fn new(
-        calculator: &'static dyn SqlConstantEvaluator,
-        observer: Option<&'a dyn SqlFoldDependencyObserver>,
-    ) -> Self {
-        Self {
-            calculator,
-            observer,
-            catalog: None,
-        }
-    }
-}
-impl SqlConstantEvaluator for SqlFoldEvaluatorLoan<'_> {
-    fn admit_fold_parent_observed(
-        &self,
-        binding: &SqlFunctionBinding,
-        lifecycle: novarocks_functions::PureCallLifecycle,
-        control: &dyn PureCompileControl,
-    ) -> Result<(), novarocks_functions::FunctionBindingError> {
-        if let Some(catalog) = self.catalog {
-            catalog.admit_bound_lifecycle_observed(binding.resolved(), lifecycle, control)?;
-            catalog.admit_authored_environment_observed(binding, control)?;
-        }
-        self.calculator
-            .admit_fold_parent_observed(binding, lifecycle, control)
-    }
-    fn eval_scalar(
-        &self,
-        request: &FoldRequest,
-        control: &dyn PureCompileControl,
-    ) -> Result<Option<ConstantValue>, SqlConstantEvaluationError> {
-        self.calculator.eval_scalar(request, control)
-    }
-    fn before_fold_dependency_observed(
-        &self,
-        input: SqlFoldDependencyInput<'_>,
-        control: &dyn PureCompileControl,
-    ) -> Result<(), novarocks_type_contract::CompileControlError> {
-        self.calculator
-            .before_fold_dependency_observed(input, control)?;
-        if let Some(observer) = self.observer {
-            observer.before_fold_dependency_observed(input, control)?;
-        }
-        Ok(())
-    }
-    fn after_fold_dependency_observed(
-        &self,
-        input: SqlFoldDependencyInput<'_>,
-        outcome: SqlFoldEvaluationOutcome<'_>,
-    ) {
-        if let Some(observer) = self.observer {
-            observer.after_fold_dependency_observed(input, outcome);
-        }
-        self.calculator
-            .after_fold_dependency_observed(input, outcome);
     }
 }
 
