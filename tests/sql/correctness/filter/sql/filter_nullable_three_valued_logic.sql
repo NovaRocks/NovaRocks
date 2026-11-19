@@ -43,7 +43,7 @@ SELECT
   id,
   a,
   b,
-  (a > b AND b > 0) AS pred
+  a > b AND b > 0 AS pred
 FROM ${case_db}.t_filter_nullable_three_valued_logic
 WHERE (a > b AND b > 0) OR tag = 'force'
 ORDER BY id;

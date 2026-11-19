@@ -527,7 +527,7 @@ SELECT k1, k2, v1, v2, v3, v4
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t4 USING(k1, k2)
-WHERE (k1 BETWEEN 1 AND 5) OR
+WHERE k1 BETWEEN 1 AND 5 OR
       (k1 IS NULL AND k2 IS NOT NULL) OR
       (k2 > 50 AND k1 IS NOT NULL)
 ORDER BY k1, k2;

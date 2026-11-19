@@ -40,7 +40,7 @@ INSERT INTO ${case_db}.t_agg_group_sum_count_avg VALUES
 
 SELECT
     g,
-    COUNT(*) AS c_all,
+    COUNT() AS c_all,
     COUNT(v) AS c_not_null,
     SUM(v) AS s_v,
     AVG(v) AS avg_v

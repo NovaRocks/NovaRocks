@@ -242,7 +242,7 @@ ORDER BY category;
 USE ${case_db};
 SELECT COUNT(DISTINCT data1) AS distinct_data1,
        COUNT(DISTINCT data2) AS distinct_data2,
-       COUNT(*) AS total_rows,
+       COUNT() AS total_rows,
        MAX(id) AS max_id
 FROM tbinary_multi_distinct_test;
 
@@ -251,7 +251,7 @@ USE ${case_db};
 SELECT category,
        COUNT(DISTINCT data1) AS distinct_data1,
        COUNT(DISTINCT data2) AS distinct_data2,
-       COUNT(*) AS total_rows,
+       COUNT() AS total_rows,
        MIN(id) AS min_id,
        MAX(id) AS max_id
 FROM tbinary_multi_distinct_test
@@ -264,7 +264,7 @@ SELECT category,
        COUNT(DISTINCT data1) AS distinct_data1,
        COUNT(DISTINCT data2) AS distinct_data2,
        ndv(data3) AS ndv_data3,
-       COUNT(*) AS total
+       COUNT() AS total
 FROM tbinary_multi_distinct_test
 WHERE id > 2
 GROUP BY category

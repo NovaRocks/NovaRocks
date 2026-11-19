@@ -23,7 +23,7 @@ DROP TABLE IF EXISTS ${case_db}.cse_projection_t;
 CREATE TABLE ${case_db}.cse_projection_t (a BIGINT, b BIGINT);
 INSERT INTO ${case_db}.cse_projection_t VALUES (3, 4), (5, 6);
 
-SELECT (a + b) AS x, (a + b) + a AS y
+SELECT a + b AS x, (a + b) + a AS y
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
 

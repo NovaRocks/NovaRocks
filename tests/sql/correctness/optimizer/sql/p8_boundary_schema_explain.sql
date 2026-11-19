@@ -17,7 +17,7 @@
 
 -- @tags=optimizer,p8,distributed_ir_explain
 EXPLAIN VERBOSE
-SELECT /*+ SET_VAR(explain_detail='VERBOSE') */ k, SUM(v) AS total_v
+SELECT k, SUM(v) AS total_v
 FROM (
     SELECT 1 AS k, 10 AS v
     UNION ALL

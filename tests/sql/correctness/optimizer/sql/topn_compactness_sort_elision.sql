@@ -21,7 +21,7 @@
 
 -- query 1
 -- @explain_contains=TOP-N
-EXPLAIN VERBOSE SELECT /*+ SET_VAR(explain_detail='VERBOSE') */ id, score
+EXPLAIN VERBOSE SELECT id, score
 FROM (
     SELECT id, score
     FROM (
@@ -39,7 +39,7 @@ SET disable_optimizer_rules = 'RemoveRedundantSortUnderTopN';
 
 -- query 3
 -- @explain_contains=SORT
-EXPLAIN VERBOSE SELECT /*+ SET_VAR(explain_detail='VERBOSE') */ id, score
+EXPLAIN VERBOSE SELECT id, score
 FROM (
     SELECT id, score
     FROM (

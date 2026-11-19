@@ -40,7 +40,7 @@ INSERT INTO ${case_db}.t_agg_region_distribution VALUES
     (7, 'AMERICA'),
     (8, 'AFRICA');
 
-SELECT c_region, COUNT(*) AS customer_count
+SELECT c_region, COUNT() AS customer_count
 FROM ${case_db}.t_agg_region_distribution
 GROUP BY c_region
 ORDER BY c_region;

@@ -87,7 +87,7 @@ ORDER BY 1,2,3 LIMIT 3;
 -- query 13
 -- @order_sensitive=true
 SELECT * FROM ${case_db}.lineitem t1
-WHERE EXISTS (SELECT 1 FROM (SELECT '2000-01-01' AS col1) t2 WHERE t1.l_shipdate=t2.col1) AND (t1.l_orderkey > 10)
+WHERE EXISTS (SELECT 1 FROM (SELECT '2000-01-01' AS col1) t2 WHERE t1.l_shipdate=t2.col1) AND t1.l_orderkey > 10
 ORDER BY 1,2,3 LIMIT 3;
 
 -- query 14

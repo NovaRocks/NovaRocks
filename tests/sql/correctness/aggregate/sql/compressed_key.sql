@@ -1082,7 +1082,7 @@ WITH result AS (
 -- query 152
 USE ${case_db};
 WITH result AS (
-    SELECT c1, COUNT(*) AS cnt FROM all_t0 WHERE c1 > 200 GROUP BY c1 ORDER BY c1 LIMIT 100
+    SELECT c1, COUNT() AS cnt FROM all_t0 WHERE c1 > 200 GROUP BY c1 ORDER BY c1 LIMIT 100
 ) SELECT 'Test Case 89' AS test_name, MD5('empty') AS result_hash FROM result LIMIT 1;
 
 -- query 153

@@ -82,177 +82,177 @@ INSERT INTO ${case_db}.t0 (`region`, `order_date`, `income`, `ship_mode`, `ship_
 
 -- query 4
 -- CASE ship_code = 'A' (ship_code >= 90)
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) = 'A' order by 1,2,3,4,5;
+   else 'E' end = 'A' order by 1,2,3,4,5;
 
 -- query 5
 -- CASE ship_code = 'B' (ship_code >= 80 and < 90)
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) = 'B' order by 1,2,3,4,5;
+   else 'E' end = 'B' order by 1,2,3,4,5;
 
 -- query 6
 -- CASE ship_code = 'C' (ship_code >= 70 and < 80)
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) = 'C' order by 1,2,3,4,5;
+   else 'E' end = 'C' order by 1,2,3,4,5;
 
 -- query 7
 -- CASE ship_code <> 'D': all rows except those with 60<=ship_code<70 (and NULL rows)
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) <> 'D' order by 1,2,3,4,5;
+   else 'E' end <> 'D' order by 1,2,3,4,5;
 
 -- query 8
 -- CASE ship_code <> 'E': rows where ship_code >= 60 (NULL rows excluded)
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) <> 'E' order by 1,2,3,4,5;
+   else 'E' end <> 'E' order by 1,2,3,4,5;
 
 -- query 9
 -- CASE ship_code IN ('A','B')
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) in ('A','B') order by 1,2,3,4,5;
+   else 'E' end in ('A','B') order by 1,2,3,4,5;
 
 -- query 10
 -- CASE ship_code IN ('D','E'): rows with ship_code < 70 (and NULL rows → 'E')
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) in ('D','E') order by 1,2,3,4,5;
+   else 'E' end in ('D','E') order by 1,2,3,4,5;
 
 -- query 11
 -- CASE ship_code IN (NULL): no rows matched (IN NULL predicate)
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) in (NULL) order by 1,2,3,4,5;
+   else 'E' end in (NULL) order by 1,2,3,4,5;
 
 -- query 12
 -- CASE ship_code IN ('A','B','C','D','E'): all non-NULL ship_code rows
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) in ('A','B','C','D','E') order by 1,2,3,4,5;
+   else 'E' end in ('A','B','C','D','E') order by 1,2,3,4,5;
 
 -- query 13
 -- CASE ship_code NOT IN ('A','B','C'): rows with ship_code < 70 (excluding NULL)
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) not in ('A','B', 'C') order by 1,2,3,4,5;
+   else 'E' end not in ('A','B', 'C') order by 1,2,3,4,5;
 
 -- query 14
 -- CASE ship_code NOT IN ('D','E'): rows with ship_code >= 70 (excluding NULL)
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) not in ('D','E') order by 1,2,3,4,5;
+   else 'E' end not in ('D','E') order by 1,2,3,4,5;
 
 -- query 15
 -- CASE ship_code NOT IN (NULL): no rows returned (NOT IN with NULL list)
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) not in (NULL) order by 1,2,3,4,5;
+   else 'E' end not in (NULL) order by 1,2,3,4,5;
 
 -- query 16
 -- CASE ship_code IS NULL: ship_code IS NULL → CASE evaluates to 'E', not NULL;
 -- ship_code IS NULL doesn't make CASE result NULL (ELSE 'E' is always non-NULL)
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) is NULL order by 1,2,3,4,5;
+   else 'E' end is NULL order by 1,2,3,4,5;
 
 -- query 17
 -- CASE ship_code IS NOT NULL: all rows (ELSE always returns non-NULL)
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_code >= 90 then 'A'
    when ship_code >= 80 then 'B'
    when ship_code >= 70 then 'C'
    when ship_code >= 60 then 'D'
-   else 'E' end) is NOT NULL order by 1,2,3,4,5;
+   else 'E' end is NOT NULL order by 1,2,3,4,5;
 
 -- Section 2: String column (region) with CASE WHEN col=X THEN N
 
 -- query 18
 -- CASE region = 1 (region = 'China')
 select * from ${case_db}.t0 where
-(case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end) = 1 order by 1,2,3,4,5;
+case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end = 1 order by 1,2,3,4,5;
 
 -- query 19
 -- CASE region <> 1 (not China)
 select * from ${case_db}.t0 where
-(case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end) <> 1 order by 1,2,3,4,5;
+case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end <> 1 order by 1,2,3,4,5;
 
 -- query 20
 -- CASE region IN (1): same as = 1
 select * from ${case_db}.t0 where
-(case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end) in (1) order by 1,2,3,4,5;
+case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end in (1) order by 1,2,3,4,5;
 
 -- query 21
 -- CASE region NOT IN (1): same as <> 1
 select * from ${case_db}.t0 where
-(case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end) not in (1) order by 1,2,3,4,5;
+case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end not in (1) order by 1,2,3,4,5;
 
 -- query 22
 -- CASE region IS NULL: impossible since region is NOT NULL and ELSE=3 is always non-NULL
 select * from ${case_db}.t0 where
-(case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end) is null order by 1,2,3,4,5;
+case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end is null order by 1,2,3,4,5;
 
 -- query 23
 -- CASE region IS NOT NULL: all rows
 select * from ${case_db}.t0 where
-(case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end) is not null order by 1,2,3,4,5;
+case when region = 'China' then 1 when region = 'Japan' then 2 else 3 end is not null order by 1,2,3,4,5;
 
 -- query 24
 -- No ELSE: CASE returns NULL when no WHEN matches; IS NULL = rows where region is not China or Japan
 select * from ${case_db}.t0 where
-(case when region = 'China' then 1 when region = 'Japan' then 2 end) is null order by 1,2,3,4,5;
+case when region = 'China' then 1 when region = 'Japan' then 2 end is null order by 1,2,3,4,5;
 
 -- query 25
 -- No ELSE: IS NOT NULL = rows where region is China or Japan
 select * from ${case_db}.t0 where
-(case when region = 'China' then 1 when region = 'Japan' then 2 end) is not null order by 1,2,3,4,5;
+case when region = 'China' then 1 when region = 'Japan' then 2 end is not null order by 1,2,3,4,5;
 
 -- query 26
 -- NULL THEN value: IS NULL returns both China rows (explicit NULL) and non-match rows (implicit NULL)
 select * from ${case_db}.t0 where
-(case when region = 'China' then NULL when region = 'Japan' then 2 end) is null order by 1,2,3,4,5;
+case when region = 'China' then NULL when region = 'Japan' then 2 end is null order by 1,2,3,4,5;
 
 -- Section 3: IS NULL in WHEN clause
 
@@ -271,28 +271,28 @@ select * from ${case_db}.t0 where case when ship_code is null then 'a' when ship
 -- query 30
 -- CASE result = NULL: always false (NULL comparison)
 select * from ${case_db}.t0 where
-(case region when 'China' then 1 when 'Japan' then 2 else 3 end) = NULL order by 1,2,3,4,5;
+case region when 'China' then 1 when 'Japan' then 2 else 3 end = NULL order by 1,2,3,4,5;
 
 -- query 31
 -- CASE result <> NULL: always false
 select * from ${case_db}.t0 where
-(case region when 'China' then 1 when 'Japan' then 2 else 3 end) <> NULL order by 1,2,3,4,5;
+case region when 'China' then 1 when 'Japan' then 2 else 3 end <> NULL order by 1,2,3,4,5;
 
 -- query 32
 -- CASE result <=> NULL: null-safe equal; returns rows where CASE result is NULL
 -- (with ELSE=3, no rows match)
 select * from ${case_db}.t0 where
-(case region when 'China' then 1 when 'Japan' then 2 else 3 end) <=> NULL order by 1,2,3,4,5;
+case region when 'China' then 1 when 'Japan' then 2 else 3 end <=> NULL order by 1,2,3,4,5;
 
 -- query 33
 -- CASE result IN (1, NULL): rows where CASE result = 1 (NULL in list doesn't match via IN)
 select * from ${case_db}.t0 where
-(case region when 'China' then 1 when 'Japan' then 2 else 3 end) in (1,NULL) order by 1,2,3,4,5;
+case region when 'China' then 1 when 'Japan' then 2 else 3 end in (1,NULL) order by 1,2,3,4,5;
 
 -- query 34
 -- CASE result NOT IN (1, NULL): no rows (NOT IN with NULL in list always false)
 select * from ${case_db}.t0 where
-(case region when 'China' then 1 when 'Japan' then 2 else 3 end) not in (1,NULL) order by 1,2,3,4,5;
+case region when 'China' then 1 when 'Japan' then 2 else 3 end not in (1,NULL) order by 1,2,3,4,5;
 
 -- Section 5: IF() function simplification
 
@@ -349,50 +349,50 @@ select * from ${case_db}.t0 where nullif(1, ship_code) is NOT NULL order by 1,2,
 
 -- query 50
 select * from ${case_db}.t0 where
-(case region when 'China' then 1 when 'Japan' then 2 else 3 end) = 1 order by 1,2,3,4,5;
+case region when 'China' then 1 when 'Japan' then 2 else 3 end = 1 order by 1,2,3,4,5;
 
 -- query 51
 select * from ${case_db}.t0 where
-(case region when 'China' then 1 when 'Japan' then 2 else 3 end) in (1,2) order by 1,2,3,4,5;
+case region when 'China' then 1 when 'Japan' then 2 else 3 end in (1,2) order by 1,2,3,4,5;
 
 -- query 52
 select * from ${case_db}.t0 where
-(case region when 'China' then 1 when 'Japan' then 2 else 3 end) <> 1 order by 1,2,3,4,5;
+case region when 'China' then 1 when 'Japan' then 2 else 3 end <> 1 order by 1,2,3,4,5;
 
 -- Section 8: Non-nullable INT column (ship_mode) with CASE WHEN
 
 -- query 53
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_mode >= 90 then 'A'
    when ship_mode >= 80 then 'B'
    when ship_mode >= 70 then 'C'
    when ship_mode >= 60 then 'D'
-   else 'E' end) = 'A' order by 1,2,3,4,5;
+   else 'E' end = 'A' order by 1,2,3,4,5;
 
 -- query 54
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_mode >= 90 then 'A'
    when ship_mode >= 80 then 'B'
    when ship_mode >= 70 then 'C'
    when ship_mode >= 60 then 'D'
-   else 'E' end) in ('A','B','C','D','E') order by 1,2,3,4,5;
+   else 'E' end in ('A','B','C','D','E') order by 1,2,3,4,5;
 
 -- query 55
 -- IS NULL: impossible since ship_mode is NOT NULL and ELSE='E' covers all cases
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_mode >= 90 then 'A'
    when ship_mode >= 80 then 'B'
    when ship_mode >= 70 then 'C'
    when ship_mode >= 60 then 'D'
-   else 'E' end) is NULL order by 1,2,3,4,5;
+   else 'E' end is NULL order by 1,2,3,4,5;
 
 -- query 56
-select * from ${case_db}.t0 where (case
+select * from ${case_db}.t0 where case
    when ship_mode >= 90 then 'A'
    when ship_mode >= 80 then 'B'
    when ship_mode >= 70 then 'C'
    when ship_mode >= 60 then 'D'
-   else 'E' end) not in ('A','B') order by 1,2,3,4,5;
+   else 'E' end not in ('A','B') order by 1,2,3,4,5;
 
 -- Section 9: Complex nested CASE WHEN LIKE/REPLACE on empty table
 

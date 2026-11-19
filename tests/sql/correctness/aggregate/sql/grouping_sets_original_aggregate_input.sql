@@ -27,7 +27,7 @@ INSERT INTO ${case_db}.t_grouping_input VALUES (2, 30);
 INSERT INTO ${case_db}.t_grouping_input VALUES (NULL, 40);
 
 -- query 2
-SELECT GROUPING(a) AS g, a, count(*) AS rows_seen,
+SELECT GROUPING(a) AS g, a, count() AS rows_seen,
        count(a) AS nonnull_a, count(DISTINCT a) AS distinct_a,
        sum(a) AS sum_a, sum(b) AS sum_b,
        array_agg(a ORDER BY b) AS ordered_a

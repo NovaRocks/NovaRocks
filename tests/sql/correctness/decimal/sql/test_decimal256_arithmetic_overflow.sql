@@ -475,7 +475,7 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 6.4: Large * -1
 SELECT
     'Test 6.4: Large * -1' as test_case,
-    cast(val_76_0 * (-1) as string) as result,
+    cast(val_76_0 * -1 as string) as result,
     'Should return negative of original' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 

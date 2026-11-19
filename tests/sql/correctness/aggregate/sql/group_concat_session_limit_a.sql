@@ -27,7 +27,7 @@ INSERT INTO ${case_db}.t_concat_limit VALUES (3, NULL, NULL);
 
 -- query 2
 SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
+       count() AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 3
 -- @skip_result_check=true
@@ -35,7 +35,7 @@ SET group_concat_max_len = -121;
 
 -- query 4
 SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
+       count() AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 5
 -- @skip_result_check=true
@@ -43,7 +43,7 @@ SET group_concat_max_len = 0;
 
 -- query 6
 SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
+       count() AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 7
 -- @skip_result_check=true
@@ -51,7 +51,7 @@ SET group_concat_max_len = 1;
 
 -- query 8
 SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
+       count() AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 9
 -- @skip_result_check=true
@@ -59,7 +59,7 @@ SET group_concat_max_len = 4;
 
 -- query 10
 SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
+       count() AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 11
 -- @skip_result_check=true
@@ -67,7 +67,7 @@ SET group_concat_max_len = 5;
 
 -- query 12
 SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
+       count() AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 13
 -- @skip_result_check=true
@@ -75,7 +75,7 @@ SET group_concat_max_len = 7;
 
 -- query 14
 SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
+       count() AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 15
 -- @skip_result_check=true
@@ -83,7 +83,7 @@ SET group_concat_max_len = 8;
 
 -- query 16
 SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
+       count() AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 17
 -- @skip_result_check=true
@@ -91,7 +91,7 @@ SET group_concat_max_len = 13;
 
 -- query 18
 SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
+       count() AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 19
 -- @skip_result_check=true
@@ -99,7 +99,7 @@ SET group_concat_max_len = 1024;
 
 -- query 20
 SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
+       count() AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 21
 -- @skip_result_check=true

@@ -201,14 +201,14 @@ on t1.t1a > t2.t1a and t1.t1b = t2.t1b and t1.t1c > t2.t1c and t1.id_datetime < 
 -- query 24
 -- inner join with OR predicate and date comparison
 select * from
-(select * from ${case_db}.test_all_type where (t1d in (1, 2, 3) and id_date = '2021-01-01') or (id_date > '2021-04-01')) t1
+(select * from ${case_db}.test_all_type where (t1d in (1, 2, 3) and id_date = '2021-01-01') or id_date > '2021-04-01') t1
 inner join ${case_db}.test_all_type_not_null t2
 on t1.t1d > t2.t1d and t1.id_date = t2.id_date;
 
 -- query 25
 -- left join with OR predicate and date comparison
 select * from
-(select * from ${case_db}.test_all_type where (t1d in (1, 2, 3) and id_date = '2021-01-01') or (id_date > '2021-04-01')) t1
+(select * from ${case_db}.test_all_type where (t1d in (1, 2, 3) and id_date = '2021-01-01') or id_date > '2021-04-01') t1
 left join ${case_db}.test_all_type_not_null t2
 on t1.t1d > t2.t1d and t1.id_date = t2.id_date;
 

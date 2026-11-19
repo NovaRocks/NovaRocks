@@ -54,7 +54,7 @@ INSERT INTO ${case_db}.t_agg_regression_lineorder_metrics VALUES
 
 SELECT metric, value
 FROM (
-    SELECT 'customer_count' AS metric, CAST(COUNT(*) AS BIGINT) AS value
+    SELECT 'customer_count' AS metric, CAST(COUNT() AS BIGINT) AS value
     FROM ${case_db}.t_agg_regression_customer_metrics
     UNION ALL
     SELECT 'lineorder_filtered_sum_revenue', CAST(SUM(lo_revenue) AS BIGINT)

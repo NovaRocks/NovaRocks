@@ -64,11 +64,11 @@ select cast(percentile_approx(c2, 0.9, 10000) as int) from t1;
 
 -- query 10
 USE ${case_db};
-with tt as (select (0.5) as v1, c1, c2 from t1) select  cast(percentile_approx(c2, v1) as int) from tt;
+with tt as (select 0.5 as v1, c1, c2 from t1) select  cast(percentile_approx(c2, v1) as int) from tt;
 
 -- query 11
 USE ${case_db};
-with tt as (select (0.5) as v1, (4096) as v2, c1, c2 from t1) select  cast(percentile_approx(c2, v1, v2 + 1) as int) from tt;
+with tt as (select 0.5 as v1, 4096 as v2, c1, c2 from t1) select  cast(percentile_approx(c2, v1, v2 + 1) as int) from tt;
 
 -- query 12
 USE ${case_db};

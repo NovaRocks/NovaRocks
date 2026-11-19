@@ -31,7 +31,7 @@ SET disable_optimizer_rules = 'JoinCommutativity';
 SELECT l.a, r.b
 FROM ${case_db}.cse_join_l l
 INNER JOIN ${case_db}.cse_join_r r
-    ON (l.a * 2) > r.b AND (l.a * 2) < r.b + 10
+    ON l.a * 2 > r.b AND l.a * 2 < r.b + 10
 ORDER BY l.a, r.b;
 
 -- @explain_contains=NEST LOOP JOIN
@@ -40,7 +40,7 @@ ORDER BY l.a, r.b;
 SELECT l.a, r.b
 FROM ${case_db}.cse_join_l l
 INNER JOIN ${case_db}.cse_join_r r
-    ON (l.a * 2) > r.b AND (l.a * 2) < r.b + 10
+    ON l.a * 2 > r.b AND l.a * 2 < r.b + 10
 ORDER BY l.a, r.b;
 
 SET disable_optimizer_rules = '';

@@ -35,7 +35,7 @@ INSERT INTO ${case_db}.t_agg_empty_input_null_semantics VALUES
     (2, NULL);
 
 SELECT
-    COUNT(*) AS c_all,
+    COUNT() AS c_all,
     COUNT(v) AS c_not_null,
     SUM(v) AS s_v,
     AVG(v) AS avg_v,

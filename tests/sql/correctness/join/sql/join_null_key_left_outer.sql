@@ -49,4 +49,4 @@ SELECT
 FROM ${case_db}.t_join_null_key_left_outer_l l
 LEFT OUTER JOIN ${case_db}.t_join_null_key_left_outer_r r
   ON l.k = r.k
-ORDER BY (l.k IS NULL) ASC, l.k ASC;
+ORDER BY l.k IS NULL ASC, l.k ASC;
