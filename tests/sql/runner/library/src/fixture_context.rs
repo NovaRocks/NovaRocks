@@ -16,11 +16,17 @@
 // under the License.
 
 //! One admitted invocation clock and collision-free bounded SQL resource names.
+mod trino_namespace;
+use trino_namespace::TrinoNamespaceAuthor;
+pub(crate) use trino_namespace::TrinoNamespaceBoundary;
+
+use crate::source_map::{SourceEdit, SourceMap};
 use crate::types::{RunnerConfig, SuiteConfig};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::fixture_run::{
     FixturePolicy, FixtureRunContext, RunBudget, RunStorageScope, ScratchIdentity, rejected,
 };
+use novarocks_parser::ast::{Literal, LiteralKind};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -68,7 +74,7 @@ pub(crate) fn resource(run: &str, kind: char, index: usize, slot: usize) -> Resu
 fn sql_namespace_declarations(source: &str) -> Result<BTreeSet<String>> {
     // Only explicit, line-start SQL DDL declares SQL namespace write ownership.
     let re = Regex::new(
-        r"(?im)^\s*CREATE\s+DATABASE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`?[A-Za-z0-9_$\{\}]+`?\s*\.\s*)?`?([A-Za-z0-9_$\{\}]+)`?\s*;",
+        r"(?im)^\s*CREATE\s+SCHEMA\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`?[A-Za-z0-9_$\{\}]+`?\s*\.\s*)?`?([A-Za-z0-9_$\{\}]+)`?\s*;",
     )?;
     Ok(re.captures_iter(source).map(|c| c[1].to_string()).collect())
 }
@@ -106,7 +112,13 @@ fn shell_line<'a>(line: &'a str, shell: &mut bool) -> Option<&'a str> {
     }
 }
 pub(crate) fn namespace_declarations(source: &str) -> Result<BTreeSet<String>> {
-    let mut declared = sql_namespace_declarations(source)?;
+    namespace_declarations_with_sql(source, sql_namespace_declarations(source)?)
+}
+
+fn namespace_declarations_with_sql(
+    source: &str,
+    mut declared: BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
     let producer = variant_producer_command()?;
     let hms = hms_producer_command()?;
     let trino = trino_producer_command()?;
@@ -593,11 +605,78 @@ pub(crate) fn rewrite_namespaces(
     source: &str,
     variables: &HashMap<String, String>,
 ) -> Result<String> {
-    let mapping = namespace_mapping(source, variables)?;
+    prepare_trino_namespaces(source, variables).map(|(sql, _)| sql)
+}
+
+#[derive(Default)]
+pub(crate) struct NamespaceTrace {
+    pub(crate) identifiers: Option<SourceMap>,
+    pub(crate) delta: Option<SourceMap>,
+    pub(crate) hms: Option<SourceMap>,
+}
+
+pub(crate) fn prepare_trino_namespaces(
+    source: &str,
+    variables: &HashMap<String, String>,
+) -> Result<(String, BTreeMap<String, String>)> {
+    prepare_namespaces(source, variables, None)
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_trino_namespaces_observed(
+    source: &str,
+    variables: &HashMap<String, String>,
+    trace: &mut NamespaceTrace,
+) -> Result<(String, BTreeMap<String, String>)> {
+    prepare_namespaces(source, variables, Some(trace))
+}
+
+fn prepare_namespaces(
+    source: &str,
+    variables: &HashMap<String, String>,
+    trace: Option<&mut NamespaceTrace>,
+) -> Result<(String, BTreeMap<String, String>)> {
+    let hms_ready = variables.contains_key("__hms_case_input_kind");
+    if hms_ready {
+        ensure!(
+            variables
+                .get("__hms_case_input_kind")
+                .is_some_and(|kind| kind == crate::hms_case_input::KIND)
+                && variables
+                    .get("case_id")
+                    .is_some_and(|case| case == crate::hms_case_input::CASE),
+            TrinoNamespaceBoundary::HmsUri
+        );
+    }
+    let author = TrinoNamespaceAuthor::inspect(source)?;
+    let mapping = namespace_mapping_from(source, variables, || {
+        namespace_declarations_with_sql(source, author.declared.clone())
+    })?;
+    ensure!(
+        !hms_ready || !mapping.is_empty(),
+        TrinoNamespaceBoundary::HmsUri
+    );
+    author.require_supported(&mapping)?;
+    let rewritten = rewrite_namespaces_with_owner(source, variables, &mapping, &author, trace)?;
+    Ok((rewritten, mapping))
+}
+
+fn rewrite_namespaces_with_owner(
+    source: &str,
+    variables: &HashMap<String, String>,
+    mapping: &BTreeMap<String, String>,
+    author: &TrinoNamespaceAuthor,
+    mut trace: Option<&mut NamespaceTrace>,
+) -> Result<String> {
     if mapping.is_empty() {
+        if let Some(trace) = trace {
+            trace.identifiers = SourceMap::verify(source, source, Vec::new());
+            trace.delta = SourceMap::verify(source, source, Vec::new());
+            trace.hms = SourceMap::verify(source, source, Vec::new());
+        }
         return Ok(source.to_string());
     }
-    let sql_declared = sql_namespace_declarations(source)?;
+    let sql_declared = &author.declared;
     let sql_mapping = mapping
         .iter()
         .filter(|(name, _)| sql_declared.contains(*name))
@@ -605,11 +684,17 @@ pub(crate) fn rewrite_namespaces(
         .collect();
     let producer = variant_producer_command()?;
     let hms = hms_producer_command()?;
-    let trino = trino_producer_command()?;
+    let trino_producer = trino_producer_command()?;
     let mut result = String::new();
+    let has_mapped_delta = author.has_mapped_delta(mapping);
+    let mut identifier_edits = (trace.is_some() || has_mapped_delta).then(Vec::new);
     let mut sql = String::new();
+    let mut sql_start = 0;
+    let mut source_offset = 0;
     let mut shell = false;
     for line in source.split_inclusive('\n') {
+        let line_start = source_offset;
+        source_offset += line.len();
         let trimmed = line.trim_start();
         if trimmed.to_ascii_lowercase().starts_with("-- query ") {
             shell = false;
@@ -618,10 +703,16 @@ pub(crate) fn rewrite_namespaces(
             shell = true;
         }
         if shell || trimmed.starts_with("-- @") {
-            result.push_str(&rewrite_sql_identifiers(&sql, &mapping));
+            result.push_str(&author.rewrite_fragment(
+                &sql,
+                mapping,
+                sql_start,
+                identifier_edits.as_mut(),
+            )?);
             sql.clear();
-            if trimmed.starts_with("-- @") {
-                result.push_str(&replace_references(line, &mapping));
+            sql_start = source_offset;
+            let rewritten = if trimmed.starts_with("-- @") {
+                replace_references(line, &mapping)
             } else {
                 // Producer-only ownership changes its namespace argument, never
                 // unrelated shell values or arbitrary commands in the block.
@@ -643,7 +734,7 @@ pub(crate) fn rewrite_namespaces(
                         rewritten =
                             format!("{} --new-namespace {sibling}{newline}", exact.trim_end());
                     }
-                } else if let Some(capture) = trino.captures(original_command) {
+                } else if let Some(capture) = trino_producer.captures(original_command) {
                     let read = &capture[1] == "verify-current";
                     ensure!(
                         read == original_command.trim_end().ends_with(" id 4 3 1 3"),
@@ -672,14 +763,58 @@ pub(crate) fn rewrite_namespaces(
                     let name = name.clone();
                     rewritten.replace_range(range, &name);
                 }
-                result.push_str(&rewritten);
-            }
+                rewritten
+            };
+            // These are complete metadata or shell lines. A SQL Query that
+            // touches a replaced line cannot take its endpoints from it.
+            SourceEdit::record(
+                identifier_edits.as_mut(),
+                line_start..source_offset,
+                line,
+                &rewritten,
+            );
+            result.push_str(&rewritten);
         } else {
             sql.push_str(line);
         }
     }
-    result.push_str(&rewrite_sql_identifiers(&sql, &mapping));
-    result = rewrite_delta_namespace_refs(&result, &mapping)?;
+    result.push_str(&author.rewrite_fragment(
+        &sql,
+        mapping,
+        sql_start,
+        identifier_edits.as_mut(),
+    )?);
+    let identifier_map =
+        identifier_edits.and_then(|edits| SourceMap::verify(source, &result, edits));
+    let mut delta_edits = trace.as_ref().map(|_| Vec::new());
+    let delta = if has_mapped_delta {
+        Some(
+            author.rewrite_delta(
+                &result,
+                mapping,
+                identifier_map
+                    .as_ref()
+                    .ok_or(TrinoNamespaceBoundary::Delta)?,
+                delta_edits.as_mut(),
+            )?,
+        )
+    } else {
+        None
+    };
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.identifiers = identifier_map;
+        trace.delta = SourceMap::verify(
+            &result,
+            delta.as_deref().unwrap_or(&result),
+            delta_edits.unwrap_or_default(),
+        );
+    }
+    if let Some(delta) = delta {
+        result = delta;
+    }
+    let mut hms_input = None;
+    let mut hms_edits = Vec::new();
+
     let mut shell = false;
     let mut families: Vec<_> = source
         .lines()
@@ -716,141 +851,92 @@ pub(crate) fn rewrite_namespaces(
             families.push(original_family);
         }
     }
-    if !families.is_empty()
-        && let Some(warehouse) = variables.get("iceberg_hms_warehouse")
-    {
-        use novarocks_parser::ast::{IcebergStatement, IcebergTableAction, LiteralKind, Statement};
-        let masked = crate::catalog_symbol::sql_source(&result);
-        let mut edits = Vec::new();
-        for range in crate::catalog_symbol::ranges(&masked)? {
-            let sql = &masked[range.clone()];
-            if let Ok(statements) = novarocks_parser::parse(sql) {
-                for statement in statements {
-                    if let Statement::Iceberg(IcebergStatement::AlterTable(table)) = statement
-                        && let IcebergTableAction::AddFiles(files) = table.action
-                        && let LiteralKind::String(value) = &files.location.kind
-                    {
-                        for family in &families {
-                            if value
-                                == &format!(
-                                    "{}/iru7/{family}/v1/data",
-                                    warehouse.trim_end_matches('/')
-                                )
-                                && let Some(mapped) = mapping.get(family)
-                            {
-                                edits.push((
-                                    range.start + files.location.span.start(),
-                                    range.start + files.location.span.end(),
-                                    format!(
-                                        "'{}/iru7/{mapped}/v1/data'",
-                                        warehouse.trim_end_matches('/')
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
+    if !families.is_empty() {
+        ensure!(
+            variables
+                .get("__hms_case_input_kind")
+                .is_some_and(|kind| kind == crate::hms_case_input::KIND)
+                && variables
+                    .get("case_id")
+                    .is_some_and(|name| name == crate::hms_case_input::CASE)
+                && families.len() == 1,
+            TrinoNamespaceBoundary::HmsUri
+        );
+        let warehouse = variables
+            .get("iceberg_hms_warehouse")
+            .ok_or(TrinoNamespaceBoundary::HmsUri)?;
+        let original = &families[0];
+        let mapped = mapping
+            .get(original)
+            .ok_or(TrinoNamespaceBoundary::HmsUri)?;
+        let uuid = variables
+            .get("uuid0")
+            .ok_or(TrinoNamespaceBoundary::HmsUri)?;
+        let edits = [crate::hms_case_input::bind_trino_q40_uri(
+            &result,
+            warehouse,
+            &format!("ice_hms_{uuid}"),
+            original,
+            mapped,
+        )
+        .context(TrinoNamespaceBoundary::HmsUri)?];
+        if trace.is_some() && !edits.is_empty() {
+            hms_input = Some(result.clone());
+            hms_edits.extend(edits.iter().map(|(start, end, value)| SourceEdit {
+                input: *start..*end,
+                output_len: value.len(),
+            }));
         }
         for (start, end, value) in edits.into_iter().rev() {
             result.replace_range(start..end, &value);
         }
     }
+    if let Some(trace) = trace {
+        trace.hms = SourceMap::verify(hms_input.as_deref().unwrap_or(&result), &result, hms_edits);
+    }
     Ok(result)
 }
 // The internal delta TVF's first argument is a table identity. It is not an
 // ordinary SQL string; only its namespace component consumes this mapping.
+fn delta_identity_parts(literal: &Literal) -> Option<[&str; 3]> {
+    let LiteralKind::String(value) = &literal.kind else {
+        return None;
+    };
+    let mut parts = value.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(catalog), Some(namespace), Some(table), None) => Some([catalog, namespace, table]),
+        _ => None,
+    }
+}
+
+fn render_delta_identity(catalog: &str, namespace: &str, table: &str) -> String {
+    format!("'{catalog}.{namespace}.{table}'")
+}
+
+#[cfg(test)]
 fn rewrite_delta_namespace_refs(
     source: &str,
     mapping: &BTreeMap<String, String>,
 ) -> Result<String> {
-    use novarocks_parser::ast::{
-        Expr, FunctionCall, Literal, LiteralKind, TableFunctionArgumentValue,
-        TableFunctionInvocation, Visit, walk_function_call, walk_table_function_invocation,
-    };
-    struct References<'a> {
-        mapping: &'a BTreeMap<String, String>,
-        edits: Vec<(usize, usize, String)>,
-    }
-    impl References<'_> {
-        fn delta_identity_literal(&mut self, literal: &Literal) {
-            if let LiteralKind::String(value) = &literal.kind {
-                let parts: Vec<_> = value.split('.').collect();
-                if parts.len() == 3
-                    && let Some(namespace) = self.mapping.get(parts[1])
-                {
-                    self.edits.push((
-                        literal.span.start(),
-                        literal.span.end(),
-                        format!("'{}.{namespace}.{}'", parts[0], parts[2]),
-                    ));
-                }
-            }
-        }
-    }
-    impl Visit for References<'_> {
-        fn visit_function_call(&mut self, call: &FunctionCall) {
-            if call.name.parts.len() == 1
-                && call.name.parts[0]
-                    .value
-                    .eq_ignore_ascii_case("__nr_ivm_delta")
-                && call.processing_mode.is_none()
-                && call
-                    .arguments
-                    .iter()
-                    .all(|argument| argument.name.is_none())
-                && let Some(Expr::Literal(literal)) =
-                    call.arguments.first().map(|argument| &argument.value)
-            {
-                self.delta_identity_literal(literal);
-            }
-            walk_function_call(self, call);
-        }
-        fn visit_table_function_invocation(&mut self, call: &TableFunctionInvocation) {
-            if call.name.parts.len() == 1
-                && call.name.parts[0]
-                    .value
-                    .eq_ignore_ascii_case("__nr_ivm_delta")
-                && call
-                    .arguments
-                    .iter()
-                    .all(|argument| argument.name.is_none())
-                && let Some(TableFunctionArgumentValue::Expression(Expr::Literal(literal))) =
-                    call.arguments.first().map(|argument| &argument.value)
-            {
-                self.delta_identity_literal(literal);
-            }
-            walk_table_function_invocation(self, call);
-        }
-    }
-    let masked = crate::catalog_symbol::sql_source(source);
-    let mut edits = Vec::new();
-    for range in crate::catalog_symbol::ranges(&masked)? {
-        if let Ok(statements) = novarocks_parser::parse(&masked[range.clone()]) {
-            let mut visitor = References {
-                mapping,
-                edits: Vec::new(),
-            };
-            for statement in &statements {
-                visitor.visit_statement(statement);
-            }
-            edits.extend(
-                visitor
-                    .edits
-                    .into_iter()
-                    .map(|(start, end, value)| (range.start + start, range.start + end, value)),
-            );
-        }
-    }
-    let mut result = source.to_string();
-    for (start, end, value) in edits.into_iter().rev() {
-        result.replace_range(start..end, &value);
-    }
-    Ok(result)
+    let owner = TrinoNamespaceAuthor::inspect(source)?;
+    owner.require_supported(mapping)?;
+    let map = SourceMap::verify(source, source, Vec::new()).expect("unchanged source");
+    owner.rewrite_delta(source, mapping, &map, None)
 }
 pub(crate) fn namespace_mapping(
     source: &str,
     variables: &HashMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let author = TrinoNamespaceAuthor::inspect(source)?;
+    namespace_mapping_from(source, variables, || {
+        namespace_declarations_with_sql(source, author.declared)
+    })
+}
+
+fn namespace_mapping_from(
+    source: &str,
+    variables: &HashMap<String, String>,
+    declare: impl FnOnce() -> Result<BTreeSet<String>>,
 ) -> Result<BTreeMap<String, String>> {
     let Some(run) = variables
         .get("suite_run_id")
@@ -880,7 +966,7 @@ pub(crate) fn namespace_mapping(
         }
     }
     let mut mapping = BTreeMap::new();
-    let mut declared = namespace_declarations(source)?;
+    let mut declared = declare()?;
     if variables
         .get("__hms_case_input_kind")
         .is_some_and(|v| v == crate::hms_case_input::KIND)
@@ -940,6 +1026,14 @@ fn metadata_columns(sql: &str) -> BTreeSet<String> {
         .collect()
 }
 pub(crate) fn rewrite_metadata_filters(sql: &str, mapping: &BTreeMap<String, String>) -> String {
+    rewrite_metadata_filters_observed(sql, mapping, None)
+}
+
+pub(crate) fn rewrite_metadata_filters_observed(
+    sql: &str,
+    mapping: &BTreeMap<String, String>,
+    mut edits: Option<&mut Vec<SourceEdit>>,
+) -> String {
     if metadata_projection(sql).is_none() {
         return sql.to_string();
     }
@@ -949,6 +1043,12 @@ pub(crate) fn rewrite_metadata_filters(sql: &str, mapping: &BTreeMap<String, Str
     .unwrap();
     re.replace_all(sql, |c: &regex::Captures<'_>| {
         let value = mapping.get(&c[3]).map_or(&c[3], String::as_str);
+        if let Some(edits) = edits.as_deref_mut() {
+            let captured = c
+                .get(3)
+                .expect("metadata filter regex always captures a value");
+            SourceEdit::record(Some(edits), captured.range(), captured.as_str(), value);
+        }
         format!("{}{}{}{}", &c[1], &c[2], value, &c[4])
     })
     .into_owned()
@@ -1111,15 +1211,15 @@ fn render_expected_flat(
     }
     let columns = metadata_columns(sql);
     let upper = sql.trim().to_ascii_uppercase();
-    let show_databases = upper.starts_with("SHOW DATABASES");
-    let current_database = Regex::new(r"(?i)^\s*SELECT\s+DATABASE\s*\(\s*\)\s*;?\s*$")
+    let show_databases = upper.starts_with("SHOW SCHEMAS");
+    let current_database = Regex::new(r"(?i)^\s*SELECT\s+CURRENT_SCHEMA\s*;?\s*$")
         .unwrap()
         .is_match(sql);
     let show_create =
         upper.starts_with("SHOW CREATE TABLE") || upper.starts_with("SHOW CREATE VIEW");
     for (index, header) in result.header.iter().enumerate() {
         let namespace = columns.contains(&header.to_ascii_lowercase())
-            || (show_databases && header.eq_ignore_ascii_case("database"))
+            || (show_databases && header.eq_ignore_ascii_case("schema"))
             || (current_database && result.header.len() == 1);
         let ddl = show_create
             && (header.eq_ignore_ascii_case("create table")
@@ -1131,7 +1231,7 @@ fn render_expected_flat(
                         *cell = name.clone();
                     }
                 } else if ddl {
-                    *cell = rewrite_sql_identifiers(cell, mapping);
+                    *cell = rewrite_displayed_ddl(cell, mapping)?;
                 }
             }
         }
@@ -1161,210 +1261,18 @@ fn replace_references(text: &str, mapping: &BTreeMap<String, String>) -> String 
     }
     text
 }
-fn namespace_observation_references(
-    sql: &str,
-) -> (BTreeMap<usize, (usize, String)>, BTreeMap<usize, usize>) {
-    use novarocks_parser::ast::{
-        LiteralKind, MaintenanceStatement, MaintenanceValue, ProcedureArgumentMode, Statement,
-    };
-    let mut namespaces = BTreeMap::new();
-    let mut protected = BTreeMap::new();
-    let masked = crate::catalog_symbol::sql_source(sql);
-    let Ok(ranges) = crate::catalog_symbol::ranges(&masked) else {
-        return (namespaces, protected);
-    };
-    for range in ranges {
-        let Ok(statements) = novarocks_parser::parse(&masked[range.clone()]) else {
-            continue;
-        };
-        for statement in statements {
-            if let Statement::Maintenance(MaintenanceStatement::Call(call)) = &statement {
-                if call.procedure.parts.last().is_some_and(|part| {
-                    part.value
-                        .eq_ignore_ascii_case("novarocks_mv_management_status")
-                }) {
-                    let supported = call.procedure.parts.len() == 1
-                        && call.argument_mode == ProcedureArgumentMode::Positional
-                        && call.arguments.len() == 3
-                        && call.arguments.iter().all(|argument| {
-                            argument.name.is_none()
-                                && matches!(
-                                    &argument.value,
-                                    MaintenanceValue::Literal(literal)
-                                        if matches!(&literal.kind, LiteralKind::String(_))
-                                )
-                        });
-                    for part in &call.procedure.parts {
-                        protected.insert(
-                            range.start + part.span.start(),
-                            range.start + part.span.end(),
-                        );
-                    }
-                    for (index, argument) in call.arguments.iter().enumerate() {
-                        let span = argument.value.span();
-                        let start = range.start + span.start();
-                        let end = range.start + span.end();
-                        if supported
-                            && index == 1
-                            && let MaintenanceValue::Literal(literal) = &argument.value
-                            && let LiteralKind::String(value) = &literal.kind
-                        {
-                            namespaces.insert(start, (end, value.clone()));
-                        } else {
-                            protected.insert(start, end);
-                        }
-                    }
-                }
-                continue;
-            }
-        }
+fn rewrite_displayed_ddl(sql: &str, mapping: &BTreeMap<String, String>) -> Result<String> {
+    if mapping.is_empty() {
+        return Ok(sql.into());
     }
-    (namespaces, protected)
+    let author = TrinoNamespaceAuthor::inspect(sql)?;
+    author.require_supported(mapping)?;
+    author.rewrite_fragment(sql, mapping, 0, None)
 }
 
-fn rewrite_sql_identifiers(line: &str, mapping: &BTreeMap<String, String>) -> String {
-    let (observed_namespaces, protected_observations) = namespace_observation_references(line);
-    let mut result = String::new();
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let mut database = false;
-    let mut previous = String::new();
-    let mut last_word = String::new();
-    while i < bytes.len() {
-        if let Some((end, name)) = observed_namespaces.get(&i) {
-            if let Some(new) = mapping.get(name) {
-                let quote = matches!(bytes[i], b'\'' | b'`' | b'"').then_some(bytes[i] as char);
-                if let Some(quote) = quote {
-                    result.push(quote);
-                    result.push_str(&new.replace(quote, &format!("{quote}{quote}")));
-                } else {
-                    result.push_str(new);
-                }
-                if let Some(quote) = quote {
-                    result.push(quote);
-                }
-            } else {
-                result.push_str(&line[i..*end]);
-            }
-            i = *end;
-            continue;
-        }
-        if let Some(end) = protected_observations.get(&i) {
-            result.push_str(&line[i..*end]);
-            i = *end;
-            continue;
-        }
-        if bytes[i..].starts_with(b"--") {
-            let end = line[i..].find('\n').map_or(bytes.len(), |n| i + n + 1);
-            result.push_str(&line[i..end]);
-            i = end;
-            continue;
-        }
-        if bytes[i] == b'\'' || bytes[i] == b'"' {
-            let quote = bytes[i];
-            let start = i;
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == quote {
-                    i += 1;
-                    if i < bytes.len() && bytes[i] == quote {
-                        i += 1;
-                        continue;
-                    }
-                    break;
-                }
-                if bytes[i] == b'\\' {
-                    i += 1;
-                }
-                i += 1;
-            }
-            let literal = &line[start..i.min(bytes.len())];
-            if previous.ends_with("table=>") {
-                result.push_str(&replace_references(literal, mapping));
-            } else {
-                result.push_str(literal);
-            }
-            continue;
-        }
-        if bytes[i] == b'`' || bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
-            let quoted = bytes[i] == b'`';
-            let start = i;
-            if quoted {
-                i += 1;
-            }
-            let name_start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            let name = &line[name_start..i];
-            if quoted && i < bytes.len() && bytes[i] == b'`' {
-                i += 1;
-            }
-            if i == start {
-                i += 1;
-                result.push_str(&line[start..i]);
-                continue;
-            }
-            let tail = line[i..].trim_start();
-            let following = tail.starts_with('.');
-            let name_tail = tail
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '`'))
-                .next()
-                .unwrap_or("");
-            let remaining_dots = name_tail.bytes().filter(|b| *b == b'.').count();
-            // Iceberg branch/tag table references add one final qualifier. It
-            // is part of the table reference, never a second namespace slot.
-            let branch_or_tag = remaining_dots == 2
-                && name_tail.rsplit('.').next().is_some_and(|part| {
-                    let part = part.trim_matches('`');
-                    part.starts_with("branch_") || part.starts_with("tag_")
-                });
-            if let Some(new) = mapping.get(name).filter(|_| {
-                (database && !following)
-                    || (!database && following && (remaining_dots == 1 || branch_or_tag))
-            }) {
-                if quoted {
-                    result.push('`');
-                }
-                result.push_str(new);
-                if quoted {
-                    result.push('`');
-                }
-            } else {
-                result.push_str(&line[start..i]);
-            }
-            if (name.eq_ignore_ascii_case("DATABASE")
-                && ["CREATE", "DROP"]
-                    .iter()
-                    .any(|v| last_word.eq_ignore_ascii_case(v)))
-                || name.eq_ignore_ascii_case("USE")
-            {
-                database = true;
-            }
-            last_word = name.to_string();
-            if name.eq_ignore_ascii_case("table") {
-                previous = "table".into();
-            } else if !["IF", "NOT", "EXISTS"]
-                .iter()
-                .any(|v| name.eq_ignore_ascii_case(v))
-                && !following
-            {
-                previous.clear();
-            }
-        } else {
-            if bytes[i] == b';' {
-                database = false;
-                previous.clear();
-            }
-            if bytes[i] == b'=' || bytes[i] == b'>' {
-                previous.push(bytes[i] as char);
-            }
-            let ch = line[i..].chars().next().unwrap();
-            result.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    result
+#[cfg(test)]
+fn rewrite_sql_identifiers(sql: &str, mapping: &BTreeMap<String, String>) -> String {
+    rewrite_displayed_ddl(sql, mapping).unwrap()
 }
 
 #[cfg(test)]
@@ -1508,18 +1416,17 @@ mod tests {
 
     #[test]
     fn typed_metadata_retains_sql_null_and_rewrites_only_the_string_null() {
-        let mut result =
-            typed_expected("-- query 1\n-- types\tvarchar\nDatabase\nNULL\n\"NULL\"\n");
+        let mut result = typed_expected("-- query 1\n-- types\tvarchar\nSchema\nNULL\n\"NULL\"\n");
         let source = result.golden.as_ref().unwrap().source.clone();
         let mapping = BTreeMap::from([("NULL".into(), "owned_namespace".into())]);
-        render_expected_result("SHOW DATABASES", &mut result, &HashMap::new(), &mapping).unwrap();
+        render_expected_result("SHOW SCHEMAS", &mut result, &HashMap::new(), &mapping).unwrap();
         assert_eq!(result.golden.as_ref().unwrap().expanded, source);
         render_expected_for_execution(
-            "SHOW DATABASES",
+            "SHOW SCHEMAS",
             &mut result,
             &HashMap::new(),
             &mapping,
-            &["SHOW DATABASES".into()],
+            &["SHOW SCHEMAS".into()],
         )
         .unwrap();
         let golden = result.golden.unwrap();
@@ -1538,9 +1445,9 @@ mod tests {
 
     #[test]
     fn typed_metadata_uses_each_exact_result_statement_owner() {
-        let sql = "SHOW DATABASES; SELECT 'logical_db' AS Database;";
+        let sql = "SHOW SCHEMAS; SELECT 'logical_db' AS Database;";
         let mut result = typed_expected(
-            "-- query 1\n-- types\tvarchar\nDatabase\nlogical_db\n-- types\tvarchar\nDatabase\nlogical_db\n",
+            "-- query 1\n-- types\tvarchar\nSchema\nlogical_db\n-- types\tvarchar\nDatabase\nlogical_db\n",
         );
         let source = result.golden.as_ref().unwrap().source.clone();
         let mapping = BTreeMap::from([("logical_db".into(), "owned_namespace".into())]);
@@ -1552,7 +1459,7 @@ mod tests {
             &HashMap::new(),
             &mapping,
             &[
-                "SHOW DATABASES".into(),
+                "SHOW SCHEMAS".into(),
                 "SELECT 'logical_db' AS Database".into(),
             ],
         )
@@ -1591,9 +1498,9 @@ mod tests {
 
     #[test]
     fn runtime_typed_binding_does_not_bind_legacy_metadata_twice() {
-        let sql = "SHOW DATABASES; SELECT 'logical_db' AS Database;";
+        let sql = "SHOW SCHEMAS; SELECT 'logical_db' AS Database;";
         let mut result = typed_expected(
-            "-- query 1\n-- legacy\nDatabase\nlogical_db\n-- types\tvarchar\nDatabase\nlogical_db\n",
+            "-- query 1\n-- legacy\nSchema\nlogical_db\n-- types\tvarchar\nSchema\nlogical_db\n",
         );
         let mapping = BTreeMap::from([
             ("logical_db".into(), "owned_namespace".into()),
@@ -1606,7 +1513,7 @@ mod tests {
             &HashMap::new(),
             &mapping,
             &[
-                "SHOW DATABASES".into(),
+                "SHOW SCHEMAS".into(),
                 "SELECT 'logical_db' AS Database".into(),
             ],
         )
@@ -1665,7 +1572,7 @@ mod tests {
             "CALL NoVaRocks_Mv_Management_Status('owned', 'mapped''namespace', 'owned');"
         );
         for unchanged in [
-            "CALL novarocks_mv_management_status(catalog => 'owned', namespace => 'owned', table => 'owned');",
+            "CALL novarocks_mv_management_status(catalog => 'owned', namespace => 'owned', \"table\" => 'owned');",
             "CALL novarocks_mv_management_status('owned', 'owned');",
             "CALL novarocks_mv_management_status('owned', 'owned', 'owned', 'owned');",
             "CALL owned.novarocks_mv_management_status('owned', 'owned', 'owned');",
@@ -1740,7 +1647,7 @@ mod tests {
                 assert!(rewritten.contains(&format!("schema_name = '{expected}'")));
                 assert!(!rewritten.contains(&format!("schema_name = '{old}'")));
             } else {
-                assert!(rewritten.contains(&format!(".{expected}.optimize_rows OPTIMIZE")));
+                assert!(rewritten.contains(&format!(".{expected}.optimize_rows EXECUTE optimize")));
                 assert!(
                     bound
                         .steps
@@ -1759,7 +1666,7 @@ mod tests {
         let symbols = crate::catalog_symbol::CatalogSymbols::seal(
             &vars["run_id"],
             &[format!(
-                "CREATE EXTERNAL CATALOG owned_{} PROPERTIES ('type'='iceberg')",
+                "CREATE CATALOG owned_{} USING iceberg",
                 vars["run_id"]
             )],
         )
@@ -1798,11 +1705,7 @@ mod tests {
     fn mv_state_metadata_filters_bind_namespaces_without_rewriting_data() {
         let vars =
             crate::config::case_placeholder_variables(&test_variables(&["case"]), "case").unwrap();
-        let source = "-- query 1\nCREATE DATABASE owned.owned;\n\
-            -- query 2\nSELECT name FROM system.runtime.materialized_view_states WHERE schema_name = 'owned';\n\
-            -- query 3\nSELECT owned, 'owned', 'system.runtime.materialized_view_states' FROM ordinary;\n\
-            -- query 4\nSELECT * FROM owned.t;\n\
-            -- query 5\nSELECT * FROM external.owned;\n";
+        let source = "-- query 1\nCREATE SCHEMA owned.owned;\n-- query 2\nSELECT name FROM system.runtime.materialized_view_states WHERE schema_name = 'owned';\n-- query 3\nSELECT owned, 'owned', 'system.runtime.materialized_view_states' FROM ordinary;\n-- query 4\nSELECT * FROM owned.t;\n-- query 5\nSELECT * FROM external.owned;\n";
         let map = namespace_mapping(source, &vars).unwrap();
         let expected = &map["owned"];
         let bound = load_namespace_bound_case("case", source, &vars);
@@ -1837,7 +1740,7 @@ mod tests {
             r#"-- query 1
 shell: python3 "${{NOVAROCKS_WORKSPACE_ROOT:-.}}/tests/sql/fixtures/iceberg-hms/fixture.py" verify-prepared {base} --receipt 'not-executed'
 -- query 2
-ALTER TABLE c.{base}.v2 ADD FILES FROM '{original_uri}';
+ALTER TABLE c.{base}.v2 EXECUTE add_files(location => '{original_uri}');
 SELECT '{original_uri}';
 "#
         );
@@ -1847,21 +1750,11 @@ SELECT '{original_uri}';
             "__hms_case_input_kind".into(),
             crate::hms_case_input::KIND.into(),
         );
-        let mapping = namespace_mapping(&source, &vars).unwrap();
-        let rewritten = rewrite_namespaces(&source, &vars).unwrap();
-        assert!(rewritten.contains(&format!(
-            "verify-prepared {} --receipt 'not-executed' --new-namespace {}",
-            mapping[&base],
-            mapping[&format!("{base}_new")]
-        )));
-        assert!(rewritten.contains(&format!(
-            "ADD FILES FROM 's3://novarocks/unit/hms/iru7/{}/v1/data'",
-            mapping[&base]
-        )));
-        assert!(
-            rewritten.contains(&format!("SELECT '{original_uri}';")),
-            "ordinary strings must remain unchanged"
-        );
+        let error = rewrite_namespaces(&source, &vars).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<TrinoNamespaceBoundary>(),
+            Some(TrinoNamespaceBoundary::HmsUri)
+        ));
     }
     #[test]
     fn exact_hms_pair_and_trino_writer_bind_references_without_new_observer_ownership() {
@@ -1876,24 +1769,16 @@ SELECT '{original_uri}';
             r#"python3 "${{NOVAROCKS_WORKSPACE_ROOT:-.}}/tests/sql/fixtures/iceberg-hms/fixture.py" prepare {base}"#
         );
         let source = format!(
-            "-- query 1\nshell: {producer}\n-- query 2\nCREATE DATABASE c.{base}_new;\nALTER TABLE c.{base}.v2 ADD FILES FROM 's3://novarocks/unit/hms/iru7/{base}/v1/data';\nSELECT 's3://novarocks/unit/hms/iru7/{base}/v1/data';\n-- query 3\nshell: {}\n",
+            "-- query 1\nshell: {producer}\n-- query 2\nCREATE SCHEMA c.{base}_new;\nALTER TABLE c.{base}.v2 EXECUTE add_files(location => 's3://novarocks/unit/hms/iru7/{base}/v1/data');\nSELECT 's3://novarocks/unit/hms/iru7/{base}/v1/data';\n-- query 3\nshell: {}\n",
             producer.replace(" prepare ", " after ")
         );
         let mapping = namespace_mapping(&source, &vars).unwrap();
-        let out = rewrite_namespaces(&source, &vars).unwrap();
-        let mapped = &mapping[&base];
-        let sibling = &mapping[&format!("{base}_new")];
-        assert_ne!(mapped, sibling);
-        assert_eq!(mapped.len(), 63);
-        assert_eq!(sibling.len(), 63);
-        assert!(out.contains(&format!("prepare {mapped} --new-namespace {sibling}")));
-        assert!(out.contains(&format!("after {mapped} --new-namespace {sibling}")));
-        assert!(out.contains(&format!(
-            "ADD FILES FROM 's3://novarocks/unit/hms/iru7/{mapped}/v1/data'"
-        )));
-        assert!(out.contains(&format!(
-            "SELECT 's3://novarocks/unit/hms/iru7/{base}/v1/data'"
-        )));
+        let error = rewrite_namespaces(&source, &vars).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<TrinoNamespaceBoundary>(),
+            Some(TrinoNamespaceBoundary::HmsUri)
+        ));
+        assert_ne!(mapping[&base], mapping[&format!("{base}_new")]);
         assert!(
             namespace_declarations(&source.replace(" prepare ", " before "))
                 .unwrap()
@@ -1926,8 +1811,7 @@ SELECT '{original_uri}';
     #[test]
     fn delta_tvf_first_argument_uses_namespace_identity_but_ordinary_literals_do_not() {
         let mapping = BTreeMap::from([("old_ns".into(), "canonical_namespace".into())]);
-        let sql =
-            "SELECT 'c.old_ns.t', ordinary('c.old_ns.t') FROM __nr_ivm_delta('c.old_ns.t',0,0);";
+        let sql = "SELECT 'c.old_ns.t', ordinary('c.old_ns.t') FROM TABLE(__nr_ivm_delta('c.old_ns.t',0,0));";
         let out = rewrite_delta_namespace_refs(sql, &mapping).unwrap();
         assert!(out.contains("SELECT 'c.old_ns.t', ordinary('c.old_ns.t')"));
         assert!(out.contains("__nr_ivm_delta('c.canonical_namespace.t',0,0)"));
@@ -2078,14 +1962,14 @@ print(json.dumps({'complete':True,'catalog_barrier':{context['identity']['run_id
         vars = crate::config::case_placeholder_variables(&vars, "case").unwrap();
         let old = format!("ns_{}", vars["uuid0"]);
         let source = format!(
-            "CREATE DATABASE catalog.{old};\nCREATE TABLE catalog.{old}.t (id INT);\nSELECT '{old}' AS value, {old} FROM ordinary;\nCREATE EXTERNAL CATALOG {old} PROPERTIES ('type'='iceberg');\n-- @db={old}\nshell: trino --namespace {old}\n"
+            "CREATE SCHEMA catalog.{old};\nCREATE TABLE catalog.{old}.t (id INT);\nSELECT '{old}' AS value, {old} FROM ordinary;\nCREATE CATALOG {old} USING iceberg;\n-- @db={old}\nshell: trino --namespace {old}\n"
         );
         let rewritten = rewrite_namespaces(&source, &vars).unwrap();
         let db = resource(&vars["run_id"], 'd', 0, 1).unwrap();
-        assert!(rewritten.contains(&format!("CREATE DATABASE catalog.{db};")));
+        assert!(rewritten.contains(&format!("CREATE SCHEMA catalog.{db};")));
         assert!(rewritten.contains(&format!("catalog.{db}.t")));
         assert!(rewritten.contains(&format!("SELECT '{old}' AS value, {old} FROM ordinary")));
-        assert!(rewritten.contains(&format!("CREATE EXTERNAL CATALOG {old}")));
+        assert!(rewritten.contains(&format!("CREATE CATALOG {old}")));
         assert!(rewritten.contains(&format!("-- @db={db}")));
         assert!(rewritten.contains(&format!("--namespace {db}")));
     }
@@ -2210,14 +2094,14 @@ print(json.dumps({'complete':True,'catalog_barrier':{context['identity']['run_id
             crate::config::case_placeholder_variables(&test_variables(&["case"]), "case").unwrap();
         let old = format!("ns_{}", vars["uuid0"]);
         let source = format!(
-            "CREATE DATABASE catalog.{old};\nCREATE TABLE catalog.{old}.t (id INT);\nINSERT INTO catalog.{old}.t.branch_dev VALUES (1);\nUPDATE catalog.`{old}`.`t`.`branch_dev` SET id=2;\nDELETE FROM {old}.t.branch_dev WHERE id=2;\nSELECT * FROM catalog.{old}.t.tag_snapshot;\nSELECT '{old}', 'catalog.{old}.t.branch_dev' AS data FROM ordinary;\n"
+            "CREATE SCHEMA catalog.{old};\nCREATE TABLE catalog.{old}.t (id INT);\nINSERT INTO catalog.{old}.t@dev VALUES (1);\nUPDATE catalog.\"{old}\".\"t\"@\"dev\" SET id=2;\nDELETE FROM {old}.t@dev WHERE id=2;\nSELECT * FROM catalog.{old}.t FOR VERSION AS OF 'snapshot';\nSELECT '{old}', 'catalog.{old}.t.branch_dev' AS data FROM ordinary;\n"
         );
         let rewritten = rewrite_namespaces(&source, &vars).unwrap();
         let db = resource(&vars["run_id"], 'd', 0, 1).unwrap();
-        assert!(rewritten.contains(&format!("catalog.{db}.t.branch_dev")));
-        assert!(rewritten.contains(&format!("catalog.`{db}`.`t`.`branch_dev`")));
-        assert!(rewritten.contains(&format!("DELETE FROM {db}.t.branch_dev")));
-        assert!(rewritten.contains(&format!("catalog.{db}.t.tag_snapshot")));
+        assert!(rewritten.contains(&format!("catalog.{db}.t@dev")));
+        assert!(rewritten.contains(&format!(r#"catalog."{db}"."t"@"dev""#)));
+        assert!(rewritten.contains(&format!("DELETE FROM {db}.t@dev")));
+        assert!(rewritten.contains(&format!("catalog.{db}.t FOR VERSION AS OF 'snapshot'")));
         assert!(rewritten.contains(&format!(
             "SELECT '{old}', 'catalog.{old}.t.branch_dev' AS data"
         )));
@@ -2226,12 +2110,12 @@ print(json.dumps({'complete':True,'catalog_barrier':{context['identity']['run_id
     fn multiline_database_names_and_golden_references_use_the_same_mapping() {
         let vars =
             crate::config::case_placeholder_variables(&test_variables(&["case"]), "case").unwrap();
-        let sql = "-- comment\nCREATE DATABASE\n catalog.raw_namespace;\nSELECT DATABASE(), raw_namespace FROM t;\n";
+        let sql = "-- comment\nCREATE SCHEMA\n catalog.raw_namespace;\nSELECT CURRENT_SCHEMA, raw_namespace FROM t;\n";
         let mapping = namespace_mapping(sql, &vars).unwrap();
         let expected = resource(&vars["run_id"], 'd', 0, 1).unwrap();
         let rewritten = rewrite_namespaces(sql, &vars).unwrap();
         assert!(rewritten.contains(&format!("catalog.{expected};")));
-        assert!(rewritten.contains("SELECT DATABASE(), raw_namespace FROM t"));
+        assert!(rewritten.contains("SELECT CURRENT_SCHEMA, raw_namespace FROM t"));
         let mut result = crate::types::ResultSet {
             golden: None,
             header: vec!["schema_name".into(), "value".into()],
@@ -2314,7 +2198,7 @@ print(json.dumps({'complete':True,'catalog_barrier':{context['identity']['run_id
     fn namespace_metadata_and_data_projection_ambiguity_rejects_before_scratch() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("case.sql");
-        std::fs::write(&file,"CREATE DATABASE ns;\nSELECT schema_name, 'ns' AS schema_name FROM information_schema.schemata;").unwrap();
+        std::fs::write(&file,"CREATE SCHEMA ns;\nSELECT schema_name, 'ns' AS schema_name FROM information_schema.schemata;").unwrap();
         let run = RunBudget::admit(
             FixturePolicy::default(),
             ScratchIdentity::create("s3://novarocks/test").unwrap(),
@@ -2345,7 +2229,7 @@ print(json.dumps({'complete':True,'catalog_barrier':{context['identity']['run_id
             "SELECT ns.id FROM t ns;",
             "SELECT ns.id FROM (SELECT 1) ns;",
         ] {
-            std::fs::write(&file, format!("CREATE DATABASE ns;\n{query}\n")).unwrap();
+            std::fs::write(&file, format!("CREATE SCHEMA ns;\n{query}\n")).unwrap();
             assert!(
                 RunNames::prepare(
                     &run,
@@ -2365,7 +2249,7 @@ print(json.dumps({'complete':True,'catalog_barrier':{context['identity']['run_id
         std::fs::write(
             &file,
             (0..10)
-                .map(|n| format!("CREATE DATABASE ns{n};\n"))
+                .map(|n| format!("CREATE SCHEMA ns{n};\n"))
                 .collect::<String>(),
         )
         .unwrap();

@@ -17,7 +17,7 @@
 
 //! Frozen FE-local catalog identities. Shared object and namespace names are unchanged.
 use anyhow::{Context, Result, bail, ensure};
-use novarocks_parser::{Span, Symbol, TokenKind, ast::*};
+use novarocks_parser::{Span, ast::*, parser};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -33,7 +33,20 @@ fn key(name: &str) -> String {
 
 /// Preserve source offsets while excluding shell blocks and explicitly expected,
 /// actually rejected syntax payloads from catalog ownership analysis.
-pub(crate) fn sql_source(source: &str) -> String {
+pub(crate) fn trino_catalog_source(source: &str) -> String {
+    source_without_non_sql(source, |_, raw| {
+        let Ok(frames) = parser::frame_statements(raw) else {
+            return false;
+        };
+        let [frame] = frames.as_slice() else {
+            return false;
+        };
+        let sql = &raw[frame.source.start()..frame.source.end()];
+        frame.lexical_failure.is_some() || parser::parse_statement(sql).is_err()
+    })
+}
+
+fn source_without_non_sql(source: &str, rejected_statement: impl Fn(&str, &str) -> bool) -> String {
     let mut shell = false;
     let mut masked: String = source
         .split_inclusive('\n')
@@ -83,8 +96,7 @@ pub(crate) fn sql_source(source: &str) -> String {
             continue;
         }
         let rejected = if expected.statement_ordinal.is_some() {
-            let Ok(statements) =
-                novarocks_parser::trino_parser::frame_statements(&source[range.clone()])
+            let Ok(statements) = novarocks_parser::parser::frame_statements(&source[range.clone()])
             else {
                 continue;
             };
@@ -94,15 +106,12 @@ pub(crate) fn sql_source(source: &str) -> String {
             let frame = statements.last().expect("validated positive ordinal");
             let selected = range.start + frame.source.start()..range.start + frame.source.end();
             let payload = &source[selected.clone()];
-            if novarocks_parser::parse(payload).is_ok()
-                || (frame.lexical_failure.is_none()
-                    && novarocks_parser::trino_parser::parse_statement(payload).is_ok())
-            {
+            if !rejected_statement(payload, payload) {
                 continue;
             }
             selected
         } else {
-            if novarocks_parser::parse(&sql).is_ok() {
+            if !rejected_statement(&sql, &source[range.clone()]) {
                 continue;
             }
             range
@@ -117,29 +126,19 @@ pub(crate) fn sql_source(source: &str) -> String {
     }
     masked
 }
-pub(crate) fn ranges(sql: &str) -> Result<Vec<std::ops::Range<usize>>> {
-    let mut start = 0;
-    let mut result = Vec::new();
-    for token in novarocks_parser::lex(sql)
-        .map_err(|error| anyhow::anyhow!("lex frozen catalog source: {error:?}"))?
-    {
-        if token.kind == TokenKind::Symbol(Symbol::Semicolon) {
-            result.push(start..token.span.end());
-            start = token.span.end();
-        }
-    }
-    if start < sql.len() {
-        result.push(start..sql.len());
-    }
-    Ok(result)
+#[cfg(test)]
+fn sql_source(source: &str) -> String {
+    trino_catalog_source(source)
 }
-fn identifier_token(sql: &str, token: &novarocks_parser::Token) -> String {
-    sql[token.span.start()..token.span.end()]
-        .trim_matches('`')
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_ascii_lowercase()
+
+#[cfg(test)]
+fn ranges(sql: &str) -> Result<Vec<std::ops::Range<usize>>> {
+    Ok(parser::frame_statements(sql)?
+        .into_iter()
+        .map(|frame| frame.source.start()..frame.source.end())
+        .collect())
 }
+
 impl CatalogSymbols {
     pub fn seal(run: &str, sources: &[String]) -> Result<Self> {
         let identity = run
@@ -159,22 +158,18 @@ impl CatalogSymbols {
         );
         let mut declared = BTreeSet::new();
         for source in sources {
-            let sql = sql_source(source);
-            for range in ranges(&sql)? {
-                // Invalid negative SQL remains a server-owned rejection. Only a
-                // successfully parsed CREATE grants local catalog ownership.
-                if let Ok(statements) = novarocks_parser::parse(&sql[range]) {
-                    for statement in statements {
-                        if let Statement::Catalog(CatalogStatement::CreateCatalog(create)) =
-                            statement
-                        {
-                            // A declaration grants ownership only for this admitted
-                            // run. Fixed/external names retain their original semantics.
-                            if create.name.value.contains(run) {
-                                declared.insert(key(&create.name.value));
-                            }
-                        }
-                    }
+            let masked = trino_catalog_source(source);
+            for frame in parser::frame_statements(&masked)? {
+                ensure!(
+                    frame.lexical_failure.is_none(),
+                    "lex sealed catalog declarations"
+                );
+                let sql = &masked[frame.source.start()..frame.source.end()];
+                if let TrinoStatement::CreateCatalog(create) =
+                    parser::parse_statement(sql).context("prove sealed catalog declarations")?
+                    && create.catalog_name.value.contains(run)
+                {
+                    declared.insert(key(&create.catalog_name.value));
                 }
             }
         }
@@ -247,114 +242,35 @@ impl CatalogSymbols {
         if self.0.is_empty() {
             return Ok(source.into());
         }
-        let masked = sql_source(source);
+        let masked = trino_catalog_source(source);
+        let frames =
+            parser::frame_statements(&masked).context("frame prepared Trino catalog SQL")?;
         let mut edits = BTreeMap::new();
-        for range in ranges(&masked)? {
-            for (start, (end, value)) in self.edits(&masked[range.clone()])? {
-                edits.insert(start + range.start, (end + range.start, value));
+        for frame in frames {
+            ensure!(
+                frame.lexical_failure.is_none(),
+                "lex prepared Trino catalog SQL"
+            );
+            let offset = frame.source.start();
+            let sql = &masked[offset..frame.source.end()];
+            let statement = parser::parse_statement(sql)
+                .context("prove Trino catalog slots in prepared SQL")?;
+            let mut visitor = CatalogEdits::new(self, sql);
+            visitor.visit_trino_statement(&statement);
+            for (start, (end, value)) in visitor.finish()? {
+                let span = offset + start..offset + end;
+                ensure!(
+                    source
+                        .get(span.clone())
+                        .is_some_and(|original| Some(original) == masked.get(span.clone())),
+                    "Trino catalog edit intersects masked source bytes"
+                );
+                edits.insert(span.start, (span.end, value));
             }
         }
         apply(source, edits)
     }
-    fn edits(&self, sql: &str) -> Result<BTreeMap<usize, (usize, String)>> {
-        let tokens = novarocks_parser::lex(sql)
-            .map_err(|error| anyhow::anyhow!("lex catalog identifier positions: {error:?}"))?;
-        // A textual match in a data cell, column or alias is not ownership.
-        // Only a closed catalog/object command position can authorize an early
-        // rejection when the product parser cannot build an AST.
-        let significant: Vec<_> = tokens
-            .iter()
-            .filter(|t| !matches!(t.kind, TokenKind::Trivia(_) | TokenKind::End))
-            .collect();
-        let owned = significant.iter().enumerate().any(|(i, token)| {
-            if self.lookup(&identifier_token(sql, token)).is_none() {
-                return false;
-            }
-            let previous = i
-                .checked_sub(1)
-                .map(|j| identifier_token(sql, significant[j]))
-                .unwrap_or_default();
-            let prefix = significant
-                .get(i + 1)
-                .is_some_and(|next| next.kind == TokenKind::Symbol(Symbol::Dot));
-            previous == "catalog"
-                || (prefix
-                    && matches!(
-                        previous.as_str(),
-                        "from"
-                            | "join"
-                            | "into"
-                            | "update"
-                            | "table"
-                            | "view"
-                            | "use"
-                            | "desc"
-                            | "describe"
-                    ))
-        });
-        let statements = match novarocks_parser::parse(sql) {
-            Ok(value) => value,
-            Err(_) if !owned => return Ok(BTreeMap::new()),
-            Err(error) => {
-                // SHOW/DESCRIBE command families are handled before product SQL
-                // parsing. Their object/catalog positions have a closed grammar.
-                let significant: Vec<_> = tokens
-                    .iter()
-                    .filter(|t| {
-                        !matches!(
-                            t.kind,
-                            TokenKind::Trivia(_)
-                                | TokenKind::End
-                                | TokenKind::Symbol(Symbol::Semicolon)
-                        )
-                    })
-                    .collect();
-                let words: Vec<_> = significant
-                    .iter()
-                    .map(|t| identifier_token(sql, t))
-                    .collect();
-                let upper = sql.trim_start().to_ascii_uppercase();
-                let command = upper.starts_with("SHOW ")
-                    || upper.starts_with("DESC ")
-                    || upper.starts_with("DESCRIBE ");
-                ensure!(
-                    command,
-                    "cannot safely bind owned FE catalog in unsupported SQL: {error}"
-                );
-                let mut result = BTreeMap::new();
-                for (i, t) in significant.iter().enumerate() {
-                    if let Some(new) = self.lookup(&words[i]) {
-                        let dot = significant
-                            .get(i + 1)
-                            .is_some_and(|n| n.kind == TokenKind::Symbol(Symbol::Dot));
-                        let catalog = words.get(i.wrapping_sub(1)).is_some_and(|w| w == "catalog");
-                        ensure!(
-                            dot || catalog,
-                            "ambiguous owned FE catalog in SHOW/DESCRIBE"
-                        );
-                        result.insert(t.span.start(), (t.span.end(), quoted(sql, t.span, new)));
-                    }
-                }
-                return Ok(result);
-            }
-        };
-        let mut visitor = CatalogEdits {
-            symbols: self,
-            sql,
-            edits: BTreeMap::new(),
-            metadata: false,
-            aliases: BTreeSet::new(),
-            relations: BTreeSet::new(),
-            error: None,
-        };
-        for statement in &statements {
-            visitor.visit_statement(statement);
-        }
-        if let Some(error) = visitor.error {
-            bail!("{error}");
-        }
-        Ok(visitor.edits)
-    }
+
     /// This adapter is for typed catalog controls, never arbitrary shell values.
     pub fn rewrite_meta(&self, meta: &mut crate::types::QueryMeta, sql: &str) -> Result<()> {
         if let Some(database) = &mut meta.db {
@@ -362,8 +278,7 @@ impl CatalogSymbols {
             // actual command preserves quoted database identifiers and leaves
             // unqualified/external/invalid controls under their original owner.
             let command = format!("USE {database}");
-            if let Ok(statements) = novarocks_parser::parse(&command)
-                && let [Statement::Session(SessionStatement::Use(context))] = statements.as_slice()
+            if let Ok(TrinoStatement::Use(context)) = parser::parse_statement(&command)
                 && let Some(catalog) = &context.catalog
                 && let Some(mapped) = self.lookup(&catalog.value)
             {
@@ -503,7 +418,33 @@ enum Display {
     Explain,
     MvIdentity,
 }
-fn quoted(sql: &str, span: Span, value: &str) -> String {
+/// The existing MV inspection call owns only these three positional literals.
+pub(crate) fn mv_management_status_literals(call: &TrinoCall) -> Option<[&Literal; 3]> {
+    let [name] = call.name.parts.as_slice() else {
+        return None;
+    };
+    if !name
+        .value
+        .eq_ignore_ascii_case("novarocks_mv_management_status")
+    {
+        return None;
+    }
+    let [catalog, schema, view] = call.arguments.as_slice() else {
+        return None;
+    };
+    let literals = [catalog, schema, view].map(|arg| match (&arg.name, &arg.value) {
+        (None, Expr::Literal(literal)) if matches!(literal.kind, LiteralKind::String(_)) => {
+            Some(literal)
+        }
+        _ => None,
+    });
+    let [Some(catalog), Some(schema), Some(view)] = literals else {
+        return None;
+    };
+    Some([catalog, schema, view])
+}
+
+pub(crate) fn quoted(sql: &str, span: Span, value: &str) -> String {
     match sql.as_bytes().get(span.start()) {
         Some(b'`') => format!("`{value}`"),
         Some(b'\'') => format!("'{value}'"),
@@ -535,7 +476,26 @@ struct CatalogEdits<'a> {
     relations: BTreeSet<Vec<String>>,
     error: Option<String>,
 }
-impl CatalogEdits<'_> {
+impl<'a> CatalogEdits<'a> {
+    fn new(symbols: &'a CatalogSymbols, sql: &'a str) -> Self {
+        Self {
+            symbols,
+            sql,
+            edits: BTreeMap::new(),
+            metadata: false,
+            aliases: BTreeSet::new(),
+            relations: BTreeSet::new(),
+            error: None,
+        }
+    }
+
+    fn finish(self) -> Result<BTreeMap<usize, (usize, String)>> {
+        if let Some(error) = self.error {
+            bail!("{error}");
+        }
+        Ok(self.edits)
+    }
+
     fn ident(&mut self, name: &Ident) {
         if let Some(new) = self.symbols.lookup(&name.value) {
             self.edits.insert(
@@ -570,40 +530,37 @@ impl CatalogEdits<'_> {
     }
 }
 impl Visit for CatalogEdits<'_> {
-    fn visit_statement(&mut self, statement: &Statement) {
+    fn visit_trino_statement(&mut self, statement: &TrinoStatement) {
         match statement {
-            Statement::Catalog(s) => match s {
-                CatalogStatement::CreateCatalog(s) => self.ident(&s.name),
-                CatalogStatement::DropCatalog(s) => self.ident(&s.name),
-                CatalogStatement::CreateDatabase(s) if s.name.parts.len() == 2 => {
-                    self.ident(&s.name.parts[0])
-                }
-                CatalogStatement::DropDatabase(s) if s.name.parts.len() == 2 => {
-                    self.ident(&s.name.parts[0])
-                }
-                _ => {}
-            },
-            Statement::Session(SessionStatement::Use(s)) => {
-                if let Some(c) = &s.catalog {
-                    self.ident(c);
+            TrinoStatement::CreateCatalog(s) => self.ident(&s.catalog_name),
+            TrinoStatement::DropCatalog(s) => self.ident(&s.catalog_name),
+            TrinoStatement::CreateSchema(s) if s.schema_name.parts.len() == 2 => {
+                self.ident(&s.schema_name.parts[0]);
+            }
+            TrinoStatement::DropSchema(s) if s.schema_name.parts.len() == 2 => {
+                self.ident(&s.schema_name.parts[0]);
+            }
+            TrinoStatement::SetSession(s) if s.name.parts.len() == 2 => {
+                self.ident(&s.name.parts[0]);
+            }
+            TrinoStatement::ResetSession(s) if s.name.parts.len() == 2 => {
+                self.ident(&s.name.parts[0]);
+            }
+            TrinoStatement::Use(s) => {
+                if let Some(catalog) = &s.catalog {
+                    self.ident(catalog);
                 }
             }
-            Statement::Maintenance(MaintenanceStatement::Call(call)) => {
-                if call.procedure.parts.last().is_some_and(|n| {
-                    n.value
-                        .eq_ignore_ascii_case("novarocks_mv_management_status")
-                }) && let Some(ProcedureArgument {
-                    value: MaintenanceValue::Literal(l),
-                    ..
-                }) = call.arguments.first()
-                {
-                    self.literal(l);
+            TrinoStatement::Call(call) => {
+                if let Some([catalog, _, _]) = mv_management_status_literals(call) {
+                    self.literal(catalog);
                 }
             }
             _ => {}
         }
-        walk_statement(self, statement);
+        walk_trino_statement(self, statement);
     }
+
     fn visit_object_name(&mut self, name: &ObjectName) {
         if name.parts.len() >= 3 {
             self.ident(&name.parts[0]);
@@ -717,7 +674,6 @@ impl Visit for CatalogEdits<'_> {
                     Relation::TableSubquery(_)
                     | Relation::Lateral(_)
                     | Relation::Unnest(_)
-                    | Relation::LegacyTableFunction(_)
                     | Relation::JsonTable(_) => {}
                 }
             }
@@ -868,11 +824,18 @@ fn known_show_catalog_column(sql: &str, header: &str) -> bool {
             "catalog" | "catalog_name" | "catalogname" | "name"
         )
 }
+fn is_current_catalog_expression(expression: &Expr) -> bool {
+    matches!(expression, Expr::CurrentCatalog(_))
+}
+
 fn catalog_output_plan(sql: &str) -> Vec<OutputColumn> {
     let mut result = Vec::new();
-    if let Ok(statements) = novarocks_parser::parse(sql) {
-        for statement in statements {
-            if let Statement::Query(query) = statement {
+    if let Ok(frames) = parser::frame_statements(sql) {
+        for frame in frames {
+            let sql = &sql[frame.source.start()..frame.source.end()];
+            if frame.lexical_failure.is_none()
+                && let Ok(TrinoStatement::Query(query)) = parser::parse_statement(sql)
+            {
                 let metadata = metadata_query(&query);
                 let state_table = materialized_view_state_query(&query);
                 if let SetExpr::Select(select) = query.body.as_ref() {
@@ -900,8 +863,7 @@ fn catalog_output_plan(sql: &str) -> Vec<OutputColumn> {
                                 break;
                             }
                         };
-                        let current = select.from.is_none()
-                            && matches!(expr,Expr::FunctionCall(call) if call.name.parts.len()==1 && call.name.parts[0].value.eq_ignore_ascii_case("current_catalog") && call.arguments.is_empty() && call.processing_mode.is_none());
+                        let current = select.from.is_none() && is_current_catalog_expression(expr);
                         let catalog = (metadata && catalog_column(expr).is_some()) || current;
                         let header = alias.unwrap_or_else(|| {
                             syntax_identifier_chain(expr)
@@ -1010,16 +972,16 @@ mod tests {
         for (database, expected) in [
             ("owned.ns", format!("{mapped}.ns")),
             (
-                "`owned`.`namespace.with.dot`",
-                format!("`{mapped}`.`namespace.with.dot`"),
+                r#""owned"."namespace.with.dot""#,
+                format!(r#""{mapped}"."namespace.with.dot""#),
             ),
             (
-                "  `owned` . `namespace`  ",
-                format!("  `{mapped}` . `namespace`  "),
+                r#"  "owned" . "namespace"  "#,
+                format!(r#"  "{mapped}" . "namespace"  "#),
             ),
             ("namespace", "namespace".into()),
             ("external.namespace", "external.namespace".into()),
-            ("`owned.namespace`", "`owned.namespace`".into()),
+            (r#""owned.namespace""#, r#""owned.namespace""#.into()),
             ("'owned.namespace'", "'owned.namespace'".into()),
         ] {
             let mut meta = crate::types::QueryMeta {
@@ -1041,10 +1003,8 @@ mod tests {
     #[test]
     fn names_are_lossless_bounded_deterministic_and_run_disjoint() {
         let sources = vec![
-            format!("CREATE EXTERNAL CATALOG z_{RUN} PROPERTIES ('type'='iceberg');"),
-            format!(
-                "CREATE EXTERNAL CATALOG A_{RUN} PROPERTIES ('type'='iceberg'); CREATE EXTERNAL CATALOG a_{RUN} PROPERTIES ('type'='iceberg');"
-            ),
+            format!("CREATE CATALOG z_{RUN} USING iceberg;"),
+            format!("CREATE CATALOG A_{RUN} USING iceberg; CREATE CATALOG a_{RUN} USING iceberg;"),
         ];
         let a = CatalogSymbols::seal(RUN, &sources).unwrap();
         let mut reversed = sources.clone();
@@ -1087,7 +1047,7 @@ mod tests {
         assert!(out.contains(&format!("SELECT {name}.ns.t.k FROM {name}.ns.t")));
         assert!(out.contains("-- keep owned"));
         assert!(
-            s.rewrite_source("SELECT * FROM __nr_ivm_delta('owned.ns.t',0,0)")
+            s.rewrite_source("SELECT * FROM TABLE(__nr_ivm_delta('owned.ns.t',0,0))")
                 .unwrap()
                 .contains(&format!("__nr_ivm_delta('{name}.ns.t',0,0)"))
         );
@@ -1101,17 +1061,20 @@ mod tests {
         assert_eq!(out, s.rewrite_source(&out).unwrap());
     }
     #[test]
-    fn metadata_base_qualifiers_keep_atomic_catalog_edits_and_quoted_dollar_names() {
+    fn metadata_qualifiers_keep_atomic_catalog_edits_and_quoted_dollar_names() {
         let symbols = symbols();
         let catalog = symbols.lookup("owned").unwrap();
-        let source = "-- preserve t$files\nSELECT owned.ns.t.*, owned.ns.t.k, 'owned.ns.t$files' AS business FROM owned.ns.t$files;";
+        let source = r#"-- preserve orders$files
+SELECT owned.ns."orders$files".*, owned.ns."orders$files".file_path,
+       'owned.ns.orders$files' AS business
+FROM owned.ns."orders$files";"#;
         let expected = format!(
-            "-- preserve t$files\nSELECT {catalog}.ns.t.*, {catalog}.ns.t.k, 'owned.ns.t$files' AS business FROM {catalog}.ns.t$files;"
+            r#"-- preserve orders$files
+SELECT {catalog}.ns."orders$files".*, {catalog}.ns."orders$files".file_path,
+       'owned.ns.orders$files' AS business
+FROM {catalog}.ns."orders$files";"#
         );
-        let statements = novarocks_parser::parse(source).unwrap();
-        let [Statement::Query(query)] = statements.as_slice() else {
-            panic!("original query");
-        };
+        let query = parser::parse_query(source.trim_end_matches(';')).unwrap();
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("original SELECT");
         };
@@ -1119,26 +1082,19 @@ mod tests {
             panic!("original table");
         };
         let last = table.name.parts.last().unwrap();
-        assert_eq!(last.value, "t$files");
-        assert!(!last.quoted);
-        assert_eq!(&source[last.span.start()..last.span.end()], "t$files");
+        assert_eq!(last.value, "orders$files");
+        assert!(last.quoted);
         assert_eq!(
-            novarocks_sql::TableNameView::new(&table.name)
-                .parts()
-                .collect::<Vec<_>>(),
-            ["owned", "ns", "t"]
+            &source[last.span.start()..last.span.end()],
+            r#""orders$files""#
         );
-        assert_eq!(
-            last.value, "t$files",
-            "the semantic name view does not mutate the source name"
-        );
-        let edits = symbols.edits(source).unwrap();
-        let mut expected_positions = [
-            source.find("owned.ns.t.*").unwrap(),
-            source.find("owned.ns.t.k").unwrap(),
-            source.rfind("owned.ns.t$files").unwrap(),
-        ];
-        expected_positions.sort();
+        let mut visitor = CatalogEdits::new(&symbols, source);
+        visitor.visit_trino_statement(&TrinoStatement::Query(query));
+        let edits = visitor.finish().unwrap();
+        let expected_positions = source
+            .match_indices(r#"owned.ns."orders$files""#)
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>();
         assert_eq!(
             edits.keys().copied().collect::<Vec<_>>(),
             expected_positions
@@ -1148,45 +1104,17 @@ mod tests {
         }
         assert_eq!(symbols.rewrite_source(source).unwrap(), expected);
         assert_eq!(symbols.rewrite_source(&expected).unwrap(), expected);
-
-        let quoted = "SELECT owned.ns.t.*, owned.ns.`t$files`.*, owned.ns.`t$files`.k FROM owned.ns.`t$files`;";
-        assert_eq!(
-            symbols.rewrite_source(quoted).unwrap(),
-            format!(
-                "SELECT owned.ns.t.*, {catalog}.ns.`t$files`.*, {catalog}.ns.`t$files`.k FROM {catalog}.ns.`t$files`;"
-            )
-        );
-        let [Statement::Query(query)]: [Statement; 1] =
-            novarocks_parser::parse(quoted).unwrap().try_into().unwrap()
-        else {
-            panic!("quoted query");
-        };
-        let SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("quoted SELECT");
-        };
-        let Some(Relation::Table(table)) = &select.from else {
-            panic!("quoted table");
-        };
-        let last = table.name.parts.last().unwrap();
-        assert!(last.quoted);
-        assert_eq!(
-            novarocks_sql::TableNameView::new(&table.name)
-                .parts()
-                .collect::<Vec<_>>(),
-            ["owned", "ns", "t$files"]
-        );
-        assert_eq!(&quoted[last.span.start()..last.span.end()], "`t$files`");
     }
 
     #[test]
     fn optimize_and_metadata_bind_the_same_catalog_without_rewriting_data() {
         let symbols = symbols();
         let catalog = symbols.lookup("owned").unwrap();
-        let source = "ALTER TABLE owned.ns.orders OPTIMIZE; \
+        let source = "ALTER TABLE owned.ns.orders EXECUTE optimize; \
                       SELECT name FROM system.metadata.materialized_views \
                       WHERE catalog_name = 'owned' AND schema_name = 'owned' AND name = 'owned';";
         let rewritten = symbols.rewrite_source(source).unwrap();
-        assert!(rewritten.contains(&format!("ALTER TABLE {catalog}.ns.orders OPTIMIZE")));
+        assert!(rewritten.contains(&format!("ALTER TABLE {catalog}.ns.orders EXECUTE optimize")));
         assert!(
             rewritten.contains(&format!("catalog_name = '{catalog}'")),
             "{rewritten}"
@@ -1213,14 +1141,14 @@ mod tests {
     }
 
     #[test]
-    fn null_safe_metadata_comparisons_rewrite_both_source_spellings() {
+    fn null_safe_metadata_comparisons_rewrite_both_catalog_operands() {
         let symbols = symbols();
         let catalog = symbols.lookup("owned").unwrap();
         let source = "SELECT 'owned' AS business FROM system.metadata.materialized_views \
-                      WHERE catalog_name <=> 'owned' OR 'owned' IS NOT DISTINCT FROM storage_catalog;";
+                      WHERE catalog_name IS NOT DISTINCT FROM 'owned' OR 'owned' IS NOT DISTINCT FROM storage_catalog;";
         let expected = format!(
             "SELECT 'owned' AS business FROM system.metadata.materialized_views \
-             WHERE catalog_name <=> '{catalog}' OR '{catalog}' IS NOT DISTINCT FROM storage_catalog;"
+             WHERE catalog_name IS NOT DISTINCT FROM '{catalog}' OR '{catalog}' IS NOT DISTINCT FROM storage_catalog;"
         );
         let rewritten = symbols.rewrite_source(source).unwrap();
         assert_eq!(rewritten, expected);
@@ -1234,7 +1162,7 @@ mod tests {
                       WHERE catalog_name > 'owned' OR storage_catalog LIKE 'owned' \
                       OR catalog_name IN ('owned') OR catalog_name BETWEEN 'owned' AND 'owned' \
                       OR catalog_name IS DISTINCT FROM 'owned' OR name = 'owned';";
-        novarocks_parser::parse(source).unwrap();
+        parser::parse_query(source.trim_end_matches(';')).unwrap();
         assert_eq!(symbols.rewrite_source(source).unwrap(), source);
     }
 
@@ -1244,13 +1172,13 @@ mod tests {
         let catalog = symbols.lookup("owned").unwrap();
         assert_eq!(
             symbols
-                .rewrite_source("ALTER TABLE owned.owned.orders OPTIMIZE;")
+                .rewrite_source("ALTER TABLE owned.owned.orders EXECUTE optimize;")
                 .unwrap(),
-            format!("ALTER TABLE {catalog}.owned.orders OPTIMIZE;")
+            format!("ALTER TABLE {catalog}.owned.orders EXECUTE optimize;")
         );
         for source in [
-            "ALTER TABLE ns.orders OPTIMIZE;",
-            "ALTER TABLE external.owned.orders OPTIMIZE;",
+            "ALTER TABLE ns.orders EXECUTE optimize;",
+            "ALTER TABLE external.owned.orders EXECUTE optimize;",
             "SELECT * FROM owned.orders;",
         ] {
             assert_eq!(symbols.rewrite_source(source).unwrap(), source);
@@ -1290,9 +1218,21 @@ mod tests {
             header: vec!["x".into(), "x".into()],
             rows: vec![vec!["owned".into(), "owned".into()]],
         };
-        s.render_expected("SELECT current_catalog() AS x, 'owned' AS x", &mut current)
+        s.render_expected("SELECT current_catalog AS x, 'owned' AS x", &mut current)
             .unwrap();
         assert_eq!(current.rows[0], vec![name.to_string(), "owned".into()]);
+
+        let mut quoted = crate::types::ResultSet {
+            golden: None,
+            header: vec!["x".into(), "x".into()],
+            rows: vec![vec!["owned".into(), "owned".into()]],
+        };
+        s.render_expected(
+            r#"SELECT "current_catalog" AS x, 'owned' AS x"#,
+            &mut quoted,
+        )
+        .unwrap();
+        assert_eq!(quoted.rows[0], vec!["owned".to_string(), "owned".into()]);
         let mut data = crate::types::QueryMeta {
             result_rows_where: vec![("catalog".into(), "owned".into())],
             ..Default::default()
@@ -1458,35 +1398,12 @@ mod tests {
         let invalid = format!("invalid_{RUN}");
         let valid = format!("valid_{RUN}");
         let declarations = format!(
-            "-- query 1\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nCREATE EXTERNAL CATALOG {invalid} PROPERTIES ('type'=@x);\n-- query 2\nCREATE EXTERNAL CATALOG {valid} PROPERTIES ('type'='iceberg');\n"
+            "-- query 1\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nCREATE CATALOG {invalid} USING @x;\n-- query 2\nCREATE CATALOG {valid} USING iceberg;\n"
         );
         let sealed = CatalogSymbols::seal(RUN, &[declarations]).unwrap();
         assert!(sealed.lookup(&invalid).is_none());
         assert!(sealed.lookup(&valid).is_some());
         assert_eq!(sealed.0.len(), 1);
-    }
-
-    #[test]
-    fn indexed_syntax_negative_masks_only_the_terminal_statement_in_catalog_analysis() {
-        let symbols = symbols();
-        let source = "-- query 1\r\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2\r\nUSE owned.ns;\r\nSELECT id FROM t ORDER BY idSELECT id;\r\n-- query 2\r\nSELECT 1;";
-        let malformed = "SELECT id FROM t ORDER BY idSELECT id;";
-        let masked = sql_source(source);
-        assert_eq!(masked.len(), source.len());
-        assert!(masked.contains("USE owned.ns;"));
-        assert!(!masked.contains(malformed));
-        assert!(masked.ends_with("-- query 2\r\nSELECT 1;"));
-        let rewritten = symbols.rewrite_source(source).unwrap();
-        assert_eq!(
-            rewritten,
-            source.replacen(
-                "USE owned.ns;",
-                &format!("USE {}.ns;", symbols.lookup("owned").unwrap()),
-                1
-            )
-        );
-        let valid = source.replace(malformed, "SELECT 2;");
-        assert_eq!(sql_source(&valid), valid);
     }
 
     #[test]
@@ -1506,7 +1423,7 @@ mod tests {
         }
         // An expectation cannot hide a valid declaration or erase its owner.
         let valid = format!(
-            "-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nCREATE EXTERNAL CATALOG valid_{RUN} PROPERTIES ('type'='iceberg');"
+            "-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nCREATE CATALOG valid_{RUN} USING iceberg;"
         );
         assert_eq!(sql_source(&valid), valid);
         assert!(
@@ -1520,21 +1437,18 @@ mod tests {
     #[test]
     fn source_shell_owner_and_negative_product_rejections_are_preserved() {
         let s = symbols();
-        let source = "-- query 1\nshell: printf 'CREATE EXTERNAL CATALOG spark_catalog; owned.ns.t';\n-- query 2\nSELECT 1;\n";
+        let source = "-- query 1\nshell: printf 'CREATE CATALOG spark_catalog; owned.ns.t';\n-- query 2\nSELECT 1;\n";
         assert_eq!(s.rewrite_source(source).unwrap(), source);
-        assert_eq!(s.rewrite_source("DROP CATALOG;").unwrap(), "DROP CATALOG;");
-        assert_eq!(
-            s.rewrite_source("UNRECOGNIZED owned.ns.t;").unwrap(),
-            "UNRECOGNIZED owned.ns.t;"
-        );
-        assert_eq!(
-            s.rewrite_source("INVALID SELECT 'owned';").unwrap(),
-            "INVALID SELECT 'owned';"
-        );
-        assert_eq!(
-            s.rewrite_source("INVALID SELECT owned AS data;").unwrap(),
-            "INVALID SELECT owned AS data;"
-        );
+        for rejected in [
+            "DROP CATALOG;",
+            "UNRECOGNIZED owned.ns.t;",
+            "INVALID SELECT 'owned';",
+            "INVALID SELECT owned AS data;",
+        ] {
+            assert!(s.rewrite_source(rejected).is_err());
+            let declared = format!("-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\n{rejected}");
+            assert_eq!(s.rewrite_source(&declared).unwrap(), declared);
+        }
         assert!(s.rewrite_source("CREATE TABLE owned.ns.t (").is_err());
     }
     #[test]
@@ -1590,8 +1504,8 @@ mod tests {
         )
         .unwrap();
         let bad = source.replacen(
-            "CREATE EXTERNAL CATALOG ice_hms_${uuid0}",
-            "CREATE EXTERNAL CATALOG different_${uuid0}",
+            "CREATE CATALOG ice_hms_${uuid0}",
+            "CREATE CATALOG different_${uuid0}",
             1,
         );
         let directory = tempfile::tempdir().unwrap();
@@ -1702,7 +1616,12 @@ mod tests {
                 .unwrap();
         let old_catalog = format!("ice_hms_{}", case_vars["uuid0"]);
         let sealed_catalog = names.catalogs.lookup(&old_catalog).unwrap();
-        let raw = crate::fixture_context::render_expected(&template, &case_vars);
+        let meta = regex::Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
+        let marker = regex::Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        let definition =
+            crate::hms_case_input::Definition::load(hms_source, &meta, &marker).unwrap();
+        let projection = definition.catalog_definition_projection().unwrap();
+        let raw = crate::fixture_context::render_expected(projection.source(), &case_vars);
         let namespaces = crate::fixture_context::namespace_mapping(&raw, &case_vars).unwrap();
         let base = format!("iru7_{}", case_vars["uuid0"]);
         let ordinal = names.suites[crate::hms_case_input::SUITE].cases[crate::hms_case_input::CASE];
@@ -1714,8 +1633,6 @@ mod tests {
             namespaces[&format!("{base}_new")],
             crate::fixture_context::resource(&names.run_id, 'd', ordinal, 2).unwrap()
         );
-        let meta = regex::Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
-        let marker = regex::Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
         assert!(
             crate::parser::load_sql_case_from_file(hms_source, &meta, &marker, &hms_vars).is_err(),
             "the pure definition must not masquerade as fully bound executable SQL"
@@ -1735,7 +1652,7 @@ mod tests {
         assert!(
             bound.steps[1]
                 .sql
-                .contains(&format!("CREATE EXTERNAL CATALOG {sealed_catalog}"))
+                .contains(&format!("CREATE CATALOG {sealed_catalog}"))
         );
         assert!(
             bound.steps[11]
@@ -1790,7 +1707,7 @@ mod tests {
         assert!(
             bound.steps[39]
                 .sql
-                .contains(&format!("ADD FILES FROM '{expected_uri}'"))
+                .contains(&format!("EXECUTE add_files(location => '{expected_uri}')"))
         );
         assert!(
             !bound.steps[39]

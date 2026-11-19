@@ -658,61 +658,73 @@ pub fn step_requires_recorded_result(step: &SqlStep) -> bool {
 }
 
 pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
-    let Ok(statements) = crate::session::split_sql_statements(&step.sql) else {
+    let Ok(statements) =
+        crate::session::split_trino_step_sql(&step.sql, step.meta.expect_trino_error.as_ref())
+    else {
         // Invalid SQL must not silently waive the result assertion.
         return false;
     };
     let Some(statement) = statements.last() else {
         return false;
     };
-    // OPTIMIZE returns the table procedure's metric rows. Its ALTER spelling
-    // cannot inherit the general DDL waiver or silently disable comparison.
-    if let Ok(statements) = novarocks_parser::parse(statement)
-        && matches!(
-            statements.as_slice(),
-            [novarocks_parser::ast::Statement::Maintenance(
-                novarocks_parser::ast::MaintenanceStatement::Optimize(_)
-            )]
-        )
-    {
-        return false;
+    // OPTIMIZE returns metric rows. Other known command completions
+    // retain their implicit skip even if comments precede the statement.
+    use novarocks_parser::ast::TrinoStatement::*;
+    match novarocks_parser::parser::parse_statement(statement) {
+        Ok(TableExecute(value)) => !value.procedure_name.value.eq_ignore_ascii_case("optimize"),
+        Ok(
+            CreateCatalog(_)
+            | DropCatalog(_)
+            | CreateSchema(_)
+            | DropSchema(_)
+            | RenameSchema(_)
+            | CreateTable(_)
+            | CreateTableAsSelect(_)
+            | DropTable(_)
+            | RenameTable(_)
+            | CreateView(_)
+            | DropView(_)
+            | RenameView(_)
+            | RefreshView(_)
+            | CreateMaterializedView(_)
+            | DropMaterializedView(_)
+            | RenameMaterializedView(_)
+            | RefreshMaterializedView(_)
+            | MaterializedViewExecute(_)
+            | SetProperties(_)
+            | CreateBranch(_)
+            | DropBranch(_)
+            | FastForwardBranch(_)
+            | AddColumn(_)
+            | RenameColumn(_)
+            | DropColumn(_)
+            | SetDefaultValue(_)
+            | DropDefaultValue(_)
+            | SetColumnType(_)
+            | DropNotNullConstraint(_)
+            | TruncateTable(_)
+            | Insert(_)
+            | Update(_)
+            | Delete(_)
+            | Merge(_)
+            | SetSession(_)
+            | SetRole(_)
+            | SetPath(_)
+            | SetTimeZone(_)
+            | SetSessionAuthorization(_)
+            | Use(_)
+            | Analyze(_)
+            | Grant(_)
+            | GrantRoles(_)
+            | Revoke(_)
+            | RevokeRoles(_)
+            | CreateRole(_)
+            | DropRole(_)
+            | CreateFunction(_)
+            | DropFunction(_),
+        ) => true,
+        _ => false,
     }
-    let normalized = statement
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    if normalized.starts_with("refresh materialized view ")
-        && normalized.contains(" with sync mode")
-    {
-        return true;
-    }
-    // Classify the final statement, so setup such as USE cannot hide a query.
-    // Other DDL / DML statements retain their existing non-rowset policy. Treat them as
-    // implicit skip_result_check so only real queries (SELECT/SHOW/WITH/etc.)
-    // need a recorded result set. This lets legacy tests that issue
-    // CREATE/INSERT/DROP before an assertion SELECT work without requiring
-    // every step to carry an explicit `-- @skip_result_check=true` marker.
-    const DDL_DML_PREFIXES: &[&str] = &[
-        "create ",
-        "drop ",
-        "alter ",
-        "truncate ",
-        "rename ",
-        "insert ",
-        "update ",
-        "delete ",
-        "merge ",
-        "set ",
-        "use ",
-        "grant ",
-        "revoke ",
-        "analyze ",
-        "refresh ",
-        "submit ",
-        "cancel ",
-    ];
-    DDL_DML_PREFIXES.iter().any(|p| normalized.starts_with(p))
 }
 
 pub fn step_retry_count(step: &SqlStep) -> usize {
@@ -878,14 +890,14 @@ mod implicit_skip_result_tests {
         for sql in [
             "SELECT 1",
             "USE x;\nselect 1;",
-            "USE x; SET query_timeout = 60; SELECT 1;",
+            "USE x; SET SESSION query_timeout = 60; SELECT 1;",
             "CREATE TABLE t (x INT); SELECT x FROM t;",
-            "USE `x;y`; SELECT 'use x; set y=1'; -- trailing comment;",
+            "USE \"x;y\"; SELECT 'use x; set y=1'; -- trailing comment;",
             "USE x; /* setup; */ SELECT 1; /* trailing; */ ;",
             "USE x; WITH t AS (SELECT 1) SELECT * FROM t;",
             "USE x; SHOW TABLES;",
-            "ALTER TABLE t OPTIMIZE;",
-            "USE x; ALTER TABLE `qualified`.`table` OPTIMIZE;",
+            "ALTER TABLE t EXECUTE optimize;",
+            "USE x; ALTER TABLE \"qualified\".\"table\" EXECUTE optimize;",
         ] {
             let step = step(sql);
             assert!(!step_has_implicit_skip_result(&step), "{sql}");
@@ -896,12 +908,12 @@ mod implicit_skip_result_tests {
     #[test]
     fn final_non_rowset_statements_remain_implicitly_skipped() {
         for sql in [
-            "USE x; SET query_timeout = 60;",
+            "USE x; SET SESSION query_timeout = 60;",
             "USE x;",
             "CREATE TABLE t (x INT);",
             "USE x; INSERT INTO t VALUES (1);",
             "USE x; DROP TABLE t; -- trailing comment;",
-            "USE x; REFRESH MATERIALIZED VIEW mv WITH SYNC MODE;",
+            "USE x; REFRESH MATERIALIZED VIEW mv;",
         ] {
             let step = step(sql);
             assert!(step_has_implicit_skip_result(&step), "{sql}");
@@ -990,7 +1002,7 @@ mod expected_error_code_result_classification_tests {
         let json = r#"{"tables":[],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"exact","bytes":80},"hash_table":{"kind":"exact","build_rows":10,"load_factor":0.75,"per_row_overhead_bytes":16}}"#;
         let step = SqlStep {
             query_number: 1,
-            sql: "EXPLAIN COSTS SELECT 1".to_string(),
+            sql: "EXPLAIN WITH SESSION explain_detail = 'COSTS'  SELECT 1".to_string(),
             meta: crate::types::QueryMeta {
                 skip_result_check: true,
                 query_stats_contract: Some(

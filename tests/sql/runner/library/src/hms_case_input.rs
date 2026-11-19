@@ -172,21 +172,6 @@ impl Definition {
                     .context("non UTF8 HMS receipt")?,
             ),
         );
-        let case = crate::parser::load_sql_case_from_file(&self.path, meta, marker, &vars)?
-            .context("bound HMS input has no executable case")?;
-        ensure!(case.steps.len() == 59, "bound HMS case changed step count");
-        // The existing loader above rewrites/parses the complete real SQL with
-        // the sealed owned catalog. The declaration projection never reaches here.
-        ensure!(
-            case.steps[11]
-                .sql
-                .contains(&format!(" FOR VERSION AS OF {snapshot} ORDER BY id;"))
-                && !case
-                    .steps
-                    .iter()
-                    .any(|step| step.sql.contains("${hms_first_snapshot_id}")),
-            "HMS numeric VERSION was not fully bound before execution"
-        );
         // This negative statement must still name the actual prepared v1
         // data. An earlier read-only refusal must not hide a stale URI.
         let v1 = ready["facts"]["actual_locations"]["v1"]
@@ -208,23 +193,48 @@ impl Definition {
             "HMS actual SDK locations differ from frozen namespace/warehouse"
         );
         let expected_add_files_uri = format!("{}/data", v1.trim_end_matches('/'));
-        let actual_uri = q40_location(&case.steps[39].sql);
-        write_once(
-            &directory.join("input.binding-attempt.json"),
-            &json!({
-                "schema":"hms-case-input-binding-attempt-v1",
-                "qualification":"diagnostic-only-not-Bound-or-Ready",
-                "source_sha256":self.source_sha256,
-                "ready_sha256":crate::results_record::hash_file(&directory.join("input.ready.json"))?,
-                "namespace":namespaces.0,"new_namespace":namespaces.1,
-                "q40_sql_sha256":format!("{:x}",Sha256::digest(case.steps[39].sql.as_bytes())),
-                "actual_uri":actual_uri.as_ref().ok(),
-                "parse_error":actual_uri.as_ref().err().map(|error| format!("{error:#}")),
-                "expected_uri":expected_add_files_uri,
-                "actual_sdk_v1":v1,"actual_sdk_v2":v2,
-                "frozen_hms_warehouse":frozen_warehouse
-            }),
-        )?;
+        let mut attempt = json!({
+            "schema": "hms-case-input-binding-attempt-v1",
+            "qualification": "diagnostic-only-not-Bound-or-Ready",
+            "source_sha256": self.source_sha256,
+            "ready_sha256": crate::results_record::hash_file(&directory.join("input.ready.json"))?,
+            "namespace": namespaces.0,
+            "new_namespace": namespaces.1,
+            "expected_uri": expected_add_files_uri,
+            "actual_sdk_v1": v1,
+            "actual_sdk_v2": v2,
+            "frozen_hms_warehouse": frozen_warehouse,
+        });
+        let case = crate::parser::load_sql_case_from_file(&self.path, meta, marker, &vars)
+            .or_else(|error| {
+                if let Some(refusal) = error.downcast_ref::<HmsUriMismatch>() {
+                    attempt["q40_source_sha256"] = json!(refusal.source_sha256);
+                    attempt["actual_uri"] = json!(refusal.actual_uri);
+                    attempt["parse_error"] = json!(refusal.to_string());
+                    write_once(&directory.join("input.binding-attempt.json"), &attempt)?;
+                }
+                Err(error)
+            })?
+            .context("bound HMS input has no executable case")?;
+        ensure!(case.steps.len() == 59, "bound HMS case changed step count");
+        // The existing loader above rewrites/parses the complete real SQL with
+        // the sealed owned catalog. The declaration projection never reaches here.
+        ensure!(
+            case.steps[11]
+                .sql
+                .contains(&format!(" FOR VERSION AS OF {snapshot} ORDER BY id;"))
+                && !case
+                    .steps
+                    .iter()
+                    .any(|step| step.sql.contains("${hms_first_snapshot_id}")),
+            "HMS numeric VERSION was not fully bound before execution"
+        );
+        let q40_sql = &case.steps[39].sql;
+        let actual_uri = q40_location(q40_sql);
+        attempt["q40_sql_sha256"] = json!(format!("{:x}", Sha256::digest(q40_sql.as_bytes())));
+        attempt["actual_uri"] = json!(actual_uri.as_ref().ok());
+        attempt["parse_error"] = json!(actual_uri.as_ref().err().map(|error| format!("{error:#}")));
+        write_once(&directory.join("input.binding-attempt.json"), &attempt)?;
         ensure!(
             actual_uri? == expected_add_files_uri,
             "bound HMS q40 ADD FILES location differs from actual prepared v1 data"
@@ -300,8 +310,11 @@ impl Definition {
             "HMS verifier must be the fixed recipe action"
         );
         ensure!(
-            case.steps[10].sql
-                == "SELECT snapshot_id FROM ice_hms_${uuid0}.iru7_${uuid0}.v2$snapshots ORDER BY committed_at LIMIT 1;",
+            matches!(
+                case.steps[10].sql.as_str(),
+                "SELECT snapshot_id FROM ice_hms_${uuid0}.iru7_${uuid0}.v2$snapshots ORDER BY committed_at LIMIT 1;"
+                    | "SELECT snapshot_id FROM ice_hms_${uuid0}.iru7_${uuid0}.\"v2$snapshots\" ORDER BY committed_at LIMIT 1;"
+            ),
             "HMS metadata observation changed"
         );
         ensure!(
@@ -325,20 +338,127 @@ pub(crate) fn add_recipe_names(source: &str, declared: &mut BTreeSet<String>) ->
     declared.insert(format!("{}_new", &captures[1]));
     Ok(())
 }
-fn q40_location(sql: &str) -> Result<String> {
-    use novarocks_parser::ast::{IcebergStatement, IcebergTableAction, LiteralKind, Statement};
-    let statements = novarocks_parser::parse(sql)
-        .map_err(|error| anyhow::anyhow!("parse bound HMS q40 ADD FILES: {error}"))?;
-    let [Statement::Iceberg(IcebergStatement::AlterTable(table))] = statements.as_slice() else {
-        anyhow::bail!("bound HMS q40 lost its exact ADD FILES statement");
+struct TrinoAddFilesLocation {
+    table: novarocks_parser::ast::ObjectName,
+    literal: novarocks_parser::ast::Literal,
+    offset: usize,
+}
+
+fn trino_add_files_location(sql: &str) -> Result<Option<TrinoAddFilesLocation>> {
+    use novarocks_parser::ast::{CallArgument, Expr, LiteralKind, TrinoStatement};
+    use novarocks_parser::parser;
+    let framed = parser::frame_statements(sql)?;
+    let [frame] = framed.as_slice() else {
+        return Ok(None);
     };
-    let IcebergTableAction::AddFiles(files) = &table.action else {
-        anyhow::bail!("bound HMS q40 changed action");
+    if frame.lexical_failure.is_some() {
+        return Ok(None);
+    }
+    let snippet = &sql[frame.source.start()..frame.source.end()];
+    let Ok(TrinoStatement::TableExecute(command)) = parser::parse_statement(snippet) else {
+        return Ok(None);
     };
-    let LiteralKind::String(uri) = &files.location.kind else {
+    if command.procedure_name.quoted
+        || !command
+            .procedure_name
+            .value
+            .eq_ignore_ascii_case("add_files")
+    {
+        return Ok(None);
+    }
+    let [
+        CallArgument {
+            name: Some(name),
+            value: Expr::Literal(location),
+            ..
+        },
+    ] = command.arguments.as_slice()
+    else {
+        anyhow::bail!("bound HMS add_files requires its single named URI argument");
+    };
+    ensure!(
+        !name.quoted
+            && name.value.eq_ignore_ascii_case("location")
+            && command.selection.is_none()
+            && matches!(location.kind, LiteralKind::String(_)),
+        "bound HMS add_files lost its exact string location"
+    );
+    Ok(Some(TrinoAddFilesLocation {
+        table: command.table.name,
+        literal: location.clone(),
+        offset: frame.source.start(),
+    }))
+}
+
+#[derive(Debug)]
+struct HmsUriMismatch {
+    actual_uri: String,
+    source_sha256: String,
+}
+
+impl std::fmt::Display for HmsUriMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .write_str("bound HMS q40 location differs from its original warehouse and v1 data")
+    }
+}
+
+impl std::error::Error for HmsUriMismatch {}
+
+pub(crate) fn bind_trino_q40_uri(
+    source: &str,
+    warehouse: &str,
+    catalog: &str,
+    original: &str,
+    mapped: &str,
+) -> Result<(usize, usize, String)> {
+    use novarocks_parser::ast::LiteralKind;
+    static MARKERS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("native marker regex")
+    });
+    let case = crate::parser::frame_case_source(source, &MARKERS)?;
+    let (number, range) = case
+        .sections
+        .get(39)
+        .context("bound HMS q40 scope absent")?;
+    ensure!(
+        *number == 40,
+        "bound HMS q40 scope escaped its original step"
+    );
+    let location = trino_add_files_location(&source[range.clone()])?
+        .context("bound HMS q40 ADD FILES absent")?;
+    let actual = location.table.parts.iter().map(|part| part.value.as_str());
+    ensure!(
+        actual.eq([catalog, mapped, "v2"]),
+        "bound HMS q40 table differs from its original target"
+    );
+    let warehouse = warehouse.trim_end_matches('/');
+    let LiteralKind::String(value) = &location.literal.kind else {
         anyhow::bail!("bound HMS q40 location is not a string literal");
     };
-    Ok(uri.clone())
+    if value != &format!("{warehouse}/iru7/{original}/v1/data") {
+        return Err(HmsUriMismatch {
+            actual_uri: value.clone(),
+            source_sha256: format!("{:x}", Sha256::digest(source[range.clone()].as_bytes())),
+        }
+        .into());
+    }
+    let start = range.start + location.offset + location.literal.span.start();
+    let end = range.start + location.offset + location.literal.span.end();
+    Ok((
+        start,
+        end,
+        quote(&format!("{warehouse}/iru7/{mapped}/v1/data")),
+    ))
+}
+
+fn q40_location(sql: &str) -> Result<String> {
+    let location = trino_add_files_location(sql)?
+        .context("bound HMS q40 lost its exact ADD FILES statement")?;
+    let novarocks_parser::ast::LiteralKind::String(uri) = location.literal.kind else {
+        anyhow::bail!("bound HMS q40 location is not a string literal");
+    };
+    Ok(uri)
 }
 
 fn canonical(v: &Value) -> Value {
@@ -429,12 +549,11 @@ impl<'a> Custody<'a> {
         );
         let mut vars = crate::config::case_placeholder_variables(variables, CASE)?;
         vars.insert("__hms_case_input_kind".into(), KIND.into());
-        let raw = fs::read_to_string(&definition.path)?;
+        let declared = definition.catalog_definition_projection()?;
         let raw = crate::config::substitute_placeholders(
-            &raw,
+            declared.source(),
             &{
                 let mut v = vars.clone();
-                v.insert(ID.into(), format!("${{{ID}}}"));
                 v.insert(RECEIPT.into(), format!("${{{RECEIPT}}}"));
                 v
             },
@@ -894,10 +1013,7 @@ mod tests {
                 .source()
                 .contains("FOR VERSION AS OF ${hms_first_snapshot_id}")
         );
-        assert!(
-            view.source()
-                .contains("CREATE EXTERNAL CATALOG ice_hms_${uuid0}")
-        );
+        assert!(view.source().contains("CREATE CATALOG ice_hms_${uuid0}"));
         assert_eq!(
             view.referenced_catalog(&HashMap::from([("uuid0".into(), "definition_only".into())]))
                 .unwrap(),
@@ -1109,8 +1225,9 @@ print(json.dumps({'empty': {'remaining_objects':empty},
         variables.insert(ID.into(), format!("${{{ID}}}"));
         variables.insert(RECEIPT.into(), format!("${{{RECEIPT}}}"));
         let case_variables = crate::config::case_placeholder_variables(&variables, CASE).unwrap();
+        let view = definition.catalog_definition_projection().unwrap();
         let raw = crate::config::substitute_placeholders(
-            &source,
+            view.source(),
             &case_variables,
             "original registration",
         )
@@ -1121,15 +1238,12 @@ print(json.dumps({'empty': {'remaining_objects':empty},
         let sibling = mapping[&format!("{family}_new")].clone();
         assert_eq!(namespace, format!("{run}_d0001"));
         assert_eq!(sibling, format!("{run}_d0002"));
-        let view = definition.catalog_definition_projection().unwrap();
         let projected = crate::config::substitute_placeholders(
             view.source(),
             &case_variables,
             "original catalog ownership",
         )
         .unwrap();
-        let projected =
-            crate::fixture_context::rewrite_namespaces(&projected, &case_variables).unwrap();
         let symbols = crate::catalog_symbol::CatalogSymbols::seal(run, &[projected]).unwrap();
         symbols.extend_variables(&mut variables).unwrap();
         (variables, namespace, sibling)
@@ -1209,7 +1323,7 @@ print(json.dumps({'empty': {'remaining_objects':empty},
         assert!(
             case.steps[1]
                 .sql
-                .contains(&format!("CREATE EXTERNAL CATALOG {catalog}"))
+                .contains(&format!("CREATE CATALOG {catalog}"))
         );
         assert!(
             case.steps[39]
@@ -1285,7 +1399,8 @@ print(json.dumps({'empty': {'remaining_objects':empty},
 
     #[test]
     fn unmatched_add_files_location_is_retained_as_attempt_not_bound() {
-        let changed = TEMPLATE.replace("/v1/data';", "/v2/data';");
+        let changed = TEMPLATE.replace("/v1/data');", "/v2/data');");
+        assert_ne!(changed, TEMPLATE);
         let (directory, definition) = definition(&changed);
         let definition = definition.unwrap();
         let (variables, namespace, sibling) = original_native02_variables(&definition);
@@ -1311,6 +1426,8 @@ print(json.dumps({'empty': {'remaining_objects':empty},
         );
         let attempt = read(&evidence.join("input.binding-attempt.json")).unwrap();
         assert_ne!(attempt["actual_uri"], attempt["expected_uri"]);
+        assert!(attempt["q40_source_sha256"].is_string());
+        assert!(attempt.get("q40_sql_sha256").is_none());
         assert!(!evidence.join("input.bound.json").exists());
     }
 
