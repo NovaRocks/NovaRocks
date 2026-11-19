@@ -20,8 +20,8 @@
 
 use super::*;
 use crate::catalog_application::{
-    CatalogRuntimeProjection, MvCatalogReferenceReader, query_catalog::QueryCatalogService,
-    query_materializer::OriginalCatalogLookup,
+    CatalogRuntimeProjection, MvCatalogReferenceReader, query_bindings::QueryTableBindingKey,
+    query_catalog::QueryCatalogService, query_materializer::OriginalCatalogLookup,
 };
 use novarocks_catalog_application::{
     CatalogApplicationError, CatalogApplicationErrorKind, CatalogApplicationPort,
@@ -41,7 +41,7 @@ use novarocks_sql::{
         CatalogRelationFact, CatalogRelationOutcome, SqlCapturedCatalogPreparation,
         SqlCompileControl, SqlCompileError, quoted_metadata_catalogs,
     },
-    planning::catalog::{catalog_table, table_binding_id},
+    planning::catalog::{MetadataTableKind, catalog_table, table_binding_id},
 };
 
 #[derive(Clone)]
@@ -339,7 +339,8 @@ async fn installed_quoted_metadata_uses_one_exact_pin_and_a_separate_statement_m
             );
             assert!(controls.acquired.lock().unwrap().is_empty());
             let (fact, pin) =
-                drive_metadata_read(gate, context, &materializer, &controls, quoted_need).await;
+                drive_metadata_read(gate, context.clone(), &materializer, &controls, quoted_need)
+                    .await;
             let CatalogRelationOutcome::Resolved(table) = fact.outcome() else {
                 panic!("the provider alias returned a typed SQL table");
             };
@@ -377,22 +378,34 @@ async fn installed_quoted_metadata_uses_one_exact_pin_and_a_separate_statement_m
             assert_eq!(controls.acquired.lock().unwrap().len(), 1);
             assert_eq!(installed.counts.table_prepare.load(Ordering::Relaxed), 1);
 
-            let legacy = preparation("SELECT x FROM ice.db.orders$files");
-            let [legacy_need] = legacy.needs() else {
-                panic!("one legacy relation need");
+            assert!(
+                novarocks_parser::parser::parse_query("SELECT x FROM ice.db.orders$files").is_err()
+            );
+            let other_bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+            let other_materializer =
+                installed.materializer(&controls, context.clone(), &other_bindings);
+            let other = installed.quoted_preparation(&other_bindings);
+            let [other_need] = other.needs() else {
+                panic!("one quoted relation need in the second statement");
             };
-            assert_eq!(legacy_need.relation(), quoted_need.relation());
-            assert_eq!(legacy_need.target(), quoted_need.target());
-            assert!(legacy_need.quoted_metadata_binding().is_none());
-            let (legacy_fact, _) =
-                drive_metadata_read(gate, context, &new_round, &controls, legacy_need).await;
-            let CatalogRelationOutcome::Resolved(table) = legacy_fact.outcome() else {
-                panic!("the legacy alias retained its own observation");
+            assert_eq!(other_need.relation(), quoted_need.relation());
+            assert_eq!(other_need.target(), quoted_need.target());
+            assert_eq!(
+                other_need.quoted_metadata_binding(),
+                quoted_need.quoted_metadata_binding()
+            );
+            let (other_fact, other_pin) =
+                drive_metadata_read(gate, context, &other_materializer, &controls, other_need)
+                    .await;
+            let CatalogRelationOutcome::Resolved(table) = other_fact.outcome() else {
+                panic!("the second statement obtained its own metadata observation");
             };
+            assert!(Arc::ptr_eq(&pin, &other_pin));
             assert_ne!(table_binding_id(table), quoted_token);
-            legacy.capture(&[legacy_fact]).unwrap();
+            other.capture(&[other_fact]).unwrap();
 
-            assert_eq!(bindings.captured_bindings().len(), 2);
+            assert_eq!(bindings.captured_bindings().len(), 1);
+            assert_eq!(other_bindings.captured_bindings().len(), 1);
             assert_eq!(controls.acquired.lock().unwrap().len(), 2);
             assert_eq!(installed.counts.table_prepare.load(Ordering::Relaxed), 2);
             assert_eq!(installed.counts.table_create.load(Ordering::Relaxed), 2);
@@ -415,6 +428,68 @@ async fn installed_quoted_metadata_uses_one_exact_pin_and_a_separate_statement_m
         })
     })
     .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn original_mv_metadata_alias_preserves_actual_provider_cause_and_one_lookup() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_spi::connector::ConnectorErrorKind;
+
+    let installed = InstalledIcebergCatalog::new().await;
+    let controls = CountedInstalledControls::new(&installed.controls);
+    let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+    let materializer = installed.materializer(&controls, context(), &bindings);
+    let preparation = installed.quoted_preparation(&bindings);
+    let [need] = preparation.needs() else {
+        panic!("one actual relation need");
+    };
+    let OriginalCatalogLookup::Metadata(lookup) = materializer
+        .begin_original_metadata_lookup(need, &controls)
+        .unwrap()
+    else {
+        panic!("the original lookup must request metadata exactly once");
+    };
+    assert_eq!(lookup.namespace, "db");
+    assert_eq!(lookup.physical_table, "orders$FILES");
+    assert_eq!(
+        lookup.resolution,
+        ConnectorTableResolution::ProviderReadAlias
+    );
+    let exact_runtime = lookup.planning_pin.control_runtime_id();
+    let original = ConnectorError::from_domain(
+        ConnectorErrorKind::ResourceExhausted,
+        novarocks_workload_control::WorkError::Capacity("original catalog observation"),
+    );
+    let fact = original.failure_fact();
+    let cause = std::error::Error::source(&original)
+        .unwrap()
+        .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+        .unwrap()
+        .clone();
+    let failed = materializer
+        .finish_original_metadata_lookup(lookup, Err(original))
+        .unwrap_err();
+    assert_eq!(failed.original_failure(), Some(&cause));
+    assert_eq!(cause.failure_fact(), fact);
+    assert_eq!(fact.class(), FailureClass::Resource);
+    assert!(matches!(
+        bindings.resolved_lookup(&QueryTableBindingKey::metadata_with_qualification(
+            "ice",
+            "db",
+            "orders",
+            MetadataTableKind::Files,
+            need.quoted_metadata_binding(),
+        )),
+        Some(Err(_))
+    ));
+    // A subsequent completion round reuses the original memo and typed cause.
+    let next_round = installed.materializer(&controls, context(), &bindings);
+    let repeated = match next_round.begin_original_metadata_lookup(need, &controls) {
+        Err(error) => error,
+        Ok(_) => panic!("failed original metadata may not be loaded again"),
+    };
+    assert_eq!(repeated.original_failure(), Some(&cause));
+    assert_eq!(*controls.acquired.lock().unwrap(), [exact_runtime]);
 }
 
 fn assert_catalog_refusal(

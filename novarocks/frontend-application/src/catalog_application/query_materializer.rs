@@ -1700,11 +1700,12 @@ mod tests {
     #[test]
     fn partitions_completion_loads_only_one_files_binding_and_preserves_its_token() {
         use novarocks_sql::compiler::{
-            CatalogLookupTarget, CatalogRelationFact, DEFAULT_COMPLETION_LIMITS,
-            SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent, SqlCompileProgress,
-            SqlCompiler, SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch,
-            SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, StatisticsFact,
-            builtin_sql_function_catalog, noop_constant_evaluator,
+            CatalogLookupTarget, CatalogQualification, CatalogQualifications, CatalogRelationFact,
+            DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
+            SqlCompileIntent, SqlCompileProgress, SqlCompiler, SqlFactBatch,
+            SqlFinalPlanCompileRequest, SqlNeedBatch, SqlPlanningEnvironment, SqlSessionContext,
+            SqlStatementInput, StatisticsFact, builtin_sql_function_catalog,
+            noop_constant_evaluator,
         };
         use novarocks_sql::planning::catalog::MetadataTableKind;
         struct FilesLoader {
@@ -1777,6 +1778,25 @@ mod tests {
                 Ok(binding)
             }
         }
+        let provider = novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap();
+        let binding = novarocks_spi::connector::ConnectorProviderBinding::try_new(
+            provider.clone(),
+            "ice",
+            [72; 16],
+            "files-loader-test",
+        )
+        .unwrap();
+        let binding = binding.binding_key().clone();
+        let mut qualifications = CatalogQualifications::default();
+        qualifications
+            .record(
+                binding.instance_id.clone(),
+                CatalogQualification::Ready {
+                    provider,
+                    binding: binding.clone(),
+                },
+            )
+            .unwrap();
         for partitioned in [true, false] {
             for sql in [
                 "SELECT * FROM \"orders$partitions\"",
@@ -1829,7 +1849,8 @@ mod tests {
                         max_batch_bytes: 1 << 20,
                     },
                     DEFAULT_COMPLETION_LIMITS,
-                );
+                )
+                .with_catalog_qualifications(qualifications.clone());
                 let mut progress =
                     SqlCompiler::start(request.try_into_completion().unwrap(), &control).unwrap();
                 loop {
@@ -1840,6 +1861,7 @@ mod tests {
                         SqlNeedBatch::CatalogRelations(needs) => SqlFactBatch::CatalogRelations(needs.iter().map(|need| {
                             let CatalogLookupTarget::IcebergMetadata { kind } = need.target() else { panic!("only Files facts") };
                             assert_eq!(kind, MetadataTableKind::Files);
+                            assert_eq!(need.quoted_metadata_binding(), Some(&binding));
                             let relation = need.relation();
                             let resolved = catalog.resolve_metadata_table_typed(Some(&relation.catalog), &relation.namespace, &relation.table, kind).unwrap();
                             CatalogRelationFact::resolved(need, resolved).unwrap()
@@ -2348,76 +2370,6 @@ mod tests {
             novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
-    }
-
-    #[test]
-    fn original_mv_metadata_alias_preserves_actual_provider_cause_and_one_lookup() {
-        use novarocks_failure_contract::{FailureClass, FailureProjection};
-        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-        let registry = crate::connector::FixtureConnectorRegistry::new();
-        crate::connector::scan_model::register_planned_files_fixture(
-            &registry,
-            "ice",
-            Vec::new(),
-            None,
-        );
-        let controls = crate::connector::FixtureControlResolver::new(registry);
-        let service = crate::catalog_application::query_catalog::new_query_catalog_service();
-        let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
-        let materializer = CatalogServiceMaterializer::new(
-            Some("ice"),
-            &service,
-            Arc::clone(&bindings),
-            Box::new(OverlayLoader),
-        );
-        let preparation = original_schema_need("SELECT * FROM ice.db.\"orders$files\"");
-        let [need] = preparation.needs() else {
-            panic!("one actual relation need");
-        };
-        let OriginalCatalogLookup::Metadata(lookup) = materializer
-            .begin_original_metadata_lookup(need, &controls)
-            .unwrap()
-        else {
-            panic!("the original lookup must request metadata exactly once");
-        };
-        let original = ConnectorError::from_domain(
-            ConnectorErrorKind::ResourceExhausted,
-            novarocks_workload_control::WorkError::Capacity("original catalog observation"),
-        );
-        let fact = original.failure_fact();
-        let cause = std::error::Error::source(&original)
-            .unwrap()
-            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
-            .unwrap()
-            .clone();
-        let failed = materializer
-            .finish_original_metadata_lookup(lookup, Err(original))
-            .unwrap_err();
-        assert_eq!(failed.original_failure(), Some(&cause));
-        assert_eq!(cause.failure_fact(), fact);
-        assert_eq!(fact.class(), FailureClass::Resource);
-        assert!(matches!(
-            bindings.resolved_lookup(&QueryTableBindingKey::metadata(
-                "ice",
-                "db",
-                "orders",
-                novarocks_sql::planning::catalog::MetadataTableKind::Files
-            )),
-            Some(Err(_))
-        ));
-        // A subsequent completion round recreates this materializer but
-        // keeps the original table memo and its typed provider failure.
-        let next_round = CatalogServiceMaterializer::new(
-            Some("ice"),
-            &service,
-            Arc::clone(&bindings),
-            Box::new(OverlayLoader),
-        );
-        let repeated = match next_round.begin_original_metadata_lookup(need, &controls) {
-            Err(error) => error,
-            Ok(_) => panic!("failed original metadata may not be loaded again"),
-        };
-        assert_eq!(repeated.original_failure(), Some(&cause));
     }
 
     #[test]

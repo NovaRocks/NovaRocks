@@ -686,39 +686,79 @@ mod tests {
     }
 
     #[test]
-    fn time_travel_lookup_preserves_classified_suffix_and_quoted_ordinary_identity() {
+    fn time_travel_lookup_preserves_ordinary_identity_and_qualified_metadata_refuses_period() {
         use novarocks_parser::ast::{Relation, SetExpr};
-        for (sql, expected_table, expected_suffix, quoted) in [
-            (
-                "SELECT * FROM ice.db.\"orders$files\" FOR VERSION AS OF 42",
-                "orders",
-                Some("$files"),
-                false,
-            ),
-            (
-                "SELECT * FROM ice.db.\"orders$files\" FOR VERSION AS OF 42",
-                "orders$files",
-                None,
-                true,
-            ),
-        ] {
-            let query = novarocks_parser::parser::parse_query(sql).unwrap();
-            let SetExpr::Select(select) = query.body.as_ref() else {
-                panic!("SELECT");
-            };
-            let Some(Relation::Table(table)) = &select.from else {
-                panic!("Table");
-            };
-            let before = table.clone();
-            let (parts, suffix) = super::time_travel_table_lookup(table);
-            assert_eq!(parts, ["ice", "db", expected_table]);
-            assert_eq!(suffix.as_deref(), expected_suffix);
-            assert_eq!(
-                table, &before,
-                "lookup keeps original full name, quote, period and spans"
-            );
-            assert_eq!(table.name.parts.last().unwrap().quoted, quoted);
-        }
+        use novarocks_spi::connector::{ConnectorProviderBinding, ConnectorProviderId};
+        use novarocks_sql::compiler::{
+            CatalogQualification, CatalogQualifications, SqlCapturedCatalogPreparation,
+            SqlCompileControl, SqlCompileError,
+        };
+
+        let sql = r#"SELECT * FROM ice.db."Orders$files" FOR VERSION AS OF 42"#;
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let Some(Relation::Table(table)) = &select.from else {
+            panic!("Table");
+        };
+        let before = table.clone();
+        let (parts, suffix) = super::time_travel_table_lookup(table);
+        assert_eq!(parts, ["ice", "db", "orders$files"]);
+        assert_eq!(suffix, None);
+        let authored = table.name.parts.last().unwrap();
+        assert_eq!(authored.value, "Orders$files");
+        assert!(authored.quoted);
+        assert_eq!(
+            table, &before,
+            "lookup keeps original full name, quote, period and spans"
+        );
+        let period_span = table.query_period.as_ref().unwrap().span;
+
+        let control = SqlCompileControl::unbounded();
+        let Err(SqlCompileError::Compilation(message)) = SqlCapturedCatalogPreparation::try_new(
+            query.clone(),
+            Some("ice"),
+            "db",
+            control.clone(),
+        ) else {
+            panic!("an unqualified catalog observation leaves the ordinary name intact");
+        };
+        assert_eq!(message, "unsupported identifier `Orders$files`");
+
+        let provider = ConnectorProviderId::parse("iceberg").unwrap();
+        let binding = ConnectorProviderBinding::try_new(
+            provider.clone(),
+            "ice",
+            [73; 16],
+            "time-travel-test",
+        )
+        .unwrap()
+        .binding_key()
+        .clone();
+        let mut qualifications = CatalogQualifications::default();
+        qualifications
+            .record(
+                binding.instance_id.clone(),
+                CatalogQualification::Ready { provider, binding },
+            )
+            .unwrap();
+        let Err(SqlCompileError::Analyze(error)) =
+            SqlCapturedCatalogPreparation::try_new_with_qualifications(
+                query,
+                Some("ice"),
+                "db",
+                control,
+                qualifications,
+            )
+        else {
+            panic!("qualified metadata must reject time travel at the original period");
+        };
+        assert_eq!(
+            error.message(),
+            "time travel is not supported on metadata relations"
+        );
+        assert_eq!(error.span(), Some(period_span));
     }
 
     #[test]
