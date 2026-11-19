@@ -99,67 +99,67 @@ insert into t3 select * from t0;
 
 -- query 12
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 13
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 14
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 15
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 16
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 17
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 18
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 19
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 20
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count() from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
 
 -- query 21
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c1 from t1 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c1 from t1 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count() from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
 
 -- query 22
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c1 from t2 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c1 from t2 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count() from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
 
 -- query 23
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c1 from t3 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c1 from t3 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count() from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
 
 -- query 24
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 25
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 26
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 27
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 28
 -- @skip_result_check=true
@@ -167,19 +167,19 @@ USE ${case_db};
 
 -- query 29
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 30
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 31
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 32
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count() from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
 
 -- query 33
 -- @skip_result_check=true
@@ -268,15 +268,15 @@ insert into t6 SELECT generate_series, generate_series, generate_series, generat
 
 -- query 48
 USE ${case_db};
-select count(*) from (select sum(c3) from t6 group by c1, c2 limit 10) t;
+select count() from (select sum(c3) from t6 group by c1, c2 limit 10) t;
 
 -- query 49
 USE ${case_db};
-select count(*) from (select sum(c3) from t6 group by c1, c2, c3 limit 10) t;
+select count() from (select sum(c3) from t6 group by c1, c2, c3 limit 10) t;
 
 -- query 50
 USE ${case_db};
-select count(*) from (select sum(c3) from t6 group by c2, c1 limit 10) t;
+select count() from (select sum(c3) from t6 group by c2, c1 limit 10) t;
 
 -- query 51
 -- @skip_result_check=true

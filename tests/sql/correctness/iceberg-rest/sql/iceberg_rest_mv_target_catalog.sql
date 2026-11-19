@@ -47,7 +47,7 @@ AS SELECT /* effective raw source */ id, name
 FROM orders_${uuid0};
 
 -- query 3
-SELECT COUNT(*) AS n FROM analytics_${uuid0}.mv_orders_${uuid0};
+SELECT COUNT() AS n FROM analytics_${uuid0}.mv_orders_${uuid0};
 
 -- query 4
 -- @skip_result_check=true

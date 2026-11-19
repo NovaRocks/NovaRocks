@@ -82,7 +82,7 @@ FROM ${case_db}.t_v3_merge_matched_delete
 ORDER BY id;
 
 -- query 7
-SELECT COUNT(DISTINCT _row_id) = COUNT(*) AS row_ids_unique
+SELECT COUNT(DISTINCT _row_id) = COUNT() AS row_ids_unique
 FROM ${case_db}.t_v3_merge_matched_delete;
 
 -- query 8

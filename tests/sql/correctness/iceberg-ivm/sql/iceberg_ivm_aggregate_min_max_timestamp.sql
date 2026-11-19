@@ -88,7 +88,7 @@ ORDER BY region;
 SELECT region,
        MIN(event_ts) AS mn,
        MAX(event_ts) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;
@@ -109,7 +109,7 @@ ORDER BY region;
 SELECT region,
        MIN(event_ts) AS mn,
        MAX(event_ts) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;
@@ -131,7 +131,7 @@ ORDER BY region;
 SELECT region,
        MIN(event_ts) AS mn,
        MAX(event_ts) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;

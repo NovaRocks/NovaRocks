@@ -57,13 +57,13 @@ INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t0;
 INSERT INTO ${case_db}.small_table SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 100));
 
 -- query 2
-select count(*) from ${case_db}.t0;
+select count() from ${case_db}.t0;
 -- query 3
-select count(*) from ${case_db}.t1;
+select count() from ${case_db}.t1;
 -- query 4
-select count(*) from ${case_db}.empty_t;
+select count() from ${case_db}.empty_t;
 -- query 5
-select count(*) from ${case_db}.small_table;
+select count() from ${case_db}.small_table;
 
 -- hash join cases
 -- query 6
@@ -136,37 +136,37 @@ select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case
 
 -- CTE
 -- query 32
-with agged_table as (select distinct c0, c1 from ${case_db}.t0) select  count(*), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1;
+with agged_table as (select distinct c0, c1 from ${case_db}.t0) select  count(), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1;
 -- query 33
-with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(*), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1;
+with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1;
 -- query 34
-with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(*), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  ${case_db}.t0 r on l.c0 = r.c0 and l.c1 = r.c1;
+with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  ${case_db}.t0 r on l.c0 = r.c0 and l.c1 = r.c1;
 -- query 35
-with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(*), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1;
+with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1;
 
 -- TableFunction
 -- query 36
-with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(*), sum(l.c0), sum(l.c1) from agged_table l join  TABLE(generate_series(1, 100)) r on l.c0 = r.generate_series;
+with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(), sum(l.c0), sum(l.c1) from agged_table l join  TABLE(generate_series(1, 100)) r on l.c0 = r.generate_series;
 -- query 37
-with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(*), sum(l.c0), sum(l.c1) from agged_table l join  TABLE(generate_series(1, 100)) r on l.c0 = r.generate_series;
+with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(), sum(l.c0), sum(l.c1) from agged_table l join  TABLE(generate_series(1, 100)) r on l.c0 = r.generate_series;
 
 -- bucket shuffle with group by
 -- query 38
-with agged_table as (select distinct c0, c1 from ${case_db}.t0) select  count(*), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1;
+with agged_table as (select distinct c0, c1 from ${case_db}.t0) select  count(), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1;
 -- query 39
-with agged_table as (select distinct c0, c1 from ${case_db}.t0) select  count(*), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l right join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1;
+with agged_table as (select distinct c0, c1 from ${case_db}.t0) select  count(), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l right join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1;
 -- query 40
-with agged_table as (select distinct c0, c1 from ${case_db}.t0) select  count(*), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l left join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1;
+with agged_table as (select distinct c0, c1 from ${case_db}.t0) select  count(), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l left join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1;
 -- query 41
-with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count(*) from flat_table l join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 limit 10000,2;
+with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count() from flat_table l join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 limit 10000,2;
 -- query 42
-with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count(*) from flat_table l right join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 limit 10000,2;
+with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count() from flat_table l right join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 limit 10000,2;
 -- query 43
-with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count(*) from flat_table l left join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 limit 10000,2;
+with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count() from flat_table l left join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 limit 10000,2;
 
 -- bucket shuffle join with runtime filter
 -- query 44
-with agged_table as (select distinct c0, c1, c3 from ${case_db}.t0) select  count(*), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 100;
+with agged_table as (select distinct c0, c1, c3 from ${case_db}.t0) select  count(), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 100;
 
 -- normal bucket shuffle join
 -- query 45
@@ -188,7 +188,7 @@ with agged_table as (select distinct c0, c1 from ${case_db}.t0) select  count(l.
 
 -- multi fragment: grouping sets
 -- query 52
-select count(*), sum(c0), sum(c1) from (select l.c0, l.c1 from (select c0, c1 from ${case_db}.t0 group by rollup (c0, c1)) l join ${case_db}.t1 r on l.c0 = r.c0 and r.c1 = l.c1) tb;
+select count(), sum(c0), sum(c1) from (select l.c0, l.c1 from (select c0, c1 from ${case_db}.t0 group by rollup (c0, c1)) l join ${case_db}.t1 r on l.c0 = r.c0 and r.c1 = l.c1) tb;
 
 -- WITH TOPN
 -- @order_sensitive=true
@@ -197,7 +197,7 @@ select l.c0, l.c1, r.c1 from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c
 
 -- WITH WINDOW FUNCTION (not in the same fragment)
 -- query 54
-select count(*) from (select l.c0, l.c1, r.c1, row_number() over () from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 order by 1,2,3 limit 10) tb;
+select count() from (select l.c0, l.c1, r.c1, row_number() over () from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 order by 1,2,3 limit 10) tb;
 -- @order_sensitive=true
 -- query 55
 select l.c0, l.c1, r.c1, row_number() over (partition by l.c0) from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 order by 1,2,3 limit 10;
@@ -207,15 +207,15 @@ select l.c0, l.c1, r.c1, row_number() over (partition by l.c0, l.c1) from ${case
 
 -- WITH PARTITION-TOP-N
 -- query 57
-select count(*), count(lc0), count(lc1), count(rc1) from (select l.c0 lc0, l.c1 lc1, r.c1 rc1, row_number() over () rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1)tb where rn < 10;
+select count(), count(lc0), count(lc1), count(rc1) from (select l.c0 lc0, l.c1 lc1, r.c1 rc1, row_number() over () rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1)tb where rn < 10;
 -- query 58
-select count(*), sum(lc0), sum(lc1), sum(rc1) from (select l.c0 lc0, l.c1 lc1, r.c1 rc1, row_number() over (partition by l.c0) rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1)tb where rn < 10;
+select count(), sum(lc0), sum(lc1), sum(rc1) from (select l.c0 lc0, l.c1 lc1, r.c1 rc1, row_number() over (partition by l.c0) rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1)tb where rn < 10;
 -- query 59
-select count(*), sum(lc0), sum(lc1), sum(rc1) from (select l.c0 lc0, l.c1 lc1, r.c1 rc1, row_number() over (partition by l.c0, l.c1) rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1)tb where rn < 10;
+select count(), sum(lc0), sum(lc1), sum(rc1) from (select l.c0 lc0, l.c1 lc1, r.c1 rc1, row_number() over (partition by l.c0, l.c1) rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1)tb where rn < 10;
 
 -- WITH PARTITION-TOP-N and AGG
 -- query 60
-select count(*) from (select c0l, c1l from (select l.c0 c0l, l.c1 c1l, r.c1 c1r, row_number() over () rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb where rn < 10 group by 1,2 order by 1,2 limit 2000, 1) tb;
+select count() from (select c0l, c1l from (select l.c0 c0l, l.c1 c1l, r.c1 c1r, row_number() over () rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb where rn < 10 group by 1,2 order by 1,2 limit 2000, 1) tb;
 -- @order_sensitive=true
 -- query 61
 select c0l, c1l from (select l.c0 c0l, l.c1 c1l, r.c1 c1r, row_number() over (partition by l.c0) rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb where rn < 10 group by 1,2 order by 1,2 limit 2000, 1;

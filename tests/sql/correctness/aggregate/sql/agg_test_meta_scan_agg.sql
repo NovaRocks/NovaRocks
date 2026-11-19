@@ -39,7 +39,7 @@ USE ${case_db};
 
 -- query 4
 USE ${case_db};
-select count(*) from t0;
+select count() from t0;
 
 -- query 5
 -- @skip_result_check=true
@@ -92,7 +92,7 @@ select count(1) from t0;
 
 -- query 17
 USE ${case_db};
-select count(*) from t0;
+select count() from t0;
 
 -- query 18
 -- @skip_result_check=true
@@ -124,11 +124,11 @@ insert into t2 values (1), (2), (3);
 
 -- query 22
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;
 
 -- query 23
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;
 
 -- query 24
 -- @skip_result_check=true
@@ -137,11 +137,11 @@ alter table t2 rename column c0 to c1;
 
 -- query 25
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;
 
 -- query 26
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;
 
 -- query 27
 -- @skip_result_check=true
@@ -150,8 +150,8 @@ alter table t2 rename column c1 to c2;
 
 -- query 28
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;
 
 -- query 29
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;

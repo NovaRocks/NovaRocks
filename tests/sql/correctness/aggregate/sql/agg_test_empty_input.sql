@@ -52,7 +52,7 @@ select max(v1),min(v1) from t0;
 
 -- query 7
 USE ${case_db};
-select max(v1),count(*) from t0;
+select max(v1),count() from t0;
 
 -- query 8
 USE ${case_db};
@@ -60,7 +60,7 @@ select count(v1) from t0;
 
 -- query 9
 USE ${case_db};
-select count(*) from t0;
+select count() from t0;
 
 -- query 10
 USE ${case_db};

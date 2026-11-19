@@ -64,7 +64,7 @@ ORDER BY id;
 
 -- query 7
 SELECT
-  COUNT(*) AS original_rows,
+  COUNT() AS original_rows,
   SUM(CASE WHEN cur.cur_row_id = old.old_row_id THEN 1 ELSE 0 END) AS preserved_row_ids
 FROM (
   SELECT id, _row_id AS cur_row_id FROM ${case_db}.t_mor_lineage_sequence
@@ -75,7 +75,7 @@ JOIN (
 ) old ON cur.id = old.id;
 
 -- query 8
-SELECT COUNT(*) AS total_rows, COUNT(DISTINCT _row_id) AS distinct_row_ids
+SELECT COUNT() AS total_rows, COUNT(DISTINCT _row_id) AS distinct_row_ids
 FROM ${case_db}.t_mor_lineage_sequence;
 
 -- query 9

@@ -77,7 +77,7 @@ DELETE FROM iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_mut WHERE
 TRUNCATE TABLE iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_mut;
 
 -- query 8
-SELECT COUNT(*) AS remaining_rows FROM iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_mut;
+SELECT COUNT() AS remaining_rows FROM iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_mut;
 
 -- query 9
 -- @expect_error=does not support writing Iceberg Variant values

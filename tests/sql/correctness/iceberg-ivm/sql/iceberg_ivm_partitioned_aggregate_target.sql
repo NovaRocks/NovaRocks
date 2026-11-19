@@ -116,7 +116,7 @@ FROM pagg_mv_${uuid0}
 ORDER BY region;
 
 SELECT region,
-       COUNT(*) AS c,
+       COUNT() AS c,
        COUNT(amount) AS c_amount,
        SUM(amount) AS s,
        AVG(amount) AS a

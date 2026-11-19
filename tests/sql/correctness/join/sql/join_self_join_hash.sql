@@ -46,7 +46,7 @@ INSERT INTO ${case_db}.t_self_join_hash VALUES
 
 -- query 4
 -- INNER JOIN self + other conjuncts
-SELECT count(*), count(a.v1), count(b.v1)
+SELECT count(), count(a.v1), count(b.v1)
 FROM ${case_db}.t_self_join_hash a
 INNER JOIN ${case_db}.t_self_join_hash b
   ON a.k1 = b.k1
@@ -54,55 +54,55 @@ INNER JOIN ${case_db}.t_self_join_hash b
 
 -- query 5
 -- LEFT OUTER JOIN self
-SELECT count(*), count(a.v1), count(b.v1)
+SELECT count(), count(a.v1), count(b.v1)
 FROM ${case_db}.t_self_join_hash a
 LEFT OUTER JOIN ${case_db}.t_self_join_hash b
   ON a.k1 = b.k1;
 
 -- query 6
 -- RIGHT OUTER JOIN self
-SELECT count(*), count(a.v1), count(b.v1)
+SELECT count(), count(a.v1), count(b.v1)
 FROM ${case_db}.t_self_join_hash a
 RIGHT OUTER JOIN ${case_db}.t_self_join_hash b
   ON a.k1 = b.k1;
 
 -- query 7
 -- FULL OUTER JOIN self
-SELECT count(*), count(a.v1), count(b.v1)
+SELECT count(), count(a.v1), count(b.v1)
 FROM ${case_db}.t_self_join_hash a
 FULL OUTER JOIN ${case_db}.t_self_join_hash b
   ON a.k1 = b.k1;
 
 -- query 8
 -- LEFT SEMI JOIN self + other conjuncts
-SELECT count(*), count(a.v1)
+SELECT count(), count(a.v1)
 FROM ${case_db}.t_self_join_hash a
 WHERE EXISTS (SELECT 1 FROM ${case_db}.t_self_join_hash b WHERE a.k1 = b.k1
   AND (a.v1 + b.v1) % 3 = 0);
 
 -- query 9
 -- LEFT ANTI JOIN self + other conjuncts
-SELECT count(*), count(a.v1)
+SELECT count(), count(a.v1)
 FROM ${case_db}.t_self_join_hash a
 WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t_self_join_hash b WHERE a.k1 = b.k1
   AND (a.v1 + b.v1) % 3 = 0);
 
 -- query 10
 -- RIGHT SEMI JOIN self + other conjuncts (original bug scenario)
-SELECT count(*), count(b.v1)
+SELECT count(), count(b.v1)
 FROM ${case_db}.t_self_join_hash b
 WHERE EXISTS (SELECT 1 FROM ${case_db}.t_self_join_hash a WHERE a.k1 = b.k1
   AND (a.v1 + b.v1) % 3 = 0);
 
 -- query 11
 -- RIGHT ANTI JOIN self + other conjuncts (original bug scenario)
-SELECT count(*), count(b.v1)
+SELECT count(), count(b.v1)
 FROM ${case_db}.t_self_join_hash b
 WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t_self_join_hash a WHERE a.k1 = b.k1
   AND (a.v1 + b.v1) % 3 = 0);
 
 -- query 12
 -- NULL AWARE LEFT ANTI JOIN (NOT IN subquery)
-SELECT count(*), count(a.v1)
+SELECT count(), count(a.v1)
 FROM ${case_db}.t_self_join_hash a
 WHERE a.k1 NOT IN (SELECT b.k1 FROM ${case_db}.t_self_join_hash b WHERE b.v1 > 25);

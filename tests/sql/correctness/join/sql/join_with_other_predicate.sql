@@ -57,13 +57,13 @@ INSERT INTO ${case_db}.t0 VALUES (null, null, null, null);
 INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t0;
 
 -- query 6
-SELECT count(*) FROM ${case_db}.t0 JOIN ${case_db}.t1 ON ${case_db}.t0.c0=${case_db}.t1.c0 WHERE ${case_db}.t0.c1 LIKE ${case_db}.t1.c1;
+SELECT count() FROM ${case_db}.t0 JOIN ${case_db}.t1 ON ${case_db}.t0.c0=${case_db}.t1.c0 WHERE ${case_db}.t0.c1 LIKE ${case_db}.t1.c1;
 
 -- query 7
-SELECT count(*) FROM ${case_db}.t0 JOIN ${case_db}.t1 ON ${case_db}.t0.c0=${case_db}.t1.c0 WHERE ${case_db}.t0.c1 LIKE concat(${case_db}.t1.c1, '%');
+SELECT count() FROM ${case_db}.t0 JOIN ${case_db}.t1 ON ${case_db}.t0.c0=${case_db}.t1.c0 WHERE ${case_db}.t0.c1 LIKE concat(${case_db}.t1.c1, '%');
 
 -- query 8
-SELECT count(*) FROM ${case_db}.t0 JOIN ${case_db}.t1 ON ${case_db}.t0.c0=${case_db}.t1.c0 WHERE ${case_db}.t0.c1 LIKE concat('%', ${case_db}.t1.c1, '%');
+SELECT count() FROM ${case_db}.t0 JOIN ${case_db}.t1 ON ${case_db}.t0.c0=${case_db}.t1.c0 WHERE ${case_db}.t0.c1 LIKE concat('%', ${case_db}.t1.c1, '%');
 
 -- query 9
-SELECT count(*) FROM ${case_db}.t0 JOIN ${case_db}.t1 ON ${case_db}.t0.c0=${case_db}.t1.c0 WHERE ${case_db}.t0.c1 LIKE concat('%', ${case_db}.t1.c1);
+SELECT count() FROM ${case_db}.t0 JOIN ${case_db}.t1 ON ${case_db}.t0.c0=${case_db}.t1.c0 WHERE ${case_db}.t0.c1 LIKE concat('%', ${case_db}.t1.c1);

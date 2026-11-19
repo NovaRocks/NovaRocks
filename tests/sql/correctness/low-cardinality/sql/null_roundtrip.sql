@@ -26,7 +26,7 @@ INSERT INTO ${case_db}.dict_null_t VALUES
   (1, 'a'), (2, NULL), (3, 'a'), (4, NULL), (5, 'b');
 SELECT s,
   CASE WHEN COUNT(s) = 0 THEN 'true' ELSE 'false' END AS is_null,
-  COUNT(*) AS c
+  COUNT() AS c
 FROM ${case_db}.dict_null_t
 GROUP BY s
 ORDER BY is_null DESC, s;

@@ -87,7 +87,7 @@ ORDER BY region;
 SELECT region,
        MIN(event_date) AS mn,
        MAX(event_date) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_minmax_date_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;
@@ -108,7 +108,7 @@ ORDER BY region;
 SELECT region,
        MIN(event_date) AS mn,
        MAX(event_date) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_minmax_date_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;
@@ -129,7 +129,7 @@ ORDER BY region;
 SELECT region,
        MIN(event_date) AS mn,
        MAX(event_date) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_minmax_date_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;

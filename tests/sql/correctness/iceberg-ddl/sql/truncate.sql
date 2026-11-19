@@ -45,7 +45,7 @@ INSERT INTO ${case_db}.t_v3 VALUES (1, 'a'), (2, 'b'), (3, 'c');
 
 -- query 3
 -- Sanity check: 3 rows present before TRUNCATE.
-SELECT COUNT(*) AS n FROM ${case_db}.t_v3;
+SELECT COUNT() AS n FROM ${case_db}.t_v3;
 
 -- query 4
 -- @skip_result_check=true
@@ -57,7 +57,7 @@ TRUNCATE TABLE ${case_db}.t_v3;
 
 -- query 5
 -- After TRUNCATE the table reads as empty.
-SELECT COUNT(*) AS n FROM ${case_db}.t_v3;
+SELECT COUNT() AS n FROM ${case_db}.t_v3;
 
 -- query 6
 -- @skip_result_check=true
@@ -85,7 +85,7 @@ TBLPROPERTIES ("format-version" = "2");
 INSERT INTO ${case_db}.t_v2 VALUES (1, 'x'), (2, 'y'), (3, 'z');
 
 -- query 10
-SELECT COUNT(*) AS n FROM ${case_db}.t_v2;
+SELECT COUNT() AS n FROM ${case_db}.t_v2;
 
 -- query 11
 -- @skip_result_check=true
@@ -95,7 +95,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t_v2;
 TRUNCATE TABLE ${case_db}.t_v2;
 
 -- query 12
-SELECT COUNT(*) AS n FROM ${case_db}.t_v2;
+SELECT COUNT() AS n FROM ${case_db}.t_v2;
 
 -- query 13
 -- @skip_result_check=true
@@ -115,7 +115,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 16
 -- Empty before TRUNCATE.
-SELECT COUNT(*) AS n FROM ${case_db}.t_empty;
+SELECT COUNT() AS n FROM ${case_db}.t_empty;
 
 -- query 17
 -- @skip_result_check=true
@@ -126,7 +126,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t_empty;
 TRUNCATE TABLE ${case_db}.t_empty;
 
 -- query 18
-SELECT COUNT(*) AS n FROM ${case_db}.t_empty;
+SELECT COUNT() AS n FROM ${case_db}.t_empty;
 
 -- query 19
 -- @skip_result_check=true
@@ -178,7 +178,7 @@ TRUNCATE TABLE ${case_db}.t_branch.branch_dev;
 
 -- query 27
 -- dev now empty.
-SELECT COUNT(*) AS n FROM ${case_db}.t_branch
+SELECT COUNT() AS n FROM ${case_db}.t_branch
   FOR VERSION AS OF 'dev';
 
 -- query 28
@@ -226,7 +226,7 @@ TRUNCATE TABLE ${case_db}.t_dv;
 
 -- query 35
 -- After TRUNCATE: empty.
-SELECT COUNT(*) AS n FROM ${case_db}.t_dv;
+SELECT COUNT() AS n FROM ${case_db}.t_dv;
 
 -- ---------------------------------------------------------------------------
 -- Case 6 & 7: parser-level rejection of PARTITION / WHERE clauses

@@ -54,7 +54,7 @@ WHERE part_id = 12 AND id = 12
 ORDER BY id;
 
 -- query 6
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM ${case_db}.t_scan_pruning
 WHERE part_id = 99 AND id = 99;
 

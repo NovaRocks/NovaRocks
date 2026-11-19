@@ -40,19 +40,19 @@ INSERT INTO test_users_bucketed VALUES
   (7, 'CN', 7.0),
   (16, 'US', 16.0),
   (32, 'CN', 32.0);
-SELECT COUNT(*) AS cnt, SUM(score) AS sum_score
+SELECT COUNT() AS cnt, SUM(score) AS sum_score
 FROM test_users_bucketed;
 
 -- query 2
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
-SELECT country, COUNT(*) AS country_cnt, SUM(score) AS score_sum
+SELECT country, COUNT() AS country_cnt, SUM(score) AS score_sum
 FROM test_users_bucketed
 GROUP BY country
 ORDER BY country;
 
 -- query 3
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
-SELECT COUNT(*) AS cnt, SUM(score) AS sum_score
+SELECT COUNT() AS cnt, SUM(score) AS sum_score
 FROM test_users_bucketed
 WHERE user_id IN (1, 2, 3, 4);
 

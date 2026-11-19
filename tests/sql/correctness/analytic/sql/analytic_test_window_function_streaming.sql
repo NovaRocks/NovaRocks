@@ -96,49 +96,49 @@ INSERT INTO ${case_db}.t1 (v1, v2, v3, v4) values
     (NULL, NULL, 124, NULL);
 
 -- query 2
-SELECT COUNT(*), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT row_number() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk <= 1;
+SELECT COUNT(), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT row_number() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk <= 1;
 
 -- query 3
-SELECT COUNT(*), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT row_number() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk > 1;
+SELECT COUNT(), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT row_number() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk > 1;
 
 -- query 4
-SELECT COUNT(*), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT row_number() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a;
+SELECT COUNT(), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT row_number() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a;
 
 -- query 5
-SELECT COUNT(*), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk <= 1;
+SELECT COUNT(), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk <= 1;
 
 -- query 6
-SELECT COUNT(*), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk > 1;
+SELECT COUNT(), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk > 1;
 
 -- query 7
-SELECT COUNT(*), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a;
+SELECT COUNT(), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a;
 
 -- query 8
-SELECT COUNT(*), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT dense_rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk <= 1;
+SELECT COUNT(), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT dense_rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk <= 1;
 
 -- query 9
-SELECT COUNT(*), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT dense_rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk > 1;
+SELECT COUNT(), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT dense_rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a WHERE rk > 1;
 
 -- query 10
-SELECT COUNT(*), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT dense_rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a;
+SELECT COUNT(), SUM(rk), MIN(rk), MAX(rk) FROM (SELECT dense_rank() OVER (PARTITION BY v2 ORDER BY v1) AS rk FROM ${case_db}.t1)a;
 
 -- query 11
-SELECT COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT count(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
+SELECT COUNT(), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT count(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
 
 -- query 12
-SELECT COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT min(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
+SELECT COUNT(), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT min(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
 
 -- query 13
-SELECT COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT max(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
+SELECT COUNT(), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT max(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
 
 -- query 14
-SELECT COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT sum(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
+SELECT COUNT(), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT sum(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
 
 -- query 15
-SELECT COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT avg(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
+SELECT COUNT(), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT avg(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
 
 -- query 16
-SELECT  COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(cume_dist() OVER (PARTITION BY v2 ORDER BY v1) AS decimal64(18,5)) AS wv FROM ${case_db}.t1)a;
+SELECT  COUNT(), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(cume_dist() OVER (PARTITION BY v2 ORDER BY v1) AS decimal64(18,5)) AS wv FROM ${case_db}.t1)a;
 
 -- query 17
-SELECT  COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(percent_rank() OVER (PARTITION BY v2 ORDER BY v1) AS decimal64(18,5)) AS wv FROM ${case_db}.t1)a;
+SELECT  COUNT(), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(percent_rank() OVER (PARTITION BY v2 ORDER BY v1) AS decimal64(18,5)) AS wv FROM ${case_db}.t1)a;

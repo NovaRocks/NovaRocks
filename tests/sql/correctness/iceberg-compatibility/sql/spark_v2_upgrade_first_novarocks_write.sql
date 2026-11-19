@@ -47,10 +47,10 @@ INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.up_unpartitioned_${uuid0} S
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.up_partitioned_${uuid0} VALUES (5,'c');
 
 -- query 3
-SELECT 'empty-append' AS first_write, COUNT(*) AS total_rows, COUNT(_row_id) AS assigned_rows, COUNT(DISTINCT _row_id) AS unique_rows
+SELECT 'empty-append' AS first_write, COUNT() AS total_rows, COUNT(_row_id) AS assigned_rows, COUNT(DISTINCT _row_id) AS unique_rows
 FROM iceberg_compat_${suite_uuid0}.${case_db}.up_unpartitioned_${uuid0}
 UNION ALL
-SELECT 'insert' AS first_write, COUNT(*) AS total_rows, COUNT(_row_id) AS assigned_rows, COUNT(DISTINCT _row_id) AS unique_rows
+SELECT 'insert' AS first_write, COUNT() AS total_rows, COUNT(_row_id) AS assigned_rows, COUNT(DISTINCT _row_id) AS unique_rows
 FROM iceberg_compat_${suite_uuid0}.${case_db}.up_partitioned_${uuid0}
 ORDER BY first_write;
 

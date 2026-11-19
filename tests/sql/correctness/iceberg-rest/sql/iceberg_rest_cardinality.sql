@@ -57,7 +57,7 @@ SELECT CAST(generate_series AS INT) AS k1, CAST(generate_series AS INT) AS v
 
 -- query 4
 -- Sanity: the table holds exactly 1000 rows spanning [1, 1000].
-SELECT COUNT(*) AS n, MIN(k1) AS lo, MAX(k1) AS hi
+SELECT COUNT() AS n, MIN(k1) AS lo, MAX(k1) AS hi
   FROM iceberg_rest_${suite_uuid0}.iceberg_rest_card_db_${uuid0}.t_card_${uuid0};
 
 -- query 5

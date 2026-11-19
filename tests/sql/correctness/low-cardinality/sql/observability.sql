@@ -41,7 +41,7 @@ INSERT INTO ${case_db}.dict_observability_orders VALUES
 -- @result_contains=hydrated_cols=
 -- @result_contains=unsupported_cols=
 EXPLAIN ANALYZE
-SELECT status, count(*) AS cnt
+SELECT status, count() AS cnt
 FROM ${case_db}.dict_observability_orders
 WHERE status <> 'CANCELLED'
 GROUP BY status

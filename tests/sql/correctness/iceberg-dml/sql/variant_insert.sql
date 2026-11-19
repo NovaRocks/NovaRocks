@@ -69,7 +69,7 @@ SELECT variant_typeof(parse_json('{"a":1}')) AS object_kind,
 SELECT get_json_string(parse_json('{"a":1,"b":"x"}'), '$.b') AS b;
 
 -- query 6
-SELECT COUNT(*) AS remaining_rows FROM iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant;
+SELECT COUNT() AS remaining_rows FROM iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant;
 
 -- query 7
 -- @skip_result_check=true

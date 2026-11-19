@@ -42,7 +42,7 @@ VALUES (1, 'us', 10.5), (2, 'us', 20.0), (3, 'eu', 30.25);
 
 -- query 4
 -- After 3 rows inserted: count = 3.
-SELECT COUNT(*) AS n FROM iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0};
+SELECT COUNT() AS n FROM iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0};
 
 -- query 5
 -- Rows ordered by id.
@@ -59,7 +59,7 @@ SELECT id + 100 AS id, region, amount * 2 AS amount
 
 -- query 7
 -- After INSERT...SELECT (2 more rows): count = 5.
-SELECT COUNT(*) AS n FROM iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0};
+SELECT COUNT() AS n FROM iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0};
 
 -- query 8
 -- @skip_result_check=true
@@ -68,7 +68,7 @@ VALUES (999, 'ap', 0.0), (998, 'ap', 1.0);
 
 -- query 9
 -- After INSERT OVERWRITE: count = 2.
-SELECT COUNT(*) AS n FROM iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0};
+SELECT COUNT() AS n FROM iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0};
 
 -- query 10
 -- INSERT OVERWRITE replaced everything; only the two new rows remain.

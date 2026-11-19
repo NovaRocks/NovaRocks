@@ -79,7 +79,7 @@ ALTER TABLE lnp_3c_${suite_uuid0}.ns_${uuid0}.orders REWRITE MANIFESTS;
 -- query 10
 -- @result_contains=3
 -- @skip_result_check=true
-SELECT COUNT(*) AS n FROM lnp_3c_${suite_uuid0}.ns_${uuid0}.orders;
+SELECT COUNT() AS n FROM lnp_3c_${suite_uuid0}.ns_${uuid0}.orders;
 
 -- query 11
 -- @skip_result_check=true

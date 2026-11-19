@@ -56,7 +56,7 @@ DELETE FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0}
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} ADD EQUALITY DELETE (id) VALUES (2);
 
 -- query 8
-SELECT COUNT(*) AS remaining_rows FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0};
+SELECT COUNT() AS remaining_rows FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0};
 
 -- query 9
 -- @skip_result_check=true

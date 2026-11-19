@@ -54,11 +54,11 @@ printf 'SPARK_SQL_OK\n'
 -- query 2
 SELECT ref_name, row_count, metric_sum
 FROM (
-  SELECT 'backup' AS ref_name, COUNT(*) AS row_count, SUM(metric) AS metric_sum
+  SELECT 'backup' AS ref_name, COUNT() AS row_count, SUM(metric) AS metric_sum
   FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_refs_${uuid0}
   FOR VERSION AS OF 'backup'
   UNION ALL
-  SELECT 'main' AS ref_name, COUNT(*) AS row_count, SUM(metric) AS metric_sum
+  SELECT 'main' AS ref_name, COUNT() AS row_count, SUM(metric) AS metric_sum
   FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_refs_${uuid0}
 ) refs
 ORDER BY ref_name;

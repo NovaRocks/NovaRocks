@@ -50,7 +50,7 @@ ANALYZE TABLE ${case_db}.rf_co_dist_probe;
 ANALYZE TABLE ${case_db}.rf_co_dist_build;
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_co_dist_probe p
 JOIN ${case_db}.rf_co_dist_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -59,7 +59,7 @@ SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
-SELECT COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_co_dist_probe p
 JOIN ${case_db}.rf_co_dist_build b ON p.k = b.k
 WHERE b.flag = 'Y';

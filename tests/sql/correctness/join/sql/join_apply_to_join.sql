@@ -66,37 +66,37 @@ INSERT INTO ${case_db}.t1 VALUES (null, 1, 1), (2, null, null), (3, 3, null), (4
 INSERT INTO ${case_db}.t2 VALUES (null, 1, 1), (2, null, null), (3, 3, null), (4, 4, 4), (5, 5, 5), (6, 6, 6), (null, null, null), (7, 7, 7), (8, 8, 8);
 
 -- query 7
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON v1 IN (SELECT v7 FROM ${case_db}.t2) OR v1 < v5;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON v1 IN (SELECT v7 FROM ${case_db}.t2) OR v1 < v5;
 
 -- query 8
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON v1 IN (SELECT v7 FROM ${case_db}.t2 WHERE v2 = v8) OR v1 < v5;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON v1 IN (SELECT v7 FROM ${case_db}.t2 WHERE v2 = v8) OR v1 < v5;
 
 -- query 9
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON v4 IN (SELECT v7 FROM ${case_db}.t2) OR v1 < v5;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON v4 IN (SELECT v7 FROM ${case_db}.t2) OR v1 < v5;
 
 -- query 10
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON v4 IN (SELECT v7 FROM ${case_db}.t2 WHERE v5 = v8) OR v1 < v5;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON v4 IN (SELECT v7 FROM ${case_db}.t2 WHERE v5 = v8) OR v1 < v5;
 
 -- query 11
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON EXISTS (SELECT v7 FROM ${case_db}.t2) OR v1 < v5;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON EXISTS (SELECT v7 FROM ${case_db}.t2) OR v1 < v5;
 
 -- query 12
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON EXISTS (SELECT v7 FROM ${case_db}.t2 WHERE v8 = v1) OR v1 < v5;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON EXISTS (SELECT v7 FROM ${case_db}.t2 WHERE v8 = v1) OR v1 < v5;
 
 -- query 13
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON EXISTS (SELECT v7 FROM ${case_db}.t2 WHERE v8 = v4) OR v1 < v5;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON EXISTS (SELECT v7 FROM ${case_db}.t2 WHERE v8 = v4) OR v1 < v5;
 
 -- query 14
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON (SELECT count(*) FROM ${case_db}.t2 WHERE v4 = v7) > 0;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON (SELECT count() FROM ${case_db}.t2 WHERE v4 = v7) > 0;
 
 -- query 15
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON (SELECT count(*) FROM ${case_db}.t2 WHERE v4 = v7) > 0 OR v1 > v4;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON (SELECT count() FROM ${case_db}.t2 WHERE v4 = v7) > 0 OR v1 > v4;
 
 -- query 16
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON (SELECT count(*) FROM ${case_db}.t2 WHERE v4 = v7) > v1 + v5 OR v1 > v4;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON (SELECT count() FROM ${case_db}.t2 WHERE v4 = v7) > v1 + v5 OR v1 > v4;
 
 -- query 17
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON (SELECT count(*) FROM ${case_db}.t2) > 0 OR v1 + v4 = v2 + v5;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON (SELECT count() FROM ${case_db}.t2) > 0 OR v1 + v4 = v2 + v5;
 
 -- query 18
-SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON (SELECT count(*) FROM ${case_db}.t2) > v1 + v4 OR v1 < v4;
+SELECT count() FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON (SELECT count() FROM ${case_db}.t2) > v1 + v4 OR v1 < v4;

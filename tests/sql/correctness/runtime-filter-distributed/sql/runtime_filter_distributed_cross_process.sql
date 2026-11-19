@@ -60,7 +60,7 @@ ANALYZE TABLE ${case_db}.rf_dist_probe;
 ANALYZE TABLE ${case_db}.rf_dist_build;
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT 'inner_int' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'inner_int' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
 JOIN ${case_db}.rf_dist_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -69,23 +69,23 @@ SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
-SELECT 'inner_int' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'inner_int' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
 JOIN ${case_db}.rf_dist_build b ON p.k = b.k
 WHERE b.flag = 'Y';
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT 'left_semi_string' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'left_semi_string' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
 WHERE EXISTS (SELECT 1 FROM ${case_db}.rf_dist_build b WHERE p.s = b.s AND b.flag = 'Y');
 
 SET disable_optimizer_rules = '';
-SELECT 'left_semi_string' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'left_semi_string' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
 WHERE EXISTS (SELECT 1 FROM ${case_db}.rf_dist_build b WHERE p.s = b.s AND b.flag = 'Y');
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT 'multi_column' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'multi_column' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
 JOIN ${case_db}.rf_dist_build b ON p.k = b.k AND p.s = b.s
 WHERE b.flag = 'Y';
@@ -94,13 +94,13 @@ SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
-SELECT 'multi_column' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'multi_column' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
 JOIN ${case_db}.rf_dist_build b ON p.k = b.k AND p.s = b.s
 WHERE b.flag = 'Y';
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT 'decimal_key' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'decimal_key' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
 JOIN ${case_db}.rf_dist_build b ON p.d = b.d
 WHERE b.flag = 'Y';
@@ -109,13 +109,13 @@ SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
-SELECT 'decimal_key' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'decimal_key' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
 JOIN ${case_db}.rf_dist_build b ON p.d = b.d
 WHERE b.flag = 'Y';
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT 'empty_build' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'empty_build' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
 JOIN ${case_db}.rf_dist_build b ON p.k = b.k
 WHERE b.flag = 'NOPE';
@@ -124,7 +124,7 @@ SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
-SELECT 'empty_build' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'empty_build' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_probe p
 JOIN ${case_db}.rf_dist_build b ON p.k = b.k
 WHERE b.flag = 'NOPE';

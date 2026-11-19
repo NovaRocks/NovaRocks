@@ -96,7 +96,7 @@ REFRESH MATERIALIZED VIEW ctest_db_mv_${uuid0};
 SELECT region, c FROM ctest_db_mv_${uuid0} ORDER BY region;
 
 -- query 8
-SELECT region, COUNT(*) AS c FROM ice_ivm_ctest_db_${uuid0}.ns_${uuid0}.orders GROUP BY region ORDER BY region;
+SELECT region, COUNT() AS c FROM ice_ivm_ctest_db_${uuid0}.ns_${uuid0}.orders GROUP BY region ORDER BY region;
 
 -- query 9
 -- This case attached a catalog onto the shared warehouse and never gave it

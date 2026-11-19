@@ -52,7 +52,7 @@ SET cbo_broadcast_node_mem_budget_bytes = 0;
 -- @explain_contains=consumer binding
 -- @explain_contains=expr = (p.k)
 -- @explain_not_contains=HASH JOIN (BROADCAST
-SELECT count(*) AS cnt
+SELECT count() AS cnt
 FROM ${case_db}.pir8_rf_probe p
 JOIN ${case_db}.pir8_rf_build b ON p.k = b.k;
 

@@ -70,7 +70,7 @@ VALUES (100, 'dropped');
 
 -- query 9
 -- The failed INSERT must not add a row.
-SELECT COUNT(*) AS n
+SELECT COUNT() AS n
   FROM iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0}.t_iw7_${uuid0};
 
 -- query 10

@@ -29,7 +29,7 @@ TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.count_seed VALUES (7), (19);
 
 -- query 2
-SELECT COUNT(*) AS row_count
+SELECT COUNT() AS row_count
 FROM ${case_db}.count_seed l CROSS JOIN ${case_db}.count_seed r;
 
 -- query 3
@@ -38,5 +38,5 @@ SET cbo_broadcast_node_mem_budget_bytes = 0;
 
 -- query 4
 -- @explain_contains=HASH JOIN (PARTITIONED, INNER
-SELECT COUNT(*) AS row_count
+SELECT COUNT() AS row_count
 FROM ${case_db}.count_seed l JOIN  ${case_db}.count_seed r ON l.id = r.id;

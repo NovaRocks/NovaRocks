@@ -31,11 +31,11 @@ insert into t2 values (1), (2), (3);
 
 -- query 3
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;
 
 -- query 4
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;
 
 -- query 5
 USE ${case_db};
@@ -43,11 +43,11 @@ alter table t2 rename column c0 to c1;
 
 -- query 6
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;
 
 -- query 7
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;
 
 -- query 8
 USE ${case_db};
@@ -55,8 +55,8 @@ alter table t2 rename column c1 to c2;
 
 -- query 9
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;
 
 -- query 10
 USE ${case_db};
-select count(*) from t2;
+select count() from t2;

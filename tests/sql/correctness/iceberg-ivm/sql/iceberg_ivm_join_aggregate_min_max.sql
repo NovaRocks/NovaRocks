@@ -98,7 +98,7 @@ ORDER BY user_region;
 SELECT u.user_region,
        MIN(o.order_amount) AS mn,
        MAX(o.order_amount) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders AS o
 JOIN ice_ivm_jmm_${uuid0}.ns_${uuid0}.users AS u
   ON o.user_id = u.id
@@ -121,7 +121,7 @@ ORDER BY user_region;
 SELECT u.user_region,
        MIN(o.order_amount) AS mn,
        MAX(o.order_amount) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders AS o
 JOIN ice_ivm_jmm_${uuid0}.ns_${uuid0}.users AS u
   ON o.user_id = u.id

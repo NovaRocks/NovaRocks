@@ -74,7 +74,7 @@ ON t.id=s.id WHEN MATCHED THEN DELETE;
 
 -- query 10
 SELECT id,v FROM ${case_db}.merge_duplicates_${uuid0} ORDER BY id,v;
-SELECT COUNT(*) AS total_rows, COUNT(DISTINCT _row_id) AS unique_ids FROM ${case_db}.merge_duplicates_${uuid0};
+SELECT COUNT() AS total_rows, COUNT(DISTINCT _row_id) AS unique_ids FROM ${case_db}.merge_duplicates_${uuid0};
 
 -- query 11
 -- @skip_result_check=true

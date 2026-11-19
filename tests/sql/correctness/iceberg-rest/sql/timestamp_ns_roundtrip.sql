@@ -60,7 +60,7 @@ SELECT id, CAST(ts AS STRING) AS s
 -- row 3 is epoch (excluded). Correct nanosecond semantics yield COUNT=1.
 -- If the predicate bound were rounded to microseconds (.000000), rows 1 and 2 would
 -- both pass (COUNT=2), proving the nanosecond path is exercised.
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
   FROM iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0}
   WHERE ts > '2024-01-02 03:04:05.000000001';
 

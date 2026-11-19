@@ -78,15 +78,15 @@ select sum(c1), max(c2) from t0 group by c0 order by 1, 2 limit 5;
 
 -- query 13
 USE ${case_db};
-select count(*) from (select distinct c0 from t0) tb;
+select count() from (select distinct c0 from t0) tb;
 
 -- query 14
 USE ${case_db};
-select count(*) from (select c0, c1, sum(c2) from t0 group by c0, c1) tb;
+select count() from (select c0, c1, sum(c2) from t0 group by c0, c1) tb;
 
 -- query 15
 USE ${case_db};
-select count(*) from (select distinct c0 from t0 limit 100) tb;
+select count() from (select distinct c0 from t0 limit 100) tb;
 
 -- query 16
 -- @skip_result_check=true
@@ -118,15 +118,15 @@ select sum(c1), max(c2) from t0 group by c0 order by 1, 2 limit 5;
 
 -- query 23
 USE ${case_db};
-select count(*) from (select distinct c0 from t0) tb;
+select count() from (select distinct c0 from t0) tb;
 
 -- query 24
 USE ${case_db};
-select count(*) from (select c0, c1, sum(c2) from t0 group by c0, c1) tb;
+select count() from (select c0, c1, sum(c2) from t0 group by c0, c1) tb;
 
 -- query 25
 USE ${case_db};
-select count(*) from (select distinct c0 from t0 limit 100) tb;
+select count() from (select distinct c0 from t0 limit 100) tb;
 
 -- query 26
 -- @skip_result_check=true
@@ -158,7 +158,7 @@ select sum(c1), max(c1), min(c1), avg(c1) from t1 group by c0, c2 order by 1 lim
 
 -- query 31
 USE ${case_db};
-select count(*) from (select distinct c0 from t1 limit 100) tb;
+select count() from (select distinct c0 from t1 limit 100) tb;
 
 -- query 32
 -- @skip_result_check=true
@@ -185,4 +185,4 @@ select sum(c1), max(c1), min(c1), avg(c1) from t2 group by c0, c2 order by 1 lim
 
 -- query 36
 USE ${case_db};
-select count(*) from (select distinct c0 from t2 limit 100) tb;
+select count() from (select distinct c0 from t2 limit 100) tb;

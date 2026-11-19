@@ -90,7 +90,7 @@ ORDER BY id;
 
 -- query 7
 -- Fresh-row-id gate: every surviving/added row carries a unique `_row_id`.
-SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT(*) AS total_rows
+SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT() AS total_rows
 FROM ${case_db}.t_v3_merge_matched_delete_insert;
 
 -- query 8

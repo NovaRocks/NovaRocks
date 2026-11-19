@@ -62,7 +62,7 @@ INSERT INTO ${case_db}.t_project_projection_dates VALUES
 
 SELECT
     (
-        SELECT COUNT(*)
+        SELECT COUNT()
         FROM (
             SELECT c_custkey, c_name
             FROM ${case_db}.t_project_projection_customer
@@ -70,7 +70,7 @@ SELECT
         ) x
     ) AS projected_limit_rows,
     (
-        SELECT COUNT(*)
+        SELECT COUNT()
         FROM (
             SELECT C_CUSTKEY
             FROM ${case_db}.t_project_projection_customer
@@ -78,7 +78,7 @@ SELECT
         ) y
     ) AS uppercase_projection_rows,
     (
-        SELECT COUNT(*)
+        SELECT COUNT()
         FROM (
             SELECT *
             FROM ${case_db}.t_project_projection_dates

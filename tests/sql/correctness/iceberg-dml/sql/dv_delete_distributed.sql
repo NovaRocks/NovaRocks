@@ -44,7 +44,7 @@ DELETE FROM ${case_db}.t_dv_delete_distributed WHERE id IN (2, 5);
 DELETE FROM ${case_db}.t_dv_delete_distributed WHERE v > 550;
 
 -- query 2
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM ${case_db}.t_dv_delete_distributed;
 
 -- query 3

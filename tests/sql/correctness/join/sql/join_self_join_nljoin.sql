@@ -45,46 +45,46 @@ INSERT INTO ${case_db}.t_self_join_nl VALUES
 
 -- query 4
 -- CROSS JOIN self
-SELECT count(*), count(a.v1), count(b.v1)
+SELECT count(), count(a.v1), count(b.v1)
 FROM ${case_db}.t_self_join_nl a
 CROSS JOIN ${case_db}.t_self_join_nl b;
 
 -- query 5
 -- INNER JOIN self ON non-equality
-SELECT count(*), count(a.v1), count(b.v1)
+SELECT count(), count(a.v1), count(b.v1)
 FROM ${case_db}.t_self_join_nl a
 INNER JOIN ${case_db}.t_self_join_nl b
   ON a.k1 > b.k1;
 
 -- query 6
 -- LEFT OUTER JOIN self ON non-equality
-SELECT count(*), count(a.v1), count(b.v1)
+SELECT count(), count(a.v1), count(b.v1)
 FROM ${case_db}.t_self_join_nl a
 LEFT OUTER JOIN ${case_db}.t_self_join_nl b
   ON a.k1 > b.k1;
 
 -- query 7
 -- RIGHT OUTER JOIN self ON non-equality
-SELECT count(*), count(a.v1), count(b.v1)
+SELECT count(), count(a.v1), count(b.v1)
 FROM ${case_db}.t_self_join_nl a
 RIGHT OUTER JOIN ${case_db}.t_self_join_nl b
   ON a.k1 > b.k1;
 
 -- query 8
 -- FULL OUTER JOIN self ON non-equality
-SELECT count(*), count(a.v1), count(b.v1)
+SELECT count(), count(a.v1), count(b.v1)
 FROM ${case_db}.t_self_join_nl a
 FULL OUTER JOIN ${case_db}.t_self_join_nl b
   ON a.k1 > b.k1;
 
 -- query 9
 -- LEFT SEMI JOIN self ON non-equality
-SELECT count(*), count(a.v1)
+SELECT count(), count(a.v1)
 FROM ${case_db}.t_self_join_nl a
 WHERE EXISTS (SELECT 1 FROM ${case_db}.t_self_join_nl b WHERE a.k1 > b.k1);
 
 -- query 10
 -- LEFT ANTI JOIN self ON non-equality
-SELECT count(*), count(a.v1)
+SELECT count(), count(a.v1)
 FROM ${case_db}.t_self_join_nl a
 WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t_self_join_nl b WHERE a.k1 > b.k1);

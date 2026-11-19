@@ -142,7 +142,7 @@ FROM agg_repart_mv_${uuid0}
 ORDER BY region;
 
 -- query 14
-SELECT region, COUNT(*) AS c, SUM(amount) AS s
+SELECT region, COUNT() AS c, SUM(amount) AS s
 FROM ice_ivm_repart_${uuid0}.ns_${uuid0}.orders
 GROUP BY region
 ORDER BY region;

@@ -168,7 +168,7 @@ WITH RECURSIVE org_hierarchy AS (
     FROM ${case_db}.employees e
     INNER JOIN org_hierarchy oh ON e.manager_id = oh.employee_id
 )
-SELECT  `level`, COUNT(*) AS employee_count
+SELECT  `level`, COUNT() AS employee_count
 FROM org_hierarchy
 GROUP BY `level`
 ORDER BY `level`;

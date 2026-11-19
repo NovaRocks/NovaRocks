@@ -113,7 +113,7 @@ WITH decimal_stats AS (
         category,
         AVG(d50_15) as avg_d50,
         AVG(d76_20) as avg_d76,
-        COUNT(*) as cnt
+        COUNT() as cnt
     FROM ${case_db}.decimal_main_test
     GROUP BY category
 )

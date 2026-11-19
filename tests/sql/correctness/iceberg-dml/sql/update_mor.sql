@@ -55,7 +55,7 @@ FROM ${case_db}.t_v3_update_mor
 ORDER BY id;
 
 -- query 5
-SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT(*) AS total_rows
+SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT() AS total_rows
 FROM ${case_db}.t_v3_update_mor;
 
 -- query 6

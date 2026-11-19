@@ -80,14 +80,14 @@ REFRESH MATERIALIZED VIEW sales_mv_${uuid0};
 
 -- query 4
 -- Verify initial MV state
-SELECT region, COUNT(*) AS cnt, SUM(amount) AS total
+SELECT region, COUNT() AS cnt, SUM(amount) AS total
 FROM sales_mv_${uuid0}
 GROUP BY region
 ORDER BY region;
 
 -- query 5
 -- Ground truth from base must match MV
-SELECT region, COUNT(*) AS cnt, SUM(amount) AS total
+SELECT region, COUNT() AS cnt, SUM(amount) AS total
 FROM ice_ivm_upd_${uuid0}.ns_${uuid0}.sales_${uuid0}
 WHERE amount > 300
 GROUP BY region
@@ -108,20 +108,20 @@ REFRESH MATERIALIZED VIEW sales_mv_${uuid0};
 
 -- query 8
 -- All 50 updated rows must appear in MV with amount=999
-SELECT COUNT(*) AS updated_in_mv
+SELECT COUNT() AS updated_in_mv
 FROM sales_mv_${uuid0}
 WHERE id BETWEEN 1 AND 50 AND amount = 999;
 
 -- query 9
 -- MV aggregates after UPDATE
-SELECT region, COUNT(*) AS cnt, SUM(amount) AS total
+SELECT region, COUNT() AS cnt, SUM(amount) AS total
 FROM sales_mv_${uuid0}
 GROUP BY region
 ORDER BY region;
 
 -- query 10
 -- Ground truth from base after UPDATE must match MV
-SELECT region, COUNT(*) AS cnt, SUM(amount) AS total
+SELECT region, COUNT() AS cnt, SUM(amount) AS total
 FROM ice_ivm_upd_${uuid0}.ns_${uuid0}.sales_${uuid0}
 WHERE amount > 300
 GROUP BY region

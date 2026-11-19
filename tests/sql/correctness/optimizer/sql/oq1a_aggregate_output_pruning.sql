@@ -51,7 +51,7 @@ FROM (
 EXPLAIN VERBOSE SELECT count(*) AS c
 FROM ${case_db}.oq1a_t;
 
-SELECT count(*) AS c
+SELECT count() AS c
 FROM ${case_db}.oq1a_t;
 
 -- @skip_result_check=true

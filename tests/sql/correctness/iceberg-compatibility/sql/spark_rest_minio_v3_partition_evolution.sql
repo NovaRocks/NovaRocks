@@ -59,7 +59,7 @@ SPARK_SQL
 printf 'SPARK_SQL_OK\n'
 
 -- query 2
-SELECT region, COUNT(*) AS cnt, SUM(metric) AS total_metric
+SELECT region, COUNT() AS cnt, SUM(metric) AS total_metric
 FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_part_evo_${uuid0}
 GROUP BY region
 ORDER BY region;

@@ -95,11 +95,11 @@ set pipeline_dop = 1;
 
 -- multi-column NOT IN with large generated dataset (int pair)
 -- query 13
-select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(generate_series(1, 8192))) t where (x0, x0 + 1) not in ( select l3.l_orderkey, l3.l_orderkey + 1 from ${case_db}.lineitem l3 ) order by 1) t;
+select count() from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(generate_series(1, 8192))) t where (x0, x0 + 1) not in ( select l3.l_orderkey, l3.l_orderkey + 1 from ${case_db}.lineitem l3 ) order by 1) t;
 
 -- multi-column NOT IN with large generated dataset (int + string pair)
 -- query 14
-select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(generate_series(1, 8192))) t where (x0, concat("l", x0)) not in ( select l3.l_orderkey, concat("l", l_orderkey) from ${case_db}.lineitem l3 ) order by 1) t;
+select count() from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(generate_series(1, 8192))) t where (x0, concat("l", x0)) not in ( select l3.l_orderkey, concat("l", l_orderkey) from ${case_db}.lineitem l3 ) order by 1) t;
 
 -- query 15
 -- @skip_result_check=true
@@ -129,27 +129,27 @@ insert into ${case_db}.build1 values (1,1,1),(1,1,1),(1,1,1),(1,1,1),(1,1,1),(1,
 
 -- NOT IN with correlated coalesce predicate
 -- query 19
-select count(*) from ${case_db}.aware3 l where l.k2 not in (select k2 from ${case_db}.build1 r where r.k3 = coalesce(l.k3, 2));
+select count() from ${case_db}.aware3 l where l.k2 not in (select k2 from ${case_db}.build1 r where r.k3 = coalesce(l.k3, 2));
 
 -- constant 1 NOT IN (non-matching build)
 -- query 20
-select count(*) from ${case_db}.aware3 l where 1 not in (select k2 from ${case_db}.build1 r);
+select count() from ${case_db}.aware3 l where 1 not in (select k2 from ${case_db}.build1 r);
 
 -- constant 5 NOT IN (non-matching build)
 -- query 21
-select count(*) from ${case_db}.aware3 l where 5 not in (select k2 from ${case_db}.build1 r);
+select count() from ${case_db}.aware3 l where 5 not in (select k2 from ${case_db}.build1 r);
 
 -- null NOT IN (should return 0)
 -- query 22
-select count(*) from ${case_db}.aware3 l where null not in (select k2 from ${case_db}.build1 r);
+select count() from ${case_db}.aware3 l where null not in (select k2 from ${case_db}.build1 r);
 
 -- constant 1 NOT IN with correlated != predicate
 -- query 23
-select count(*) from ${case_db}.aware3 l where 1 not in (select k2 from ${case_db}.build1 r where r.k3 != l.k3);
+select count() from ${case_db}.aware3 l where 1 not in (select k2 from ${case_db}.build1 r where r.k3 != l.k3);
 
 -- constant 1000 NOT IN with correlated != predicate
 -- query 24
-select count(*) from ${case_db}.aware3 l where 1000 not in (select k2 from ${case_db}.build1 r where r.k3 != l.k3);
+select count() from ${case_db}.aware3 l where 1000 not in (select k2 from ${case_db}.build1 r where r.k3 != l.k3);
 
 -- query 25
 -- @skip_result_check=true
@@ -166,28 +166,28 @@ insert into ${case_db}.build2 values (1,1,1),(NULL,NULL,NULL);
 
 -- constant 1 NOT IN build with NULL row
 -- query 27
-select count(*) from ${case_db}.aware3 l where 1 not in (select k2 from ${case_db}.build2 r);
+select count() from ${case_db}.aware3 l where 1 not in (select k2 from ${case_db}.build2 r);
 
 -- null NOT IN build with NULL row
 -- query 28
-select count(*) from ${case_db}.aware3 l where null not in (select k2 from ${case_db}.build2 r);
+select count() from ${case_db}.aware3 l where null not in (select k2 from ${case_db}.build2 r);
 
 -- constant 5 NOT IN build with NULL row (should return 0 due to NULL)
 -- query 29
-select count(*) from ${case_db}.aware3 l where 5 not in (select k2 from ${case_db}.build2 r);
+select count() from ${case_db}.aware3 l where 5 not in (select k2 from ${case_db}.build2 r);
 
 -- NOT IN with correlated = on build1
 -- query 30
-select count(*) from ${case_db}.aware3 l where l.k2 not in (select k2 from ${case_db}.build1 r where r.k3 = l.k3);
+select count() from ${case_db}.aware3 l where l.k2 not in (select k2 from ${case_db}.build1 r where r.k3 = l.k3);
 
 -- constant 1 NOT IN with correlated != on build1
 -- query 31
-select count(*) from ${case_db}.aware3 l where 1 not in (select k2 from ${case_db}.build1 r where r.k3 != l.k3);
+select count() from ${case_db}.aware3 l where 1 not in (select k2 from ${case_db}.build1 r where r.k3 != l.k3);
 
 -- NOT IN with correlated = on build2
 -- query 32
-select count(*) from ${case_db}.aware3 l where l.k2 not in (select k2 from ${case_db}.build2 r where r.k3 = l.k3);
+select count() from ${case_db}.aware3 l where l.k2 not in (select k2 from ${case_db}.build2 r where r.k3 = l.k3);
 
 -- constant 1 NOT IN with correlated != on build2
 -- query 33
-select count(*) from ${case_db}.aware3 l where 1 not in (select k2 from ${case_db}.build2 r where r.k3 != l.k3);
+select count() from ${case_db}.aware3 l where 1 not in (select k2 from ${case_db}.build2 r where r.k3 != l.k3);

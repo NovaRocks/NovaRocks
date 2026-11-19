@@ -129,7 +129,7 @@ FROM agg_apply_mv_${uuid0}
 ORDER BY region;
 
 -- query 4
-SELECT region, COUNT(*) AS c, SUM(amount) AS s
+SELECT region, COUNT() AS c, SUM(amount) AS s
 FROM ice_mv_apply_agg_${uuid0}.ns_${uuid0}.orders_${uuid0}
 GROUP BY region
 ORDER BY region;
@@ -155,7 +155,7 @@ FROM agg_apply_mv_${uuid0}
 ORDER BY region;
 
 -- query 8
-SELECT region, COUNT(*) AS c, SUM(amount) AS s
+SELECT region, COUNT() AS c, SUM(amount) AS s
 FROM ice_mv_apply_agg_${uuid0}.ns_${uuid0}.orders_${uuid0}
 GROUP BY region
 ORDER BY region;
@@ -166,7 +166,7 @@ FROM join_agg_apply_mv_${uuid0}
 ORDER BY region;
 
 -- query 10
-SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
+SELECT d.region, COUNT() AS c, SUM(f.amount) AS s
 FROM ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0} AS f
 JOIN ice_mv_apply_agg_${uuid0}.ns_${uuid0}.dim_${uuid0} AS d ON f.dim_id = d.id
 GROUP BY d.region
@@ -197,7 +197,7 @@ FROM join_agg_apply_mv_${uuid0}
 ORDER BY region;
 
 -- query 14
-SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
+SELECT d.region, COUNT() AS c, SUM(f.amount) AS s
 FROM ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0} AS f
 JOIN ice_mv_apply_agg_${uuid0}.ns_${uuid0}.dim_${uuid0} AS d ON f.dim_id = d.id
 GROUP BY d.region
@@ -211,11 +211,11 @@ ORDER BY region, s;
 -- query 16
 SELECT region, c, s
 FROM (
-  SELECT region, COUNT(*) AS c, SUM(amount) AS s
+  SELECT region, COUNT() AS c, SUM(amount) AS s
   FROM ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t1_${uuid0}
   GROUP BY region
   UNION ALL
-  SELECT region, COUNT(*) AS c, SUM(amount) AS s
+  SELECT region, COUNT() AS c, SUM(amount) AS s
   FROM ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t2_${uuid0}
   GROUP BY region
 ) u
@@ -242,11 +242,11 @@ ORDER BY region, s;
 -- query 20
 SELECT region, c, s
 FROM (
-  SELECT region, COUNT(*) AS c, SUM(amount) AS s
+  SELECT region, COUNT() AS c, SUM(amount) AS s
   FROM ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t1_${uuid0}
   GROUP BY region
   UNION ALL
-  SELECT region, COUNT(*) AS c, SUM(amount) AS s
+  SELECT region, COUNT() AS c, SUM(amount) AS s
   FROM ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t2_${uuid0}
   GROUP BY region
 ) u

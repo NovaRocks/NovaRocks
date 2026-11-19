@@ -151,7 +151,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 16
@@ -162,7 +162,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 17
@@ -215,7 +215,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 22
@@ -226,7 +226,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 23
@@ -279,7 +279,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 28
@@ -290,7 +290,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 29

@@ -86,7 +86,7 @@ FROM ${case_db}.t_v3_merge_mor
 ORDER BY id;
 
 -- query 7
-SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT(*) AS total_rows
+SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT() AS total_rows
 FROM ${case_db}.t_v3_merge_mor;
 
 -- query 8

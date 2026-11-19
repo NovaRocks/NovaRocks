@@ -29,7 +29,7 @@ USE ${case_db};
 SELECT id, m IS NULL AS parent_null, m[1] AS value_at_one FROM map_aggregate_contract ORDER BY id;
 -- query 4
 USE ${case_db};
-SELECT COUNT(*) AS rows_total, COUNT(m) AS maps_present, COUNT(m[1]) AS values_present FROM map_aggregate_contract;
+SELECT COUNT() AS rows_total, COUNT(m) AS maps_present, COUNT(m[1]) AS values_present FROM map_aggregate_contract;
 -- query 5
 USE ${case_db};
 SELECT COUNT(m) AS maps_present FROM map_aggregate_contract WHERE id >= 2;

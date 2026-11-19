@@ -97,7 +97,7 @@ ORDER BY region;
 SELECT region,
        MIN(reading) AS mn,
        MAX(reading) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_float_db_${uuid0}.ns_${uuid0}.measurements
 GROUP BY region
 ORDER BY region;
@@ -121,7 +121,7 @@ ORDER BY region;
 SELECT region,
        MIN(reading) AS mn,
        MAX(reading) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_float_db_${uuid0}.ns_${uuid0}.measurements
 GROUP BY region
 ORDER BY region;
@@ -147,7 +147,7 @@ ORDER BY region;
 SELECT region,
        MIN(reading) AS mn,
        MAX(reading) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_float_db_${uuid0}.ns_${uuid0}.measurements
 GROUP BY region
 ORDER BY region;

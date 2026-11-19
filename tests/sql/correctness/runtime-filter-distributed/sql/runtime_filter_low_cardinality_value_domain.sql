@@ -52,7 +52,7 @@ SET global_runtime_filter_probe_min_selectivity = 0.0;
 SET cbo_broadcast_node_mem_budget_bytes = 0;
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT 'rf_off' AS mode, COUNT(*) AS row_count, COALESCE(SUM(p.payload), 0) AS payload_sum
+SELECT 'rf_off' AS mode, COUNT() AS row_count, COALESCE(SUM(p.payload), 0) AS payload_sum
 FROM ${case_db}.rf_dist_lc_probe p
 JOIN ${case_db}.rf_dist_lc_build b ON p.status = b.status
 WHERE b.flag = 'Y';
@@ -61,7 +61,7 @@ SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
-SELECT 'rf_on' AS mode, COUNT(*) AS row_count, COALESCE(SUM(p.payload), 0) AS payload_sum
+SELECT 'rf_on' AS mode, COUNT() AS row_count, COALESCE(SUM(p.payload), 0) AS payload_sum
 FROM ${case_db}.rf_dist_lc_probe p
 JOIN ${case_db}.rf_dist_lc_build b ON p.status = b.status
 WHERE b.flag = 'Y';

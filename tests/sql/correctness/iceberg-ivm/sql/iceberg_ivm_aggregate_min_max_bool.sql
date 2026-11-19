@@ -88,7 +88,7 @@ ORDER BY region;
 SELECT region,
        MIN(flag) AS mn,
        MAX(flag) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;
@@ -111,7 +111,7 @@ ORDER BY region;
 SELECT region,
        MIN(flag) AS mn,
        MAX(flag) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;
@@ -146,7 +146,7 @@ ORDER BY region;
 SELECT region,
        MIN(flag) AS mn,
        MAX(flag) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;

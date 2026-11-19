@@ -39,7 +39,7 @@ INSERT INTO ${case_db}.t_partition_overwrite_lineage VALUES
 ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_partition_overwrite_lineage CREATE TAG before_overwrite;
 
 -- query 2
-SELECT region, COUNT(*) AS n
+SELECT region, COUNT() AS n
 FROM ${case_db}.t_partition_overwrite_lineage
 GROUP BY region
 ORDER BY region;
@@ -79,7 +79,7 @@ INSERT INTO ${case_db}.t_partition_overwrite_lineage VALUES
 
 -- query 7
 SELECT
-  COUNT(*) AS total_rows,
+  COUNT() AS total_rows,
   COUNT(DISTINCT _row_id) AS distinct_row_ids
 FROM ${case_db}.t_partition_overwrite_lineage;
 

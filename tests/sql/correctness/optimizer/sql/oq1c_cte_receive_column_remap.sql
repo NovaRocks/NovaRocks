@@ -52,7 +52,7 @@ SELECT payload FROM c WHERE v = 30;
 
 -- Aggregate-backed producer keeps its full child output when aggregate pruning is disabled.
 WITH c AS (
-    SELECT k, COUNT(*) AS cnt FROM ${case_db}.oq1c_cte_src GROUP BY k
+    SELECT k, COUNT() AS cnt FROM ${case_db}.oq1c_cte_src GROUP BY k
 )
 SELECT l.k
 FROM c l

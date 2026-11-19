@@ -481,7 +481,7 @@ SELECT * FROM ${case_db}.decimal_test WHERE
     (max_decimal >= 0 OR max_decimal <= -10000000000000) ORDER BY id;
 
 -- query 83
-SELECT COUNT(*) FROM ${case_db}.decimal_test WHERE
+SELECT COUNT() FROM ${case_db}.decimal_test WHERE
     big_decimal >= 100000000000.000000000000000 OR
     huge_decimal >= 1000000000.00000000000000000000 OR
     max_decimal >= 10000000000000;
@@ -496,13 +496,13 @@ SELECT * FROM ${case_db}.decimal_test WHERE huge_decimal IS NULL ORDER BY id;
 SELECT * FROM ${case_db}.decimal_test WHERE max_decimal IS NULL ORDER BY id;
 
 -- query 87
-SELECT COUNT(*) as null_big_decimal_count FROM ${case_db}.decimal_test WHERE big_decimal IS NULL;
+SELECT COUNT() as null_big_decimal_count FROM ${case_db}.decimal_test WHERE big_decimal IS NULL;
 
 -- query 88
-SELECT COUNT(*) as null_huge_decimal_count FROM ${case_db}.decimal_test WHERE huge_decimal IS NULL;
+SELECT COUNT() as null_huge_decimal_count FROM ${case_db}.decimal_test WHERE huge_decimal IS NULL;
 
 -- query 89
-SELECT COUNT(*) as null_max_decimal_count FROM ${case_db}.decimal_test WHERE max_decimal IS NULL;
+SELECT COUNT() as null_max_decimal_count FROM ${case_db}.decimal_test WHERE max_decimal IS NULL;
 
 -- query 90
 SELECT
@@ -521,13 +521,13 @@ SELECT * FROM ${case_db}.decimal_test WHERE huge_decimal IS NOT NULL ORDER BY id
 SELECT * FROM ${case_db}.decimal_test WHERE max_decimal IS NOT NULL ORDER BY id;
 
 -- query 94
-SELECT COUNT(*) as not_null_big_decimal_count FROM ${case_db}.decimal_test WHERE big_decimal IS NOT NULL;
+SELECT COUNT() as not_null_big_decimal_count FROM ${case_db}.decimal_test WHERE big_decimal IS NOT NULL;
 
 -- query 95
-SELECT COUNT(*) as not_null_huge_decimal_count FROM ${case_db}.decimal_test WHERE huge_decimal IS NOT NULL;
+SELECT COUNT() as not_null_huge_decimal_count FROM ${case_db}.decimal_test WHERE huge_decimal IS NOT NULL;
 
 -- query 96
-SELECT COUNT(*) as not_null_max_decimal_count FROM ${case_db}.decimal_test WHERE max_decimal IS NOT NULL;
+SELECT COUNT() as not_null_max_decimal_count FROM ${case_db}.decimal_test WHERE max_decimal IS NOT NULL;
 
 -- query 97
 SELECT
@@ -680,7 +680,7 @@ SELECT * FROM ${case_db}.decimal_test WHERE
     ) ORDER BY id;
 
 -- query 134
-SELECT COUNT(*) as total_rows FROM ${case_db}.decimal_test;
+SELECT COUNT() as total_rows FROM ${case_db}.decimal_test;
 
 -- query 135
 SELECT COUNT(big_decimal) as non_null_big_decimal FROM ${case_db}.decimal_test;
@@ -719,7 +719,7 @@ FROM ${case_db}.decimal_test;
 -- query 145
 SELECT
     CASE WHEN big_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as big_decimal_status,
-    COUNT(*) as count
+    COUNT() as count
 FROM ${case_db}.decimal_test
 GROUP BY CASE WHEN big_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END
 ORDER BY big_decimal_status;
@@ -727,7 +727,7 @@ ORDER BY big_decimal_status;
 -- query 146
 SELECT
     CASE WHEN huge_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as huge_decimal_status,
-    COUNT(*) as count
+    COUNT() as count
 FROM ${case_db}.decimal_test
 GROUP BY CASE WHEN huge_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END
 ORDER BY huge_decimal_status;
@@ -735,7 +735,7 @@ ORDER BY huge_decimal_status;
 -- query 147
 SELECT
     CASE WHEN max_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as max_decimal_status,
-    COUNT(*) as count
+    COUNT() as count
 FROM ${case_db}.decimal_test
 GROUP BY CASE WHEN max_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END
 ORDER BY max_decimal_status;
@@ -744,7 +744,7 @@ ORDER BY max_decimal_status;
 SELECT
     CASE WHEN big_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as big_decimal_status,
     CASE WHEN huge_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as huge_decimal_status,
-    COUNT(*) as count
+    COUNT() as count
 FROM ${case_db}.decimal_test
 GROUP BY
     CASE WHEN big_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END,
@@ -755,7 +755,7 @@ ORDER BY big_decimal_status, huge_decimal_status;
 SELECT
     CASE WHEN big_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as big_decimal_status,
     CASE WHEN max_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as max_decimal_status,
-    COUNT(*) as count
+    COUNT() as count
 FROM ${case_db}.decimal_test
 GROUP BY
     CASE WHEN big_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END,
@@ -767,7 +767,7 @@ SELECT
     CASE WHEN big_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as big_decimal_status,
     CASE WHEN huge_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as huge_decimal_status,
     CASE WHEN max_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as max_decimal_status,
-    COUNT(*) as count
+    COUNT() as count
 FROM ${case_db}.decimal_test
 GROUP BY
     CASE WHEN big_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END,
@@ -778,19 +778,19 @@ ORDER BY big_decimal_status, huge_decimal_status, max_decimal_status;
 -- query 151
 SELECT
     CASE WHEN big_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as big_decimal_status,
-    COUNT(*) as count
+    COUNT() as count
 FROM ${case_db}.decimal_test
 GROUP BY CASE WHEN big_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END
-HAVING COUNT(*) > 1
+HAVING COUNT() > 1
 ORDER BY big_decimal_status;
 
 -- query 152
 SELECT
     CASE WHEN huge_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END as huge_decimal_status,
-    COUNT(*) as count
+    COUNT() as count
 FROM ${case_db}.decimal_test
 GROUP BY CASE WHEN huge_decimal IS NULL THEN 'NULL' ELSE 'NOT NULL' END
-HAVING COUNT(*) > 2
+HAVING COUNT() > 2
 ORDER BY huge_decimal_status;
 
 -- query 153

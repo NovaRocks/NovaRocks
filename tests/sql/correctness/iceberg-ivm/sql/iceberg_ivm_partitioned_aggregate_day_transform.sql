@@ -91,7 +91,7 @@ SELECT ts, c, s
 FROM pday_mv_${uuid0}
 ORDER BY ts;
 
-SELECT ts, COUNT(*) AS c, SUM(amount) AS s
+SELECT ts, COUNT() AS c, SUM(amount) AS s
 FROM ice_ivm_pday_${uuid0}.ns_${uuid0}.orders
 GROUP BY ts
 ORDER BY ts;

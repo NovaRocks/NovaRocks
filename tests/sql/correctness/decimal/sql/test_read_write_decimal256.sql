@@ -1093,5 +1093,5 @@ ORDER BY id1, id2, id3;
 SELECT decimal_value FROM ${case_db}.decimal_append_test_p50_s10 WHERE id1 = 2 AND id2 = 'key002' AND id3 = 200;
 
 -- query 89
-SELECT COUNT(*), SUM(regular_value), MIN(decimal_value), MAX(decimal_value)
+SELECT COUNT(), SUM(regular_value), MIN(decimal_value), MAX(decimal_value)
 FROM ${case_db}.decimal_append_test_p50_s10;

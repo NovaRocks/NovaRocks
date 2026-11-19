@@ -53,19 +53,19 @@ INSERT INTO ${case_db}.t_filter_dates_metrics VALUES
 
 SELECT metric, value
 FROM (
-    SELECT 'asia_america_customers' AS metric, COUNT(*) AS value
+    SELECT 'asia_america_customers' AS metric, COUNT() AS value
     FROM ${case_db}.t_filter_customer_metrics
     WHERE c_region IN ('ASIA', 'AMERICA')
     UNION ALL
-    SELECT 'asia_customers', COUNT(*)
+    SELECT 'asia_customers', COUNT()
     FROM ${case_db}.t_filter_customer_metrics
     WHERE c_region = 'ASIA'
     UNION ALL
-    SELECT 'datekey_19920101', COUNT(*)
+    SELECT 'datekey_19920101', COUNT()
     FROM ${case_db}.t_filter_dates_metrics
     WHERE d_datekey = 19920101
     UNION ALL
-    SELECT 'dates_1993', COUNT(*)
+    SELECT 'dates_1993', COUNT()
     FROM ${case_db}.t_filter_dates_metrics
     WHERE d_year = 1993
 ) t

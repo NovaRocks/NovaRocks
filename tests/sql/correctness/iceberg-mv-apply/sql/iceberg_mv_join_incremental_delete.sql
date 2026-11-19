@@ -118,7 +118,7 @@ FROM TABLE(generate_series(1000, 3499)) AS gs(id);
 REFRESH MATERIALIZED VIEW join_apply_mv_${uuid0};
 
 -- query 9
-SELECT COUNT(*) AS c, SUM(id) AS sum_id, SUM(amount) AS sum_amount
+SELECT COUNT() AS c, SUM(id) AS sum_id, SUM(amount) AS sum_amount
 FROM join_apply_mv_${uuid0};
 
 -- query 10
@@ -141,7 +141,7 @@ FROM TABLE(generate_series(3500, 3999)) AS gs(id);
 REFRESH MATERIALIZED VIEW join_apply_mv_${uuid0};
 
 -- query 12
-SELECT COUNT(*) AS c, SUM(id) AS sum_id, SUM(amount) AS sum_amount
+SELECT COUNT() AS c, SUM(id) AS sum_id, SUM(amount) AS sum_amount
 FROM join_apply_mv_${uuid0};
 
 -- query 13

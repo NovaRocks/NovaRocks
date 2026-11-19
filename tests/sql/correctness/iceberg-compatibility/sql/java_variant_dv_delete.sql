@@ -47,7 +47,7 @@ SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0}
 TRUNCATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0};
 
 -- query 7
-SELECT COUNT(*) AS remaining_rows FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0};
+SELECT COUNT() AS remaining_rows FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0};
 
 -- query 8
 -- @skip_result_check=true

@@ -273,7 +273,7 @@ SELECT id, tinyint_col FROM ${case_db}.t_int WHERE coalesce(tinyint_col, 0) IN (
 -- ============================================================
 -- query 31
 -- @order_sensitive=true
-SELECT int_col, count(*) AS cnt FROM ${case_db}.t_int GROUP BY int_col HAVING int_col IN (1000, 2000, 3000, 4000) ORDER BY int_col;
+SELECT int_col, count() AS cnt FROM ${case_db}.t_int GROUP BY int_col HAVING int_col IN (1000, 2000, 3000, 4000) ORDER BY int_col;
 
 -- ============================================================
 -- Subquery with IN
@@ -430,7 +430,7 @@ SELECT id, int_col FROM ${case_db}.t_int WHERE id IN (
 -- query 47
 -- @order_sensitive=true
 SELECT id, int_col FROM ${case_db}.t_int t1 WHERE (
-    SELECT count(*) FROM ${case_db}.t_large t2
+    SELECT count() FROM ${case_db}.t_large t2
     WHERE t2.category_id = t1.id AND t2.status IN ('active', 'pending', 'completed', 'processing')
 ) > 0 ORDER BY id;
 
@@ -525,7 +525,7 @@ ORDER BY id;
 -- Aggregate with IN
 -- ============================================================
 -- query 56
-SELECT count(*), sum(int_col), avg(int_col), min(int_col), max(int_col)
+SELECT count(), sum(int_col), avg(int_col), min(int_col), max(int_col)
 FROM ${case_db}.t_int
 WHERE int_col IN (1000, 2000, 3000, 4000, 5000, 6000);
 

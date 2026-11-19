@@ -209,7 +209,7 @@ SELECT DISTINCT arrays_zip([1, 2], ['a', 'b']) FROM arrays_zip_test LIMIT 5;
 
 -- query 34
 USE ${case_db};
-SELECT COUNT(*) AS cnt, arrays_zip([1], ['test']) 
+SELECT COUNT() AS cnt, arrays_zip([1], ['test'])
 FROM arrays_zip_test 
 GROUP BY arrays_zip([1], ['test']);
 

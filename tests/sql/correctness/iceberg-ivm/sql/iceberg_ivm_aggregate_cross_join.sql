@@ -80,7 +80,7 @@ FROM xjoin_mv_${uuid0}
 ORDER BY region;
 
 -- query 4
-SELECT r.region, COUNT(*) AS c, SUM(a.amount) AS s
+SELECT r.region, COUNT() AS c, SUM(a.amount) AS s
 FROM ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions AS r
 CROSS JOIN ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts AS a
 GROUP BY r.region
@@ -106,7 +106,7 @@ FROM xjoin_mv_${uuid0}
 ORDER BY region;
 
 -- query 8
-SELECT r.region, COUNT(*) AS c, SUM(a.amount) AS s
+SELECT r.region, COUNT() AS c, SUM(a.amount) AS s
 FROM ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions AS r
 CROSS JOIN ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts AS a
 GROUP BY r.region
@@ -131,7 +131,7 @@ FROM xjoin_mv_${uuid0}
 ORDER BY region;
 
 -- query 12
-SELECT r.region, COUNT(*) AS c, SUM(a.amount) AS s
+SELECT r.region, COUNT() AS c, SUM(a.amount) AS s
 FROM ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions AS r
 CROSS JOIN ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts AS a
 GROUP BY r.region

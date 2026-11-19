@@ -65,7 +65,7 @@ INSERT INTO ${case_db}.t1 VALUES (5, 'e');
 
 -- query 7
 -- Sanity check: 5 rows present before REWRITE.
-SELECT COUNT(*) AS n FROM ${case_db}.t1;
+SELECT COUNT() AS n FROM ${case_db}.t1;
 
 -- query 8
 -- @skip_result_check=true
@@ -92,7 +92,7 @@ INSERT INTO ${case_db}.t2 VALUES (1, 'x'), (2, 'y'), (3, 'z');
 
 -- query 12
 -- Baseline: 3 rows before noop REWRITE.
-SELECT COUNT(*) AS n FROM ${case_db}.t2;
+SELECT COUNT() AS n FROM ${case_db}.t2;
 
 -- query 13
 -- @skip_result_check=true
@@ -101,7 +101,7 @@ ALTER TABLE ${case_db}.t2 REWRITE MANIFESTS;
 
 -- query 14
 -- After noop REWRITE: all 3 rows still present.
-SELECT COUNT(*) AS n FROM ${case_db}.t2;
+SELECT COUNT() AS n FROM ${case_db}.t2;
 
 -- ---------------------------------------------------------------------------
 -- Case 3: Empty table → REWRITE MANIFESTS is a noop (no snapshot, no error)
@@ -115,7 +115,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 16
 -- Table is empty before REWRITE.
-SELECT COUNT(*) AS n FROM ${case_db}.t3;
+SELECT COUNT() AS n FROM ${case_db}.t3;
 
 -- query 17
 -- @skip_result_check=true
@@ -124,7 +124,7 @@ ALTER TABLE ${case_db}.t3 REWRITE MANIFESTS;
 
 -- query 18
 -- Still empty after REWRITE.
-SELECT COUNT(*) AS n FROM ${case_db}.t3;
+SELECT COUNT() AS n FROM ${case_db}.t3;
 
 -- ---------------------------------------------------------------------------
 -- Case 4: V2 table — REWRITE MANIFESTS works (not v3-only)
@@ -298,7 +298,7 @@ SELECT id, v FROM ${case_db}.t9 ORDER BY id;
 
 -- query 50
 -- Total row count confirms no data loss from the REWRITE.
-SELECT COUNT(*) AS n FROM ${case_db}.t9;
+SELECT COUNT() AS n FROM ${case_db}.t9;
 
 -- ---------------------------------------------------------------------------
 -- Case 10: Two consecutive REWRITEs — second is noop after first merged manifests
@@ -340,4 +340,4 @@ SELECT id, v FROM ${case_db}.t10 ORDER BY id;
 
 -- query 58
 -- Total count confirms no rows lost through the two-pass rewrite.
-SELECT COUNT(*) AS n FROM ${case_db}.t10;
+SELECT COUNT() AS n FROM ${case_db}.t10;

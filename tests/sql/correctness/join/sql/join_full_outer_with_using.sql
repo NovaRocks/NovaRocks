@@ -142,7 +142,7 @@ ORDER BY k1, k2;
 -- query 17
 -- FULL OUTER JOIN single-key USING + aggregation
 -- @order_sensitive=true
-SELECT k1, COUNT(*) as cnt, COUNT(v1) as cnt_v1, COUNT(v2) as cnt_v2
+SELECT k1, COUNT() as cnt, COUNT(v1) as cnt_v1, COUNT(v2) as cnt_v2
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1)
 GROUP BY k1
 ORDER BY k1;
@@ -150,7 +150,7 @@ ORDER BY k1;
 -- query 18
 -- FULL OUTER JOIN single-key USING + HAVING
 -- @order_sensitive=true
-SELECT k1, COUNT(*) as cnt
+SELECT k1, COUNT() as cnt
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1)
 GROUP BY k1
 HAVING k1 > 1 OR k1 IS NULL
@@ -264,7 +264,7 @@ ORDER BY k1, k2, v1, v2, v3, v4;
 -- Four-table FULL OUTER single-key USING + aggregation HAVING
 -- @order_sensitive=true
 SELECT k1,
-       COUNT(*) as total_rows,
+       COUNT() as total_rows,
        COUNT(v1) as t1_rows,
        COUNT(v2) as t2_rows,
        COUNT(v3) as t3_rows,
@@ -273,7 +273,7 @@ FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1)
         FULL OUTER JOIN ${case_db}.t3 USING(k1)
         FULL OUTER JOIN ${case_db}.t4 USING(k1)
 GROUP BY k1
-HAVING COUNT(*) > 1
+HAVING COUNT() > 1
 ORDER BY k1;
 
 -- query 32
@@ -319,7 +319,7 @@ ORDER BY k1, k2;
 -- Four-table FULL OUTER USING + aggregation with COUNT DISTINCT
 -- @order_sensitive=true
 SELECT k1, k2,
-       COUNT(*) as cnt,
+       COUNT() as cnt,
        COUNT(DISTINCT v1) as dist_v1,
        COUNT(DISTINCT v2) as dist_v2,
        MAX(v3) as max_v3,
@@ -363,7 +363,7 @@ ORDER BY k1, k2;
 -- query 40
 -- Four-table FULL OUTER USING + GROUP BY ROLLUP
 -- @order_sensitive=false
-SELECT k1, k2, COUNT(*) as cnt
+SELECT k1, k2, COUNT() as cnt
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t4 USING(k1, k2)
@@ -383,7 +383,7 @@ ORDER BY k1, v1, v2, v3, v4;
 -- Four-table single-key FULL OUTER USING + non_null_values HAVING
 -- @order_sensitive=true
 SELECT k1,
-       COUNT(*) as total,
+       COUNT() as total,
        SUM(CASE WHEN v1 IS NOT NULL THEN 1 ELSE 0 END) +
        SUM(CASE WHEN v2 IS NOT NULL THEN 1 ELSE 0 END) +
        SUM(CASE WHEN v3 IS NOT NULL THEN 1 ELSE 0 END) +
@@ -621,7 +621,7 @@ SELECT k1,
            WHEN v1 IS NOT NULL OR v2 IS NOT NULL THEN 1
            ELSE 0
        END) as match_score,
-       COUNT(*) as total
+       COUNT() as total
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1)
 GROUP BY k1
 ORDER BY match_score DESC, k1;
@@ -915,7 +915,7 @@ ORDER BY k1, k2;
 -- query 93
 -- Three-table FULL OUTER USING + aggregation HAVING with AVG
 -- @order_sensitive=true
-SELECT k1, COUNT(*) as cnt, AVG(k2) as avg_k2
+SELECT k1, COUNT() as cnt, AVG(k2) as avg_k2
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)
 GROUP BY k1

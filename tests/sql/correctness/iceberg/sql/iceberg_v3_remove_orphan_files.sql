@@ -58,7 +58,7 @@ INSERT INTO ${case_db}.t1 VALUES (3, 'c');
 
 -- query 5
 -- Sanity: 3 rows present before REMOVE ORPHAN FILES.
-SELECT COUNT(*) AS n FROM ${case_db}.t1;
+SELECT COUNT() AS n FROM ${case_db}.t1;
 
 -- query 6
 -- @expect_sql_code=query.execution.unsupported
@@ -72,7 +72,7 @@ SELECT id, v FROM ${case_db}.t1 ORDER BY id;
 
 -- query 8
 -- Row count still 3 confirming no data files were removed.
-SELECT COUNT(*) AS n FROM ${case_db}.t1;
+SELECT COUNT() AS n FROM ${case_db}.t1;
 
 -- ---------------------------------------------------------------------------
 -- Case 2: Empty table -> the same explicit scan refusal
@@ -86,7 +86,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 10
 -- Table is empty before REMOVE ORPHAN FILES.
-SELECT COUNT(*) AS n FROM ${case_db}.t2;
+SELECT COUNT() AS n FROM ${case_db}.t2;
 
 -- query 11
 -- @expect_sql_code=query.execution.unsupported
@@ -96,7 +96,7 @@ ALTER TABLE ${case_db}.t2 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 12
 -- Still empty after the explicit scan refusal.
-SELECT COUNT(*) AS n FROM ${case_db}.t2;
+SELECT COUNT() AS n FROM ${case_db}.t2;
 
 -- ---------------------------------------------------------------------------
 -- Case 3: Exact EXPIRE succeeds, scanned ORPHAN refuses, data is intact
@@ -123,7 +123,7 @@ INSERT INTO ${case_db}.t3 VALUES (30, 'z');
 
 -- query 17
 -- Baseline: 3 rows before the EXPIRE+ORPHAN pipeline.
-SELECT COUNT(*) AS n FROM ${case_db}.t3;
+SELECT COUNT() AS n FROM ${case_db}.t3;
 
 -- query 18
 -- @skip_result_check=true
@@ -188,7 +188,7 @@ INSERT INTO ${case_db}.t6 VALUES (2, 'second');
 
 -- query 28
 -- Baseline: 2 rows before REMOVE ORPHAN FILES on v2 table.
-SELECT COUNT(*) AS n FROM ${case_db}.t6;
+SELECT COUNT() AS n FROM ${case_db}.t6;
 
 -- query 29
 -- @expect_sql_code=query.execution.unsupported
@@ -262,7 +262,7 @@ INSERT INTO ${case_db}.t9 VALUES (200, 'beta');
 
 -- query 41
 -- Baseline: 2 rows.
-SELECT COUNT(*) AS n FROM ${case_db}.t9;
+SELECT COUNT() AS n FROM ${case_db}.t9;
 
 -- query 42
 -- @expect_sql_code=query.execution.unsupported
@@ -272,7 +272,7 @@ ALTER TABLE ${case_db}.t9 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 43
 -- Row count unchanged after the explicit scan refusal.
-SELECT COUNT(*) AS n FROM ${case_db}.t9;
+SELECT COUNT() AS n FROM ${case_db}.t9;
 
 -- ---------------------------------------------------------------------------
 -- Case 10: Combined EXPIRE -> ORPHAN -> INSERT maintenance sequence
@@ -299,7 +299,7 @@ INSERT INTO ${case_db}.t10 VALUES (3, 'row3');
 
 -- query 48
 -- Pre-maintenance baseline: 3 rows.
-SELECT COUNT(*) AS n FROM ${case_db}.t10;
+SELECT COUNT() AS n FROM ${case_db}.t10;
 
 -- query 49
 -- @skip_result_check=true
@@ -323,4 +323,4 @@ SELECT id, v FROM ${case_db}.t10 ORDER BY id;
 
 -- query 53
 -- Total count confirms no data loss through the full maintenance pipeline.
-SELECT COUNT(*) AS n FROM ${case_db}.t10;
+SELECT COUNT() AS n FROM ${case_db}.t10;

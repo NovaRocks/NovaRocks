@@ -101,78 +101,78 @@ INSERT INTO ${case_db}.pre_t1 VALUES
 
 -- query 7
 -- LEFT JOIN with reused abs() in WHERE
-SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5) AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5;
 
 -- query 8
 -- LEFT JOIN with reused bit_shift_left() in WHERE
-SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
 WHERE bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 10 OR bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 20;
 
 -- query 9
 -- RIGHT JOIN with reused abs() in WHERE
-SELECT COUNT(*) FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5) AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5;
 
 -- query 10
 -- RIGHT JOIN with reused bit_shift_left() in WHERE
-SELECT COUNT(*) FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
 WHERE bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 10 OR bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 20;
 
 -- query 11
 -- LEFT JOIN with inequality ON and reused abs() in WHERE
-SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 > ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 > ${case_db}.pre_t1.v4
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5) AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5;
 
 -- query 12
 -- LEFT JOIN with inequality ON and reused bit_shift_left() in WHERE
-SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 > ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 > ${case_db}.pre_t1.v4
 WHERE bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 10 OR bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 20;
 
 -- query 13
 -- RIGHT JOIN with inequality + equality ON and reused abs() in WHERE
-SELECT COUNT(*) FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 > ${case_db}.pre_t1.v4 AND ${case_db}.pre_t0.v2 = ${case_db}.pre_t1.v5
+SELECT COUNT() FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 > ${case_db}.pre_t1.v4 AND ${case_db}.pre_t0.v2 = ${case_db}.pre_t1.v5
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5) AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5;
 
 -- query 14
 -- LEFT JOIN with reused abs() range predicate
-SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5 AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) < 10;
 
 -- query 15
 -- LEFT JOIN with reused abs() + bit_shift_left() combination
-SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5)
   AND bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) > 10
   AND bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) < 20;
 
 -- query 16
 -- RIGHT JOIN with inequality ON and reused abs() OR ranges
-SELECT COUNT(*) FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 > ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 > ${case_db}.pre_t1.v4
 WHERE (abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5 AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) < 10)
    OR (abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 15 AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) < 20);
 
 -- query 17
 -- LEFT JOIN with nested reused abs(bit_shift_left())
-SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
 WHERE abs(bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1)) = abs(bit_shift_left(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5, 1))
   AND abs(bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1)) > 10;
 
 -- query 18
 -- RIGHT JOIN with reused arithmetic multiplication
-SELECT COUNT(*) FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
 WHERE (${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) * 2 = (${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5) * 2
   AND (${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) * 2 > 10
   AND (${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) * 2 < 100;
 
 -- query 19
 -- INNER JOIN with reused abs() in WHERE
-SELECT COUNT(*) FROM ${case_db}.pre_t0 JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5) AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5;
 
 -- query 20
 -- INNER JOIN with reused abs() in ON clause
-SELECT COUNT(*) FROM ${case_db}.pre_t0 JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
+SELECT COUNT() FROM ${case_db}.pre_t0 JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
   AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5) AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5;
 
 -- query 21
@@ -183,12 +183,12 @@ WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v
 -- query 22
 -- @order_sensitive=false
 -- LEFT SEMI JOIN with reused abs() in WHERE + GROUP BY
-SELECT COUNT(*), abs(${case_db}.pre_t0.v1) FROM ${case_db}.pre_t0
+SELECT COUNT(), abs(${case_db}.pre_t0.v1) FROM ${case_db}.pre_t0
 WHERE EXISTS (SELECT 1 FROM ${case_db}.pre_t1 WHERE ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4) AND (abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) > 10 AND abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) < 100 AND abs(${case_db}.pre_t0.v1) > 5)
 GROUP BY abs(${case_db}.pre_t0.v1);
 
 -- query 23
 -- LEFT ANTI JOIN with reused abs() in WHERE + GROUP BY (expect empty)
-SELECT COUNT(*), abs(${case_db}.pre_t0.v1) FROM ${case_db}.pre_t0
+SELECT COUNT(), abs(${case_db}.pre_t0.v1) FROM ${case_db}.pre_t0
 WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.pre_t1 WHERE ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4) AND (abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) > 10 AND abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) < 100 AND abs(${case_db}.pre_t0.v1) > 5)
 GROUP BY abs(${case_db}.pre_t0.v1);

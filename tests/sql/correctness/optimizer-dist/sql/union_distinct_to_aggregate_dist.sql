@@ -43,7 +43,7 @@ UNION
 SELECT k, s
 FROM ${case_db}.union_distinct_dist_r;
 
-SELECT COUNT(*) AS distinct_rows
+SELECT COUNT() AS distinct_rows
 FROM (
     SELECT k, s
     FROM ${case_db}.union_distinct_dist_l

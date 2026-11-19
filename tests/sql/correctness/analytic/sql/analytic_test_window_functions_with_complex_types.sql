@@ -948,6 +948,6 @@ SELECT CAST(127 AS TINYINT) AS upper_valid, CAST(128 AS TINYINT) AS upper_overfl
        CAST(-128 AS TINYINT) AS lower_valid, CAST(-129 AS TINYINT) AS lower_overflow;
 
 -- query 216
-SELECT COUNT(*) AS row_count, COUNT(c1) AS valid_count,
+SELECT COUNT() AS row_count, COUNT(c1) AS valid_count,
        SUM(CASE WHEN c1 IS NULL THEN 1 ELSE 0 END) AS null_count
 FROM ${case_db}.t1;

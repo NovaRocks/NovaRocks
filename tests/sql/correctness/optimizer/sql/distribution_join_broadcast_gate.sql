@@ -32,7 +32,7 @@ ANALYZE TABLE ${case_db}.oq8_build_big;
 SET cbo_broadcast_backend_count = 7;
 -- @explain_contains=bcast_verdict=feasible
 -- @explain_contains=HASH JOIN (BROADCAST
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM ${case_db}.oq8_probe_big p
 INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
 
@@ -48,7 +48,7 @@ INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
 SET cbo_broadcast_backend_count = 3;
 -- @explain_contains=bcast_verdict=feasible
 -- @explain_contains=HASH JOIN (BROADCAST
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM ${case_db}.oq8_probe_big p
 INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
 

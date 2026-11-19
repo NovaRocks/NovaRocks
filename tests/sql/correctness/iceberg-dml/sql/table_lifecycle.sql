@@ -42,7 +42,7 @@ ORDER BY k1;
 TRUNCATE TABLE ${case_db}.t_table_lifecycle;
 
 -- query 4
-SELECT count(*)
+SELECT count()
 FROM ${case_db}.t_table_lifecycle;
 
 -- query 5

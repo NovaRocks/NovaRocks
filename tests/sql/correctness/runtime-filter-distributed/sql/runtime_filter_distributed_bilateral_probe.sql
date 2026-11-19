@@ -102,7 +102,7 @@ SET cbo_enable_dp_join_reorder = false;
 SET cbo_enable_greedy_join_reorder = false;
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown,JoinAssociativity,JoinCommutativity';
-SELECT 'bilateral_probe' AS scenario, COUNT(*) AS row_count,
+SELECT 'bilateral_probe' AS scenario, COUNT() AS row_count,
        COALESCE(SUM(t1.v), 0) AS t1_sum, COALESCE(SUM(t2.v), 0) AS t2_sum
 FROM ${case_db}.rf_dist_bi_t1 t1
 JOIN ${case_db}.rf_dist_bi_t2 t2 ON t1.k = t2.k
@@ -128,7 +128,7 @@ SET disable_optimizer_rules = 'JoinAssociativity,JoinCommutativity';
 -- @explain_contains=rf_dist_bi_t3
 -- @explain_contains=expr = (t1.k)
 -- @explain_contains=expr = (t2.k)
-SELECT 'bilateral_probe' AS scenario, COUNT(*) AS row_count,
+SELECT 'bilateral_probe' AS scenario, COUNT() AS row_count,
        COALESCE(SUM(t1.v), 0) AS t1_sum, COALESCE(SUM(t2.v), 0) AS t2_sum
 FROM ${case_db}.rf_dist_bi_t1 t1
 JOIN ${case_db}.rf_dist_bi_t2 t2 ON t1.k = t2.k

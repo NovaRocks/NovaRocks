@@ -301,10 +301,10 @@ INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES (1, null), (2, 1), (3, 2), (4,
 INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 2), (3, 3);
 
 -- query 55
-SELECT count(*) FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON abs(t1.c_bigint)=abs(t2.c_int);
+SELECT count() FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON abs(t1.c_bigint)=abs(t2.c_int);
 
 -- query 56
-SELECT count(*) FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON abs(t1.c_bigint)=abs(t2.c_int);
+SELECT count() FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON abs(t1.c_bigint)=abs(t2.c_int);
 
 -- ============================================================
 -- Skew join with multi-key and additional predicate + NULL results
@@ -569,7 +569,7 @@ ANALYZE TABLE ${case_db}.t_mcv_r;
 -- @skip_result_check=true
 
 -- query 115
-SELECT count(*) FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
+SELECT count() FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
 
 -- query 116
 WITH l AS (SELECT (cast(k AS bigint) + 10) AS k2, v FROM ${case_db}.t_mcv_l), r AS (SELECT (cast(k AS bigint) + 10) AS k2, v FROM ${case_db}.t_mcv_r) SELECT count(*) FROM l JOIN r ON l.k2 = r.k2;
@@ -581,7 +581,7 @@ WITH l AS (SELECT (cast(k AS bigint) + 10) AS k2, v FROM ${case_db}.t_mcv_l), r 
 -- @skip_result_check=true
 
 -- query 118
-SELECT count(*) FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
+SELECT count() FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
 
 -- query 119
 -- @skip_result_check=true
@@ -593,7 +593,7 @@ SELECT count(*) FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_
 -- @skip_result_check=true
 
 -- query 121
-SELECT count(*) FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
+SELECT count() FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
 
 -- query 122
 -- @skip_result_check=true
@@ -605,7 +605,7 @@ SELECT count(*) FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_
 -- @skip_result_check=true
 
 -- query 124
-SELECT count(*) FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
+SELECT count() FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
 
 -- query 125
 -- @skip_result_check=true
@@ -665,10 +665,10 @@ ANALYZE TABLE ${case_db}.t_mcv_r2;
 -- @skip_result_check=true
 
 -- query 137
-SELECT count(*) FROM ${case_db}.t_mcv_l2 JOIN ${case_db}.t_mcv_r2 ON ${case_db}.t_mcv_l2.k = ${case_db}.t_mcv_r2.k;
+SELECT count() FROM ${case_db}.t_mcv_l2 JOIN ${case_db}.t_mcv_r2 ON ${case_db}.t_mcv_l2.k = ${case_db}.t_mcv_r2.k;
 
 -- query 138
-SELECT count(*) FROM ${case_db}.t_mcv_l2 LEFT JOIN ${case_db}.t_mcv_r2 ON ${case_db}.t_mcv_l2.k = ${case_db}.t_mcv_r2.k;
+SELECT count() FROM ${case_db}.t_mcv_l2 LEFT JOIN ${case_db}.t_mcv_r2 ON ${case_db}.t_mcv_l2.k = ${case_db}.t_mcv_r2.k;
 
 -- query 139
 -- @skip_result_check=true
@@ -736,7 +736,7 @@ ANALYZE TABLE ${case_db}.t_null_r;
 -- @skip_result_check=true
 
 -- query 153
-SELECT count(*) FROM ${case_db}.t_null_l LEFT JOIN ${case_db}.t_null_r ON ${case_db}.t_null_l.k = ${case_db}.t_null_r.k;
+SELECT count() FROM ${case_db}.t_null_l LEFT JOIN ${case_db}.t_null_r ON ${case_db}.t_null_l.k = ${case_db}.t_null_r.k;
 
 -- ============================================================
 -- Cleanup

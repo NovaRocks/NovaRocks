@@ -157,10 +157,10 @@ SELECT s.i_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON
 -- INNER JOIN: count with cross-type <=> and =
 -- ============================================================
 -- query 16
-SELECT count(*) FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.i_1 <=> t.s_1;
+SELECT count() FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.i_1 <=> t.s_1;
 
 -- query 17
-SELECT count(*) FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.i_1 = t.s_1;
+SELECT count() FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.i_1 = t.s_1;
 
 -- ============================================================
 -- INNER JOIN: Array<BigInt> = Array<DECIMAL> (various decimal precisions)

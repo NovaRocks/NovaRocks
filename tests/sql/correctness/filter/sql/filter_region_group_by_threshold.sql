@@ -42,7 +42,7 @@ INSERT INTO ${case_db}.t_filter_group_by_customer VALUES
     (13000, 'MIDDLE EAST'),
     (19000, 'MIDDLE EAST');
 
-SELECT c_region, COUNT(*) AS customer_count
+SELECT c_region, COUNT() AS customer_count
 FROM ${case_db}.t_filter_group_by_customer
 WHERE c_custkey > 15000
 GROUP BY c_region

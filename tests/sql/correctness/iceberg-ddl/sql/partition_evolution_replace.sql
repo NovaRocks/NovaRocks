@@ -44,11 +44,11 @@ INSERT INTO ${case_db}.t_replace_partition VALUES
   (4, '2024-01-15 13:00:00', 40.0),
   (5, '2024-02-10 14:00:00', 50.0),
   (6, '2024-03-05 15:00:00', 60.0);
-SELECT COUNT(*) AS cnt, SUM(val) AS sum_val FROM ${case_db}.t_replace_partition;
+SELECT COUNT() AS cnt, SUM(val) AS sum_val FROM ${case_db}.t_replace_partition;
 
 -- query 2
 -- Verify grouping by month still works across both partition specs.
-SELECT DATE_FORMAT(ts, '%Y-%m') AS ym, COUNT(*) AS cnt, SUM(val) AS sum_val
+SELECT DATE_FORMAT(ts, '%Y-%m') AS ym, COUNT() AS cnt, SUM(val) AS sum_val
 FROM ${case_db}.t_replace_partition
 GROUP BY DATE_FORMAT(ts, '%Y-%m')
 ORDER BY ym;
@@ -77,11 +77,11 @@ ALTER TABLE ${case_db}.t_replace_identity_to_bucket ADD PARTITION COLUMN bucket(
 INSERT INTO ${case_db}.t_replace_identity_to_bucket VALUES
   (4, 'Guangzhou', 300.0),
   (5, 'Beijing', 250.0);
-SELECT COUNT(*) AS cnt, SUM(amount) AS total FROM ${case_db}.t_replace_identity_to_bucket;
+SELECT COUNT() AS cnt, SUM(amount) AS total FROM ${case_db}.t_replace_identity_to_bucket;
 
 -- query 5
 -- Verify group-by on the original column works after replace.
-SELECT city, COUNT(*) AS cnt, SUM(amount) AS total
+SELECT city, COUNT() AS cnt, SUM(amount) AS total
 FROM ${case_db}.t_replace_identity_to_bucket
 GROUP BY city
 ORDER BY city;

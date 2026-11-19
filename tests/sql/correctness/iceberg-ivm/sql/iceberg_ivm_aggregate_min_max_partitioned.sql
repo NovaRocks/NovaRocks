@@ -109,7 +109,7 @@ ORDER BY region;
 SELECT region,
        MIN(amount) AS mn,
        MAX(amount) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_minmax_p_${uuid0}.ns_${uuid0}.orders
 GROUP BY region
 ORDER BY region;

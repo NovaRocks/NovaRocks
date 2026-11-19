@@ -73,7 +73,7 @@ SELECT id, region
   ORDER BY id;
 
 -- query 10
-SELECT region, COUNT(*) AS cnt
+SELECT region, COUNT() AS cnt
   FROM iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_${uuid0}
   GROUP BY region
   ORDER BY region;

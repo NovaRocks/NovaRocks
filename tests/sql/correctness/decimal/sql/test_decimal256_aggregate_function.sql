@@ -67,7 +67,7 @@ INSERT INTO ${case_db}.decimal256_agg_test VALUES
 (22, 'K', 777.7777777777, 777.777777777777777, 777.77777777777777777777, 888);
 
 -- query 2
-SELECT 'Test1_COUNT_BASIC' as test_name, COUNT(*) as total_rows FROM ${case_db}.decimal256_agg_test;
+SELECT 'Test1_COUNT_BASIC' as test_name, COUNT() as total_rows FROM ${case_db}.decimal256_agg_test;
 
 -- query 3
 SELECT
@@ -113,7 +113,7 @@ FROM ${case_db}.decimal256_agg_test;
 SELECT
     'Test5_GROUP_BY_CATEGORY' as test_name,
     category,
-    COUNT(*) as row_count,
+    COUNT() as row_count,
     SUM(p40s10) as sum_p40s10,
     AVG(p40s10) as avg_p40s10,
     MIN(p50s15) as min_p50s15,
@@ -126,7 +126,7 @@ ORDER BY category;
 SELECT
     'Test6_GROUP_BY_P40S10' as test_name,
     p40s10,
-    COUNT(*) as row_count,
+    COUNT() as row_count,
     SUM(p50s15) as sum_p50s15,
     AVG(p50s15) as avg_p50s15,
     MIN(p76s0) as min_p76s0,
@@ -194,7 +194,7 @@ FROM ${case_db}.decimal256_agg_test;
 SELECT
     'Test10_GROUP_COUNT_DISTINCT_planner0' as test_name,
     category,
-    COUNT(*) as row_count,
+    COUNT() as row_count,
     COUNT(DISTINCT p40s10) as distinct_p40s10,
     COUNT(DISTINCT p76s0) as distinct_p76s0
 FROM ${case_db}.decimal256_agg_test
@@ -205,7 +205,7 @@ ORDER BY category;
 SELECT
     'Test10_GROUP_COUNT_DISTINCT_planner2' as test_name,
     category,
-    COUNT(*) as row_count,
+    COUNT() as row_count,
     COUNT(DISTINCT p40s10) as distinct_p40s10,
     COUNT(DISTINCT p76s0) as distinct_p76s0
 FROM ${case_db}.decimal256_agg_test
@@ -256,7 +256,7 @@ ORDER BY category;
 SELECT
     'Test13_GROUP_BY_DECIMAL_DISTINCT_planner0' as test_name,
     p76s0,
-    COUNT(*) as row_count,
+    COUNT() as row_count,
     COUNT(DISTINCT p40s10) as distinct_p40s10,
     SUM(DISTINCT p40s10) as sum_distinct_p40s10,
     AVG(DISTINCT p40s10) as avg_distinct_p40s10
@@ -269,7 +269,7 @@ ORDER BY p76s0;
 SELECT
     'Test13_GROUP_BY_DECIMAL_DISTINCT_planner2' as test_name,
     p76s0,
-    COUNT(*) as row_count,
+    COUNT() as row_count,
     COUNT(DISTINCT p40s10) as distinct_p40s10,
     SUM(DISTINCT p40s10) as sum_distinct_p40s10,
     AVG(DISTINCT p40s10) as avg_distinct_p40s10
@@ -328,32 +328,32 @@ FROM ${case_db}.decimal256_agg_test;
 SELECT
     'Test17_HAVING_DISTINCT_planner0' as test_name,
     p40s10,
-    COUNT(*) as row_count,
+    COUNT() as row_count,
     COUNT(DISTINCT p50s15) as distinct_p50s15,
     SUM(DISTINCT p50s15) as sum_distinct_p50s15
 FROM ${case_db}.decimal256_agg_test
 WHERE p40s10 IS NOT NULL
 GROUP BY p40s10
-HAVING COUNT(*) > 1
+HAVING COUNT() > 1
 ORDER BY p40s10;
 
 -- query 30
 SELECT
     'Test17_HAVING_DISTINCT_planner2' as test_name,
     p40s10,
-    COUNT(*) as row_count,
+    COUNT() as row_count,
     COUNT(DISTINCT p50s15) as distinct_p50s15,
     SUM(DISTINCT p50s15) as sum_distinct_p50s15
 FROM ${case_db}.decimal256_agg_test
 WHERE p40s10 IS NOT NULL
 GROUP BY p40s10
-HAVING COUNT(*) > 1
+HAVING COUNT() > 1
 ORDER BY p40s10;
 
 -- query 31
 SELECT
     'Test18_EMPTY_RESULT' as test_name,
-    COUNT(*) as count_all,
+    COUNT() as count_all,
     SUM(p40s10) as sum_p40s10,
     AVG(p40s10) as avg_p40s10,
     MIN(p50s15) as min_p50s15,
@@ -364,7 +364,7 @@ WHERE id > 1000;
 -- query 32
 SELECT
     'Test19_NULL_ONLY' as test_name,
-    COUNT(*) as count_all,
+    COUNT() as count_all,
     COUNT(p40s10) as count_p40s10,
     SUM(p50s15) as sum_p50s15,
     AVG(p50s15) as avg_p50s15
@@ -374,7 +374,7 @@ WHERE id = 18;
 -- query 33
 SELECT
     'Test20_SINGLE_ROW' as test_name,
-    COUNT(*) as count_all,
+    COUNT() as count_all,
     SUM(p40s10) as sum_p40s10,
     AVG(p40s10) as avg_p40s10,
     MIN(p50s15) as min_p50s15,

@@ -105,7 +105,7 @@ INSERT INTO ${case_db}.decimal_range_partition VALUES
 SELECT
     'Test1_PARTITION_BASIC_QUERY' as test_name,
     DATE_FORMAT(transaction_date, '%Y-%m') as month,
-    COUNT(*) as transaction_count,
+    COUNT() as transaction_count,
     SUM(amount) as total_amount,
     AVG(balance) as avg_balance,
     MAX(amount) as max_amount,
@@ -130,7 +130,7 @@ ORDER BY transaction_date;
 SELECT
     'Test3_CROSS_PARTITION_AGGREGATION' as test_name,
     account_type,
-    COUNT(*) as transaction_count,
+    COUNT() as transaction_count,
     SUM(amount) as total_amount,
     AVG(amount) as avg_amount,
     SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as total_deposits,
@@ -144,7 +144,7 @@ SELECT
     'Test4_LIST_PARTITION_AGGREGATION' as test_name,
     amount_range,
     category,
-    COUNT(*) as count,
+    COUNT() as count,
     SUM(amount) as total_amount,
     AVG(amount) as avg_amount,
     MIN(amount) as min_amount,
@@ -169,7 +169,7 @@ ORDER BY amount DESC;
 SELECT
     'Test7_ALL_PARTITIONS_INCLUDING_NEW' as test_name,
     DATE_FORMAT(transaction_date, '%Y-%m') as month,
-    COUNT(*) as transaction_count,
+    COUNT() as transaction_count,
     SUM(amount) as total_amount,
     AVG(balance) as avg_balance
 FROM ${case_db}.decimal_range_partition
@@ -196,7 +196,7 @@ WITH monthly_stats AS (
         DATE_FORMAT(transaction_date, '%Y-%m') as month,
         account_type,
         SUM(amount) as monthly_total,
-        COUNT(*) as monthly_count
+        COUNT() as monthly_count
     FROM ${case_db}.decimal_range_partition
     GROUP BY DATE_FORMAT(transaction_date, '%Y-%m'), account_type
 )
@@ -217,7 +217,7 @@ ORDER BY dp.transaction_date;
 SELECT
     'Test10_PARTITION_INFORMATION' as test_name,
     DATE_FORMAT(transaction_date, '%Y-%m') as partition_month,
-    COUNT(*) as row_count,
+    COUNT() as row_count,
     SUM(CASE WHEN amount > 0 THEN 1 ELSE 0 END) as positive_transactions,
     SUM(CASE WHEN amount < 0 THEN 1 ELSE 0 END) as negative_transactions,
     MIN(balance) as min_balance_in_partition,

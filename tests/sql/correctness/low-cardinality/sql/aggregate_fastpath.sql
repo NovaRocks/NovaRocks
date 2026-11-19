@@ -32,13 +32,13 @@ INSERT INTO ${case_db}.dict_agg_fastpath_t VALUES
   (5, 'CANCELLED', 'east', 50),
   (6, NULL, 'west', 60);
 
-SELECT status, COUNT(*) AS c, SUM(v) AS total
+SELECT status, COUNT() AS c, SUM(v) AS total
 FROM ${case_db}.dict_agg_fastpath_t
 GROUP BY status
 ORDER BY status IS NOT NULL, status;
 
 -- Mixed string grouping keeps plain result semantics.
-SELECT status, region, COUNT(*) AS c
+SELECT status, region, COUNT() AS c
 FROM ${case_db}.dict_agg_fastpath_t
 GROUP BY status, region
 ORDER BY status IS NOT NULL, status, region;

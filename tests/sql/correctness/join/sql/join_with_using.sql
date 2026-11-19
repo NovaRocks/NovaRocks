@@ -266,7 +266,7 @@ SELECT * FROM (
 -- @order_sensitive=true
 SELECT outer_query.id1, outer_query.total_count
 FROM (
-    SELECT id1, COUNT(*) as total_count
+    SELECT id1, COUNT() as total_count
     FROM ${case_db}.left_table L JOIN ${case_db}.right_table R USING(id1)
     GROUP BY id1
 ) outer_query

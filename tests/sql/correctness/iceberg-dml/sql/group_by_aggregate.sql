@@ -33,7 +33,7 @@ INSERT INTO ${case_db}.t_metrics VALUES
   ('B', 5),
   ('B', -1),
   ('B', NULL);
-SELECT grp, COUNT(*) AS cnt_all, COUNT(v) AS cnt_v, SUM(v) AS sum_v
+SELECT grp, COUNT() AS cnt_all, COUNT(v) AS cnt_v, SUM(v) AS sum_v
 FROM ${case_db}.t_metrics
 GROUP BY grp
 ORDER BY grp;

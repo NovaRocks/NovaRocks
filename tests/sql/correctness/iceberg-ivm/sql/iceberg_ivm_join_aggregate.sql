@@ -125,7 +125,7 @@ FROM join_agg_mv_${uuid0}
 ORDER BY region;
 
 -- query 9
-SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
+SELECT d.region, COUNT() AS c, SUM(f.amount) AS s
 FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region
@@ -137,7 +137,7 @@ FROM join_agg_dim_amount_mv_${uuid0}
 ORDER BY region;
 
 -- query 11
-SELECT d.region, COUNT(*) AS c, SUM(d.amount) AS s
+SELECT d.region, COUNT() AS c, SUM(d.amount) AS s
 FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region
@@ -200,7 +200,7 @@ FROM join_agg_dim_amount_mv_${uuid0}
 ORDER BY region;
 
 -- query 22
-SELECT d.region, COUNT(*) AS c, SUM(d.amount) AS s
+SELECT d.region, COUNT() AS c, SUM(d.amount) AS s
 FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region

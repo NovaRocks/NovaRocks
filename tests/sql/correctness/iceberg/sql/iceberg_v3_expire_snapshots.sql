@@ -57,7 +57,7 @@ INSERT INTO ${case_db}.t1 VALUES (3, 'c');
 
 -- query 5
 -- Sanity: 3 rows present before EXPIRE.
-SELECT COUNT(*) AS n FROM ${case_db}.t1;
+SELECT COUNT() AS n FROM ${case_db}.t1;
 
 -- query 6
 -- @skip_result_check=true
@@ -71,7 +71,7 @@ SELECT id, v FROM ${case_db}.t1 ORDER BY id;
 
 -- query 8
 -- Row count still 3 after noop expire.
-SELECT COUNT(*) AS n FROM ${case_db}.t1;
+SELECT COUNT() AS n FROM ${case_db}.t1;
 
 -- ---------------------------------------------------------------------------
 -- Case 2: RETAIN LAST clause syntax acceptance
@@ -98,7 +98,7 @@ INSERT INTO ${case_db}.t2 VALUES (30, 'z');
 
 -- query 13
 -- Baseline: 3 rows before EXPIRE.
-SELECT COUNT(*) AS n FROM ${case_db}.t2;
+SELECT COUNT() AS n FROM ${case_db}.t2;
 
 -- query 14
 -- @skip_result_check=true
@@ -107,7 +107,7 @@ ALTER TABLE ${case_db}.t2 EXPIRE SNAPSHOTS RETAIN LAST 1;
 
 -- query 15
 -- After noop EXPIRE: all 3 rows still present.
-SELECT COUNT(*) AS n FROM ${case_db}.t2;
+SELECT COUNT() AS n FROM ${case_db}.t2;
 
 -- ---------------------------------------------------------------------------
 -- Case 3: Both clauses together (OLDER THAN + RETAIN LAST)
@@ -171,7 +171,7 @@ ALTER TABLE iceberg_cat_${suite_uuid0}.${case_db}.t4 CREATE TAG release_v1;
 
 -- query 27
 -- 3 rows visible through main branch.
-SELECT COUNT(*) AS n FROM ${case_db}.t4;
+SELECT COUNT() AS n FROM ${case_db}.t4;
 
 -- query 28
 -- @skip_result_check=true
@@ -244,7 +244,7 @@ INSERT INTO ${case_db}.t8 VALUES (2, 'second');
 
 -- query 39
 -- Baseline before EXPIRE on v2 table.
-SELECT COUNT(*) AS n FROM ${case_db}.t8;
+SELECT COUNT() AS n FROM ${case_db}.t8;
 
 -- query 40
 -- @skip_result_check=true
@@ -300,7 +300,7 @@ ALTER TABLE ${case_db}.t10 EXPIRE SNAPSHOTS OLDER THAN '2026-01-01 00:00:00' OLD
 
 -- query 49
 -- A syntax rejection must not remove the target table.
-SELECT COUNT(*) AS n FROM ${case_db}.t10;
+SELECT COUNT() AS n FROM ${case_db}.t10;
 
 -- ---------------------------------------------------------------------------
 -- Case 11: After EXPIRE, table still readable + INSERT works
@@ -337,4 +337,4 @@ SELECT id, v FROM ${case_db}.t11 ORDER BY id;
 
 -- query 56
 -- Total row count confirms no data loss.
-SELECT COUNT(*) AS n FROM ${case_db}.t11;
+SELECT COUNT() AS n FROM ${case_db}.t11;

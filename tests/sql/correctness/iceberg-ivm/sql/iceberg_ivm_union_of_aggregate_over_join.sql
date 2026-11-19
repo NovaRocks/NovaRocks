@@ -105,12 +105,12 @@ FROM ujoin_mv_${uuid0}
 ORDER BY region, s;
 
 -- query 4
-SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
+SELECT d.region, COUNT() AS c, SUM(f.amount) AS s
 FROM ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_ujoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region
 UNION ALL
-SELECT d.region, COUNT(*) AS c, SUM(d.amount) AS s
+SELECT d.region, COUNT() AS c, SUM(d.amount) AS s
 FROM ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_ujoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region
@@ -138,12 +138,12 @@ FROM ujoin_mv_${uuid0}
 ORDER BY region, s;
 
 -- query 8
-SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
+SELECT d.region, COUNT() AS c, SUM(f.amount) AS s
 FROM ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_ujoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region
 UNION ALL
-SELECT d.region, COUNT(*) AS c, SUM(d.amount) AS s
+SELECT d.region, COUNT() AS c, SUM(d.amount) AS s
 FROM ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_ujoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region
@@ -166,12 +166,12 @@ FROM ujoin_mv_${uuid0}
 ORDER BY region, s;
 
 -- query 12
-SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
+SELECT d.region, COUNT() AS c, SUM(f.amount) AS s
 FROM ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_ujoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region
 UNION ALL
-SELECT d.region, COUNT(*) AS c, SUM(d.amount) AS s
+SELECT d.region, COUNT() AS c, SUM(d.amount) AS s
 FROM ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_ujoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region

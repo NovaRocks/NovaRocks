@@ -71,63 +71,63 @@ INSERT INTO ${case_db}.t0 (region, order_date, income, ship_mode, ship_code) VAL
 
 -- query 2
 -- t0 has 33 rows; skip 10, take 20 → 20 rows
-SELECT count(*) FROM (SELECT * FROM ${case_db}.t0 LIMIT 10, 20) xx;
+SELECT count() FROM (SELECT * FROM ${case_db}.t0 LIMIT 10, 20) xx;
 
 -- query 3
 -- skip 20, take 20 → only 13 remaining
-SELECT count(*) FROM (SELECT * FROM ${case_db}.t0 LIMIT 20, 20) xx;
+SELECT count() FROM (SELECT * FROM ${case_db}.t0 LIMIT 20, 20) xx;
 
 -- query 4
 -- skip 50 → past end, 0 rows
-SELECT count(*) FROM (SELECT * FROM ${case_db}.t0 LIMIT 50, 20) xx;
+SELECT count() FROM (SELECT * FROM ${case_db}.t0 LIMIT 50, 20) xx;
 
 -- query 5
 -- outer LIMIT 10 → 10 rows; then skip 10 → 0 rows
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 10) x LIMIT 10, 20) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 10) x LIMIT 10, 20) xx;
 
 -- query 6
 -- inner: skip 10, take 10 → 10 rows; outer: skip 1, take 2 → 2 rows
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 10, 10) x LIMIT 1, 2) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 10, 10) x LIMIT 1, 2) xx;
 
 -- query 7
 -- inner: skip 10, take 50 → 23 rows; outer: skip 10, take 30 → 13 rows
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 10, 50) x LIMIT 10, 30) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 10, 50) x LIMIT 10, 30) xx;
 
 -- query 8
 -- inner: skip 50, take 1 → 0 rows; outer: skip 1 → still 0
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 50, 1) x LIMIT 1, 1) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 50, 1) x LIMIT 1, 1) xx;
 
 -- query 9
 -- inner: skip 40, take 10 → 0 rows (33 total); outer: take 2 → 0
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 40, 10) x LIMIT 2) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 40, 10) x LIMIT 2) xx;
 
 -- query 10
 -- inner: skip 40, take 2 → 0 rows; outer: take 1 → 0
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 40, 2) x LIMIT 1) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 40, 2) x LIMIT 1) xx;
 
 -- query 11
 -- inner: skip 30, take 10 → 3 rows; outer: take 2 → 2
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 30, 10) x LIMIT 2) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 30, 10) x LIMIT 2) xx;
 
 -- query 12
 -- inner: skip 30, take 2 → 2 rows; outer: take 1 → 1
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 30, 2) x LIMIT 1) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 30, 2) x LIMIT 1) xx;
 
 -- query 13
 -- inner: skip 30, take 2 → 2 rows; outer: take 5 → 2 (capped)
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 30, 2) x LIMIT 5) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 30, 2) x LIMIT 5) xx;
 
 -- query 14
 -- inner: take 20; outer: skip 10, take 40 → 10 rows
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 20) x LIMIT 10, 40) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 20) x LIMIT 10, 40) xx;
 
 -- query 15
 -- inner: take 10; outer: skip 10 → 0 rows
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 10) x LIMIT 10, 10) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 10) x LIMIT 10, 10) xx;
 
 -- query 16
 -- inner: take 30; outer: skip 50 → 0 rows
-SELECT COUNT(*) FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 30) x LIMIT 50, 10) xx;
+SELECT COUNT() FROM (SELECT * FROM (SELECT * FROM ${case_db}.t0 LIMIT 30) x LIMIT 50, 10) xx;
 
 -- query 17
 -- generate_series 1..100000; skip 50000, take 10
@@ -150,7 +150,7 @@ SELECT count() FROM (SELECT * FROM TABLE(generate_series(1, 100000)) LIMIT 1, 10
 WITH C AS (SELECT region, sum(income) AS total FROM ${case_db}.t0 GROUP BY 1),
      L AS (SELECT total FROM C LIMIT 3),
      R AS (SELECT total FROM C LIMIT 4)
-SELECT count(*) FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
+SELECT count() FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
 
 -- query 22
 -- push-down=false: EXPLAIN executes without error; both branches share the conservative max limit
@@ -169,7 +169,7 @@ SELECT  count(*) FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
 WITH C AS (SELECT region, sum(income) AS total FROM ${case_db}.t0 GROUP BY 1),
      L AS (SELECT total FROM C LIMIT 3),
      R AS (SELECT total FROM C LIMIT 4)
-SELECT count(*) FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
+SELECT count() FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
 
 -- query 25
 -- push-down=true: EXPLAIN executes without error; the L branch gets its own tighter limit (3)

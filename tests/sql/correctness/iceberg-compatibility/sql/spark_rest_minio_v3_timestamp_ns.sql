@@ -130,7 +130,7 @@ SELECT id, CAST(ts AS STRING) AS s
 -- ts > '2024-01-02 03:04:05.000000001' matches only row 1 (.123456789).
 -- If the predicate were rounded to microseconds (.000000), rows 1 and 2 would
 -- both pass (COUNT=2), proving the nanosecond path is exercised end-to-end.
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
   FROM iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0}
   WHERE ts > '2024-01-02 03:04:05.000000001';
 

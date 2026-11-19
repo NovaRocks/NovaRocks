@@ -54,7 +54,7 @@ FROM ${case_db}.t_v3_update_multi_file
 ORDER BY id;
 
 -- query 6
-SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT(*) AS total_rows
+SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT() AS total_rows
 FROM ${case_db}.t_v3_update_multi_file;
 
 -- query 7

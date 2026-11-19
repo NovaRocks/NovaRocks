@@ -165,4 +165,4 @@ SELECT i, mi, ms, mi IS NULL AS mi_parent_null, ms IS NULL AS ms_parent_null FRO
 
 -- query 27
 USE ${case_db};
-SELECT COUNT(*) AS rows_total, COUNT(mi) AS mi_present, COUNT(ms) AS ms_present, COUNT(ms[1]) AS ms_nonnull_values FROM tc;
+SELECT COUNT() AS rows_total, COUNT(mi) AS mi_present, COUNT(ms) AS ms_present, COUNT(ms[1]) AS ms_nonnull_values FROM tc;

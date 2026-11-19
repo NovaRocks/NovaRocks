@@ -118,7 +118,7 @@ FROM fanin_mv_${uuid0}
 ORDER BY region;
 
 -- query 10
-SELECT region, COUNT(*) AS c, SUM(amount) AS s
+SELECT region, COUNT() AS c, SUM(amount) AS s
 FROM (
   SELECT region, amount
   FROM ice_ivm_fanin_${uuid0}.ns_${uuid0}.fact_east

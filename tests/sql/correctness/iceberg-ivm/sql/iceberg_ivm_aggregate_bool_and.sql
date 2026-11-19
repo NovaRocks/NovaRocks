@@ -86,7 +86,7 @@ ORDER BY region;
 -- Plain GROUP BY verification.
 SELECT region,
        BOOL_AND(flag) AS all_true,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_bool_and_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;
@@ -109,7 +109,7 @@ ORDER BY region;
 -- query 7
 SELECT region,
        BOOL_AND(flag) AS all_true,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_bool_and_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;
@@ -142,7 +142,7 @@ ORDER BY region;
 -- query 12
 SELECT region,
        BOOL_AND(flag) AS all_true,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_bool_and_db_${uuid0}.ns_${uuid0}.events
 GROUP BY region
 ORDER BY region;

@@ -48,12 +48,12 @@ INSERT INTO ${case_db}.t_limit_global VALUES
   (7), (8), (9);
 
 -- query 6
-SELECT COUNT(*) FROM (
+SELECT COUNT() FROM (
   SELECT 1 AS marker FROM ${case_db}.t_limit_global LIMIT 1
 ) x;
 
 -- query 7
-SELECT COUNT(*) FROM (
+SELECT COUNT() FROM (
   SELECT 42 AS host_key
 ) h
 LEFT JOIN (

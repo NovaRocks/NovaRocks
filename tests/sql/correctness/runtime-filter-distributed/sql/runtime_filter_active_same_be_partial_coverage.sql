@@ -57,7 +57,7 @@ SET global_runtime_filter_probe_min_selectivity = 0.0;
 SET cbo_broadcast_node_mem_budget_bytes = 0;
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT 'partial_coverage' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'partial_coverage' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_active_partial_probe p
 JOIN ${case_db}.rf_active_partial_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -66,7 +66,7 @@ WHERE b.flag = 'Y';
 -- @normalize_explain_timing=true
 -- @result_not_contains=RuntimeFilterApply:
 EXPLAIN ANALYZE
-SELECT COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_active_partial_probe p
 JOIN ${case_db}.rf_active_partial_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -77,7 +77,7 @@ SET disable_optimizer_rules = '';
 -- @explain_contains=HASH_PARTITIONED (b.k)
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
-SELECT 'partial_coverage' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'partial_coverage' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_active_partial_probe p
 JOIN ${case_db}.rf_active_partial_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -88,7 +88,7 @@ WHERE b.flag = 'Y';
 -- @result_contains=Profile: tasks=
 -- @result_contains=HASH JOIN (PARTITIONED
 EXPLAIN ANALYZE
-SELECT COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_active_partial_probe p
 JOIN ${case_db}.rf_active_partial_build b ON p.k = b.k
 WHERE b.flag = 'Y';

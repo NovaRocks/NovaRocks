@@ -28,12 +28,12 @@ ANALYZE TABLE ${case_db}.eq_b;
 ANALYZE TABLE ${case_db}.eq_p;
 
 -- RF enabled (default).
-SELECT b.k, count(*) AS c
+SELECT b.k, count() AS c
 FROM ${case_db}.eq_p p JOIN ${case_db}.eq_b b ON p.k = b.k
 GROUP BY b.k ORDER BY b.k;
 
 -- RF disabled: same result.
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT b.k, count(*) AS c
+SELECT b.k, count() AS c
 FROM ${case_db}.eq_p p JOIN ${case_db}.eq_b b ON p.k = b.k
 GROUP BY b.k ORDER BY b.k;

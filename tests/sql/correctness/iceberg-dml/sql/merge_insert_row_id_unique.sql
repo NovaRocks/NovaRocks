@@ -35,11 +35,11 @@ WHEN MATCHED THEN UPDATE SET v=s.v WHEN NOT MATCHED THEN INSERT (id,v) VALUES (s
 INSERT INTO ${case_db}.t_merge_row_id VALUES (6,'f'),(7,'g');
 
 -- query 2
-SELECT COUNT(*) AS total_rows, COUNT(DISTINCT _row_id) AS unique_row_ids,
+SELECT COUNT() AS total_rows, COUNT(DISTINCT _row_id) AS unique_row_ids,
 SUM(CASE WHEN _row_id IS NULL THEN 1 ELSE 0 END) AS null_row_ids FROM ${case_db}.t_merge_row_id;
 
 -- query 3
-SELECT COUNT(*) AS source_rows, SUM(CASE WHEN cur.rid=old.rid THEN 1 ELSE 0 END) AS preserved_row_ids
+SELECT COUNT() AS source_rows, SUM(CASE WHEN cur.rid=old.rid THEN 1 ELSE 0 END) AS preserved_row_ids
 FROM (SELECT id,_row_id AS rid FROM ${case_db}.t_merge_row_id) cur
 JOIN (SELECT id,_row_id AS rid FROM ${case_db}.t_merge_row_id FOR VERSION AS OF 'before_merge') old ON cur.id=old.id;
 

@@ -91,7 +91,7 @@ TBLPROPERTIES ('write.row-lineage'='false') AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
 -- query 8
-SELECT COUNT(*) AS n, COUNT(_row_id) AS assigned_ids,
+SELECT COUNT() AS n, COUNT(_row_id) AS assigned_ids,
        COUNT(_last_updated_sequence_number) AS assigned_sequences
   FROM lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success;
 

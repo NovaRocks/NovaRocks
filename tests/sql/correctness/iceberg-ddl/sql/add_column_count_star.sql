@@ -34,7 +34,7 @@ INSERT INTO ${case_db}.t0 VALUES (1, 1);
 
 -- query 2
 -- @order_sensitive=true
-SELECT count(*) AS row_count FROM ${case_db}.t0;
+SELECT count() AS row_count FROM ${case_db}.t0;
 
 -- query 3
 -- @order_sensitive=true
@@ -46,7 +46,7 @@ ALTER TABLE ${case_db}.t0 ADD COLUMN b1 BOOLEAN;
 
 -- query 5
 -- @order_sensitive=true
-SELECT count(*) AS row_count FROM ${case_db}.t0;
+SELECT count() AS row_count FROM ${case_db}.t0;
 
 -- query 6
 -- @order_sensitive=true

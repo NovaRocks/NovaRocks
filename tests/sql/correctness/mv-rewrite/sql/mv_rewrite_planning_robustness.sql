@@ -149,7 +149,7 @@ REFRESH MATERIALIZED VIEW xns_mv WITH SYNC MODE;
 SELECT category_l1, COUNT(*), SUM(sales_amount) FROM mvrw_${uuid0}.ns_${uuid0}.sales_data GROUP BY category_l1;
 
 -- query 17
-SELECT category_l1, COUNT(*) AS c, SUM(sales_amount) AS s
+SELECT category_l1, COUNT() AS c, SUM(sales_amount) AS s
 FROM mvrw_${uuid0}.ns_${uuid0}.sales_data GROUP BY category_l1 ORDER BY category_l1;
 
 -- query 18

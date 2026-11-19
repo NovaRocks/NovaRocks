@@ -58,7 +58,7 @@ set pipeline_dop = 1;
 
 -- query 7
 -- INNER JOIN, interleaving_group_size=0, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -67,7 +67,7 @@ join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <>
 
 -- query 9
 -- INNER JOIN, interleaving_group_size=-10, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -76,7 +76,7 @@ join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <>
 
 -- query 11
 -- LEFT JOIN, interleaving_group_size=0, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -85,7 +85,7 @@ left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppk
 
 -- query 13
 -- LEFT JOIN, interleaving_group_size=-10, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -94,7 +94,7 @@ left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppk
 
 -- query 15
 -- NOT EXISTS, interleaving_group_size=0, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where not exists (
   select * from ${case_db}.lineitem l3
@@ -106,7 +106,7 @@ where not exists (
 
 -- query 17
 -- NOT EXISTS, interleaving_group_size=-10, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where not exists (
   select * from ${case_db}.lineitem l3
@@ -118,7 +118,7 @@ where not exists (
 
 -- query 19
 -- NOT IN, interleaving_group_size=0, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey not in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -129,7 +129,7 @@ where l1.l_orderkey not in (
 
 -- query 21
 -- NOT IN, interleaving_group_size=-10, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey not in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -140,7 +140,7 @@ where l1.l_orderkey not in (
 
 -- query 23
 -- EXISTS, interleaving_group_size=0, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where exists (
   select * from ${case_db}.lineitem l3
@@ -152,7 +152,7 @@ where exists (
 
 -- query 25
 -- EXISTS, interleaving_group_size=-10, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where exists (
   select * from ${case_db}.lineitem l3
@@ -164,7 +164,7 @@ where exists (
 
 -- query 27
 -- IN, interleaving_group_size=0, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -175,7 +175,7 @@ where l1.l_orderkey in (
 
 -- query 29
 -- IN, interleaving_group_size=-10, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -186,7 +186,7 @@ where l1.l_orderkey in (
 
 -- query 31
 -- RIGHT JOIN, interleaving_group_size=0, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -195,7 +195,7 @@ right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_supp
 
 -- query 33
 -- RIGHT JOIN, interleaving_group_size=-10, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -204,7 +204,7 @@ right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_supp
 
 -- query 35
 -- FULL OUTER JOIN, interleaving_group_size=0, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -213,7 +213,7 @@ full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l
 
 -- query 37
 -- FULL OUTER JOIN, interleaving_group_size=-10, chunk_size=2, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -229,7 +229,7 @@ full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l
 
 -- query 40
 -- INNER JOIN, interleaving_group_size=0, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -238,7 +238,7 @@ join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <>
 
 -- query 42
 -- INNER JOIN, interleaving_group_size=-10, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -247,7 +247,7 @@ join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <>
 
 -- query 44
 -- LEFT JOIN, interleaving_group_size=0, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -256,7 +256,7 @@ left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppk
 
 -- query 46
 -- LEFT JOIN, interleaving_group_size=-10, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -265,7 +265,7 @@ left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppk
 
 -- query 48
 -- NOT EXISTS, interleaving_group_size=0, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where not exists (
   select * from ${case_db}.lineitem l3
@@ -277,7 +277,7 @@ where not exists (
 
 -- query 50
 -- NOT EXISTS, interleaving_group_size=-10, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where not exists (
   select * from ${case_db}.lineitem l3
@@ -289,7 +289,7 @@ where not exists (
 
 -- query 52
 -- NOT IN, interleaving_group_size=0, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey not in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -300,7 +300,7 @@ where l1.l_orderkey not in (
 
 -- query 54
 -- NOT IN, interleaving_group_size=-10, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey not in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -311,7 +311,7 @@ where l1.l_orderkey not in (
 
 -- query 56
 -- EXISTS, interleaving_group_size=0, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where exists (
   select * from ${case_db}.lineitem l3
@@ -323,7 +323,7 @@ where exists (
 
 -- query 58
 -- EXISTS, interleaving_group_size=-10, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where exists (
   select * from ${case_db}.lineitem l3
@@ -335,7 +335,7 @@ where exists (
 
 -- query 60
 -- IN, interleaving_group_size=0, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -346,7 +346,7 @@ where l1.l_orderkey in (
 
 -- query 62
 -- IN, interleaving_group_size=-10, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -357,7 +357,7 @@ where l1.l_orderkey in (
 
 -- query 64
 -- RIGHT JOIN, interleaving_group_size=0, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -366,7 +366,7 @@ right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_supp
 
 -- query 66
 -- RIGHT JOIN, interleaving_group_size=-10, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -375,7 +375,7 @@ right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_supp
 
 -- query 68
 -- FULL OUTER JOIN, interleaving_group_size=0, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -384,7 +384,7 @@ full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l
 
 -- query 70
 -- FULL OUTER JOIN, interleaving_group_size=-10, chunk_size=3, <>
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey;
 
@@ -400,7 +400,7 @@ full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l
 
 -- query 73
 -- INNER JOIN, interleaving_group_size=0, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -409,7 +409,7 @@ join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = 
 
 -- query 75
 -- INNER JOIN, interleaving_group_size=-10, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -418,7 +418,7 @@ join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = 
 
 -- query 77
 -- LEFT JOIN, interleaving_group_size=0, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -427,7 +427,7 @@ left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppk
 
 -- query 79
 -- LEFT JOIN, interleaving_group_size=-10, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -436,7 +436,7 @@ left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppk
 
 -- query 81
 -- NOT EXISTS, interleaving_group_size=0, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where not exists (
   select * from ${case_db}.lineitem l3
@@ -448,7 +448,7 @@ where not exists (
 
 -- query 83
 -- NOT EXISTS, interleaving_group_size=-10, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where not exists (
   select * from ${case_db}.lineitem l3
@@ -460,7 +460,7 @@ where not exists (
 
 -- query 85
 -- NOT IN (with <>), interleaving_group_size=0, chunk_size=2
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey not in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -471,7 +471,7 @@ where l1.l_orderkey not in (
 
 -- query 87
 -- NOT IN (with <>), interleaving_group_size=-10, chunk_size=2
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey not in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -482,7 +482,7 @@ where l1.l_orderkey not in (
 
 -- query 89
 -- EXISTS, interleaving_group_size=0, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where exists (
   select * from ${case_db}.lineitem l3
@@ -494,7 +494,7 @@ where exists (
 
 -- query 91
 -- EXISTS, interleaving_group_size=-10, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where exists (
   select * from ${case_db}.lineitem l3
@@ -506,7 +506,7 @@ where exists (
 
 -- query 93
 -- IN (with <>), interleaving_group_size=0, chunk_size=2
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -517,7 +517,7 @@ where l1.l_orderkey in (
 
 -- query 95
 -- IN (with <>), interleaving_group_size=-10, chunk_size=2
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -528,7 +528,7 @@ where l1.l_orderkey in (
 
 -- query 97
 -- RIGHT JOIN, interleaving_group_size=0, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -537,7 +537,7 @@ right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_supp
 
 -- query 99
 -- RIGHT JOIN, interleaving_group_size=-10, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -546,7 +546,7 @@ right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_supp
 
 -- query 101
 -- FULL OUTER JOIN, interleaving_group_size=0, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -555,7 +555,7 @@ full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l
 
 -- query 103
 -- FULL OUTER JOIN, interleaving_group_size=-10, chunk_size=2, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -571,7 +571,7 @@ full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l
 
 -- query 106
 -- INNER JOIN, interleaving_group_size=0, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -580,7 +580,7 @@ join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = 
 
 -- query 108
 -- INNER JOIN, interleaving_group_size=-10, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -589,7 +589,7 @@ join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = 
 
 -- query 110
 -- LEFT JOIN, interleaving_group_size=0, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -598,7 +598,7 @@ left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppk
 
 -- query 112
 -- LEFT JOIN, interleaving_group_size=-10, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -607,7 +607,7 @@ left join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppk
 
 -- query 114
 -- NOT EXISTS, interleaving_group_size=0, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where not exists (
   select * from ${case_db}.lineitem l3
@@ -619,7 +619,7 @@ where not exists (
 
 -- query 116
 -- NOT EXISTS, interleaving_group_size=-10, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where not exists (
   select * from ${case_db}.lineitem l3
@@ -631,7 +631,7 @@ where not exists (
 
 -- query 118
 -- NOT IN (with <>), interleaving_group_size=0, chunk_size=3
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey not in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -642,7 +642,7 @@ where l1.l_orderkey not in (
 
 -- query 120
 -- NOT IN (with <>), interleaving_group_size=-10, chunk_size=3
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey not in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -653,7 +653,7 @@ where l1.l_orderkey not in (
 
 -- query 122
 -- EXISTS, interleaving_group_size=0, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where exists (
   select * from ${case_db}.lineitem l3
@@ -665,7 +665,7 @@ where exists (
 
 -- query 124
 -- EXISTS, interleaving_group_size=-10, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where exists (
   select * from ${case_db}.lineitem l3
@@ -677,7 +677,7 @@ where exists (
 
 -- query 126
 -- IN (with <>), interleaving_group_size=0, chunk_size=3
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -688,7 +688,7 @@ where l1.l_orderkey in (
 
 -- query 128
 -- IN (with <>), interleaving_group_size=-10, chunk_size=3
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 where l1.l_orderkey in (
   select l3.l_orderkey from ${case_db}.lineitem l3 where l3.l_suppkey <> l1.l_suppkey
@@ -699,7 +699,7 @@ where l1.l_orderkey in (
 
 -- query 130
 -- RIGHT JOIN, interleaving_group_size=0, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -708,7 +708,7 @@ right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_supp
 
 -- query 132
 -- RIGHT JOIN, interleaving_group_size=-10, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -717,7 +717,7 @@ right join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_supp
 
 -- query 134
 -- FULL OUTER JOIN, interleaving_group_size=0, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;
 
@@ -726,6 +726,6 @@ full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l
 
 -- query 136
 -- FULL OUTER JOIN, interleaving_group_size=-10, chunk_size=3, =
-select count(*) as c
+select count() as c
 from ${case_db}.lineitem l1
 full outer join ${case_db}.lineitem l3 on l3.l_orderkey = l1.l_orderkey and l3.l_suppkey = l1.l_suppkey;

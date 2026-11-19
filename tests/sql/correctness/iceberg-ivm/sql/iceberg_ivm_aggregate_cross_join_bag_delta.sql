@@ -73,7 +73,7 @@ REFRESH MATERIALIZED VIEW xjoin_mv_${uuid0};
 SELECT region, c, s FROM xjoin_mv_${uuid0} ORDER BY region;
 
 -- query 4
-SELECT r.region, COUNT(*) AS c, SUM(a.amount) AS s
+SELECT r.region, COUNT() AS c, SUM(a.amount) AS s
 FROM ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions AS r
 CROSS JOIN ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts AS a
 GROUP BY r.region ORDER BY region;
@@ -102,7 +102,7 @@ REFRESH MATERIALIZED VIEW xjoin_mv_${uuid0};
 SELECT region, c, s FROM xjoin_mv_${uuid0} ORDER BY region;
 
 -- query 9
-SELECT r.region, COUNT(*) AS c, SUM(a.amount) AS s
+SELECT r.region, COUNT() AS c, SUM(a.amount) AS s
 FROM ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions AS r
 CROSS JOIN ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts AS a
 GROUP BY r.region ORDER BY region;
@@ -125,7 +125,7 @@ EXPLAIN REFRESH MATERIALIZED VIEW xjoin_mv_${uuid0};
 REFRESH MATERIALIZED VIEW xjoin_mv_${uuid0};
 
 -- query 13
-SELECT COUNT(*) AS g FROM xjoin_mv_${uuid0};
+SELECT COUNT() AS g FROM xjoin_mv_${uuid0};
 
 -- query 14
 -- @skip_result_check=true
@@ -148,7 +148,7 @@ REFRESH MATERIALIZED VIEW xjoin_mv_${uuid0};
 SELECT region, c, s FROM xjoin_mv_${uuid0} ORDER BY region;
 
 -- query 18
-SELECT r.region, COUNT(*) AS c, SUM(a.amount) AS s
+SELECT r.region, COUNT() AS c, SUM(a.amount) AS s
 FROM ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions AS r
 CROSS JOIN ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts AS a
 GROUP BY r.region ORDER BY region;

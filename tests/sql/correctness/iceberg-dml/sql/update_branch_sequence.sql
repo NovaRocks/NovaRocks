@@ -44,7 +44,7 @@ SELECT id, v FROM ${case_db}.t_update_ref_sequence ORDER BY id;
 SELECT id, v FROM ${case_db}.t_update_ref_sequence FOR VERSION AS OF 'dev' ORDER BY id;
 
 -- query 6
-SELECT COUNT(*) AS preserved_row_ids FROM ${case_db}.t_update_ref_sequence cur
+SELECT COUNT() AS preserved_row_ids FROM ${case_db}.t_update_ref_sequence cur
 JOIN (SELECT id, _row_id AS rid FROM ${case_db}.t_update_ref_sequence
  FOR VERSION AS OF 'dev') old ON cur.id = old.id AND cur._row_id = old.rid;
 

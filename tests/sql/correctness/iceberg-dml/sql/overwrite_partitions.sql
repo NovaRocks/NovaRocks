@@ -47,7 +47,7 @@ INSERT INTO ${case_db}.t_id VALUES
 
 -- query 3
 -- Pre-OVERWRITE: 4 rows across two partitions.
-SELECT region, COUNT(*) AS n FROM ${case_db}.t_id GROUP BY region ORDER BY region;
+SELECT region, COUNT() AS n FROM ${case_db}.t_id GROUP BY region ORDER BY region;
 
 -- query 4
 -- @skip_result_check=true
@@ -56,7 +56,7 @@ INSERT OVERWRITE PARTITIONS ${case_db}.t_id VALUES (99, 'us');
 
 -- query 5
 -- Post-OVERWRITE: us has 1 row (the new one), eu still has 2 rows.
-SELECT region, COUNT(*) AS n FROM ${case_db}.t_id GROUP BY region ORDER BY region;
+SELECT region, COUNT() AS n FROM ${case_db}.t_id GROUP BY region ORDER BY region;
 
 -- query 6
 -- The new row is the only us row.
@@ -89,7 +89,7 @@ INSERT OVERWRITE PARTITIONS ${case_db}.t_empty_sel
 
 -- query 10
 -- All base data is still present.
-SELECT region, COUNT(*) AS n FROM ${case_db}.t_empty_sel GROUP BY region ORDER BY region;
+SELECT region, COUNT() AS n FROM ${case_db}.t_empty_sel GROUP BY region ORDER BY region;
 
 -- ---------------------------------------------------------------------------
 -- Case 3: covered partition contains deletion-vector entries
@@ -113,7 +113,7 @@ DELETE FROM ${case_db}.t_dv WHERE id = 2;
 
 -- query 14
 -- Pre-OVERWRITE: 2 us rows live (id=1,3), 1 eu row live.
-SELECT region, COUNT(*) AS n FROM ${case_db}.t_dv GROUP BY region ORDER BY region;
+SELECT region, COUNT() AS n FROM ${case_db}.t_dv GROUP BY region ORDER BY region;
 
 -- query 15
 -- @skip_result_check=true

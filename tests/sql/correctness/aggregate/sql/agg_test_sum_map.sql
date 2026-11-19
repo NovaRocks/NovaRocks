@@ -394,7 +394,7 @@ select category, sum_map(metrics)["clicks"], sum_map(metrics)["views"], sum_map(
 
 -- query 68
 USE ${case_db};
-select category, sum_map(metrics)["clicks"] as clicks_total, sum_map(metrics)["views"] as views_total, sum_map(metrics)["impressions"] as impressions_total from t8 group by category having count(*) > 1 order by category;
+select category, sum_map(metrics)["clicks"] as clicks_total, sum_map(metrics)["views"] as views_total, sum_map(metrics)["impressions"] as impressions_total from t8 group by category having count() > 1 order by category;
 
 -- query 69
 USE ${case_db};

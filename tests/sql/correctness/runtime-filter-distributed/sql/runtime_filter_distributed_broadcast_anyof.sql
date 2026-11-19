@@ -51,7 +51,7 @@ SET global_runtime_filter_probe_min_selectivity = 0.0;
 SET cbo_broadcast_node_mem_budget_bytes = 10737418240;
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT 'broadcast_anyof' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'broadcast_anyof' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_broadcast_probe p
 JOIN ${case_db}.rf_dist_broadcast_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -60,7 +60,7 @@ WHERE b.flag = 'Y';
 -- @normalize_explain_timing=true
 -- @result_not_contains=RuntimeFilterApply:
 EXPLAIN ANALYZE
-SELECT COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_broadcast_probe p
 JOIN ${case_db}.rf_dist_broadcast_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -79,7 +79,7 @@ SET disable_optimizer_rules = '';
 -- @expect_runtime_filter_total_at_least=transport_sent_count,1
 -- @expect_runtime_filter_total_at_least=transport_acked_count,1
 -- @expect_runtime_filter_total_at_least=consumer_input_rows,1
-SELECT 'broadcast_anyof' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'broadcast_anyof' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_broadcast_probe p
 JOIN ${case_db}.rf_dist_broadcast_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -90,7 +90,7 @@ WHERE b.flag = 'Y';
 -- @result_contains=Profile: tasks=
 -- @result_contains=HASH JOIN (BROADCAST
 EXPLAIN ANALYZE
-SELECT COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_broadcast_probe p
 JOIN ${case_db}.rf_dist_broadcast_build b ON p.k = b.k
 WHERE b.flag = 'Y';

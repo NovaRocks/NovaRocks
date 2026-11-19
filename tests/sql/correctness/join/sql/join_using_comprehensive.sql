@@ -399,7 +399,7 @@ LIMIT 100;
 -- 6-table mixed: aggregation COUNT per source
 -- @order_sensitive=true
 SELECT id,
-       COUNT(*) as row_count,
+       COUNT() as row_count,
        COUNT(v1) as t1_count,
        COUNT(v2) as t2_count,
        COUNT(v3) as t3_count,
@@ -454,7 +454,7 @@ ORDER BY id;
 -- 6-table mixed: aggregation with GROUP BY + HAVING
 -- @order_sensitive=true
 SELECT id,
-       COUNT(*) as cnt,
+       COUNT() as cnt,
        MAX(v1) as max_v1,
        MIN(v2) as min_v2
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(id)
@@ -464,7 +464,7 @@ FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(id)
         FULL OUTER JOIN ${case_db}.t6 USING(id)
 WHERE id > 0
 GROUP BY id
-HAVING COUNT(*) > 0
+HAVING COUNT() > 0
 ORDER BY id;
 
 -- query 44
@@ -558,7 +558,7 @@ WHERE id IN (
     FROM ${case_db}.t5
     WHERE id IS NOT NULL
     GROUP BY id
-    HAVING COUNT(*) > 0
+    HAVING COUNT() > 0
 )
   AND (v1 IS NOT NULL OR v2 IS NOT NULL OR v3 IS NOT NULL)
 ORDER BY id
@@ -578,7 +578,7 @@ FROM (
     WHERE id > 0
 ) main
 CROSS JOIN (
-    SELECT COUNT(*) AS total_matches,
+    SELECT COUNT() AS total_matches,
            AVG(LENGTH(COALESCE(v3, v4, ''))) AS avg_len
     FROM ${case_db}.t3 FULL OUTER JOIN ${case_db}.t4 USING(id)
     WHERE id > 0
@@ -588,7 +588,7 @@ WHERE main.id IN (
     FROM ${case_db}.t5 FULL OUTER JOIN ${case_db}.t6 USING(id)
     WHERE id IS NOT NULL
     GROUP BY id
-    HAVING COUNT(*) > 0
+    HAVING COUNT() > 0
 )
 ORDER BY main.id
 LIMIT 50;
@@ -619,12 +619,12 @@ WITH join_result AS (
     WHERE id IS NOT NULL
 )
 SELECT id,
-       COUNT(*) AS row_count,
+       COUNT() AS row_count,
        MAX(CONCAT(COALESCE(v1, ''), COALESCE(v2, ''))) AS concat_result,
        SUM(CASE WHEN v3 IS NOT NULL THEN 1 ELSE 0 END) AS v3_non_null
 FROM join_result
 GROUP BY id
-HAVING COUNT(*) > 0
+HAVING COUNT() > 0
 ORDER BY id
 LIMIT 50;
 
@@ -830,7 +830,7 @@ LIMIT 50;
 -- @skip_result_check=true
 WITH agg_level1 AS (
     SELECT id,
-           COUNT(*) AS l1_count,
+           COUNT() AS l1_count,
            MAX(v1) AS l1_max_v1,
            MIN(v2) AS l1_min_v2,
            SUM(CASE WHEN v3 IS NOT NULL THEN 1 ELSE 0 END) AS l1_v3_count

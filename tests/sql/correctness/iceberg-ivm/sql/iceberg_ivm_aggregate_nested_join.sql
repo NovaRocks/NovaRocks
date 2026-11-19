@@ -95,7 +95,7 @@ FROM njoin_mv_${uuid0}
 ORDER BY region;
 
 -- query 4
-SELECT d2.region, COUNT(*) AS c, SUM(f.amount) AS s
+SELECT d2.region, COUNT() AS c, SUM(f.amount) AS s
 FROM ice_ivm_njoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_njoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 JOIN ice_ivm_njoin_${uuid0}.ns_${uuid0}.dim2 AS d2 ON d.region_id = d2.id
@@ -128,7 +128,7 @@ FROM njoin_mv_${uuid0}
 ORDER BY region;
 
 -- query 8
-SELECT d2.region, COUNT(*) AS c, SUM(f.amount) AS s
+SELECT d2.region, COUNT() AS c, SUM(f.amount) AS s
 FROM ice_ivm_njoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_njoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 JOIN ice_ivm_njoin_${uuid0}.ns_${uuid0}.dim2 AS d2 ON d.region_id = d2.id
@@ -154,7 +154,7 @@ FROM njoin_mv_${uuid0}
 ORDER BY region;
 
 -- query 12
-SELECT d2.region, COUNT(*) AS c, SUM(f.amount) AS s
+SELECT d2.region, COUNT() AS c, SUM(f.amount) AS s
 FROM ice_ivm_njoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_njoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 JOIN ice_ivm_njoin_${uuid0}.ns_${uuid0}.dim2 AS d2 ON d.region_id = d2.id
@@ -180,7 +180,7 @@ FROM njoin_mv_${uuid0}
 ORDER BY region;
 
 -- query 16
-SELECT d2.region, COUNT(*) AS c, SUM(f.amount) AS s
+SELECT d2.region, COUNT() AS c, SUM(f.amount) AS s
 FROM ice_ivm_njoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_njoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 JOIN ice_ivm_njoin_${uuid0}.ns_${uuid0}.dim2 AS d2 ON d.region_id = d2.id

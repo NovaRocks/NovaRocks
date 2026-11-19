@@ -97,11 +97,11 @@ FROM ${case_db}.fpj_t0 l RIGHT JOIN ${case_db}.fpj_t1 r ON l.c0 = r.c0 AND l.c1 
 
 -- query 14
 -- NOT IN without NULLs in subquery
-SELECT count(*) FROM (SELECT * FROM ${case_db}.fpj_t0 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t1)) t;
+SELECT count() FROM (SELECT * FROM ${case_db}.fpj_t0 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t1)) t;
 
 -- query 15
 -- NOT IN with correlated predicate
-SELECT count(*) FROM (SELECT * FROM ${case_db}.fpj_t0 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t1 WHERE ${case_db}.fpj_t0.c1)) t;
+SELECT count() FROM (SELECT * FROM ${case_db}.fpj_t0 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t1 WHERE ${case_db}.fpj_t0.c1)) t;
 
 -- query 16
 -- @skip_result_check=true
@@ -109,7 +109,7 @@ INSERT INTO ${case_db}.fpj_t1 VALUES (NULL, NULL, NULL, NULL);
 
 -- query 17
 -- NOT IN after inserting NULL into subquery set (should return 0)
-SELECT count(*) FROM (SELECT * FROM ${case_db}.fpj_t0 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t1)) t;
+SELECT count() FROM (SELECT * FROM ${case_db}.fpj_t0 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t1)) t;
 
 -- query 18
 -- @skip_result_check=true
@@ -179,8 +179,8 @@ INSERT INTO ${case_db}.fpj_t3 SELECT generate_series, generate_series, generate_
 
 -- query 29
 -- NOT IN with correlated IF predicate (null row, expect 0)
-SELECT count(*) FROM (SELECT * FROM ${case_db}.fpj_t2 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t3 WHERE if(${case_db}.fpj_t3.c0=1, ${case_db}.fpj_t2.c1, true))) t;
+SELECT count() FROM (SELECT * FROM ${case_db}.fpj_t2 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t3 WHERE if(${case_db}.fpj_t3.c0=1, ${case_db}.fpj_t2.c1, true))) t;
 
 -- query 30
 -- NOT IN with correlated IF and IS NOT NULL predicate (null row, expect 0)
-SELECT count(*) FROM (SELECT * FROM ${case_db}.fpj_t2 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t3 WHERE if(${case_db}.fpj_t3.c0!=2, ${case_db}.fpj_t2.c0 IS NOT NULL, true))) t;
+SELECT count() FROM (SELECT * FROM ${case_db}.fpj_t2 WHERE c0 NOT IN (SELECT c0 FROM ${case_db}.fpj_t3 WHERE if(${case_db}.fpj_t3.c0!=2, ${case_db}.fpj_t2.c0 IS NOT NULL, true))) t;

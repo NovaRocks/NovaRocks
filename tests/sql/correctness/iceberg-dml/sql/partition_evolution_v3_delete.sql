@@ -45,7 +45,7 @@ INSERT INTO ${case_db}.t_partition_evolution_v3_delete VALUES
 DELETE FROM ${case_db}.t_partition_evolution_v3_delete WHERE id IN (2, 5);
 
 -- query 2
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM ${case_db}.t_partition_evolution_v3_delete;
 
 -- query 3

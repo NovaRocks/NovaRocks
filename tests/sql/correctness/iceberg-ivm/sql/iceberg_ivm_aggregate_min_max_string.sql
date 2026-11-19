@@ -88,7 +88,7 @@ ORDER BY region;
 SELECT region,
        MIN(name) AS mn,
        MAX(name) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_minmax_string_db_${uuid0}.ns_${uuid0}.items
 GROUP BY region
 ORDER BY region;
@@ -110,7 +110,7 @@ ORDER BY region;
 SELECT region,
        MIN(name) AS mn,
        MAX(name) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_minmax_string_db_${uuid0}.ns_${uuid0}.items
 GROUP BY region
 ORDER BY region;
@@ -131,7 +131,7 @@ ORDER BY region;
 SELECT region,
        MIN(name) AS mn,
        MAX(name) AS mx,
-       COUNT(*) AS c
+       COUNT() AS c
 FROM ice_ivm_minmax_string_db_${uuid0}.ns_${uuid0}.items
 GROUP BY region
 ORDER BY region;

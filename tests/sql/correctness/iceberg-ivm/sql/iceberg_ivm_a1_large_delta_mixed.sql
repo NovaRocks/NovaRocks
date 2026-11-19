@@ -83,14 +83,14 @@ REFRESH MATERIALIZED VIEW orders_mv_${uuid0};
 
 -- query 4
 -- Verify initial MV state via deterministic aggregates
-SELECT region, COUNT(*) AS cnt, SUM(amount) AS total
+SELECT region, COUNT() AS cnt, SUM(amount) AS total
 FROM orders_mv_${uuid0}
 GROUP BY region
 ORDER BY region;
 
 -- query 5
 -- Ground truth from base must match MV
-SELECT region, COUNT(*) AS cnt, SUM(amount) AS total
+SELECT region, COUNT() AS cnt, SUM(amount) AS total
 FROM ice_ivm_ldm_${uuid0}.ns_${uuid0}.orders_${uuid0}
 WHERE amount > 500
 GROUP BY region
@@ -113,14 +113,14 @@ REFRESH MATERIALIZED VIEW orders_mv_${uuid0};
 
 -- query 8
 -- MV reflects the mixed delta (aggregates are deterministic)
-SELECT region, COUNT(*) AS cnt, SUM(amount) AS total
+SELECT region, COUNT() AS cnt, SUM(amount) AS total
 FROM orders_mv_${uuid0}
 GROUP BY region
 ORDER BY region;
 
 -- query 9
 -- Ground truth from base after delta must match MV
-SELECT region, COUNT(*) AS cnt, SUM(amount) AS total
+SELECT region, COUNT() AS cnt, SUM(amount) AS total
 FROM ice_ivm_ldm_${uuid0}.ns_${uuid0}.orders_${uuid0}
 WHERE amount > 500
 GROUP BY region
