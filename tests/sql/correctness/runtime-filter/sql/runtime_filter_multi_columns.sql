@@ -124,15 +124,15 @@ select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case
 
 -- cross join: in colocate group upper
 -- query 28
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 join  ${case_db}.small_table t3 where r.c3 < 10 and t3.c0 < 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 CROSS JOIN  ${case_db}.small_table t3 where r.c3 < 10 and t3.c0 < 3;
 -- cross join: in colocate group lower
 -- query 29
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.small_table t3 join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c0 < 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l CROSS JOIN  ${case_db}.small_table t3 join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c0 < 3;
 -- cross join with runtime filter
 -- query 30
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.small_table t3 join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c0 = 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l CROSS JOIN  ${case_db}.small_table t3 join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c0 = 3;
 -- query 31
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 join  ${case_db}.small_table t3 where r.c3 < 10 and t3.c0 = 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 CROSS JOIN  ${case_db}.small_table t3 where r.c3 < 10 and t3.c0 = 3;
 
 -- CTE
 -- query 32
