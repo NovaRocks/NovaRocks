@@ -132,7 +132,7 @@ impl Fixture {
         );
         CatalogPropertyCpuInput {
             source: Arc::from(source),
-            statement: statement,
+            statement,
             context: PropertyCpuContext {
                 current_database: frozen.current_database().to_owned(),
                 sql_semantics: frozen.sql_semantics().clone(),

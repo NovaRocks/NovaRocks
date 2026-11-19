@@ -312,11 +312,12 @@ fn selected_scalar_result_author_keeps_original_inherited_and_decimal_error_ordi
         assert_eq!(actual.errors(), expected_errors.as_slice());
         assert_eq!(actual.selection().iter().collect::<Vec<_>>(), rows);
         // Matching diagnostic text does not grant custody of another journal.
+        let foreign_errors = selected.errors().to_vec();
         assert!(matches!(
             recipe.evaluate_selected(
                 EvaluatedArgument::SelectedColumn(&selected),
                 selection,
-                &selected.errors().to_vec(),
+                &foreign_errors,
                 &Control::default()
             ),
             Err(KernelFailure::InvalidProgram(_))

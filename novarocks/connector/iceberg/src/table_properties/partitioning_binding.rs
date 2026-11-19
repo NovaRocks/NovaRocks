@@ -193,12 +193,12 @@ impl PropertyOutputNames {
                     }
                     _ => None,
                 };
-                if let Some(kind) = dedup {
-                    if !self.dedup.insert((source_id, kind)) {
-                        return Err(invalid(format!(
-                            "redundant partition transform for source ID {source_id}: {kind}"
-                        )));
-                    }
+                if let Some(kind) = dedup
+                    && !self.dedup.insert((source_id, kind))
+                {
+                    return Err(invalid(format!(
+                        "redundant partition transform for source ID {source_id}: {kind}"
+                    )));
                 }
                 return Ok(candidate);
             }

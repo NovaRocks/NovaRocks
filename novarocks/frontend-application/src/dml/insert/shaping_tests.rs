@@ -240,13 +240,13 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         column("s", structure),
     ];
     let source = parse_query(
-        "VALUES ([123456789.123456789, 1.25e2, NULL], map(123456789.123456789, [123456789.123456789, NULL]), row(123456789.123456789, [123456789.123456789]))",
+        "VALUES ROW(ARRAY[123456789.123456789, 1.25e2, NULL], map(123456789.123456789, ARRAY[123456789.123456789, NULL]), ROW(123456789.123456789, ARRAY[123456789.123456789]))",
     );
     let query = shape_insert_source(&source, &[], &columns, &columns)
         .expect("literal source should shape")
         .expect("literal source should use target shaping");
     let row = &rows(&query)[0];
-    let ast::Expr::Array(array) = cast_input(row[0], "ARRAY<DECIMAL(18, 9)>") else {
+    let ast::Expr::Array(array) = cast_input(row[0], "ARRAY(DECIMAL(18, 9))") else {
         panic!("expected direct ARRAY");
     };
     assert_eq!(
@@ -276,7 +276,7 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
     ));
 
     let ast::Expr::FunctionCall(map) =
-        cast_input(row[1], "MAP<DECIMAL(18, 9), ARRAY<DECIMAL(18, 9)>>")
+        cast_input(row[1], "MAP(DECIMAL(18, 9), ARRAY(DECIMAL(18, 9)))")
     else {
         panic!("expected MAP constructor");
     };
@@ -284,7 +284,7 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         number_text(cast_input(&map.arguments[0].value, "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
-    let ast::Expr::Array(map_array) = cast_input(&map.arguments[1].value, "ARRAY<DECIMAL(18, 9)>")
+    let ast::Expr::Array(map_array) = cast_input(&map.arguments[1].value, "ARRAY(DECIMAL(18, 9))")
     else {
         panic!("expected MAP array value");
     };
@@ -294,8 +294,8 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
     );
 
     let ast::Expr::Row(structure) = cast_input(
-        &row[2],
-        "STRUCT<`d` DECIMAL(18, 9), `a` ARRAY<DECIMAL(18, 9)>>",
+        row[2],
+        r#"ROW("d" DECIMAL(18, 9), "a" ARRAY(DECIMAL(18, 9)))"#,
     ) else {
         panic!("expected ROW constructor");
     };
@@ -307,7 +307,7 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         "123456789.123456789"
     );
     let ast::Expr::Array(struct_array) =
-        cast_input(&structure.fields[1].expression, "ARRAY<DECIMAL(18, 9)>")
+        cast_input(&structure.fields[1].expression, "ARRAY(DECIMAL(18, 9))")
     else {
         panic!("expected STRUCT array field");
     };
@@ -326,14 +326,14 @@ fn explicit_casts_keep_their_original_expression_and_declared_type() {
             "DECIMAL(18, 9)",
         ),
         (
-            "VALUES (CAST([123456789.123456789, 1.25e2] AS ARRAY<DOUBLE>))",
+            "VALUES ROW(CAST(ARRAY[123456789.123456789, 1.25e2] AS ARRAY(DOUBLE)))",
             array_type(decimal_type()),
-            "ARRAY<DECIMAL(18, 9)>",
+            "ARRAY(DECIMAL(18, 9))",
         ),
         (
-            "VALUES (CAST([123456789.123456789, 1.25e2] AS ARRAY<DOUBLE>))",
+            "VALUES ROW(CAST(ARRAY[123456789.123456789, 1.25e2] AS DOUBLE ARRAY))",
             array_type(decimal_type()),
-            "ARRAY<DECIMAL(18, 9)>",
+            "ARRAY(DECIMAL(18, 9))",
         ),
     ] {
         let source = parse_query(sql);
@@ -554,7 +554,7 @@ fn typed_single_field_struct_defaults_keep_their_values_row() {
             .into(),
             span: SYNTHETIC,
         }),
-        "STRUCT<`only` BIGINT>",
+        r#"ROW("only" BIGINT)"#,
     );
     assert!(shaped.syntax_eq(&baseline));
     // This input originally failed at SQL's unsupported Row branch, not at
@@ -684,12 +684,12 @@ fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
     .unwrap();
     let ast::Expr::Row(structure) = cast_input(
         rows(&shaped)[0][1],
-        "STRUCT<`a` ARRAY<DECIMAL(18, 9)>, `m` MAP<INT, DECIMAL(18, 9)>>",
+        r#"ROW("a" ARRAY(DECIMAL(18, 9)), "m" MAP(INT, DECIMAL(18, 9)))"#,
     ) else {
         panic!("expected target-shaped structured default");
     };
     let ast::Expr::Array(array) =
-        cast_input(&structure.fields[0].expression, "ARRAY<DECIMAL(18, 9)>")
+        cast_input(&structure.fields[0].expression, "ARRAY(DECIMAL(18, 9))")
     else {
         panic!("expected target-shaped ARRAY default");
     };
@@ -782,7 +782,7 @@ fn column_mapping_reorders_and_fills_only_omitted_columns() {
         rendered,
         [
             "CAST(10 AS INT)",
-            "CAST(123456789.123456789 AS DECIMAL(18, 9))",
+            "CAST(DECIMAL '123456789.123456789' AS DECIMAL(18, 9))",
             "CAST(30 AS INT)"
         ]
     );
@@ -957,7 +957,7 @@ fn select_projection_keeps_singleton_source_and_default_row_values() {
     .unwrap()
     .unwrap();
     let expression = projection_expr(select(&shaped.body), 0);
-    let ast::Expr::Row(row) = cast_input(expression, "STRUCT<`only` BIGINT>") else {
+    let ast::Expr::Row(row) = cast_input(expression, r#"ROW("only" BIGINT)"#) else {
         panic!("source singleton Row must keep its value shape");
     };
     assert_eq!(row.fields.len(), 1);
@@ -976,7 +976,7 @@ fn select_projection_keeps_singleton_source_and_default_row_values() {
     .unwrap();
     let expression = projection_expr(select(&shaped.body), 1);
     assert!(
-        matches!(cast_input(expression, "STRUCT<`only` BIGINT>"), ast::Expr::Row(row) if row.fields.len() == 1)
+        matches!(cast_input(expression, r#"ROW("only" BIGINT)"#), ast::Expr::Row(row) if row.fields.len() == 1)
     );
     assert_eq!(
         novarocks_sql::literal::expr_to_literal(expression).unwrap(),
@@ -986,7 +986,7 @@ fn select_projection_keeps_singleton_source_and_default_row_values() {
 
 #[test]
 fn literal_values_shaping_preserves_outer_row_span_and_single_struct_cell() {
-    let source = parse_query("VALUES (ROW(7))");
+    let source = parse_query("VALUES ROW(ROW(7))");
     let ast::SetExpr::Values(original) = source.body.as_ref() else {
         panic!("VALUES");
     };
@@ -1024,7 +1024,7 @@ fn literal_values_shaping_preserves_outer_row_span_and_single_struct_cell() {
     assert!(outer.fields[0].name.is_none());
     assert_eq!(outer.fields[0].span, outer.fields[0].expression.span());
     let ast::Expr::Row(shaped_inner) =
-        cast_input(&outer.fields[0].expression, "STRUCT<`only` BIGINT>")
+        cast_input(&outer.fields[0].expression, r#"ROW("only" BIGINT)"#)
     else {
         panic!("Struct value must remain one cell");
     };

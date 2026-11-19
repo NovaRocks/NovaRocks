@@ -585,11 +585,10 @@ fn bind_value<'a>(
     absolute_time: &mut dyn TableProcedureAbsoluteTimePort,
     control: &dyn PureCompileControl,
 ) -> Result<BoundProcedureValue<'a>, QueryServiceError> {
-    match (slot.value_type, input) {
-        (ProcedureArgumentType::EqualityRows, ProcedureInput::Expression(expression)) => {
-            return Ok(BoundProcedureValue::EqualityRows(expression));
-        }
-        _ => {}
+    if let (ProcedureArgumentType::EqualityRows, ProcedureInput::Expression(expression)) =
+        (slot.value_type, input)
+    {
+        return Ok(BoundProcedureValue::EqualityRows(expression));
     }
     let location = Some((source, span));
     let evaluate = |expression, ty, constants: &mut dyn DdlPropertyConstantPort| {

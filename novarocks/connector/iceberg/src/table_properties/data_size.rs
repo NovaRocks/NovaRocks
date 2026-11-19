@@ -176,12 +176,12 @@ fn parse(
             break;
         }
     }
-    if (2..=20).contains(&units) && !text.starts_with('+') {
-        if let Some(number) = text.strip_suffix('B') {
-            if let Some(bytes) = java_byte_integer(number, control)? {
-                return Ok(bytes);
-            }
-        }
+    if (2..=20).contains(&units)
+        && !text.starts_with('+')
+        && let Some(number) = text.strip_suffix('B')
+        && let Some(bytes) = java_byte_integer(number, control)?
+    {
+        return Ok(bytes);
     }
     // Exact Java regex: ^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]+)\s*$.
     // Neither Unicode whitespace nor exponent/leading-sign syntax is enabled.

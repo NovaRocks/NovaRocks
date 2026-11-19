@@ -347,13 +347,12 @@ impl Fixture {
             .unwrap(),
             _ => panic!("CREATE TABLE preparation must match its LIKE input"),
         };
-        assert_eq!(
+        assert!(
             self.planning
                 .as_ref()
                 .unwrap()
                 .local_health_failure()
-                .is_none(),
-            true
+                .is_none()
         );
         assert_ne!(
             witness

@@ -413,7 +413,7 @@ impl ControlSource {
                     .map_err(connector)?
                     .clone();
                 let result = if matches!(&self.request, MvControlRequest::Alter { statement, .. }
-                    if matches!(statement.action, MvAlterAction::StorageProperties { .. })) {
+                    if matches!(statement.action, MvAlterAction::Storage { .. })) {
                     crate::mv::domain::staged_create::install_admitted_current_projection_async_in(
                         &entrance,&view,body.input.ports.connector_control(),catalog,self.target.clone(),self.operation,
                         context,&factory,&self.current).await

@@ -697,26 +697,25 @@ fn null_list_to_json_or_utf8_keeps_actual_rows_and_nonzero_constant_ordinal() {
 fn null_list_to_json_or_utf8_keeps_exact_profile_journal_and_original_refusals() {
     use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
     let (input, source, target) = null_list_json_types();
-    for ordinary in [FunctionValueType::new(
+    let ordinary = FunctionValueType::new(
         DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
         true,
-    )] {
-        assert!(!novarocks_type_contract::is_null_list_to_json_cast(
-            &source, &ordinary
-        ));
-        assert_eq!(
-            PreparedCastRecipe::try_new(
-                CastOperation::Carrier,
-                &source,
-                &ordinary,
-                DecimalOverflowPolicy::OutputNull,
-                false,
-                None,
-                &Control::default()
-            ),
-            Err(CastPrepareError::Unsupported)
-        );
-    }
+    );
+    assert!(!novarocks_type_contract::is_null_list_to_json_cast(
+        &source, &ordinary
+    ));
+    assert_eq!(
+        PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &source,
+            &ordinary,
+            DecimalOverflowPolicy::OutputNull,
+            false,
+            None,
+            &Control::default()
+        ),
+        Err(CastPrepareError::Unsupported)
+    );
     let storage = ValueTypeStorageLifetime::pure();
     let required = FunctionValueType::try_from_value(
         ValueTypeRef::try_new(

@@ -37,7 +37,7 @@ use std::{
 };
 
 pub(super) enum TrinoMvProperties {
-    Create(TrinoCreateMaterializedView),
+    Create(Box<TrinoCreateMaterializedView>),
     Alter {
         name: ObjectName,
         properties: AstVec<StatementProperty>,
@@ -80,7 +80,7 @@ impl MvPropertyCpuInput {
         };
         match self.pending {
             TrinoMvProperties::Create(statement) => preparation
-                .create(statement)
+                .create(*statement)
                 .map(|statement| PreparedMvProperties::Create(Box::new(statement))),
             TrinoMvProperties::Alter {
                 name,

@@ -182,14 +182,14 @@ fn prepare_trino_argument(value: &Expr) -> Result<PreparedMaintenanceValue, &'st
                 .map(PreparedMaintenanceValue::Literal)
         }
         Expr::FunctionCall(call) if is_procedure_map(call) => {
-            let pairs = call.arguments.chunks_exact(2);
-            if !pairs.remainder().is_empty() {
+            let (pairs, remainder) = call.arguments.as_slice().as_chunks::<2>();
+            if !remainder.is_empty() {
                 return Err("CALL MAP expects alternating literal key and value arguments");
             }
             pairs
-                .map(|pair| {
-                    let (Expr::Literal(key), Expr::Literal(value)) =
-                        (&pair[0].value, &pair[1].value)
+                .iter()
+                .map(|[key, value]| {
+                    let (Expr::Literal(key), Expr::Literal(value)) = (&key.value, &value.value)
                     else {
                         return Err("CALL MAP expects alternating literal key and value arguments");
                     };

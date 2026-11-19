@@ -472,8 +472,8 @@ fn alter_command_for_target(
 ) -> Result<crate::query::mv_action::MvCommandRequest, CommandError> {
     use crate::query::mv_action::{MvCommandRequest, MvControlRequest};
     let fields = match &statement.action {
-        MvAlterAction::StorageProperties { owner, properties }
-        | MvAlterAction::RefreshAndStorageProperties {
+        MvAlterAction::Storage { owner, properties }
+        | MvAlterAction::RefreshAndStorage {
             owner, properties, ..
         } => {
             let mut partitioning = properties
@@ -501,9 +501,7 @@ fn alter_command_for_target(
                     properties: Arc::clone(properties),
                     partitioning_index,
                     configuration: match &statement.action {
-                        MvAlterAction::RefreshAndStorageProperties { changes, .. } => {
-                            Some(changes.clone())
-                        }
+                        MvAlterAction::RefreshAndStorage { changes, .. } => Some(changes.clone()),
                         _ => None,
                     },
                 })
@@ -702,7 +700,7 @@ mod tests {
                 target.clone(),
                 MvAlterStatement {
                     name_parts: vec!["t".into()],
-                    action: MvAlterAction::StorageProperties {
+                    action: MvAlterAction::Storage {
                         owner: owner.clone(),
                         properties: properties.into(),
                     },
@@ -714,7 +712,7 @@ mod tests {
         else {
             panic!("storage properties use the original metadata control");
         };
-        let MvAlterAction::StorageProperties {
+        let MvAlterAction::Storage {
             properties,
             owner: actual,
         } = statement.action
@@ -772,7 +770,7 @@ mod tests {
             target,
             MvAlterStatement {
                 name_parts: vec!["t".into()],
-                action: MvAlterAction::RefreshAndStorageProperties {
+                action: MvAlterAction::RefreshAndStorage {
                     changes: changes.clone(),
                     owner: owner.clone(),
                     properties: Arc::clone(&properties),

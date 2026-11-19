@@ -35,13 +35,13 @@ pub struct MvDropStatement {
 /// Frontend-owned admitted materialized-view alteration.
 #[derive(Clone, Debug, PartialEq)]
 pub enum MvAlterAction {
-    RefreshProperties(MvRefreshPropertyChanges),
-    RefreshAndStorageProperties {
+    Refresh(MvRefreshPropertyChanges),
+    RefreshAndStorage {
         changes: MvRefreshPropertyChanges,
         owner: ConnectorProviderBindingKey,
         properties: Arc<[(Arc<str>, DdlPropertyChange)]>,
     },
-    StorageProperties {
+    Storage {
         owner: ConnectorProviderBindingKey,
         properties: Arc<[(Arc<str>, DdlPropertyChange)]>,
     },

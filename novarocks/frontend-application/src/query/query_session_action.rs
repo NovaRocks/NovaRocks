@@ -99,6 +99,10 @@ pub(super) struct QueryActionInputs {
     pub(super) statement_token: StatementToken,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Both preparation paths are already carried inside the boxed governed query action."
+)]
 enum QueryFamilyPreparation {
     Ready(Option<PreparedQuerySession>),
     Declared(QuerySessionPreparation),

@@ -43,6 +43,9 @@ impl CatalogPropertyCpuInput {
 }
 
 #[cfg(test)]
+pub(crate) use tests::prepare_catalog_for_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use novarocks_query_application::sql::session::SessionSqlState;
@@ -165,6 +168,3 @@ mod tests {
         fixture.close();
     }
 }
-
-#[cfg(test)]
-pub(crate) use tests::prepare_catalog_for_test;

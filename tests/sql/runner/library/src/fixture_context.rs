@@ -601,6 +601,7 @@ pub(crate) fn selected_sources(
 
 /// Replace owned namespace identifiers, control metadata and shell references.
 /// Ordinary SQL string values, column names and catalog prefixes are preserved.
+#[cfg(test)]
 pub(crate) fn rewrite_namespaces(
     source: &str,
     variables: &HashMap<String, String>,
@@ -712,7 +713,7 @@ fn rewrite_namespaces_with_owner(
             sql.clear();
             sql_start = source_offset;
             let rewritten = if trimmed.starts_with("-- @") {
-                replace_references(line, &mapping)
+                replace_references(line, mapping)
             } else {
                 // Producer-only ownership changes its namespace argument, never
                 // unrelated shell values or arbitrary commands in the block.

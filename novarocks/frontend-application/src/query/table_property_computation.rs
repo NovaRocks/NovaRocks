@@ -53,6 +53,10 @@ pub(crate) struct TrinoTablePropertyCpuInput {
     pub(crate) context: PropertyCpuContext,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Move the prepared mutation from the boxed CPU result into the original table action without another allocation."
+)]
 pub(crate) enum TrinoTablePropertyOutput {
     Mutation(PreparedTableMutationInput),
     Like(Box<PreparedTrinoTableLike>),

@@ -398,10 +398,12 @@ pub fn prepare_trino_set_table_properties(
     })
 }
 
+type TablePropertyChanges = Arc<[(Arc<str>, DdlPropertyChange)]>;
+
 fn into_table_changes(
     evaluated: EvaluatedDdlProperties,
     control: &dyn PureCompileControl,
-) -> Result<Arc<[(Arc<str>, DdlPropertyChange)]>, QueryServiceError> {
+) -> Result<TablePropertyChanges, QueryServiceError> {
     let mut properties = Vec::with_capacity(evaluated.properties().len());
     for property in evaluated.into_properties() {
         checkpoint(control, 1)?;

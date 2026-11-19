@@ -81,7 +81,7 @@ impl TrinoMvPropertyPreparation<'_> {
         let (name_parts, target, owner) = self.target(&name)?;
         let (engine, storage) = self.evaluate(&properties, DdlPropertyEvaluationMode::Alter)?;
         let action = if engine.is_empty() {
-            MvAlterAction::StorageProperties {
+            MvAlterAction::Storage {
                 owner,
                 properties: frozen_storage_changes(storage),
             }
@@ -89,9 +89,9 @@ impl TrinoMvPropertyPreparation<'_> {
             let changes = MvRefreshPropertyChanges::from_alter_properties(&engine)
                 .map_err(|error| self.engine_error(error, &properties, span))?;
             if storage.is_empty() {
-                MvAlterAction::RefreshProperties(changes)
+                MvAlterAction::Refresh(changes)
             } else {
-                MvAlterAction::RefreshAndStorageProperties {
+                MvAlterAction::RefreshAndStorage {
                     changes,
                     owner,
                     properties: frozen_storage_changes(storage),

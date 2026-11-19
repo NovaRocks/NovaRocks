@@ -66,7 +66,7 @@ struct CommandEntry {
 
 enum CommandStart {
     Ready(Box<CommandEntry>),
-    Error(StatementResult),
+    Error(Box<StatementResult>),
 }
 
 impl FrontendQuerySession {
@@ -101,7 +101,7 @@ impl FrontendQuerySession {
                     CommandStart::Ready(entry) => {
                         self.execute_trino_product(command, *entry).await?
                     }
-                    CommandStart::Error(result) => result,
+                    CommandStart::Error(result) => *result,
                 };
                 Ok(QuerySessionStatement::output_owned(result, kind))
             }
@@ -116,7 +116,7 @@ impl FrontendQuerySession {
                         self.execute_trino_preparation(source, preparation, *entry)
                             .await?
                     }
-                    CommandStart::Error(result) => result,
+                    CommandStart::Error(result) => *result,
                 };
                 Ok(QuerySessionStatement::output_owned(result, kind))
             }
@@ -185,9 +185,9 @@ impl FrontendQuerySession {
         {
             Ok(handle) => handle.flatten(),
             Err(error) => {
-                return Ok(CommandStart::Error(
+                return Ok(CommandStart::Error(Box::new(
                     self.governed_typed_error(internal_error(error), statement),
-                ));
+                )));
             }
         };
         let cancellation = QueryCancellationView::governed(
@@ -214,9 +214,9 @@ impl FrontendQuerySession {
         let topology = match topology {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                return Ok(CommandStart::Error(
+                return Ok(CommandStart::Error(Box::new(
                     self.governed_typed_error(error, statement),
-                ));
+                )));
             }
         };
         let state = self.state.lock().map_err(poisoned_state)?.clone();
@@ -298,9 +298,9 @@ impl FrontendQuerySession {
                 statement,
                 input,
             }))),
-            Err(error) => Ok(CommandStart::Error(
+            Err(error) => Ok(CommandStart::Error(Box::new(
                 self.governed_typed_error(error, statement),
-            )),
+            ))),
         }
     }
 }
@@ -836,7 +836,7 @@ impl FrontendQuerySession {
                 return self
                     .execute_trino_view(
                         source,
-                        TrinoViewInput::Create(node),
+                        TrinoViewInput::Create(Box::new(node)),
                         CommandEntry { statement, input },
                     )
                     .await;
@@ -863,7 +863,7 @@ impl FrontendQuerySession {
                 return self
                     .execute_observed_trino_mv_properties(
                         source,
-                        TrinoMvProperties::Create(node),
+                        TrinoMvProperties::Create(Box::new(node)),
                         input.request,
                         input.command,
                         input.deadline,
@@ -928,7 +928,7 @@ enum TrinoWrite {
 }
 
 enum TrinoViewInput {
-    Create(ast::TrinoCreateView),
+    Create(Box<ast::TrinoCreateView>),
     Drop(ast::TrinoDropView),
     ShowCreate(ast::TrinoShowCreate),
 }

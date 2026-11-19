@@ -26,7 +26,7 @@ use std::sync::Weak;
 
 pub(in crate::catalog_control) enum Stage {
     Preflight,
-    Freeze(CreatePreflightFacts),
+    Freeze(Box<CreatePreflightFacts>),
 }
 
 pub(in crate::catalog_control) enum Output {
@@ -127,7 +127,7 @@ pub(super) async fn freeze(
     original: &Arc<async_existing::Original>,
     facts: CreatePreflightFacts,
 ) -> Result<PreparedCreate, CreatePreparationFailure> {
-    match run(original, Stage::Freeze(facts))
+    match run(original, Stage::Freeze(Box::new(facts)))
         .await
         .map_err(CreatePreparationFailure::Source)?
     {

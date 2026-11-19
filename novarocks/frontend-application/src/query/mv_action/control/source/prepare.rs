@@ -92,8 +92,8 @@ impl ControlSource {
         )
         .map_err(connector)?;
         if let MvControlRequest::Alter { statement, .. } = &self.request
-            && let MvAlterAction::StorageProperties { owner, .. }
-            | MvAlterAction::RefreshAndStorageProperties { owner, .. } = &statement.action
+            && let MvAlterAction::Storage { owner, .. }
+            | MvAlterAction::RefreshAndStorage { owner, .. } = &statement.action
             && (owner.instance_id != planning.binding().descriptor().instance_id
                 || owner.incarnation != planning.binding().incarnation())
         {
@@ -222,7 +222,7 @@ impl ControlSource {
                 });
             }
             MvControlRequest::Alter { statement, .. } => match &statement.action {
-                MvAlterAction::StorageProperties { properties, .. } => {
+                MvAlterAction::Storage { properties, .. } => {
                     if properties
                         .iter()
                         .any(|(name, _)| name.as_ref() == "partitioning")
@@ -236,8 +236,8 @@ impl ControlSource {
                         properties: Arc::clone(properties),
                     });
                 }
-                MvAlterAction::RefreshProperties(changes)
-                | MvAlterAction::RefreshAndStorageProperties { changes, .. } => {
+                MvAlterAction::Refresh(changes)
+                | MvAlterAction::RefreshAndStorage { changes, .. } => {
                     ready
                         .candidate_reader()
                         .observe_current_application_async(&documents, request.clone())
@@ -321,17 +321,16 @@ impl ControlSource {
                         .map_err(connector)?;
                     let change =
                         keyed_configuration_slot_change(&configuration).map_err(document)?;
-                    let mutation =
-                        if let MvAlterAction::RefreshAndStorageProperties { properties, .. } =
-                            &statement.action
-                        {
-                            KeyedMutation::SlotChangeWithTableProperties {
-                                change,
-                                properties: Arc::clone(properties),
-                            }
-                        } else {
-                            KeyedMutation::SlotChange(change)
-                        };
+                    let mutation = if let MvAlterAction::RefreshAndStorage { properties, .. } =
+                        &statement.action
+                    {
+                        KeyedMutation::SlotChangeWithTableProperties {
+                            change,
+                            properties: Arc::clone(properties),
+                        }
+                    } else {
+                        KeyedMutation::SlotChange(change)
+                    };
                     body.operation = Some(ConnectorCatalogMutationOperation::KeyedDocuments {
                         intent: KeyedMutationIntent {
                             admission,

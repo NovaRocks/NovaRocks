@@ -49,6 +49,10 @@ pub fn no_transaction_in_progress() -> QueryServiceError {
 
 /// Executable inputs selected by admission. Preparation carries the one
 /// concrete leaf an existing owner must lower before a product command exists.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Move the parser-owned preparation AST into its command owner without an additional allocation."
+)]
 #[derive(Debug)]
 pub enum TrinoStatementAction {
     Query(TrinoQueryAction),
