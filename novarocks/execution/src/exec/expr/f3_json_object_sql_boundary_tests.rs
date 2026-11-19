@@ -75,7 +75,7 @@ FROM t ORDER BY id;"#,
     ),
     (
         5,
-        r#"SELECT id, json_object(k) AS odd_tail FROM t ORDER BY id;"#,
+        r#"SELECT id, json_object(k: NULL) AS odd_tail FROM t ORDER BY id;"#,
     ),
     (
         6,
