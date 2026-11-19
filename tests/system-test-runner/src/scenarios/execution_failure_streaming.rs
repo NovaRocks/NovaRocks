@@ -50,7 +50,7 @@ const DETAIL: &str = "Unexpected failure (reason 13:20)";
 // keeping the real producer live behind that read without a timing workload.
 const TARGET: &str = "SELECT payload FROM (SELECT 0 AS ordinal, CAST('1' AS VARCHAR) AS payload UNION ALL SELECT 1 AS ordinal, REPEAT('x', 1048576) AS payload UNION ALL SELECT 2 AS ordinal, REPEAT('x', 1048576) AS payload UNION ALL SELECT 3 AS ordinal, REPEAT('x', 1048576) AS payload UNION ALL SELECT 4 AS ordinal, REPEAT('x', 1048576) AS payload) ordered_rows ORDER BY ordinal ASC";
 const HEALTHY: &str =
-    "SELECT CAST(SUM(generate_series) AS VARCHAR) AS payload FROM generate_series(1, 100)";
+    "SELECT CAST(SUM(generate_series) AS VARCHAR) AS payload FROM TABLE(generate_series(1, 100))";
 
 pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![

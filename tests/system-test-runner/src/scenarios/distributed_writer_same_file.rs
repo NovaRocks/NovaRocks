@@ -61,12 +61,20 @@ pub(super) fn observation_specs(cluster_size: usize) -> impl Iterator<Item = Sta
     })
 }
 
+fn metadata_files(table: &str) -> String {
+    let (namespace, name) = table
+        .rsplit_once('.')
+        .expect("scenario tables have a namespace");
+    format!("{namespace}.\"{name}$files\"")
+}
+
 fn files(control: &mut SqlSession, table: &str) -> Result<Vec<FileFact>> {
     writer_live_files(
         &control
             .execute(format!(
-                "SELECT content,file_path,file_format,record_count FROM {table}$files \
-             ORDER BY content,file_path"
+                "SELECT content,file_path,file_format,record_count FROM {metadata} \
+             ORDER BY content,file_path",
+                metadata = metadata_files(table),
             ))
             .context("read current live data/delete entries from original Iceberg metadata")?,
     )
@@ -137,12 +145,11 @@ pub(super) fn run(
         "retain one old data file across large DELETE and DV merge with requested DOP {dop}"
     ));
     control.execute(format!(
-        "CREATE TABLE {table} (id BIGINT,v BIGINT) TBLPROPERTIES \
-         (\"format-version\"=\"3\",\"write.row-lineage\"=\"true\",\"novarocks.update.mode\"=\"merge-on-read\")"
+        "CREATE TABLE {table} (id BIGINT,v BIGINT) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['true', 'merge-on-read']))"
     ))?;
     // Only seeding is singleton. The original ORDER BY shape also gathers
     // the generated input, and the following observations verify the outcome.
-    control.execute("SET pipeline_dop=1")?;
+    control.execute("SET SESSION pipeline_dop = 1")?;
     let seed_result = control.execute(format!(
         "INSERT INTO {table} SELECT generate_series,generate_series \
          FROM TABLE(generate_series(1,{SEED_ROWS})) ORDER BY generate_series"
@@ -165,7 +172,7 @@ pub(super) fn run(
         "row-level source file differs from original live metadata: {before:?}"
     );
     let old_file = row_files[0].0.as_str();
-    control.execute(format!("SET pipeline_dop={dop}"))?;
+    control.execute(format!("SET SESSION pipeline_dop={dop}"))?;
 
     let before_writers = all_write_counters(context)?;
     super::dop_observation::mutate_observed(

@@ -454,7 +454,7 @@ pub(super) fn set_query_timeout(
     timeout_seconds: u64,
     live_uri: &mut Option<String>,
 ) -> Result<Value> {
-    let mut page = actor.submit(&format!("SET query_timeout = {timeout_seconds}"))?;
+    let mut page = actor.submit(&format!("SET SESSION query_timeout = {timeout_seconds}"))?;
     *live_uri = page.next_uri()?;
     let set_id = page.json()?["id"]
         .as_str()

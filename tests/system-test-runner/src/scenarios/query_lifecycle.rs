@@ -377,7 +377,7 @@ impl DistributedBaseline {
                     SqlSession::new(peer.sql_user(), peer.runtime().fe_trino_port, deadline)?;
                 for level in ["package", "wipe"] {
                     let sql = format!(
-                        "CALL test_control_probe.system.novarocks_imv_stateless_rebuild(table => 'ns.mv', level => '{level}')"
+                        "CALL test_control_probe.system.novarocks_imv_stateless_rebuild(\"table\" => 'ns.mv', level => '{level}')"
                     );
                     match session.execute(&sql) {
                         Err(StatementFailure::Trino(error)) => {

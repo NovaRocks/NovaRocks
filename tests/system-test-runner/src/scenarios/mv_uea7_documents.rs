@@ -176,14 +176,14 @@ impl Scenario for Documents {
             context,
             &mut conn,
             "create document namespace",
-            &format!("CREATE DATABASE {catalog}.{NS}"),
+            &format!("CREATE SCHEMA {catalog}.{NS}"),
         )?;
         select_catalog_and_namespace(context, &mut conn, catalog)?;
         execute(
             context,
             &mut conn,
             "create row-lineage document source",
-            "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES ('format-version'='3','write.row-lineage'='true')",
+            "CREATE TABLE orders (k1 INT, v2 BIGINT) WITH (format_version = 3)",
         )?;
         execute(
             context,
@@ -332,7 +332,7 @@ fn create_mv(context: &mut ScenarioContext, conn: &mut SqlSession, name: &str) -
         conn,
         "create isolated document MV",
         &format!(
-            "CREATE MATERIALIZED VIEW {name} DISTRIBUTED BY HASH(k1) BUCKETS 1 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine'='iceberg') AS SELECT k1, v2 FROM orders"
+            "CREATE MATERIALIZED VIEW {name} WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders"
         ),
     )
 }
@@ -341,7 +341,7 @@ fn refresh(context: &mut ScenarioContext, conn: &mut SqlSession, name: &str) -> 
         context,
         conn,
         "ordinary document MV refresh",
-        &format!("REFRESH MATERIALIZED VIEW {name} WITH SYNC MODE"),
+        &format!("REFRESH MATERIALIZED VIEW {name}"),
     )
 }
 fn repartition(
@@ -354,12 +354,14 @@ fn repartition(
         context,
         conn,
         "publish a distinct document interpretation",
-        &format!("ALTER MATERIALIZED VIEW {name} REPARTITION BY (bucket(k1, {buckets}))"),
+        &format!(
+            "ALTER MATERIALIZED VIEW {name} SET PROPERTIES partitioning = ARRAY['bucket(k1, {buckets})']"
+        ),
     )
 }
 fn expiry_sql(catalog: &str, table: &str, token: &str, keep: usize) -> String {
     format!(
-        "CALL {catalog}.system.novarocks_mv_document_expiry(table => '{NS}.{table}', keep_last => {keep}, token => '{token}')"
+        r#"CALL {catalog}.system.novarocks_mv_document_expiry("table" => '{NS}.{table}', keep_last => {keep}, token => '{token}')"#
     )
 }
 fn expire(
@@ -1057,7 +1059,7 @@ fn run_expiry(
             context,
             conn,
             "create a real unreferenced expiry candidate",
-            &format!("ALTER MATERIALIZED VIEW {table} RESUME REFRESH"),
+            &format!("ALTER MATERIALIZED VIEW {table} SET PROPERTIES refresh_paused = false"),
         )?;
         let mut before = load_metadata(context, rest, NS, table)?;
         let head = before["current-snapshot-id"]
@@ -1454,7 +1456,7 @@ impl Documents {
                 format!("read original FE warning log {}", diagnostic_path.display())
             })?;
             let failure = conn
-                .execute(format!("REFRESH MATERIALIZED VIEW {case} WITH SYNC MODE"))
+                .execute(format!("REFRESH MATERIALIZED VIEW {case}"))
                 .expect_err("corrupt current documents must refuse refresh");
             let public = mv_public_error(&failure)?;
             ensure!(
@@ -1613,7 +1615,7 @@ impl Documents {
             context,
             conn,
             "ordinary ALTER uses Refs loads",
-            "ALTER MATERIALIZED VIEW stable PAUSE REFRESH",
+            "ALTER MATERIALIZED VIEW stable SET PROPERTIES refresh_paused = true",
         )?;
         self.assert_refs_since(start, "stable")?;
         let after = save_graph(
@@ -1636,7 +1638,7 @@ impl Documents {
             context,
             conn,
             "same-value ALTER still commits a slot snapshot",
-            "ALTER MATERIALIZED VIEW stable PAUSE REFRESH",
+            "ALTER MATERIALIZED VIEW stable SET PROPERTIES refresh_paused = true",
         )?;
         let same = save_graph(
             context,

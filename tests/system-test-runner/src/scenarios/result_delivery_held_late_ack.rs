@@ -60,8 +60,8 @@ use std::{
 use tokio::runtime::Runtime;
 
 const NAME: &str = "result-delivery/held-response-late-ack";
-const SQL: &str = "SELECT REPEAT('x', 1048576) AS payload FROM generate_series(1, 1)";
-const HEALTH_SQL: &str = "SELECT SUM(generate_series) AS total FROM generate_series(1, 100)";
+const SQL: &str = "SELECT REPEAT('x', 1048576) AS payload FROM TABLE(generate_series(1, 1))";
+const HEALTH_SQL: &str = "SELECT SUM(generate_series) AS total FROM TABLE(generate_series(1, 100))";
 const S: u64 = 1_048_576;
 const SAMPLES: usize = 51;
 const RECEIPT_BYTES: usize = 131_072;

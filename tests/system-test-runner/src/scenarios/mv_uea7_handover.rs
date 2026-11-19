@@ -87,14 +87,13 @@ impl Scenario for MvOwnerHandover {
             context,
             &mut conn,
             "create managed MV namespace",
-            "CREATE DATABASE uea7_mv_handover.ns",
+            "CREATE SCHEMA uea7_mv_handover.ns",
         )?;
         execute(
             context,
             &mut conn,
             "create row-lineage source table",
-            "CREATE TABLE uea7_mv_handover.ns.orders (k1 INT, v2 BIGINT) \
-             TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+            "CREATE TABLE uea7_mv_handover.ns.orders (k1 INT, v2 BIGINT) WITH (format_version = 3)",
         )?;
         execute(
             context,
@@ -107,15 +106,13 @@ impl Scenario for MvOwnerHandover {
             context,
             &mut conn,
             "create document-managed MV",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 1 \
-             REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') \
-             AS SELECT k1, SUM(v2) AS total FROM orders GROUP BY k1",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, SUM(v2) AS total FROM orders GROUP BY k1",
         )?;
         execute(
             context,
             &mut conn,
             "publish initial MV snapshot",
-            "REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE",
+            "REFRESH MATERIALIZED VIEW orders_mv",
         )?;
         assert_rows(
             context,
@@ -214,7 +211,7 @@ impl Scenario for MvOwnerHandover {
         );
         context.action("verify the old deployment cannot publish after handover");
         let error = conn
-            .execute("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE")
+            .execute("REFRESH MATERIALIZED VIEW orders_mv")
             .expect_err("old deployment must not manage a handed-over MV");
         let message = mv_public_error(&error)?.message.clone();
         if !message.contains("another deployment")

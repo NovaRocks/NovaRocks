@@ -174,28 +174,28 @@ impl CheckedFixture {
         let name = self.catalog_name(slow);
         let properties = if self.provider == "iceberg" {
             format!(
-                "\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\"iceberg.catalog.warehouse\"=\"{}\"",
+                "\"iceberg.catalog.type\" = 'rest',\"uri\" = '{}',\"iceberg.catalog.warehouse\" = '{}'",
                 sql_string(self.facts.rest_uri.as_deref().unwrap_or_default()),
                 sql_string(&self.facts.warehouse_uri)
             )
         } else {
             format!(
-                "\"paimon.catalog.type\"=\"filesystem\",\"warehouse\"=\"{}\"",
+                "\"paimon.catalog.type\" = 'filesystem',\"warehouse\" = '{}'",
                 sql_string(&self.facts.warehouse_uri)
             )
         };
         format!(
-            "CREATE EXTERNAL CATALOG {name} PROPERTIES(\"type\"=\"{}\",{properties},\
-             \"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"{}\",\
-             \"aws.s3.enable_path_style_access\"=\"true\",\
-             \"credential.object-store-metadata.consumer-role\"=\"frontend\",\
-             \"credential.object-store-metadata.mode\"=\"static\",\
-             \"credential.object-store-metadata.name\"=\"{}\",\
-             \"credential.object-store-metadata.generation\"=\"{}\",\
-             \"credential.object-store-data.consumer-role\"=\"backend\",\
-             \"credential.object-store-data.mode\"=\"static\",\
-             \"credential.object-store-data.name\"=\"{}\",\
-             \"credential.object-store-data.generation\"=\"{}\")",
+            "CREATE CATALOG {name} USING {} WITH ({properties},\
+             \"aws.s3.endpoint\" = '{}',\"aws.s3.region\" = '{}',\
+             \"aws.s3.enable_path_style_access\" = 'true',\
+             \"credential.object-store-metadata.consumer-role\" = 'frontend',\
+             \"credential.object-store-metadata.mode\" = 'static',\
+             \"credential.object-store-metadata.name\" = '{}',\
+             \"credential.object-store-metadata.generation\" = '{}',\
+             \"credential.object-store-data.consumer-role\" = 'backend',\
+             \"credential.object-store-data.mode\" = 'static',\
+             \"credential.object-store-data.name\" = '{}',\
+             \"credential.object-store-data.generation\" = '{}')",
             self.provider,
             sql_string(s3_endpoint),
             sql_string(&self.facts.region),
@@ -327,7 +327,7 @@ fn credential_overlay(purpose: &str, name: &str, generation: &str) -> String {
 }
 
 fn sql_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value.replace('\'', "''")
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -629,7 +629,7 @@ impl Scenario for CatalogPlanningNoFeQuota {
         let paimon_table = fixtures.paimon.table_name(false);
         let budget_error = connection
             .execute(format!(
-                "SELECT /*+ SET_VAR(query_mem_limit=1) */ * FROM {paimon_table}"
+                "WITH SESSION query_mem_limit = 1 SELECT * FROM {paimon_table}"
             ))
             .expect_err("one-byte query memory budget must reject the admitted Paimon read");
         if !(matches!(&budget_error, StatementFailure::Trino(_))
@@ -861,7 +861,7 @@ fn run_iceberg_held_deadline(
         "iceberg-deadline-q1",
         move |connection, statements| {
             statements
-                .run(connection, "SET query_timeout = 1")?
+                .run(connection, "SET SESSION query_timeout = 1")?
                 .context("set one-second statement deadline")?;
             Ok(statements.run(connection, query)?.and_then(unsigned_rows))
         },

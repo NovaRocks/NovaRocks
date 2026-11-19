@@ -103,11 +103,11 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
         context.deadline(),
     )?;
     crate::scenarios::connector::create_catalog(&mut control, "cbw_catalog", &warehouse)?;
-    control.execute("CREATE DATABASE cbw_catalog.cbw_db")?;
-    control.execute("CREATE TABLE cbw_catalog.cbw_db.cbw_data (v BIGINT) TBLPROPERTIES ('novarocks.statistics.collect-on-write'='false')")?;
+    control.execute("CREATE SCHEMA cbw_catalog.cbw_db")?;
+    control.execute("CREATE TABLE cbw_catalog.cbw_db.cbw_data (v BIGINT) WITH (statistics_collect_on_write = false)")?;
     for value in [1, 2, 3] {
         control.execute(format!(
-            "INSERT INTO cbw_catalog.cbw_db.cbw_data VALUES ({value})"
+            "INSERT INTO cbw_catalog.cbw_db.cbw_data VALUES ROW({value})"
         ))?;
     }
     drop(control);

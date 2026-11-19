@@ -214,7 +214,7 @@ impl Scenario for CatalogListing {
             phases.push(record_listing_phase(context, "drop-refusal", || {
                 let error = listing_sql(
                     &mut control,
-                    "DROP DATABASE cl_normal.cl_ns_0000 FORCE",
+                    "DROP SCHEMA cl_normal.cl_ns_0000 CASCADE",
                     deadline,
                 )
                 .err()
@@ -266,7 +266,7 @@ impl Scenario for CatalogListing {
         phases.push(record_listing_phase(context, "drop-success", || {
             listing_sql(
                 &mut control,
-                "DROP DATABASE cl_normal.cl_ns_0000 FORCE",
+                "DROP SCHEMA cl_normal.cl_ns_0000 CASCADE",
                 deadline,
             )?;
             let audit = fixture.snapshot()?;
@@ -478,10 +478,10 @@ impl std::fmt::Display for ListingClientPanic {
 impl std::error::Error for ListingClientPanic {}
 
 fn listing_catalog_sql(fixture: &ListingRestFixture, name: &str) -> String {
+    let endpoint = fixture.endpoint().replace('\'', "''");
     format!(
-        "CREATE EXTERNAL CATALOG {name} PROPERTIES (\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\"warehouse\"=\"s3://cl-fixture/warehouse\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"cl-fixture\",\"credential.object-store-metadata.generation\"=\"v1\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"static\",\"credential.object-store-data.name\"=\"cl-fixture\",\"credential.object-store-data.generation\"=\"v1\")",
-        fixture.endpoint(),
-        fixture.endpoint()
+        "CREATE CATALOG {name} USING iceberg WITH (\"iceberg.catalog.type\" = 'rest',\"uri\" = '{}',\"warehouse\" = 's3://cl-fixture/warehouse',\"aws.s3.endpoint\" = '{}',\"aws.s3.region\" = 'us-east-1',\"aws.s3.enable_path_style_access\" = 'true',\"credential.object-store-metadata.consumer-role\" = 'frontend',\"credential.object-store-metadata.mode\" = 'static',\"credential.object-store-metadata.name\" = 'cl-fixture',\"credential.object-store-metadata.generation\" = 'v1',\"credential.object-store-data.consumer-role\" = 'backend',\"credential.object-store-data.mode\" = 'static',\"credential.object-store-data.name\" = 'cl-fixture',\"credential.object-store-data.generation\" = 'v1')",
+        endpoint, endpoint
     )
 }
 
@@ -534,7 +534,7 @@ impl Scenario for ObjectStoreListingBoundary {
         ] {
             fixture.set_object_store_list_body_bytes(bytes)?;
             record_listing_phase(context, "opendal-list-body-boundary", || {
-                let error = listing_sql(&mut control, "ALTER TABLE cl_opendal.cl_ns_0000.cl_table_000000 ADD FILES FROM 's3://cl-fixture/import-source/'", deadline)
+                let error = listing_sql(&mut control, "ALTER TABLE cl_opendal.cl_ns_0000.cl_table_000000 EXECUTE add_files(location => 's3://cl-fixture/import-source/')", deadline)
                     .err()
                     .context("empty source listing must not commit ADD FILES")?;
                 let diagnostic = listing_public_error(&error)?.message.clone();
@@ -620,7 +620,7 @@ impl Scenario for CatalogListingCancellation {
         listing_sql(&mut control, "USE cl_cancel.cl_ns_0000", deadline)?;
         fixture.set_mode(ListingMode::Delayed)?;
         record_listing_phase(context, "listing-deadline", || {
-            listing_sql(&mut control, "SET query_timeout=1", deadline)?;
+            listing_sql(&mut control, "SET SESSION query_timeout = 1", deadline)?;
             let error = listing_sql(&mut control, "SELECT table_name FROM information_schema.tables WHERE table_schema='cl_ns_0000' AND table_type='VIEW' ORDER BY table_name", deadline)
                 .and_then(listing_views)
                 .err()
@@ -634,7 +634,7 @@ impl Scenario for CatalogListingCancellation {
             {
                 return Err(error.context("listing failed outside its absolute deadline"));
             }
-            listing_sql(&mut control, "SET query_timeout=0", deadline)?;
+            listing_sql(&mut control, "SET SESSION query_timeout = 0", deadline)?;
             let one = listing_sql(&mut control, "SELECT 1", deadline)
                 .and_then(|result| listing_integer(&result).map(Some))?;
             ensure!(

@@ -55,7 +55,7 @@ impl ReadSessionSettings {
         // Only this original session property is supported. Memory is frozen
         // by each statement's admitted hint; batch size remains its default.
         // The scenario checks the actual build participant count separately.
-        connection.execute(format!("SET pipeline_dop={}", self.pipeline_dop))?;
+        connection.execute(format!("SET SESSION pipeline_dop={}", self.pipeline_dop))?;
         Ok(())
     }
 }
@@ -118,7 +118,7 @@ impl WriterActor {
                 }
                 if let Some(seconds) = query_timeout_secs {
                     connection
-                        .execute(format!("SET query_timeout = {seconds}"))
+                        .execute(format!("SET SESSION query_timeout = {seconds}"))
                         .context("set the deadline write session query_timeout")?;
                 }
                 let pending = connection.submit(&actor_sql)?;

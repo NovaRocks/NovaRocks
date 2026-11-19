@@ -86,7 +86,7 @@ impl ReadbackFault {
             Self::OwnedWrongDigest => 102,
             Self::OwnedReadRejected => 103,
         };
-        format!("INSERT INTO {CATALOG}.{SOURCE} VALUES ({id})")
+        format!("INSERT INTO {CATALOG}.{SOURCE} VALUES ROW({id})")
     }
 
     fn pause(self) -> PauseAfter {
@@ -682,9 +682,17 @@ fn cancel_ctas(context: &mut ScenarioContext, observations: &SqlIntentOwner) -> 
     Ok(())
 }
 
+fn metadata_files(table: &str) -> String {
+    let (namespace, name) = table
+        .rsplit_once('.')
+        .expect("scenario tables have a namespace");
+    format!("{namespace}.\"{name}$files\"")
+}
+
 fn live_paths(control: &mut SqlSession, table: &str) -> Result<Vec<String>> {
     let result = control.execute(format!(
-        "SELECT file_path FROM {table}$files WHERE content=0 ORDER BY file_path"
+        "SELECT file_path FROM {metadata} WHERE content=0 ORDER BY file_path",
+        metadata = metadata_files(table),
     ))?;
     result
         .rows
@@ -928,7 +936,7 @@ fn native_writes(
         fixture.proxy.endpoint(),
     );
     let retry_properties = format!(
-        r#", "aws.s3.max_retries"="{RETRIES}", "aws.s3.retry_min_delay_ms"="{RETRY_MIN_MS}", "aws.s3.retry_max_delay_ms"="{RETRY_MAX_MS}", "aws.s3.request_timeout_ms"="{REQUEST_TIMEOUT_MS}", "aws.s3.io_timeout_ms"="{IO_TIMEOUT_MS}")"#
+        r#", "aws.s3.max_retries" = '{RETRIES}', "aws.s3.retry_min_delay_ms" = '{RETRY_MIN_MS}', "aws.s3.retry_max_delay_ms" = '{RETRY_MAX_MS}', "aws.s3.request_timeout_ms" = '{REQUEST_TIMEOUT_MS}', "aws.s3.io_timeout_ms" = '{IO_TIMEOUT_MS}')"#
     );
     sql.execute(format!(
         "{}{}",
@@ -937,11 +945,14 @@ fn native_writes(
             .context("REST catalog SQL layout changed")?,
         retry_properties
     ))?;
-    sql.execute(format!("CREATE DATABASE {CATALOG}.managed_objects"))?;
-    sql.execute("SET pipeline_dop=1")?;
+    sql.execute(format!("CREATE SCHEMA {CATALOG}.managed_objects"))?;
+    sql.execute("SET SESSION pipeline_dop = 1")?;
     let table = format!("{CATALOG}.{SOURCE}");
-    sql.execute(format!("CREATE TABLE {table} (id BIGINT) TBLPROPERTIES (\"format-version\"=\"3\",\"write.row-lineage\"=\"true\",\"novarocks.update.mode\"=\"merge-on-read\")"))?;
-    sql::expect_update_count(&sql.execute(format!("INSERT INTO {table} VALUES (1)"))?, 1)?;
+    sql.execute(format!("CREATE TABLE {table} (id BIGINT) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['true', 'merge-on-read']))"))?;
+    sql::expect_update_count(
+        &sql.execute(format!("INSERT INTO {table} VALUES ROW(1)"))?,
+        1,
+    )?;
     let seed = live_paths(&mut sql, &table)?;
     let [first] = seed.as_slice() else {
         anyhow::bail!("native seed did not write exactly one file")
@@ -955,7 +966,7 @@ fn native_writes(
         .proxy
         .arm_ack_loss(S3Operation::Put, AckTarget::NextObjectUnder(prefix.clone()))?;
     sql::expect_update_count(
-        &sql.execute(format!("INSERT INTO {table} VALUES (2),(3),(4)"))?,
+        &sql.execute(format!("INSERT INTO {table} VALUES ROW(2),ROW(3),ROW(4)"))?,
         3,
     )?;
     let events = fixture.proxy.events();
@@ -1131,7 +1142,8 @@ fn native_writes(
         "native DV replacement changed the committed row bag"
     );
     let vectors = sql::integer_column(&sql.execute(format!(
-        "SELECT record_count FROM {table}$files WHERE content=1 AND file_format='PUFFIN'"
+        "SELECT record_count FROM {metadata} WHERE content=1 AND file_format='PUFFIN'",
+        metadata = metadata_files(&table),
     ))?)?;
     ensure!(
         vectors == [2],
@@ -1154,7 +1166,10 @@ fn native_writes(
         dv_puts.len() == 2,
         "each materialization must create its own real conditional Puffin object"
     );
-    sql::expect_update_count(&sql.execute(format!("INSERT INTO {table} VALUES (5)"))?, 1)?;
+    sql::expect_update_count(
+        &sql.execute(format!("INSERT INTO {table} VALUES ROW(5)"))?,
+        1,
+    )?;
     ensure!(
         sql::integer_column(&sql.execute(format!("SELECT id FROM {table} ORDER BY id"))?)?
             == [1, 4, 5],

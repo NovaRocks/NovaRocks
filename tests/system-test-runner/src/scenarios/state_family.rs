@@ -56,14 +56,14 @@ impl Scenario for WipeStartRebuild {
             .join("state-family");
         std::fs::create_dir_all(&warehouse)
             .with_context(|| format!("create warehouse {}", warehouse.display()))?;
-        let warehouse = warehouse.to_string_lossy().replace('"', "\\\"");
+        let warehouse = warehouse.to_string_lossy().replace('\'', "''");
 
         context.remaining("connect state family client")?;
         let mut connection =
             sql::SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         attach_catalog(&mut connection, "wipe_before", &warehouse)?;
         connection
-            .execute("CREATE DATABASE wipe_before.ns")
+            .execute("CREATE SCHEMA wipe_before.ns")
             .context("create pre-wipe namespace")?;
         connection
             .execute("CREATE TABLE wipe_before.ns.orders (id INT, amount INT)")
@@ -173,8 +173,7 @@ impl Scenario for WipeStartRebuild {
 fn attach_catalog(connection: &mut sql::SqlSession, name: &str, warehouse: &str) -> Result<()> {
     connection
         .execute(format!(
-            "CREATE EXTERNAL CATALOG {name} PROPERTIES(\"type\"=\"iceberg\",\
-             \"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{warehouse}\")"
+            "CREATE CATALOG {name} USING iceberg WITH (\"iceberg.catalog.type\" = 'hadoop', \"iceberg.catalog.warehouse\" = '{warehouse}')"
         ))
         .with_context(|| format!("create catalog attachment {name}"))
         .map(|_| ())

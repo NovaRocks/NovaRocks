@@ -88,7 +88,7 @@ impl Scenario for SingleStatementEffects {
             .context("native query-output resource baseline missing")?;
         let mut session =
             SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
-        let completion = session.execute("SET query_timeout = 61")?;
+        let completion = session.execute("SET SESSION query_timeout = 61")?;
         ensure!(
             completion.is_completion()
                 && completion.columns.is_empty()
@@ -113,7 +113,7 @@ impl Scenario for SingleStatementEffects {
             &context.scenario_root().join("batch-http"),
         )?
         .with_session(&[("x-trino-session", "query_timeout=61")]);
-        let pages = raw.execute("SET query_timeout = 60; SELECT 1")?;
+        let pages = raw.execute("SET SESSION query_timeout = 60; SELECT 1")?;
         let first = pages
             .first()
             .context("batch admission omitted its original response")?

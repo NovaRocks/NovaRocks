@@ -575,7 +575,7 @@ fn seed(context: &mut ScenarioContext) -> Result<()> {
     let mut control =
         SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
     create_catalog(&mut control, CATALOG, &warehouse)?;
-    control.execute(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))?;
+    control.execute(format!("CREATE SCHEMA {CATALOG}.{DATABASE}"))?;
     control.execute(format!("CREATE TABLE {TABLE} (k BIGINT NOT NULL)"))?;
     // Independent committed files make the scan eligible on the live BE
     // roster. Actual selected participants are checked, never guessed.
@@ -586,8 +586,11 @@ fn seed(context: &mut ScenarioContext) -> Result<()> {
             "INSERT INTO {TABLE} SELECT generate_series FROM TABLE(generate_series({first},{last}))"
         ))?;
     }
+    let (schema, table) = TABLE
+        .rsplit_once('.')
+        .expect("Exchange fixture table is qualified");
     let files = file_geometry(&control.execute(format!(
-        "SELECT content,file_path,file_format,record_count,file_size_in_bytes FROM {TABLE}$files ORDER BY file_path"
+        "SELECT content,file_path,file_format,record_count,file_size_in_bytes FROM {schema}.\"{table}$files\" ORDER BY file_path"
     )).context("read original Exchange fixture file geometry")?)?;
     retain(context, "exchange-seed-file-geometry.json", &files)?;
     // All six original files share Iceberg's minimum split weight (0.05 of
@@ -620,14 +623,14 @@ fn join_sql() -> String {
 
 fn settings(partitioned: bool, seconds: u64) -> Vec<String> {
     vec![
-        format!("SET query_timeout = {seconds}"),
+        format!("SET SESSION query_timeout = {seconds}"),
         format!(
-            "SET cbo_broadcast_node_mem_budget_bytes = {}",
+            "SET SESSION cbo_broadcast_node_mem_budget_bytes = {}",
             if partitioned { 0 } else { 10_737_418_240_u64 }
         ),
         // Exercise actual ordered join inputs, independently of optional RF
         // admission. The affected V3 RF suites cover that separate contract.
-        "SET enable_global_runtime_filter = false".into(),
+        "SET SESSION enable_global_runtime_filter = false".into(),
     ]
 }
 
@@ -949,8 +952,12 @@ fn explain(context: &mut ScenarioContext, sql: &str, partitioned: bool) -> Resul
     for setting in settings(partitioned, 120) {
         control.execute(setting)?;
     }
-    let physical_tree = plan_text(&control.execute(format!("EXPLAIN VERBOSE {sql}"))?)?;
-    let contract = plan_text(&control.execute(format!("EXPLAIN CONTRACT {sql}"))?)?;
+    let physical_tree = plan_text(&control.execute(format!(
+        "EXPLAIN WITH SESSION explain_detail = 'VERBOSE' {sql}"
+    ))?)?;
+    let contract = plan_text(&control.execute(format!(
+        "EXPLAIN WITH SESSION explain_detail = 'CONTRACT' {sql}"
+    ))?)?;
     // Retain both original replies even if the subsequent format/identity
     // checks reject the fixture. No display ordinal is used as a wire ID.
     let input = format!("{partitioned}:{sql}");

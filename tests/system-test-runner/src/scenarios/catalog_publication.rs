@@ -225,10 +225,10 @@ access_key_secret = "${ENV:NOVA_PUBLICATION_SECRET_KEY}"
             catalog_sql(fixture, "publication_setup", 30_000),
             deadline,
         )?;
-        execute_sql(&mut conn, "CREATE DATABASE publication_setup.ns", deadline)?;
+        execute_sql(&mut conn, "CREATE SCHEMA publication_setup.ns", deadline)?;
         execute_sql(
             &mut conn,
-            "CREATE TABLE publication_setup.ns.orders (k INT) TBLPROPERTIES (\"format-version\"=\"2\", \"history.expire.min-snapshots-to-keep\"=\"1\")",
+            "CREATE TABLE publication_setup.ns.orders (k INT) WITH (format_version = 2, extra_properties = MAP(ARRAY['history.expire.min-snapshots-to-keep'], ARRAY['1']))",
             deadline,
         )?;
         execute_sql(&mut conn, catalog_sql(fixture, CATALOG, budget), deadline)?;
@@ -239,7 +239,7 @@ access_key_secret = "${ENV:NOVA_PUBLICATION_SECRET_KEY}"
                 for value in 1..=4 {
                     execute_sql(
                         &mut conn,
-                        format!("INSERT INTO {TABLE} VALUES ({value})"),
+                        format!("INSERT INTO {TABLE} VALUES ROW({value})"),
                         deadline,
                     )?;
                 }
@@ -305,18 +305,19 @@ fn require_catalog_activity(context: &ScenarioContext) -> Result<()> {
 
 fn catalog_sql(fixture: &PublicationFixture, catalog: &str, budget: u64) -> String {
     let endpoints = fixture.rest().endpoints();
+    let sql_text = |value: &str| value.replace('\'', "''");
     format!(
-        r#"CREATE EXTERNAL CATALOG {catalog} PROPERTIES(
-        "type"="iceberg", "iceberg.catalog.type"="rest", "uri"="{}", "warehouse"="{}",
-        "novarocks.publication.evidence-timeout-ms"="{budget}",
-        "credential.object-store-metadata.consumer-role"="frontend", "credential.object-store-metadata.mode"="static",
-        "credential.object-store-metadata.name"="publication-fixture", "credential.object-store-metadata.generation"="v1",
-        "credential.object-store-data.consumer-role"="backend", "credential.object-store-data.mode"="static",
-        "credential.object-store-data.name"="publication-fixture", "credential.object-store-data.generation"="v1",
-        "aws.s3.endpoint"="{}", "aws.s3.region"="us-east-1", "aws.s3.enable_path_style_access"="true")"#,
-        fixture.uri(),
-        endpoints.rest_warehouse,
-        endpoints.minio_endpoint
+        r#"CREATE CATALOG {catalog} USING iceberg WITH (
+        "iceberg.catalog.type" = 'rest', "uri" = '{}', "warehouse" = '{}',
+        "novarocks.publication.evidence-timeout-ms" = '{budget}',
+        "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = 'static',
+        "credential.object-store-metadata.name" = 'publication-fixture', "credential.object-store-metadata.generation" = 'v1',
+        "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = 'static',
+        "credential.object-store-data.name" = 'publication-fixture', "credential.object-store-data.generation" = 'v1',
+        "aws.s3.endpoint" = '{}', "aws.s3.region" = 'us-east-1', "aws.s3.enable_path_style_access" = 'true')"#,
+        sql_text(fixture.uri()),
+        sql_text(&endpoints.rest_warehouse),
+        sql_text(&endpoints.minio_endpoint)
     )
 }
 fn new_session(context: &ScenarioContext) -> Result<SqlSession> {
@@ -881,7 +882,7 @@ fn stream_deadline(context: &mut ScenarioContext, fixture: &PublicationFixture) 
         ),
         (
             "catalog-mutation",
-            format!("CREATE DATABASE {CATALOG}.streamed_namespace"),
+            format!("CREATE SCHEMA {CATALOG}.streamed_namespace"),
             true,
         ),
         (
@@ -901,7 +902,7 @@ fn stream_deadline(context: &mut ScenarioContext, fixture: &PublicationFixture) 
         ),
         (
             "catalog-mutation",
-            format!("DROP DATABASE {CATALOG}.streamed_namespace"),
+            format!("DROP SCHEMA {CATALOG}.streamed_namespace"),
             false,
         ),
     ]
@@ -1035,10 +1036,10 @@ fn maintenance_race(
     let mut hold = fixture.service().arm("ns.orders")?;
     let statement = if matches!(property, Property::ExpiryConcurrency) {
         format!(
-            "ALTER TABLE {TABLE} EXPIRE SNAPSHOTS OLDER THAN '2099-01-01 00:00:00' RETAIN LAST 1"
+            "ALTER TABLE {TABLE} EXECUTE expire_snapshots(older_than => '2099-01-01 00:00:00', retain_last => 1)"
         )
     } else {
-        format!("ALTER TABLE {TABLE} REWRITE MANIFESTS")
+        format!("ALTER TABLE {TABLE} EXECUTE optimize_manifests")
     };
     let query = service_sql(context, "maintenance", &mut hold, statement)?;
     let mut competitor_snapshot = Value::Null;
@@ -1074,7 +1075,7 @@ fn maintenance_race(
             )?;
             sql(
                 context,
-                "INSERT INTO publication_competitor.ns.orders VALUES (99)",
+                "INSERT INTO publication_competitor.ns.orders VALUES ROW(99)",
             )?;
             let appended = metadata(fixture)?;
             competitor_snapshot = appended["current-snapshot-id"].clone();
@@ -1210,20 +1211,20 @@ fn seed(
     sql(
         context,
         &format!(
-            "CREATE TABLE publication_setup.ns.{table} (k INT) TBLPROPERTIES (\"format-version\"=\"{format_version}\", \"history.expire.min-snapshots-to-keep\"=\"1\")"
+            "CREATE TABLE publication_setup.ns.{table} (k INT) WITH (format_version = {format_version}, extra_properties = MAP(ARRAY['history.expire.min-snapshots-to-keep'], ARRAY['1']))"
         ),
     )?;
     for value in 1..=3 {
         sql(
             context,
-            &format!("INSERT INTO publication_setup.ns.{table} VALUES ({value})"),
+            &format!("INSERT INTO publication_setup.ns.{table} VALUES ROW({value})"),
         )?;
     }
     // The final overwrite makes the first snapshot's data unreachable from
     // main. Its later source read cannot pass merely through main protection.
     sql(
         context,
-        &format!("INSERT OVERWRITE publication_setup.ns.{table} VALUES (4)"),
+        &format!("INSERT OVERWRITE publication_setup.ns.{table} VALUES ROW(4)"),
     )?;
     ensure!(
         rows(context, table, None)? == vec![4],
@@ -1320,7 +1321,7 @@ fn rows(context: &ScenarioContext, table: &str, version: Option<&str>) -> Result
 }
 fn expire(catalog: &str, table: &str) -> String {
     format!(
-        "ALTER TABLE {catalog}.ns.{table} EXPIRE SNAPSHOTS OLDER THAN '2099-01-01 00:00:00' RETAIN LAST 1"
+        "ALTER TABLE {catalog}.ns.{table} EXECUTE expire_snapshots(older_than => '2099-01-01 00:00:00', retain_last => 1)"
     )
 }
 fn finish_proxy<T>(
@@ -1437,7 +1438,7 @@ fn expiry_properties(
                     sql(
                         context,
                         &format!(
-                            "INSERT INTO publication_branch_writer.ns.{table}.branch_dev2 VALUES (99)"
+                            "INSERT INTO publication_branch_writer.ns.{table} @dev2 VALUES ROW(99)"
                         ),
                     )?;
                     let append_forwarded =
@@ -1628,7 +1629,7 @@ fn local_expiry_serialization(
         hold.wait_until_held(context.deadline())?;
         let count = control.mutation_counts("ns", table).table_commit_forwarded;
         let statement = format!(
-            "ALTER TABLE {CATALOG}.ns.{table} CREATE TAG local_waiter AS OF VERSION {candidate}"
+            "ALTER TABLE {CATALOG}.ns.{table} EXECUTE create_tag(name => 'local_waiter', snapshot_id => {candidate})"
         );
         reference = Some(spawn_observed_sql(
             context,
@@ -1804,7 +1805,7 @@ fn local_expiry_serialization(
             sql(
                 context,
                 &format!(
-                    "ALTER TABLE publication_unknown.ns.{table} CREATE TAG after_unknown AS OF VERSION {candidate}"
+                    "ALTER TABLE publication_unknown.ns.{table} EXECUTE create_tag(name => 'after_unknown', snapshot_id => {candidate})"
                 ),
             )?;
             let tagged = table_metadata(fixture, table)?;

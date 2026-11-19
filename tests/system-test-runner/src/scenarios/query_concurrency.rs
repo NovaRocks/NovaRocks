@@ -1097,7 +1097,9 @@ fn start_timed_hold(
 )> {
     let deadline = context.deadline();
     let mut session = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
-    let completion = session.execute(format!("SET query_timeout = {TERMINAL_TIMEOUT_SECONDS}"))?;
+    let completion = session.execute(format!(
+        "SET SESSION query_timeout = {TERMINAL_TIMEOUT_SECONDS}"
+    ))?;
     ensure!(
         completion.update_type.as_deref() == Some("SET SESSION")
             && completion.update_count.is_none()

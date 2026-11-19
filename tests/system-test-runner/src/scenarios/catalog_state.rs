@@ -39,14 +39,14 @@ impl Scenario for CatalogAttachmentRestart {
                 warehouse.display()
             )
         })?;
-        let warehouse = warehouse.to_string_lossy().replace('"', "\\\"");
+        let warehouse = warehouse.to_string_lossy().replace('\'', "''");
         connection
             .execute(format!(
-                "CREATE EXTERNAL CATALOG tst3_attachment PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{warehouse}\")"
+                "CREATE CATALOG tst3_attachment USING iceberg WITH (\"iceberg.catalog.type\" = 'hadoop', \"iceberg.catalog.warehouse\" = '{warehouse}')"
             ))
             .context("create durable catalog attachment")?;
         connection
-            .execute("CREATE DATABASE tst3_attachment.ns")
+            .execute("CREATE SCHEMA tst3_attachment.ns")
             .context("create catalog attachment namespace")?;
         connection
             .execute("CREATE TABLE tst3_attachment.ns.orders (id INT, amount INT)")
