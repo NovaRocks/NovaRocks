@@ -59,12 +59,13 @@ use novarocks_physical_plan::{
     RuntimeFilterProducerProgress, RuntimeFilterProducerTarget, RuntimeFilterReduction,
     RuntimeFilterWitnessId, SetOperationKind, SortDirection, SortExpr, SortMode,
     TableFunctionOutput, TopNPhase as ContractTopNPhase, TopNSequenceId, UnaryOperator,
-    UnpivotConstant as ContractUnpivotConstant, UnpivotSpec, UnpivotValueMapping, ValidationErrors,
-    ValueId, ValueOrigin, ValueType, WRITER_MULTIPLEX_SCHEMA_REVISION,
-    WindowBound as ContractWindowBound, WindowExpression, WindowFrame as ContractWindowFrame,
-    WindowFrameExclusion, WindowFrameUnits, WindowSpec, WriterAggregateCall, WriterDerivedKind,
-    WriterFinishSpec, WriterGroupedUnpivotMapping, WriterGroupedUnpivotSpec, WriterRelationField,
-    WriterRelationFieldRole, WriterRelationSchema, WriterTarget, WriterTargetField,
+    UnpivotConstant as ContractUnpivotConstant, UnpivotSpec, UnpivotValueMapping,
+    ValidationErrorCategory, ValidationErrors, ValueId, ValueOrigin, ValueType,
+    WRITER_MULTIPLEX_SCHEMA_REVISION, WindowBound as ContractWindowBound, WindowExpression,
+    WindowFrame as ContractWindowFrame, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+    WriterAggregateCall, WriterDerivedKind, WriterFinishSpec, WriterGroupedUnpivotMapping,
+    WriterGroupedUnpivotSpec, WriterRelationField, WriterRelationFieldRole, WriterRelationSchema,
+    WriterTarget, WriterTargetField,
 };
 #[cfg(test)]
 use novarocks_physical_plan::{LiteralValue as ContractLiteralValue, ProviderReadOccurrenceId};
@@ -13800,6 +13801,13 @@ impl From<ContractLoweringError> for crate::compiler::SqlCompileError {
             ContractLoweringError::ConstantSource(cause) => Self::from(cause),
             ContractLoweringError::UnsupportedWaitCycle(cause) => {
                 Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
+            }
+            ContractLoweringError::Validation(errors)
+                if errors.has(ValidationErrorCategory::ResourceLimit)
+                    && !errors.has(ValidationErrorCategory::StructuralInvariant)
+                    && !errors.has(ValidationErrorCategory::UnsupportedCapability) =>
+            {
+                Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(errors))
             }
             error => Self::Compilation(error.to_string()),
         }

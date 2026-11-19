@@ -3989,13 +3989,11 @@ mod tests {
     #[test]
     fn deep_scalar_source_returns_a_plan_or_the_existing_physical_depth_error() {
         use crate::compiler::{CompletionProtocolError, SqlCompileProgressError};
+        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+        use novarocks_physical_plan::{ValidationErrorCategory, ValidationErrors};
 
-        fn original_depth_rejection(message: &str, lowered: bool) -> bool {
-            let prefix = if lowered {
-                "final physical-plan validation failed: physical plan retains 1 validation error(s); [resource-limit] fragments["
-            } else {
-                "physical plan retains 1 validation error(s); [resource-limit] fragments["
-            };
+        fn original_depth_rejection(message: &str) -> bool {
+            let prefix = "physical plan retains 1 validation error(s); [resource-limit] fragments[";
             let Some(rest) = message.strip_prefix(prefix) else {
                 return false;
             };
@@ -4045,14 +4043,25 @@ mod tests {
                 );
                 drop(completed);
             }
-            Err(SqlCompileProgressError::Compile(SqlCompileError::Compilation(message))) => {
-                assert!(original_depth_rejection(&message, true), "{message}");
-                eprintln!("Deep source rejected at original physical admission: {message}");
+            Err(SqlCompileProgressError::Compile(SqlCompileError::CompilationSource(source))) => {
+                let errors = source
+                    .downcast_ref::<ValidationErrors>()
+                    .expect("original physical validation errors");
+                let [error] = errors.errors() else {
+                    panic!("expected one original physical depth refusal: {errors}");
+                };
+                assert_eq!(error.category(), ValidationErrorCategory::ResourceLimit);
+                assert_eq!(source.failure_fact().class(), FailureClass::Resource);
+                assert_eq!(
+                    source.failure_fact().reason().domain(),
+                    domain::PHYSICAL_PLAN.get()
+                );
+                assert!(original_depth_rejection(&errors.to_string()), "{errors}");
             }
             Err(SqlCompileProgressError::Protocol(CompletionProtocolError::PlanValidation(
                 message,
             ))) => {
-                assert!(original_depth_rejection(&message, false), "{message}");
+                assert!(original_depth_rejection(&message), "{message}");
                 eprintln!("Deep source rejected at original physical admission: {message}");
             }
             Ok(SqlCompileProgress::Incomplete(_)) => {

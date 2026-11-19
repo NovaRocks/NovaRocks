@@ -5100,6 +5100,35 @@ mod tests {
         drop(baseline_query);
     }
 
+    #[test]
+    fn trino_reference_nesting_sizes_pass_analysis_with_their_declared_types() {
+        use arrow::datatypes::DataType;
+
+        let parentheses = format!("SELECT {}1{}", "(".repeat(1_000), ")".repeat(1_000));
+        let subqueries = format!(
+            "{}SELECT * FROM (VALUES 1) AS t(a){}",
+            "SELECT * FROM (".repeat(200),
+            ") AS t".repeat(200),
+        );
+        let disjunction = format!("SELECT {}false", "false OR ".repeat(19_999));
+        for (shape, source, expected) in [
+            ("parentheses", parentheses, DataType::Int32),
+            ("derived tables", subqueries, DataType::Int32),
+            ("disjunction", disjunction, DataType::Boolean),
+        ] {
+            let query =
+                parse_native_query(&source).unwrap_or_else(|error| panic!("{shape}: {error}"));
+            let (resolved, registry, factory) = analyze(&query, &TestCatalog, "default")
+                .unwrap_or_else(|error| panic!("{shape}: {error}"));
+            let [field] = resolved.output_columns.as_slice() else {
+                panic!("{shape} must produce one column");
+            };
+            assert_eq!(field.value_type.data_type(), &expected, "{shape}");
+            drop((resolved, registry, factory));
+            drop(query);
+        }
+    }
+
     fn parse_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {
         let query = parse_native_query(sql)?;
         let (resolved, _registry, _factory) =
