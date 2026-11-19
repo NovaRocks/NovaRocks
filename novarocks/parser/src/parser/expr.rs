@@ -466,7 +466,7 @@ mod tests {
             Expr::Extract(_)
         ));
         assert!(
-            matches!(parse("payload->>'$.name'"), Expr::FunctionCall(call) if call.name.parts[0].value=="json_query")
+            matches!(parse("payload->>'$.name'"), Expr::JsonQuery(query) if query.path_invocation.json_path.value == "$.name")
         );
         let Expr::FunctionCall(call) = parse("array_map((x, y) -> x + y, input)") else {
             panic!("expected lambda function argument");

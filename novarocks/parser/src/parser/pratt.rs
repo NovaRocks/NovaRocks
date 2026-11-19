@@ -19,8 +19,9 @@
 
 use crate::ast::{
     AstBox, BetweenPredicate, BooleanTestPredicate, ComparisonOperator, ComparisonPredicate,
-    DistinctFromPredicate, InPredicate, IsNullPredicate, LikePredicate, LogicalExpr,
-    LogicalOperator, Predicate, PredicatedExpr, TruthValue, TypeKind, TypeParameter,
+    DistinctFromPredicate, InPredicate, IsNullPredicate, JsonPathInvocation, JsonPathString,
+    JsonQuery, LikePredicate, LogicalExpr, LogicalOperator, Predicate, PredicatedExpr, TruthValue,
+    TypeKind, TypeParameter,
 };
 
 use crate::{
@@ -582,8 +583,29 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let path = self.parse_binding_power_frame(UNARY_ARITHMETIC_PRECEDENCE + 1)?;
         let span = Span::new(start, path.legacy_metadata_span.end());
         let syntax_span = Span::new(syntax_start, path.syntax_span.end());
-        // This is the old producer's uniform semantic bridge, not the
-        // AstBuilder result for the reserved Trino JSON_QUERY grammar.
+        let path = match path {
+            ParsedExpression {
+                expression:
+                    Expr::Literal(Literal {
+                        kind: LiteralKind::String(value),
+                        span: path_span,
+                    }),
+                ..
+            } => {
+                let invocation = JsonPathInvocation::plain(
+                    base.expression,
+                    JsonPathString::new(value, path_span),
+                    span,
+                );
+                return Ok(ParsedExpression::authored(
+                    Expr::JsonQuery(AstBox::new(JsonQuery::plain(invocation, span))),
+                    syntax_span,
+                    span,
+                ));
+            }
+            path => path,
+        };
+        // Keep all other legacy path expressions in the ordinary scalar call.
         Ok(ParsedExpression::authored(
             Expr::FunctionCall(AstBox::new(FunctionCall {
                 name: ObjectName {

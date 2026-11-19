@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Old-producer semantic bridge; this is not the target JSON_QUERY AstBuilder result.
+//! Transitional old arrow producer coverage. The target JSON_QUERY grammar is tested separately.
 use novarocks_parser::{Span, ast::*, build, printer};
 fn expression(source: &str) -> Expr {
     let tokens = novarocks_parser::lex(source).unwrap();
@@ -28,56 +28,33 @@ fn name() -> ObjectName {
     }
 }
 #[test]
-fn both_old_arrows_move_literal_children_to_one_plain_call_without_claiming_target_node_equality() {
+fn both_old_arrows_with_direct_string_literals_match_plain_trino_json_query() {
     let mut nodes = Vec::new();
     for operator in ["->", "->>"] {
         let source = format!("doc.payload {operator} '$.a''b'");
         let expr = expression(&source);
-        let Expr::FunctionCall(call) = &expr else {
-            panic!("old ordinary-call bridge");
+        let Expr::JsonQuery(node) = &expr else {
+            panic!("literal JSON arrow must produce the dedicated query");
         };
-        assert_eq!(call.name.parts.len(), 1);
-        assert_eq!(call.name.parts[0].value, "json_query");
-        assert!(!call.name.parts[0].quoted);
-        assert_eq!(call.name.span, novarocks_parser::SYNTHETIC);
-        assert_eq!(call.name.parts[0].span, novarocks_parser::SYNTHETIC);
-        assert_eq!(call.span, Span::new(0, source.len()));
-        assert_eq!(call.arguments.len(), 2);
-        assert!(!call.distinct);
-        assert!(
-            call.order_by.is_none()
-                && call.filter.is_none()
-                && call.null_treatment.is_none()
-                && call.window.is_none()
-                && call.processing_mode.is_none()
-        );
-        for (argument, expected) in call.arguments.iter().zip(["doc.payload", "'$.a''b'"]) {
-            assert!(argument.name.is_none());
-            assert_eq!(argument.span, argument.value.span());
-            assert_eq!(
-                &source[argument.span.start()..argument.span.end()],
-                expected
-            );
-        }
-        assert!(
-            matches!(&call.arguments[1].value,Expr::Literal(Literal {kind:LiteralKind::String(value),..}) if value=="$.a'b")
-        );
-        assert!(expr.syntax_eq(&expression("json_query(doc.payload, '$.a''b')")));
+        assert_eq!(node.span, Span::new(0, source.len()));
+        assert_eq!(node.path_invocation.span, node.span);
         assert_eq!(
-            printer::print_expr(&expr),
-            "json_query(doc.payload, '$.a''b')"
+            node.path_invocation.input_expression.span(),
+            Span::new(0, 11)
         );
-        let dedicated = Expr::JsonQuery(AstBox::new(JsonQuery::plain(
-            JsonPathInvocation::plain(
-                expression("doc.payload"),
-                JsonPathString::new("$.a'b".to_owned(), novarocks_parser::SYNTHETIC),
-                novarocks_parser::SYNTHETIC,
-            ),
-            novarocks_parser::SYNTHETIC,
-        )));
-        // P01 source-bound literal facts need their own canonicalization for
-        // strict P11 comparison. This old bridge is not that final baseline.
-        assert!(!expr.syntax_eq(&dedicated));
+        let path = &node.path_invocation.json_path;
+        assert_eq!(&source[path.span.start()..path.span.end()], "'$.a''b'");
+        assert_eq!(path.value, "$.a'b");
+        let dedicated =
+            novarocks_parser::trino_parser::parse_expression("JSON_QUERY(doc.payload, '$.a''b')")
+                .unwrap();
+        assert!(expr.syntax_eq(&dedicated));
+        let legacy_printed = printer::print_expr(&expr);
+        assert_eq!(legacy_printed, "doc.payload -> '$.a''b'");
+        assert!(expr.syntax_eq(&expression(&legacy_printed)));
+        let canonical = novarocks_parser::trino_printer::print_expression(&expr).unwrap();
+        let reparsed = novarocks_parser::trino_parser::parse_expression(&canonical).unwrap();
+        assert!(expr.syntax_eq(&reparsed));
         nodes.push(expr);
     }
     assert!(nodes[0].syntax_eq(&nodes[1]));
@@ -104,13 +81,6 @@ fn dynamic_null_and_parenthesized_paths_remain_real_expressions_in_the_old_bridg
         assert!(call.arguments[1].value.syntax_eq(&expression(path)));
         assert_eq!(call.span, Span::new(0, source.len()));
     }
-    let chained = expression("doc.payload -> '$.a' -> '$.b'");
-    let Expr::FunctionCall(outer) = chained else {
-        unreachable!()
-    };
-    assert!(
-        matches!(&outer.arguments[1].value,Expr::FunctionCall(call) if call.name.parts[0].value=="json_query")
-    );
     // Keep the actual successful old source's admission; result values are a
     // separate native oracle owned by Root, never inferred from parsing.
     let source = "SELECT typeof(CAST(JSON '{\"a\":1}' -> concat('$.','a') AS integer)) AS observed";
@@ -152,6 +122,73 @@ fn dynamic_null_and_parenthesized_paths_remain_real_expressions_in_the_old_bridg
         assert!(matches!(&call.arguments[1].value,Expr::Identifier(id) if id.value=="path"));
     }
 }
+#[test]
+fn multi_hop_arrow_legacy_printer_preserves_authored_groups_and_path_association() {
+    for (source, expected) in [
+        ("j -> '$.a' -> '$.b'", "json_query(j, '$.a' -> '$.b')"),
+        ("(j -> '$.a') -> '$.b'", "(j -> '$.a') -> '$.b'"),
+        ("((j -> '$.a')) -> '$.b'", "((j -> '$.a')) -> '$.b'"),
+        ("j ->> ('$.a' ->> '$.b')", "json_query(j, ('$.a' -> '$.b'))"),
+        ("(j -> '$.a') ->> path", "json_query((j -> '$.a'), path)"),
+        (
+            "j -> '$.a' ->> path",
+            "json_query(j, json_query('$.a', path))",
+        ),
+        (
+            "j ->> concat('$.', key) -> '$.b'",
+            "json_query(j, concat('$.', key) -> '$.b')",
+        ),
+        (
+            "(j ->> concat('$.', key)) -> '$.b'",
+            "(json_query(j, concat('$.', key))) -> '$.b'",
+        ),
+        ("(j -> '$.a')[1] ->> '$.b'", "(j -> '$.a')[1] -> '$.b'"),
+        (
+            "j -> '$.a' -> '$.b' -> '$.c'",
+            "json_query(j, json_query('$.a', '$.b' -> '$.c'))",
+        ),
+        ("j -> path -> '$.b'", "j -> path -> '$.b'"),
+        ("(-1) -> '$.a'", "(-1) -> '$.a'"),
+        ("CAST((j -> '$.a') AS JSON)", "CAST((j -> '$.a') AS JSON)"),
+    ] {
+        let original = expression(source);
+        let printed = printer::print_expr(&original);
+        assert_eq!(printed, expected, "{source}");
+        assert!(original.syntax_eq(&expression(&printed)), "{source}");
+    }
+
+    let right_nested = expression("j -> '$.a' -> '$.b'");
+    let Expr::FunctionCall(outer) = &right_nested else {
+        panic!("the right-hand arrow is the outer call's path expression");
+    };
+    assert!(matches!(
+        &outer.arguments[1].value,
+        Expr::JsonQuery(query)
+            if query.path_invocation.json_path.value == "$.b"
+                && query.path_invocation.input_expression.syntax_eq(&expression("'$.a'"))
+    ));
+
+    let left_nested = expression("(j -> '$.a') -> '$.b'");
+    let Expr::JsonQuery(outer) = &left_nested else {
+        panic!("the grouped left-hand arrow yields a literal-path outer query");
+    };
+    assert!(matches!(
+        &outer.path_invocation.input_expression,
+        Expr::LegacyParenthesized(group)
+            if matches!(group.expression.as_ref(), Expr::JsonQuery(_))
+    ));
+    assert!(!right_nested.syntax_eq(&left_nested));
+
+    let typed =
+        novarocks_parser::trino_parser::parse_expression("JSON_QUERY(JSON_QUERY(j, '$.a'), '$.b')")
+            .unwrap();
+    // A typed left-nested input has no authored parentheses. Legacy arrow
+    // spelling requires one pair to preserve the left composition.
+    let printed = printer::print_expr(&typed);
+    assert_eq!(printed, "(j -> '$.a') -> '$.b'");
+    assert!(left_nested.syntax_eq(&expression(&printed)));
+}
+
 #[test]
 fn ordinary_bridge_author_retains_original_owning_payloads_and_actual_argument_borrows() {
     let input = expression("items[2]");

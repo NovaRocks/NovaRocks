@@ -2379,6 +2379,40 @@ impl Printer {
 
     #[recursive::recursive]
     fn write_json_query(&mut self, node: &JsonQuery) {
+        let invocation = &node.path_invocation;
+        if invocation.input_format == JsonFormat::Json
+            && invocation.path_name.is_none()
+            && invocation.path_parameters.is_empty()
+            && node.returned_type.is_none()
+            && node.output_format.is_none()
+            && node.wrapper_behavior == JsonQueryWrapperBehavior::Without
+            && node.quotes_behavior.is_none()
+            && node.empty_behavior == JsonQueryBehavior::Null
+            && node.error_behavior == JsonQueryBehavior::Null
+        {
+            let input = &invocation.input_expression;
+            // A typed left-nested call needs grouping in legacy arrow syntax.
+            // LegacyParenthesized already renders its authored delimiters.
+            let parentheses = matches!(
+                input,
+                Expr::JsonQuery(_)
+                    | Expr::Lambda(_)
+                    | Expr::Binary(_)
+                    | Expr::Logical(_)
+                    | Expr::Predicated(_)
+                    | Expr::Unary(_)
+            );
+            if parentheses {
+                self.output.push('(');
+            }
+            self.write_expr(input);
+            if parentheses {
+                self.output.push(')');
+            }
+            self.output.push_str(" -> ");
+            self.write_json_path_string(&invocation.json_path);
+            return;
+        }
         self.output.push_str("JSON_QUERY(");
         self.write_json_path_invocation(&node.path_invocation);
         self.write_json_returning(node.returned_type.as_ref(), node.output_format);

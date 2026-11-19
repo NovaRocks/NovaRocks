@@ -2556,9 +2556,12 @@ fn actual_plain_json_query_owning_chain_preserves_path_facts_and_original_input(
     )));
     crate::ast::validate_statement(&statement).unwrap();
     drop(statement);
-    let printed = crate::printer::print_expr(&tree);
-    assert_eq!(printed.matches("JSON_QUERY(").count(), DEPTH);
-    assert_eq!(printed.matches("strict $.p1'").count(), 1);
+    let legacy_printed = crate::printer::print_expr(&tree);
+    assert_eq!(legacy_printed.matches(" -> ").count(), DEPTH);
+    assert_eq!(legacy_printed.matches("strict $.p1'").count(), 1);
+    let trino_printed = crate::trino_printer::print_expression(&tree).unwrap();
+    assert_eq!(trino_printed.matches("JSON_QUERY(").count(), DEPTH);
+    assert_eq!(trino_printed.matches("strict $.p1'").count(), 1);
     let Expr::JsonQuery(top) = tree else {
         unreachable!()
     };
