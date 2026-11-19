@@ -145,11 +145,11 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
     // with a real table added for this catalog/statistics/provider driver.
     for (sql, nested) in [
         (
-            "SELECT array_agg(json_object('2:3')) AS j, array_agg(CAST(json_object('2:3') AS VARCHAR)) AS s FROM orders",
+            "SELECT array_agg(JSON_OBJECT('2': 3)) AS j, array_agg(CAST(JSON_OBJECT('2': 3) AS VARCHAR)) AS s FROM orders",
             false,
         ),
         (
-            "SELECT CAST(array_sortby([json_object('k',1), json_object('k',2)], [2,1]) AS ARRAY<VARCHAR>) AS s FROM orders",
+            "SELECT CAST(array_sortby([json_object('k':1), json_object('k':2)], [2,1]) AS ARRAY<VARCHAR>) AS s FROM orders",
             true,
         ),
     ] {
@@ -289,7 +289,7 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
 #[test]
 fn typed_empty_array_retains_independent_unknown_owner_and_outer_json_cast() {
     for sql in [
-        "SELECT ARRAY<JSON>[] AS a FROM orders",
+        "SELECT CAST([] AS ARRAY<JSON>) AS a FROM orders",
         "SELECT CAST([] AS ARRAY<JSON>) AS a FROM orders",
     ] {
         let owner = crate::compiler::compile_authored_aggregate_for_test(sql);

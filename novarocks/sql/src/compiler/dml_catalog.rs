@@ -209,10 +209,7 @@ mod tests {
     use std::sync::Arc;
 
     fn query(sql: &str) -> novarocks_parser::ast::Query {
-        let parsed = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = parsed.as_slice() else {
-            panic!("query fixture")
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
 
@@ -682,7 +679,7 @@ mod tests {
             (FunctionValueType::new(map.clone(), false), None),
         ]);
         let source = prepare(SqlStatementInput::parsed_query(Box::new(query(
-            "VALUES (NULL, [], MAP{})",
+            "VALUES (NULL, [], map())",
         ))))
         .with_write_assignments(assignments.clone())
         .unwrap();

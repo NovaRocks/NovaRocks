@@ -193,6 +193,7 @@ mod tests {
     // Presence-scoped refusals and the declaration shortcut are guarded below.
     fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
         AnalyzerContext {
+            purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
             grouping_scope: Default::default(),
             view_stack: Default::default(),
             control,
@@ -984,8 +985,7 @@ mod tests {
             panic!("one projection fixture")
         };
         assert!(projection_column.alias.is_none(), "anonymous projection");
-        let expression = &projection_column.expression;
-        expression
+        &projection_column.expression
     }
 
     #[test]
@@ -1375,11 +1375,9 @@ mod tests {
         let scope = ctx.new_scope();
         for quoted in [false, true] {
             let child = opaque_dynamic_json_call(quoted);
-            let statements =
-                novarocks_parser::parse("SELECT typeof(CAST(NULL AS INTEGER))").unwrap();
-            let [ast::Statement::Query(query)] = statements.as_slice() else {
-                panic!("query");
-            };
+            let query =
+                &novarocks_parser::parser::parse_query("SELECT typeof(CAST(NULL AS INTEGER))")
+                    .unwrap();
             let ast::SetExpr::Select(select) = query.body.as_ref() else {
                 panic!("select");
             };

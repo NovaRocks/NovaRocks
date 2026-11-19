@@ -83,12 +83,19 @@ impl SqlAggregateCalls {
         let mut aggregates = Vec::new();
         let mut visible_outputs = Vec::with_capacity(select.projection.len());
         let mut projected_group_keys = vec![false; group_keys.len()];
+        let group_keys_sql = group_keys
+            .iter()
+            .map(|key| printer::print_expression(&key.expr))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
 
         for item in &select.projection {
             let (expr, output_name) = projection_expr_and_output_name(item)?;
-            if let Some(group_key_index) = group_keys.iter().position(|group_key| {
-                printer::print_expr(&group_key.expr) == printer::print_expr(expr)
-            }) {
+            let expression_sql =
+                printer::print_expression(expr).map_err(|error| error.to_string())?;
+            if let Some(group_key_index) =
+                group_keys_sql.iter().position(|key| *key == expression_sql)
+            {
                 if group_keys[group_key_index].output_name.is_empty() {
                     group_keys[group_key_index].output_name = output_name;
                 }
@@ -210,8 +217,11 @@ fn projection_expr_and_output_name(item: &ast::SelectItem) -> Result<(&ast::Expr
             column
                 .alias
                 .as_ref()
-                .map(|alias| alias.value.clone())
-                .unwrap_or_else(|| printer::print_expr(&column.expression)),
+                .map_or_else(
+                    || printer::print_expression(&column.expression),
+                    |alias| Ok(alias.value.clone()),
+                )
+                .map_err(|error| error.to_string())?,
         )),
         ast::SelectItem::AllColumns(_) => Err(
             "incremental aggregate MV projection can only contain expressions or aliases"
@@ -298,6 +308,9 @@ fn classify_aggregate_call(
 }
 
 fn count_input(args: &[&ast::Expr]) -> Result<(AggregateFunctionKind, SqlAggregateInput), String> {
+    if args.is_empty() {
+        return Ok((AggregateFunctionKind::Count, SqlAggregateInput::Star));
+    }
     let [arg] = args else {
         return Err(aggregate_error());
     };
@@ -427,10 +440,7 @@ mod tests {
     use super::*;
 
     fn parse(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
 
@@ -440,7 +450,8 @@ mod tests {
         let calls = SqlAggregateCalls::extract(&query).unwrap();
         assert_eq!(calls.aggregates.len(), 1);
         assert_eq!(state_column_name("total"), "__agg_state_total");
-        let sql = printer::print_query(&rewrite_select_sql_for_state(&query, &calls).unwrap());
+        let sql =
+            printer::print_query(&rewrite_select_sql_for_state(&query, &calls).unwrap()).unwrap();
         assert!(sql.contains("sum_state(v) AS __agg_state_total"), "{sql}");
         assert!(
             sql.contains("COUNT(*) AS __agg_state___ivm_row_count"),

@@ -30,7 +30,6 @@
 
 use arrow::datatypes::DataType;
 use novarocks_parser::ast;
-use novarocks_parser::printer;
 
 use crate::analysis::*;
 use crate::analysis::{AnalyzedOutputField as OutputColumn, AnalyzedProjectItem as ProjectItem};
@@ -298,7 +297,7 @@ impl<'a> AnalyzerContext<'a> {
             return Err(AnalyzeError::unsupported_query_shape(
                 format!(
                     "subquery shape is not supported by Apply rewrite: {}",
-                    novarocks_parser::printer::print_query(&sq_info.subquery)
+                    crate::parser::query_for_diagnostic(&sq_info.subquery)
                 ),
                 sq_info.subquery.span,
             ));
@@ -406,7 +405,7 @@ impl<'a> AnalyzerContext<'a> {
             inner: resolved_sub,
             correlation_column_ids: corr_ids,
             need_check_max_rows: true,
-            subquery_text: printer::print_query(&sq_info.subquery),
+            subquery_text: crate::parser::query_for_diagnostic(&sq_info.subquery),
         });
         Ok(true)
     }
@@ -461,10 +460,7 @@ impl<'a> AnalyzerContext<'a> {
                     .in_expr
                     .as_ref()
                     .ok_or_else(|| AnalyzeError::internal("IN subquery missing LHS expression"))?;
-                let positional_lhs = match in_expr.as_ref() {
-                    ast::Expr::LegacyParenthesized(nested) => nested.expression.as_ref(),
-                    other => other,
-                };
+                let positional_lhs = in_expr.as_ref();
                 if self.anonymous_row(positional_lhs)?.is_some() {
                     let SubqueryKind::InSubquery { negated } = &sq_info.kind else {
                         unreachable!("tuple LHS only exists for IN subqueries");
@@ -566,7 +562,7 @@ impl<'a> AnalyzerContext<'a> {
             correlation_column_ids: corr_ids,
             in_lhs,
             use_semi_anti: true,
-            subquery_text: printer::print_query(&sq_info.subquery),
+            subquery_text: crate::parser::query_for_diagnostic(&sq_info.subquery),
         });
         Ok(true)
     }
@@ -1836,10 +1832,7 @@ impl<'a> AnalyzerContext<'a> {
         // retains the LHS as an anonymous `Expr::Row` (possibly wrapped in
         // `Expr::Nested`). Analyze each component separately and pair
         // them with the subquery's output columns one-to-one.
-        let positional_lhs = match in_expr_ast.as_ref() {
-            ast::Expr::LegacyParenthesized(nested) => nested.expression.as_ref(),
-            other => other,
-        };
+        let positional_lhs = in_expr_ast.as_ref();
         let lhs_items_ast: Vec<&ast::Expr> = match self.anonymous_row(positional_lhs)? {
             Some(row) => row.fields.iter().map(|field| &field.expression).collect(),
             None => vec![positional_lhs],
@@ -2009,7 +2002,7 @@ impl<'a> AnalyzerContext<'a> {
                 inner: resolved_sub,
                 correlation_column_ids: Vec::new(),
                 need_check_max_rows: false,
-                subquery_text: printer::print_query(&sq_info.subquery),
+                subquery_text: crate::parser::query_for_diagnostic(&sq_info.subquery),
             });
             return Ok(());
         }
@@ -3033,6 +3026,7 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
+            purpose: self.purpose,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: self.materialized_values,
             control: self.control,
@@ -5459,7 +5453,7 @@ fn replace_placeholder_in_expr(
                     .map(|a| replace_placeholder_in_expr(a, placeholder_id, replacement))
                     .collect(),
                 distinct: *distinct,
-                order_by: (order_by.clone()).into(),
+                order_by: order_by.clone(),
                 resolved: resolved.clone(),
             },
         },
@@ -5657,7 +5651,7 @@ fn replace_placeholder_in_expr(
                     .iter()
                     .map(|p| replace_placeholder_in_expr(p, placeholder_id, replacement))
                     .collect(),
-                order_by: (order_by.clone()).into(),
+                order_by: order_by.clone(),
                 window_frame: window_frame.clone(),
                 ignore_nulls: *ignore_nulls,
             },
@@ -6041,10 +6035,8 @@ mod tests {
 
     #[test]
     fn composite_in_evaluates_volatile_probe_outside_candidate_lambda() {
-        let statements = novarocks_parser::parse("SELECT [random()] IN (SELECT [0.0])").unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query");
-        };
+        let query =
+            &novarocks_parser::parser::parse_query("SELECT [random()] IN (SELECT [0.0])").unwrap();
         let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
         let (resolved, _, _) = super::super::analyze_with_function_catalog(
             query,
@@ -6102,10 +6094,7 @@ mod tests {
                 ApplyClause::AggregateInput,
             ),
         ] {
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let [ast::Statement::Query(query)] = statements.as_slice() else {
-                panic!("query");
-            };
+            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
             let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
             let (resolved, _, _) = super::super::analyze_with_function_catalog(
                 query,

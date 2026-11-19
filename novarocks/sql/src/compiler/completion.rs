@@ -4537,10 +4537,7 @@ mod tests {
     }
 
     fn test_query(sql: &str) -> novarocks_parser::ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("fixture must be a query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         query.clone()
     }
 
@@ -5705,10 +5702,7 @@ mod time_travel_exchange_tests {
     use crate::compiler::{SqlCapturedCatalogPreparation, SqlCompileControl};
 
     fn query(sql: &str) -> novarocks_parser::ast::Query {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query")
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
 

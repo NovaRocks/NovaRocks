@@ -175,13 +175,13 @@ impl SqlFinalPlanCompileRequest {
         let display_intent = display_intent(&intent);
         let root_session_admitted = statement.root_session_admitted();
         let query = super::parse_query(&statement)?;
-        let legacy_semantics;
+        let query_semantics;
         let effective = if root_session_admitted {
             &session.sql_semantics
         } else {
-            legacy_semantics = crate::sql_mode::query_sql_semantics(&session.sql_semantics, &query)
+            query_semantics = crate::sql_mode::query_sql_semantics(&session.sql_semantics, &query)
                 .map_err(SqlCompileError::from)?;
-            &legacy_semantics
+            &query_semantics
         };
         let query = crate::sql_mode::normalize_concat_query_with_semantics(query, effective);
         let consumer_requires_semantic_snapshot =
@@ -1475,12 +1475,12 @@ mod tests {
             ("ERROR_IF_OVERFLOW", "SELECT 1", false),
             (
                 "ERROR_IF_OVERFLOW",
-                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1",
+                "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT 1",
                 true,
             ),
             (
                 "ALLOW_THROW_EXCEPTION",
-                "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+                "WITH SESSION sql_mode = 32 SELECT 1",
                 false,
             ),
         ] {
@@ -2087,7 +2087,7 @@ mod tests {
     fn explain_delta_projection_requests_exact_provider_window_without_private_action() {
         for (from, to) in [(0, 0), (7, 11)] {
             let seed = request(
-                &format!("SELECT order_key FROM __nr_ivm_delta('iceberg.db.orders', {from}, {to}) WHERE order_key > 0"),
+                &format!("SELECT order_key FROM TABLE(__nr_ivm_delta('iceberg.db.orders', {from}, {to})) WHERE order_key > 0"),
                 SqlCompileIntent::Explain { level: crate::explain::ExplainLevel::Verbose, analyze: false },
             ).try_into_completion().unwrap();
             let mut progress = SqlCompiler::start(seed, &SqlCompileControl::unbounded()).unwrap();
@@ -2148,7 +2148,10 @@ mod tests {
             level: crate::explain::ExplainLevel::Verbose,
             analyze: false,
         };
-        let seed = request("select count(*) from orders$snapshots", intent)
+        let seed = request("select count(*) from \"orders$snapshots\"", intent)
+            .with_catalog_qualifications(crate::compiler::iceberg_metadata_qualifications_for_test(
+                "iceberg",
+            ))
             .try_into_completion()
             .unwrap();
         let mut progress = SqlCompiler::start(seed, &SqlCompileControl::unbounded()).unwrap();
@@ -2236,7 +2239,7 @@ mod tests {
     #[test]
     fn admitted_session_completion_uses_frozen_settings_for_expression_assignments() {
         let source = "WITH SESSION decimal_overflow_to_double = true AND true SELECT 1 AS a";
-        let query = Box::new(novarocks_parser::trino_parser::parse_query(source).unwrap());
+        let query = Box::new(novarocks_parser::parser::parse_query(source).unwrap());
         let mut legacy = request("SELECT 1 AS a", SqlCompileIntent::Query);
         legacy.statement = SqlStatementInput::parsed_query(query.clone());
         assert!(matches!(
@@ -2320,13 +2323,13 @@ mod tests {
             ),
             (
                 "ALLOW_THROW_EXCEPTION",
-                "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders",
+                "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders",
                 false,
                 ReportError,
             ),
             (
                 "ERROR_IF_OVERFLOW",
-                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders",
+                "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders",
                 true,
                 OutputNull,
             ),
@@ -2376,11 +2379,11 @@ mod tests {
     }
 
     #[test]
-    fn completed_nested_legacy_hint_inherits_root_allow_refs_and_decimal_policy() {
+    fn completed_derived_query_inherits_root_allow_refs_and_decimal_policy() {
         use novarocks_physical_plan::{BinaryOperator, ExprKind};
         use novarocks_type_contract::{DecimalOverflowPolicy::OutputNull, SemanticParameterValue};
         let completed = complete_root_intrinsic_fixture(
-            "SELECT x + 1 AS a FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(order_key AS DECIMAL(18,6)) AS x FROM orders) s",
+            "SELECT x + 1 AS a FROM (SELECT CAST(order_key AS DECIMAL(18,6)) AS x FROM orders) s",
             "ALLOW_THROW_EXCEPTION",
         );
         let plan = completed.plan();
@@ -2591,15 +2594,15 @@ mod tests {
         for (sql, connection_mode) in [
             ("SELECT order_key FROM orders", "GROUP_CONCAT_LEGACY"),
             (
-                "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders",
+                "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT order_key FROM orders",
                 "32",
             ),
             (
-                "SELECT order_key FROM orders UNION ALL SELECT /*+ SET_VAR(sql_mode=32) */ order_key FROM orders",
+                "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
                 "GROUP_CONCAT_LEGACY",
             ),
             (
-                "SELECT order_key FROM (SELECT /*+ SET_VAR(sql_mode=32) */ order_key FROM orders) d",
+                "SELECT order_key FROM (SELECT order_key FROM orders) d",
                 "GROUP_CONCAT_LEGACY",
             ),
         ] {
@@ -2628,23 +2631,23 @@ mod tests {
     }
 
     #[test]
-    fn modern_root_and_ignored_local_hints_keep_existing_mv_discovery_policy() {
+    fn modern_root_preserves_mv_discovery_across_query_shapes() {
         use crate::sql_mode::SqlMode;
         for (sql, connection_mode) in [
             (
-                "SELECT /*+ SET_VAR(sql_mode=32) */ order_key FROM orders",
+                "WITH SESSION sql_mode = 32 SELECT order_key FROM orders",
                 "GROUP_CONCAT_LEGACY",
             ),
             (
-                "SELECT order_key FROM orders UNION ALL SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders",
+                "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
                 "32",
             ),
             (
-                "SELECT order_key FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders) d",
+                "SELECT order_key FROM (SELECT order_key FROM orders) d",
                 "32",
             ),
             (
-                "WITH d AS (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders) SELECT order_key FROM d",
+                "WITH d AS (SELECT order_key FROM orders) SELECT order_key FROM d",
                 "32",
             ),
         ] {
@@ -2692,13 +2695,10 @@ mod tests {
             namespace: "db".to_string(),
             table: "orders".to_string(),
         };
-        let mut statements = novarocks_parser::parse(
-            "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders",
+        let query = novarocks_parser::parser::parse_query(
+            "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT order_key FROM orders",
         )
         .unwrap();
-        let novarocks_parser::ast::Statement::Query(query) = statements.remove(0) else {
-            panic!("query")
-        };
         let definition = SqlMvRewriteDefinitionFacts::try_new(
             91,
             [11; 32],
@@ -2750,15 +2750,15 @@ mod tests {
         for (sql, connection_flag) in [
             ("SELECT order_key FROM orders", true),
             (
-                "SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders",
+                "WITH SESSION decimal_overflow_to_double = true SELECT order_key FROM orders",
                 false,
             ),
             (
-                "SELECT order_key FROM orders UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders",
+                "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
                 true,
             ),
             (
-                "SELECT order_key FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders) d",
+                "SELECT order_key FROM (SELECT order_key FROM orders) d",
                 true,
             ),
         ] {
@@ -2789,15 +2789,15 @@ mod tests {
     #[test]
     fn decimal_false_overrides_keep_existing_mv_discovery_policy() {
         for sql in [
-            "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders",
+            "WITH SESSION decimal_overflow_to_double = false SELECT order_key FROM orders",
             "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
         ] {
             let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
             let mut query = crate::compiler::test_query(sql);
             // UNION branches never own session properties. Bind the override
-            // explicitly to the root query, independent of legacy hint syntax.
+            // explicitly to the root query, using WITH SESSION.
             query.session_properties = crate::compiler::test_query(
-                "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ 1",
+                "WITH SESSION decimal_overflow_to_double = false SELECT 1",
             )
             .session_properties;
             request.statement = SqlStatementInput::parsed_query(query);
@@ -2847,13 +2847,10 @@ mod tests {
             namespace: "db".to_string(),
             table: "orders".to_string(),
         };
-        let mut statements = novarocks_parser::parse(
-            "SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders",
+        let query = novarocks_parser::parser::parse_query(
+            "WITH SESSION decimal_overflow_to_double = true SELECT order_key FROM orders",
         )
         .unwrap();
-        let novarocks_parser::ast::Statement::Query(query) = statements.remove(0) else {
-            panic!("query")
-        };
         let definition = SqlMvRewriteDefinitionFacts::try_new(
             91,
             [11; 32],
@@ -3537,7 +3534,9 @@ mod tests {
             .trim()
             .strip_prefix("USE ${case_db};")
             .expect("original query 140 selects its case namespace")
-            .trim();
+            .trim()
+            .strip_suffix(';')
+            .expect("the source contains one terminated query");
         // SQL owns this component regression; no external resource is used.
         // Historical source statistics select a real preaggregation path, not
         // a forced physical winner. Verify the actual filter and endpoints,
@@ -3644,7 +3643,7 @@ mod tests {
             ),
             (
                 "original-137",
-                "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING)||':'||CAST(c2 AS STRING)||':'||CAST(c3 AS STRING)||':'||CAST(cnt AS STRING))) AS result_hash FROM result",
+                "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c1 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c2 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c3 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result",
             ),
         ];
         let mut failures = Vec::new();
@@ -3829,9 +3828,15 @@ mod tests {
 
     fn assert_distinct_rows_topn_sequence() {
         let mut failures = Vec::new();
-        for sql in [
-            "select distinct c2,c1 from all_numbers_t0 where c2 = 7 order by 1,2 limit 1;",
-            "select distinct c2,c1 from all_numbers_t0 where c2 = 7 order by 1,2 limit 30,1;",
+        for (sql, offset) in [
+            (
+                "select distinct c2,c1 from all_numbers_t0 where c2 = 7 order by 1,2 limit 1",
+                0,
+            ),
+            (
+                "select distinct c2,c1 from all_numbers_t0 where c2 = 7 order by 1,2 OFFSET 30 LIMIT 1",
+                30,
+            ),
         ] {
             match distinct_rows_topn_sequence_fixture(sql) {
                 Ok(SqlCompileProgress::Complete(completed)) => {
@@ -3854,7 +3859,7 @@ mod tests {
                     }));
                     let fragment = &plan.fragments()[&result.fragment];
                     let root = &fragment.nodes()[&fragment.root()];
-                    if sql.ends_with("limit 1;") {
+                    if offset == 0 {
                         // Completed publication already proves the exact
                         // reduction path; retain ordinary parallel Rows split.
                         assert!(matches!(
@@ -4287,39 +4292,39 @@ mod tests {
         use novarocks_physical_plan::ResultValueDomain as D;
         use novarocks_result_contract::ScalarValueType as V;
         for (sql, domain, value) in [
-            ("select json_object('k', 1) as j", D::Json, V::Json),
+            ("select json_object('k': 1) as j", D::Json, V::Json),
             (
-                "select coalesce(json_object('k', 1), null) as j",
+                "select coalesce(json_object('k': 1), null) as j",
                 D::Json,
                 V::Json,
             ),
             (
-                "select if(true, json_object('k', 1), null) as j",
+                "select if(true, json_object('k': 1), null) as j",
                 D::Json,
                 V::Json,
             ),
             (
-                "select case when true then json_object('k', 1) else null end as j",
+                "select case when true then json_object('k': 1) else null end as j",
                 D::Json,
                 V::Json,
             ),
             (
-                "with q as (select json_object('k', 1) as j) select j from q",
+                "with q as (select json_object('k': 1) as j) select j from q",
                 D::Json,
                 V::Json,
             ),
             (
-                "select cast(json_object('k', 1) as varchar) as j",
+                "select cast(json_object('k': 1) as varchar) as j",
                 D::Plain,
                 V::String,
             ),
             (
-                "select coalesce(json_object('k', 1), 'plain') as j",
+                "select coalesce(json_object('k': 1), 'plain') as j",
                 D::Plain,
                 V::String,
             ),
             (
-                "select json_object('k', 1) as j union all select null",
+                "select json_object('k': 1) as j union all select null",
                 D::Json,
                 V::Json,
             ),

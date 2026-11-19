@@ -244,7 +244,7 @@ alternative	tableElement	1		0	CREATE TABLE lake.ns.t (id bigint)	supported	accep
 alternative	tableElement	2		0	CREATE TABLE lake.ns.t (LIKE lake.ns.source_table)	supported	accept	reviewed-grammar-path	none
 optional	columnDefinition	1		1	CREATE TABLE lake.ns.t (id bigint DEFAULT 1)	supported	accept	reviewed-grammar-path	none
 optional	columnDefinition	1		2	CREATE TABLE lake.ns.t (id bigint NOT NULL)	supported	accept	reviewed-grammar-path	none
-optional	columnDefinition	1		3	CREATE TABLE lake.ns.t (id bigint COMMENT 'note')	parsed-not-supported	accept	reviewed-grammar-path	none
+optional	columnDefinition	1		3	CREATE TABLE lake.ns.t (id bigint COMMENT 'note')	supported	accept	reviewed-grammar-path	none
 optional	columnDefinition	1		4	CREATE TABLE lake.ns.t (id bigint WITH (example_option = 1))	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	columnDefinition	1		0	CREATE TABLE lake.ns.t (id bigint)	supported	accept	reviewed-grammar-path	none
 optional	likeClause	1		1	CREATE TABLE lake.ns.t (LIKE lake.ns.source_table EXCLUDING PROPERTIES)	supported	accept	reviewed-grammar-path	none
@@ -2004,7 +2004,7 @@ alternative	rootQueryWithSession	1		g1.b1	WITH SESSION x = ? TABLE x	supported	a
 alternative	with	1		g1.b1	WITH x AS ( TABLE x ) , x AS ( TABLE x ) TABLE x	supported	accept	reviewed-grammar-path	none
 alternative	columnDefinition	1		g1.b1	CREATE TABLE lake.ns.t (id bigint DEFAULT 1)	supported	accept	reviewed-grammar-path	none
 alternative	columnDefinition	1		g2.b1	CREATE TABLE lake.ns.t (id bigint NOT NULL)	supported	accept	reviewed-grammar-path	none
-alternative	columnDefinition	1		g3.b1	CREATE TABLE lake.ns.t (id bigint COMMENT 'note')	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	columnDefinition	1		g3.b1	CREATE TABLE lake.ns.t (id bigint COMMENT 'note')	supported	accept	reviewed-grammar-path	none
 alternative	columnDefinition	1		g4.b1	CREATE TABLE lake.ns.t (id bigint WITH (example_option = 1))	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	likeClause	1		g1.b1.g1.b1	CREATE TABLE lake.ns.t (LIKE lake.ns.source_table INCLUDING PROPERTIES)	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	likeClause	1		g1.b1.g1.b2	CREATE TABLE lake.ns.t (LIKE lake.ns.source_table EXCLUDING PROPERTIES)	supported	accept	reviewed-grammar-path	none

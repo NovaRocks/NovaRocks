@@ -19,10 +19,7 @@ use std::collections::BTreeSet;
 
 use novarocks_parser::{
     Span,
-    ast::{
-        CallStatement, Expr, FunctionCall, Ident, Literal, LiteralKind, MaintenanceValue,
-        ObjectName, ProcedureArgumentMode, TrinoCall,
-    },
+    ast::{Expr, FunctionCall, Ident, Literal, LiteralKind, ObjectName, TrinoCall},
 };
 use novarocks_sql::semantic::{
     MaintenanceSqlCommand,
@@ -96,45 +93,6 @@ impl PreparedMaintenanceValue {
 }
 
 impl PreparedMaintenanceCall {
-    pub fn from_legacy(statement: &CallStatement) -> Self {
-        let arguments = statement
-            .arguments
-            .iter()
-            .map(|argument| {
-                let value = match &argument.value {
-                    MaintenanceValue::Literal(value) => {
-                        PreparedMaintenanceValue::Literal(value.clone())
-                    }
-                    MaintenanceValue::Timestamp { value, .. } => {
-                        PreparedMaintenanceValue::Timestamp(value.clone())
-                    }
-                    MaintenanceValue::Map(map) => PreparedMaintenanceValue::Map(
-                        map.entries
-                            .iter()
-                            .map(|entry| (entry.key.clone(), entry.value.clone()))
-                            .collect(),
-                    ),
-                };
-                PreparedMaintenanceArgument {
-                    name: argument.name.clone(),
-                    value,
-                    span: argument.span,
-                }
-            })
-            .collect();
-        let argument_mode = match statement.argument_mode {
-            ProcedureArgumentMode::Empty => ProcedureArgumentModeSql::Empty,
-            ProcedureArgumentMode::Positional => ProcedureArgumentModeSql::Positional,
-            ProcedureArgumentMode::Named => ProcedureArgumentModeSql::Named,
-        };
-        Self {
-            procedure: statement.procedure.clone(),
-            arguments,
-            argument_mode,
-            span: statement.span,
-        }
-    }
-
     pub fn from_trino(statement: &TrinoCall) -> Result<Self, CommandError> {
         let has_named = statement
             .arguments
@@ -273,14 +231,11 @@ fn is_procedure_map(call: &FunctionCall) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::{
-        ast::{Statement, TrinoStatement},
-        trino_parser,
-    };
+    use novarocks_parser::{ast::TrinoStatement, parser};
     use novarocks_sql::semantic::ObjectName;
 
     fn prepare(sql: &str) -> Result<MaintenanceSqlCommand, CommandError> {
-        let TrinoStatement::Call(call) = trino_parser::parse_statement(sql).unwrap() else {
+        let TrinoStatement::Call(call) = parser::parse_statement(sql).unwrap() else {
             panic!("expected CALL");
         };
         PreparedMaintenanceCall::from_trino(&call)?
@@ -290,7 +245,6 @@ mod tests {
 
     #[test]
     fn typed_call_moves_to_the_original_maintenance_value_shapes() {
-        let legacy_sql = "CALL lake.system.proc(table => 's.t', before => TIMESTAMP '2020-01-01 00:00:00', options => map('keep', 'true', 'drop', 'false'))";
         let sql = r#"CALL lake.system.proc("table" => 's.t', before => TIMESTAMP '2020-01-01 00:00:00', options => map('keep', 'true', 'drop', 'false'))"#;
         let expected = MaintenanceSqlCommand::Call {
             procedure: ObjectName {
@@ -323,14 +277,6 @@ mod tests {
                 },
             ],
         };
-        let legacy = novarocks_parser::parse(legacy_sql).unwrap().pop().unwrap();
-        let Statement::Maintenance(legacy) = legacy else {
-            panic!("expected legacy CALL")
-        };
-        assert_eq!(
-            super::super::lower_maintenance_command(&legacy).unwrap(),
-            expected
-        );
         assert_eq!(prepare(sql).unwrap(), expected);
     }
 

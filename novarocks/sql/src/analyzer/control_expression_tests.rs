@@ -38,6 +38,7 @@ impl PlannerTableProvider for NoTables {
 }
 fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
     AnalyzerContext {
+        purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
         grouping_scope: Default::default(),
         view_stack: Default::default(),
         control,
@@ -59,11 +60,8 @@ fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
     }
 }
 fn query(sql: &str) -> ast::Query {
-    let statements =
-        novarocks_parser::parse(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query fixture")
-    };
+    let query = &novarocks_parser::parser::parse_query(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
     query.clone()
 }
 fn projection(query: &ast::Query) -> &ast::Expr {
@@ -74,8 +72,7 @@ fn projection(query: &ast::Query) -> &ast::Expr {
         panic!("projection fixture")
     };
     assert!(projection_column.alias.is_none(), "anonymous projection");
-    let expr = &projection_column.expression;
-    expr
+    &projection_column.expression
 }
 fn same_typed(actual: &TypedExpr, expected: &TypedExpr, control: &SqlCompileControl) {
     assert_eq!(actual.value_type, expected.value_type);
@@ -273,7 +270,7 @@ fn cast_safe_syntax_retains_the_existing_conversion_policy_and_display_contract(
             "CASE 1 WHEN 2 THEN 3 WHEN 4 THEN 5 END",
         ),
         ("SELECT EXISTS (SELECT 1)", "EXISTS (SELECT 1)"),
-        ("SELECT NOT EXISTS (SELECT 1)", "NOT EXISTS (SELECT 1)"),
+        ("SELECT NOT EXISTS (SELECT 1)", "(NOT (EXISTS (SELECT 1)))"),
         ("SELECT x -> CAST(x AS INT)", "x -> CAST(x AS INT)"),
     ] {
         assert_eq!(
@@ -471,101 +468,37 @@ fn case_result_cast_path_preserves_original_constant_and_write_conversion() {
 }
 
 #[test]
-fn named_arguments_and_processing_modes_refuse_before_ordinary_or_table_lookup() {
-    use novarocks_parser::{ast::*, build};
+fn named_arguments_and_processing_modes_refuse_before_ordinary_lookup() {
     let source = crate::planning::catalog::PlannerMemoryCatalog::default();
     let functions = crate::compiler::build_builtin_engine_function_catalog().unwrap();
     let control = crate::compiler::SqlCompileControl::unbounded();
-    for table_call in [false, true] {
-        for named in [false, true] {
-            let sql = if table_call {
-                "SELECT * FROM missing_function(missing_value)"
-            } else {
-                "SELECT missing_function(missing_value) FROM missing_table"
-            };
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let [Statement::Query(query)] = statements.as_slice() else {
-                panic!("query");
-            };
-            let mut query = query.clone();
-            let SetExpr::Select(select) = query.body.as_mut() else {
-                panic!("select");
-            };
-            let expression: &mut Expr = if table_call {
-                let relation = select.from.take().expect("table call");
-                let Relation::TableFunction(invocation) = relation else {
-                    panic!("table call");
-                };
-                let invocation = invocation.into_inner();
-                let arguments = invocation
-                    .arguments
-                    .into_iter()
-                    .map(|argument| {
-                        let TableFunctionArgumentValue::Expression(value) = argument.value else {
-                            panic!("scalar argument");
-                        };
-                        value
-                    })
-                    .collect();
-                let expression = build::function(invocation.name, arguments);
-                select.from = Some(Relation::LegacyTableFunction(AstBox::new(
-                    legacy::TableFunction {
-                        expr: expression,
-                        lateral: false,
-                        syntax: legacy::TableFunctionSyntax::BareCall,
-                        span: invocation.span,
-                    },
-                )));
-                let Some(Relation::LegacyTableFunction(node)) = &mut select.from else {
-                    panic!("legacy metadata call");
-                };
-                &mut node.expr
-            } else {
-                let SelectItem::SingleColumn(projection_column) = &mut select.projection[0] else {
-                    panic!("projection");
-                };
-                assert!(projection_column.alias.is_none(), "anonymous projection");
-                let expr = &mut projection_column.expression;
-                expr
-            };
-            let Expr::FunctionCall(call) = expression else {
-                panic!("call");
-            };
-            if named {
-                let argument_span = call.arguments[0].span;
-                call.arguments[0].name = Some(build::ident_at("named", false, argument_span));
-            } else {
-                let call_span = call.span;
-                call.processing_mode = Some(ProcessingMode {
-                    mode: ProcessingModeKind::Running,
-                    span: call_span,
-                });
-            }
-            let error = super::analyze_with_function_catalog_and_sql_semantics(
-                &query,
-                &source,
-                "default",
-                &functions,
-                &crate::sql_mode::SqlSemanticSettings::default(),
-                crate::constant::test_constant_policy(),
-                &control,
-            )
-            .map(|result| result.0)
-            .unwrap_err();
-            assert_eq!(
-                error.kind(),
-                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
-            );
-            let message = error.to_string();
-            assert!(
-                message.contains(if named {
-                    "named function arguments"
-                } else {
-                    "processing modes"
-                }),
-                "{message}"
-            );
-        }
+    for (sql, expected) in [
+        (
+            "SELECT missing_function(named => missing_value) FROM missing_table",
+            "named function arguments",
+        ),
+        (
+            "SELECT RUNNING missing_function(missing_value) FROM missing_table",
+            "processing modes",
+        ),
+    ] {
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        let error = super::analyze_with_function_catalog_and_sql_semantics(
+            &query,
+            &source,
+            "default",
+            &functions,
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+        .map(|result| result.0)
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert!(error.to_string().contains(expected), "{sql}: {error}");
     }
 }
 

@@ -316,7 +316,7 @@ fn query_definition(
 ) -> Result<PersistedQueryDefinition, String> {
     PersistedQueryDefinition::new(
         raw_query_source,
-        PersistedQueryDialect::StarRocks,
+        PersistedQueryDialect::Trino,
         context.current_catalog.unwrap_or(DEFAULT_CATALOG),
         context.current_database,
     )

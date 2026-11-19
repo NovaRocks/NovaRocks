@@ -3189,10 +3189,7 @@ mod tests {
     >;
 
     fn parse_query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("fixture must be a query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         query.clone()
     }
 
@@ -3848,7 +3845,7 @@ mod tests {
                 "__apply_key__".to_string(),
             ),
             artifact: SqlMvFirstRefreshArtifactInput::Sql(MvFirstRefreshPhysicalQuery {
-                query: Box::new(parse_query("SELECT 1 AS `__apply_key__`")),
+                query: Box::new(parse_query("SELECT 1 AS \"__apply_key__\"")),
                 root_hash_column: "__apply_key__".to_string(),
             }),
         })
@@ -3871,7 +3868,7 @@ mod tests {
             target_binding: sqlx2_target_binding(),
             root_distribution,
             artifact: SqlMvFirstRefreshArtifactInput::Sql(MvFirstRefreshPhysicalQuery {
-                query: Box::new(parse_query("SELECT 1 AS `__apply_key__`")),
+                query: Box::new(parse_query("SELECT 1 AS \"__apply_key__\"")),
                 root_hash_column: "__apply_key__".to_string(),
             }),
         };
@@ -4239,8 +4236,7 @@ mod tests {
             .unwrap();
         use ast::SyntaxEq;
         let expected = novarocks_parser::parser::parse_expression(
-            "avg_state_visible(`state`.`__agg_state_a_d_avg_sum`, `state`.`__agg_state_a_d_avg_count`, CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))",
-            &novarocks_parser::lex("avg_state_visible(`state`.`__agg_state_a_d_avg_sum`, `state`.`__agg_state_a_d_avg_count`, CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))").unwrap(),
+            "avg_state_visible(\"state\".\"__agg_state_a_d_avg_sum\", \"state\".\"__agg_state_a_d_avg_count\", CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))",
         ).unwrap();
         assert!(projection_expression(prepared.query(), "a_d").syntax_eq(&expected));
     }
@@ -4400,12 +4396,8 @@ mod tests {
                 Some(&[Some(DataType::Float64)]),
             )
             .unwrap();
-        let source = "avg_state_visible(`state`.`__agg_state_total_avg_sum`, `state`.`__agg_state_total_avg_count`, CAST(-1 AS BIGINT), CAST(NULL AS DOUBLE))";
-        let expected = novarocks_parser::parser::parse_expression(
-            source,
-            &novarocks_parser::lex(source).unwrap(),
-        )
-        .unwrap();
+        let source = "avg_state_visible(\"state\".\"__agg_state_total_avg_sum\", \"state\".\"__agg_state_total_avg_count\", CAST(-1 AS BIGINT), CAST(NULL AS DOUBLE))";
+        let expected = novarocks_parser::parser::parse_expression(source).unwrap();
         assert!(projection_expression(prepared.query(), "total").syntax_eq(&expected));
     }
 
@@ -4520,7 +4512,7 @@ mod tests {
     fn join_two_phase_analysis_keeps_root_decimal_policy_in_the_consumed_request() {
         use novarocks_type_contract::DecimalOverflowPolicy;
 
-        let query = parse_query("SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1");
+        let query = parse_query("WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT 1");
         let base = crate::sql_mode::SqlSemanticSettings::default();
         assert_eq!(
             base.sql_mode().decimal_overflow_policy(),

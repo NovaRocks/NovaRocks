@@ -57,24 +57,19 @@ mod tests {
     use super::{query_allows_throw_exception_hint, query_mem_limit_hint};
 
     #[test]
-    fn allow_throw_exception_uses_typed_set_var_hints() {
-        let mut statements =
-            novarocks_parser::parse("SELECT /*+ SET_VAR(sql_mode = 'ALLOW_THROW_EXCEPTION') */ 1")
-                .expect("typed hint fixture parses");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
-            panic!("expected query");
-        };
+    fn allow_throw_exception_uses_root_session_properties() {
+        let query = &mut novarocks_parser::parser::parse_query(
+            "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT 1",
+        )
+        .expect("typed session fixture parses");
         assert!(query_allows_throw_exception_hint(query).unwrap());
     }
 
     #[test]
-    fn query_memory_limit_uses_typed_set_var_hints() {
-        let mut statements =
-            novarocks_parser::parse("SELECT /*+ SET_VAR(query_mem_limit = 1) */ 1")
-                .expect("typed hint fixture parses");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
-            panic!("expected query");
-        };
+    fn query_memory_limit_uses_root_session_properties() {
+        let query =
+            &mut novarocks_parser::parser::parse_query("WITH SESSION query_mem_limit = 1 SELECT 1")
+                .expect("typed session fixture parses");
         assert_eq!(query_mem_limit_hint(query), Some(1));
     }
 }

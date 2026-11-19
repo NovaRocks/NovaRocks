@@ -18,3 +18,19 @@
 //! SQL-local typed query reference helpers.
 
 pub(crate) mod query_refs;
+
+use novarocks_parser::{ast, printer};
+
+// Diagnostic fragments can borrow a subtree with statement-relative
+// parameters. Report a standalone rendering failure in the diagnostic itself.
+pub(crate) fn expression_for_diagnostic(expression: &ast::Expr) -> String {
+    printer::print_expression(expression).unwrap_or_else(|error| format!("<{error}>"))
+}
+
+pub(crate) fn query_for_diagnostic(query: &ast::Query) -> String {
+    printer::print_query(query).unwrap_or_else(|error| format!("<{error}>"))
+}
+
+pub(crate) fn type_for_diagnostic(data_type: &ast::TypeName) -> String {
+    printer::print_type(data_type).unwrap_or_else(|error| format!("<{error}>"))
+}

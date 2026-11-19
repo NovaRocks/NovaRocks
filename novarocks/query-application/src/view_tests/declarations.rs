@@ -70,11 +70,11 @@ pub(super) fn execute(
     engine: &FakeViewEngine,
     sql: &str,
 ) -> Result<ViewStatementResult, crate::api::CommandError> {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ParsedStatement::View(statement)] = statements.as_slice() else {
-        panic!("view statement fixture")
-    };
-    service.execute_statement(engine, statement, context(None, "db"))
+    let statement = crate::sql::parse_single_statement(sql).unwrap();
+    let command = view_command(sql, &statement)
+        .unwrap()
+        .expect("view command");
+    service.execute_command(engine, command, context(None, "db"))
 }
 
 fn identity(name: &str) -> TableIdentity {
@@ -425,7 +425,7 @@ fn saved_with_and_derived_cte_scopes_are_analyzed_without_physical_cte_lookups()
 }
 
 #[test]
-fn actual_saved_view_analysis_inherits_query_settings_and_ignores_local_hints() {
+fn actual_saved_view_analysis_inherits_query_settings_and_ignores_comment_hints() {
     use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
     let service = QueryViewService::new();
     let engine = engine();
@@ -456,17 +456,9 @@ fn actual_saved_view_analysis_inherits_query_settings_and_ignores_local_hints() 
             assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
             analyze_snapshot_query(&snapshot, sql, "db", &SqlSemanticSettings::default()).unwrap();
         }
-        let root = novarocks_parser::parse(&format!("SELECT /*+ SET_VAR({hint}) */ 1")).unwrap();
-        let effective =
-            novarocks_sql::sql_mode::statement_sql_semantics(&caller, &root[0]).unwrap();
-        analyze_snapshot_query(
-            &snapshot,
-            &format!("SELECT /*+ SET_VAR({hint}) */ * FROM v"),
-            "db",
-            &caller,
-        )
-        .unwrap();
+        let effective = SqlSemanticSettings::default();
         for sql in [
+            format!("SELECT /*+ SET_VAR({hint}) */ * FROM v"),
             format!("WITH c AS (SELECT /*+ SET_VAR({hint}) */ * FROM v) SELECT * FROM c"),
             format!("SELECT * FROM (SELECT /*+ SET_VAR({hint}) */ * FROM v) d"),
             format!("SELECT 1 AS a UNION ALL SELECT /*+ SET_VAR({hint}) */ * FROM v"),

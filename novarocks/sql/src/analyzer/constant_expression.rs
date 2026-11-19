@@ -62,6 +62,7 @@ pub(crate) fn prepare(
     control.check()?;
     let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
     let context = super::AnalyzerContext {
+        purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
         grouping_scope: RefCell::new(None),
         view_stack: Default::default(),
         control,

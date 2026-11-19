@@ -188,10 +188,7 @@ mod scalar_domain_tests {
         }
     }
     fn query(sql: &str) -> ast::Query {
-        let mut statements = novarocks_parser::parse(sql).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_mut_slice() else {
-            panic!("expected query")
-        };
+        let query = &mut novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
     fn output_domains(sql: &str) -> Vec<Option<SqlType>> {
@@ -215,6 +212,7 @@ mod scalar_domain_tests {
         control: &'a crate::compiler::SqlCompileControl,
     ) -> AnalyzerContext<'a> {
         AnalyzerContext {
+            purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
             constant_policy: crate::constant::test_constant_policy(),
@@ -237,17 +235,19 @@ mod scalar_domain_tests {
     #[test]
     fn m07_json_list_explicit_literal_target_keeps_its_source_decision() {
         assert_eq!(
-            output_domains("select array<json>[],array<json>[null]"),
+            output_domains("select CAST([] AS ARRAY<json>),CAST([null] AS ARRAY<json>)"),
             vec![Some(SqlType::Array(Box::new(SqlType::Json))); 2],
         );
         assert_eq!(
             output_domains(
-                "with q as (select array<json>[] as j) select array_sortby(j,[1]) from q"
+                "with q as (select CAST([] AS ARRAY<json>) as j) select array_sortby(j,[1]) from q"
             ),
             vec![Some(SqlType::Array(Box::new(SqlType::Json)))],
         );
         assert_eq!(
-            output_domains("select array<varchar>[json_object('k',1)],array<json>['plain']"),
+            output_domains(
+                "select CAST([json_object('k':1)] AS ARRAY<varchar>),CAST(['plain'] AS ARRAY<json>)"
+            ),
             vec![
                 Some(SqlType::Array(Box::new(SqlType::String))),
                 Some(SqlType::Array(Box::new(SqlType::Json)))
@@ -304,7 +304,7 @@ mod scalar_domain_tests {
         }
         // Both declarations belong to the ordinary outer CAST. Their source
         // constructors retain the original text and JSON domains separately.
-        let sql = "select array<json>['{}'],array<json>[parse_json('{}')]";
+        let sql = "select CAST(['{}'] AS ARRAY<json>),CAST([parse_json('{}')] AS ARRAY<json>)";
         assert_eq!(
             output_domains(sql),
             vec![Some(SqlType::Array(Box::new(SqlType::Json))); 2]
@@ -541,7 +541,7 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains(
-                "select coalesce(null,parse_json('null')),if(false,null,json_object('k',1)),case when true then null else parse_json('null') end"
+                "select coalesce(null,parse_json('null')),if(false,null,json_object('k':1)),case when true then null else parse_json('null') end"
             ),
             vec![Some(SqlType::Json); 3]
         );
@@ -2292,7 +2292,7 @@ mod scalar_domain_tests {
                 V::Variant,
             ),
             (
-                "select [cast(null as struct<col1 bitmap,col2 json>)]",
+                "select [cast(null as ROW(col1 bitmap,col2 json))]",
                 D::Plain,
                 V::List(Box::new(F {
                     nullable: true,

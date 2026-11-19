@@ -415,7 +415,7 @@ fn into_table_changes(
 mod tests {
     use super::*;
     use novarocks_constant_contract::ConstantValue;
-    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
     use novarocks_spi::connector::DdlPropertyType;
     use novarocks_sql::{
         compiler::{RequiredConstantTarget, SqlCompileControl},
@@ -452,7 +452,10 @@ mod tests {
             DdlPropertyType::Integer,
             DdlPropertyValue::Integer(2),
         )];
-        let source = "CREATE TABLE IF NOT EXISTS lake.ns.t (\"Id\" bigint DEFAULT 7 NOT NULL,                       optional bigint DEFAULT NULL, bare bigint) COMMENT 'note' WITH (format_version = DEFAULT)";
+        let source = "CREATE TABLE IF NOT EXISTS lake.ns.t (\
+                      \"Id\" bigint DEFAULT 7 NOT NULL COMMENT 'key', \
+                      optional bigint DEFAULT NULL COMMENT 'id', bare bigint) \
+                      COMMENT 'note' WITH (format_version = DEFAULT)";
         let TrinoStatement::CreateTable(statement) = parse_statement(source).unwrap() else {
             panic!("real ordinary CREATE");
         };
@@ -491,14 +494,14 @@ mod tests {
                     data_type: SqlType::BigInt,
                     nullable: Some(false),
                     default: Some(CommandLiteral::Number("7".into())),
-                    comment: None,
+                    comment: Some(CommandLiteral::String("key".into())),
                 },
                 TableColumnSqlCommand {
                     name: "optional".into(),
                     data_type: SqlType::BigInt,
                     nullable: Some(true),
                     default: Some(CommandLiteral::Null),
-                    comment: None,
+                    comment: Some(CommandLiteral::String("id".into())),
                 },
                 TableColumnSqlCommand {
                     name: "bare".into(),
@@ -662,9 +665,9 @@ mod tests {
                 "LIKE",
             ),
             (
-                "CREATE TABLE lake.ns.t (id bigint COMMENT 'note')",
-                "CREATE TABLE column comments are not supported",
-                "id",
+                "CREATE TABLE lake.ns.t (id bigint WITH (unsupported = true))",
+                "CREATE TABLE column properties are not supported",
+                "unsupported",
             ),
             (
                 "CREATE TABLE lake.ns.t AS SELECT 1 WITH NO DATA",
@@ -678,7 +681,7 @@ mod tests {
                     validate_trino_create_table(source, table, &control).unwrap_err(),
                     match &table.elements[table.elements.len() - 1] {
                         TrinoTableElement::Like(like) => like.span,
-                        TrinoTableElement::Column(column) => column.span,
+                        TrinoTableElement::Column(column) => column.properties[0].span,
                     },
                 ),
                 TrinoStatement::CreateTableAsSelect(ctas) => (

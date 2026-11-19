@@ -24,7 +24,7 @@ fn actual_map_key_keeps_original_exact_binding_and_candidate_named_refusal() {
     use novarocks_sql_testkit::try_sql_source_with_declared_fields;
     {
         let result = try_sql_source_with_declared_fields(
-            "SELECT map{CAST(1 AS TINYINT):10,CAST(2 AS TINYINT):20}[k] AS picked FROM t",
+            "SELECT map(CAST(1 AS TINYINT),10,CAST(2 AS TINYINT),20)[k] AS picked FROM t",
             &[Field::new("k", DataType::Int64, false)],
         );
 

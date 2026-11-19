@@ -3174,8 +3174,6 @@ impl Visit for CompletionRetainedBytes {
             | Expr::FunctionCall(_)
             | Expr::Unary(_)
             | Expr::Binary(_)
-            | Expr::LegacyParenthesized(_)
-            | Expr::LegacyInterval(_)
             | Expr::Subquery(_) => {}
         }
         walk_expr(self, expression);
@@ -3319,9 +3317,6 @@ impl Visit for CompletionRetainedBytes {
                 for group in &node.copartitioning {
                     self.add_vec_capacity::<ObjectName>(group.capacity());
                 }
-            }
-            ast::Relation::LegacyTableFunction(_) => {
-                self.add(std::mem::size_of::<ast::legacy::TableFunction>())
             }
             ast::Relation::JsonTable(_) => {}
             ast::Relation::PatternRecognition(node) => {
@@ -3937,10 +3932,7 @@ mod tests {
     use super::*;
 
     fn test_query(sql: &str) -> Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("fixture must be a query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         query.clone()
     }
 
@@ -3983,7 +3975,7 @@ mod tests {
         let resolutions_before = catalog.resolutions.load(Ordering::Acquire);
         let mut index = candidate_index();
         index.definitions[0].select_query =
-            test_query("SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ k FROM base");
+            test_query("WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT k FROM base");
         let analysis = analyze_candidates(
             &index,
             &catalog,
@@ -4011,7 +4003,7 @@ mod tests {
         let resolutions_before = catalog.resolutions.load(Ordering::Acquire);
         let mut index = candidate_index();
         index.definitions[0].select_query =
-            test_query("SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ k FROM base");
+            test_query("WITH SESSION decimal_overflow_to_double = true SELECT k FROM base");
         let analysis = analyze_candidates(
             &index,
             &catalog,

@@ -20354,10 +20354,7 @@ mod tests {
             ("-9223372036854775808", DataType::Int64, i64::MIN),
         ] {
             let sql = format!("SELECT {literal}");
-            let statements = novarocks_parser::parse(&sql).unwrap();
-            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
-                panic!("query");
-            };
+            let query = &novarocks_parser::parser::parse_query(&sql).unwrap();
             let (resolved, _, _) = crate::analyzer::analyze(query, &catalog, "default").unwrap();
             let crate::analysis::QueryBody::Select(select) = resolved.body else {
                 panic!("select");

@@ -20,10 +20,7 @@ use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType}
 use std::sync::Arc;
 
 fn query(sql: &str) -> ast::Query {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query")
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     query.clone()
 }
 fn value(policy: ConstantPolicy, control: &SqlCompileControl) -> ConstantValue {
@@ -216,7 +213,6 @@ fn logical_term_paths_borrow_only_the_authored_occurrence_and_reject_wrong_edges
     assert_eq!(retained.value_type(), &ty);
     for path in [
         vec![SqlConstantExpressionStep::LogicalTerm(3)],
-        vec![SqlConstantExpressionStep::Nested],
         vec![
             SqlConstantExpressionStep::LogicalTerm(1),
             SqlConstantExpressionStep::LogicalTerm(0),
@@ -297,7 +293,7 @@ fn predicate_source_paths_keep_actual_children_and_refuse_wrong_fields_or_clones
             },
         ),
         (
-            "SELECT 1 <=> source_value",
+            "SELECT 1  IS NOT DISTINCT FROM  source_value",
             vec![Edge::ComparisonRight],
             |p| {
                 let ast::Predicate::DistinctFrom(p) = &p.predicate else {
@@ -1242,10 +1238,7 @@ fn dedicated_control_children_keep_mixed_original_pool_occurrences() {
         );
     }
     let missing_false = {
-        let statements = novarocks_parser::parse("SELECT if(TRUE, 1)").unwrap();
-        let [ast::Statement::Query(value)] = statements.as_slice() else {
-            panic!("query");
-        };
+        let value = &novarocks_parser::parser::parse_query("SELECT if(TRUE, 1)").unwrap();
         value.clone()
     };
     assert!(
@@ -1608,7 +1601,7 @@ fn concat_normalization_reloans_original_value_separator_and_order_occurrences()
     let functions = build_builtin_engine_function_catalog().unwrap();
     for (sql, legacy, parsed_name) in [
         (
-            "SELECT group_concat(only_original_value ORDER BY only_original_order DESC NULLS LAST SEPARATOR only_original_separator)",
+            "SELECT string_agg(only_original_value \n,\n only_original_separator\nORDER BY only_original_order DESC NULLS LAST \n)",
             false,
             "string_agg",
         ),

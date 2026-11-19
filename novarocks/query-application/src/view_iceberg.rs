@@ -17,7 +17,7 @@
 
 use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::view::{
-    CreateExternalViewRequest, CreateViewCommand, ViewComment, ViewEngine, ViewRequestContext,
+    CreateExternalViewRequest, CreateViewCommand, ViewEngine, ViewRequestContext,
     ViewStatementResult, ViewTarget,
 };
 use novarocks_parser::ast::ObjectName;
@@ -94,7 +94,7 @@ pub(crate) fn create_external_view(
 
     let definition = PersistedQueryDefinition::new(
         statement.raw_query,
-        PersistedQueryDialect::StarRocks,
+        PersistedQueryDialect::Trino,
         context.current_catalog.unwrap_or(DEFAULT_CATALOG),
         context.current_database,
     )?;
@@ -113,13 +113,7 @@ pub(crate) fn create_external_view(
             target,
             columns,
             definition,
-            comment: statement
-                .comment
-                .map(|comment| match comment {
-                    ViewComment::Literal(literal) => literal_to_string(literal),
-                    ViewComment::Text(text) => Ok(text.to_owned()),
-                })
-                .transpose()?,
+            comment: statement.comment.map(str::to_owned),
             or_replace: statement.or_replace,
             if_not_exists: statement.if_not_exists,
             properties: Vec::new(),
@@ -127,21 +121,6 @@ pub(crate) fn create_external_view(
         connector_context,
     )?;
     Ok(ViewStatementResult::Ok)
-}
-
-fn literal_to_string(literal: &novarocks_parser::ast::Literal) -> Result<String, String> {
-    use novarocks_parser::ast::LiteralKind;
-    Ok(match &literal.kind {
-        LiteralKind::String(value) | LiteralKind::Decimal(value) => value.clone(),
-        LiteralKind::Long { parsed_value, .. } => parsed_value.to_string(),
-        LiteralKind::Double(value) => format!("{:?}", value.get()),
-        LiteralKind::Binary(value) => value.iter().map(|byte| format!("{byte:02X}")).collect(),
-        LiteralKind::Null => "NULL".to_string(),
-        LiteralKind::Boolean(value) => value.to_string(),
-        LiteralKind::Generic(_) | LiteralKind::Interval(_) => {
-            return Err("typed view comments are not supported".into());
-        }
-    })
 }
 
 pub(crate) fn drop_external_view(

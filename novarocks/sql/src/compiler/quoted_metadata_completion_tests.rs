@@ -29,19 +29,15 @@ use novarocks_type_contract::FunctionValueType;
 use novarocks_types::schema::ColumnDef;
 use std::sync::Arc;
 
-fn legacy_query(sql: &str) -> ast::Query {
-    let statements = novarocks_parser::parse(sql).expect("compatible SQL must parse");
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("expected one query");
-    };
-    query.clone()
+fn query(sql: &str) -> ast::Query {
+    novarocks_parser::parser::parse_query(sql).expect("SQL fixture must parse")
 }
 
 fn instance(name: &str) -> ConnectorInstanceId {
     ConnectorInstanceId::try_from_canonical(name).unwrap()
 }
 
-fn ready(provider: &str, catalog: &str, epoch: u8) -> CatalogQualification {
+pub(super) fn ready(provider: &str, catalog: &str, epoch: u8) -> CatalogQualification {
     let provider = ConnectorProviderId::parse(provider).unwrap();
     let binding = ConnectorProviderBinding::try_new(
         provider.clone(),
@@ -56,7 +52,10 @@ fn ready(provider: &str, catalog: &str, epoch: u8) -> CatalogQualification {
     }
 }
 
-fn observations(catalog: &str, observation: CatalogQualification) -> CatalogQualifications {
+pub(super) fn observations(
+    catalog: &str,
+    observation: CatalogQualification,
+) -> CatalogQualifications {
     let mut qualifications = CatalogQualifications::default();
     qualifications
         .record(instance(catalog), observation)
@@ -162,83 +161,57 @@ fn quoted_metadata_requests_the_exact_base_kind_and_admitted_binding() {
         let CatalogQualification::Ready { binding, .. } = &observed else {
             unreachable!();
         };
-        for query in [
-            legacy_query(source),
-            novarocks_parser::trino_parser::parse_query(source).unwrap(),
-        ] {
-            assert_eq!(
-                quoted_metadata_catalogs(&query, Some("caller"), "caller_db", &control).unwrap(),
-                [instance(catalog)],
-                "{source}",
-            );
-            let state = state(query, observations(catalog, observed.clone())).unwrap();
-            assert_metadata_need(
-                only_need(&state),
-                TableIdentity::new(catalog, namespace, base),
-                kind,
-                binding,
-            );
-        }
+        let query = query(source);
+        assert_eq!(
+            quoted_metadata_catalogs(&query, Some("caller"), "caller_db", &control).unwrap(),
+            [instance(catalog)],
+            "{source}",
+        );
+        let state = state(query, observations(catalog, observed.clone())).unwrap();
+        assert_metadata_need(
+            only_need(&state),
+            TableIdentity::new(catalog, namespace, base),
+            kind,
+            binding,
+        );
     }
 }
 
 #[test]
-fn quoted_metadata_does_not_share_the_unquoted_need_or_accept_its_fact() {
+fn quoted_metadata_refuses_a_fact_without_the_admitted_catalog_binding() {
     let control = SqlCompileControl::unbounded();
     let observed = ready("iceberg", "ice", 2);
     let CatalogQualification::Ready { binding, .. } = &observed else {
         unreachable!();
     };
-    let mut state = state(
-        legacy_query(
-            r#"SELECT 1 FROM ice.sales.orders$files AS a
-                CROSS JOIN ice.sales."orders$files" AS b"#,
-        ),
-        observations("ice", observed.clone()),
-    )
-    .unwrap();
-    let [legacy, quoted] = state.needs() else {
-        panic!("the same base and kind must have two exact needs");
-    };
-    assert_ne!(legacy.id(), quoted.id());
-    assert_eq!(legacy.relation(), quoted.relation());
-    assert_eq!(legacy.target(), quoted.target());
-    assert!(legacy.quoted_metadata_binding().is_none());
+    let source = r#"SELECT 1 FROM ice.sales."orders$files""#;
+    let mut state = state(query(source), observations("ice", observed.clone())).unwrap();
+    let quoted = only_need(&state);
     assert_metadata_need(
         quoted,
         TableIdentity::new("ice", "sales", "orders"),
         SqlMetadataTableKind::Files,
         binding,
     );
-
-    let legacy_fact = CatalogRelationFact::missing(legacy, "legacy failure").unwrap();
-    let legacy_retry = CatalogRelationFact::missing(legacy, "legacy failure").unwrap();
     let quoted_fact = CatalogRelationFact::missing(quoted, "quoted failure").unwrap();
     let forged =
         CatalogRelationNeed::try_new(quoted.id(), quoted.relation().clone(), quoted.target())
             .unwrap();
     let wrong_fact = CatalogRelationFact::missing(&forged, "missing without admission").unwrap();
     let error = state
-        .accept_facts(vec![legacy_fact, wrong_fact].into(), &control)
+        .accept_facts(vec![wrong_fact].into(), &control)
         .unwrap_err();
     assert!(
         matches!(error, SqlCompileError::Compilation(message) if message.contains("does not match its exact request"))
     );
-
     state
-        .accept_facts(vec![legacy_retry, quoted_fact].into(), &control)
+        .accept_facts(vec![quoted_fact].into(), &control)
         .unwrap();
     let catalog = state.completed_catalog().unwrap();
     let error = crate::analyzer::analyze(state.query(), &catalog, "caller_db").unwrap_err();
     assert_eq!(error.kind(), AnalyzeErrorKind::UnknownTable);
-    assert_eq!(
-        error.message(),
-        "catalog relation 'orders' is missing: legacy failure",
-    );
-    let quoted_query = legacy_query(r#"SELECT 1 FROM ice.sales."orders$files""#);
-    let error = crate::analyzer::analyze(&quoted_query, &catalog, "caller_db").unwrap_err();
-    assert_eq!(error.kind(), AnalyzeErrorKind::UnknownTable);
     assert_eq!(error.message(), "quoted failure");
+    assert!(novarocks_parser::parser::parse_query("SELECT 1 FROM ice.sales.orders$files").is_err());
 }
 
 #[test]
@@ -246,7 +219,7 @@ fn observed_initial_absence_and_other_providers_keep_the_original_name_error() {
     let control = SqlCompileControl::unbounded();
     for suffix in ["files", "entries", "history", "manifests", "partitions"] {
         let source = format!(r#"SELECT 1 FROM ice.sales."orders${suffix}""#);
-        let query = novarocks_parser::trino_parser::parse_query(&source).unwrap();
+        let query = novarocks_parser::parser::parse_query(&source).unwrap();
         assert_eq!(
             quoted_metadata_catalogs(&query, Some("caller"), "caller_db", &control).unwrap(),
             [instance("ice")],
@@ -282,7 +255,7 @@ fn quoted_metadata_requires_exact_simple_components_and_a_recognized_suffix() {
         (r#"ice." sales"."orders$partitions""#, "orders$partitions"),
     ] {
         let source = format!("SELECT 1 FROM {name}");
-        let query = novarocks_parser::trino_parser::parse_query(&source).unwrap();
+        let query = novarocks_parser::parser::parse_query(&source).unwrap();
         let Err(SqlCompileError::Compilation(message)) =
             state(query, observations("ice", ready("iceberg", "ice", 2)))
         else {
@@ -296,18 +269,14 @@ fn quoted_metadata_requires_exact_simple_components_and_a_recognized_suffix() {
 fn a_complete_quoted_cte_name_uses_no_catalog_qualification_or_relation_need() {
     let control = SqlCompileControl::unbounded();
     let source = r#"WITH "orders$files" AS (SELECT 1 AS x) SELECT x FROM "orders$files""#;
-    for query in [
-        legacy_query(source),
-        novarocks_parser::trino_parser::parse_query(source).unwrap(),
-    ] {
-        assert!(
-            quoted_metadata_catalogs(&query, Some("caller"), "caller_db", &control)
-                .unwrap()
-                .is_empty()
-        );
-        let state = state(query, observations("caller", ready("iceberg", "caller", 2))).unwrap();
-        assert!(state.needs().is_empty());
-    }
+    let query = query(source);
+    assert!(
+        quoted_metadata_catalogs(&query, Some("caller"), "caller_db", &control)
+            .unwrap()
+            .is_empty()
+    );
+    let state = state(query, observations("caller", ready("iceberg", "caller", 2))).unwrap();
+    assert!(state.needs().is_empty());
 }
 
 #[test]
@@ -326,7 +295,7 @@ fn quoted_partitions_analyze_a_files_view_with_the_exact_catalog_binding() {
             let source = format!(
                 r#"WITH "orders$files" AS (SELECT 'not a file' AS content) SELECT p.* FROM {name} p"#
             );
-            let query = novarocks_parser::trino_parser::parse_query(&source).unwrap();
+            let query = novarocks_parser::parser::parse_query(&source).unwrap();
             let qualified = ready("iceberg", "caller", 2);
             let CatalogQualification::Ready { binding, .. } = &qualified else {
                 unreachable!();
@@ -479,7 +448,7 @@ fn snapshots_fact(need: &CatalogRelationNeed) -> CatalogRelationFact {
 fn saved_view_sidecar_discovers_late_metadata_in_the_exact_saved_context() {
     let control = SqlCompileControl::unbounded();
     let mut state = state(
-        legacy_query("SELECT x FROM root_view"),
+        query("SELECT x FROM root_view"),
         CatalogQualifications::default(),
     )
     .unwrap();
@@ -527,6 +496,39 @@ fn saved_view_sidecar_discovers_late_metadata_in_the_exact_saved_context() {
 }
 
 #[test]
+fn saved_table_query_uses_trino_for_both_metadata_dependency_passes() {
+    let control = SqlCompileControl::unbounded();
+    let source = "SELECT x FROM root_view";
+    let mut state = state(
+        novarocks_parser::parser::parse_query(source).unwrap(),
+        CatalogQualifications::default(),
+    )
+    .unwrap();
+    let root = only_need(&state);
+    let mut definition = saved_view(root);
+    Arc::make_mut(&mut definition).raw_sql = r#"TABLE "orders$snapshots""#.into();
+    assert_eq!(
+        quoted_metadata_catalogs_for_view(&definition, &control).unwrap(),
+        [instance("ice")],
+    );
+    let ready = ready("iceberg", "ice", 2);
+    let CatalogQualification::Ready { binding, .. } = &ready else {
+        unreachable!();
+    };
+    let fact = CatalogRelationFact::view(root, definition)
+        .unwrap()
+        .with_view_qualifications(observations("ice", ready.clone()))
+        .unwrap();
+    state.accept_facts(vec![fact].into(), &control).unwrap();
+    assert_metadata_need(
+        only_need(&state),
+        TableIdentity::new("ice", "saved_db", "orders"),
+        SqlMetadataTableKind::Snapshots,
+        binding,
+    );
+}
+
+#[test]
 fn saved_view_sidecar_refuses_a_wrong_scope_and_a_conflicting_observation() {
     let control = SqlCompileControl::unbounded();
     for sidecar in [
@@ -534,7 +536,7 @@ fn saved_view_sidecar_refuses_a_wrong_scope_and_a_conflicting_observation() {
         observations("caller", ready("iceberg", "caller", 2)),
     ] {
         let mut state = state(
-            legacy_query("SELECT x FROM root_view"),
+            query("SELECT x FROM root_view"),
             CatalogQualifications::default(),
         )
         .unwrap();
@@ -550,7 +552,7 @@ fn saved_view_sidecar_refuses_a_wrong_scope_and_a_conflicting_observation() {
     }
 
     let mut state = state(
-        legacy_query(
+        query(
             r#"SELECT v.x FROM root_view AS v
                 CROSS JOIN ice.live_db."root_orders$snapshots" AS s"#,
         ),

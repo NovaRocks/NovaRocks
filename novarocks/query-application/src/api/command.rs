@@ -17,7 +17,6 @@
 
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
-use novarocks_parser::ast::MaterializedViewStatement;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationSession, ConnectorControlPlanningPin, ConnectorNamespaceIdentity,
     ConnectorRequestContext, ConnectorTableIdentity,
@@ -625,36 +624,6 @@ pub trait MaintenanceCommandConsumer: Send + Sync + 'static {
     ) -> CommandFuture;
 }
 
-pub struct MaterializedViewCommand {
-    statement: MaterializedViewStatement,
-}
-
-impl MaterializedViewCommand {
-    /// The SQL application retains the parser-admitted statement until the
-    /// injected role adapter performs product-specific lowering.
-    pub fn new(statement: MaterializedViewStatement) -> Self {
-        Self { statement }
-    }
-
-    pub const fn statement(&self) -> &MaterializedViewStatement {
-        &self.statement
-    }
-}
-
-/// Protocol-neutral SQL-to-MV product consumer. Query Application owns the
-/// statement and immutable admission contexts; role composition supplies the
-/// adapter that owns Connector and query-execution capabilities.
-pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
-    /// Prepare the original asynchronous action for a parser-admitted MV statement.
-    /// The caller retains the existing statement admission and supervision.
-    fn prepare_statement_action(
-        &self,
-        command: MaterializedViewCommand,
-        context: RequestContext,
-        command_context: CommandContext,
-    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, CommandError>;
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -825,22 +794,6 @@ mod tests {
         drop(consumer);
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         assert_eq!(control.snapshot().root_responsibilities, 0);
-    }
-
-    #[test]
-    fn materialized_view_command_retains_the_parser_admitted_shape() {
-        let statements = novarocks_parser::parse("DROP MATERIALIZED VIEW analytics.mv")
-            .expect("MV statement should parse");
-        let [novarocks_parser::ast::Statement::MaterializedView(statement)] = statements.as_slice()
-        else {
-            panic!("expected one parser-admitted MV statement");
-        };
-
-        let command = MaterializedViewCommand::new(statement.clone());
-        assert!(matches!(
-            command.statement(),
-            novarocks_parser::ast::MaterializedViewStatement::Drop(_)
-        ));
     }
 }
 

@@ -1049,7 +1049,7 @@ fn sql_query_properties_use_the_original_session_and_admitted_catalog_binding() 
     );
     let catalogs = Catalog(Arc::clone(&metadata), AtomicUsize::new(0));
     let source = r#"WITH SESSION "FIRST"."LIMIT" = 7, PIPELINE_DOP = 3 SELECT 1"#;
-    let query = novarocks_parser::trino_parser::parse_query(source).unwrap();
+    let query = novarocks_parser::parser::parse_query(source).unwrap();
     let mut original = SessionSqlState::default();
     original
         .apply_effects(&SessionEffects::property(
@@ -1189,7 +1189,7 @@ fn sql_query_property_errors_keep_order_and_real_name_parts() {
         FunctionValueType::new(DataType::Int32, false),
     );
     let source = r#"WITH SESSION pipeline_dop = 2, "PIPELINE_DOP" = 1 / 0 SELECT 1"#;
-    let query = novarocks_parser::trino_parser::parse_query(source).unwrap();
+    let query = novarocks_parser::parser::parse_query(source).unwrap();
     let mut calls = 0;
     let result = registry.prepare_query_session(
         source,
@@ -1229,7 +1229,7 @@ fn sql_query_property_errors_keep_order_and_real_name_parts() {
             1,
         ),
     ] {
-        let query = novarocks_parser::trino_parser::parse_query(source).unwrap();
+        let query = novarocks_parser::parser::parse_query(source).unwrap();
         let result = registry.prepare_query_session(
             source,
             &query.session_properties,

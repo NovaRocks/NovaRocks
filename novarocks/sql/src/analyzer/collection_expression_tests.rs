@@ -35,6 +35,7 @@ impl PlannerTableProvider for NoTables {
 }
 fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
     AnalyzerContext {
+        purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
         grouping_scope: Default::default(),
         view_stack: Default::default(),
         control,
@@ -57,11 +58,8 @@ fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
 }
 
 fn query(sql: &str) -> ast::Query {
-    let statements =
-        novarocks_parser::parse(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("one query fixture");
-    };
+    let query = &novarocks_parser::parser::parse_query(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
     query.clone()
 }
 fn projection(query: &ast::Query) -> &ast::Expr {
@@ -72,8 +70,7 @@ fn projection(query: &ast::Query) -> &ast::Expr {
         panic!("one expression fixture");
     };
     assert!(projection_column.alias.is_none(), "anonymous projection");
-    let expression = &projection_column.expression;
-    expression
+    &projection_column.expression
 }
 fn json_list_target() -> novarocks_type_contract::FunctionValueType {
     use arrow::datatypes::{DataType, Field};
@@ -204,7 +201,7 @@ fn null_list_cast_retains_selected_constant_field_and_write_assignment_source() 
     let value = pool.value(1).unwrap();
     for sql in [
         "SELECT CAST(original_null_list AS ARRAY<JSON>)",
-        "SELECT ARRAY<JSON>[NULL,NULL]",
+        "SELECT CAST([NULL,NULL] AS ARRAY<JSON>)",
     ] {
         let query = query(sql);
         let ast::Expr::Cast(cast) = projection(&query) else {
@@ -311,8 +308,8 @@ fn map_literals_keep_the_existing_alternating_argument_binding() {
     let ctx = context(&control);
     let scope = ctx.new_scope();
     for (literal, call) in [
-        ("SELECT map{}", "SELECT map()"),
-        ("SELECT map{1:'one',2:'two'}", "SELECT map(1,'one',2,'two')"),
+        ("SELECT map()", "SELECT map()"),
+        ("SELECT map(1,'one',2,'two')", "SELECT map(1,'one',2,'two')"),
     ] {
         let literal = ctx
             .analyze_expr(projection(&query(literal)), &scope)
@@ -789,7 +786,7 @@ fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly()
         same_typed(&inspected, &legacy_inspected, &control);
     }
     let names = ctx
-        .analyze_query(&query("SELECT ROW(7), map{}, ROW(7) AS Kept"))
+        .analyze_query(&query("SELECT ROW(7), map(), ROW(7) AS Kept"))
         .unwrap();
     assert_eq!(
         names

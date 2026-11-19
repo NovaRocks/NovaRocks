@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
-use novarocks_parser::{ast, printer};
+use novarocks_parser::ast;
 
 use crate::analyze_error::AnalyzeError;
 
@@ -875,7 +875,6 @@ fn type_name_argument_span(argument: &ast::DataTypeParameter) -> novarocks_parse
 
 pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
     match expr {
-        ast::Expr::LegacyParenthesized(nested) => expr_display_name(&nested.expression),
         ast::Expr::Literal(literal) => format_literal_display_name(literal),
         ast::Expr::Identifier(ident) => ident.value.clone(),
         ast::Expr::Dereference(node) => format_dereference_display_name(node, expr),
@@ -884,7 +883,7 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
             expr_display_name_preserve_path(&node.base),
             expr_display_name(&node.index),
         ),
-        ast::Expr::ArrayWildcardSubscript(_) => printer::print_expr(expr),
+        ast::Expr::ArrayWildcardSubscript(_) => crate::parser::expression_for_diagnostic(expr),
         ast::Expr::Array(array) => format!(
             "[{}]",
             array
@@ -923,7 +922,7 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
             };
             format_control_call_display(name, &[&node.trim_source])
         }
-        ast::Expr::Extract(_) => printer::print_expr(expr),
+        ast::Expr::Extract(_) => crate::parser::expression_for_diagnostic(expr),
         ast::Expr::If(node) => {
             let mut arguments = vec![&node.condition, &node.true_value];
             arguments.extend(node.false_value.iter());
@@ -946,7 +945,7 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
                     .iter()
                     .any(|argument| argument.name.is_some()) =>
         {
-            printer::print_expr(expr)
+            crate::parser::expression_for_diagnostic(expr)
         }
         ast::Expr::FunctionCall(function) => format_function_display_name(function),
         ast::Expr::Predicated(node) => format_predicated_display_name(expr, node),
@@ -1001,13 +1000,13 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        other => lowercase_leading_keyword(&printer::print_expr(other)),
+        other => lowercase_leading_keyword(&crate::parser::expression_for_diagnostic(other)),
     }
 }
 
 fn format_subquery_display_name(query: &ast::Query) -> String {
     // AliasedRelation prints the canonical AS form directly.
-    printer::print_query(query)
+    crate::parser::query_for_diagnostic(query)
 }
 
 fn pure_identifier_chain(expr: &ast::Expr) -> Option<ast::IdentifierChain<'_>> {
@@ -1017,7 +1016,7 @@ fn pure_identifier_chain(expr: &ast::Expr) -> Option<ast::IdentifierChain<'_>> {
 
 fn format_dereference_display_name(node: &ast::DereferenceExpr, whole: &ast::Expr) -> String {
     let Some(field) = &node.field else {
-        return printer::print_expr(whole);
+        return crate::parser::expression_for_diagnostic(whole);
     };
     if pure_identifier_chain(&node.base).is_some() {
         return field.value.clone();
@@ -1039,23 +1038,20 @@ fn expr_display_name_preserve_path(expr: &ast::Expr) -> String {
         return parts.join(".");
     }
     match expr {
-        ast::Expr::LegacyParenthesized(nested) => {
-            expr_display_name_preserve_path(&nested.expression)
-        }
         ast::Expr::Dereference(node) => match &node.field {
             Some(field) => format!(
                 "{}.{}",
                 expr_display_name_preserve_path(&node.base),
                 field.value
             ),
-            None => printer::print_expr(expr),
+            None => crate::parser::expression_for_diagnostic(expr),
         },
         ast::Expr::Subscript(node) => format!(
             "{}[{}]",
             expr_display_name_preserve_path(&node.base),
             expr_display_name(&node.index)
         ),
-        ast::Expr::ArrayWildcardSubscript(_) => printer::print_expr(expr),
+        ast::Expr::ArrayWildcardSubscript(_) => crate::parser::expression_for_diagnostic(expr),
         _ => expr_display_name(expr),
     }
 }
@@ -1071,7 +1067,7 @@ fn format_literal_display_name(literal: &ast::Literal) -> String {
         ast::LiteralKind::Double(value) => value.get().to_string(),
         ast::LiteralKind::Binary(bytes) => format!("X'{}'", hex::encode(bytes)),
         ast::LiteralKind::Generic(_) | ast::LiteralKind::Interval(_) => {
-            printer::print_expr(&ast::Expr::Literal(literal.clone()))
+            crate::parser::expression_for_diagnostic(&ast::Expr::Literal(literal.clone()))
         }
     }
 }
@@ -1088,7 +1084,6 @@ fn expr_display_name_with_parens(expr: &ast::Expr) -> String {
         {
             expr_display_name(expr)
         }
-        ast::Expr::LegacyParenthesized(nested) => expr_display_name_with_parens(&nested.expression),
         _ => format!("({})", expr_display_name(expr)),
     }
 }
@@ -1155,27 +1150,22 @@ fn format_predicated_display_name(expression: &ast::Expr, node: &ast::Predicated
                     value(),
                     format_subquery_display_name(&subquery.query)
                 ),
-                _ => lowercase_leading_keyword(&printer::print_expr(expression)),
+                _ => {
+                    lowercase_leading_keyword(&crate::parser::expression_for_diagnostic(expression))
+                }
             }
         }
-        _ => lowercase_leading_keyword(&printer::print_expr(expression)),
+        _ => lowercase_leading_keyword(&crate::parser::expression_for_diagnostic(expression)),
     }
 }
 
 fn binary_operator_display(operator: ast::BinaryOperator) -> &'static str {
     match operator {
-        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::NamedArgument) => "=>",
         ast::BinaryOperator::Add => "+",
         ast::BinaryOperator::Subtract => "-",
         ast::BinaryOperator::Multiply => "*",
         ast::BinaryOperator::Divide => "/",
         ast::BinaryOperator::Modulo => "%",
-        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::BitwiseAnd) => "&",
-        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::BitwiseOr) => "|",
-        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::BitwiseXor) => "^",
-        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::ShiftLeft) => "<<",
-        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::ShiftRight) => ">>",
-        ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::StringConcat) => "||",
     }
 }
 
@@ -1287,10 +1277,10 @@ fn format_type_display(data_type: &ast::TypeName, style: u8) -> String {
                 "int" | "integer" => "INT".into(),
                 "string" => "VARCHAR(65533)".into(),
                 "binary" | "varbinary" => "VARBINARY".into(),
-                _ => printer::print_type_name(data_type),
+                _ => crate::parser::type_for_diagnostic(data_type),
             }
         }
-        _ => printer::print_type_name(data_type),
+        _ => crate::parser::type_for_diagnostic(data_type),
     }
 }
 
@@ -1550,16 +1540,12 @@ fn ordinal_function_argument<'a>(
 }
 
 fn is_constant_expr(expr: &ast::Expr) -> bool {
-    match expr {
-        ast::Expr::Literal(_) => true,
-        ast::Expr::LegacyParenthesized(nested) => is_constant_expr(&nested.expression),
-        _ => false,
-    }
+    matches!(expr, ast::Expr::Literal(_))
 }
 
 fn format_function_order_by(order_by: &ast::SortItem, arguments: &[&ast::Expr]) -> String {
     let expression = ordinal_function_argument(&order_by.sort_key, arguments)
-        .map(|value| expr_display_name_preserve_path(value))
+        .map(expr_display_name_preserve_path)
         .unwrap_or_else(|| expr_display_name(&order_by.sort_key));
     format_order_by_display_name(
         expression,
@@ -1801,11 +1787,10 @@ pub(super) fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
                 )),
             }
         }
-        ast::Expr::LegacyParenthesized(nested) => eval_const_i64(&nested.expression),
         _ => Err(AnalyzeError::invalid_literal(
             format!(
                 "expected constant integer expression, got: {}",
-                printer::print_expr(expr)
+                crate::parser::expression_for_diagnostic(expr)
             ),
             expr.span(),
         )),
@@ -1819,10 +1804,7 @@ mod tests {
     use super::{expr_display_name, sql_type_to_arrow};
 
     fn parse_select_expr(sql: &str) -> novarocks_parser::ast::Expr {
-        let statements = novarocks_parser::parse(sql).expect("parse SQL");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse SQL");
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select body");
         };
@@ -1837,10 +1819,7 @@ mod tests {
     }
 
     fn parse_native_cast_type(sql: &str) -> novarocks_parser::ast::TypeName {
-        let statements = novarocks_parser::parse(sql).expect("parse native SQL");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected native query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse native SQL");
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected native select body");
         };
@@ -1889,10 +1868,7 @@ mod tests {
         ] {
             let expression = parse_select_expr(sql);
             assert_eq!(expr_display_name(&expression), expected, "{sql}");
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-                panic!("query")
-            };
+            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
             let (resolved, _, _) = crate::analyzer::analyze(
                 query,
                 &crate::planning::catalog::PlannerMemoryCatalog::default(),
@@ -1978,7 +1954,7 @@ mod tests {
         // Numeric type parameters accept integer tokens. Fractions are syntax
         // errors whose rejected span must identify source within this CAST.
         const FRACTIONAL_SOURCE: &str = "SELECT CAST(NULL AS DECIMAL(1.5,0))";
-        let error = novarocks_parser::parse(FRACTIONAL_SOURCE)
+        let error = novarocks_parser::parser::parse_query(FRACTIONAL_SOURCE)
             .expect_err("fractional type parameters have no final AST representation");
         let novarocks_parser::ParserError::Parse(novarocks_parser::ParseError::UnexpectedToken {
             span,
@@ -1993,7 +1969,8 @@ mod tests {
         // Signed parameters are already rejected by the native parser.
         for type_name in ["DECIMAL(-1,0)", "DECIMAL(10,-1)"] {
             assert!(
-                novarocks_parser::parse(&format!("SELECT CAST(NULL AS {type_name})")).is_err(),
+                novarocks_parser::parser::parse_query(&format!("SELECT CAST(NULL AS {type_name})"))
+                    .is_err(),
                 "{type_name}"
             );
         }
@@ -2002,7 +1979,7 @@ mod tests {
     #[test]
     fn sql_decimal_type_producer_preserves_nested_cast_carriers() {
         let target = parse_native_cast_type(
-            "SELECT CAST(NULL AS STRUCT<a ARRAY<DECIMAL(60,2)>,m MAP<INT,DECIMAL(76,4)>>)",
+            "SELECT CAST(NULL AS ROW(a ARRAY<DECIMAL(60,2)>,m MAP<INT,DECIMAL(76,4)>))",
         );
         let DataType::Struct(fields) = sql_type_to_arrow(&target).unwrap() else {
             panic!("expected STRUCT");
@@ -2034,7 +2011,7 @@ mod tests {
     #[test]
     fn expr_display_name_formats_group_concat_like_starrocks() {
         let expr =
-            parse_select_expr("SELECT group_concat(name, subject ORDER BY 1, 2 SEPARATOR ',')");
+            parse_select_expr("SELECT string_agg(name, subject \n,\n ','\nORDER BY 1, 2 \n)");
         assert_eq!(
             expr_display_name(&expr),
             "group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')"
@@ -2043,7 +2020,7 @@ mod tests {
 
     #[test]
     fn expr_display_name_normalizes_double_quoted_strings_to_single_quotes() {
-        let expr = parse_select_expr("SELECT array_agg(\"中国\" ORDER BY 1, id)");
+        let expr = parse_select_expr("SELECT array_agg('中国' ORDER BY 1, id)");
         assert_eq!(
             expr_display_name(&expr),
             "array_agg('中国' ORDER BY id ASC)"
@@ -2052,10 +2029,10 @@ mod tests {
 
     #[test]
     fn expr_display_name_normalizes_array_literal_string_quotes() {
-        let expr = parse_select_expr("SELECT array_agg(DISTINCT [json_object(\"2:3\")])");
+        let expr = parse_select_expr("SELECT array_agg(DISTINCT ARRAY[JSON_OBJECT('k': 1)])");
         assert_eq!(
             expr_display_name(&expr),
-            "array_agg(DISTINCT [json_object('2:3')])"
+            "array_agg(DISTINCT [JSON_OBJECT(KEY 'k' VALUE 1 NULL ON NULL WITHOUT UNIQUE KEYS)])"
         );
     }
 
@@ -2147,12 +2124,10 @@ mod tests {
     #[test]
     fn expr_display_name_keeps_json_struct_field_widths_but_canonicalizes_other_structs() {
         let json_expr = parse_select_expr(
-            "SELECT CAST(parse_json('[1,2,3]') AS \
-             STRUCT<col1 INT, col2 ARRAY<INT>, col3 STRUCT<nested TINYINT>>)",
+            "SELECT CAST(parse_json('[1,2,3]') AS ROW(col1 INT, col2 ARRAY<INT>, col3 ROW(nested TINYINT)))",
         );
         let row_expr = parse_select_expr(
-            "SELECT CAST(row(1, 2, 3) AS \
-             STRUCT<col1 INT, col2 ARRAY<INT>, col3 STRUCT<nested TINYINT>>)",
+            "SELECT CAST(row(1, 2, 3) AS ROW(col1 INT, col2 ARRAY<INT>, col3 ROW(nested TINYINT)))",
         );
 
         assert_eq!(
@@ -2299,11 +2274,9 @@ mod tests {
             span,
         }));
         for expression in expressions {
-            let mut statements =
-                novarocks_parser::parse("SELECT NULL FROM missing_type_input").unwrap();
-            let ast::Statement::Query(query) = &mut statements[0] else {
-                panic!("query")
-            };
+            let query =
+                &mut novarocks_parser::parser::parse_query("SELECT NULL FROM missing_type_input")
+                    .unwrap();
             let ast::SetExpr::Select(select) = query.body.as_mut() else {
                 panic!("select")
             };

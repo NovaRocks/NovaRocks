@@ -83,7 +83,6 @@ pub use resolve_from::TableNameView;
 mod scope;
 mod subquery_rewrite;
 
-pub mod alter_iceberg_ref;
 pub mod iceberg_metadata;
 mod iceberg_partitions;
 pub mod iceberg_ref;
@@ -197,6 +196,38 @@ pub(crate) fn analyze_with_function_catalog(
     )
 }
 
+/// Analyze the defining query of a materialized view with its binding diagnostics.
+pub(crate) fn analyze_mv_definition(
+    query: &ast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::analysis::cte::CTERegistry,
+        crate::column_id::ColumnRefFactory,
+    ),
+    AnalyzeError,
+> {
+    analyze_with_factory_and_function_catalog_and_assignments_inner(
+        query,
+        catalog,
+        current_database,
+        crate::column_id::ColumnRefFactory::new(),
+        function_catalog,
+        &crate::sql_mode::SqlSemanticSettings::default(),
+        constant_policy,
+        control,
+        None,
+        None,
+        false,
+        QueryAnalysisPurpose::MaterializedViewDefinition,
+    )
+}
+
 /// Analyze using the semantic setting frozen by the SQL compiler.
 #[cfg(test)]
 pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
@@ -289,6 +320,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
         materialized,
         assignments,
         root_session_admitted,
+        QueryAnalysisPurpose::Ordinary,
     )
 }
 
@@ -388,9 +420,14 @@ fn analyze_with_factory_and_function_catalog_inner(
         materialized,
         None,
         false,
+        QueryAnalysisPurpose::Ordinary,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each argument is independently owned by the query analysis boundary"
+)]
 fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     query: &ast::Query,
     catalog: &dyn PlannerTableProvider,
@@ -403,6 +440,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
     root_session_admitted: bool,
+    purpose: QueryAnalysisPurpose,
 ) -> Result<
     (
         ResolvedQuery,
@@ -417,12 +455,12 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         0,
     )
     .map_err(AnalyzeError::control)?;
-    let legacy_semantics;
+    let query_semantics;
     let sql_semantics = if root_session_admitted {
         sql_semantics
     } else {
-        legacy_semantics = crate::sql_mode::query_sql_semantics(sql_semantics, query)?;
-        &legacy_semantics
+        query_semantics = crate::sql_mode::query_sql_semantics(sql_semantics, query)?;
+        &query_semantics
     };
     let query =
         crate::sql_mode::normalize_concat_query_with_semantics(query.clone(), sql_semantics);
@@ -458,6 +496,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
         grouping_scope: std::cell::RefCell::new(None),
+        purpose,
         catalog,
         current_database,
         function_catalog,
@@ -515,7 +554,7 @@ struct GroupingCall {
 
 #[derive(Clone)]
 enum GroupingSyntax {
-    Call(ast::FunctionCall),
+    Call(ast::AstBox<ast::FunctionCall>),
     Operation(ast::GroupingOperation),
 }
 #[derive(Clone, Copy)]
@@ -550,7 +589,7 @@ impl<'a> GroupingSyntaxRef<'a> {
     }
     fn owned(self) -> GroupingSyntax {
         match self {
-            Self::Call(call) => GroupingSyntax::Call(call.clone()),
+            Self::Call(call) => GroupingSyntax::Call(ast::AstBox::new(call.clone())),
             Self::Operation(node) => GroupingSyntax::Operation(node.clone()),
         }
     }
@@ -564,7 +603,7 @@ impl GroupingSyntax {
     }
     fn matches(&self, input: GroupingSyntaxRef<'_>) -> bool {
         match (self, input) {
-            (Self::Call(a), GroupingSyntaxRef::Call(b)) => a == b,
+            (Self::Call(a), GroupingSyntaxRef::Call(b)) => a.as_ref() == b,
             (Self::Operation(a), GroupingSyntaxRef::Operation(b)) => a == b,
             _ => false,
         }
@@ -578,7 +617,14 @@ impl GroupingSyntax {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum QueryAnalysisPurpose {
+    Ordinary,
+    MaterializedViewDefinition,
+}
+
 pub(super) struct AnalyzerContext<'a> {
+    purpose: QueryAnalysisPurpose,
     grouping_scope: std::cell::RefCell<Option<std::rc::Rc<GroupingAnalysis>>>,
     view_stack: view::ViewAnalysisStack,
     pub(super) control: &'a crate::compiler::SqlCompileControl,
@@ -842,7 +888,7 @@ impl<'a> AnalyzerContext<'a> {
                 };
                 let canonical = state.keys.get(index).map(expr_syntax_key).ok_or_else(|| {
                     AnalyzeError::internal("GROUP BY key ordinal is missing its original syntax")
-                })?;
+                })??;
                 call.columns.push(canonical);
             }
         }
@@ -954,6 +1000,7 @@ impl<'a> AnalyzerContext<'a> {
 
         let mut child_ctx = AnalyzerContext {
             grouping_scope: std::cell::RefCell::new(None),
+            purpose: self.purpose,
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: self.materialized_values,
@@ -2158,7 +2205,7 @@ impl<'a> AnalyzerContext<'a> {
             ast::GroupingSetsKind::Cube => cube_grouping_sets(&groups),
         };
         let all_group_by_exprs = if sets.kind == ast::GroupingSetsKind::Explicit {
-            unique_exprs_in_order(groups.iter().flat_map(|group| group.iter()))
+            unique_exprs_in_order(groups.iter().flat_map(|group| group.iter()))?
         } else {
             flatten_grouping_groups(&groups)
         };
@@ -2185,7 +2232,7 @@ impl<'a> AnalyzerContext<'a> {
             .all_group_by_exprs
             .iter()
             .map(|expr| expr_syntax_key(expr))
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         // StarRocks uses the last grouping argument as the least-significant
         // bit, so for GROUPING_ID(a, b) nulling b yields 0b01, not 0b10.
@@ -2198,7 +2245,7 @@ impl<'a> AnalyzerContext<'a> {
             let non_null_cols: Vec<String> = grouping_set
                 .iter()
                 .map(|expr| expr_syntax_key(expr))
-                .collect();
+                .collect::<Result<_, _>>()?;
             let active_cols: std::collections::HashSet<String> =
                 non_null_cols.iter().cloned().collect();
             repeat_column_ref_list.push(non_null_cols);
@@ -2916,7 +2963,7 @@ impl<'a> AnalyzerContext<'a> {
                     // a SELECT list expression. If so, resolve as a reference to
                     // the output alias. This handles ORDER BY count(x) matching
                     // SELECT count(x) as alias.
-                    let ob_text = expr_syntax_key(&ob.sort_key);
+                    let ob_text = expr_syntax_key(&ob.sort_key)?;
                     let mut matched_alias = None;
                     // Match ORDER BY expression text against SELECT item
                     // expressions (not aliases). This handles ORDER BY
@@ -2962,7 +3009,7 @@ impl<'a> AnalyzerContext<'a> {
                             }
                             let ast_expr_text = match ast_item {
                                 ast::SelectItem::SingleColumn(column) => {
-                                    expr_syntax_key(&column.expression)
+                                    expr_syntax_key(&column.expression)?
                                 }
                                 _ => continue,
                             };
@@ -3479,8 +3526,10 @@ fn is_grouping_call(expression: &ast::Expr) -> bool {
         && matches!(function.name.parts[0].value.to_ascii_lowercase().as_str(), "grouping" | "grouping_id"))
 }
 
-fn expr_syntax_key(expr: &ast::Expr) -> String {
-    novarocks_parser::printer::print_expr(expr).to_lowercase()
+fn expr_syntax_key(expr: &ast::Expr) -> Result<String, AnalyzeError> {
+    novarocks_parser::printer::print_expression(expr)
+        .map(|sql| sql.to_lowercase())
+        .map_err(|error| AnalyzeError::unsupported_expression(error.to_string(), expr.span()))
 }
 
 /// Keep historical planner labels while all value/type binding uses the
@@ -3514,19 +3563,19 @@ fn flatten_grouping_groups<'s>(groups: &[&'s [ast::Expr]]) -> Vec<&'s ast::Expr>
     groups.iter().flat_map(|group| group.iter()).collect()
 }
 
-fn unique_exprs_in_order<'s, I>(exprs: I) -> Vec<&'s ast::Expr>
+fn unique_exprs_in_order<'s, I>(exprs: I) -> Result<Vec<&'s ast::Expr>, AnalyzeError>
 where
     I: IntoIterator<Item = &'s ast::Expr>,
 {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
     for expr in exprs {
-        let key = expr_syntax_key(expr);
+        let key = expr_syntax_key(expr)?;
         if seen.insert(key) {
             result.push(expr);
         }
     }
-    result
+    Ok(result)
 }
 
 fn rollup_grouping_sets<'s>(groups: &[&'s [ast::Expr]]) -> Vec<Vec<&'s ast::Expr>> {
@@ -3585,7 +3634,6 @@ fn natural_field_name(expr: &ast::Expr) -> Option<String> {
             ast::Expr::Identifier(ident) => {
                 return Some(terminal.unwrap_or(ident).value.clone());
             }
-            ast::Expr::LegacyParenthesized(nested) => current = &nested.expression,
             ast::Expr::Dereference(node) => {
                 let field = node.field.as_ref()?;
                 terminal.get_or_insert(field);
@@ -3617,7 +3665,7 @@ mod tests {
         use crate::analyze_error::AnalyzeErrorKind;
         use novarocks_parser::{SYNTHETIC, ast, build};
         let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
-        for (sql, struct_width) in [("VALUES (1)", None), ("VALUES (ROW(1, 2))", Some(2))] {
+        for (sql, struct_width) in [("VALUES (1)", None), ("VALUES ROW(ROW(1, 2))", Some(2))] {
             let query = parse_native_query(sql).unwrap();
             let ast::SetExpr::Values(values) = query.body.as_ref() else {
                 panic!("VALUES")
@@ -3655,10 +3703,6 @@ mod tests {
                 .into(),
                 span: SYNTHETIC,
             })]
-            .into(),
-            vec![build::legacy_nested(
-                build::tuple_value(vec![build::integer(1), build::integer(2)]).unwrap(),
-            )]
             .into(),
         ] {
             let ast::SetExpr::Values(values) = query.body.as_mut() else {
@@ -3755,7 +3799,7 @@ mod tests {
     }
 
     #[test]
-    fn parenthesized_struct_base_keeps_its_column_when_an_alias_has_the_same_name() {
+    fn qualified_struct_base_keeps_its_column_when_an_alias_has_the_same_name() {
         use arrow::datatypes::{DataType, Field};
         use novarocks_type_contract::FunctionValueType;
         use std::sync::Arc;
@@ -3821,7 +3865,7 @@ mod tests {
 
         for (sql, struct_access) in [
             (
-                "SELECT (x).y FROM row_source t CROSS JOIN qualified_source x",
+                "SELECT t.x.y FROM row_source t CROSS JOIN qualified_source x",
                 true,
             ),
             (
@@ -3884,7 +3928,7 @@ mod tests {
                     ..
                 } = &projected.expr.kind
                 else {
-                    panic!("parenthesized base must select original STRUCT-field owner")
+                    panic!("qualified base must select original STRUCT-field owner")
                 };
                 assert_eq!(name, "__struct_subfield");
                 assert_eq!(args.len(), 2);
@@ -3901,8 +3945,8 @@ mod tests {
                     base = inner;
                 }
                 assert!(
-                    matches!(&base.kind, ExprKind::ColumnRef { column_id, qualifier: None, column }
-                    if *column_id == left.column_ids[0] && column == "x")
+                    matches!(&base.kind, ExprKind::ColumnRef { column_id, qualifier: Some(qualifier), column }
+                    if *column_id == left.column_ids[0] && qualifier == "t" && column == "x")
                 );
             } else {
                 assert_eq!(projected.expr.value_type, expected_qualified);
@@ -3919,10 +3963,7 @@ mod tests {
     #[test]
     fn count_nodes_keep_static_values_and_direct_capability_refusals() {
         use novarocks_parser::{Span, ast, build};
-        let mut statements = novarocks_parser::parse("SELECT 1").unwrap();
-        let [ast::Statement::Query(query)] = statements.as_mut_slice() else {
-            panic!("query");
-        };
+        let query = &mut novarocks_parser::parser::parse_query("SELECT 1").unwrap();
         let ast::SetExpr::Select(select) = query.body.as_mut() else {
             panic!("select");
         };
@@ -4016,7 +4057,7 @@ mod tests {
     #[test]
     fn parenthesized_query_retains_each_suffix_and_original_output_identity() {
         let query = parse_native_query(
-            "(SELECT k1 FROM t1 ORDER BY v1 LIMIT 5 OFFSET 3) ORDER BY k1 LIMIT 2 OFFSET 1",
+            "(SELECT k1 FROM t1 ORDER BY v1 OFFSET 3 LIMIT 5) ORDER BY k1 OFFSET 1 LIMIT 2",
         )
         .unwrap();
         let (resolved, ctes, mut factory) = analyze(&query, &TestCatalog, "default").unwrap();
@@ -4184,27 +4225,27 @@ mod tests {
     fn trino_struct_dereferences_keep_natural_and_computed_names() {
         for (sql, expected_name, expected_type) in [
             (
-                "SELECT s.a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                "SELECT s.a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
                 Some("a"),
                 DataType::Int32,
             ),
             (
-                "SELECT a2[1].a FROM (VALUES ([CAST(ROW(1) AS STRUCT<a integer>)])) AS t (a2);",
+                "SELECT a2[1].a FROM (VALUES ([CAST(ROW(1) AS ROW(a integer))])) AS t (a2)",
                 None,
                 DataType::Int32,
             ),
             (
-                "SELECT (s).a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                "SELECT (s).a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
                 Some("a"),
                 DataType::Int32,
             ),
             (
-                "SELECT (CAST(s AS STRUCT<a bigint>)).a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                "SELECT (CAST(s AS ROW(a bigint))).a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
                 None,
                 DataType::Int64,
             ),
             (
-                "SELECT s.A FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                "SELECT s.A FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
                 Some("A"),
                 DataType::Int32,
             ),
@@ -4223,7 +4264,7 @@ mod tests {
         for sql in [
             "SELECT _col0 FROM (SELECT 1) AS t",
             "SELECT column_0 FROM (VALUES (1)) AS t",
-            "SELECT t.`1` FROM (SELECT 1) AS t",
+            "SELECT t.\"1\" FROM (SELECT 1) AS t",
         ] {
             let query = parse_native_query(sql).unwrap();
             assert_eq!(
@@ -4953,6 +4994,15 @@ mod tests {
             ))
         }
 
+        fn resolve_quoted_iceberg_metadata(
+            &self,
+            name: &novarocks_parser::ast::ObjectName,
+            catalog: Option<&str>,
+            database: &str,
+        ) -> Option<crate::catalog::QuotedMetadataTable> {
+            crate::compiler::resolve_quoted_iceberg_metadata_for_test(name, catalog, database, self)
+        }
+
         fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
             Some(self)
         }
@@ -4984,10 +5034,8 @@ mod tests {
     }
 
     fn parse_native_query(sql: &str) -> Result<ast::Query, String> {
-        let mut statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
-            return Err("expected exactly one query".to_string());
-        };
+        let query =
+            &mut novarocks_parser::parser::parse_query(sql).map_err(|error| error.to_string())?;
         Ok(query.clone())
     }
 
@@ -5943,7 +5991,7 @@ mod tests {
 
     #[test]
     fn table_metadata_name_view_keeps_actual_quoted_facts_and_authored_locations() {
-        let source = "SELECT * FROM ice.db.orders$future_metadata";
+        let source = "SELECT * FROM ice.db.\"orders$future_metadata\"";
         let query = parse_native_query(source).unwrap();
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
@@ -5954,17 +6002,12 @@ mod tests {
         let view = TableNameView::new(&table.name);
         assert_eq!(
             view.parts().collect::<Vec<_>>(),
-            vec!["ice", "db", "orders"]
+            ["ice", "db", "orders$future_metadata"]
         );
-        let suffix = view.metadata.unwrap();
-        assert_eq!(suffix.value, "future_metadata");
-        assert_eq!(
-            &source[suffix.span.start()..suffix.span.end()],
-            "future_metadata"
-        );
+        assert!(view.metadata.is_none());
         assert_eq!(
             &source[view.base_span.start()..view.base_span.end()],
-            "ice.db.orders"
+            "ice.db.\"orders$future_metadata\""
         );
         let mut name = novarocks_parser::build::object_name(vec![novarocks_parser::build::ident(
             "orders$files",
@@ -6288,7 +6331,7 @@ mod tests {
     #[test]
     fn test_percentile_approx_with_array_literal_returns_array_type() {
         let resolved = parse_raw_and_analyze(
-            "SELECT percentile_approx(o_totalprice, array<double>[0.25, 0.5]) FROM orders",
+            "SELECT percentile_approx(o_totalprice, CAST([0.25, 0.5] AS ARRAY<double>)) FROM orders",
         )
         .expect("analysis should succeed");
         assert_eq!(resolved.output_columns.len(), 1);
@@ -6350,7 +6393,7 @@ mod tests {
     #[test]
     fn test_group_concat_rejects_non_string_separator() {
         let err = parse_raw_and_analyze(
-            "SELECT group_concat(\"中国\" ORDER BY \"第一\" SEPARATOR 1) FROM orders",
+            "SELECT string_agg('中国' \n,\n 1\nORDER BY '第一' \n) FROM orders",
         )
         .expect_err("group_concat should reject non-string separator");
         assert!(
@@ -6449,10 +6492,9 @@ mod tests {
 
     #[test]
     fn test_time_slice_interval_literal_analyzes() {
-        let resolved = parse_raw_and_analyze(
-            "SELECT time_slice('9999-12-31 23:59:59', interval 5 year, ceil)",
-        )
-        .expect("time_slice interval literal should analyze");
+        let resolved =
+            parse_raw_and_analyze("SELECT time_slice('9999-12-31 23:59:59', 5, 'year', 'ceil')")
+                .expect("time_slice interval literal should analyze");
         assert_eq!(resolved.output_columns.len(), 1);
     }
 
@@ -6556,10 +6598,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_rollup_and_cube_keep_one_empty_repeat_group_and_original_count_binding() {
+    fn empty_grouping_sets_keep_exact_repeat_multiplicity_and_count_binding() {
         let count_type = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
         let mut canonical_binding = None;
-        for group_by in ["GROUPING SETS (())", "ROLLUP()", "CUBE()"] {
+        for (group_by, repeats) in [
+            ("GROUPING SETS (())", 1),
+            ("ROLLUP(())", 2),
+            ("CUBE(())", 2),
+        ] {
             let sql =
                 format!("SELECT count(*) AS cnt FROM (VALUES (1), (2)) t(v) GROUP BY {group_by}");
             let query = parse_and_analyze(&sql).unwrap_or_else(|error| {
@@ -6569,10 +6615,13 @@ mod tests {
                 panic!("{group_by} must produce the original Select with RepeatInfo");
             };
             let repeat = select.repeat.as_ref().expect("an actual Repeat expansion");
-            assert_eq!(repeat.repeat_column_ref_list, vec![Vec::<String>::new()]);
+            assert_eq!(
+                repeat.repeat_column_ref_list,
+                vec![Vec::<String>::new(); repeats]
+            );
             // This analyzer stage leaves the per-group ColumnId mapping unpopulated.
             assert!(repeat.repeat_column_ref_ids.is_empty());
-            assert_eq!(repeat.grouping_ids, vec![0]);
+            assert_eq!(repeat.grouping_ids, vec![0; repeats]);
             assert!(repeat.all_rollup_columns.is_empty());
             assert!(repeat.all_rollup_column_ids.is_empty());
             assert!(repeat.grouping_fn_args.is_empty());
@@ -7177,6 +7226,7 @@ mod tests {
         let control = crate::compiler::SqlCompileControl::unbounded();
         let ctx = AnalyzerContext {
             grouping_scope: Default::default(),
+            purpose: QueryAnalysisPurpose::Ordinary,
             view_stack: Default::default(),
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
@@ -7225,10 +7275,7 @@ mod tests {
         let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
         let args = vec!["missing"; 64].join(",");
         let sql = format!("SELECT grouping({args}) FROM (VALUES (1)) t(a) GROUP BY a");
-        let statements = novarocks_parser::parse(&sql).unwrap();
-        let ast::Statement::Query(query) = &statements[0] else {
-            panic!("query");
-        };
+        let query = &novarocks_parser::parser::parse_query(&sql).unwrap();
         let error = analyze(query, &catalog, "default").unwrap_err();
         assert_eq!(
             error.kind(),
@@ -7532,6 +7579,7 @@ mod tests {
         let control = crate::compiler::SqlCompileControl::unbounded();
         let ctx = AnalyzerContext {
             grouping_scope: Default::default(),
+            purpose: QueryAnalysisPurpose::Ordinary,
             view_stack: Default::default(),
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
@@ -7812,8 +7860,8 @@ mod tests {
 
     #[test]
     fn left_casts_value_argument_but_preserves_length_type() {
-        let resolved = parse_and_analyze("select left(o_totalprice, 6) from orders")
-            .expect("left should analyze");
+        let resolved = parse_and_analyze("select strleft(o_totalprice, 6) from orders")
+            .expect("strleft should analyze");
         let QueryBody::Select(sel) = &resolved.body else {
             panic!("expected Select body");
         };
@@ -7823,7 +7871,7 @@ mod tests {
                 sel.projection[0].expr.kind
             );
         };
-        assert_eq!(name, "left");
+        assert_eq!(name, "strleft");
         let ExprKind::Cast { target, expr, .. } = &args[0].kind else {
             panic!("expected left value argument cast, got {:?}", args[0].kind);
         };
@@ -8063,6 +8111,17 @@ mod tests {
                 CatalogAwareTestCatalog.resolve_table_for_analysis(catalog, database, table)
             }
 
+            fn resolve_quoted_iceberg_metadata(
+                &self,
+                name: &novarocks_parser::ast::ObjectName,
+                catalog: Option<&str>,
+                database: &str,
+            ) -> Option<crate::catalog::QuotedMetadataTable> {
+                crate::compiler::resolve_quoted_iceberg_metadata_for_test(
+                    name, catalog, database, self,
+                )
+            }
+
             fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
                 Some(self)
             }
@@ -8088,8 +8147,8 @@ mod tests {
         }
 
         let catalog = MetadataModeCatalog(std::cell::Cell::new(false));
-        let query =
-            parse_native_query("SELECT record_count FROM ice.db.orders$partitions").expect("parse");
+        let query = parse_native_query("SELECT record_count FROM ice.db.\"orders$partitions\"")
+            .expect("parse");
 
         let _ = analyze(&query, &catalog, "default").expect("analyze");
         assert!(
@@ -8109,6 +8168,17 @@ mod tests {
                 table: &str,
             ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
                 CatalogAwareTestCatalog.resolve_table_for_analysis(catalog, database, table)
+            }
+
+            fn resolve_quoted_iceberg_metadata(
+                &self,
+                name: &novarocks_parser::ast::ObjectName,
+                catalog: Option<&str>,
+                database: &str,
+            ) -> Option<crate::catalog::QuotedMetadataTable> {
+                crate::compiler::resolve_quoted_iceberg_metadata_for_test(
+                    name, catalog, database, self,
+                )
             }
 
             fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
@@ -8139,8 +8209,8 @@ mod tests {
         }
 
         let catalog = LowercaseMetadataModeCatalog(std::cell::Cell::new(false));
-        let query =
-            parse_native_query("SELECT record_count FROM ICE.DB.ORDERS$partitions").expect("parse");
+        let query = parse_native_query("SELECT record_count FROM ICE.DB.\"ORDERS$partitions\"")
+            .expect("parse");
 
         let _ = analyze(&query, &catalog, "default").expect("analyze");
         assert!(
@@ -8154,7 +8224,7 @@ mod tests {
         use crate::planner::table::SqlMetadataTableKind;
 
         // Metadata table syntax is carried by the typed table-factor metadata field.
-        let resolved = parse_raw_and_analyze("SELECT snapshot_id FROM orders$snapshots")
+        let resolved = parse_raw_and_analyze("SELECT snapshot_id FROM \"orders$snapshots\"")
             .expect("analyze should succeed");
         let QueryBody::Select(sel) = &resolved.body else {
             panic!("expected Select body");
@@ -8165,7 +8235,7 @@ mod tests {
                 assert_eq!(rel.metadata_table_type, SqlMetadataTableKind::Snapshots);
                 assert_eq!(rel.table.name, "orders");
                 assert_eq!(rel.database, "default");
-                assert!(rel.alias.is_none());
+                assert_eq!(rel.alias.as_deref(), Some("orders$snapshots"));
             }
             other => panic!("expected IcebergMetadataScan, got {other:?}"),
         }
@@ -8185,8 +8255,8 @@ mod tests {
     #[test]
     fn metadata_order_by_hidden_column_reuses_scan_column_id() {
         for sql in [
-            "SELECT snapshot_id FROM orders$snapshots ORDER BY committed_at LIMIT 1",
-            "SELECT snapshot_id FROM orders$snapshots AS s ORDER BY s.committed_at LIMIT 1",
+            "SELECT snapshot_id FROM \"orders$snapshots\" ORDER BY committed_at LIMIT 1",
+            "SELECT snapshot_id FROM \"orders$snapshots\" AS s ORDER BY s.committed_at LIMIT 1",
         ] {
             let resolved = parse_raw_and_analyze(sql).expect("analyze metadata ORDER BY");
             let QueryBody::Select(select) = &resolved.body else {
@@ -8216,8 +8286,8 @@ mod tests {
     #[test]
     fn metadata_order_by_hidden_column_survives_optimizer_id_binding() {
         for sql in [
-            "SELECT snapshot_id FROM orders$snapshots ORDER BY committed_at LIMIT 1",
-            "SELECT snapshot_id FROM orders$snapshots AS s ORDER BY s.committed_at LIMIT 1",
+            "SELECT snapshot_id FROM \"orders$snapshots\" ORDER BY committed_at LIMIT 1",
+            "SELECT snapshot_id FROM \"orders$snapshots\" AS s ORDER BY s.committed_at LIMIT 1",
         ] {
             let query = parse_native_query(sql).expect("parse metadata ORDER BY");
             let (resolved, registry, mut factory) =
@@ -8253,15 +8323,10 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_rejects_branch_combined_with_metadata_suffix() {
-        // The typed metadata suffix leaves `branch_dev` as the base name,
-        // which is
-        // illegal in combination with a metadata-table suffix.
-        let err = parse_raw_and_analyze("SELECT * FROM orders.branch_dev$snapshots")
-            .expect_err("must fail");
+    fn parser_rejects_an_unquoted_branch_with_a_metadata_suffix() {
         assert!(
-            err.contains("cannot be combined with branch/tag suffix"),
-            "unexpected error: {err}"
+            novarocks_parser::parser::parse_query("SELECT * FROM orders.branch_dev$snapshots")
+                .is_err()
         );
     }
 
@@ -8272,7 +8337,7 @@ mod tests {
         // returns the same table for any database name, so we can pass any
         // catalog/namespace strings in the three-part identifier.
         let resolved = parse_raw_and_analyze(
-            "SELECT _row_id FROM __nr_ivm_delta('cat.ns.iv_orders', 100, 200) AS t",
+            "SELECT _row_id FROM TABLE(__nr_ivm_delta('cat.ns.iv_orders', 100, 200)) AS t",
         )
         .expect("analysis should succeed");
         let QueryBody::Select(sel) = &resolved.body else {
@@ -8348,18 +8413,20 @@ mod tests {
 
     #[test]
     fn analyzer_rejects_nr_ivm_delta_with_negative_snapshot() {
-        let err =
-            parse_raw_and_analyze("SELECT * FROM __nr_ivm_delta('cat.ns.iv_orders', -1, 200) AS t")
-                .expect_err("must fail");
+        let err = parse_raw_and_analyze(
+            "SELECT * FROM TABLE(__nr_ivm_delta('cat.ns.iv_orders', -1, 200)) AS t",
+        )
+        .expect_err("must fail");
         assert!(err.contains("non-negative"), "unexpected error: {err}");
     }
 
     #[test]
     fn analyzer_rejects_nr_ivm_delta_on_non_v3_table() {
         // `orders` is registered without row-lineage metadata columns.
-        let err =
-            parse_raw_and_analyze("SELECT * FROM __nr_ivm_delta('cat.ns.orders', 100, 200) AS t")
-                .expect_err("must fail");
+        let err = parse_raw_and_analyze(
+            "SELECT * FROM TABLE(__nr_ivm_delta('cat.ns.orders', 100, 200)) AS t",
+        )
+        .expect_err("must fail");
         assert!(
             err.contains("Iceberg v3") || err.contains("row-lineage metadata"),
             "expected row-lineage rebuild diagnostic, got: {err}"
@@ -9086,7 +9153,7 @@ mod tests {
 
     #[test]
     fn group_by_subquery_is_rejected_clearly() {
-        let err = parse_and_analyze("SELECT k1 FROM t1 GROUP BY (SELECT max(k2) FROM t2)")
+        let err = parse_and_analyze("SELECT k1 FROM t1 GROUP BY ((SELECT max(k2) FROM t2))")
             .expect_err("subquery in GROUP BY should be rejected");
         assert!(
             err.contains("subquery is not supported in GROUP BY"),

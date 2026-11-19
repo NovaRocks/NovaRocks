@@ -105,43 +105,6 @@ pub struct StatementAdmission {
     pub kind: StatementKind,
     pub shape: StatementOutputShape,
 }
-// Design: ADR-0217 (docs/adr/ADR-0217-sole-trino-entry-and-application-owned-completion.md)
-impl StatementAdmission {
-    pub fn from_statement(statement: &novarocks_parser::ast::Statement) -> Self {
-        use novarocks_parser::ast::{DmlStatement, Statement};
-        let kind = StatementKind::from_statement(statement);
-        let shape = if matches!(
-            statement,
-            Statement::Dml(DmlStatement::CreateTableAsSelect(_))
-        ) || matches!(
-            kind,
-            StatementKind::Insert
-                | StatementKind::Delete
-                | StatementKind::Update
-                | StatementKind::Merge
-                | StatementKind::RefreshMaterializedView
-                | StatementKind::Analyze
-        ) {
-            StatementOutputShape::Rows
-        } else if kind.is_row_kind()
-            || kind == StatementKind::Optimize
-            || matches!(
-                statement,
-                Statement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(alter))
-                    if matches!(&alter.action, novarocks_parser::ast::IcebergTableAction::AddFiles(_))
-            )
-        {
-            // ADD FILES already returns the original domain status result set.
-            // It is not a counted command and must not discard those rows.
-            StatementOutputShape::ResultSet
-        } else if kind == StatementKind::Call {
-            StatementOutputShape::UndeterminedCall
-        } else {
-            StatementOutputShape::Empty
-        };
-        Self { kind, shape }
-    }
-}
 /// One original statement retains its immutable admission fact. Observation
 /// grants neither execution nor access to the statement owner.
 #[derive(Clone)]
@@ -251,48 +214,6 @@ mod tests {
         assert!(!completed.load(Ordering::Acquire));
         terminal.complete();
         assert!(completed.load(Ordering::Acquire));
-    }
-    #[test]
-    fn admitted_shape_distinguishes_ctas_and_preserves_call_uncertainty() {
-        fn admission(sql: &str) -> StatementAdmission {
-            let statements = novarocks_parser::parse(sql).unwrap();
-            assert_eq!(statements.len(), 1);
-            StatementAdmission::from_statement(&statements[0])
-        }
-        let create = admission("CREATE TABLE t (v BIGINT)");
-        let ctas = admission("CREATE TABLE IF NOT EXISTS t AS SELECT 1");
-        assert_eq!(create.kind, ctas.kind);
-        assert_eq!(create.shape, StatementOutputShape::Empty);
-        assert_eq!(ctas.shape, StatementOutputShape::Rows);
-        for sql in [
-            "INSERT INTO t SELECT 1",
-            "INSERT OVERWRITE t SELECT 1",
-            "DELETE FROM t",
-            "UPDATE t SET v = 1",
-            "MERGE INTO t USING src s ON t.id = s.id WHEN MATCHED THEN DELETE",
-            "ANALYZE TABLE t",
-            "REFRESH MATERIALIZED VIEW mv",
-        ] {
-            assert_eq!(admission(sql).shape, StatementOutputShape::Rows, "{sql}");
-        }
-        assert_eq!(admission("SELECT 1").shape, StatementOutputShape::ResultSet);
-        let add_files = admission("ALTER TABLE t ADD FILES FROM 's3://bucket/input'");
-        assert_eq!(add_files.kind, StatementKind::AddFiles);
-        assert_eq!(add_files.shape, StatementOutputShape::ResultSet);
-        assert!(
-            !add_files.kind.is_row_kind(),
-            "business classification is unchanged"
-        );
-        for sql in [
-            "ALTER TABLE t ADD EQUALITY DELETE (id) VALUES (2)",
-            "TRUNCATE TABLE t",
-        ] {
-            assert_eq!(admission(sql).shape, StatementOutputShape::Empty, "{sql}");
-        }
-        assert_eq!(
-            admission("CALL system.expire_snapshots('t')").shape,
-            StatementOutputShape::UndeterminedCall
-        );
     }
     #[tokio::test]
     async fn original_admission_observation_precedes_statement_completion() {

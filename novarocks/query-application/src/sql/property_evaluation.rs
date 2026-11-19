@@ -17,9 +17,6 @@
 
 //! DDL property preparation, separate from expression execution and provider policy.
 
-mod legacy_table_properties;
-pub(super) use legacy_table_properties::prepare_legacy_create_table_properties;
-
 use std::collections::HashSet;
 
 use novarocks_constant_contract::{ConstantError, ConstantValue};
@@ -48,15 +45,7 @@ pub struct DdlPropertyAssignment<'a> {
 #[derive(Clone, Copy, Debug)]
 pub enum DdlPropertyAssignmentValue<'a> {
     Expression(&'a Expr),
-    /// A neutral value already issued by the original preparation owner.
-    /// It is not SQL syntax, a carrier/domain inference, or setter authority.
-    Authored {
-        value: &'a DdlPropertyValue,
-        span: Span,
-    },
-    Default {
-        span: Span,
-    },
+    Default { span: Span },
 }
 
 /// The original computation owner alone classifies a failed expression as
@@ -138,87 +127,6 @@ impl EvaluatedDdlProperties {
     pub fn into_properties(self) -> Vec<EvaluatedDdlProperty> {
         self.properties
     }
-}
-
-/// Temporary old-parser bridge; remove with the legacy catalog entry at P12.
-/// The legacy value is a parsed Literal, not an Expr slot. Its real kind/span
-/// are retained in a temporary Expr::Literal for the original constant port.
-/// This new wrapper address is not represented as an old-tree Expr identity.
-pub fn prepare_legacy_create_catalog(
-    source: &str,
-    statement: &novarocks_parser::ast::legacy::CreateCatalog,
-    port: &mut dyn DdlPropertyConstantPort,
-    control: &dyn PureCompileControl,
-) -> Result<novarocks_sql::semantic::command::CatalogCreateCommand, QueryServiceError> {
-    use novarocks_parser::ast::LiteralKind;
-
-    checkpoint(control, 0)?;
-    // The original literal-admission check preceded property lowering. Neither
-    // EXTERNAL nor COMMENT has a product reader; no new comment policy is added.
-    if let Some(comment) = &statement.comment {
-        super::lower_command_literal(comment)
-            .map_err(|message| QueryServiceError::new(QueryServiceErrorKind::Internal, message))?;
-    }
-    let mut expressions = Vec::with_capacity(statement.properties.len());
-    for property in &statement.properties {
-        checkpoint(control, 1)?;
-        if !matches!(&property.key.kind, LiteralKind::String(_)) {
-            return Err(invalid(
-                DdlPropertyScope::Catalog,
-                source,
-                property.key.span,
-                "Catalog property keys must be string values",
-            ));
-        }
-        match &property.value.kind {
-            LiteralKind::String(value) | LiteralKind::Decimal(value) => {
-                observe_bytes(value, control)?
-            }
-            LiteralKind::Long { spelling, .. } => observe_bytes(spelling, control)?,
-            LiteralKind::Binary(value) => {
-                for chunk in value.chunks(256) {
-                    checkpoint(control, chunk.len() as u32)?;
-                }
-            }
-            _ => {}
-        }
-        expressions.push(Expr::Literal(property.value.clone()));
-        checkpoint(control, 0)?;
-    }
-    let assignments = statement
-        .properties
-        .iter()
-        .zip(&expressions)
-        .map(|(property, expression)| {
-            let LiteralKind::String(name) = &property.key.kind else {
-                unreachable!("keys checked above")
-            };
-            DdlPropertyAssignment {
-                name,
-                name_span: property.key.span,
-                span: property.span,
-                value: DdlPropertyAssignmentValue::Expression(expression),
-            }
-        })
-        .collect::<Vec<_>>();
-    let evaluated = evaluate_ddl_properties(
-        DdlPropertyScope::Catalog,
-        DdlPropertyEvaluationMode::Create,
-        source,
-        &[],
-        &assignments,
-        port,
-        control,
-    )?;
-    let properties = catalog_strings(evaluated, control)?;
-    let name = copy_string(&statement.name.value, control)?;
-    checkpoint(control, 0)?;
-    Ok(novarocks_sql::semantic::command::CatalogCreateCommand {
-        if_not_exists: statement.if_not_exists,
-        name,
-        connector_name: None,
-        properties,
-    })
 }
 
 pub(super) fn validate_create_authorization(
@@ -518,47 +426,6 @@ fn evaluate_properties(
                     continue;
                 }
                 DdlPropertyChange::Reset(value)
-            }
-            DdlPropertyAssignmentValue::Authored { value, span } => {
-                checkpoint(control, 0)?;
-                if let Some(actual) = value.value_type()
-                    && actual != value_type
-                {
-                    return Err(invalid(
-                        scope,
-                        source,
-                        span,
-                        format!("Property '{name}' requires {value_type:?}, got {actual:?}"),
-                    ));
-                }
-                if value == &DdlPropertyValue::Null {
-                    return Err(invalid(
-                        scope,
-                        source,
-                        span,
-                        format!("Property '{name}' cannot be NULL"),
-                    ));
-                }
-                if let DdlPropertyValue::MapVarcharVarchar(entries) = value {
-                    let mut keys = HashSet::new();
-                    for (key, _) in entries {
-                        checkpoint(control, 1)?;
-                        observe_bytes(key, control)?;
-                        if !keys.insert(key.as_str()) {
-                            return Err(invalid(
-                                scope,
-                                source,
-                                span,
-                                format!("Duplicate map property key '{key}' in property '{name}'"),
-                            ));
-                        }
-                    }
-                }
-                // The user map has already passed its scope duplicate check;
-                // the existing default-copy invariant is never its classifier.
-                let value = copy_value(value, control)?;
-                checkpoint(control, 0)?;
-                DdlPropertyChange::Set(value)
             }
             DdlPropertyAssignmentValue::Expression(expression) => {
                 let value = if value_type == DdlPropertyType::MapVarcharVarchar {

@@ -154,10 +154,7 @@ mod tests {
     use super::*;
 
     fn query(sql: &str) -> novarocks_parser::ast::Query {
-        let mut parsed = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = parsed.as_mut_slice() else {
-            panic!("query fixture")
-        };
+        let query = &mut novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
     fn session() -> SqlSessionContext {
@@ -213,7 +210,7 @@ mod tests {
     #[test]
     fn logical_explain_carries_admitted_session_through_catalog_and_final_analysis() {
         let sql = "WITH SESSION decimal_overflow_to_double = true AND true SELECT 1 AS a";
-        let query = novarocks_parser::trino_parser::parse_query(sql).unwrap();
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         let mut effective = session();
         effective.sql_semantics = effective
             .sql_semantics

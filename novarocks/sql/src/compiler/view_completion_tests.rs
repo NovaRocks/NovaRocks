@@ -213,11 +213,7 @@ fn expression_subquery_dependencies_use_saved_context_without_caller_ctes() {
 }
 
 fn query(sql: &str) -> novarocks_parser::ast::Query {
-    let mut statements = novarocks_parser::parse(sql).unwrap();
-    let novarocks_parser::ast::Statement::Query(query) = statements.remove(0) else {
-        panic!("query fixture")
-    };
-    query
+    novarocks_parser::parser::parse_query(sql).unwrap()
 }
 
 #[test]
@@ -408,7 +404,7 @@ fn semantic_refusal_does_not_lose_other_valid_saved_dependencies() {
 fn unsupported_saved_quoted_identifier_is_not_an_unrequested_fact_protocol_error() {
     let result = answer(
         start(DEFAULT_COMPLETION_LIMITS),
-        "SELECT 1 AS x FROM `bad-name`",
+        r#"SELECT 1 AS x FROM "bad-name""#,
     );
     let Err(SqlCompileProgressError::Compile(SqlCompileError::Analyze(error))) = result else {
         panic!("unsupported saved identifier");
@@ -575,7 +571,7 @@ fn selected_answer(need: &CatalogRelationNeed, ordinal: u32) -> CatalogRelationF
 #[test]
 fn exact_selection_requests_deduplicate_aliases_without_merging_current_or_other_requests() {
     let source = SqlCapturedCatalogPreparation::try_new(
-        query("SELECT a.x FROM ice.db.orders a JOIN ice.db.orders FOR VERSION AS OF 10 b ON 1=1 JOIN ice.db.orders FOR VERSION AS OF 20 c ON 1=1 JOIN ice.db.orders FOR VERSION AS OF 'backup' d ON 1=1 JOIN ice.db.orders FOR SYSTEM_TIME AS OF 1000 e ON 1=1 JOIN ice.db.orders FOR VERSION AS OF 10 f ON 1=1"),
+        query("SELECT a.x FROM ice.db.orders a JOIN ice.db.orders FOR VERSION AS OF 10 b ON 1=1 JOIN ice.db.orders FOR VERSION AS OF 20 c ON 1=1 JOIN ice.db.orders FOR VERSION AS OF 'backup' d ON 1=1 JOIN ice.db.orders FOR TIMESTAMP AS OF 1000 e ON 1=1 JOIN ice.db.orders FOR VERSION AS OF 10 f ON 1=1"),
         Some("ice"), "db", SqlCompileControl::unbounded(),
     ).unwrap();
     assert_eq!(source.needs().len(), 5);
@@ -634,7 +630,7 @@ fn selected_fact_requires_the_same_sql_request_and_actual_historical_selector() 
     .unwrap();
     for sql in [
         "SELECT x FROM ice.db.orders FOR VERSION AS OF 'backup'",
-        "SELECT x FROM ice.db.orders FOR SYSTEM_TIME AS OF 1000",
+        "SELECT x FROM ice.db.orders FOR TIMESTAMP AS OF 1000",
     ] {
         let source = SqlCapturedCatalogPreparation::try_new(
             query(sql),
@@ -857,7 +853,7 @@ fn invalid_saved_selection_is_diagnosed_before_unrequested_fact_lookup() {
     use std::error::Error;
     let result = answer(
         start(DEFAULT_COMPLETION_LIMITS),
-        "SELECT x FROM orders FOR SYSTEM_TIME AS OF 'not-a-time'",
+        "SELECT x FROM orders FOR TIMESTAMP AS OF 'not-a-time'",
     );
     let Err(SqlCompileProgressError::Compile(SqlCompileError::Analyze(error))) = result else {
         panic!("invalid saved selection")
@@ -959,11 +955,12 @@ fn unsupported_version_consumers_never_silently_use_current_or_cte_facts() {
         );
     }
     assert_eq!(catalog.0.get(), 0);
-    let result = SqlCapturedCatalogPreparation::try_new(
-        query("SELECT * FROM ice.db.orders$snapshots FOR VERSION AS OF 10"),
+    let result = SqlCapturedCatalogPreparation::try_new_with_qualifications(
+        query("SELECT * FROM ice.db.\"orders$snapshots\" FOR VERSION AS OF 10"),
         Some("ice"),
         "db",
         SqlCompileControl::unbounded(),
+        crate::compiler::iceberg_metadata_qualifications_for_test("ice"),
     );
     assert!(
         matches!(result, Err(SqlCompileError::Analyze(error)) if error.kind() == crate::analyze_error::AnalyzeErrorKind::UnsupportedQueryShape)

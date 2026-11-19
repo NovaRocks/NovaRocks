@@ -164,7 +164,6 @@ pub(super) fn partitions_query(
                     span,
                 )
             }),
-            legacy: ast::LegacySelectExtensions::default(),
             windows: Vec::new().into(),
             modifiers: Default::default(),
             span,
@@ -239,7 +238,6 @@ mod tests {
 #[cfg(test)]
 mod analysis_tests {
     use super::super::iceberg_metadata::{IcebergMetadataDerivedTypes, metadata_table_schema_with};
-    use super::*;
     use crate::analysis::{QueryBody, Relation};
     use crate::catalog::{
         IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable,
@@ -262,6 +260,15 @@ mod analysis_tests {
         ) -> Result<ResolvedAnalyzerTable, String> {
             Err("ordinary table lookup must not capture the metadata relation".into())
         }
+        fn resolve_quoted_iceberg_metadata(
+            &self,
+            name: &novarocks_parser::ast::ObjectName,
+            catalog: Option<&str>,
+            database: &str,
+        ) -> Option<crate::catalog::QuotedMetadataTable> {
+            crate::compiler::resolve_quoted_iceberg_metadata_for_test(name, catalog, database, self)
+        }
+
         fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
             Some(self)
         }
@@ -319,19 +326,16 @@ mod analysis_tests {
     fn partitions_analysis_schema_matches_nullable_sums_and_required_count() {
         for partitioned in [false, true] {
             for sql in [
-                "SELECT * FROM orders$partitions",
-                "SELECT p.* FROM DB.ORDERS$partitions p",
-                "SELECT `orders$partitions`.* FROM ICE.DB.ORDERS$partitions",
-                "WITH orders AS (SELECT 7 AS content) SELECT p.* FROM orders$partitions p",
+                "SELECT * FROM \"orders$partitions\"",
+                "SELECT p.* FROM DB.\"ORDERS$partitions\" p",
+                "SELECT \"orders$partitions\".* FROM ICE.DB.\"ORDERS$partitions\"",
+                "WITH orders AS (SELECT 7 AS content) SELECT p.* FROM \"orders$partitions\" p",
             ] {
                 let catalog = Catalog {
                     partitioned,
                     calls: Default::default(),
                 };
-                let mut parsed = novarocks_parser::parse(sql).unwrap();
-                let ast::Statement::Query(query) = parsed.remove(0) else {
-                    panic!("query")
-                };
+                let query = novarocks_parser::parser::parse_query(sql).unwrap();
                 let (resolved, _, _) = super::super::analyze(&query, &catalog, "db").unwrap();
                 let partition = partitioned.then(|| {
                     DataType::Struct(vec![Field::new("region", DataType::Int32, true)].into())

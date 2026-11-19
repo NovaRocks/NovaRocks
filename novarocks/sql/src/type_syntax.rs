@@ -176,11 +176,9 @@ mod tests {
         let constructed = sql_type_syntax(&value).unwrap();
         // The expected spelling is fixed independently of the syntax author.
         // Parser entry exists only in this unit-test oracle.
-        let statements =
-            novarocks_parser::parse(&format!("SELECT CAST(NULL AS {spelling})")).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query");
-        };
+        let query =
+            &novarocks_parser::parser::parse_query(&format!("SELECT CAST(NULL AS {spelling})"))
+                .unwrap();
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
@@ -227,9 +225,15 @@ mod tests {
             (DataType::BinaryView, "VARBINARY"),
             (DataType::FixedSizeBinary(7), "VARBINARY"),
             (DataType::Date32, "DATE"),
-            (DataType::Timestamp(TimeUnit::Second, None), "DATETIME"),
-            (DataType::Timestamp(TimeUnit::Millisecond, None), "DATETIME"),
-            (DataType::Timestamp(TimeUnit::Microsecond, None), "DATETIME"),
+            (DataType::Timestamp(TimeUnit::Second, None), "TIMESTAMP"),
+            (
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                "TIMESTAMP",
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                "TIMESTAMP",
+            ),
             (
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 "DATETIME_NS",
@@ -305,7 +309,7 @@ mod tests {
         );
         assert_spelling(
             FunctionValueType::new(structure, true),
-            "STRUCT<`a``b` INT, `space name` MAP<STRING, ARRAY<BOOLEAN>>>",
+            r#"ROW("a`b" INT, "space name" MAP<STRING, ARRAY<BOOLEAN>>)"#,
         );
     }
 
@@ -343,7 +347,7 @@ mod tests {
         );
         assert_spelling(
             declared(declaration, carrier),
-            "STRUCT<`documents` ARRAY<JSON>, `lookup` MAP<STRING, STRUCT<`value` VARIANT>>>",
+            r#"ROW("documents" ARRAY<JSON>, "lookup" MAP<STRING, ROW("value" VARIANT)>)"#,
         );
     }
 
@@ -399,8 +403,10 @@ mod tests {
                 }
             );
             assert!(
-                novarocks_parser::parse(&format!("SELECT CAST(NULL AS DECIMAL({precision}, -2))"))
-                    .is_err()
+                novarocks_parser::parser::parse_query(&format!(
+                    "SELECT CAST(NULL AS DECIMAL({precision}, -2))"
+                ))
+                .is_err()
             );
         }
         assert_eq!(
@@ -410,7 +416,7 @@ mod tests {
             )),
             Err(TypeSyntaxError::EmptyStruct)
         );
-        assert!(novarocks_parser::parse("SELECT CAST(NULL AS STRUCT<>)").is_err());
+        assert!(novarocks_parser::parser::parse_query("SELECT CAST(NULL AS STRUCT<>)").is_err());
     }
 
     #[test]

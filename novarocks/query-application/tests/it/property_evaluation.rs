@@ -27,7 +27,7 @@ use arrow::{
 };
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool, ConstantValue};
 use novarocks_failure_contract::SharedFailureCause;
-use novarocks_parser::{SYNTHETIC, Span, ast::Expr, trino_parser::parse_expression};
+use novarocks_parser::{SYNTHETIC, Span, ast::Expr, parser::parse_expression};
 use novarocks_query_application::{
     session_error::{QueryServiceError, QueryServiceErrorKind},
     sql::{property_admit::DdlPropertyScope, property_evaluation::*},
@@ -831,127 +831,29 @@ fn ddl_property_control_refuses_before_port_and_after_actual_port_return() {
 }
 
 #[test]
-fn legacy_catalog_preparation_uses_original_literal_facts_and_evaluated_strings() {
-    use novarocks_parser::ast::{
-        CatalogStatement, LiteralKind, Statement, legacy::CatalogProperty,
-    };
-    use novarocks_query_application::sql::{lower_product_sql_command, parse_single_statement};
+fn typed_catalog_duplicate_stops_before_evaluating_the_second_property() {
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
 
-    struct LegacyPort<'a> {
-        properties: &'a [CatalogProperty],
-        results: VecDeque<ConstantValue>,
-        cursor: usize,
-    }
-    impl DdlPropertyConstantPort for LegacyPort<'_> {
-        fn evaluate(
-            &mut self,
-            expression: &Expr,
-            target: Target,
-        ) -> Result<ConstantValue, DdlPropertyConstantError> {
-            assert_eq!(target, Target::Varchar);
-            let Expr::Literal(literal) = expression else {
-                panic!("original literal bridge");
-            };
-            // The old tree has a Literal slot, not an Expr address. Compare its
-            // actual parsed value/range; do not claim a fabricated old Expr loan.
-            assert_eq!(literal, &self.properties[self.cursor].value);
-            self.cursor += 1;
-            let result = self
-                .results
-                .pop_front()
-                .expect("one result per requested literal");
-            assert_eq!(result.ordinal(), 1);
-            assert_eq!(result.field().metadata()["original-provider"], "retained");
-            Ok(result)
-        }
-    }
-    let source = "CREATE EXTERNAL CATALOG IF NOT EXISTS Warehouse COMMENT 'old admitted comment' PROPERTIES ('MixedCase'='iceberg', 'location'='s3://original/中')";
-    let statement = parse_single_statement(source).unwrap();
-    let Statement::Catalog(CatalogStatement::CreateCatalog(original)) = &statement else {
-        panic!("actual legacy CREATE CATALOG");
+    let source = "CREATE CATALOG warehouse USING iceberg WITH (same = 'first', same = 'second')";
+    let TrinoStatement::CreateCatalog(statement) = parse_statement(source).unwrap() else {
+        panic!("expected typed CREATE CATALOG");
     };
-    assert!(original.external);
-    assert!(
-        matches!(&original.comment.as_ref().unwrap().kind, LiteralKind::String(value) if value == "old admitted comment")
+    let first = statement.properties[0].value.as_ref().unwrap();
+    let expected = DdlPropertyScope::Catalog.to_user_error(
+        source,
+        statement.properties[1].name.span,
+        "Duplicate property 'same'",
     );
-    assert_eq!(
-        lower_product_sql_command(&statement).unwrap_err(),
-        "CREATE CATALOG requires evaluated property preparation"
-    );
-    let mut port = LegacyPort {
-        properties: &original.properties,
-        cursor: 0,
-        results: vec![
-            text(Some("evaluated-iceberg")),
-            text(Some("s3://evaluated/中")),
-        ]
-        .into(),
-    };
-    let command =
-        prepare_legacy_create_catalog(source, original, &mut port, &Control::default()).unwrap();
-    assert_eq!(port.cursor, 2);
-    assert!(port.results.is_empty());
-    assert_eq!(command.name, "Warehouse");
-    assert!(command.if_not_exists);
-    assert_eq!(
-        command.properties,
-        vec![
-            ("MixedCase".into(), "evaluated-iceberg".into()),
-            ("location".into(), "s3://evaluated/中".into())
-        ]
-    );
-    assert!(
-        matches!(&original.properties[0].value.kind, LiteralKind::String(value) if value == "iceberg")
-    );
-    assert_eq!(
-        &source[original.properties[1].value.span.start()..original.properties[1].value.span.end()],
-        "'s3://original/中'"
-    );
-
-    let source = "CREATE CATALOG Warehouse PROPERTIES (12='iceberg')";
-    let statement = parse_single_statement(source).unwrap();
-    let Statement::Catalog(CatalogStatement::CreateCatalog(original)) = &statement else {
-        panic!("actual legacy CREATE CATALOG");
-    };
-    let mut port = LegacyPort {
-        properties: &original.properties,
-        cursor: 0,
-        results: VecDeque::new(),
-    };
-    let error = prepare_legacy_create_catalog(source, original, &mut port, &Control::default())
+    let mut port = Port::new(vec![Call {
+        expression: first,
+        target: Target::Varchar,
+        result: Ok(text(Some("first evaluated"))),
+    }]);
+    let error = prepare_trino_create_catalog(source, &statement, &mut port, &Control::default())
         .unwrap_err();
-    assert_eq!(port.cursor, 0);
-    assert_eq!(
-        error.user_error().unwrap(),
-        &DdlPropertyScope::Catalog.to_user_error(
-            source,
-            original.properties[0].key.span,
-            "Catalog property keys must be string values"
-        )
-    );
-
-    let source = "CREATE CATALOG Warehouse PROPERTIES ('same'='first', 'same'='second')";
-    let statement = parse_single_statement(source).unwrap();
-    let Statement::Catalog(CatalogStatement::CreateCatalog(original)) = &statement else {
-        panic!("actual legacy CREATE CATALOG");
-    };
-    let mut port = LegacyPort {
-        properties: &original.properties,
-        cursor: 0,
-        results: vec![text(Some("first evaluated"))].into(),
-    };
-    let error = prepare_legacy_create_catalog(source, original, &mut port, &Control::default())
-        .unwrap_err();
-    assert_eq!(port.cursor, 1);
-    assert!(port.results.is_empty());
-    assert_eq!(
-        error.user_error().unwrap(),
-        &DdlPropertyScope::Catalog.to_user_error(
-            source,
-            original.properties[1].key.span,
-            "Duplicate property 'same'"
-        )
-    );
+    assert_eq!(error.user_error(), Some(&expected));
+    assert_eq!(port.seen, [std::ptr::from_ref(first)]);
+    port.exhausted();
 }
 
 struct NamePolicy {
@@ -1218,7 +1120,7 @@ fn ddl_property_name_policy_bypasses_known_duplicate_and_dynamic_catalog_names()
 }
 
 #[test]
-fn authored_property_inputs_share_expression_results_defaults_and_order_without_sql_casts() {
+fn evaluated_properties_preserve_selected_values_defaults_and_order() {
     let cases = vec![
         (
             Type::Integer,
@@ -1242,7 +1144,7 @@ fn authored_property_inputs_share_expression_results_defaults_and_order_without_
             strings(),
         ),
     ];
-    for (value_type, target, authored, checked) in cases {
+    for (value_type, target, expected, checked) in cases {
         let source = "actual_value";
         let expression = parse_expression(source).unwrap();
         let declarations = [
@@ -1254,7 +1156,7 @@ fn authored_property_inputs_share_expression_results_defaults_and_order_without_
             target,
             result: Ok(checked),
         }]);
-        let evaluated_expression = evaluate_ddl_properties(
+        let evaluated = evaluate_ddl_properties(
             DdlPropertyScope::Table,
             DdlPropertyEvaluationMode::Create,
             source,
@@ -1265,29 +1167,8 @@ fn authored_property_inputs_share_expression_results_defaults_and_order_without_
         )
         .unwrap();
         port.exhausted();
-        let mut port = Port::new(vec![]);
-        let evaluated_authored = evaluate_ddl_properties(
-            DdlPropertyScope::Table,
-            DdlPropertyEvaluationMode::Create,
-            source,
-            &declarations,
-            &[DdlPropertyAssignment {
-                name: "CHOSEN",
-                name_span: SYNTHETIC,
-                span: expression.span(),
-                value: DdlPropertyAssignmentValue::Authored {
-                    value: &authored,
-                    span: expression.span(),
-                },
-            }],
-            &mut port,
-            &Control::default(),
-        )
-        .unwrap();
-        port.exhausted();
-        assert_eq!(evaluated_expression, evaluated_authored);
         assert_eq!(
-            evaluated_authored.properties(),
+            evaluated.properties(),
             &[
                 EvaluatedDdlProperty {
                     name: "before".into(),
@@ -1295,160 +1176,15 @@ fn authored_property_inputs_share_expression_results_defaults_and_order_without_
                 },
                 EvaluatedDdlProperty {
                     name: "chosen".into(),
-                    change: DdlPropertyChange::Set(authored.clone())
+                    change: DdlPropertyChange::Set(expected)
                 },
             ]
         );
     }
-    let source = "actual_map_value";
-    let expression = parse_expression(source).unwrap();
-    let map = Value::MapVarcharVarchar(vec![
-        ("first".into(), None),
-        ("second".into(), Some("kept".into())),
-    ]);
-    let mut port = Port::new(vec![]);
-    let result = evaluate_ddl_properties(
-        DdlPropertyScope::Table,
-        DdlPropertyEvaluationMode::Alter,
-        source,
-        &[declaration(
-            "extra_properties",
-            Type::MapVarcharVarchar,
-            Value::Null,
-        )],
-        &[DdlPropertyAssignment {
-            name: "extra_properties",
-            name_span: SYNTHETIC,
-            span: expression.span(),
-            value: DdlPropertyAssignmentValue::Authored {
-                value: &map,
-                span: expression.span(),
-            },
-        }],
-        &mut port,
-        &Control::default(),
-    )
-    .unwrap();
-    assert_eq!(result.properties()[0].change, DdlPropertyChange::Set(map));
-    port.exhausted();
 }
 
 #[test]
-fn authored_property_input_errors_keep_scope_span_and_original_name_duplicate_precedence() {
-    let source = "actual_property_value";
-    let expression = parse_expression(source).unwrap();
-    let value_span = expression.span();
-    let null = Value::Null;
-    let wrong = Value::Varchar("2".into());
-    let duplicate_map = Value::MapVarcharVarchar(vec![
-        ("key".into(), None),
-        ("key".into(), Some("not overwritten".into())),
-    ]);
-    for (value_type, value, expected) in [
-        (Type::Integer, &null, "cannot be NULL"),
-        (Type::Integer, &wrong, "requires Integer, got Varchar"),
-        (
-            Type::MapVarcharVarchar,
-            &duplicate_map,
-            "Duplicate map property key 'key' in property 'known'",
-        ),
-    ] {
-        let mut port = Port::new(vec![]);
-        let error = evaluate_ddl_properties(
-            DdlPropertyScope::Table,
-            DdlPropertyEvaluationMode::Alter,
-            source,
-            &[declaration("known", value_type, Value::Null)],
-            &[DdlPropertyAssignment {
-                name: "known",
-                name_span: SYNTHETIC,
-                span: value_span,
-                value: DdlPropertyAssignmentValue::Authored {
-                    value,
-                    span: value_span,
-                },
-            }],
-            &mut port,
-            &Control::default(),
-        )
-        .unwrap_err();
-        let user = error.user_error().expect("typed property data error");
-        assert_eq!(user.code().as_str(), "sql.admit.invalid_table_property");
-        assert_eq!(
-            user.location(),
-            Some(&value_span.to_user_error_location(source))
-        );
-        assert!(user.message().contains(expected));
-        port.exhausted();
-    }
-    let mut port = Port::new(vec![]);
-    let error = evaluate_ddl_properties(
-        DdlPropertyScope::Table,
-        DdlPropertyEvaluationMode::Alter,
-        source,
-        &[declaration("known", Type::Integer, Value::Null)],
-        &[DdlPropertyAssignment {
-            name: "unknown",
-            name_span: SYNTHETIC,
-            span: value_span,
-            value: DdlPropertyAssignmentValue::Authored {
-                value: &wrong,
-                span: value_span,
-            },
-        }],
-        &mut port,
-        &Control::default(),
-    )
-    .unwrap_err();
-    assert!(
-        error
-            .user_error()
-            .unwrap()
-            .message()
-            .contains("Unknown property 'unknown'")
-    );
-    let first = Value::Integer(7);
-    let error = evaluate_ddl_properties(
-        DdlPropertyScope::Table,
-        DdlPropertyEvaluationMode::Alter,
-        source,
-        &[declaration("known", Type::Integer, Value::Null)],
-        &[
-            DdlPropertyAssignment {
-                name: "known",
-                name_span: SYNTHETIC,
-                span: value_span,
-                value: DdlPropertyAssignmentValue::Authored {
-                    value: &first,
-                    span: value_span,
-                },
-            },
-            DdlPropertyAssignment {
-                name: "KNOWN",
-                name_span: SYNTHETIC,
-                span: value_span,
-                value: DdlPropertyAssignmentValue::Authored {
-                    value: &null,
-                    span: value_span,
-                },
-            },
-        ],
-        &mut port,
-        &Control::default(),
-    )
-    .unwrap_err();
-    assert!(
-        error
-            .user_error()
-            .unwrap()
-            .message()
-            .contains("Duplicate property 'known'")
-    );
-    port.exhausted();
-}
-
-#[test]
-fn authored_property_copy_preserves_control_source_and_does_not_reorder_expression_failure() {
+fn evaluated_property_keeps_control_and_expression_failure_precedence() {
     struct StopCopy {
         cause: SharedFailureCause,
         stopped: AtomicBool,
@@ -1477,27 +1213,23 @@ fn authored_property_copy_preserves_control_source_and_does_not_reorder_expressi
     };
     let source = "actual_value";
     let expression = parse_expression(source).unwrap();
-    let large = Value::Varchar("x".repeat(600));
+    let large = "x".repeat(600);
     let declarations = [
         declaration("first", Type::Varchar, Value::Null),
         declaration("later", Type::Integer, Value::Null),
     ];
-    let mut port = Port::new(vec![]);
+    let mut port = Port::new(vec![Call {
+        expression: &expression,
+        target: Target::Varchar,
+        result: Ok(text(Some(&large))),
+    }]);
     let error = evaluate_ddl_properties(
         DdlPropertyScope::Table,
         DdlPropertyEvaluationMode::Alter,
         source,
         &declarations,
         &[
-            DdlPropertyAssignment {
-                name: "first",
-                name_span: SYNTHETIC,
-                span: expression.span(),
-                value: DdlPropertyAssignmentValue::Authored {
-                    value: &large,
-                    span: expression.span(),
-                },
-            },
+            assignment("first", &expression),
             assignment("later", &expression),
         ],
         &mut port,
@@ -1524,7 +1256,6 @@ fn authored_property_copy_preserves_control_source_and_does_not_reorder_expressi
         target: Target::Varchar,
         result: Err(DdlPropertyConstantError::Failure(original.clone())),
     }]);
-    let wrong = Value::Varchar("not an integer".into());
     let error = evaluate_ddl_properties(
         DdlPropertyScope::Table,
         DdlPropertyEvaluationMode::Alter,
@@ -1532,15 +1263,7 @@ fn authored_property_copy_preserves_control_source_and_does_not_reorder_expressi
         &declarations,
         &[
             assignment("first", &expression),
-            DdlPropertyAssignment {
-                name: "later",
-                name_span: SYNTHETIC,
-                span: expression.span(),
-                value: DdlPropertyAssignmentValue::Authored {
-                    value: &wrong,
-                    span: expression.span(),
-                },
-            },
+            assignment("later", &expression),
         ],
         &mut port,
         &Control::default(),
@@ -1552,13 +1275,14 @@ fn authored_property_copy_preserves_control_source_and_does_not_reorder_expressi
 
 #[test]
 fn trino_catalog_using_is_independent_of_original_with_arguments() {
-    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
 
     let source = "CREATE CATALOG IF NOT EXISTS Warehouse USING iceberg COMMENT 'kept by parser' \
                   WITH (\"Mixed Key\" = coalesce('source', 'other'), \"Value\" = 'source')";
     let TrinoStatement::CreateCatalog(statement) = parse_statement(source).unwrap() else {
         panic!("real CREATE CATALOG");
     };
+    assert_eq!(statement.comment.as_deref(), Some("kept by parser"));
     let mut port = Port::new(vec![
         Call {
             expression: statement.properties[0].value.as_ref().unwrap(),
@@ -1588,7 +1312,7 @@ fn trino_catalog_using_is_independent_of_original_with_arguments() {
 
 #[test]
 fn trino_catalog_rejects_type_at_the_original_name_before_its_value() {
-    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
 
     let source =
         "CREATE CATALOG warehouse USING iceberg WITH (setting = 'good', \"TyPe\" = DEFAULT)";
@@ -1644,7 +1368,7 @@ fn assert_create_authorization_refusal(
 
 #[test]
 fn trino_catalog_refuses_authorization_and_delimited_provider_names() {
-    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
 
     let source =
         "CREATE CATALOG warehouse USING iceberg AUTHORIZATION USER user1 WITH (setting = 'value')";
@@ -1678,7 +1402,7 @@ fn trino_catalog_refuses_authorization_and_delimited_provider_names() {
 
 #[test]
 fn trino_schema_properties_use_the_scope_declaration_and_original_value_slot() {
-    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
     use novarocks_sql::semantic::CatalogSqlCommand;
 
     // Independent declaration fixture of the Iceberg provider's current
@@ -1773,7 +1497,7 @@ fn trino_schema_properties_use_the_scope_declaration_and_original_value_slot() {
 
 #[test]
 fn trino_column_and_comment_commands_keep_parser_name_segments() {
-    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
     use novarocks_query_application::sql::trino_table_command::*;
     use novarocks_sql::semantic::{
         CatalogSqlCommand,
@@ -1847,7 +1571,7 @@ fn trino_column_and_comment_commands_keep_parser_name_segments() {
 
 #[test]
 fn trino_analyze_properties_preserve_omission_and_array_custody() {
-    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
     use novarocks_query_application::sql::trino_table_command::prepare_trino_analyze;
     use novarocks_sql::semantic::StatisticsSqlCommand;
 
@@ -1928,7 +1652,7 @@ fn trino_analyze_properties_preserve_omission_and_array_custody() {
 
 #[test]
 fn trino_branch_uses_the_authentic_bigint_expression_and_original_ref_command() {
-    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
     use novarocks_query_application::sql::trino_table_command::*;
     use novarocks_sql::semantic::{
         CatalogSqlCommand,
@@ -1989,7 +1713,7 @@ fn trino_branch_uses_the_authentic_bigint_expression_and_original_ref_command() 
 
 #[test]
 fn trino_table_execute_resolves_provider_and_where_before_evaluating_arguments() {
-    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
     use novarocks_query_application::sql::{
         table_procedure::{
             BoundProcedureArgument, TableProcedureAbsoluteTimePort, TableProcedureKind,
@@ -2067,7 +1791,7 @@ fn table_procedure_timestamp_projection_uses_original_selected_ticks_and_declare
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray,
     };
-    use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
     use novarocks_query_application::sql::{
         table_procedure::{
             BoundProcedureArgument, BoundProcedureValue, TableProcedureAbsoluteTimePort,

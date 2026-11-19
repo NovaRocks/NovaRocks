@@ -370,10 +370,6 @@ pub(crate) fn intern_column_sort_key(
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::items_after_test_module,
-    reason = "The scalar conversion helpers stay adjacent to their callers; moving the large test module would obscure that local relationship."
-)]
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;

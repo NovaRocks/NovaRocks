@@ -4450,6 +4450,10 @@ mod tests {
             .next()
             .unwrap()
             .replace("${case_db}", "db");
+        let sql = sql
+            .trim()
+            .strip_suffix(';')
+            .expect("one terminated suite query");
         fn table(need: &CatalogRelationNeed) -> ResolvedAnalyzerTable {
             let relation = need.relation();
             let (binding, names) = match relation.table.as_str() {
@@ -4489,7 +4493,7 @@ mod tests {
             )
         }
         let completed = completed_external_sql_with_tables(
-            &sql,
+            sql,
             85,
             PredicateGuaranteeKind::Exact,
             SqlCompileIntent::Query,

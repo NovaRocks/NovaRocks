@@ -97,12 +97,7 @@ fn scoped_builtin_functions(scope: &mut ()) -> &dyn SqlFunctionCatalog {
 }
 
 fn test_query(sql: &str) -> Box<novarocks_parser::ast::Query> {
-    let mut statements = novarocks_parser::parse(sql).expect("test query parses");
-    assert_eq!(statements.len(), 1, "expected exactly one test statement");
-    let novarocks_parser::ast::Statement::Query(query) = statements.remove(0) else {
-        panic!("expected test query");
-    };
-    Box::new(query)
+    Box::new(novarocks_parser::parser::parse_query(sql).expect("test query parses"))
 }
 
 #[test]

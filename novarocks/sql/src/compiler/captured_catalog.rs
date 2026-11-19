@@ -234,10 +234,7 @@ mod tests {
     };
 
     fn query(sql: &str) -> novarocks_parser::ast::Query {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query fixture")
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
 
@@ -311,11 +308,11 @@ mod tests {
 mod view_definition_tests {
     use super::*;
     use crate::analyze_error::AnalyzeErrorKind;
-    use novarocks_parser::ast::{Statement, ViewStatement};
+    use novarocks_parser::ast::TrinoStatement;
 
     fn definition(sql: &str) -> Result<Box<[crate::catalog::SqlViewColumn]>, SqlCompileError> {
-        let mut statements = novarocks_parser::parse(sql).unwrap();
-        let Statement::View(ViewStatement::Create(create)) = statements.remove(0) else {
+        let statement = novarocks_parser::parser::parse_statement(sql).unwrap();
+        let TrinoStatement::CreateView(create) = statement else {
             panic!("view definition fixture")
         };
         let source = SqlCapturedCatalogPreparation::try_new_definition(
@@ -369,7 +366,7 @@ mod view_definition_tests {
             public.data_type(),
             &DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into())
         );
-        let columns = definition("CREATE VIEW v AS SELECT array<json>[] AS js").unwrap();
+        let columns = definition("CREATE VIEW v AS SELECT CAST([] AS ARRAY<json>) AS js").unwrap();
         assert!(columns[0].value_type.nullable());
         let ValueKind::List(item) = columns[0].value_type.value_type().kind() else {
             panic!("ARRAY declaration")
@@ -417,10 +414,9 @@ mod view_definition_tests {
     fn definition_terminal_rejects_an_ordinary_shadowing_capture_context() {
         let source = SqlCapturedCatalogPreparation::try_new(
             {
-                let Statement::View(ViewStatement::Create(create)) =
-                    novarocks_parser::parse("CREATE VIEW v AS SELECT 1 AS x")
+                let TrinoStatement::CreateView(create) =
+                    novarocks_parser::parser::parse_statement("CREATE VIEW v AS SELECT 1 AS x")
                         .unwrap()
-                        .remove(0)
                 else {
                     panic!("fixture")
                 };

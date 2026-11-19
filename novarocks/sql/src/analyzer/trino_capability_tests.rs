@@ -6,7 +6,7 @@ use crate::catalog::{PlannerTableProvider, ResolvedAnalyzerTable, SqlViewDefinit
 use arrow::datatypes::DataType;
 use novarocks_parser::Span;
 use novarocks_parser::ast::{Query, Relation, SetExpr, SyntaxEq, TableFunctionArgumentValue};
-use novarocks_parser::trino_parser::parse_query;
+use novarocks_parser::parser::parse_query;
 use novarocks_type_contract::FunctionValueType;
 use novarocks_user_error::ErrorPhase;
 

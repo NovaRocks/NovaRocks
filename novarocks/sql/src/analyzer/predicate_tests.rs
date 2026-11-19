@@ -38,6 +38,7 @@ impl PlannerTableProvider for NoTables {
 }
 fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
     AnalyzerContext {
+        purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
         grouping_scope: Default::default(),
         view_stack: Default::default(),
         control,
@@ -59,11 +60,8 @@ fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
     }
 }
 fn query(sql: &str) -> ast::Query {
-    let statements =
-        novarocks_parser::parse(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query fixture")
-    };
+    let query = &novarocks_parser::parser::parse_query(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
     query.clone()
 }
 fn projection(query: &ast::Query) -> &ast::Expr {
@@ -74,8 +72,7 @@ fn projection(query: &ast::Query) -> &ast::Expr {
         panic!("projection fixture")
     };
     assert!(projection_column.alias.is_none(), "anonymous projection");
-    let expr = &projection_column.expression;
-    expr
+    &projection_column.expression
 }
 fn same_typed(actual: &TypedExpr, expected: &TypedExpr, control: &SqlCompileControl) {
     assert_eq!(actual.value_type, expected.value_type);
@@ -87,7 +84,7 @@ fn same_typed(actual: &TypedExpr, expected: &TypedExpr, control: &SqlCompileCont
 }
 
 #[test]
-fn distinct_from_retains_original_null_safe_equality_and_not_results() {
+fn distinct_from_retains_null_safe_equality_and_not_results() {
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
@@ -98,11 +95,8 @@ fn distinct_from_retains_original_null_safe_equality_and_not_results() {
         ("1", "1"),
         ("[1,NULL]", "[1,NULL]"),
     ] {
-        let original = query(&format!("SELECT {left} <=> {right}"));
-        let old_equal = ctx.analyze_expr(projection(&original), &scope).unwrap();
         let standard = query(&format!("SELECT {left} IS NOT DISTINCT FROM {right}"));
         let actual_equal = ctx.analyze_expr(projection(&standard), &scope).unwrap();
-        same_typed(&actual_equal, &old_equal, &control);
         assert_eq!(
             actual_equal.value_type,
             FunctionValueType::new(DataType::Boolean, false)
@@ -115,7 +109,7 @@ fn distinct_from_retains_original_null_safe_equality_and_not_results() {
                 ..
             }
         ));
-        let old_not = query(&format!("SELECT NOT ({left} <=> {right})"));
+        let old_not = query(&format!("SELECT NOT ({left} IS NOT DISTINCT FROM {right})"));
         let old_not = ctx.analyze_expr(projection(&old_not), &scope).unwrap();
         let standard = query(&format!("SELECT {left} IS DISTINCT FROM {right}"));
         let actual_not = ctx.analyze_expr(projection(&standard), &scope).unwrap();
@@ -138,10 +132,7 @@ fn distinct_from_retains_original_null_safe_equality_and_not_results() {
         else {
             panic!("original typed NOT")
         };
-        let ExprKind::Nested(original_equal) = &original_inner.kind else {
-            panic!("original parentheses")
-        };
-        same_typed(actual_inner, original_equal, &control);
+        same_typed(actual_inner, original_inner, &control);
     }
 }
 
@@ -316,15 +307,9 @@ fn admitted_predicates_keep_original_child_bindings_and_three_valued_declaration
             "{sql}"
         );
     }
-    // The legacy RLIKE spelling currently has exactly the same admitted LIKE
-    // owner. This test grants no regex function or implementation capability.
-    let legacy = query("SELECT 'ab' RLIKE 'a%'");
-    let plain = query("SELECT 'ab' LIKE 'a%'");
-    same_typed(
-        &ctx.analyze_expr(projection(&legacy), &scope).unwrap(),
-        &ctx.analyze_expr(projection(&plain), &scope).unwrap(),
-        &control,
-    );
+    let like = query("SELECT 'ab' LIKE 'a%'");
+    let typed = ctx.analyze_expr(projection(&like), &scope).unwrap();
+    assert!(matches!(typed.kind, ExprKind::Like { negated: false, .. }));
 }
 
 #[test]

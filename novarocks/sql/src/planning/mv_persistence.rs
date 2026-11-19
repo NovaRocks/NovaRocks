@@ -1141,7 +1141,6 @@ mod tests {
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
     use crate::planning::mv::SqlResolvedMvRefreshInput;
-    use novarocks_parser::ast;
     use novarocks_types::schema::ColumnDef;
 
     struct TestCatalog;
@@ -1190,10 +1189,7 @@ mod tests {
     }
 
     fn input(sql: &str) -> SqlResolvedMvRefreshInput {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         let (resolved, _, _) =
             crate::analyzer::analyze(query, &TestCatalog, "sales").expect("analyze query");
         SqlResolvedMvRefreshInput::from_analysis(resolved).expect("named MV output declaration")

@@ -39,8 +39,7 @@ fn syntax(
     sql: &str,
     target: RequiredConstantTarget,
 ) -> Result<PreparedRequiredConstant, SqlCompileError> {
-    let tokens = novarocks_parser::lex(sql).unwrap();
-    let expression = novarocks_parser::parser::parse_expression(sql, &tokens).unwrap();
+    let expression = novarocks_parser::parser::parse_expression(sql).unwrap();
     prepare(RequiredConstantRequest {
         input: RequiredConstantInput::Expression(&expression),
         target,
@@ -212,8 +211,8 @@ fn required_preparation_does_not_fold_and_preserves_original_publication_source(
         SqlCompileControl::unbounded().with_fold_dependency_observer(Arc::new(RejectPublication {
             cause: CompileControlError::Source(source.clone()),
         }));
-    let tokens = novarocks_parser::lex("1 + 2").unwrap();
-    let expression = novarocks_parser::parser::parse_expression("1 + 2", &tokens).unwrap();
+
+    let expression = novarocks_parser::parser::parse_expression("1 + 2").unwrap();
     let result = prepare(RequiredConstantRequest {
         input: RequiredConstantInput::Expression(&expression),
         target: RequiredConstantTarget::Integer,
@@ -287,7 +286,7 @@ fn required_implicit_coercion_uses_semantic_kind_not_encoded_layout() {
 }
 
 fn core_required_array(sql: &str) -> Result<PreparedRequiredConstant, SqlCompileError> {
-    let expression = novarocks_parser::trino_parser::parse_expression(sql).unwrap();
+    let expression = novarocks_parser::parser::parse_expression(sql).unwrap();
     prepare(RequiredConstantRequest {
         input: RequiredConstantInput::Expression(&expression),
         target: RequiredConstantTarget::ArrayVarchar,

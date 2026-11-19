@@ -24,7 +24,7 @@
 //! policy, and maintenance options), but never retain a source span or a SQL
 //! fragment that would invite reparsing at the application boundary.
 
-use super::{IcebergPartitionFieldExpr, ObjectName};
+use super::ObjectName;
 use novarocks_types::schema::SqlType;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -111,10 +111,8 @@ pub struct AlterIcebergTableSqlCommand {
 #[derive(Clone, Debug, PartialEq)]
 pub enum IcebergTableSqlAction {
     Schema(IcebergSchemaSqlChange),
-    Properties(IcebergPropertiesSqlAction),
-    Partition(IcebergPartitionSqlChange),
+    Comment(String),
     Reference(IcebergReferenceSqlAction),
-    AddFiles { location: CommandLiteral },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -159,26 +157,6 @@ pub enum IcebergColumnSqlAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum IcebergPropertiesSqlAction {
-    Set {
-        entries: Vec<(String, CommandLiteral)>,
-    },
-    Unset {
-        keys: Vec<String>,
-        if_exists: bool,
-    },
-    Comment {
-        value: CommandLiteral,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IcebergPartitionSqlChange {
-    Add(IcebergPartitionFieldExpr),
-    Drop(IcebergPartitionFieldExpr),
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub enum IcebergReferenceSqlAction {
     Create {
         kind: IcebergReferenceKindSql,
@@ -219,20 +197,6 @@ pub enum MaintenanceSqlCommand {
         arguments: Vec<ProcedureArgumentSql>,
         argument_mode: ProcedureArgumentModeSql,
     },
-    Optimize {
-        table: ObjectName,
-    },
-    RewriteManifests {
-        table: ObjectName,
-    },
-    ExpireSnapshots {
-        table: ObjectName,
-        options: Vec<ExpireSnapshotsOptionSql>,
-    },
-    RemoveOrphanFiles {
-        table: ObjectName,
-        older_than: MaintenanceValueSql,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,10 +217,4 @@ pub enum MaintenanceValueSql {
     Literal(CommandLiteral),
     Timestamp(CommandLiteral),
     Map(Vec<(CommandLiteral, CommandLiteral)>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ExpireSnapshotsOptionSql {
-    OlderThan(MaintenanceValueSql),
-    RetainLast(MaintenanceValueSql),
 }

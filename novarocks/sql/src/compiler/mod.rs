@@ -1385,11 +1385,9 @@ pub fn analyze_mv_refresh_input(
         &crate::sql_mode::SqlSemanticSettings::default(),
     )
     .map_err(SqlCompileError::Compilation)?;
-    crate::planning::mv::validate_imv_aggregate_star_arguments(&query)
-        .map_err(SqlCompileError::from)?;
     let scoped_functions = functions.snapshot_for_scalar_presence();
     let functions = scoped_functions.as_ref();
-    let (resolved, _, factory) = crate::analyzer::analyze_with_function_catalog(
+    let (resolved, _, factory) = crate::analyzer::analyze_mv_definition(
         &query,
         catalog.planner_table_provider(),
         &current_database,
@@ -1716,6 +1714,10 @@ pub use crate::explain::completed::{
 };
 pub use crate::explain::completed_tree::render_completed_plan_tree;
 pub use catalog_qualification::{CatalogQualification, CatalogQualifications};
+#[cfg(test)]
+pub(crate) use catalog_qualification::{
+    iceberg_metadata_qualifications_for_test, resolve_quoted_iceberg_metadata_for_test,
+};
 pub use completion_catalog::{quoted_metadata_catalogs, quoted_metadata_catalogs_for_view};
 pub use completion_driver::SqlFinalPlanCompileRequest;
 pub(crate) use completion_driver::{
@@ -1816,16 +1818,16 @@ impl SqlCompiler {
                     &factory,
                 )?
                 .with_analysis_span(query.span);
-                let legacy_semantics;
+                let query_semantics;
                 let effective = if request.statement.root_session_admitted() {
                     &request.session.sql_semantics
                 } else {
-                    legacy_semantics = crate::sql_mode::query_sql_semantics(
+                    query_semantics = crate::sql_mode::query_sql_semantics(
                         &request.session.sql_semantics,
                         &query,
                     )
                     .map_err(SqlCompileError::from)?;
-                    &legacy_semantics
+                    &query_semantics
                 };
                 let consumer_requires_semantic_snapshot =
                     crate::sql_mode::query_requires_semantic_snapshot(effective, &query);
@@ -2254,12 +2256,7 @@ fn validate_planning_environment(
 
 #[cfg(test)]
 pub(crate) fn test_query(sql: &str) -> Box<novarocks_parser::ast::Query> {
-    let mut statements = novarocks_parser::parse(sql).expect("test query parses");
-    assert_eq!(statements.len(), 1, "expected exactly one test statement");
-    let novarocks_parser::ast::Statement::Query(query) = statements.remove(0) else {
-        panic!("expected test query");
-    };
-    Box::new(query)
+    Box::new(novarocks_parser::parser::parse_query(sql).expect("test query parses"))
 }
 
 #[cfg(test)]
@@ -2916,10 +2913,8 @@ mod tests {
 
     #[test]
     fn imv_refresh_explain_terminal_keeps_logical_rewrite_inside_sql() {
-        let mut statements = novarocks_parser::parse("SELECT 1").expect("query fixture parses");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
-            panic!("expected query fixture");
-        };
+        let query =
+            &mut novarocks_parser::parser::parse_query("SELECT 1").expect("query fixture parses");
         let cancellation = Arc::new(Cancellation::default());
         let input = imv_validation_input(SqlImvRewriteValidation::None);
         let request = imv_refresh_explain_request(
@@ -2947,22 +2942,20 @@ mod tests {
     }
 
     fn mv_analysis_query(sql: &str) -> Box<novarocks_parser::ast::Query> {
-        let mut statements = novarocks_parser::parse(sql).expect("MV analysis query parses");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
-            panic!("expected MV analysis query");
-        };
+        let query =
+            &mut novarocks_parser::parser::parse_query(sql).expect("MV analysis query parses");
         Box::new(query.clone())
     }
 
     #[test]
-    fn mv_refresh_rejects_stored_legacy_hint_before_table_analysis() {
+    fn mv_refresh_rejects_stored_legacy_mode_before_table_analysis() {
         let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let catalog = SqlPlannerTableSnapshot::new(&catalog);
         let functions = crate::functions::build_builtin_engine_function_catalog().unwrap();
         let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
             constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query(
-                "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ k FROM missing_table",
+                "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT k FROM missing_table",
             ),
             current_database: "db".to_string(),
             catalog: &catalog,
@@ -3054,10 +3047,10 @@ mod tests {
     fn array_agg_json_semantic_schema_survives_optimizer_and_exact_final_plan() {
         use arrow::datatypes::DataType;
         for sql in [
-            "select array_agg(json_object('2:3')) as j, array_agg(cast(json_object('2:3') as varchar)) as s",
-            "with q as (select cast(json_object('k',1) as json) as j) select array_agg(j) as j, array_agg(cast(j as varchar)) as s from q",
-            "select array_sortby([json_object('k',1), json_object('k',2)],[2,1]) as j, array_sortby(cast([json_object('k',1), json_object('k',2)] as array<varchar>),[2,1]) as s",
-            "with q as (select [json_object('k',1),json_object('k',2)] as j) select array_sortby(j,[2,1]) as j, array_sortby(cast(j as array<varchar>),[2,1]) as s from q",
+            "select array_agg(JSON_OBJECT('2': 3)) as j, array_agg(cast(JSON_OBJECT('2': 3) as varchar)) as s",
+            "with q as (select cast(json_object('k':1) as json) as j) select array_agg(j) as j, array_agg(cast(j as varchar)) as s from q",
+            "select array_sortby([json_object('k':1), json_object('k':2)],[2,1]) as j, array_sortby(cast([json_object('k':1), json_object('k':2)] as array<varchar>),[2,1]) as s",
+            "with q as (select [json_object('k':1),json_object('k':2)] as j) select array_sortby(j,[2,1]) as j, array_sortby(cast(j as array<varchar>),[2,1]) as s from q",
         ] {
             let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
             let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
@@ -3214,7 +3207,7 @@ mod tests {
     fn ordered_array_agg_nullable_json_union_reaches_exact_final_plan() {
         // Exact original public SQL source, using the ordinary builtin catalog
         // and compiler path, not a hand-built selected signature or expression.
-        let sql = "WITH q AS (SELECT 1 AS n, json_object('k',1) AS j UNION ALL SELECT 2, json_object('k',2) UNION ALL SELECT 3, NULL) SELECT array_agg(j ORDER BY n) AS json_values, array_agg(CAST(j AS VARCHAR) ORDER BY n) AS string_values FROM q";
+        let sql = "WITH q AS (SELECT 1 AS n, json_object('k':1) AS j UNION ALL SELECT 2, json_object('k':2) UNION ALL SELECT 3, NULL) SELECT array_agg(j ORDER BY n) AS json_values, array_agg(CAST(j AS VARCHAR) ORDER BY n) AS string_values FROM q";
         let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
@@ -3335,12 +3328,10 @@ mod tests {
 
     #[test]
     fn parsed_query_input_preserves_complex_types_and_escapes_without_sql_round_trip() {
-        let mut statements =
-            novarocks_parser::parse(r"SELECT CAST('{}' AS MAP<STRING, INT>), 'e\\f'")
-                .expect("query fixture must parse");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
-            panic!("expected query fixture");
-        };
+        let query = &mut novarocks_parser::parser::parse_query(
+            r"SELECT CAST('{}' AS MAP<STRING, INT>), 'e\f'",
+        )
+        .expect("query fixture must parse");
 
         assert_eq!(
             parse_query(&SqlStatementInput::parsed_query(Box::new(query.clone()))),
@@ -3621,15 +3612,15 @@ mod tests {
         use arrow::datatypes::{DataType, TimeUnit};
         for (sql, expected) in [
             (
-                "select time_slice('2023-12-31 03:12:04',interval 2147483647 year) as sliced",
+                "select time_slice('2023-12-31 03:12:04',2147483647, 'year') as sliced",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
             ),
             (
-                "select time_slice(cast('2020-01-01' as date),interval 1 day,ceil) as sliced",
+                "select time_slice(cast('2020-01-01' as date),1, 'day','ceil') as sliced",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
             ),
             (
-                "select date_slice('2020-01-01 12:00:00',interval 1 day) as sliced",
+                "select date_slice('2020-01-01 12:00:00',1, 'day') as sliced",
                 DataType::Date32,
             ),
             (
@@ -3750,26 +3741,22 @@ mod tests {
     }
 
     #[test]
-    fn analyzed_root_policy_keeps_admitted_hint_across_optimize_handoff() {
+    fn analyzed_root_policy_keeps_admitted_override_across_optimize_handoff() {
         use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
         for (session, sql, expected) in [
             ("32", "SELECT 1", OutputNull),
             (
                 "32",
-                "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1",
+                "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT 1",
                 ReportError,
             ),
             (
                 "ERROR_IF_OVERFLOW",
-                "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+                "WITH SESSION sql_mode = 32 SELECT 1",
                 OutputNull,
             ),
             ("ERROR_IF_OVERFLOW", "SELECT 1", ReportError),
-            (
-                "32",
-                "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1 AS x) s",
-                OutputNull,
-            ),
+            ("32", "SELECT x FROM (SELECT 1 AS x) s", OutputNull),
         ] {
             let cancellation = Arc::new(Cancellation::default());
             let mut input = request(control(None, &cancellation));
@@ -3803,13 +3790,13 @@ mod tests {
             ),
             (
                 "ERROR_IF_OVERFLOW",
-                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1",
+                "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT 1",
                 true,
                 OutputNull,
             ),
             (
                 "ALLOW_THROW_EXCEPTION",
-                "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1",
+                "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT 1",
                 false,
                 ReportError,
             ),
@@ -3838,7 +3825,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_legacy_hint_inherits_the_admitted_root_allow_and_decimal_policy() {
+    fn derived_query_inherits_the_admitted_root_allow_and_decimal_policy() {
         use crate::analysis::ExprKind;
         use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
         use novarocks_type_contract::DecimalOverflowPolicy::OutputNull;
@@ -3865,7 +3852,7 @@ mod tests {
         let request_control = control(None, &cancellation);
         let mut input = request(request_control.clone());
         input.statement = SqlStatementInput::parsed_query(mv_analysis_query(
-            "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(1 AS DECIMAL(18,6)) AS x) s",
+            "SELECT x FROM (SELECT CAST(1 AS DECIMAL(18,6)) AS x) s",
         ));
         input.session.sql_semantics = input.session.sql_semantics.clone().with_sql_mode(
             crate::sql_mode::SqlMode::from_assignment("ALLOW_THROW_EXCEPTION"),
@@ -3910,7 +3897,7 @@ mod tests {
             ("32", "SELECT CAST(1000 AS DECIMAL(3,0))", false),
             (
                 "32",
-                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(1000 AS DECIMAL(3,0))",
+                "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT CAST(1000 AS DECIMAL(3,0))",
                 true,
             ),
             (
@@ -3920,7 +3907,7 @@ mod tests {
             ),
             (
                 "ALLOW_THROW_EXCEPTION",
-                "SELECT /*+ SET_VAR(sql_mode=32) */ CAST(1000 AS DECIMAL(3,0))",
+                "WITH SESSION sql_mode = 32 SELECT CAST(1000 AS DECIMAL(3,0))",
                 false,
             ),
         ] {

@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_functions::{ConstantPolicy, FunctionArgumentType, FunctionResultType};
-use novarocks_parser::ast;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType,
     PureCompileControl, ValueLogicalType,
@@ -85,10 +84,7 @@ fn analyze(
     source: &SourceCatalog,
     policy: ConstantPolicy,
 ) -> Result<ResolvedQuery, AnalyzeError> {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query");
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     super::analyze_with_function_catalog_and_sql_semantics(
         query,
         source,
@@ -245,14 +241,11 @@ fn canonical_day_arithmetic_inherits_root_policy_and_required_nullable_sources()
         logical: None,
         nullable: true,
     };
-    for (outer, inner, outer_policy) in [
-        ("ERROR_IF_OVERFLOW", "32", ReportError),
-        ("32", "ERROR_IF_OVERFLOW", OutputNull),
-    ] {
+    for (outer, outer_policy) in [("ERROR_IF_OVERFLOW", ReportError), ("32", OutputNull)] {
         let sql = format!(
-            "SELECT /*+ SET_VAR(sql_mode='{outer}') */ q.x+CAST(1 AS INT), days_add(q.x,CAST(1 AS INT)) FROM (SELECT /*+ SET_VAR(sql_mode='{inner}') */ x,x-CAST(1 AS INT) AS shifted FROM temporal_source) q"
+            "WITH SESSION sql_mode = '{outer}' SELECT q.x+CAST(1 AS INT), days_add(q.x,CAST(1 AS INT)) FROM (SELECT x,x-CAST(1 AS INT) AS shifted FROM temporal_source) q"
         );
-        // A nested legacy hint cannot shadow the frozen whole-query policy.
+        // The admitted root policy also governs expressions in the derived query.
         let query = analyze(&sql, &source, crate::constant::test_constant_policy()).unwrap();
         for ordinal in [0, 1] {
             let (_, binding, args) = call(project(&query, ordinal));

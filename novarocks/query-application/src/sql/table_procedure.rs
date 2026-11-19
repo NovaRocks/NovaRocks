@@ -27,9 +27,7 @@ use novarocks_parser::{
     Span,
     ast::{CallArgument, Expr, Ident, LiteralKind},
 };
-use novarocks_spi::connector::{
-    ConnectorColumnPath, ConnectorProviderId, DdlPropertyType, DdlPropertyValue,
-};
+use novarocks_spi::connector::{ConnectorProviderId, DdlPropertyType, DdlPropertyValue};
 use novarocks_sql::compiler::RequiredConstantTarget;
 use novarocks_type_contract::{CompilePhase, PureCompileControl, ValueKind, ValueLogicalType};
 use novarocks_user_error::{
@@ -37,7 +35,7 @@ use novarocks_user_error::{
 };
 
 use super::property_evaluation::{
-    DdlPropertyConstantPort, constant_failure, copy_string, copy_value, evaluate_required_constant,
+    DdlPropertyConstantPort, constant_failure, evaluate_required_constant,
     evaluate_required_property_value,
 };
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
@@ -304,14 +302,6 @@ pub fn resolve_table_procedure(
     resolve_table_procedure_name(provider, &name.value, name.quoted)
 }
 
-/// Resolve the actual procedure name authored by a legacy lowerer.
-pub fn resolve_legacy_table_procedure(
-    provider: &ConnectorProviderId,
-    name: &str,
-) -> Result<&'static TableProcedure, QueryServiceError> {
-    resolve_table_procedure_name(provider, name, false)
-}
-
 /// Classify a declared statement shape before catalog admission. The provider
 /// still resolves the procedure against the retained catalog generation.
 pub fn declared_table_procedure_kind(name: &Ident) -> Option<TableProcedureKind> {
@@ -370,8 +360,6 @@ pub struct ProcedureArgumentName<'a> {
 #[derive(Clone, Copy, Debug)]
 pub enum ProcedureInput<'a> {
     Expression(&'a Expr),
-    /// A value signed by the original legacy argument author.
-    Authored(&'a DdlPropertyValue),
     /// A parsed default clause only, never inferred from identifier text.
     ExplicitDefault,
 }
@@ -390,14 +378,7 @@ pub trait TableProcedureAbsoluteTimePort {
 pub enum BoundProcedureValue<'a> {
     Value(DdlPropertyValue),
     RetentionDuration(ProcedureRetentionDuration),
-    LegacyEpochMillis(i64),
-    LegacyRetainLast(u32),
-    LegacyColumnPath(ConnectorColumnPath),
     EqualityRows(&'a Expr),
-    #[cfg(novarocks_dev_controls)]
-    LegacyEqualityColumns(&'a [Ident]),
-    #[cfg(novarocks_dev_controls)]
-    LegacyEqualityRows(&'a [Vec<Expr>]),
 }
 
 #[derive(Debug, PartialEq)]
@@ -478,112 +459,6 @@ pub fn bind_arguments<'a>(
                     span: Some(span),
                 }),
             }
-        },
-    )
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum LegacyProcedureValue<'a> {
-    OlderThanMillis(i64),
-    RetainLast(u32),
-    Varchar(&'a str),
-    ColumnPath(&'a ConnectorColumnPath),
-    Bigint(i64),
-    Boolean(bool),
-    #[cfg(novarocks_dev_controls)]
-    EqualityColumns(&'a [Ident]),
-    #[cfg(novarocks_dev_controls)]
-    EqualityRows(&'a [Vec<Expr>]),
-}
-
-/// Bind arguments authored by legacy statements. The authored slot names
-/// have no SQL location. Borrowed syntax values retain their original spans.
-pub fn bind_legacy_procedure_arguments<'a>(
-    procedure: &'static TableProcedure,
-    arguments: &[(&str, LegacyProcedureValue<'a>)],
-    control: &dyn PureCompileControl,
-) -> Result<BoundTableProcedure<'a>, QueryServiceError> {
-    let arguments = arguments
-        .iter()
-        .map(|(name, input)| BindingInput {
-            name: Some(ProcedureArgumentName {
-                value: name,
-                quoted: false,
-            }),
-            input: *input,
-            span: None,
-        })
-        .collect::<Vec<_>>();
-    bind_slots(
-        procedure,
-        &arguments,
-        None,
-        None,
-        control,
-        |slot, argument| {
-            let value = match (slot.name, slot.value_type, argument.input) {
-                (
-                    "older_than",
-                    ProcedureArgumentType::AbsoluteTime,
-                    LegacyProcedureValue::OlderThanMillis(ms),
-                ) => BoundProcedureValue::LegacyEpochMillis(ms),
-                ("retain_last", Value(Type::Integer), LegacyProcedureValue::RetainLast(count))
-                    if count > 0 =>
-                {
-                    BoundProcedureValue::LegacyRetainLast(count)
-                }
-                ("column", Value(Type::Varchar), LegacyProcedureValue::ColumnPath(path))
-                    if matches!(
-                        procedure.kind,
-                        TableProcedureKind::MoveColumn | TableProcedureKind::SetColumnNotNull
-                    ) && !path.segments.is_empty() =>
-                {
-                    // The original column lowerer has already resolved the segment
-                    // boundaries. Preserve that fact across the legacy binding.
-                    let mut segments = Vec::with_capacity(path.segments.len());
-                    for segment in &path.segments {
-                        checkpoint(control, 1)?;
-                        segments.push(segment.clone());
-                    }
-                    BoundProcedureValue::LegacyColumnPath(ConnectorColumnPath { segments })
-                }
-                #[cfg(novarocks_dev_controls)]
-                (
-                    "columns",
-                    Value(Type::ArrayVarchar),
-                    LegacyProcedureValue::EqualityColumns(columns),
-                ) if procedure.kind == TableProcedureKind::AddEqualityDelete => {
-                    BoundProcedureValue::LegacyEqualityColumns(columns)
-                }
-                #[cfg(novarocks_dev_controls)]
-                (
-                    "rows",
-                    ProcedureArgumentType::EqualityRows,
-                    LegacyProcedureValue::EqualityRows(rows),
-                ) if procedure.kind == TableProcedureKind::AddEqualityDelete => {
-                    BoundProcedureValue::LegacyEqualityRows(rows)
-                }
-                (_, Value(Type::Varchar), LegacyProcedureValue::Varchar(value)) => {
-                    BoundProcedureValue::Value(DdlPropertyValue::Varchar(copy_string(
-                        value, control,
-                    )?))
-                }
-                (_, Value(Type::Bigint), LegacyProcedureValue::Bigint(value)) => {
-                    BoundProcedureValue::Value(DdlPropertyValue::Bigint(value))
-                }
-                (_, Value(Type::Boolean), LegacyProcedureValue::Boolean(value)) => {
-                    BoundProcedureValue::Value(DdlPropertyValue::Boolean(value))
-                }
-                _ => {
-                    return Err(invariant(
-                        "Legacy maintenance value differs from its original argument declaration",
-                    ));
-                }
-            };
-            if let BoundProcedureValue::Value(value) = &value {
-                validate_supplied_value(slot, value, None)?;
-            }
-            Ok(BoundProcedureArgument::Present { value, span: None })
         },
     )
 }
@@ -752,14 +627,6 @@ fn bind_value<'a>(
                 Some(ty) => evaluate(expression, ty, constants)?,
                 None => evaluate_timestamp(expression, source, span, constants, control)?,
             }
-        }
-        (_, ProcedureInput::Authored(value)) => {
-            if !matches!(value, DdlPropertyValue::Null) && !matches_type(slot.value_type, value) {
-                return Err(invariant(
-                    "Table procedure argument author produced a different declared type",
-                ));
-            }
-            copy_value(value, control)?
         }
         _ => {
             return Err(invariant(
@@ -938,7 +805,7 @@ mod tests {
     use super::super::property_evaluation::DdlPropertyConstantError;
     use super::*;
     use novarocks_constant_contract::ConstantValue;
-    use novarocks_parser::trino_parser::parse_expression;
+    use novarocks_parser::parser::parse_expression;
     use novarocks_sql::compiler::{RequiredConstantTarget, SqlCompileControl};
 
     struct UnreachedEvaluation;
@@ -1015,58 +882,6 @@ mod tests {
         let user = error.user_error().unwrap();
         assert_eq!(user.code().as_str(), "sql.admit.table_procedure_not_found");
         assert!(user.location().is_none());
-    }
-
-    #[test]
-    fn old_retain_only_keeps_full_legacy_value_and_the_threshold_omitted() {
-        use novarocks_sql::semantic::command::{
-            CommandLiteral, ExpireSnapshotsOptionSql, MaintenanceSqlCommand, MaintenanceValueSql,
-        };
-        let sql = "ALTER TABLE ice.db.events EXPIRE SNAPSHOTS RETAIN LAST 4294967295";
-        let statement = super::super::parse_single_statement(sql).unwrap();
-        let Some(super::super::ProductSqlCommand::Maintenance(
-            MaintenanceSqlCommand::ExpireSnapshots { options, .. },
-        )) = super::super::lower_product_sql_command(&statement).unwrap()
-        else {
-            panic!("original expiry lowerer");
-        };
-        let [
-            ExpireSnapshotsOptionSql::RetainLast(MaintenanceValueSql::Literal(
-                CommandLiteral::Number(count),
-            )),
-        ] = options.as_slice()
-        else {
-            panic!("original retain-only option");
-        };
-        let Expr::Identifier(name) = parse_expression("expire_snapshots").unwrap() else {
-            panic!("registered procedure identifier");
-        };
-        let provider = ConnectorProviderId::parse("iceberg").unwrap();
-        let procedure = resolve_table_procedure(&provider, &name).unwrap();
-        let bound = bind_legacy_procedure_arguments(
-            procedure,
-            &[(
-                "retain_last",
-                LegacyProcedureValue::RetainLast(count.parse().unwrap()),
-            )],
-            &SqlCompileControl::unbounded(),
-        )
-        .unwrap();
-        let slots = bound.arguments().collect::<Vec<_>>();
-        assert_eq!(slots[0].0.name, "retention_threshold");
-        assert_eq!(
-            slots[0].0.default,
-            Some(ProcedureArgumentDefault::Varchar("7d"))
-        );
-        assert_eq!(slots[0].1, &BoundProcedureArgument::Omitted);
-        assert_eq!(
-            slots[1].1,
-            &BoundProcedureArgument::Present {
-                value: BoundProcedureValue::LegacyRetainLast(u32::MAX),
-                span: None,
-            }
-        );
-        assert_eq!(slots[3].1, &BoundProcedureArgument::Omitted);
     }
 
     #[test]

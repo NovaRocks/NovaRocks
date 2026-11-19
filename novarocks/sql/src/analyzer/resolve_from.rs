@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::parser::expression_for_diagnostic;
 use arrow::datatypes::DataType;
 use novarocks_parser::ast;
-use novarocks_parser::printer::print_expr;
 
 use crate::analysis::AnalyzedOutputField as OutputColumn;
 use crate::analysis::*;
@@ -150,7 +150,7 @@ impl<'a> super::AnalyzerContext<'a> {
         self.check_control()?;
         let (right_rel, mut right_scope) =
             self.analyze_from_with_outer(&join.right, Some(&current_scope))?;
-        let (join_kind, constraint) = parse_join_operator(join.kind, join.criteria.as_ref())?;
+        let (join_kind, constraint) = parse_join_operator(join.kind, join.criteria.as_ref());
 
         let condition = match constraint {
             Some(ast::JoinCriteria::On(on)) => {
@@ -464,9 +464,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 node.span,
                 outer_scope,
             ),
-            ast::Relation::LegacyTableFunction(node) => {
-                self.analyze_legacy_table_function(&node.expr, alias)
-            }
             ast::Relation::TableFunction(node) => self.analyze_table_function(node, alias),
             ast::Relation::JsonTable(_) => Err(AnalyzeError::unsupported_expression(
                 "JSON_TABLE is not supported",
@@ -553,16 +550,16 @@ impl<'a> super::AnalyzerContext<'a> {
                     version.span,
                 ));
             }
-            let metadata_ty = crate::planner::table::SqlMetadataTableKind::parse(&metadata.value)
+            let metadata_ty = crate::planner::table::SqlMetadataTableKind::parse(metadata.value)
                 .map_err(|_| {
-                AnalyzeError::unsupported_query_shape(
-                    format!(
-                        "unsupported iceberg metadata table type: {}",
-                        metadata.value
-                    ),
-                    metadata.span,
-                )
-            })?;
+                    AnalyzeError::unsupported_query_shape(
+                        format!(
+                            "unsupported iceberg metadata table type: {}",
+                            metadata.value
+                        ),
+                        metadata.span,
+                    )
+                })?;
             // Reject branch/tag combo: `t.branch_dev$snapshots` is meaningless.
             if let Some(last) = parts.last()
                 && (last.starts_with("branch_") || last.starts_with("tag_"))
@@ -713,7 +710,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 if let Some(alias) = alias {
                     crate::analysis::schema::apply_column_aliases(
                         &mut output_columns,
-                        &alias.columns,
+                        alias.columns,
                         alias.span,
                     )?;
                 }
@@ -806,7 +803,7 @@ impl<'a> super::AnalyzerContext<'a> {
             if let Some(alias) = alias {
                 crate::analysis::schema::apply_column_aliases(
                     &mut output_columns,
-                    &alias.columns,
+                    alias.columns,
                     alias.span,
                 )?;
             }
@@ -1091,33 +1088,6 @@ impl<'a> super::AnalyzerContext<'a> {
         ))
     }
 
-    /// Analyze a TABLE(...) table function reference.
-    fn analyze_legacy_table_function(
-        &self,
-        expr: &ast::Expr,
-        alias: Option<RelationAlias<'_>>,
-    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
-        if let Some(reason) = super::resolve_expr::unsupported_control_expression_reason(expr) {
-            return Err(AnalyzeError::unsupported_expression(reason, expr.span()));
-        }
-        let ast::Expr::FunctionCall(function) = expr else {
-            return Err(AnalyzeError::invalid_query_shape(
-                format!("TABLE() requires a function call, got: {expr:?}"),
-                expr.span(),
-            ));
-        };
-        let arguments = function
-            .arguments
-            .iter()
-            .map(|argument| TableArgument {
-                name: None,
-                expression: &argument.value,
-                span: argument.span,
-            })
-            .collect::<Vec<_>>();
-        self.analyze_table_function_arguments(&function.name, &arguments, function.span, alias)
-    }
-
     fn analyze_table_function(
         &self,
         invocation: &ast::TableFunctionInvocation,
@@ -1181,44 +1151,20 @@ impl<'a> super::AnalyzerContext<'a> {
                 name.span,
             ));
         }
-        // Detect whether the call uses named args (start=>2, end=>5, ...).
-        // The typed parser represents both `=>` and StarRocks's accepted
-        // `=` spelling as a binary syntax node; their semantic distinction is
-        // local to this function's argument grammar.
-        // Mixing named and positional is disallowed; StarRocks's FE rejects
-        // the first positional token after a named one as `Unexpected input
-        // '<token>'`, which the SQL test suite asserts against verbatim.
-        let any_named = arguments
-            .iter()
-            .any(|argument| table_argument_named_arg(argument).is_some());
-        let any_positional = arguments
-            .iter()
-            .any(|arg| !table_argument_named_arg(arg).is_some());
-        if any_named && any_positional {
-            // Surface the first stray positional token. An
-            // `Identifier -> value` expression in a function-arg slot is
-            // not a valid named-arg operator in StarRocks; report it with
-            // the legacy `No viable statement for input` wording the FE
-            // uses. Other stray positional tokens get the canonical
-            // `Unexpected input '<token>'` form.
-            if let Some(arg) = arguments
-                .iter()
-                .find(|arg| !table_argument_named_arg(arg).is_some())
-            {
-                if matches!(arg.expression, ast::Expr::Lambda(_)) {
-                    return Err(AnalyzeError::invalid_argument(
-                        "No viable statement for input",
-                        arg.span(),
-                    ));
-                }
+        let any_named = arguments.iter().any(|argument| argument.name.is_some());
+        if any_named && let Some(arg) = arguments.iter().find(|arg| arg.name.is_none()) {
+            if matches!(arg.expression, ast::Expr::Lambda(_)) {
                 return Err(AnalyzeError::invalid_argument(
-                    format!("Unexpected input '{}'.", print_expr(arg.expression)),
+                    "No viable statement for input",
                     arg.span(),
                 ));
             }
             return Err(AnalyzeError::invalid_argument(
-                "Unknown table function: generate_series",
-                span,
+                format!(
+                    "Unexpected input '{}'.",
+                    expression_for_diagnostic(arg.expression)
+                ),
+                arg.span(),
             ));
         }
 
@@ -1228,13 +1174,14 @@ impl<'a> super::AnalyzerContext<'a> {
             let mut step_v: Option<Option<i64>> = None;
             for arg in arguments {
                 self.check_control()?;
-                let Some((name, expr)) = table_argument_named_arg(arg) else {
+                let Some(name) = arg.name else {
                     return Err(AnalyzeError::invalid_argument(
                         "Unknown table function: generate_series",
                         arg.span(),
                     ));
                 };
                 let key = name.value.to_ascii_lowercase();
+                let expr = arg.expression;
                 let value = if is_null_literal(expr) {
                     None
                 } else {
@@ -1463,64 +1410,15 @@ impl<'a> super::AnalyzerContext<'a> {
 fn parse_join_operator(
     kind: ast::JoinType,
     criteria: Option<&ast::JoinCriteria>,
-) -> Result<(JoinKind, Option<&ast::JoinCriteria>), AnalyzeError> {
-    use ast::legacy::JoinOperator as Old;
+) -> (JoinKind, Option<&ast::JoinCriteria>) {
     let kind = match kind {
-        ast::JoinType::Cross | ast::JoinType::Implicit | ast::JoinType::Legacy(Old::Cross) => {
-            return Ok((JoinKind::Cross, None));
-        }
-        ast::JoinType::Inner | ast::JoinType::Legacy(Old::Inner | Old::InnerExplicit) => {
-            JoinKind::Inner
-        }
-        ast::JoinType::Left | ast::JoinType::Legacy(Old::LeftOuter | Old::LeftOuterExplicit) => {
-            JoinKind::LeftOuter
-        }
-        ast::JoinType::Right | ast::JoinType::Legacy(Old::RightOuter | Old::RightOuterExplicit) => {
-            JoinKind::RightOuter
-        }
-        ast::JoinType::Full | ast::JoinType::Legacy(Old::FullOuter | Old::FullOuterExplicit) => {
-            JoinKind::FullOuter
-        }
-        ast::JoinType::Legacy(Old::LeftSemi) => JoinKind::LeftSemi,
-        ast::JoinType::Legacy(Old::RightSemi) => JoinKind::RightSemi,
-        ast::JoinType::Legacy(Old::LeftAnti) => JoinKind::LeftAnti,
-        ast::JoinType::Legacy(Old::RightAnti) => JoinKind::RightAnti,
+        ast::JoinType::Cross | ast::JoinType::Implicit => return (JoinKind::Cross, None),
+        ast::JoinType::Inner => JoinKind::Inner,
+        ast::JoinType::Left => JoinKind::LeftOuter,
+        ast::JoinType::Right => JoinKind::RightOuter,
+        ast::JoinType::Full => JoinKind::FullOuter,
     };
-    Ok((kind, criteria))
-}
-
-fn table_argument_named_arg<'r>(
-    argument: &TableArgument<'r>,
-) -> Option<(&'r ast::Ident, &'r ast::Expr)> {
-    argument
-        .name
-        .map(|name| (name, argument.expression))
-        .or_else(|| generate_series_named_arg(argument.expression))
-}
-
-fn generate_series_named_arg(expr: &ast::Expr) -> Option<(&ast::Ident, &ast::Expr)> {
-    let (left, right) = match expr {
-        ast::Expr::Binary(binary)
-            if binary.operator
-                == ast::BinaryOperator::Legacy(ast::LegacyBinaryOperator::NamedArgument) =>
-        {
-            (binary.left.as_ref(), binary.right.as_ref())
-        }
-        ast::Expr::Predicated(node) => {
-            let ast::Predicate::Comparison(p) = &node.predicate else {
-                return None;
-            };
-            if p.operator != ast::ComparisonOperator::Equal {
-                return None;
-            }
-            (&node.value, &p.right)
-        }
-        _ => return None,
-    };
-    let ast::Expr::Identifier(name) = left else {
-        return None;
-    };
-    Some((name, right))
+    (kind, criteria)
 }
 
 #[recursive::recursive]
@@ -1546,17 +1444,12 @@ fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
                 ast::BinaryOperator::Multiply => Ok(left * right),
                 ast::BinaryOperator::Divide if right != 0 => Ok(left / right),
                 ast::BinaryOperator::Modulo if right != 0 => Ok(left % right),
-                ast::BinaryOperator::Legacy(operator) => Err(AnalyzeError::invalid_argument(
-                    format!("unsupported operator in constant expression: {operator:?}"),
-                    expr.span(),
-                )),
                 operator => Err(AnalyzeError::invalid_argument(
                     format!("unsupported operator in constant expression: {operator:?}"),
                     expr.span(),
                 )),
             }
         }
-        ast::Expr::LegacyParenthesized(nested) => eval_const_i64(&nested.expression),
         _ => Err(AnalyzeError::invalid_literal(
             format!("expected constant integer expression, got: {expr:?}"),
             expr.span(),
@@ -1585,6 +1478,6 @@ fn derived_table_output_columns(
         return Ok(columns.to_vec());
     }
     let mut fields = columns.to_vec();
-    crate::analysis::schema::apply_column_aliases(&mut fields, &alias.columns, alias.span)?;
+    crate::analysis::schema::apply_column_aliases(&mut fields, alias.columns, alias.span)?;
     Ok(fields)
 }

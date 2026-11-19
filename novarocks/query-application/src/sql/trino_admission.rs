@@ -8,9 +8,11 @@ use novarocks_user_error::{
 };
 
 use novarocks_sql::semantic::{CatalogSqlCommand, ObjectName, StatisticsSqlCommand};
+use novarocks_sql::sql_mode::{self, SqlSemanticSettings};
 
 use super::{
     ProductSqlCommand, lower_object_name, property_evaluation::validate_create_authorization,
+    session_admit::SessionAdmitError,
 };
 
 const UNSUPPORTED_STATEMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
@@ -124,12 +126,71 @@ pub enum TrinoStatementPreparation {
     CreateMaterializedView(ast::TrinoCreateMaterializedView),
     DropMaterializedView(ast::TrinoDropMaterializedView),
     RefreshMaterializedView(ast::TrinoRefreshMaterializedView),
-    ExplainRefreshMaterializedView(ast::TrinoRefreshMaterializedView),
+    ExplainRefreshMaterializedView(ast::TrinoRefreshMaterializedView, Span),
     SetMaterializedViewProperties {
         name: ast::ObjectName,
         properties: ast::AstVec<ast::StatementProperty>,
         span: Span,
     },
+}
+
+/// Refuse uncaptured settings before publishing a definition or replaying its query.
+pub fn admit_persisted_definition_semantics(
+    source: &str,
+    preparation: &TrinoStatementPreparation,
+    caller: &SqlSemanticSettings,
+) -> Result<(), QueryServiceError> {
+    use TrinoStatementPreparation as Preparation;
+
+    let (definition, span) = match preparation {
+        Preparation::CreateView(node) => (Some(&node.query), node.span),
+        Preparation::CreateMaterializedView(node) => (Some(&node.query), node.span),
+        Preparation::RefreshMaterializedView(node) => (None, node.span),
+        Preparation::ExplainRefreshMaterializedView(_, span) => (None, *span),
+        Preparation::SetMaterializedViewProperties {
+            properties, span, ..
+        } if properties
+            .iter()
+            .any(|property| property.name.value.eq_ignore_ascii_case("partitioning")) =>
+        {
+            (None, *span)
+        }
+        _ => return Ok(()),
+    };
+    let (legacy, numeric, strict) = match definition {
+        Some(query) => {
+            let map_error = |error: novarocks_sql::analyze_error::AnalyzeError| {
+                QueryServiceError::from_user_error(error.to_user_error(Some(source)))
+            };
+            (
+                sql_mode::query_uses_group_concat_legacy(caller, query).map_err(map_error)?,
+                sql_mode::query_uses_decimal_overflow_to_double(caller, query)
+                    .map_err(map_error)?,
+                sql_mode::query_uses_error_if_overflow(caller, query).map_err(map_error)?,
+            )
+        }
+        None => (
+            caller.sql_mode().group_concat_legacy(),
+            caller.decimal_overflow_to_double(),
+            caller.sql_mode().error_if_overflow(),
+        ),
+    };
+    let setting = if numeric {
+        "decimal_overflow_to_double=true"
+    } else if legacy {
+        "GROUP_CONCAT_LEGACY"
+    } else if strict {
+        "ERROR_IF_OVERFLOW"
+    } else {
+        return Ok(());
+    };
+    let message = format!(
+        "unsupported semantic setting: {setting} is not captured for persistent VIEW or MATERIALIZED VIEW definition replay"
+    );
+    Err(QueryServiceError::from_user_error(
+        SessionAdmitError::PersistedDefinitionSemanticsUnsupported
+            .to_user_error(source, span, message),
+    ))
 }
 
 /// Select the exact statement owner before any provider or session effects.
@@ -418,7 +479,7 @@ fn admit_trino_explain(
             TrinoQueryAction::Explain(query),
         )),
         ast::TrinoStatement::RefreshMaterializedView(refresh) => Ok(TrinoStatementAction::Prepare(
-            TrinoStatementPreparation::ExplainRefreshMaterializedView(refresh),
+            TrinoStatementPreparation::ExplainRefreshMaterializedView(refresh, explain.span),
         )),
         statement => Err(unsupported_statement(
             source,
@@ -443,13 +504,116 @@ fn admit_trino_explain_analyze(
 }
 
 #[cfg(test)]
+mod retired_ddl_tests {
+    use super::*;
+    use novarocks_parser::parser::parse_statement;
+
+    #[test]
+    fn retired_statement_spelling_has_a_syntax_error() {
+        for source in [
+            "SHOW PROCESSLIST",
+            "SHOW FULL PROCESSLIST",
+            "CREATE TABLE IF NOT EXISTS ice.db.orders (id INT NOT NULL DEFAULT 7 COMMENT 'key') PRIMARY KEY(id) PARTITION BY day(id) DISTRIBUTED BY HASH(id) BUCKETS 4 COMMENT 'orders' PROPERTIES('format-version'='3')",
+            "CREATE TABLE ice.db.measures (id BIGINT SUM NOT NULL DEFAULT 7 COMMENT 'id') AGGREGATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4 COMMENT 'table' PROPERTIES('format-version'='3')",
+            "ALTER TABLE ice.db.orders ADD COLUMN address.zip INT DEFAULT 94107 AFTER address.city",
+        ] {
+            let error = parse_statement(source).unwrap_err().to_user_error(source);
+            assert_eq!(
+                error.code().as_str(),
+                "sql.parse.unexpected_token",
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_catalog_add_column_and_show_commands_retain_their_owners() {
+        let source = "CREATE CATALOG IF NOT EXISTS lake USING iceberg COMMENT 'catalog'";
+        assert!(matches!(
+            admit_trino_statement(source, parse_statement(source).unwrap()).unwrap(),
+            TrinoStatementAction::Prepare(TrinoStatementPreparation::CreateCatalog(_)),
+        ));
+        let source = "ALTER TABLE ice.db.orders ADD COLUMN address.zip INTEGER DEFAULT 94107";
+        assert!(matches!(
+            admit_trino_statement(source, parse_statement(source).unwrap()).unwrap(),
+            TrinoStatementAction::Prepare(TrinoStatementPreparation::AddColumn(_)),
+        ));
+        let source = "SHOW STATS FOR ice.db.orders";
+        assert!(matches!(
+            admit_trino_statement(source, parse_statement(source).unwrap()).unwrap(),
+            TrinoStatementAction::Product(ProductSqlCommand::Statistics(_)),
+        ));
+        assert!(crate::statement_kind::StatementKind::ShowStats.is_row_kind());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::trino_parser::parse_statement;
+    use novarocks_parser::parser::parse_statement;
 
     fn admit(source: &str) -> Result<TrinoStatementAction, QueryServiceError> {
         let statement = parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
         admit_trino_statement(source, statement)
+    }
+
+    #[test]
+    fn persisted_definition_admission_keeps_the_frozen_caller_policy() {
+        use novarocks_sql::sql_mode::SqlMode;
+
+        let default = SqlSemanticSettings::default();
+        let legacy = default
+            .clone()
+            .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
+        let numeric = default.clone().with_decimal_overflow_to_double(true);
+        let strict = default
+            .clone()
+            .with_sql_mode(SqlMode::from_assignment("ERROR_IF_OVERFLOW"));
+        for source in [
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            "CREATE MATERIALIZED VIEW v AS SELECT 1",
+            "REFRESH MATERIALIZED VIEW v",
+            "EXPLAIN REFRESH MATERIALIZED VIEW v",
+            "ALTER MATERIALIZED VIEW v SET PROPERTIES partitioning = ARRAY['x']",
+        ] {
+            let TrinoStatementAction::Prepare(preparation) = admit(source).unwrap() else {
+                panic!("expected definition or replay preparation: {source}");
+            };
+            assert!(admit_persisted_definition_semantics(source, &preparation, &default).is_ok());
+            for (settings, feature) in [
+                (&legacy, "GROUP_CONCAT_LEGACY"),
+                (&numeric, "decimal_overflow_to_double=true"),
+                (&strict, "ERROR_IF_OVERFLOW"),
+            ] {
+                let error = admit_persisted_definition_semantics(source, &preparation, settings)
+                    .unwrap_err();
+                let user = error.user_error().unwrap();
+                assert_eq!(
+                    user.code().as_str(),
+                    "sql.admit.persisted_definition_semantics_unsupported"
+                );
+                assert!(user.message().contains(feature), "{source}: {user}");
+                assert_eq!(user.location().unwrap().column(), 1);
+            }
+        }
+        for source in [
+            "CREATE VIEW v AS VALUES 1",
+            "CREATE VIEW v AS SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1",
+            "DROP VIEW v",
+            "DROP MATERIALIZED VIEW v",
+            "ALTER MATERIALIZED VIEW v SET PROPERTIES primary_key = ARRAY['x']",
+        ] {
+            let TrinoStatementAction::Prepare(preparation) = admit(source).unwrap() else {
+                panic!("expected typed VIEW or MATERIALIZED VIEW preparation: {source}");
+            };
+            let settings = if source.contains("SET_VAR") {
+                &default
+            } else {
+                &strict
+            };
+            assert!(admit_persisted_definition_semantics(source, &preparation, settings).is_ok());
+        }
     }
 
     #[test]
@@ -527,7 +691,7 @@ mod tests {
         assert!(matches!(
             admit("EXPLAIN REFRESH MATERIALIZED VIEW lake.db.v").unwrap(),
             TrinoStatementAction::Prepare(
-                TrinoStatementPreparation::ExplainRefreshMaterializedView(_)
+                TrinoStatementPreparation::ExplainRefreshMaterializedView(..)
             )
         ));
     }
@@ -642,14 +806,7 @@ mod tests {
         else {
             panic!("drop table");
         };
-        let legacy =
-            crate::sql::parse_single_statement("DROP TABLE IF EXISTS lake.db.t FORCE").unwrap();
-        let Some(ProductSqlCommand::Catalog(legacy_command)) =
-            crate::sql::lower_product_sql_command(&legacy).unwrap()
-        else {
-            panic!("legacy drop table command");
-        };
-        assert_eq!(legacy_command, command);
+        assert!(parse_statement("DROP TABLE IF EXISTS lake.db.t FORCE").is_err());
         let CatalogSqlCommand::DropTable { name, if_exists } = *command else {
             panic!("exact drop table command");
         };

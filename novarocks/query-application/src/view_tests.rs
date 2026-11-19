@@ -21,13 +21,14 @@ use std::time::{Duration, Instant};
 
 use crate::api::QueryResult;
 use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
+use crate::view::ViewCommand;
 use crate::view::{
     CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
     ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
 use crate::view_service::QueryViewService;
 use arrow::array::{Array, StringArray};
-use novarocks_parser::ast::{Query, SetExpr, Statement as ParsedStatement};
+use novarocks_parser::ast::{Query, SetExpr, ShowCreateKind, TrinoStatement};
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
 
 #[derive(Default)]
@@ -43,7 +44,7 @@ impl FakeViewEngine {
     fn insert_view(&self, target: ViewTarget, sql: &str, default_database: &str) {
         let definition = PersistedQueryDefinition::new(
             sql,
-            PersistedQueryDialect::StarRocks,
+            PersistedQueryDialect::Trino,
             &target.catalog,
             default_database,
         )
@@ -168,13 +169,11 @@ fn context<'a>(catalog: Option<&'a str>, database: &'a str) -> ViewRequestContex
 
 #[test]
 fn admitted_trino_view_preserves_the_actual_definition_and_comment() {
-    use crate::view::ViewCommand;
-    use novarocks_parser::{ast::TrinoStatement, trino_parser};
+    use novarocks_parser::parser;
 
     let source =
         "CREATE VIEW IF NOT EXISTS ice.demo.v COMMENT 'visible' AS SELECT /* raw */  1 AS a";
-    let TrinoStatement::CreateView(statement) = trino_parser::parse_statement(source).unwrap()
-    else {
+    let TrinoStatement::CreateView(statement) = parser::parse_statement(source).unwrap() else {
         panic!("typed VIEW");
     };
     let engine = FakeViewEngine::default();
@@ -190,6 +189,7 @@ fn admitted_trino_view_preserves_the_actual_definition_and_comment() {
     let [create] = calls.as_slice() else {
         panic!("one actual View command");
     };
+    assert_eq!(create.definition.dialect, PersistedQueryDialect::Trino);
     assert_eq!(
         create.definition.raw_query_source,
         "SELECT /* raw */  1 AS a"
@@ -216,22 +216,39 @@ impl ViewServiceTestExt for QueryViewService {
         sql: &str,
         context: ViewRequestContext<'_>,
     ) -> Result<Option<ViewStatementResult>, String> {
-        let statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
-        let [ParsedStatement::View(statement)] = statements.as_slice() else {
+        let statement =
+            crate::sql::parse_single_statement(sql).map_err(|error| error.to_string())?;
+        let Some(command) = view_command(sql, &statement)? else {
             return Ok(None);
         };
-        self.execute_statement(engine, statement, context)
+        self.execute_command(engine, command, context)
             .map(Some)
             .map_err(|error| error.to_string())
     }
 }
 
-fn parse_query(sql: &str) -> Query {
-    let statements = novarocks_parser::parse(sql).expect("parse typed query");
-    let [ParsedStatement::Query(query)] = statements.as_slice() else {
-        panic!("expected typed query");
+fn view_command<'a>(
+    source: &'a str,
+    statement: &'a TrinoStatement,
+) -> Result<Option<ViewCommand<'a>>, String> {
+    let command = match statement {
+        TrinoStatement::CreateView(node) => {
+            ViewCommand::trino_create(source, node).map_err(|error| error.to_string())?
+        }
+        TrinoStatement::DropView(node) => ViewCommand::Drop {
+            name: &node.name,
+            if_exists: node.exists,
+        },
+        TrinoStatement::ShowCreate(node) if node.kind == ShowCreateKind::View => {
+            ViewCommand::ShowCreate { name: &node.name }
+        }
+        _ => return Ok(None),
     };
-    query.clone()
+    Ok(Some(command))
+}
+
+fn parse_query(sql: &str) -> Query {
+    novarocks_parser::parser::parse_query(sql).expect("parse typed query")
 }
 
 fn query_result(result: Option<ViewStatementResult>) -> QueryResult {
@@ -297,15 +314,15 @@ fn virtual_view_mutations_refuse_before_analysis_or_external_changes() {
             format!("DROP VIEW {name}"),
             format!("DROP VIEW IF EXISTS {name}"),
         ] {
-            let statements = novarocks_parser::parse(&sql).unwrap();
-            let [ParsedStatement::View(statement)] = statements.as_slice() else {
-                panic!("view command")
+            let statement = crate::sql::parse_single_statement(&sql).unwrap();
+            let command = view_command(&sql, &statement)
+                .unwrap()
+                .expect("view command");
+            let error = match service.execute_command(&engine, command, context(catalog, database))
+            {
+                Err(error) => error,
+                Ok(_) => panic!("virtual view mutation succeeded: {sql}"),
             };
-            let error =
-                match service.execute_statement(&engine, statement, context(catalog, database)) {
-                    Err(error) => error,
-                    Ok(_) => panic!("virtual view mutation succeeded: {sql}"),
-                };
             assert_eq!(
                 error.kind(),
                 crate::api::CommandErrorKind::Unsupported,
@@ -421,10 +438,10 @@ fn local_views_do_not_exist_on_a_new_service_instance() {
 }
 
 #[test]
-fn ignore_nulls_uses_the_original_parser_and_preserves_local_and_external_raw_source() {
+fn trino_ignore_nulls_preserves_local_and_external_raw_source() {
     // This checks parsing and persisted source, not first_value execution capability.
-    let body = "SELECT /* original */ first_value(a IGNORE NULLS) OVER () AS x FROM t";
-    let parsed = parse_query(body);
+    let body = "SELECT /* original */ first_value(a) IGNORE NULLS OVER () AS x FROM t";
+    let parsed = novarocks_parser::parser::parse_query(body).unwrap();
     let SetExpr::Select(select) = parsed.body.as_ref() else {
         panic!("select")
     };
@@ -477,7 +494,11 @@ fn ignore_nulls_uses_the_original_parser_and_preserves_local_and_external_raw_so
         .unwrap()
         .unwrap();
     assert_eq!(external.definition.raw_query_source, body);
-    assert_eq!(parse_query(&external.definition.raw_query_source), parsed);
+    assert_eq!(external.definition.dialect, PersistedQueryDialect::Trino);
+    assert_eq!(
+        novarocks_parser::parser::parse_query(&external.definition.raw_query_source).unwrap(),
+        parsed,
+    );
 }
 
 #[test]
@@ -578,7 +599,7 @@ fn iceberg_show_create_escapes_comment_and_preserves_original_body() {
         ResolvedExternalView {
             definition: PersistedQueryDefinition::new(
                 "SELECT /* raw body */\n 1 AS a",
-                PersistedQueryDialect::StarRocks,
+                PersistedQueryDialect::Trino,
                 "ice",
                 "db",
             )
@@ -602,14 +623,12 @@ fn iceberg_show_create_escapes_comment_and_preserves_original_body() {
         ]
     );
 
+    // P13 owns the display header. The saved query body already uses Trino.
     let displayed = query_rows_at(&show_create, 1);
-    let reparsed = novarocks_parser::parse(&displayed[0]).unwrap();
-    let [ParsedStatement::View(novarocks_parser::ast::ViewStatement::Create(create))] =
-        reparsed.as_slice()
-    else {
-        panic!("SHOW CREATE must be a supported CREATE VIEW statement")
-    };
-    assert_eq!(create.raw_query_source, "SELECT /* raw body */\n 1 AS a");
+    let (_, body) = displayed[0].split_once("\nAS ").unwrap();
+    let body = body.strip_suffix(';').unwrap();
+    assert_eq!(body, "SELECT /* raw body */\n 1 AS a");
+    novarocks_parser::parser::parse_query(body).unwrap();
 }
 
 #[test]

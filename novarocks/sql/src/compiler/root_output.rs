@@ -555,10 +555,7 @@ mod tests {
             "SELECT x+1 AS a, x+1 AS B FROM (SELECT 1 AS x) AS t GROUP BY ROLLUP(x+1)",
             "SELECT sum(x) AS a, sum(x) AS B FROM (SELECT 1 AS x) AS t",
         ] {
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
-                panic!("query")
-            };
+            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
             let (resolved, ctes, mut factory) =
                 crate::analyzer::analyze(query, &catalog, "default").unwrap();
             let fields = resolved.output_columns.clone();
@@ -588,10 +585,7 @@ mod tests {
             "substr('abc', 2)",
         ] {
             let sql = format!("SELECT {expression}, {expression} AS KeptName");
-            let statements = novarocks_parser::parse(&sql).unwrap();
-            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
-                panic!("query");
-            };
+            let query = &novarocks_parser::parser::parse_query(&sql).unwrap();
             let (resolved, ctes, mut factory) =
                 crate::analyzer::analyze(query, &catalog, "default").unwrap();
             let fields = resolved.output_columns.clone();
@@ -613,10 +607,7 @@ mod tests {
                 "{sql}"
             );
             let derived = format!("SELECT q.KeptName FROM (SELECT {expression} AS KeptName) q");
-            let statements = novarocks_parser::parse(&derived).unwrap();
-            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
-                panic!("query");
-            };
+            let query = &novarocks_parser::parser::parse_query(&derived).unwrap();
             let (resolved, _, _) = crate::analyzer::analyze(query, &catalog, "default").unwrap();
             assert_eq!(
                 resolved.output_columns[0].field_name.as_deref(),
@@ -633,10 +624,7 @@ mod tests {
             "SELECT grouping(a) FROM (VALUES (CAST(1 AS integer))) AS t (a) GROUP BY ROLLUP (a)",
             "SELECT x + 1 FROM (VALUES (CAST(1 AS integer))) AS t (x) ORDER BY 1",
         ] {
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
-                panic!("query")
-            };
+            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
             let (resolved, ctes, mut factory) =
                 crate::analyzer::analyze(query, &catalog, "default").unwrap();
             let fields = resolved.output_columns.clone();

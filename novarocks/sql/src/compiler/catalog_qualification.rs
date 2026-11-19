@@ -176,3 +176,47 @@ fn quoted_catalog<'a>(
     let instance = ConnectorInstanceId::try_from_canonical(&namespace.catalog).ok()?;
     Some((namespace, instance, authored))
 }
+
+#[cfg(test)]
+pub(crate) fn iceberg_metadata_qualifications_for_test(catalog: &str) -> CatalogQualifications {
+    let provider = ConnectorProviderId::parse("iceberg").unwrap();
+    let binding = novarocks_spi::connector::ConnectorProviderBinding::try_new(
+        provider.clone(),
+        catalog,
+        [51; 16],
+        "unit-test-binding",
+    )
+    .unwrap();
+    let binding = binding.binding_key().clone();
+    let mut qualifications = CatalogQualifications::default();
+    qualifications
+        .record(
+            binding.instance_id.clone(),
+            CatalogQualification::Ready { provider, binding },
+        )
+        .unwrap();
+    qualifications
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_quoted_iceberg_metadata_for_test(
+    name: &ObjectName,
+    current_catalog: Option<&str>,
+    database: &str,
+    provider: &dyn crate::catalog::IcebergMetadataTableProvider,
+) -> Option<crate::catalog::QuotedMetadataTable> {
+    let catalog = current_catalog.unwrap_or("ice");
+    let qualifications = iceberg_metadata_qualifications_for_test(catalog);
+    let found = qualifications.classify(name, Some(catalog), database)?;
+    let resolved = provider.get_iceberg_metadata_table(
+        Some(&found.relation.catalog),
+        &found.relation.namespace,
+        &found.relation.table,
+        found.kind.provider_kind(),
+    );
+    Some(crate::catalog::QuotedMetadataTable {
+        relation: found.relation,
+        kind: found.kind,
+        resolved,
+    })
+}

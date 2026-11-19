@@ -27,7 +27,6 @@ use novarocks_functions::{
     FunctionResultType, FunctionVolatility, ResolvedAggregateSignature, ResolvedFunctionBinding,
     ResolvedFunctionSignature,
 };
-use novarocks_parser::ast;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionKind, FunctionValueType,
     PureCompileControl, ValueLogicalType,
@@ -128,10 +127,7 @@ fn analyze(
     source: &SourceCatalog,
     functions: &dyn SqlFunctionCatalog,
 ) -> Result<ResolvedQuery, AnalyzeError> {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query");
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     super::analyze_with_function_catalog_and_sql_semantics(
         query,
         source,
@@ -189,7 +185,7 @@ fn window_canonical_lead_lag_offsets_preserve_original_sources_and_policy() {
     for nullable in [false, true] {
         for mode in ["32", "ERROR_IF_OVERFLOW"] {
             let sql = format!(
-                "SELECT /*+ SET_VAR(sql_mode='{mode}') */ lead(v,off64) OVER (PARTITION BY text ORDER BY v), lag(v,off64) OVER (ORDER BY v), off64, off64 FROM source"
+                "WITH SESSION sql_mode='{mode}' SELECT lead(v,off64) OVER (PARTITION BY text ORDER BY v), lag(v,off64) OVER (ORDER BY v), off64, off64 FROM source"
             );
             let query = analyze(
                 &sql,
@@ -879,10 +875,7 @@ fn complete_window_metadata_refuses_before_missing_names_or_catalog_lookup() {
         } else {
             "SELECT missing_function(missing_argument) OVER (ROWS CURRENT ROW) FROM missing_table"
         };
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [Statement::Query(query)] = statements.as_slice() else {
-            panic!("query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).unwrap();
         let mut query = query.clone();
         let span = query.span;
         let SetExpr::Select(select) = query.body.as_mut() else {

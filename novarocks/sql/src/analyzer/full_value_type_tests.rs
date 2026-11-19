@@ -106,10 +106,7 @@ impl PlannerTableProvider for SourceCatalog {
 }
 
 fn analyze(sql: &str) -> crate::analysis::ResolvedQuery {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("expected query");
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     super::analyze(query, &SourceCatalog, "default").unwrap().0
 }
 
@@ -220,7 +217,10 @@ fn explicit_largeint_and_typed_null_are_authored_by_syntax_not_carrier() {
 
 #[test]
 fn typed_empty_array_uses_the_original_unknown_constructor_and_complete_json_cast() {
-    for sql in ["SELECT ARRAY<JSON>[]", "SELECT CAST([] AS ARRAY<JSON>)"] {
+    for sql in [
+        "SELECT CAST([] AS ARRAY<JSON>)",
+        "SELECT CAST([] AS ARRAY<JSON>)",
+    ] {
         let resolved = analyze(sql);
         let QueryBody::Select(select) = resolved.body else {
             panic!("expected select");
@@ -474,10 +474,7 @@ fn round_and_truncate_decimal_result_is_the_exact_selected_binding() {
                 "SELECT round({arguments}) FROM \
                  (SELECT CAST(1.234 AS DECIMAL(18, 6)) AS decimal_value, 2 AS digits) source"
             );
-            let mut statements = novarocks_parser::parse(&sql).unwrap();
-            let [ast::Statement::Query(query)] = statements.as_mut_slice() else {
-                panic!("expected the decimal call query");
-            };
+            let query = &mut novarocks_parser::parser::parse_query(&sql).unwrap();
             if name == "truncate" {
                 // TRUNCATE is a statement keyword in the current parser. Rename
                 // only this call AST to isolate the analyzer contract regression.
@@ -680,11 +677,9 @@ fn same_spelling_custom_round_result_is_not_reauthored_by_analyzer() {
         )
         .unwrap();
     let catalog = builder.seal_bound().unwrap();
-    let statements =
-        novarocks_parser::parse("SELECT round(CAST(1.234 AS DECIMAL(18, 6)), 2)").unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("expected the custom round query");
-    };
+    let query =
+        &novarocks_parser::parser::parse_query("SELECT round(CAST(1.234 AS DECIMAL(18, 6)), 2)")
+            .unwrap();
     let resolved = super::analyze_with_function_catalog(
         query,
         &SourceCatalog,
@@ -788,7 +783,7 @@ fn mixed_case_and_typed_array_convert_actual_json_sources() {
     };
     assert_selected_conversion(&when_then[0].1, "json_text_same_structure/v1");
     for sql in [
-        "SELECT ARRAY<VARCHAR>[j] FROM source",
+        "SELECT CAST([j] AS ARRAY<VARCHAR>) FROM source",
         "SELECT CAST([j] AS ARRAY<VARCHAR>) FROM source",
     ] {
         let expression = projection(sql);
@@ -851,11 +846,9 @@ fn only_literal_null_is_declared_without_running_its_source() {
 
 #[test]
 fn hidden_conversion_cannot_be_selected_as_a_user_function() {
-    let statements =
-        novarocks_parser::parse("SELECT __value_domain_conversion(j) FROM source").unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("expected query");
-    };
+    let query =
+        &novarocks_parser::parser::parse_query("SELECT __value_domain_conversion(j) FROM source")
+            .unwrap();
     assert!(super::analyze(query, &SourceCatalog, "default").is_err());
 }
 
@@ -911,10 +904,8 @@ impl crate::compiler::SqlFunctionCatalog for MissingConversionPort {
 
 #[test]
 fn actual_request_catalog_missing_conversion_port_has_no_fallback() {
-    let statements = novarocks_parser::parse("SELECT CAST(j AS VARCHAR) FROM source").unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("expected query");
-    };
+    let query =
+        &novarocks_parser::parser::parse_query("SELECT CAST(j AS VARCHAR) FROM source").unwrap();
     let error = super::analyze_with_function_catalog(
         query,
         &SourceCatalog,
@@ -986,7 +977,7 @@ fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
         ),
     ] {
         let expression = projection(&format!(
-            "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ {cast}(ja_meta AS ARRAY<VARCHAR>) FROM source"
+            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT {cast}(ja_meta AS ARRAY<VARCHAR>) FROM source"
         ));
         let ExprKind::Cast {
             expr,
@@ -1205,14 +1196,11 @@ fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
 #[test]
 fn exact_value_conversion_call_inherits_query_sql_mode_policy() {
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-    let strict = "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */";
-    let relaxed = "/*+ SET_VAR(sql_mode=32) */";
-    for (outer, inner, policy) in [
-        (strict, relaxed, ReportError),
-        (relaxed, strict, OutputNull),
-    ] {
+    let strict = "WITH SESSION sql_mode='ERROR_IF_OVERFLOW'";
+    let relaxed = "WITH SESSION sql_mode=32";
+    for (outer, policy) in [(strict, ReportError), (relaxed, OutputNull)] {
         let sql = format!(
-            "SELECT {outer} CAST(q.j AS VARCHAR) AS x FROM (SELECT {inner} j,CAST(j AS VARCHAR) AS y FROM source) q"
+            "{outer} SELECT CAST(q.j AS VARCHAR) AS x FROM (SELECT j,CAST(j AS VARCHAR) AS y FROM source) q"
         );
         let query = analyze(&sql);
         let QueryBody::Select(select) = &query.body else {

@@ -16,11 +16,9 @@
 // under the License.
 
 //! Query-application session state and admitted property projections.
-use super::session_admit::SessionAdmitError;
 use crate::session_effects::SessionEffects;
 use crate::session_error::QueryServiceError;
 use crate::session_value::{SessionTimeZone, SessionValue, StatementSessionError};
-use novarocks_parser::ast;
 use novarocks_result_contract::ClientPresentationFamily;
 use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::naming::DEFAULT_DATABASE;
@@ -187,23 +185,6 @@ impl SessionSqlState {
             self.property_inputs,
         )
     }
-}
-
-/// GLOBAL is refused before lookup, including unknown property names.
-pub fn admit_session_set_assignment(
-    source: &str,
-    assignment: &ast::SetAssignment,
-) -> Result<(), QueryServiceError> {
-    if matches!(assignment.scope, ast::SetScope::Global) {
-        return Err(QueryServiceError::from_user_error(
-            SessionAdmitError::GlobalScopeUnsupported.to_user_error(
-                source,
-                assignment.span,
-                format!("SET GLOBAL {} is not supported", assignment.name.value),
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// The plan detail requested by the session. Execution profiling is a

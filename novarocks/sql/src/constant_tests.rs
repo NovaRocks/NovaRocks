@@ -925,7 +925,6 @@ fn analyzed_ordinary_integers_reach_actual_scalar_and_run_constant_carriers() {
         analysis::{ExprKind, QueryBody},
         constant::admit_syntax_constant_run,
     };
-    use novarocks_parser::ast::Statement;
     let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
     for (sql, expected, value) in [
         ("SELECT -2147483648", DataType::Int32, i64::from(i32::MIN)),
@@ -937,10 +936,7 @@ fn analyzed_ordinary_integers_reach_actual_scalar_and_run_constant_carriers() {
         ),
         ("SELECT -9223372036854775808", DataType::Int64, i64::MIN),
     ] {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let Statement::Query(query) = &statements[0] else {
-            panic!("query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).unwrap();
         let (resolved, _, _) = crate::analyzer::analyze(query, &catalog, "default").unwrap();
         let QueryBody::Select(select) = resolved.body else {
             panic!("select");

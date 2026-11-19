@@ -329,17 +329,14 @@ impl CatalogCompletionState {
             }
             // Invalid stored syntax belongs to the actual view-reference
             // analysis boundary, where its caller span is still available.
-            let Ok(statements) = novarocks_parser::parse(&view.raw_sql) else {
-                continue;
-            };
-            let [ast::Statement::Query(query)] = statements.as_slice() else {
+            let Ok(query) = novarocks_parser::parser::parse_query(&view.raw_sql) else {
                 continue;
             };
             // Stored definitions keep their original replay boundary. Their saved
             // SQL/context has no session-depth snapshot, so discovery must agree
             // with the view analyzer's default prepass rather than the caller's
             // recursive-depth override.
-            let Ok(query) = crate::analyzer::query_prepass::preanalyze(query.clone()) else {
+            let Ok(query) = crate::analyzer::query_prepass::preanalyze(query) else {
                 continue;
             };
             if let Some(qualifications) = fact.view_qualifications() {
@@ -600,10 +597,10 @@ impl<'a> CatalogNeedCollector<'a> {
         if let Some(offset) = &modifiers.offset {
             self.collect_expr(&offset.row_count, scope)?;
         }
-        if let Some(ast::QueryLimit::FetchFirst(fetch)) = &modifiers.limit {
-            if let Some(row_count) = &fetch.row_count {
-                self.collect_expr(row_count, scope)?;
-            }
+        if let Some(ast::QueryLimit::FetchFirst(fetch)) = &modifiers.limit
+            && let Some(row_count) = &fetch.row_count
+        {
+            self.collect_expr(row_count, scope)?;
         }
         Ok(())
     }
@@ -660,9 +657,6 @@ impl<'a> CatalogNeedCollector<'a> {
         self.collect_group_by(&select.group_by, scope)?;
         if let Some(having) = &select.having {
             self.collect_expr(having, scope)?;
-        }
-        if let Some(qualify) = &select.legacy.qualify {
-            self.collect_expr(qualify, scope)?;
         }
         for window in &select.windows {
             self.collect_window_spec(&window.specification, scope)?;
@@ -756,10 +750,6 @@ impl<'a> CatalogNeedCollector<'a> {
             ast::Relation::Table(node) => self.collect_table_node(node, scope),
             ast::Relation::TableSubquery(node) => self.collect_query(&node.query, scope),
             ast::Relation::Lateral(node) => self.collect_query(&node.query, scope),
-            ast::Relation::LegacyTableFunction(node) => {
-                self.collect_internal_table_function_need(&node.expr)?;
-                self.collect_expr(&node.expr, scope)
-            }
             ast::Relation::TableFunction(invocation) => {
                 self.collect_typed_internal_table_function_need(invocation)?;
                 for argument in &invocation.arguments {
@@ -892,7 +882,7 @@ impl<'a> CatalogNeedCollector<'a> {
         }
         let target = match metadata {
             Some(metadata) => {
-                let kind = match SqlMetadataTableKind::parse(&metadata.value) {
+                let kind = match SqlMetadataTableKind::parse(metadata.value) {
                     Ok(kind) => kind,
                     Err(_) if self.defer_semantic_refusals => {
                         return self.collect_table_decorations(version, scope);
@@ -975,35 +965,6 @@ impl<'a> CatalogNeedCollector<'a> {
             Some(error) => Err(error),
             None => Ok(()),
         }
-    }
-
-    fn collect_internal_table_function_need(
-        &mut self,
-        expression: &ast::Expr,
-    ) -> Result<(), SqlCompileError> {
-        let ast::Expr::FunctionCall(function) = expression else {
-            return Ok(());
-        };
-        let Some(name) = function.name.parts.last() else {
-            return Ok(());
-        };
-        if !name.value.eq_ignore_ascii_case("__nr_ivm_delta")
-            || function.processing_mode.is_some()
-            || function
-                .arguments
-                .iter()
-                .any(|argument| argument.name.is_some())
-        {
-            return Ok(());
-        }
-        let Some(ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::String(identity),
-            ..
-        })) = function.arguments.first().map(|argument| &argument.value)
-        else {
-            return Ok(());
-        };
-        self.collect_internal_table_identity(identity)
     }
 
     fn collect_internal_table_identity(&mut self, identity: &str) -> Result<(), SqlCompileError> {
@@ -1144,13 +1105,10 @@ pub fn quoted_metadata_catalogs_for_view(
     definition: &crate::catalog::SqlViewDefinition,
     control: &super::SqlCompileControl,
 ) -> Result<Vec<ConnectorInstanceId>, SqlCompileError> {
-    let Ok(statements) = novarocks_parser::parse(&definition.raw_sql) else {
+    let Ok(query) = novarocks_parser::parser::parse_query(&definition.raw_sql) else {
         return Ok(Vec::new());
     };
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        return Ok(Vec::new());
-    };
-    let Ok(query) = crate::analyzer::query_prepass::preanalyze(query.clone()) else {
+    let Ok(query) = crate::analyzer::query_prepass::preanalyze(query) else {
         return Ok(Vec::new());
     };
     quoted_metadata_catalogs_in_context(
@@ -1822,11 +1780,7 @@ mod tests {
     };
 
     fn parse_query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("query must parse");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected one query statement");
-        };
-        query.clone()
+        novarocks_parser::parser::parse_query(sql).expect("query must parse")
     }
 
     fn state(sql: &str) -> CatalogCompletionState {
@@ -1838,6 +1792,23 @@ mod tests {
             10,
         )
         .expect("catalog needs must collect")
+    }
+
+    fn quoted_metadata_state(sql: &str, catalog: &str) -> CatalogCompletionState {
+        use super::quoted_metadata_completion_tests::{observations, ready};
+        let qualifications = observations(catalog, ready("iceberg", catalog, 2));
+        CatalogCompletionState::try_new_with_qualifications(
+            novarocks_parser::parser::parse_query(sql).unwrap(),
+            &[],
+            &[],
+            Some("session_catalog"),
+            "session_db",
+            TableLookupMode::SchemaOnly,
+            10,
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            qualifications,
+        )
+        .expect("catalog needs must collect with the admitted Iceberg qualification")
     }
 
     #[test]
@@ -1886,7 +1857,7 @@ mod tests {
             }
         }
         let sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT x FROM n";
-        let hinted = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT /*+ SET_VAR(recursive_cte_max_depth = 4) */ x FROM n";
+        let hinted = "WITH SESSION recursive_cte_max_depth = 4 WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT x FROM n";
         let semantics =
             crate::sql_mode::SqlSemanticSettings::default().with_recursive_cte_max_depth(2);
         for (source, expected) in [(sql, 2), (hinted, 4)] {
@@ -2058,19 +2029,20 @@ mod tests {
 
     #[test]
     fn metadata_and_ordinary_lookups_are_distinct_and_each_is_deduplicated() {
-        let state = state(
-            "SELECT * FROM iceberg.prod.orders$files f1 \
-             JOIN iceberg.prod.orders$files f2 ON 1 = 1 \
-             JOIN iceberg.prod.orders o ON 1 = 1",
+        let state = quoted_metadata_state(
+            "SELECT * FROM iceberg.prod.\"orders$files\" f1 JOIN iceberg.prod.\"orders$files\" f2 ON 1 = 1 JOIN iceberg.prod.orders o ON 1 = 1",
+            "iceberg",
         );
         let identity = TableIdentity::new("iceberg", "prod", "orders");
         assert_eq!(state.needs().len(), 2);
-        assert!(keys(&state).contains(&CatalogFactKey::new(
-            identity.clone(),
-            CatalogLookupTarget::IcebergMetadata {
-                kind: SqlMetadataTableKind::Files,
-            },
-        )));
+        assert!(state.needs().iter().any(|need| {
+            need.relation() == &identity
+                && need.quoted_metadata_binding().is_some()
+                && need.target()
+                    == (CatalogLookupTarget::IcebergMetadata {
+                        kind: SqlMetadataTableKind::Files,
+                    })
+        }));
         assert!(keys(&state).contains(&CatalogFactKey::new(
             identity,
             CatalogLookupTarget::Table {
@@ -2081,10 +2053,9 @@ mod tests {
 
     #[test]
     fn partitions_view_and_files_share_one_exact_frozen_catalog_fact() {
-        let state = state(
-            "WITH orders AS (SELECT 1 AS content) \
-             SELECT * FROM orders$partitions p \
-             JOIN session_catalog.session_db.orders$files f ON 1 = 1",
+        let state = quoted_metadata_state(
+            "WITH orders AS (SELECT 1 AS content) SELECT * FROM \"orders$partitions\" p JOIN session_catalog.session_db.\"orders$files\" f ON 1 = 1",
+            "session_catalog",
         );
         assert_eq!(state.needs().len(), 1);
         let need = &state.needs()[0];
@@ -2108,11 +2079,22 @@ mod tests {
         let ScanSource::Sql(original_binding) = table.planner.source.clone();
         let fact = CatalogRelationFact::resolved(need, table).expect("exact Files fact");
         let catalog = state.fact_catalog(&[fact]).expect("frozen catalog");
-        let resolved = catalog
-            .get_iceberg_metadata_table(None, "session_db", "orders", SqlMetadataTableKind::Files)
-            .expect("the view consumes its frozen Files fact");
-        let ScanSource::Sql(resolved_source) = resolved.planner.source;
-        assert_eq!(resolved_source, original_binding);
+        for source in [
+            r#"TABLE "orders$partitions""#,
+            r#"TABLE session_catalog.session_db."orders$files""#,
+        ] {
+            let query = novarocks_parser::parser::parse_query(source).unwrap();
+            let ast::SetExpr::Table(table) = query.body.as_ref() else {
+                panic!("expected table query")
+            };
+            let resolved = catalog
+                .resolve_quoted_iceberg_metadata(&table.name, Some("session_catalog"), "session_db")
+                .expect("the authored name has an admitted Iceberg binding")
+                .resolved
+                .expect("the view consumes its frozen Files fact");
+            let ScanSource::Sql(resolved_source) = resolved.planner.source;
+            assert_eq!(resolved_source, original_binding);
+        }
         assert!(
             catalog
                 .get_iceberg_metadata_table(
@@ -2204,7 +2186,8 @@ mod tests {
 
     #[test]
     fn resolved_fact_must_match_ordinary_vs_metadata_scan_kind() {
-        let metadata_state = state("SELECT * FROM iceberg.prod.orders$entries");
+        let metadata_state =
+            quoted_metadata_state("SELECT * FROM iceberg.prod.\"orders$entries\"", "iceberg");
         let metadata_need = &metadata_state.needs()[0];
         let ordinary = resolved_table(
             metadata_need.relation(),
@@ -2228,7 +2211,8 @@ mod tests {
 
     #[test]
     fn metadata_fact_must_match_the_exact_requested_kind() {
-        let state = state("SELECT * FROM iceberg.prod.orders$entries");
+        let state =
+            quoted_metadata_state("SELECT * FROM iceberg.prod.\"orders$entries\"", "iceberg");
         let need = &state.needs()[0];
         let wrong_kind = resolved_table(
             need.relation(),

@@ -29,14 +29,18 @@ mod left_right {
         "/../../tests/sql/correctness/project/sql/project_string_int_argument_semantics.sql"
     ));
     fn check() {
-        let owner = sql_source(SQL, DataType::Int64);
+        let query = SQL
+            .trim()
+            .strip_suffix(';')
+            .expect("one terminated suite query");
+        let owner = sql_source(query, DataType::Int64);
         let mut count = 0;
         for fragment in owner.plan().fragments().values() {
             for (id, node) in fragment.expressions().iter() {
                 let ExprKind::FunctionCall { function, args } = &node.kind else {
                     continue;
                 };
-                if !["builtin.scalar/left/v1", "builtin.scalar/right/v1"]
+                if !["builtin.scalar/strleft/v1", "builtin.scalar/strright/v1"]
                     .contains(&function.function_id.as_str())
                 {
                     continue;

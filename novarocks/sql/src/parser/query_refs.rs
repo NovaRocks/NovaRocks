@@ -41,15 +41,11 @@ pub(crate) fn strip_catalog_from_three_part_names(query: &mut ast::Query) {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_parser::ast::Statement;
 
     use super::*;
 
     fn parse_query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse native SQL");
-        let [Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse native SQL");
         query.clone()
     }
 
@@ -61,7 +57,7 @@ mod tests {
         );
         strip_catalog_from_three_part_names(&mut query);
         assert_eq!(
-            novarocks_parser::printer::print_query(&query),
+            novarocks_parser::printer::print_query(&query).unwrap(),
             "WITH x AS (SELECT * FROM db.seed) SELECT (SELECT count(*) FROM db.t) FROM db.outer_t"
         );
     }

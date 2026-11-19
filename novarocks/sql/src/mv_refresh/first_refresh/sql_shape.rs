@@ -282,8 +282,11 @@ fn validate_reserved_projection_output_names(
                 column
                     .alias
                     .as_ref()
-                    .map(|alias| alias.value.clone())
-                    .unwrap_or_else(|| printer::print_expr(&column.expression)),
+                    .map_or_else(
+                        || printer::print_expression(&column.expression),
+                        |alias| Ok(alias.value.clone()),
+                    )
+                    .map_err(|error| error.to_string())?,
             ),
             ast::SelectItem::AllColumns(_) => None,
         };
@@ -643,10 +646,7 @@ mod tests {
     use super::*;
 
     fn parse_query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("fixture must be a query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         query.clone()
     }
 
@@ -733,12 +733,9 @@ mod tests {
                 _ => panic!("source Query boundary changed"),
             };
             assert_eq!(select.projection[0], source_select.projection[0]);
-            fn base(
-                relation: &ast::Relation,
-            ) -> (
-                &ast::Table,
-                Option<(&ast::Ident, &Option<Vec<ast::Ident>>, Span)>,
-            ) {
+            type RelationAlias<'a> = (&'a ast::Ident, &'a Option<Vec<ast::Ident>>, Span);
+
+            fn base(relation: &ast::Relation) -> (&ast::Table, Option<RelationAlias<'_>>) {
                 match relation {
                     ast::Relation::Table(table) => (table, None),
                     ast::Relation::Aliased(alias) => {

@@ -813,11 +813,7 @@ mod tests {
         }
 
         fn analyze(&self, sql: &str) -> ResolvedQuery {
-            let mut statements = novarocks_parser::parse(sql).expect("parse");
-            let Some(novarocks_parser::ast::Statement::Query(query)) = statements.pop() else {
-                panic!("expected query");
-            };
-            assert!(statements.is_empty(), "expected exactly one statement");
+            let query = novarocks_parser::parser::parse_query(sql).expect("parse");
             let (resolved, _registry, _factory) =
                 crate::analyzer::analyze(&query, &SingleLineageCatalog, "default")
                     .expect("analyze");
@@ -893,11 +889,7 @@ mod tests {
         }
 
         fn analyze(&self, sql: &str) -> ResolvedQuery {
-            let mut statements = novarocks_parser::parse(sql).expect("parse");
-            let Some(novarocks_parser::ast::Statement::Query(query)) = statements.pop() else {
-                panic!("expected query");
-            };
-            assert!(statements.is_empty(), "expected exactly one statement");
+            let query = novarocks_parser::parser::parse_query(sql).expect("parse");
             let (resolved, _registry, _factory) =
                 crate::analyzer::analyze(&query, &JoinLineageCatalog, "default").expect("analyze");
             resolved

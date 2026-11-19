@@ -25,8 +25,8 @@ use novarocks_sql::semantic::{
     CatalogSqlCommand, ObjectName, StatisticsSqlCommand,
     command::{
         AlterIcebergTableSqlCommand, ColumnPositionSql, CommandLiteral, IcebergColumnSqlAction,
-        IcebergPropertiesSqlAction, IcebergReferenceKindSql, IcebergReferenceSqlAction,
-        IcebergSchemaSqlChange, IcebergTableSqlAction,
+        IcebergReferenceKindSql, IcebergReferenceSqlAction, IcebergSchemaSqlChange,
+        IcebergTableSqlAction,
     },
 };
 use novarocks_type_contract::{CompilePhase, PureCompileControl};
@@ -221,9 +221,8 @@ pub fn lower_trino_table_comment(
         ));
     };
     let mut table = lower_object_name(&statement.name);
-    let value = CommandLiteral::String(comment.clone());
     let action = if statement.kind == ast::CommentKind::Table {
-        IcebergTableSqlAction::Properties(IcebergPropertiesSqlAction::Comment { value })
+        IcebergTableSqlAction::Comment(comment.clone())
     } else {
         let column = table
             .parts
@@ -232,7 +231,7 @@ pub fn lower_trino_table_comment(
             .ok_or_else(|| invalid_value("COMMENT ON COLUMN requires a table and a column"))?;
         IcebergTableSqlAction::Schema(IcebergSchemaSqlChange::AlterColumn {
             path: vec![column],
-            action: IcebergColumnSqlAction::Comment(value),
+            action: IcebergColumnSqlAction::Comment(CommandLiteral::String(comment.clone())),
         })
     };
     Ok(table_command(table, action))

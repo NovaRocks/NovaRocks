@@ -149,11 +149,10 @@ pub(in crate::planner::distributed::build) fn authored_lambda_source_for_test()
     // The real analyzer supplies the selected Lambda and LOWER declarations.
     // This emitter fixture does not assert an installed ARRAY_MAP pure kernel
     // or bypass the public compiler's implementation-presence admission.
-    let statements =
-        novarocks_parser::parse("SELECT ARRAY_MAP(x -> LOWER(x), ['AA','BB']) AS mapped").unwrap();
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("one Lambda query")
-    };
+    let query = &novarocks_parser::parser::parse_query(
+        "SELECT ARRAY_MAP(x -> LOWER(x), ['AA','BB']) AS mapped",
+    )
+    .unwrap();
     let (query, _, _) = crate::analyzer::analyze(
         query,
         &crate::catalog::memory::PlannerMemoryCatalog::default(),

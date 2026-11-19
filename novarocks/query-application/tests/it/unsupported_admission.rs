@@ -2,7 +2,7 @@
 
 //! The P09 statement gate uses the grammar coverage author's original samples.
 
-use novarocks_parser::{ast::TrinoStatement, trino_parser::parse_statement};
+use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
 use novarocks_query_application::{
     session_error::QueryServiceError,
     sql::{
@@ -261,7 +261,7 @@ fn each_pure_parsed_only_statement_witness_has_its_typed_gate() {
         exercised += 1;
     }
     assert_eq!(
-        exercised, 294,
+        exercised, 292,
         "reconcile the statement gate with the grammar ledger"
     );
 }

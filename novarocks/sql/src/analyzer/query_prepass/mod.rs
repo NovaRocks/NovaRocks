@@ -45,7 +45,7 @@ pub(crate) fn preanalyze(query: Query) -> Result<Query, AnalyzeError> {
     preanalyze_with_semantics(query, &crate::sql_mode::SqlSemanticSettings::default())
 }
 
-/// Unrolls with the statement hint, then the frozen session override, then the
+/// Unrolls with the statement session property, then the frozen session override, then the
 /// original default. The selected depth still uses the existing finite unroller.
 pub(crate) fn preanalyze_with_semantics(
     mut query: Query,
@@ -60,7 +60,6 @@ pub(crate) fn preanalyze_with_semantics(
         })
         .unwrap_or(crate::sql_mode::DEFAULT_RECURSIVE_CTE_MAX_DEPTH as usize);
     rewrite_nested_queries(&mut query, max_depth.max(1))?;
-    normalize_cross_joins(&mut query);
 
     remove_bare_top_level_dual(&mut query);
     Ok(query)
@@ -539,7 +538,6 @@ fn inline_iteration(
         selection: None,
         group_by: None,
         having: None,
-        legacy: ast::LegacySelectExtensions::default(),
         windows: ast::AstVec::new(),
         modifiers: Default::default(),
         span,
@@ -630,11 +628,8 @@ fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, ex
             if let Some(group_by) = &select.group_by {
                 visitor.visit_group_by(group_by);
             }
-            for expression in [&select.having, &select.legacy.qualify]
-                .into_iter()
-                .flatten()
-            {
-                visitor.visit_expr(expression);
+            if let Some(having) = &select.having {
+                visitor.visit_expr(having);
             }
             for window in &select.windows {
                 for expression in &window.specification.partition_by {
@@ -759,32 +754,6 @@ fn substitute_table_with_derived(
     *expr = substituter.fold_query(template).body.into_inner();
 }
 
-fn normalize_cross_joins(query: &mut Query) {
-    normalize_cross_set_expr(query.body.as_mut());
-    if let Some(with) = query.with.as_mut() {
-        for cte in &mut with.ctes {
-            normalize_cross_joins(cte.query.as_mut());
-        }
-    }
-}
-
-fn normalize_cross_set_expr(expr: &mut SetExpr) {
-    struct CrossNormalizer;
-    impl Fold for CrossNormalizer {
-        fn fold_relation(&mut self, relation: ast::Relation) -> ast::Relation {
-            let mut relation = ast::fold_relation(self, relation);
-            if let ast::Relation::Join(node) = &mut relation
-                && node.kind == ast::JoinType::Legacy(ast::legacy::JoinOperator::Cross)
-                && node.criteria.is_some()
-            {
-                node.kind = ast::JoinType::Legacy(ast::legacy::JoinOperator::InnerExplicit);
-            }
-            relation
-        }
-    }
-    *expr = ast::fold_set_expr(&mut CrossNormalizer, expr.clone());
-}
-
 fn remove_bare_top_level_dual(query: &mut Query) {
     let SetExpr::Select(select) = query.body.as_mut() else {
         return;
@@ -792,7 +761,6 @@ fn remove_bare_top_level_dual(query: &mut Query) {
     if select.selection.is_some()
         || select.group_by.is_some()
         || select.having.is_some()
-        || select.legacy.qualify.is_some()
         || !select.windows.is_empty()
         || !select.modifiers.is_empty()
         || query.modifiers.order_by.is_some()
@@ -818,14 +786,10 @@ fn remove_bare_top_level_dual(query: &mut Query) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::ast::{Statement, SyntaxEq};
+    use novarocks_parser::ast::SyntaxEq;
 
     fn parse_query(sql: &str) -> Query {
-        let mut statements = novarocks_parser::parse(sql).expect("typed query should parse");
-        match statements.remove(0) {
-            Statement::Query(query) => query,
-            other => panic!("expected query, got {other:?}"),
-        }
+        novarocks_parser::parser::parse_query(sql).expect("typed query should parse")
     }
 
     fn inline_function() -> novarocks_parser::ast::FunctionSpecification {
@@ -898,15 +862,15 @@ mod tests {
     }
 
     #[test]
-    fn recursive_depth_uses_hint_then_session_then_original_default() {
+    fn recursive_depth_uses_root_property_then_session_then_default() {
         let sql =
             "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n) SELECT x FROM n";
-        let hinted_sql = "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n) SELECT /*+ SET_VAR(recursive_cte_max_depth = 4) */ x FROM n";
+        let overridden_sql = "WITH SESSION recursive_cte_max_depth = 4 WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n) SELECT x FROM n";
         let session =
             crate::sql_mode::SqlSemanticSettings::default().with_recursive_cte_max_depth(2);
         for (source, semantics, expected_branches) in [
             (sql, session.clone(), 2),
-            (hinted_sql, session, 4),
+            (overridden_sql, session, 4),
             (sql, crate::sql_mode::SqlSemanticSettings::default(), 5),
         ] {
             let rewritten = preanalyze_with_semantics(parse_query(source), &semantics)
@@ -1043,20 +1007,17 @@ mod tests {
     }
 
     #[test]
-    fn cross_join_with_constraint_becomes_inner_join() {
-        let query = preanalyze(parse_query("SELECT * FROM a CROSS JOIN b ON a.id = b.id"))
-            .expect("prepass");
+    fn inner_join_keeps_constraint_during_prepass() {
+        let query = novarocks_parser::parser::parse_query("SELECT * FROM a JOIN b ON a.id = b.id")
+            .expect("parse an inner join");
+        let query = preanalyze(query).expect("prepass");
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select");
         };
-        assert_eq!(
-            {
-                let Some(ast::Relation::Join(join)) = &select.from else {
-                    panic!("Join")
-                };
-                join.kind
-            },
-            ast::JoinType::Legacy(ast::legacy::JoinOperator::InnerExplicit)
-        );
+        let Some(ast::Relation::Join(join)) = &select.from else {
+            panic!("expected join");
+        };
+        assert_eq!(join.kind, ast::JoinType::Inner);
+        assert!(matches!(join.criteria, Some(ast::JoinCriteria::On(_))));
     }
 }

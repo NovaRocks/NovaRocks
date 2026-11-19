@@ -29,7 +29,7 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 use crate::semantic::Literal;
-use novarocks_parser::{ast, printer};
+use novarocks_parser::ast;
 use novarocks_types::schema::{ColumnDefault, SqlType, validate_column_default};
 
 #[path = "literal_failure.rs"]
@@ -156,7 +156,6 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
         ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
             negate_literal(expr_to_literal(&unary.expression)?)
         }
-        ast::Expr::LegacyParenthesized(nested) => expr_to_literal(&nested.expression),
         // Handle CAST(expr AS type): peel the CAST and evaluate the inner literal,
         // EXCEPT for DECIMAL targets. CAST to a DECIMAL type carries an explicit
         // (precision, scale) that the literal fast-path ignores — it always writes
@@ -170,7 +169,7 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
             if cast_type_is_decimal(&cast.data_type) {
                 Err(LiteralFailure::rejected(format_args!(
                     "CAST to DECIMAL in INSERT SELECT requires pipeline evaluation: {}",
-                    printer::print_expr(expr)
+                    crate::parser::expression_for_diagnostic(expr)
                 )))
             } else {
                 expr_to_literal(&cast.expression)
@@ -203,7 +202,7 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
                 }
                 _ => Err(LiteralFailure::rejected(format_args!(
                     "unsupported expression in INSERT VALUES: {}",
-                    printer::print_expr(expr)
+                    crate::parser::expression_for_diagnostic(expr)
                 ))),
             }
         }
@@ -225,7 +224,7 @@ pub fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, LiteralFailure> {
         )),
         _ => Err(LiteralFailure::rejected(format_args!(
             "unsupported expression in INSERT VALUES: {}",
-            printer::print_expr(expr)
+            crate::parser::expression_for_diagnostic(expr)
         ))),
     }
 }
@@ -772,7 +771,9 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, L
         }
         _ => Err(LiteralFailure::rejected(format_args!(
             "unsupported expression in INSERT VALUES: {}",
-            printer::print_expr(&ast::Expr::FunctionCall(ast::AstBox::new(func.clone())))
+            crate::parser::expression_for_diagnostic(&ast::Expr::FunctionCall(ast::AstBox::new(
+                func.clone()
+            )))
         ))),
     }
 }
@@ -831,7 +832,6 @@ fn parse_single_arrow_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)> {
             .arguments
             .first()
             .map(|argument| (argument.name.value.to_lowercase(), &lambda.body)),
-        ast::Expr::LegacyParenthesized(nested) => parse_single_arrow_lambda(&nested.expression),
         _ => None,
     }
 }
@@ -841,9 +841,6 @@ fn lambda_body_casts_param_to_string(
     param_name: &str,
 ) -> Result<bool, LiteralFailure> {
     match expr {
-        ast::Expr::LegacyParenthesized(nested) => {
-            lambda_body_casts_param_to_string(&nested.expression, param_name)
-        }
         ast::Expr::Cast(cast) if lambda_expr_is_param(&cast.expression, param_name) => {
             let sql_type = type_name_to_sql_type(&cast.data_type)?;
             Ok(matches!(sql_type, SqlType::String))
@@ -855,9 +852,6 @@ fn lambda_body_casts_param_to_string(
 fn lambda_expr_is_param(expr: &ast::Expr, param_name: &str) -> bool {
     match expr {
         ast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(param_name),
-        ast::Expr::LegacyParenthesized(nested) => {
-            lambda_expr_is_param(&nested.expression, param_name)
-        }
         _ => false,
     }
 }
@@ -1544,11 +1538,8 @@ mod tests {
     }
 
     fn parse_expr(sql: &str) -> novarocks_parser::ast::Expr {
-        let statements =
-            novarocks_parser::parse(&format!("SELECT {sql}")).expect("parse expression query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
+        let query = &novarocks_parser::parser::parse_query(&format!("SELECT {sql}"))
+            .expect("parse expression query");
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select");
         };
@@ -2053,8 +2044,7 @@ mod source_failure_tests {
     use novarocks_failure_contract::{FailureClass, FailureProjection};
     use std::error::Error;
     fn fold(source: &str) -> Result<Literal, LiteralFailure> {
-        let tokens = novarocks_parser::lex(source).unwrap();
-        let expr = novarocks_parser::parser::parse_expression(source, &tokens).unwrap();
+        let expr = novarocks_parser::parser::parse_expression(source).unwrap();
         expr_to_literal(&expr)
     }
     #[test]
@@ -2153,9 +2143,7 @@ mod source_failure_tests {
             "CAST(1 AS DECIMAL(38,256))",
             "CAST(1 AS DECIMAL(39,0))",
         ] {
-            let tokens = novarocks_parser::lex(sql).unwrap();
-            let ast::Expr::Cast(expr) =
-                novarocks_parser::parser::parse_expression(sql, &tokens).unwrap()
+            let ast::Expr::Cast(expr) = novarocks_parser::parser::parse_expression(sql).unwrap()
             else {
                 panic!("actual CAST source");
             };
@@ -2176,8 +2164,7 @@ mod source_failure_tests {
                 Literal::String(bytes_to_latin1_string(&[0, 255])),
             ),
         ] {
-            let tokens = novarocks_parser::lex(source).unwrap();
-            let expression = novarocks_parser::parser::parse_expression(source, &tokens).unwrap();
+            let expression = novarocks_parser::parser::parse_expression(source).unwrap();
             assert_eq!(expr_to_literal(&expression).unwrap(), expected, "{source}");
         }
         let unknown = ast::Expr::Literal(ast::Literal {

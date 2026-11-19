@@ -89,21 +89,28 @@ impl SqlMode {
 
     /// Interpret a parser-admitted value without evaluating arbitrary SQL.
     /// Unconsumed expressions remain intact, as they were before this feature.
-    pub fn from_expression(value: &ast::Expr) -> Self {
+    pub fn from_expression(value: &ast::Expr) -> Result<Self, crate::analyze_error::AnalyzeError> {
+        fn render_assignment(
+            value: &ast::Expr,
+        ) -> Result<String, crate::analyze_error::AnalyzeError> {
+            novarocks_parser::printer::print_expression(value).map_err(|error| {
+                crate::analyze_error::AnalyzeError::invalid_argument(
+                    error.to_string(),
+                    value.span(),
+                )
+            })
+        }
         let value = match value {
             ast::Expr::Literal(literal) => match &literal.kind {
                 ast::LiteralKind::String(value) | ast::LiteralKind::Decimal(value) => value.clone(),
                 ast::LiteralKind::Long { parsed_value, .. } => parsed_value.to_string(),
                 ast::LiteralKind::Double(value) => value.get().to_string(),
-                _ => novarocks_parser::printer::print_expr(value),
+                _ => render_assignment(value)?,
             },
             ast::Expr::Identifier(name) => name.value.clone(),
-            ast::Expr::LegacyParenthesized(nested) => {
-                return Self::from_expression(&nested.expression);
-            }
-            _ => novarocks_parser::printer::print_expr(value),
+            _ => render_assignment(value)?,
         };
-        Self::from_assignment(&value)
+        Ok(Self::from_assignment(&value))
     }
 }
 
@@ -170,7 +177,6 @@ fn decimal_flag(value: &ast::Expr) -> Result<bool, crate::analyze_error::Analyze
             _ => "",
         },
         ast::Expr::Identifier(name) => name.value.as_str(),
-        ast::Expr::LegacyParenthesized(nested) => return decimal_flag(&nested.expression),
         _ => "",
     };
     match text.trim().to_ascii_lowercase().as_str() {
@@ -195,7 +201,7 @@ pub fn query_sql_semantics(
             continue;
         };
         if name.value.eq_ignore_ascii_case("sql_mode") {
-            settings = settings.with_sql_mode(SqlMode::from_expression(&property.value));
+            settings = settings.with_sql_mode(SqlMode::from_expression(&property.value)?);
         } else if name
             .value
             .eq_ignore_ascii_case("decimal_overflow_to_double")
@@ -210,14 +216,18 @@ pub fn query_sql_semantics(
 /// This returns an owned setting and never mutates connection state.
 pub fn statement_sql_semantics(
     session: &SqlSemanticSettings,
-    statement: &ast::Statement,
+    statement: &ast::TrinoStatement,
 ) -> Result<SqlSemanticSettings, crate::analyze_error::AnalyzeError> {
-    let query: Option<&ast::Query> = match statement {
-        ast::Statement::Query(query) => Some(query),
-        ast::Statement::ExplainQuery(explain) => Some(&explain.query),
-        ast::Statement::Dml(ast::DmlStatement::Insert(insert)) => Some(&insert.source),
-        ast::Statement::Dml(ast::DmlStatement::CreateTableAsSelect(ctas)) => Some(&ctas.query),
-        _ => None,
+    let mut source = statement;
+    let query = loop {
+        match source {
+            ast::TrinoStatement::Query(query) => break Some(query),
+            ast::TrinoStatement::Explain(explain) => source = &explain.statement,
+            ast::TrinoStatement::ExplainAnalyze(explain) => source = &explain.statement,
+            ast::TrinoStatement::Insert(insert) => break Some(&*insert.query),
+            ast::TrinoStatement::CreateTableAsSelect(ctas) => break Some(&*ctas.query),
+            _ => break None,
+        }
     };
     query.map_or_else(
         || Ok(session.clone()),
@@ -416,20 +426,12 @@ mod tests {
     }
 
     fn query(sql: &str) -> ast::Query {
-        let mut statements = novarocks_parser::parse(sql).expect("fixture parses");
-        let ast::Statement::Query(query) = statements.remove(0) else {
-            panic!("query");
-        };
-        query
+        novarocks_parser::parser::parse_query(sql).expect("fixture parses")
     }
 
     // Author query-level facts explicitly; UNION branches never grant them.
     fn query_with_assignments(sql: &str, assignments: &str) -> ast::Query {
-        let mut value = query(sql);
-        let assignment_source = query(&format!("SELECT /*+ SET_VAR({assignments}) */ 1"));
-        assert!(!assignment_source.session_properties.is_empty());
-        value.session_properties = assignment_source.session_properties;
-        value
+        query(&format!("WITH SESSION {assignments} {sql}"))
     }
 
     fn calls(query: &ast::Query) -> Vec<ast::FunctionCall> {
@@ -487,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_replay_rejects_legacy_caller_and_stored_legacy_hint() {
+    fn persisted_replay_rejects_legacy_caller_and_stored_legacy_mode() {
         let modern = semantics("32");
         let legacy = semantics("GROUP_CONCAT_LEGACY");
         assert!(validate_persisted_query_semantics(&query("SELECT 1"), &modern).is_ok());
@@ -496,7 +498,7 @@ mod tests {
                 .unwrap_err()
                 .starts_with("Unsupported:")
         );
-        let stored = query("SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1");
+        let stored = query("WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT 1");
         assert!(validate_persisted_query_semantics(&stored, &modern).is_err());
         assert_eq!(modern.sql_mode().assignment(), "32");
         assert_eq!(legacy.sql_mode().assignment(), "GROUP_CONCAT_LEGACY");
@@ -537,10 +539,11 @@ mod tests {
 
     #[test]
     fn last_sql_mode_assignment_wins_without_mutating_session() {
+        let query = |sql: &str| novarocks_parser::parser::parse_query(sql).expect("fixture parses");
         let session = semantics("GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION");
         for sql in [
-            "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ /*+ SET_VAR(sql_mode=32) */ 1",
-            "SELECT /*+ SET_VAR('sql_mode'='68719476736', sql_mode='32') */ 1",
+            "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY', sql_mode = 32 SELECT 1",
+            "WITH SESSION sql_mode = '68719476736', sql_mode = '32' SELECT 1",
         ] {
             let effective = query_sql_semantics(&session, &query(sql)).unwrap();
             assert!(!effective.sql_mode().group_concat_legacy());
@@ -548,7 +551,7 @@ mod tests {
         }
         let effective = query_sql_semantics(
             &SqlSemanticSettings::default(),
-            &query("SELECT /*+ SET_VAR(sql_mode=68719477248) */ /*+ SET_VAR(query_timeout=1) */ 1"),
+            &query("WITH SESSION sql_mode = 68719477248, query_timeout = 1 SELECT 1"),
         )
         .unwrap();
         assert!(effective.sql_mode().group_concat_legacy());
@@ -564,7 +567,7 @@ mod tests {
             assert!(
                 query_sql_semantics(
                     &SqlSemanticSettings::default(),
-                    &query(&format!("SELECT /*+ SET_VAR('sql_mode'={value}) */ 1"))
+                    &query(&format!("WITH SESSION sql_mode = {value} SELECT 1"))
                 )
                 .unwrap()
                 .sql_mode()
@@ -592,7 +595,7 @@ mod tests {
         );
         for mode in ["32", "GROUP_CONCAT_LEGACY"] {
             assert_eq!(
-                display("SELECT group_concat(v,'-' ORDER BY id SEPARATOR '|')", mode),
+                display("SELECT string_agg(v,'-' \n,\n '|'\nORDER BY id \n)", mode),
                 "group_concat(v,'-' ORDER BY id ASC SEPARATOR '|')"
             );
             assert_eq!(
@@ -675,16 +678,16 @@ mod tests {
     }
 
     #[test]
-    fn statement_admission_freezes_select_explain_insert_and_ctas_overrides() {
+    fn statement_admission_freezes_root_query_overrides() {
         let session = semantics("GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION");
         for sql in [
-            "SELECT /*+ SET_VAR(sql_mode=32) */ group_concat('a','-')",
-            "EXPLAIN SELECT /*+ SET_VAR(sql_mode=32) */ group_concat('a','-')",
-            "INSERT INTO t SELECT /*+ SET_VAR(sql_mode=32) */ group_concat('a','-')",
-            "CREATE TABLE t AS SELECT /*+ SET_VAR(sql_mode=32) */ group_concat('a','-')",
+            "WITH SESSION sql_mode = 32 SELECT group_concat('a','-')",
+            "EXPLAIN WITH SESSION sql_mode = 32  SELECT group_concat('a','-')",
+            "EXPLAIN ANALYZE WITH SESSION sql_mode = 32 SELECT group_concat('a','-')",
         ] {
-            let statements = novarocks_parser::parse(sql).expect("statement parses");
-            let effective = statement_sql_semantics(&session, &statements[0]).unwrap();
+            let statement =
+                novarocks_parser::parser::parse_statement(sql).expect("statement parses");
+            let effective = statement_sql_semantics(&session, &statement).unwrap();
             assert!(!effective.sql_mode().group_concat_legacy());
             assert!(!effective.sql_mode().allow_throw_exception());
         }
@@ -715,9 +718,10 @@ mod tests {
             let actual = collected
                 .iter()
                 .map(|call| {
-                    novarocks_parser::printer::print_expr(
+                    novarocks_parser::printer::print_expression(
                         &call.arguments.last().expect("canonical separator").value,
                     )
+                    .unwrap()
                 })
                 .collect::<Vec<_>>();
             assert_eq!(actual, separators);
@@ -760,7 +764,7 @@ mod tests {
             assert!(resolved.sql_mode().group_concat_legacy());
         }
         let value = query_sql_semantics(&session, &query(
-            "SELECT /*+ SET_VAR(sql_mode=32,decimal_overflow_to_double=0) */ /*+ SET_VAR(decimal_overflow_to_double=1) */ 1"
+            "WITH SESSION sql_mode = 32, decimal_overflow_to_double = 0, decimal_overflow_to_double = 1 SELECT 1"
         )).unwrap();
         assert!(value.decimal_overflow_to_double());
         assert!(!value.sql_mode().group_concat_legacy());
@@ -775,7 +779,7 @@ mod tests {
             assert_eq!(error.code().as_str(), "sql.analyze.invalid_argument");
             assert!(error.span().is_some());
             let error =
-                statement_sql_semantics(&session, &ast::Statement::Query(query)).unwrap_err();
+                statement_sql_semantics(&session, &ast::TrinoStatement::Query(query)).unwrap_err();
             assert_eq!(error.code().as_str(), "sql.analyze.invalid_argument");
             assert!(error.span().is_some());
         }

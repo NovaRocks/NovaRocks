@@ -85,7 +85,7 @@ mod result_declaration {
     fn numeric_unary_public_transport_observed_receipt_preserves_first_control_cause() {
         let label = "x".repeat(700);
         let source = nonnull_source(
-            &format!("SELECT -k AS `{label}` FROM fixture"),
+            &format!(r#"SELECT -k AS "{label}" FROM fixture"#),
             DataType::Int8,
         );
         let ok = Trace {
