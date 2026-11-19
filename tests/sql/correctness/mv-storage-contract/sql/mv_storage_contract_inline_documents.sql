@@ -242,7 +242,7 @@ REFRESH MATERIALIZED VIEW oversized_mv FULL WITH SYNC MODE;
 -- query 13
 -- @skip_result_check=true
 -- @result_contains=OVERSIZED_CONTENT_OK
-SELECT CASE WHEN COUNT(*) = 740
+SELECT CASE WHEN COUNT() = 740
   AND SUM(CASE WHEN k = 'east' THEN 1 ELSE 0 END) = 370
   AND SUM(CASE WHEN k = 'west' THEN 1 ELSE 0 END) = 370
   AND SUM(CASE WHEN k = 'east' AND LENGTH(wide_value) = 16388 THEN 1 ELSE 0 END) = 1
@@ -252,7 +252,7 @@ SELECT CASE WHEN COUNT(*) = 740
   AND SUM(LENGTH(wide_value)) = 35728
   AND SUM(CASE WHEN c01 = k AND c02 = k AND c03 = k AND c04 = k
     AND c05 = k AND c06 = k AND c07 = k AND c08 = k
-    AND LEFT(wide_value, 4) = k
+    AND STRLEFT(wide_value, 4) = k
     AND LENGTH(REPLACE(SUBSTR(wide_value, 5), 'x', '')) = 0
     THEN 0 ELSE 1 END) = 0
   THEN 'OVERSIZED_CONTENT_OK' ELSE 'OVERSIZED_CONTENT_BAD' END AS content_check
@@ -268,7 +268,7 @@ SELECT 1;
 -- @retry_interval_ms=500
 -- @skip_result_check=true
 -- @result_contains=OVERSIZED_CONTENT_OK
-SELECT CASE WHEN COUNT(*) = 740
+SELECT CASE WHEN COUNT() = 740
   AND SUM(CASE WHEN k = 'east' THEN 1 ELSE 0 END) = 370
   AND SUM(CASE WHEN k = 'west' THEN 1 ELSE 0 END) = 370
   AND SUM(CASE WHEN k = 'east' AND LENGTH(wide_value) = 16388 THEN 1 ELSE 0 END) = 1
@@ -278,7 +278,7 @@ SELECT CASE WHEN COUNT(*) = 740
   AND SUM(LENGTH(wide_value)) = 35728
   AND SUM(CASE WHEN c01 = k AND c02 = k AND c03 = k AND c04 = k
     AND c05 = k AND c06 = k AND c07 = k AND c08 = k
-    AND LEFT(wide_value, 4) = k
+    AND STRLEFT(wide_value, 4) = k
     AND LENGTH(REPLACE(SUBSTR(wide_value, 5), 'x', '')) = 0
     THEN 0 ELSE 1 END) = 0
   THEN 'OVERSIZED_CONTENT_OK' ELSE 'OVERSIZED_CONTENT_BAD' END AS content_check
@@ -294,7 +294,7 @@ SELECT 1;
 -- @retry_interval_ms=500
 -- @skip_result_check=true
 -- @result_contains=OVERSIZED_CONTENT_OK
-SELECT CASE WHEN COUNT(*) = 740
+SELECT CASE WHEN COUNT() = 740
   AND SUM(CASE WHEN k = 'east' THEN 1 ELSE 0 END) = 370
   AND SUM(CASE WHEN k = 'west' THEN 1 ELSE 0 END) = 370
   AND SUM(CASE WHEN k = 'east' AND LENGTH(wide_value) = 16388 THEN 1 ELSE 0 END) = 1
@@ -304,7 +304,7 @@ SELECT CASE WHEN COUNT(*) = 740
   AND SUM(LENGTH(wide_value)) = 35728
   AND SUM(CASE WHEN c01 = k AND c02 = k AND c03 = k AND c04 = k
     AND c05 = k AND c06 = k AND c07 = k AND c08 = k
-    AND LEFT(wide_value, 4) = k
+    AND STRLEFT(wide_value, 4) = k
     AND LENGTH(REPLACE(SUBSTR(wide_value, 5), 'x', '')) = 0
     THEN 0 ELSE 1 END) = 0
   THEN 'OVERSIZED_CONTENT_OK' ELSE 'OVERSIZED_CONTENT_BAD' END AS content_check
@@ -330,7 +330,7 @@ REFRESH MATERIALIZED VIEW oversized_mv FULL WITH SYNC MODE;
 -- query 21
 -- @skip_result_check=true
 -- @result_contains=OVERSIZED_CONTENT_OK
-SELECT CASE WHEN COUNT(*) = 740
+SELECT CASE WHEN COUNT() = 740
   AND SUM(CASE WHEN k = 'east' THEN 1 ELSE 0 END) = 370
   AND SUM(CASE WHEN k = 'west' THEN 1 ELSE 0 END) = 370
   AND SUM(CASE WHEN k = 'east' AND LENGTH(wide_value) = 16388 THEN 1 ELSE 0 END) = 1
@@ -340,7 +340,7 @@ SELECT CASE WHEN COUNT(*) = 740
   AND SUM(LENGTH(wide_value)) = 35728
   AND SUM(CASE WHEN c01 = k AND c02 = k AND c03 = k AND c04 = k
     AND c05 = k AND c06 = k AND c07 = k AND c08 = k
-    AND LEFT(wide_value, 4) = k
+    AND STRLEFT(wide_value, 4) = k
     AND LENGTH(REPLACE(SUBSTR(wide_value, 5), 'x', '')) = 0
     THEN 0 ELSE 1 END) = 0
   THEN 'OVERSIZED_CONTENT_OK' ELSE 'OVERSIZED_CONTENT_BAD' END AS content_check
