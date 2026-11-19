@@ -1111,10 +1111,15 @@ fn double_text(value: f64, work: &mut EvaluationCheckpoints<'_>) -> Result<Strin
         // The legacy converter's upper logarithm estimate affects the two
         // smallest decimal decades: a leading zero can round into the next
         // exponent. Replacing it with exact floor(log10) changes those values.
+        #[expect(
+            clippy::approx_constant,
+            reason = "The legacy converter uses this rounded coefficient for its exponent estimate"
+        )]
+        const LEGACY_LOG10_2: f64 = 0.301029995663981;
         let normalized = f64::from_bits((1023_u64 << 52) | (fraction & ((1_u64 << 52) - 1)));
         decimal_exp = ((normalized - 1.5) * 0.289529654
             + 0.176091259
-            + f64::from(binary_exp) * 0.301029995663981)
+            + f64::from(binary_exp) * LEGACY_LOG10_2)
             .floor() as i32;
         // An exact value ratio and the legacy converter's symmetric margin.
         // At powers of two the legacy margin halves again; that behavior and
@@ -1156,7 +1161,7 @@ fn double_text(value: f64, work: &mut EvaluationCheckpoints<'_>) -> Result<Strin
                 digits[count] = q;
                 count += 1;
             }
-            let force_second = first && (decimal_exp < -3 || decimal_exp >= 8);
+            let force_second = first && !(-3..8).contains(&decimal_exp);
             first = false;
             if !force_second && (low || high) {
                 let round_up = if high && low {

@@ -432,7 +432,7 @@ fn rescale_coefficient(
         // Trino rescale uses HALF_UP, including negative half ties. The sign
         // is restored only after rounding the exact unsigned magnitude.
         if remainder << 1_u8 >= factor {
-            magnitude = magnitude + i256::ONE;
+            magnitude += i256::ONE;
         }
     }
     if magnitude >= i256::from_parts(10_u128.pow(u32::from(target_precision)), 0) {
@@ -500,7 +500,8 @@ fn shortest_integer_decimal(value: f64) -> u128 {
             (false, true) => upper,
             (true, true) => {
                 let upper_distance = unit - remainder;
-                if remainder < upper_distance || (remainder == upper_distance && quotient % 2 == 0)
+                if remainder < upper_distance
+                    || (remainder == upper_distance && quotient.is_multiple_of(2))
                 {
                     lower
                 } else {
@@ -553,7 +554,9 @@ fn decimal_to_float_bits(value: i128, scale: u8, width: FloatWidth) -> u64 {
         .to_i128()
         .expect("decimal float quotient fits 53 bits") as u64;
     let doubled_remainder = remainder << 1_u8;
-    if doubled_remainder > divisor || (doubled_remainder == divisor && significand % 2 != 0) {
+    if doubled_remainder > divisor
+        || (doubled_remainder == divisor && !significand.is_multiple_of(2))
+    {
         significand += 1;
     }
     let sign = u64::from(value < 0) << (fraction_bits + exponent_bits);

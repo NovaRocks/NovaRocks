@@ -269,14 +269,14 @@ impl ProgramTypedExpressions {
                             else {
                                 return Err(ProgramExpressionTypeError::WrongKind.into());
                             };
-                            if let Some(mode) = array_failure_mode {
-                                if *operation != novarocks_functions::CastOperation::Carrier
+                            if let Some(mode) = array_failure_mode
+                                && (*operation != novarocks_functions::CastOperation::Carrier
                                     || !novarocks_type_contract::array_cast_mode_types_valid_observed(
                                         source, value, *mode,
                                         || work.step().map_err(ProgramExpressionTypeError::Control),
-                                    )? {
-                                    return Err(ProgramExpressionTypeError::TypeMismatch.into());
-                                }
+                                    )?)
+                            {
+                                return Err(ProgramExpressionTypeError::TypeMismatch.into());
                             }
                             if ((source.nullable() || *source.data_type() == arrow_schema::DataType::Null) && !value.nullable())
                                 || (array_failure_mode.is_none()
