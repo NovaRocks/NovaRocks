@@ -1187,13 +1187,19 @@ async fn run_activation_drop_child(fault: crate::fixtures::native_recipe::Activa
     // exit receipt, change Core phase or terminate a Work future.
     gate.release();
     let logical_exit = original.logical.exit.as_ref().unwrap();
+    let probe = &original.logical.probe;
     let exited = drive_until_with_original_clock(
         &original.process,
         &mut original.joint,
         async {
             loop {
                 let native_returned = logical_exit.view().unwrap().pending_native_returns() == 0;
-                if native_returned && *installed.fixture_exit.observe_actual_exit().borrow() {
+                // The active return and AP exit can be visible before the
+                // failure supervisor calls the separate dormant destructor.
+                if native_returned
+                    && *installed.fixture_exit.observe_actual_exit().borrow()
+                    && probe.activation_drop_observation().dormant_drops != 0
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1205,7 +1211,7 @@ async fn run_activation_drop_child(fault: crate::fixtures::native_recipe::Activa
     .await;
     assert!(
         exited.is_some(),
-        "same actual AP exit and Native return remain unproven"
+        "actual AP exit, Native return, or dormant destructor remains unobserved"
     );
     let port_exit = novarocks_query_application::api::NativeInstalledAttemptPort::resources_exited(
         original.logical.binding.as_ref(),
@@ -1224,7 +1230,7 @@ async fn run_activation_drop_child(fault: crate::fixtures::native_recipe::Activa
             novarocks_query_application::coordination::LocalExecutionDisposition::OriginalPaidOwnerReturn
         ));
     }
-    let causes = original.logical.probe.activation_drop_observation();
+    let causes = probe.activation_drop_observation();
     assert_eq!(causes.activation_calls, 1, "no ordinary activation retry");
     assert_eq!(causes.returned, 1);
     assert_eq!(causes.future_drops, 1);
