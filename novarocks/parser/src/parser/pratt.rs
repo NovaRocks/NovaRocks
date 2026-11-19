@@ -982,7 +982,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     }),
                 ));
             }
-            let expression = self.parse_binding_power_frame(binding.precedence)?;
+            let expression = self.parse_deferred_binding_power(binding.precedence)?;
+            let expression = match binding.operator {
+                UnaryOperator::Plus | UnaryOperator::Minus => expression.commit_computed_operand(),
+                _ => expression.keep_parentheses(),
+            };
             let span = Span::new(start, expression.legacy_metadata_span.end());
             return Ok(ParsedExpression::authored(
                 Expr::Unary(UnaryExpr {
@@ -1391,7 +1395,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
         self.advance();
         self.skip_trivia();
-        let expr = self.parse_binding_power(0)?;
+        let expr = self
+            .parse_deferred_binding_power(0)?
+            .commit_computed_operand()
+            .expression;
         if !self.current_is_keyword(Keyword::As) {
             return Err(self.unexpected("AS in CAST expression"));
         }
@@ -3687,6 +3694,26 @@ mod tests {
     }
 
     #[test]
+    fn arithmetic_unary_and_cast_keep_computed_structure_without_legacy_parentheses() {
+        use crate::ast::{BinaryOperator, Expr, SyntaxEq};
+
+        for source in ["-(a+b)", "+(a+b)", "CAST((a+b) AS BIGINT)"] {
+            let tree = parse_expression(source, &lex(source).unwrap()).unwrap();
+            let child = match &tree {
+                Expr::Unary(node) => &node.expression,
+                Expr::Cast(node) => &node.expression,
+                _ => panic!("computed operand owner"),
+            };
+            assert!(
+                matches!(child, Expr::Binary(sum) if sum.operator == BinaryOperator::Add)
+            );
+            let canonical = crate::printer::print_expr(&tree);
+            let reparsed = parse_expression(&canonical, &lex(&canonical).unwrap()).unwrap();
+            assert!(tree.syntax_eq(&reparsed), "{canonical}");
+        }
+    }
+
+    #[test]
     fn unknown_parents_and_noncomputed_roots_keep_original_parentheses() {
         use crate::ast::{Expr, Predicate};
         for source in [
@@ -3707,8 +3734,9 @@ mod tests {
         }
         for source in [
             "f((a+b))",
-            "-(a+b)",
-            "+(a+b)",
+            "-(a)",
+            "+(f(a))",
+            "~(a+b)",
             "(a+b).field",
             "(a+b)=c",
             "a||(b+c)",
