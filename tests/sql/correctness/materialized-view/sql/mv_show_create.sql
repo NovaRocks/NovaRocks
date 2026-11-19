@@ -24,6 +24,7 @@ CREATE TABLE ${case_db}.show_create_base (
   id integer NOT NULL,
   value bigint
 ) WITH (format_version = 3);
+INSERT INTO ${case_db}.show_create_base VALUES ROW(1, 10);
 CREATE MATERIALIZED VIEW ${case_db}.show_create_mv
 WITH (partitioning = ARRAY['id'], refresh_policy = 'MANUAL', gc_enabled = false)
 AS SELECT /* saved query body */ id,  value
@@ -35,10 +36,10 @@ FROM ${case_db}.show_create_base;
 -- @result_contains=CREATE MATERIALIZED VIEW
 -- @result_contains=format = 'PARQUET'
 -- @result_contains=format_version = 3
--- @result_contains=gc_enabled = false
+-- @result_contains=gc_enabled = FALSE
 -- @result_contains=partitioning = ARRAY['id']
 -- @result_contains=refresh_policy = 'MANUAL'
--- @result_contains=refresh_paused = false
+-- @result_contains=refresh_paused = FALSE
 -- @result_contains=SELECT /* saved query body */ id,  value
 -- @result_not_contains=extra_properties
 SHOW CREATE MATERIALIZED VIEW ${case_db}.show_create_mv;
