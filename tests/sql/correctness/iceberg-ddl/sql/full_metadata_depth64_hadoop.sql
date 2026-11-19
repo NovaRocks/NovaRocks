@@ -67,7 +67,7 @@ INSERT INTO metadata_depth_native(id,deep) VALUES (4,[[[[[[[[[[[[[[[[[[[[[[[[[[[
 SELECT id,deep FROM metadata_depth_native ORDER BY id;
 
 -- query 6
-SELECT typeof(deep[1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1]) AS leaf_type,COUNT(*) AS row_count FROM metadata_depth_native GROUP BY 1;
+SELECT typeof(deep[1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1]) AS leaf_type,COUNT() AS row_count FROM metadata_depth_native GROUP BY 1;
 
 -- query 7
 -- @skip_result_check=true

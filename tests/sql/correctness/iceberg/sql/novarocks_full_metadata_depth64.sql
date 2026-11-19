@@ -76,7 +76,7 @@ printf 'METADATA_DEPTH_READY\n'
 SELECT id,deep FROM metadata_depth ORDER BY id;
 
 -- query 4
-SELECT typeof(deep[1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1]) AS leaf_type,COUNT(*) AS row_count FROM metadata_depth GROUP BY 1;
+SELECT typeof(deep[1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1]) AS leaf_type,COUNT() AS row_count FROM metadata_depth GROUP BY 1;
 
 -- query 5
 -- @skip_result_check=true
