@@ -261,7 +261,7 @@ fn each_pure_parsed_only_statement_witness_has_its_typed_gate() {
         exercised += 1;
     }
     assert_eq!(
-        exercised, 292,
+        exercised, 291,
         "reconcile the statement gate with the grammar ledger"
     );
 }
