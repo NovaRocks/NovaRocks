@@ -981,10 +981,7 @@ fn metadata_cv_source_cross_entry(functions: &PureEngineFunctionCatalog, spare_e
     .unwrap();
     let original = pool.value(1).unwrap();
     let source_identity = pool.backing_identity();
-    let parsed = novarocks_parser::parse("SELECT NULL AS metadata_cv_source").unwrap();
-    let [novarocks_parser::ast::Statement::Query(query)] = parsed.as_slice() else {
-        panic!("one query")
-    };
+    let query = novarocks_parser::parser::parse_query("SELECT NULL AS metadata_cv_source").unwrap();
     let control = SqlCompileControl::unbounded();
     let statement = SqlStatementInput::query_with_expression_constants(
         Box::new(query.clone()),

@@ -274,7 +274,7 @@ pub(crate) fn author(
     author_with_target(functions, name, arguments, shape, None)
 }
 
-fn trusted_author(
+pub(crate) fn trusted_author(
     functions: &PureEngineFunctionCatalog,
     name: &str,
     arguments: Vec<FunctionArgument>,
@@ -439,7 +439,9 @@ impl FlowAuthor {
             ExprKind::Disjunction { args } => (ControlShape::Disjunction, args.as_ref()),
             ExprKind::Unary {
                 expr,
-                op: novarocks_physical_plan::UnaryOperator::Not,
+                op:
+                    novarocks_physical_plan::UnaryOperator::Not
+                    | novarocks_physical_plan::UnaryOperator::BitwiseNot,
             }
             | ExprKind::IsNull { expr, .. }
             | ExprKind::Cast { expr, .. } => (ControlShape::Eager, std::slice::from_ref(expr)),
@@ -746,6 +748,17 @@ pub(crate) fn compile_checked_fragment_with_parameters(
     result: ResultPort,
     parameters: SemanticParameters,
 ) -> Arc<LocalProgram> {
+    try_compile_checked_fragment_with_parameters(functions, fragment, authors, result, parameters)
+        .unwrap()
+}
+
+pub(crate) fn try_compile_checked_fragment_with_parameters(
+    functions: &PureEngineFunctionCatalog,
+    fragment: Fragment,
+    authors: &BTreeMap<ExprId, Author>,
+    result: ResultPort,
+    parameters: SemanticParameters,
+) -> Result<Arc<LocalProgram>, novarocks_local_compiler::FragmentCompileError> {
     let (fragment, constants) = original_request_sources(fragment, authors);
     let fragment_id = fragment.id();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
@@ -998,15 +1011,13 @@ pub(crate) fn compile_checked_fragment_with_parameters(
     );
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Control).unwrap();
-    Arc::new(
-        compile_fragment(
-            validate_fragment_providers(package, &providers, &Control).unwrap(),
-            functions,
-            options(),
-            &Control,
-        )
-        .unwrap(),
+    compile_fragment(
+        validate_fragment_providers(package, &providers, &Control).unwrap(),
+        functions,
+        options(),
+        &Control,
     )
+    .map(Arc::new)
 }
 fn root() -> ProgramExpressionRootSite {
     ProgramExpressionRootSite::Node {

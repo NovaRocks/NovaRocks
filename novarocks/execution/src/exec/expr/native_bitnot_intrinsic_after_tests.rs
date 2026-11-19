@@ -14,18 +14,31 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Actual source journal/effects, original package author, LocalCompiler and
-//! Frame. The shared SQL fixture deliberately disables folding; native whole
-//! cases and production FE folding remain separate acceptance obligations.
+//! Typed native BitwiseNot packages and independently authored named SQL controls.
 use super::compiled_program::CompiledExpressionInstance;
+use super::compiled_program::guarded_tests::{
+    call, trusted_author, try_compile_checked_fragment_with_parameters,
+};
 use super::numeric_unary_owned_transaction_tests::{batch, programs_with_catalogue};
 use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array};
 use arrow::datatypes::DataType;
-use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
+use novarocks_functions::{
+    FunctionArgument, KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection,
+};
+use novarocks_local_compiler::FragmentCompileError;
+use novarocks_local_program::{ProgramChannelLayoutRole, ProgramChannelSite};
 use novarocks_local_program::{
     ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind,
 };
+use novarocks_physical_plan::{
+    ExprKind, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, NodeId, PipelineDopDomain,
+    ResultField, ResultPort, StagePlacementPolicy, UnaryOperator, ValueOrigin,
+};
+use novarocks_type_contract::{
+    ControlShape, FunctionValueType, SemanticParameters, ValueLogicalType,
+};
+use std::collections::BTreeMap;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,41 +74,213 @@ fn programs(
         super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
     programs_with_catalogue(source, &functions)
 }
-fn producer_root(
-    plans: &std::collections::BTreeMap<
-        novarocks_physical_plan::FragmentId,
-        Arc<novarocks_local_program::LocalProgram>,
-    >,
-) -> (
-    Arc<novarocks_local_program::LocalProgram>,
-    ProgramExpressionRootSite,
-) {
-    let mut found = None;
-    for program in plans.values() {
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        for (&root, &use_id) in snapshot.bindings() {
-            let occurrence = novarocks_local_program::ProgramUseRef {
-                arena: root.arena(),
-                use_id,
-            };
-            if program.native_bitnot_recipe(occurrence).is_some() {
-                assert!(
-                    found.is_none(),
-                    "this actual SQL source declares exactly one BitwiseNot output root"
-                );
-                found = Some((program.clone(), root));
-            }
-        }
-    }
-    found.expect("the actual published root binding retains its owned BitwiseNot recipe")
+enum Operand {
+    Column,
+    Literal(LiteralValue),
 }
+
+fn nullable_largeint() -> FunctionValueType {
+    FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap()
+}
+
+fn intrinsic_program(
+    source_type: FunctionValueType,
+    operand: Operand,
+    conversion_overload: Option<&str>,
+) -> Result<
+    (
+        Arc<novarocks_local_program::LocalProgram>,
+        ProgramExpressionRootSite,
+    ),
+    FragmentCompileError,
+> {
+    let functions =
+        super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
+    let fragment_id = FragmentId::new(211);
+    let input = NodeId::new(41);
+    let output = NodeId::new(0);
+    let mut builder = FragmentBuilder::new(fragment_id);
+    let source = match operand {
+        Operand::Column => {
+            // The empty VALUES leaf declares the exact input port. Each
+            // frame test lends a matching batch directly to the project.
+            let value = builder
+                .add_value(
+                    source_type.clone(),
+                    ValueOrigin::NodeOutput {
+                        node: input,
+                        output_ordinal: 0,
+                    },
+                )
+                .unwrap();
+            builder
+                .add_values(input, Box::default(), Box::from([value]))
+                .unwrap();
+            ExprKind::Value(value)
+        }
+        Operand::Literal(value) => {
+            builder
+                .add_values(input, Box::from([Box::default()]), Box::default())
+                .unwrap();
+            ExprKind::Literal(value)
+        }
+    };
+    let source = builder
+        .add_expression(output, source_type.clone(), source)
+        .unwrap();
+    let mut authors = BTreeMap::new();
+    let (input_expr, result_type) = if conversion_overload.is_some() {
+        let target = nullable_largeint();
+        let owner = trusted_author(
+            &functions,
+            novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME,
+            vec![FunctionArgument::Value {
+                value_type: source_type,
+                constant: None,
+            }],
+            ControlShape::Eager,
+            target.clone(),
+        );
+        (
+            call(&mut builder, &mut authors, owner, vec![source]),
+            target,
+        )
+    } else {
+        (source, source_type)
+    };
+    let bitnot = builder
+        .add_expression(
+            output,
+            result_type.clone(),
+            ExprKind::Unary {
+                op: UnaryOperator::BitwiseNot,
+                expr: input_expr,
+            },
+        )
+        .unwrap();
+    let result_value = builder
+        .add_value(
+            result_type.clone(),
+            ValueOrigin::Expr {
+                node: output,
+                expr: bitnot,
+            },
+        )
+        .unwrap();
+    builder
+        .add_project(
+            output,
+            input,
+            Box::from([(bitnot, result_value)]),
+            Box::from([result_value]),
+        )
+        .unwrap();
+    let fragment = builder
+        .finish_definition(
+            output,
+            FragmentSink::Result,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
+    if let Some(overload) = conversion_overload {
+        let ExprKind::FunctionCall { function, .. } =
+            &fragment.expressions().get(input_expr).unwrap().kind
+        else {
+            panic!("expected the trusted LARGEINT conversion");
+        };
+        assert_eq!(function.overload.as_str(), overload);
+    }
+    let result = ResultPort {
+        scalar_schema: None,
+        fragment: fragment_id,
+        output: fragment.nodes()[&output].output.clone(),
+        fields: Box::from([ResultField {
+            domain: crate::test_result_domain::result_value_domain(&result_type),
+            name: "original_inverted".into(),
+            alias: None,
+            value: result_value,
+            ty: result_type.clone(),
+        }]),
+    };
+    let program = try_compile_checked_fragment_with_parameters(
+        &functions,
+        fragment,
+        &authors,
+        result,
+        SemanticParameters::try_new([]).unwrap(),
+    )?;
+    let resolved = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot();
+    let mut roots = resolved.bindings().iter().filter_map(|(&root, &use_id)| {
+        let occurrence = novarocks_local_program::ProgramUseRef {
+            arena: root.arena(),
+            use_id,
+        };
+        program
+            .native_bitnot_recipe(occurrence)
+            .map(|recipe| (root, recipe))
+    });
+    let (root, recipe) = roots.next().expect("one native BitwiseNot project root");
+    assert!(roots.next().is_none());
+    assert_eq!(recipe.source_type(), &result_type);
+    assert_eq!(recipe.result_type(), &result_type);
+    let ProgramExpressionRootSite::Node { node, .. } = root else {
+        panic!("native BitwiseNot project site");
+    };
+    let actual = program
+        .checked()
+        .channels()
+        .channel_type(ProgramChannelSite::Layout {
+            node,
+            role: ProgramChannelLayoutRole::NodeOutput,
+            ordinal: 0,
+        });
+    assert_eq!(actual, Some(&result_type));
+    Ok((program, root))
+}
+
+fn intrinsic_constant(
+    source: FunctionValueType,
+    operand: LiteralValue,
+    conversion_overload: Option<&str>,
+) -> ArrayRef {
+    let (program, root) =
+        intrinsic_program(source, Operand::Literal(operand), conversion_overload).unwrap();
+    let ProgramExpressionRootSite::Node { node, .. } = root else {
+        panic!("constant project");
+    };
+    let ProgramNodeKind::Project { input, .. } = program.graph().nodes()[node.index()].kind()
+    else {
+        panic!("constant project");
+    };
+    let ProgramNodeKind::Values { values } = program.graph().nodes()[input.index()].kind() else {
+        panic!("constant VALUES");
+    };
+    let data = values.batch().unwrap();
+    assert_eq!(data.num_rows(), 1);
+    let mut frame = CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
+    let out = frame.evaluate(data, Selection::all(1), &Control).unwrap();
+    assert!(out.errors().is_empty());
+    assert_eq!(out.values().len(), 1);
+    out.values().clone()
+}
+
 #[test]
-fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_and_full_fvt() {
+fn native_bitnot_intrinsic_typed_signed_four_widths_preserve_full_fvt() {
     // For a fixed signed two's-complement width, complement swaps MIN/MAX,
     // maps -1 to zero, zero to -1, and one to -2. These are independent inputs
     // and fixed expected arrays, not an evaluator over the supplied input.
@@ -118,19 +303,8 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
         ),
     ];
     for (input, expected) in cases {
-        let source = sql_source(
-            "SELECT ~k AS original_inverted FROM fixture.source",
-            input.data_type().clone(),
-        );
-        let public = source
-            .checked_original_result_declaration_observed(&Control)
-            .unwrap()
-            .unwrap();
-        let computed = source.plan().result_port().unwrap();
-        assert_eq!(public.original_port(), computed);
-        assert!(!public.fields()[0].ty.nullable());
-        let plans = programs(&source);
-        let (program, root) = producer_root(&plans);
+        let ty = FunctionValueType::new(input.data_type().clone(), false);
+        let (program, root) = intrinsic_program(ty, Operand::Column, None).unwrap();
         let data = batch(&program, root, input.clone());
         let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
         let all = frame
@@ -177,13 +351,13 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
     }
 }
 #[test]
-fn native_bitnot_intrinsic_actual_sql_largeint_cast_uses_exact_logical_recipe() {
-    let source = sql_source(
-        "SELECT ~CAST(k AS LARGEINT) AS original_inverted FROM fixture.source",
-        DataType::Int64,
-    );
-    let plans = programs(&source);
-    let (program, root) = producer_root(&plans);
+fn native_bitnot_intrinsic_typed_signed_to_largeint_uses_exact_logical_recipe() {
+    let (program, root) = intrinsic_program(
+        FunctionValueType::new(DataType::Int64, false),
+        Operand::Column,
+        Some("builtin.scalar/value_domain_conversion/signed_to_largeint/v1"),
+    )
+    .unwrap();
     let data = batch(
         &program,
         root,
@@ -202,21 +376,15 @@ fn native_bitnot_intrinsic_actual_sql_largeint_cast_uses_exact_logical_recipe() 
     .unwrap();
     assert!(out.errors().is_empty());
     assert_eq!(out.values().to_data(), expected.to_data());
-    assert_eq!(
-        source.plan().result_port().unwrap().fields[0]
-            .ty
-            .logical_type(),
-        novarocks_type_contract::ValueLogicalType::LargeInt
-    );
 }
 #[test]
-fn native_bitnot_intrinsic_actual_sql_nullable_values_current_domain_matches_original() {
-    let source = sql_source(
-        "SELECT ~i AS original_inverted FROM (VALUES (CAST(1 AS BIGINT)),(CAST(NULL AS BIGINT)),(CAST(-2 AS BIGINT))) AS source(i)",
-        DataType::Int64,
-    );
-    let plans = programs(&source);
-    let (program, root) = producer_root(&plans);
+fn native_bitnot_intrinsic_typed_nullable_values_preserve_output_and_selection() {
+    let (program, root) = intrinsic_program(
+        FunctionValueType::new(DataType::Int64, true),
+        Operand::Column,
+        None,
+    )
+    .unwrap();
     let input: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(-2)]));
     let data = batch(&program, root, input.clone());
     let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
@@ -235,7 +403,7 @@ fn native_bitnot_intrinsic_actual_sql_nullable_values_current_domain_matches_ori
         sparse.values().to_data(),
         Int64Array::from(vec![-2, 1]).to_data()
     );
-    assert!(source.plan().result_port().unwrap().fields[0].ty.nullable());
+    assert!(sparse.errors().is_empty());
 }
 fn constant_outputs(sql: &str) -> Vec<ArrayRef> {
     let source = sql_source(sql, DataType::Int64);
@@ -287,7 +455,7 @@ fn native_bitnot_intrinsic_actual_project_sql_unchanged_constants_execute_each_r
     assert_eq!(actual, vec![0, -1, -2, -1025]);
 }
 #[test]
-fn native_bitnot_intrinsic_actual_sql_largeint_full128_and_nullable_constant_sources() {
+fn native_bitnot_intrinsic_typed_largeint_full128_and_nullable_constant_sources() {
     for (value, expected) in [
         (Some(i128::MIN), Some(i128::MAX)),
         (Some(i128::MAX), Some(i128::MIN)),
@@ -299,30 +467,33 @@ fn native_bitnot_intrinsic_actual_sql_largeint_full128_and_nullable_constant_sou
         ),
         (None, None),
     ] {
-        // Explicit text conversion preserves the original full-width LARGEINT
-        // domain; ordinary integer literals are bounded by signed i64.
-        let operand = match value {
-            Some(value) => format!("CAST('{value}' AS LARGEINT)"),
-            None => "CAST(NULL AS LARGEINT)".to_owned(),
+        let output = match value {
+            Some(value) => intrinsic_constant(
+                FunctionValueType::new(DataType::Utf8, false),
+                LiteralValue::Utf8(value.to_string().into_boxed_str()),
+                Some("builtin.scalar/value_domain_conversion/utf8_to_largeint_null_invalid/v1"),
+            ),
+            None => intrinsic_constant(nullable_largeint(), LiteralValue::Null, None),
         };
-        let outputs = constant_outputs(&format!("SELECT ~{operand} AS original_inverted"));
-        assert_eq!(outputs.len(), 1);
         let expected = novarocks_types::largeint::array_from_i128(&[expected]).unwrap();
-        assert_eq!(outputs[0].to_data(), expected.to_data());
+        assert_eq!(output.to_data(), expected.to_data());
     }
 }
 #[test]
 fn native_bitnot_intrinsic_exact_physical_null_is_refused_before_folding() {
-    let refused =
-        std::panic::catch_unwind(|| sql_source("SELECT ~NULL", DataType::Int64)).unwrap_err();
-    let message = refused
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| refused.downcast_ref::<&str>().copied())
-        .unwrap();
+    let Err(refused) = intrinsic_program(
+        FunctionValueType::new(DataType::Null, true),
+        Operand::Literal(LiteralValue::Null),
+        None,
+    ) else {
+        panic!("physical NULL must fail during LocalCompiler preparation");
+    };
+    assert!(matches!(refused, FragmentCompileError::Owner { .. }));
     assert!(
-        message.contains("native BitwiseNot unsupported source shape"),
-        "actual pre-fold source refusal: {message}"
+        refused
+            .to_string()
+            .contains("native BitwiseNot unsupported source shape"),
+        "typed pre-frame refusal: {refused}"
     );
 }
 struct Refuse {
@@ -373,9 +544,12 @@ fn causes() -> [KernelFailure; 7] {
 #[test]
 fn native_bitnot_intrinsic_actual_frame_every_constructor_and_runtime_callback_keeps_cause_and_never_replays()
  {
-    let source = sql_source("SELECT ~k FROM fixture.source", DataType::Int64);
-    let plans = programs(&source);
-    let (program, root) = producer_root(&plans);
+    let (program, root) = intrinsic_program(
+        FunctionValueType::new(DataType::Int64, false),
+        Operand::Column,
+        None,
+    )
+    .unwrap();
     let data = batch(
         &program,
         root,
@@ -425,7 +599,7 @@ fn native_bitnot_intrinsic_original_and_exact_utf8_largeint_source_keeps_convers
     use novarocks_physical_plan::ExprKind;
     use novarocks_type_contract::ValueLogicalType;
 
-    let sql = "SELECT ~CAST('-170141183460469231731687303715884105728' AS LARGEINT)";
+    let sql = "SELECT bitnot(CAST('-170141183460469231731687303715884105728' AS LARGEINT))";
     let expected_type = FunctionValueType::try_with_logical_type(
         DataType::FixedSizeBinary(16),
         true,
