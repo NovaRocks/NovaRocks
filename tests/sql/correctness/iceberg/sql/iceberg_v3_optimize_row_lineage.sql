@@ -114,7 +114,7 @@ SELECT id, v FROM olineage ORDER BY id;
 -- query 10
 -- No post-rewrite row value or lineage may be absent from the baseline.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS rows_changed_by_optimize
+SELECT count() AS rows_changed_by_optimize
   FROM (
     SELECT id, v, _row_id, _last_updated_sequence_number FROM olineage
     EXCEPT
@@ -125,7 +125,7 @@ SELECT count(*) AS rows_changed_by_optimize
 -- query 11
 -- The reverse direction also rejects losing a baseline row or lineage.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS baseline_rows_missing_after_optimize
+SELECT count() AS baseline_rows_missing_after_optimize
   FROM (
     SELECT id, v, _row_id, _last_updated_sequence_number
       FROM olineage FOR VERSION AS OF 'pre_opt'
