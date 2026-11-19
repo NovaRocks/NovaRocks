@@ -87,6 +87,10 @@ fn reason(gate: &str) -> &str {
         "interval_literal" => "INTERVAL literals",
         "interval_type" => "INTERVAL data types",
         "json_constructor" => "SQL/JSON constructor",
+        "json_exists" => "JSON_EXISTS is not supported",
+        "json_value" => "JSON_VALUE is not supported",
+        "json_serialize" => "JSON_SERIALIZE is not supported",
+        "interval_value_expression" => "INTERVAL value expressions are not supported",
         "json_query_profile" => "JSON_QUERY only supports its plain two-argument profile",
         "json_table" => "JSON_TABLE is not supported",
         "match" => "MATCH predicates",
@@ -128,13 +132,22 @@ fn assert_row_field_dereference(source: &str) {
 
 #[test]
 fn parsed_trino_queries_reach_their_declared_analyzer_capability_gate() {
+    let parser_ledger: Vec<_> = include_str!("../../../parser/tests/it/grammar-coverage.tsv")
+        .lines()
+        .collect();
     let mut covered = std::collections::BTreeSet::new();
     for line in include_str!("trino_capability_cases.tsv").lines().skip(1) {
         let columns = line.split('\t').collect::<Vec<_>>();
-        let [row, rule, _, _, _, source, gate] = columns.as_slice() else {
+        let [row, rule, alternative, label, clause, source, gate] = columns.as_slice() else {
             panic!("invalid grammar coverage row: {line}");
         };
-        assert!(covered.insert(*row), "duplicate grammar coverage row {row}");
+        let row: usize = row.parse().unwrap();
+        assert!(covered.insert(row), "duplicate grammar coverage row {row}");
+        let fields: Vec<_> = parser_ledger[row - 1].split('\t').collect();
+        assert_eq!(
+            &fields[1..6],
+            [*rule, *alternative, *label, *clause, *source]
+        );
         if *gate == "row_field_dereference" {
             assert_row_field_dereference(source);
         } else {
@@ -172,13 +185,11 @@ fn assert_relation_capability(source: &str, owner: &str, gate: &str) {
         )
     } else {
         match (gate, unaliased_select_relation(&query)) {
-            ("pivot", Relation::Pivot(node)) => ("relation profile is not supported", node.span),
+            ("pivot", Relation::Pivot(node)) => ("PIVOT is not supported", node.span),
             ("match_recognize", Relation::PatternRecognition(node)) => {
-                ("relation profile is not supported", node.span)
+                ("MATCH_RECOGNIZE is not supported", node.span)
             }
-            ("nearest", Relation::Nearest(node)) => {
-                ("relation profile is not supported", node.span)
-            }
+            ("nearest", Relation::Nearest(node)) => ("NEAREST is not supported", node.span),
             ("table_function_argument_profile", Relation::TableFunction(node)) => {
                 assert!(
                     !node.copartitioning.is_empty()
@@ -337,7 +348,7 @@ fn values_inputs_expose_the_nested_pattern_and_set_operation_gates() {
         ),
         (
             "SELECT * FROM (VALUES 1) AS facts(x) MATCH_RECOGNIZE (PATTERN (A) DEFINE A AS TRUE)",
-            "relation profile is not supported",
+            "MATCH_RECOGNIZE is not supported",
         ),
     ] {
         assert_analyzer_capability(source, "table-free capability witness", reason);

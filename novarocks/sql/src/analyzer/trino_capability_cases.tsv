@@ -47,53 +47,53 @@ line	rule	alternative	label	clause	sql	gate
 559	primaryExpression	17	unique	0	VALUES UNIQUE ( TABLE x )	unique
 573	primaryExpression	25	arrayWildcardSubscript	0	VALUES ? [ * ]	array_wildcard
 576	primaryExpression	28	stringLiteralDereference	0	VALUES ? . 'x'	row_field_dereference
-603	primaryExpression	45	intervalValueExpression	0	VALUES ( ? - ? ) DAY	special_root
-608	primaryExpression	47	jsonExists	0	VALUES JSON_EXISTS ( ? , 'x' )	json_constructor
-612	primaryExpression	48	jsonValue	0	VALUES JSON_VALUE ( ? , 'x' )	json_constructor
-624	primaryExpression	50	jsonSerialize	0	VALUES JSON_SERIALIZE ( ? )	json_constructor
+603	primaryExpression	45	intervalValueExpression	0	VALUES ( ? - ? ) DAY	interval_value_expression
+608	primaryExpression	47	jsonExists	0	VALUES JSON_EXISTS ( ? , 'x' )	json_exists
+612	primaryExpression	48	jsonValue	0	VALUES JSON_VALUE ( ? , 'x' )	json_value
+624	primaryExpression	50	jsonSerialize	0	VALUES JSON_SERIALIZE ( ? )	json_serialize
 640	literal	1	intervalLiteral	0	VALUES INTERVAL 'x' DAY	interval_literal
-649	jsonPathInvocation	1		1	VALUES JSON_VALUE ( ? , 'x' AS x )	json_constructor
-650	jsonPathInvocation	1		2	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x , ? AS x )	json_constructor
-651	jsonPathInvocation	1		3	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x )	json_constructor
-652	jsonPathInvocation	1		0	VALUES JSON_VALUE ( ? , 'x' )	json_constructor
+649	jsonPathInvocation	1		1	VALUES JSON_VALUE ( ? , 'x' AS x )	json_value
+650	jsonPathInvocation	1		2	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x , ? AS x )	json_value
+651	jsonPathInvocation	1		3	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x )	json_value
+652	jsonPathInvocation	1		0	VALUES JSON_VALUE ( ? , 'x' )	json_value
 653	jsonValueExpression	1		1	VALUES JSON ( ? FORMAT JSON )	json_constructor
 654	jsonValueExpression	1		0	VALUES JSON ( ? )	json_constructor
 655	jsonRepresentation	1		1	VALUES JSON ( ? FORMAT JSON ENCODING UTF8 )	json_constructor
 656	jsonRepresentation	1		0	VALUES JSON ( ? FORMAT JSON )	json_constructor
-657	jsonArgument	1		0	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x )	json_constructor
-658	jsonExistsErrorBehavior	1		0	VALUES JSON_EXISTS ( ? , 'x' TRUE ON ERROR )	json_constructor
-659	jsonExistsErrorBehavior	2		0	VALUES JSON_EXISTS ( ? , 'x' FALSE ON ERROR )	json_constructor
-660	jsonExistsErrorBehavior	3		0	VALUES JSON_EXISTS ( ? , 'x' UNKNOWN ON ERROR )	json_constructor
-661	jsonExistsErrorBehavior	4		0	VALUES JSON_EXISTS ( ? , 'x' ERROR ON ERROR )	json_constructor
-662	jsonValueBehavior	1		0	VALUES JSON_VALUE ( ? , 'x' ERROR ON EMPTY )	json_constructor
-663	jsonValueBehavior	2		0	VALUES JSON_VALUE ( ? , 'x' NULL ON EMPTY )	json_constructor
-664	jsonValueBehavior	3		0	VALUES JSON_VALUE ( ? , 'x' DEFAULT ? ON EMPTY )	json_constructor
+657	jsonArgument	1		0	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x )	json_value
+658	jsonExistsErrorBehavior	1		0	VALUES JSON_EXISTS ( ? , 'x' TRUE ON ERROR )	json_exists
+659	jsonExistsErrorBehavior	2		0	VALUES JSON_EXISTS ( ? , 'x' FALSE ON ERROR )	json_exists
+660	jsonExistsErrorBehavior	3		0	VALUES JSON_EXISTS ( ? , 'x' UNKNOWN ON ERROR )	json_exists
+661	jsonExistsErrorBehavior	4		0	VALUES JSON_EXISTS ( ? , 'x' ERROR ON ERROR )	json_exists
+662	jsonValueBehavior	1		0	VALUES JSON_VALUE ( ? , 'x' ERROR ON EMPTY )	json_value
+663	jsonValueBehavior	2		0	VALUES JSON_VALUE ( ? , 'x' NULL ON EMPTY )	json_value
+664	jsonValueBehavior	3		0	VALUES JSON_VALUE ( ? , 'x' DEFAULT ? ON EMPTY )	json_value
 667	jsonQueryWrapperBehavior	2		1	VALUES JSON_QUERY ( ? , 'x' WITH CONDITIONAL WRAPPER )	json_query_profile
 668	jsonQueryWrapperBehavior	2		2	VALUES JSON_QUERY ( ? , 'x' WITH ARRAY WRAPPER )	json_query_profile
 669	jsonQueryWrapperBehavior	2		0	VALUES JSON_QUERY ( ? , 'x' WITH WRAPPER )	json_query_profile
 670	jsonQueryBehavior	1		0	VALUES JSON_QUERY ( ? , 'x' ERROR ON EMPTY )	json_query_profile
 672	jsonQueryBehavior	3		0	VALUES JSON_QUERY ( ? , 'x' EMPTY ARRAY ON EMPTY )	json_query_profile
 673	jsonQueryBehavior	4		0	VALUES JSON_QUERY ( ? , 'x' EMPTY OBJECT ON EMPTY )	json_query_profile
-674	jsonSerializeOnErrorBehavior	1		0	VALUES JSON_SERIALIZE ( ? ERROR ON ERROR )	json_constructor
-675	jsonSerializeOnErrorBehavior	2		0	VALUES JSON_SERIALIZE ( ? NULL ON ERROR )	json_constructor
+674	jsonSerializeOnErrorBehavior	1		0	VALUES JSON_SERIALIZE ( ? ERROR ON ERROR )	json_serialize
+675	jsonSerializeOnErrorBehavior	2		0	VALUES JSON_SERIALIZE ( ? NULL ON ERROR )	json_serialize
 679	processingMode	1		0	VALUES RUNNING x ( )	function_processing_mode
 680	processingMode	2		0	VALUES FINAL x ( )	function_processing_mode
 699	interval	1		1	VALUES INTERVAL + 'x' DAY	interval_literal
 700	interval	1		0	VALUES INTERVAL 'x' DAY	interval_literal
 707	type	2	intervalType	0	VALUES CAST ( NULL AS INTERVAL DAY )	interval_type
 721	type	10		1	VALUES CAST ( NULL AS x ARRAY [ 1 ] )	explicit_array_type
-726	intervalQualifier	1		1	VALUES ( ? - ? ) YEAR ( 1 ) TO MONTH	special_root
-727	intervalQualifier	1	compositeYearToMonthInterval	0	VALUES ( ? - ? ) YEAR TO MONTH	special_root
-728	intervalQualifier	2		1	VALUES ( ? - ? ) YEAR ( 1 )	special_root
-729	intervalQualifier	2	simpleYearMonthInterval	0	VALUES ( ? - ? ) YEAR	special_root
-730	intervalQualifier	3		1	VALUES ( ? - ? ) DAY ( 1 ) TO HOUR	special_root
-731	intervalQualifier	3		2	VALUES ( ? - ? ) DAY TO SECOND ( 1 )	special_root
-732	intervalQualifier	3	compositeDayTimeInterval	0	VALUES ( ? - ? ) DAY TO HOUR	special_root
-733	intervalQualifier	4		1	VALUES ( ? - ? ) DAY ( 1 )	special_root
-734	intervalQualifier	4	simpleDayTimeInterval	0	VALUES ( ? - ? ) DAY	special_root
-735	intervalQualifier	5		1	VALUES ( ? - ? ) SECOND ( 1 , 1 )	special_root
-736	intervalQualifier	5		2	VALUES ( ? - ? ) SECOND ( 1 )	special_root
-737	intervalQualifier	5	secondsDayTimeInterval	0	VALUES ( ? - ? ) SECOND	special_root
+726	intervalQualifier	1		1	VALUES ( ? - ? ) YEAR ( 1 ) TO MONTH	interval_value_expression
+727	intervalQualifier	1	compositeYearToMonthInterval	0	VALUES ( ? - ? ) YEAR TO MONTH	interval_value_expression
+728	intervalQualifier	2		1	VALUES ( ? - ? ) YEAR ( 1 )	interval_value_expression
+729	intervalQualifier	2	simpleYearMonthInterval	0	VALUES ( ? - ? ) YEAR	interval_value_expression
+730	intervalQualifier	3		1	VALUES ( ? - ? ) DAY ( 1 ) TO HOUR	interval_value_expression
+731	intervalQualifier	3		2	VALUES ( ? - ? ) DAY TO SECOND ( 1 )	interval_value_expression
+732	intervalQualifier	3	compositeDayTimeInterval	0	VALUES ( ? - ? ) DAY TO HOUR	interval_value_expression
+733	intervalQualifier	4		1	VALUES ( ? - ? ) DAY ( 1 )	interval_value_expression
+734	intervalQualifier	4	simpleDayTimeInterval	0	VALUES ( ? - ? ) DAY	interval_value_expression
+735	intervalQualifier	5		1	VALUES ( ? - ? ) SECOND ( 1 , 1 )	interval_value_expression
+736	intervalQualifier	5		2	VALUES ( ? - ? ) SECOND ( 1 )	interval_value_expression
+737	intervalQualifier	5	secondsDayTimeInterval	0	VALUES ( ? - ? ) SECOND	interval_value_expression
 782	rowPattern	1		1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ * ) )	window_operation
 783	rowPattern	1	quantifiedPrimary	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ ) )	window_operation
 784	rowPattern	2	patternConcatenation	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ $ ) )	window_operation
@@ -101,7 +101,7 @@ line	rule	alternative	label	clause	sql	gate
 786	patternPrimary	1	patternVariable	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( x ) )	window_operation
 787	patternPrimary	2	emptyPattern	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( ( ) ) )	window_operation
 788	patternPrimary	3		1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( PERMUTE ( $ , $ ) ) )	window_operation
-789	patternPrimary	3	patternPermutation	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( PERMUTE ( $ ) ) )	window_operation
+789	patternPrimary	3	patternPermutation	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( PERMUTE ( $ , A ) ) )	window_operation
 790	patternPrimary	4	groupedPattern	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( ( $ ) ) )	window_operation
 791	patternPrimary	5	partitionStartAnchor	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( ^ ) )	window_operation
 792	patternPrimary	6	partitionEndAnchor	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ ) )	window_operation
@@ -146,9 +146,9 @@ line	rule	alternative	label	clause	sql	gate
 2120	jsonTableDefaultPlan	2		g2.b1.g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS , OUTER ) )	json_table
 2121	jsonTableDefaultPlan	2		g2.b1.g1.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS , INNER ) )	json_table
 2122	jsonTableDefaultPlan	2		g2.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS , INNER ) )	json_table
-2224	jsonPathInvocation	1		g1.b1	VALUES JSON_VALUE ( ? , 'x' AS x )	json_constructor
-2225	jsonPathInvocation	1		g2.b1.g1.b1	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x , ? AS x )	json_constructor
-2226	jsonPathInvocation	1		g2.b1	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x )	json_constructor
+2224	jsonPathInvocation	1		g1.b1	VALUES JSON_VALUE ( ? , 'x' AS x )	json_value
+2225	jsonPathInvocation	1		g2.b1.g1.b1	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x , ? AS x )	json_value
+2226	jsonPathInvocation	1		g2.b1	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x )	json_value
 2227	jsonValueExpression	1		g1.b1	VALUES JSON ( ? FORMAT JSON )	json_constructor
 2228	jsonRepresentation	1		g1.b1.g1.b1	VALUES JSON ( ? FORMAT JSON ENCODING UTF8 )	json_constructor
 2229	jsonRepresentation	1		g1.b1.g1.b2	VALUES JSON ( ? FORMAT JSON ENCODING UTF16 )	json_constructor
@@ -159,24 +159,24 @@ line	rule	alternative	label	clause	sql	gate
 2235	interval	1		g1.b1	VALUES INTERVAL + 'x' DAY	interval_literal
 2236	interval	1		g1.b2	VALUES INTERVAL - 'x' DAY	interval_literal
 2244	type	10		g1.b1	VALUES CAST ( NULL AS x ARRAY [ 1 ] )	explicit_array_type
-2247	intervalQualifier	1		g1.b1	VALUES ( ? - ? ) YEAR ( 1 ) TO MONTH	special_root
-2248	intervalQualifier	2		g1.b1	VALUES ( ? - ? ) YEAR	special_root
-2249	intervalQualifier	2		g1.b2	VALUES ( ? - ? ) MONTH	special_root
-2250	intervalQualifier	2		g2.b1	VALUES ( ? - ? ) YEAR ( 1 )	special_root
-2251	intervalQualifier	3		g1.b1	VALUES ( ? - ? ) DAY TO HOUR	special_root
-2252	intervalQualifier	3		g1.b2	VALUES ( ? - ? ) HOUR TO SECOND	special_root
-2253	intervalQualifier	3		g1.b3	VALUES ( ? - ? ) MINUTE TO SECOND	special_root
-2254	intervalQualifier	3		g2.b1	VALUES ( ? - ? ) DAY ( 1 ) TO HOUR	special_root
-2255	intervalQualifier	3		g3.b1	VALUES ( ? - ? ) DAY TO HOUR	special_root
-2256	intervalQualifier	3		g3.b2	VALUES ( ? - ? ) DAY TO MINUTE	special_root
-2257	intervalQualifier	3		g3.b3.g1.b1	VALUES ( ? - ? ) DAY TO SECOND ( 1 )	special_root
-2258	intervalQualifier	3		g3.b3	VALUES ( ? - ? ) DAY TO SECOND	special_root
-2259	intervalQualifier	4		g1.b1	VALUES ( ? - ? ) DAY	special_root
-2260	intervalQualifier	4		g1.b2	VALUES ( ? - ? ) HOUR	special_root
-2261	intervalQualifier	4		g1.b3	VALUES ( ? - ? ) MINUTE	special_root
-2262	intervalQualifier	4		g2.b1	VALUES ( ? - ? ) DAY ( 1 )	special_root
-2263	intervalQualifier	5		g1.b1.g1.b1	VALUES ( ? - ? ) SECOND ( 1 , 1 )	special_root
-2264	intervalQualifier	5		g1.b1	VALUES ( ? - ? ) SECOND ( 1 )	special_root
+2247	intervalQualifier	1		g1.b1	VALUES ( ? - ? ) YEAR ( 1 ) TO MONTH	interval_value_expression
+2248	intervalQualifier	2		g1.b1	VALUES ( ? - ? ) YEAR	interval_value_expression
+2249	intervalQualifier	2		g1.b2	VALUES ( ? - ? ) MONTH	interval_value_expression
+2250	intervalQualifier	2		g2.b1	VALUES ( ? - ? ) YEAR ( 1 )	interval_value_expression
+2251	intervalQualifier	3		g1.b1	VALUES ( ? - ? ) DAY TO HOUR	interval_value_expression
+2252	intervalQualifier	3		g1.b2	VALUES ( ? - ? ) HOUR TO SECOND	interval_value_expression
+2253	intervalQualifier	3		g1.b3	VALUES ( ? - ? ) MINUTE TO SECOND	interval_value_expression
+2254	intervalQualifier	3		g2.b1	VALUES ( ? - ? ) DAY ( 1 ) TO HOUR	interval_value_expression
+2255	intervalQualifier	3		g3.b1	VALUES ( ? - ? ) DAY TO HOUR	interval_value_expression
+2256	intervalQualifier	3		g3.b2	VALUES ( ? - ? ) DAY TO MINUTE	interval_value_expression
+2257	intervalQualifier	3		g3.b3.g1.b1	VALUES ( ? - ? ) DAY TO SECOND ( 1 )	interval_value_expression
+2258	intervalQualifier	3		g3.b3	VALUES ( ? - ? ) DAY TO SECOND	interval_value_expression
+2259	intervalQualifier	4		g1.b1	VALUES ( ? - ? ) DAY	interval_value_expression
+2260	intervalQualifier	4		g1.b2	VALUES ( ? - ? ) HOUR	interval_value_expression
+2261	intervalQualifier	4		g1.b3	VALUES ( ? - ? ) MINUTE	interval_value_expression
+2262	intervalQualifier	4		g2.b1	VALUES ( ? - ? ) DAY ( 1 )	interval_value_expression
+2263	intervalQualifier	5		g1.b1.g1.b1	VALUES ( ? - ? ) SECOND ( 1 , 1 )	interval_value_expression
+2264	intervalQualifier	5		g1.b1	VALUES ( ? - ? ) SECOND ( 1 )	interval_value_expression
 2286	patternPrimary	3		g1.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( PERMUTE ( $ , $ ) ) )	window_operation
 2287	patternQuantifier	1		g1.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ * ? ) )	window_operation
 2288	patternQuantifier	2		g1.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ + ? ) )	window_operation

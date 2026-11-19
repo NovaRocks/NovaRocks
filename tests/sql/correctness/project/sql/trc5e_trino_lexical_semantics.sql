@@ -161,6 +161,7 @@ SELECT concat(
 SELECT CAST(NULL AS varchar) LIKE CAST('x!' AS varchar) ESCAPE '!';
 
 -- query 40
+-- @order_sensitive=false
 SELECT value LIKE pattern ESCAPE esc FROM (VALUES (CAST(NULL AS varchar), CAST('x!' AS varchar), CAST('!' AS varchar)), ('ok', 'ok', '!')) t(value,pattern,esc);
 
 -- query 41
