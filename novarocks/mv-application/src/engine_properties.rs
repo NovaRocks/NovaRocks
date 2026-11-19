@@ -131,6 +131,12 @@ pub fn prepare_create_engine_properties(
     let mut primary_key = None;
     for property in properties {
         if property.name == PRIMARY_KEY {
+            if matches!(
+                property.change,
+                DdlPropertyChange::Reset(DdlPropertyValue::Null)
+            ) {
+                continue;
+            }
             let DdlPropertyChange::Set(DdlPropertyValue::ArrayVarchar(columns)) = &property.change
             else {
                 // CREATE preparation omitted the NULL default already.

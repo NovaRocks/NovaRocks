@@ -810,7 +810,7 @@ async fn mv_create_uses_the_staged_iceberg_format_version_default() {
                 3,
             ),
             (
-                "CREATE MATERIALIZED VIEW ice.atomic.mv WITH (format_version = DEFAULT) AS SELECT 1 AS id",
+                "CREATE MATERIALIZED VIEW ice.atomic.mv WITH (format_version = DEFAULT, primary_key = DEFAULT) AS SELECT 1 AS id",
                 3,
             ),
             (
@@ -834,6 +834,7 @@ async fn mv_create_uses_the_staged_iceberg_format_version_default() {
             .create(statement)
             .unwrap();
             assert_eq!(prepared.storage.binding, fixture.key);
+            assert_eq!(prepared.primary_key, None);
             let (_, actual) = prepared
                 .storage
                 .properties

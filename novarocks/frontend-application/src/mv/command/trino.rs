@@ -49,13 +49,13 @@ impl TrinoMvPropertyPreparation<'_> {
             .map_err(|error| self.engine_error(error, &statement.properties, statement.span))?;
         let properties = storage
             .into_iter()
-            .map(|property| match property.change {
-                DdlPropertyChange::Set(value) => Ok((Arc::from(property.name), value)),
-                DdlPropertyChange::Reset(_) => Err(invariant(
-                    "CREATE materialized view storage received a reset",
-                )),
+            .map(|property| {
+                let value = match property.change {
+                    DdlPropertyChange::Set(value) | DdlPropertyChange::Reset(value) => value,
+                };
+                (Arc::from(property.name), value)
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
         let select_sql = create_query_source(self.source, &statement)?.to_owned();
         Ok(MvCreateStatement {
             if_not_exists: statement.not_exists,
