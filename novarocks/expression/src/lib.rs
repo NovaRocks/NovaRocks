@@ -23,6 +23,10 @@ mod creation;
 pub use creation::ProgramCreationFailure as ExprConstructionFailure;
 mod compiler;
 pub use compiler::{ExprCompileError, ExprCompileFailure};
+mod call_authorship;
+pub use call_authorship::{
+    CallAuthorError, CallAuthorInputs, UnitCallAuthorship, author_call_controls, author_unit_calls,
+};
 mod original_requests;
 mod primitives;
 pub use primitives::{

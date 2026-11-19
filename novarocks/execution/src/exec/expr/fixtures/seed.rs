@@ -369,7 +369,14 @@ fn package_with_dictionary(
         .add_limit(limit, second_project, Some(1), 0)
         .unwrap();
     let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
-    declare_call_controls(builder.unit(second_project).unwrap(), &authors, &mut work);
+    declare_call_controls(
+        builder.unit(second_project).unwrap(),
+        functions,
+        &constants,
+        &parameters,
+        options(1).constants,
+        &mut work,
+    );
     let no_authors = BTreeMap::new();
     for node in [first_project, filter, second_project] {
         let ports = builder.node_ports(node).unwrap();
@@ -386,9 +393,10 @@ fn package_with_dictionary(
             } else {
                 &no_authors
             },
+            &constants,
             &parameters,
+            options(1).constants,
             &mut work,
-            |_, _, children| children,
         );
         builder.install_unit(node, Arc::new(unit)).unwrap();
     }

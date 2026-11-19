@@ -24,6 +24,7 @@ mod arithmetic;
 #[cfg(novarocks_dev_controls)]
 mod array_invocation_frames;
 mod byte_guarded;
+mod call_authorship;
 mod case;
 mod cast;
 mod concat_trim;

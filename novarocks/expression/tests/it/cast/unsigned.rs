@@ -500,7 +500,8 @@ fn actual_compiled_unsigned_cast_every_compile_and_runtime_callback_keeps_primar
         Wrap::Bare,
         DecimalOverflowPolicy::ReportError,
         true,
-    );
+    )
+    .expect("nullable unsigned cast is admitted");
     let recorder = CompileCallbacks::new(CompileControlError::Cancelled, usize::MAX);
     let program = fixture.compile(&recorder).unwrap();
     let trace = recorder.trace();

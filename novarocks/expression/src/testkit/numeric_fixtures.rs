@@ -17,6 +17,7 @@
 
 use super::{
     ClaimAuthor, HarnessControl, add_call, checked_constants, declare_call_controls, finish_unit,
+    try_finish_unit,
     fixture_scope, register_call_requests, register_constant,
 };
 use crate::{
@@ -32,7 +33,7 @@ use novarocks_expression_contract::{
 use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_functions::{
     CastOperation, EngineFunctionCatalogBuilder, FunctionArgument, FunctionId, FunctionKind,
-    FunctionOverloadId, InstalledPureKernel, PreparedArithmeticRecipe, PureEngineFunctionCatalog,
+    FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
 };
 use novarocks_type_contract::{
@@ -198,7 +199,7 @@ pub struct PreparedFixture {
 }
 
 impl SinglePortFixture {
-    fn prepare(self) -> PreparedFixture {
+    fn prepare(self) -> Result<PreparedFixture, crate::CallAuthorError> {
         let Self {
             input,
             source_prefix,
@@ -217,78 +218,58 @@ impl SinglePortFixture {
         register_call_requests(&mut unit, &authors, &mut constants);
         let mut work =
             CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-        declare_call_controls(&mut unit, &authors, &mut work);
+        declare_call_controls(
+            &mut unit,
+            &functions,
+            &constants,
+            &parameters,
+            fixture_constant_policy(),
+            &mut work,
+        );
 
         // Preserve the checked source unit when its cast recipes were observed.
         // Its declared Port(0) is empty; the output unit sees the actual typed shape.
-        let source_prefix = source_prefix.map(|source| {
-            let sealed = source
-                .seal(
-                    vec![ExprPort {
-                        values: Box::default(),
-                    }],
+        let source_prefix = match source_prefix {
+            Some(source) => {
+                let sealed = source
+                    .seal(
+                        vec![ExprPort {
+                            values: Box::default(),
+                        }],
+                        &mut work,
+                    )
+                    .unwrap();
+                Some(try_finish_unit(
+                    &functions,
+                    sealed,
+                    &BTreeMap::new(),
+                    &constants,
+                    &parameters,
+                    fixture_constant_policy(),
                     &mut work,
-                )
-                .unwrap();
-            finish_unit(
-                &functions,
-                sealed,
-                &BTreeMap::new(),
-                &parameters,
-                &mut work,
-                |_, _, effects| effects,
-            )
-        });
+                )?)
+            }
+            None => None,
+        };
         let sealed = unit.seal(vec![input], &mut work).unwrap();
-        let unit = finish_unit(
+        let unit = try_finish_unit(
             &functions,
             sealed,
             &authors,
+            &constants,
             &parameters,
+            fixture_constant_policy(),
             &mut work,
-            |unit, invocation, children| {
-                let definition = unit.definition(invocation.definition).unwrap();
-                if let ExprKind::Binary {
-                    op,
-                    left,
-                    right,
-                    decimal_overflow_policy,
-                    allow_throw_exception: Some(reference),
-                } = &definition.kind
-                {
-                    let SemanticParameterValue::AllowThrowException(allow) =
-                        parameters.require(*reference).unwrap()
-                    else {
-                        panic!("exact intrinsic parameter key")
-                    };
-                    let recipe = PreparedArithmeticRecipe::try_new(
-                        operation(*op),
-                        &unit.definition(*left).unwrap().ty,
-                        &unit.definition(*right).unwrap().ty,
-                        &definition.ty,
-                        *decimal_overflow_policy,
-                        *allow,
-                        &HarnessControl,
-                    )
-                    .unwrap();
-                    recipe
-                        .own_effects(invocation.context)
-                        .join_same_region(children)
-                        .unwrap()
-                } else {
-                    children
-                }
-            },
-        );
+        )?;
         work.finish().unwrap();
-        PreparedFixture {
+        Ok(PreparedFixture {
             unit,
             source_prefix,
             root,
             functions,
             constants,
             parameters,
-        }
+        })
     }
 }
 
@@ -467,7 +448,7 @@ pub fn cast_fixture(
     wrap: Wrap,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> PreparedFixture {
+) -> Result<PreparedFixture, crate::CallAuthorError> {
     let mut source_pools = ConstantPools::empty();
     let functions = catalogue();
     let boolean = FunctionValueType::new(DataType::Boolean, true);
@@ -813,7 +794,8 @@ pub fn compiled(
     policy: DecimalOverflowPolicy,
     allow: bool,
 ) -> CompiledFixture {
-    let fixture = cast_fixture(source.clone(), result.clone(), mode, wrap, policy, allow);
+    let fixture = cast_fixture(source.clone(), result.clone(), mode, wrap, policy, allow)
+        .expect("cast fixture admitted by the call author");
     let source_unit = fixture
         .compile_unit(
             fixture.source_prefix.as_ref().unwrap(),
@@ -1000,7 +982,7 @@ pub fn build_program(
         constants: source_pools,
         allow,
     }
-    .prepare()
+    .prepare().unwrap()
     .compile(&HarnessControl)
     .unwrap()
 }
@@ -1175,7 +1157,7 @@ pub fn typed_program(
         constants: source_pools,
         allow,
     }
-    .prepare()
+    .prepare().unwrap()
     .compile(&HarnessControl)
     .unwrap()
 }
@@ -1279,7 +1261,7 @@ pub fn inherited_round_fixture_with_target(allow: bool, target: DataType) -> Com
         constants: source_pools,
         allow,
     }
-    .prepare()
+    .prepare().unwrap()
     .compile(&HarnessControl)
     .unwrap()
 }
@@ -1333,7 +1315,7 @@ pub fn narrow_unsigned_constant(narrow: DataType) -> CompiledFixture {
         constants,
         allow: false,
     }
-    .prepare()
+    .prepare().unwrap()
     .compile(&HarnessControl)
     .unwrap()
 }
@@ -1427,17 +1409,25 @@ pub fn nullsafe_program(ty: FunctionValueType, right_kind: NullSafeRight) -> Com
         values: ids.map(|id| (id, ty.clone())).into(),
     };
     register_call_requests(&mut builder, &authors, &mut source_pools);
-    let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    declare_call_controls(&mut builder, &authors, &mut work);
-    let sealed = builder.seal(vec![input], &mut work).unwrap();
     let parameters = SemanticParameters::try_new([]).unwrap();
+    let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
+    declare_call_controls(
+        &mut builder,
+        &functions,
+        &source_pools,
+        &parameters,
+        fixture_constant_policy(),
+        &mut work,
+    );
+    let sealed = builder.seal(vec![input], &mut work).unwrap();
     let unit = finish_unit(
         &functions,
         sealed,
         &authors,
+        &source_pools,
         &parameters,
+        fixture_constant_policy(),
         &mut work,
-        |_, _, effects| effects,
     );
     work.finish().unwrap();
     PreparedFixture {

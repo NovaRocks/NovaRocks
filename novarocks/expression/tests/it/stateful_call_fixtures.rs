@@ -181,8 +181,9 @@ fn checked_fixture(
         .root(result, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     register_call_requests(&mut draft, authors, &mut constants);
+    let parameters = SemanticParameters::try_new([]).unwrap();
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    declare_call_controls(&mut draft, authors, &mut work);
+    declare_call_controls(&mut draft, catalogue, &constants, &parameters, POLICY, &mut work);
 
     // The original physical input was the first Project after zero-column
     // Values. Those non-result columns were named local_1_{ordinal}.
@@ -199,15 +200,15 @@ fn checked_fixture(
         })
         .collect::<Vec<_>>();
     let scope = fixture_scope(&port, Arc::new(Schema::new(fields)));
-    let parameters = SemanticParameters::try_new([]).unwrap();
     let sealed = draft.seal(vec![port], &mut work).unwrap();
     let unit = finish_unit(
         catalogue,
         sealed,
         authors,
+        &constants,
         &parameters,
+        POLICY,
         &mut work,
-        |_, _, effects| effects,
     );
     work.finish().unwrap();
     let compiled = compile_fixture_unit(

@@ -220,15 +220,23 @@ pub(super) fn install_claims(
     let ports = builder.node_ports(node).unwrap();
     let mut draft = builder.take_unit_builder(node).unwrap();
     register_call_requests(&mut draft, authors, constants);
-    declare_call_controls(&mut draft, authors, &mut work);
+    declare_call_controls(
+        &mut draft,
+        functions,
+        constants,
+        parameters,
+        options().constants,
+        &mut work,
+    );
     let sealed = draft.seal(ports, &mut work).unwrap();
     let unit = finish_unit(
         functions,
         sealed,
         authors,
+        constants,
         parameters,
+        options().constants,
         &mut work,
-        |_, _, effects| effects,
     );
     builder.install_unit(node, Arc::new(unit)).unwrap();
     work.finish().unwrap();

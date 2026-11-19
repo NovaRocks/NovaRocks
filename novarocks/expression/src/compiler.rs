@@ -1279,12 +1279,7 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                 creation,
             )?;
             work.flush()?;
-            let selection = Arc::new(FunctionBindingSelection {
-                overload: function.overload.clone(),
-                argument_types: function.argument_types.clone(),
-                result_type: FunctionResultType::Scalar(function.result_type.clone()),
-                aggregate: None,
-            });
+            let selection = crate::call_authorship::scalar_binding_selection(function);
             work.flush()?;
             validate_call_created(
                 functions.metadata(),

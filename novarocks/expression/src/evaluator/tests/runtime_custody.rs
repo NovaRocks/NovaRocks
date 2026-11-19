@@ -101,15 +101,23 @@ fn compile(
     let parameters = SemanticParameters::try_new([]).unwrap();
     register_call_requests(&mut builder, authors, &mut constants);
     let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
-    declare_call_controls(&mut builder, authors, &mut work);
+    declare_call_controls(
+        &mut builder,
+        catalogue,
+        &constants,
+        &parameters,
+        fixture_constant_policy(),
+        &mut work,
+    );
     let sealed = builder.seal(vec![port], &mut work).unwrap();
     let unit = finish_unit(
         catalogue,
         sealed,
         authors,
+        &constants,
         &parameters,
+        fixture_constant_policy(),
         &mut work,
-        |_, _, children| children,
     );
     work.finish().unwrap();
     compile_fixture_unit(

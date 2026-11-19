@@ -412,7 +412,7 @@ fn actual_compiled_bool_cast_full_type_nullable_and_uninstalled_nominal_profiles
         ValueLogicalType::Uuid,
     )
     .unwrap();
-    let fixture = cast_fixture(
+    let authored = cast_fixture(
         uuid.clone(),
         uuid,
         Source::Column,
@@ -420,7 +420,14 @@ fn actual_compiled_bool_cast_full_type_nullable_and_uninstalled_nominal_profiles
         DecimalOverflowPolicy::OutputNull,
         false,
     );
-    assert!(fixture.compile(&Control).is_err());
+    match authored {
+        Err(error) => assert!(
+            error
+                .to_string()
+                .contains("implemented exact Physical scalar domain")
+        ),
+        Ok(fixture) => assert!(fixture.compile(&Control).is_err()),
+    }
     let program = compiled(
         FunctionValueType::new(DataType::Boolean, false),
         FunctionValueType::new(DataType::Int64, false),
@@ -470,7 +477,8 @@ fn actual_compiled_bool_cast_compile_and_runtime_failures_keep_every_original_pr
         Wrap::Bare,
         DecimalOverflowPolicy::ReportError,
         true,
-    );
+    )
+    .expect("nullable boolean cast is admitted");
     let recorder = CompileCallbacks::new(CompileControlError::Cancelled, usize::MAX);
     let program = fixture.compile(&recorder).unwrap();
     let trace = recorder.trace();
