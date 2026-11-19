@@ -21,7 +21,7 @@ use novarocks_execution_contract::{ExchangeSource, FragmentNodeId, TaskIdentity}
 use novarocks_proto_codec::ProtocolErrorKind;
 use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId, StageId, TaskId};
 use prost::Message;
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroUsize};
 
 fn path() -> FieldPath {
     FieldPath::root("exchange_unit")
@@ -444,4 +444,94 @@ fn grant_batches_accept_more_than_a_publication_page_and_preserve_snapshot_fence
     invalid = encoded;
     invalid.snapshot = false;
     assert!(decode_grant_batch(&invalid, expected, path()).is_err());
+}
+
+fn assert_worst_case_envelope(request: &wire::DeliverExchangeUnitRequest) {
+    assert_eq!(request.task_key_hi, -1);
+    assert_eq!(request.task_key_lo, -1);
+    assert_eq!(request.node_id, -1);
+    assert_eq!(request.sender_id, -1);
+    assert_eq!(request.be_number, -1);
+    assert_eq!(request.source_task_key_hi, -1);
+    assert_eq!(request.source_task_key_lo, -1);
+    assert_eq!(request.sender_ordinal, u32::MAX);
+    assert_eq!(request.sender_count, u32::MAX);
+    let stream = request.stream.as_ref().expect("stream");
+    assert_eq!(stream.source_task_key_hi, -1);
+    assert_eq!(stream.source_task_key_lo, -1);
+    assert_eq!(stream.sender_ordinal, u32::MAX);
+    assert_eq!(stream.destination_task_key_hi, -1);
+    assert_eq!(stream.destination_task_key_lo, -1);
+    assert_eq!(stream.destination_node_id, -1);
+    for task in [
+        stream.source_task.as_ref(),
+        stream.destination_task.as_ref(),
+    ] {
+        let task = task.expect("task identity");
+        let execution = task.query_execution_id.expect("query execution");
+        let query_id = execution.query_id.expect("query id");
+        assert_eq!(query_id.hi, -1);
+        assert_eq!(query_id.lo, -1);
+        assert_eq!(execution.attempt_id, u64::MAX);
+        assert_eq!(task.stage_id, u32::MAX);
+        assert_eq!(task.task_id, u32::MAX);
+        let backend = task.backend_process_id.as_ref().expect("backend process");
+        assert_eq!(backend.value.as_slice(), &[0xff; 16]);
+    }
+    let demand = request.next_demand.expect("next demand");
+    assert_eq!(demand.sequence, u64::MAX);
+    assert_eq!(demand.wire_bytes, u64::MAX);
+}
+
+#[test]
+fn delivery_non_payload_bound_covers_worst_case_units_and_end() {
+    let bound = max_delivery_non_payload_bytes();
+    eprintln!("max_delivery_non_payload_bytes={bound}");
+    assert_ne!(bound, 0);
+    assert!(bound < 64 * 1024);
+
+    let empty = worst_case_delivery_request(worst_case_unit(Bytes::new()));
+    assert_worst_case_envelope(&empty);
+    let wire::deliver_exchange_unit_request::Item::Unit(unit) = empty.item.as_ref().unwrap() else {
+        panic!("unit expected");
+    };
+    assert!(unit.payload.is_empty());
+    assert!(unit.end_after_unit);
+    assert_eq!(bound - empty.encoded_len(), 1 + 5 + 4 + 4);
+
+    // 256 crosses ExchangeUnitData's own encoded size past 127. 200_000 crosses
+    // 16383. Both stay far below a multi-megabyte allocation.
+    let payload_lengths = [0usize, 1, 127, 128, 16_383, 16_384, 256, 200_000];
+    let mut unit_sizes = Vec::with_capacity(payload_lengths.len());
+    for length in payload_lengths {
+        let payload = Bytes::from(vec![0u8; length]);
+        let request = worst_case_delivery_request(worst_case_unit(payload));
+        assert!(request.encoded_len() <= bound + length);
+        let wire::deliver_exchange_unit_request::Item::Unit(unit) = request.item.as_ref().unwrap()
+        else {
+            panic!("unit expected");
+        };
+        unit_sizes.push(unit.encoded_len());
+    }
+    assert!(unit_sizes.iter().any(|size| *size > 127));
+    assert!(unit_sizes.iter().any(|size| *size > 16_383));
+
+    let end = worst_case_delivery_request(wire::deliver_exchange_unit_request::Item::End(
+        wire::ExchangeUnitEnd { sequence: u64::MAX },
+    ));
+    assert_worst_case_envelope(&end);
+    let without_demand = {
+        let mut smaller = end.clone();
+        smaller.next_demand = None;
+        smaller.encoded_len()
+    };
+    assert!(end.encoded_len() > without_demand);
+    assert!(end.encoded_len() <= bound);
+
+    assert_eq!(grantable_delivery_payload_bytes(0), None);
+    assert_eq!(grantable_delivery_payload_bytes(bound), None);
+    assert_eq!(
+        grantable_delivery_payload_bytes(bound + 1),
+        NonZeroUsize::new(1)
+    );
 }

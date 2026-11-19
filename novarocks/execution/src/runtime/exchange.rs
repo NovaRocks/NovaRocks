@@ -67,9 +67,7 @@ use tracing::debug;
 
 pub(crate) mod online_unit;
 mod reader_structure;
-mod result_ipc_preflight;
 mod unit_ingress;
-pub use result_ipc_preflight::{TypedRootResultDecodeBounds, preflight_typed_root_result_decode};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ExchangeKey {
@@ -2090,12 +2088,6 @@ fn decode_root_result_chunks(
     bytes: &[u8],
     expected_chunk_schema: &ChunkSchemaRef,
 ) -> Result<Vec<Chunk>, ExchangeFailure> {
-    let exact_payload_limit = novarocks_execution_contract::ResultByteLimit::new(
-        u64::try_from(bytes.len())
-            .map_err(|source| failure::metadata("root fixture payload length", source))?,
-    )
-    .map_err(|source| failure::metadata("root fixture payload limit", source))?;
-    preflight_typed_root_result_decode(bytes, exact_payload_limit)?;
     let DecodedExchangePayload {
         wire_meta,
         arrow_payload,
