@@ -67,7 +67,6 @@ NOVA_CI_NATIVE_CROSS_PROCESS_CORE="${NOVA_CI_NATIVE_CROSS_PROCESS_CORE:-0}"
 NOVA_CI_NATIVE_CROSS_PROCESS_FULL="${NOVA_CI_NATIVE_CROSS_PROCESS_FULL:-0}"
 NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED="${NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED:-0}"
 
-# Design: ADR-0200 (docs/adr/ADR-0200-advisory-discovery-is-independent-of-admission.md)
 ci_list_stages() {
   cat <<'STAGES'
 {
@@ -102,7 +101,6 @@ ci_list_stages() {
     {"name": "verification composition tests", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "local CI classification tests", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "disabled SQL suite tests", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "Cargo dependency advisories", "tier": "full", "domain": ["Cargo.lock", "deny.toml", "tools/ci/dependency-advisories.py", ".github/workflows/dependency-advisories.yml"]},
     {"name": "control-runtime:loom", "mode": "loom", "tier": "full", "domain": ["novarocks/control-runtime/**", "novarocks/control-runtime-core/**", "tools/ci/control-runtime-model-checks.sh"], "env_inputs": [{"name": "RUSTFLAGS", "kind": "value"}, {"name": "CARGO_ENCODED_RUSTFLAGS", "kind": "value"}, {"name": "CARGO_BUILD_JOBS", "kind": "value"}, {"name": "RUSTUP_TOOLCHAIN", "kind": "value"}, {"name": "RUSTC", "kind": "value"}, {"name": "RUSTC_WRAPPER", "kind": "value"}, {"name": "RUSTC_WORKSPACE_WRAPPER", "kind": "value"}, {"name": "CARGO_BUILD_TARGET", "kind": "value"}, {"name": "LOOM_MAX_BRANCHES", "kind": "value"}, {"name": "LOOM_MAX_PERMUTATIONS", "kind": "value"}, {"name": "LOOM_MAX_DURATION", "kind": "value"}, {"name": "LOOM_MAX_PREEMPTIONS", "kind": "value"}, {"name": "LOOM_CHECKPOINT_FILE", "kind": "value"}, {"name": "LOOM_CHECKPOINT_INTERVAL", "kind": "value"}, {"name": "LOOM_LOCATION", "kind": "value"}, {"name": "LOOM_LOG", "kind": "value"}]},
     {"name": "memory-model:loom", "tier": "full", "domain": ["novarocks/memory/**", "tools/ci/memory-model-checks.sh"]},
     {"name": "memory-model:miri", "tier": "full", "domain": ["novarocks/memory/**", "tools/ci/memory-model-checks.sh"]},
@@ -1281,9 +1279,6 @@ ci_execute_selected_stage() (
   case "$CI_SELECTED_STAGE" in
     'workspace nextest and doctests')
       ci_stage_native_command "$CI_SELECTED_STAGE" python3 "$SCRIPT_DIR/test-run.py" batch --output "$CI_RUN_DIR/rust-stage"
-      return $? ;;
-    'Cargo dependency advisories')
-      ci_stage_native_command "$CI_SELECTED_STAGE" python3 "$SCRIPT_DIR/dependency-advisories.py" --output "$CI_RUN_DIR/dependency-advisories"
       return $? ;;
     control-runtime:loom) ci_stage_native_command "$CI_SELECTED_STAGE" bash "$SCRIPT_DIR/control-runtime-model-checks.sh" --loom --output "$CI_RUN_DIR/control-runtime-models"; return $? ;;
     memory-model:loom) ci_stage_native_command "$CI_SELECTED_STAGE" bash "$SCRIPT_DIR/memory-model-checks.sh" --loom; return $? ;;
