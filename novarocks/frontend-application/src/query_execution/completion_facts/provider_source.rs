@@ -428,11 +428,7 @@ mod owned_catalog_cpu_tests {
         }
     }
     fn query(sql: &str) -> novarocks_parser::ast::Query {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query fixture")
-        };
-        query.clone()
+        novarocks_parser::parser::parse_query(sql).unwrap()
     }
     #[tokio::test]
     async fn dropped_catalog_cpu_borrow_remains_owned_until_real_close_without_a_provider() {
@@ -567,8 +563,10 @@ mod owned_catalog_cpu_tests {
         assert!(custody.state.lock().unwrap().owned_catalog_cpu.is_none());
         // The actual borrowed Read/Explain CPU can still accept its next turn.
         let logical = cpu
-            .logical_catalog(
-                query("SELECT 1 AS retained_value"),
+            .logical_catalog_for_input(
+                novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query(
+                    "SELECT 1 AS retained_value",
+                ))),
                 SqlSessionContext {
                     current_catalog: None,
                     current_database: "db".into(),

@@ -31,11 +31,7 @@ use novarocks_type_contract::{
 use std::sync::Mutex;
 
 fn query_ast(sql: &str) -> Box<novarocks_parser::ast::Query> {
-    let mut statements = novarocks_parser::parse(sql).unwrap();
-    assert_eq!(statements.len(), 1);
-    let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
-        panic!("expected one query");
-    };
+    let query = novarocks_parser::parser::parse_query(sql).unwrap();
     Box::new(query)
 }
 
@@ -333,18 +329,14 @@ fn statement_with_sources(
     sources: &[ConstantValue],
 ) -> novarocks_sql::compiler::SqlStatementInput {
     use novarocks_sql::compiler::{
-        SqlConstantExpressionSite, SqlConstantExpressionStep, SqlExpressionConstant,
-        SqlStatementInput,
+        SqlConstantExpressionSite, SqlExpressionConstant, SqlStatementInput,
     };
     let projections = (0..sources.len())
         .map(|i| format!("(NULL) AS v{i}"))
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("SELECT {hint}{projections}, {expression} AS result");
-    let statements = novarocks_parser::parse(&sql).unwrap();
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("one query")
-    };
+    let query = novarocks_parser::parser::parse_query(&sql).unwrap();
     let constants = sources
         .iter()
         .enumerate()
@@ -354,7 +346,6 @@ fn statement_with_sources(
                 SqlConstantExpressionSite::SelectProjection { column },
                 value.clone(),
             )
-            .with_expression_path(vec![SqlConstantExpressionStep::Nested])
         })
         .collect::<Vec<_>>()
         .into();

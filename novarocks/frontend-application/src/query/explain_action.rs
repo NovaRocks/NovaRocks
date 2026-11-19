@@ -33,8 +33,7 @@ use novarocks_query_application::api::{
     ExecutionOutputObligation, LocalResultProducer, OwnedLocalResult,
 };
 use novarocks_query_application::session_control::{
-    GovernedActionContext, GovernedQueryStatementOwner, GovernedStatementAction,
-    GovernedStatementResidual, StatementActionValue,
+    GovernedActionContext, GovernedStatementAction, GovernedStatementResidual, StatementActionValue,
 };
 use novarocks_spi::connector::{
     ConnectorIoAdmissionPort, ConnectorMetadataMaintenanceIoProfile, SharedDependency,
@@ -68,7 +67,6 @@ struct ExplainPreparationInput {
     optimizer_limit: u64,
     sql: String,
     explain: ExplainInput,
-    root_session_admitted: bool,
     state: SessionSqlState,
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
@@ -113,22 +111,12 @@ async fn make_explain_preparation(
         let presentation = input.state.presentation().copied();
         let (catalog, database, execution, mut optimizer, semantics, property_inputs) =
             input.state.into_query_attempt_inputs();
-        let semantics = if input.root_session_admitted {
-            semantics
-        } else {
-            novarocks_sql::sql_mode::query_sql_semantics(&semantics, &input.explain.query).map_err(
-                |e| QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql))),
-            )?
-        };
         if optimizer.optimizer_query_mem_limit_bytes.is_none() {
             optimizer.optimizer_query_mem_limit_bytes = Some(input.optimizer_limit as f64);
         }
-        let options = with_query_hints(
-            query_options_from_session_settings(&execution),
-            &semantics,
-            (!input.root_session_admitted).then_some(input.explain.query.as_ref()),
-        );
-        let options = if input.root_session_admitted && !input.explain.is_analyze() {
+        let options =
+            with_query_sql_semantics(query_options_from_session_settings(&execution), &semantics);
+        let options = if !input.explain.is_analyze() {
             // The outer EXPLAIN deadline already belongs to RequestContext.
             // A missing outer deadline uses the original connector bound.
             let mut raw = *options.as_proto();
@@ -178,7 +166,6 @@ async fn make_explain_preparation(
         .prepare_explain_async(
             input.explain,
             detail,
-            input.root_session_admitted,
             &context,
             Some(options),
             &input.scope,
@@ -577,63 +564,6 @@ impl ExplainStatementAction {
     }
 }
 
-impl FrontendQuerySession {
-    pub(super) async fn execute_observed_explain(
-        &self,
-        sql: String,
-        explain: ast::ExplainQuery,
-        state: SessionSqlState,
-        deadline: Option<Instant>,
-        statement: GovernedQueryStatementOwner,
-        #[cfg(novarocks_dev_controls)] observation: Option<
-            crate::preparation_diagnostics::StatementObservationHandle,
-        >,
-    ) -> Result<StatementResult, QueryServiceError> {
-        let family = match state.presentation().copied() {
-            Some(family) => family,
-            None => {
-                return Ok(self.governed_typed_error(
-                    internal_error("EXPLAIN client result requires an explicit presentation"),
-                    statement,
-                ));
-            }
-        };
-        let window = match statement.result_window_alias() {
-            Some(window) => window,
-            None => {
-                return Ok(self.governed_typed_error(
-                    internal_error("EXPLAIN has no original result window"),
-                    statement,
-                ));
-            }
-        };
-        let action = build_explain_action(
-            &QueryActionEnvironment::new(&self.service),
-            QueryActionInputs {
-                scope: statement.scope().clone(),
-                deadline,
-                cancellation: QueryCancellationView::governed(
-                    statement.cancellation().clone(),
-                    statement.timeout_ms(),
-                ),
-                window,
-                planning_cpu: None,
-                root_session_admitted: false,
-                #[cfg(novarocks_dev_controls)]
-                observation,
-                #[cfg(novarocks_dev_controls)]
-                statement_token: statement.token(),
-            },
-            sql,
-            ExplainInput::from_legacy(explain),
-            state,
-            family,
-        )?;
-        self.execute_observed_statement_action(statement, action)
-            .await
-    }
-}
-
 pub(super) fn build_explain_action(
     environment: &QueryActionEnvironment,
     inputs: QueryActionInputs,
@@ -648,7 +578,6 @@ pub(super) fn build_explain_action(
         cancellation,
         window,
         planning_cpu,
-        root_session_admitted,
         #[cfg(novarocks_dev_controls)]
         observation,
         #[cfg(novarocks_dev_controls)]
@@ -697,7 +626,6 @@ pub(super) fn build_explain_action(
         optimizer_limit: environment.optimizer_limit,
         sql,
         explain,
-        root_session_admitted,
         state,
         deadline,
         cancellation,
@@ -765,6 +693,7 @@ fn explain_preparation_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_query_application::session_control::GovernedQueryStatementOwner;
     use novarocks_query_application::{
         api::ReservedExecutionIdentity, query_control::QueryApplicationControl,
         session_control::StatementActionReady,

@@ -737,7 +737,7 @@ mod session_property_projection_tests {
             for source in [
                 TrinoErrorSource::Service {
                     error: &service,
-                    sql: "SET SESSION x=1",
+                    sql: "SET SESSION x = 1",
                 },
                 TrinoErrorSource::Session {
                     error: &session,

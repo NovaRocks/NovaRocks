@@ -22,10 +22,10 @@ use super::{
     FrontendQuerySession, QueryCancellationView, QueryServiceError, StatementResult,
     compiler::FrontendQueryCompiler,
     governed_cancellation_error, internal_error, product_command_service_error,
-    table_mutation_action::{self, PreparedTableMutationInput},
+    table_mutation_action::{self, AlterTableMvGuard, PreparedTableMutationInput},
     table_property_computation::{
-        LikeColumnsCpuInput, PreparedTrinoTableLike, TablePropertyCpuInput,
-        TrinoTablePropertyCpuInput, TrinoTablePropertyOutput, TrinoTablePropertySyntax,
+        LikeColumnsCpuInput, PreparedTrinoTableLike, TrinoTablePropertyCpuInput,
+        TrinoTablePropertyOutput, TrinoTablePropertySyntax,
     },
 };
 use crate::query_execution::{
@@ -35,7 +35,6 @@ use crate::query_execution::{
 };
 use novarocks_parser::ast::{
     AstVec, ObjectName as ParsedObjectName, StatementProperty, StatementSaveMode, TrinoCreateTable,
-    legacy::CreateTable,
 };
 use novarocks_query_application::{
     admitted_query_context::RequestContext,
@@ -160,7 +159,6 @@ impl GovernedStatementResidual for Tail {
 }
 
 pub(super) enum TablePropertyInput {
-    LegacyCreate(CreateTable),
     TrinoCreate(TrinoCreateTable),
     TrinoSet {
         name: ParsedObjectName,
@@ -186,6 +184,7 @@ struct Action {
     compiler: FrontendQueryCompiler,
     interpreter: Arc<RequiredConstantInterpreter>,
     router: ProductCommandRouter,
+    alter_mv_guard: AlterTableMvGuard,
     context: RequestContext,
     command: Option<CommandContext>,
     control: SqlCompileControl,
@@ -197,51 +196,6 @@ struct Action {
     delivered: bool,
 }
 impl Action {
-    fn start_properties(
-        &mut self,
-        owner: &GovernedActionContext<'_>,
-        like_columns: Option<Vec<TableColumnDef>>,
-    ) -> Result<(), QueryServiceError> {
-        let Some(TablePropertyInput::LegacyCreate(pending)) = self.pending.take() else {
-            unreachable!("legacy table property preparation has its original syntax");
-        };
-        let binding = self
-            .router
-            .acquire_table_property_binding(&lower_object_name(&pending.name), &self.context)
-            .map_err(product_command_service_error)?;
-        let window = owner
-            .result_window_alias()
-            .ok_or_else(|| internal_error("table properties have no original result window"))?;
-        let input = TablePropertyCpuInput {
-            source: self.source.clone(),
-            statement: pending,
-            binding,
-            command: self
-                .command
-                .as_ref()
-                .expect("same original command")
-                .clone(),
-            like_columns,
-            context: self.compiler.property_cpu_context(
-                self.context.session().current_database().to_owned(),
-                self.context.execution().sql_semantics().clone(),
-                self.interpreter.clone(),
-                self.control.clone(),
-                owner.scope().clone(),
-                window,
-            ),
-        };
-        let tail = self.tail.as_mut().expect("same original table residual");
-        let cpu = tail.cpu.clone();
-        assert!(tail.preparation.is_none() && tail.prepared.is_none());
-        tail.preparation = Some(Box::pin(async move {
-            cpu.table_properties(input)
-                .await
-                .map(|r| r.map(Prepared::Table))
-        }));
-        self.phase = Phase::Properties;
-        Ok(())
-    }
     fn start_trino_properties(
         &mut self,
         owner: &GovernedActionContext<'_>,
@@ -254,7 +208,6 @@ impl Action {
             TablePropertyInput::TrinoSet { properties, .. } => {
                 TrinoTablePropertySyntax::Set(properties)
             }
-            TablePropertyInput::LegacyCreate(_) => unreachable!("original typed table input"),
         };
         let window = owner
             .result_window_alias()
@@ -354,10 +307,6 @@ impl Action {
         loop {
             match self.phase {
                 Phase::Start => match self.pending.as_ref().expect("one table input") {
-                    TablePropertyInput::LegacyCreate(node) => match node.like.as_ref() {
-                        Some(source) => self.start_like(&lower_object_name(source))?,
-                        None => self.start_properties(owner, None)?,
-                    },
                     TablePropertyInput::TrinoCreate(node) => {
                         if node.save_mode == StatementSaveMode::Replace {
                             return Poll::Ready(Err(unsupported_statement(
@@ -453,17 +402,14 @@ impl Action {
                     let Prepared::Like(columns) = prepared else {
                         unreachable!("same finite LIKE CPU case")
                     };
-                    if let Some(table) = self.trino_like.take() {
-                        let cpu = tail.cpu.clone();
-                        tail.preparation = Some(Box::pin(async move {
-                            cpu.finish_trino_table_like(table, columns)
-                                .await
-                                .map(|r| r.map(Prepared::Table))
-                        }));
-                        self.phase = Phase::Properties;
-                    } else {
-                        self.start_properties(owner, Some(columns))?;
-                    }
+                    let table = self.trino_like.take().expect("original typed LIKE input");
+                    let cpu = tail.cpu.clone();
+                    tail.preparation = Some(Box::pin(async move {
+                        cpu.finish_trino_table_like(table, columns)
+                            .await
+                            .map(|r| r.map(Prepared::Table))
+                    }));
+                    self.phase = Phase::Properties;
                 }
                 Phase::Properties => {
                     let tail = self.tail.as_mut().expect("same table residual");
@@ -488,6 +434,7 @@ impl Action {
                         self.cpu.clone(),
                         self.cancellation.clone(),
                         self.compiler.connector_runtime().clone(),
+                        &self.alter_mv_guard,
                     )
                     .map_err(product_command_service_error)?;
                     tail.inner = Some(inner);
@@ -597,26 +544,6 @@ impl GovernedStatementAction for Action {
     }
 }
 impl FrontendQuerySession {
-    pub(super) async fn execute_observed_table_create(
-        &self,
-        source: Arc<str>,
-        pending: CreateTable,
-        context: RequestContext,
-        command: CommandContext,
-        deadline: Option<Instant>,
-        statement: GovernedQueryStatementOwner,
-    ) -> Result<StatementResult, QueryServiceError> {
-        self.execute_observed_table_properties(
-            source,
-            TablePropertyInput::LegacyCreate(pending),
-            context,
-            command,
-            deadline,
-            statement,
-        )
-        .await
-    }
-
     pub(super) async fn execute_observed_table_properties(
         &self,
         source: Arc<str>,
@@ -650,6 +577,7 @@ impl FrontendQuerySession {
             compiler: self.service.query_compiler.clone(),
             interpreter: self.service.required_constant_interpreter.clone(),
             router: self.service.product_command_router.clone(),
+            alter_mv_guard: self.service.alter_mv_guard.clone(),
             context,
             command: Some(command),
             control: SqlCompileControl::new(

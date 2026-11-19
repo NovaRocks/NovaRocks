@@ -24,8 +24,7 @@ use super::{
     routed_execution_service_error,
 };
 use crate::query::{
-    catalog_property_computation::{CatalogCreateInput, CatalogPropertyCpuInput},
-    compiler::FrontendQueryCompiler,
+    catalog_property_computation::CatalogPropertyCpuInput, compiler::FrontendQueryCompiler,
     property_action_tail::PropertyActionTail,
 };
 use crate::query_execution::{
@@ -61,7 +60,7 @@ impl PropertyActionTail<CatalogCreateCommand> {
 }
 struct CatalogCreateAction {
     source: Arc<str>,
-    pending: Option<CatalogCreateInput>,
+    pending: Option<ast::TrinoCreateCatalog>,
     compiler: FrontendQueryCompiler,
     interpreter: Arc<RequiredConstantInterpreter>,
     router: ProductCommandRouter,
@@ -173,26 +172,6 @@ impl GovernedStatementAction for CatalogCreateAction {
     }
 }
 impl FrontendQuerySession {
-    pub(super) async fn execute_observed_catalog_create(
-        &self,
-        source: Arc<str>,
-        pending: ast::legacy::CreateCatalog,
-        context: RequestContext,
-        command_context: CommandContext,
-        deadline: Option<Instant>,
-        statement: GovernedQueryStatementOwner,
-    ) -> Result<StatementResult, QueryServiceError> {
-        self.execute_catalog_create(
-            source,
-            CatalogCreateInput::Legacy(pending),
-            context,
-            command_context,
-            deadline,
-            statement,
-        )
-        .await
-    }
-
     pub(super) async fn execute_observed_trino_catalog_create(
         &self,
         source: Arc<str>,
@@ -204,7 +183,7 @@ impl FrontendQuerySession {
     ) -> Result<StatementResult, QueryServiceError> {
         self.execute_catalog_create(
             source,
-            CatalogCreateInput::Trino(pending),
+            pending,
             context,
             command_context,
             deadline,
@@ -216,15 +195,15 @@ impl FrontendQuerySession {
     async fn execute_catalog_create(
         &self,
         source: Arc<str>,
-        pending: CatalogCreateInput,
+        pending: ast::TrinoCreateCatalog,
         context: RequestContext,
         command_context: CommandContext,
         deadline: Option<Instant>,
         statement: GovernedQueryStatementOwner,
     ) -> Result<StatementResult, QueryServiceError> {
-        if let Err(cause) =
-            crate::catalog_application::statement_action::admit_create_catalog_name(pending.name())
-        {
+        if let Err(cause) = crate::catalog_application::statement_action::admit_create_catalog_name(
+            &pending.catalog_name.value,
+        ) {
             return Ok(
                 self.governed_typed_error(QueryServiceError::from_failure_cause(cause), statement)
             );

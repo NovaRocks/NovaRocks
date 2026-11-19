@@ -42,18 +42,6 @@ pub(super) fn prepare(
             "maintenance client result requires an explicit presentation",
         )
     })?;
-    if let Some(action) = executor.prepare_optimize_action(
-        command,
-        context.session().current_catalog(),
-        context.session().current_database(),
-        context.execution(),
-        command_context.connector_context(),
-        family,
-        #[cfg(novarocks_dev_controls)]
-        observation.clone(),
-    )? {
-        return Ok(action);
-    }
     if let Some(action) = executor
         .prepare_direct_rewrite_action(
             command,

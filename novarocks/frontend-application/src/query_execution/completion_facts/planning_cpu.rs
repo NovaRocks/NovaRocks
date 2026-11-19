@@ -185,7 +185,6 @@ enum PlanningCpuInput {
         columns: Vec<novarocks_sql::semantic::TableColumnDef>,
     },
     SchemaProperties(Box<crate::query::schema_create_action::SchemaPropertyInput>),
-    TableProperties(Box<crate::query::table_property_computation::TablePropertyCpuInput>),
     CtasProperties(Box<crate::query::ctas_action::trino::TrinoCtasPropertyInput>),
     LikeColumns(Box<crate::query::table_property_computation::LikeColumnsCpuInput>),
     SystemTableBatch,
@@ -382,9 +381,6 @@ impl PlanningCpuOriginal {
             }
             PlanningCpuInput::SchemaProperties(input) => {
                 PlanningCpuOutput::SchemaProperties(Box::new(input.run()))
-            }
-            PlanningCpuInput::TableProperties(input) => {
-                PlanningCpuOutput::TableProperties(Box::new(input.run()))
             }
             PlanningCpuInput::CtasProperties(input) => {
                 PlanningCpuOutput::CtasProperties(Box::new(input.run()))
@@ -1223,22 +1219,6 @@ impl FrontendPlanningCpuSource {
         };
         Ok(*result)
     }
-    pub(crate) async fn table_properties(
-        &self,
-        input: crate::query::table_property_computation::TablePropertyCpuInput,
-    ) -> Result<
-        Result<
-            crate::query::table_mutation_action::PreparedTableMutationInput,
-            novarocks_query_application::session_error::QueryServiceError,
-        >,
-        StatementNativeHealthFailure,
-    > {
-        self.install(PlanningCpuInput::TableProperties(Box::new(input)));
-        let PlanningCpuOutput::TableProperties(result) = self.receive().await? else {
-            panic!("table properties returned another CPU phase");
-        };
-        Ok(*result)
-    }
     pub(crate) async fn ctas_properties(
         &self,
         input: crate::query::ctas_action::trino::TrinoCtasPropertyInput,
@@ -1303,21 +1283,6 @@ impl FrontendPlanningCpuSource {
         };
         Ok(*result)
     }
-    pub(crate) async fn logical_catalog(
-        &self,
-        query: novarocks_parser::ast::Query,
-        session: SqlSessionContext,
-        control: SqlCompileControl,
-    ) -> Result<Result<SqlLogicalExplainCatalog, SqlCompileError>, StatementNativeHealthFailure>
-    {
-        self.logical_catalog_for_input(
-            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
-            session,
-            control,
-        )
-        .await
-    }
-
     pub(crate) async fn logical_catalog_for_input(
         &self,
         input: novarocks_sql::compiler::SqlStatementInput,
@@ -1547,11 +1512,7 @@ mod map64_planning_worker_tests {
         for level in 0..63 {
             sql = format!("SELECT map_agg(1, m) AS m FROM ({sql}) q{level}");
         }
-        let mut statements = novarocks_parser::parse(&sql).unwrap();
-        assert_eq!(statements.len(), 1);
-        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
-            panic!("expected one query");
-        };
+        let query = novarocks_parser::parser::parse_query(&sql).unwrap();
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([43; 16]).unwrap(),
             SqlStatementInput::parsed_query(Box::new(query)),

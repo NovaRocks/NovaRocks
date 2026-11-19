@@ -32,8 +32,7 @@ use novarocks_query_application::api::{
     StatementNativeHealthFailure,
 };
 use novarocks_query_application::session_control::{
-    GovernedActionContext, GovernedQueryStatementOwner, GovernedStatementAction,
-    GovernedStatementResidual, StatementActionValue,
+    GovernedActionContext, GovernedStatementAction, GovernedStatementResidual, StatementActionValue,
 };
 use novarocks_spi::connector::{
     ConnectorIoAdmissionPort, ConnectorMetadataMaintenanceIoProfile, SharedDependency,
@@ -49,7 +48,6 @@ pub(super) struct ReadPreparationInput {
     pub(super) optimizer_limit: u64,
     pub(super) sql: Arc<str>,
     pub(super) query: Box<ast::Query>,
-    pub(super) root_session_admitted: bool,
     pub(super) state: SessionSqlState,
     pub(super) deadline: Option<Instant>,
     pub(super) cancellation: QueryCancellationView,
@@ -76,21 +74,11 @@ pub(super) async fn prepare_read(
         let presentation = input.state.presentation().copied();
         let (catalog, database, execution, mut optimizer, semantics, property_inputs) =
             input.state.into_query_attempt_inputs();
-        let semantics = if input.root_session_admitted {
-            semantics
-        } else {
-            novarocks_sql::sql_mode::query_sql_semantics(&semantics, &query).map_err(|e| {
-                QueryServiceError::from_user_error(e.to_user_error(Some(&input.sql)))
-            })?
-        };
         if optimizer.optimizer_query_mem_limit_bytes.is_none() {
             optimizer.optimizer_query_mem_limit_bytes = Some(input.optimizer_limit as f64);
         }
-        let options = with_query_hints(
-            query_options_from_session_settings(&execution),
-            &semantics,
-            (!input.root_session_admitted).then_some(query.as_ref()),
-        );
+        let options =
+            with_query_sql_semantics(query_options_from_session_settings(&execution), &semantics);
         let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
             .map_err(statement_work_error)?;
         let context = RequestContext::admit(
@@ -147,7 +135,6 @@ pub(super) async fn prepare_read(
         .prepare_read_async(
             *query,
             input.purpose,
-            input.root_session_admitted,
             &context,
             Some(options),
             &input.scope,
@@ -782,76 +769,8 @@ impl GovernedStatementAction for ReadStatementAction {
         result
     }
 }
+#[cfg(novarocks_dev_controls)]
 impl FrontendQuerySession {
-    pub(super) async fn execute_observed_read(
-        &self,
-        sql: Arc<str>,
-        parsed: ParsedStatement,
-        state: SessionSqlState,
-        deadline: Option<Instant>,
-        statement: GovernedQueryStatementOwner,
-        purpose: FrontendQueryPurpose,
-    ) -> Result<StatementResult, QueryServiceError> {
-        let ParsedStatement::Query(query) = parsed else {
-            return Ok(self.governed_typed_error(
-                internal_error("Read preparation requires a query"),
-                statement,
-            ));
-        };
-        if state.presentation().is_none() {
-            return Ok(self.governed_typed_error(
-                internal_error("Read client result requires an explicit presentation"),
-                statement,
-            ));
-        }
-        let window = statement
-            .result_window_alias()
-            .ok_or_else(|| internal_error("Read has no original result window"))?;
-        let action = build_read_action(
-            &QueryActionEnvironment::new(&self.service),
-            QueryActionInputs {
-                scope: statement.scope().clone(),
-                deadline,
-                cancellation: QueryCancellationView::governed(
-                    statement.cancellation().clone(),
-                    statement.timeout_ms(),
-                ),
-                window,
-                planning_cpu: None,
-                root_session_admitted: false,
-                #[cfg(novarocks_dev_controls)]
-                observation: self
-                    .service
-                    .statement_observation
-                    .as_ref()
-                    .and_then(|owner| owner.bound_statement(statement.token())),
-                #[cfg(novarocks_dev_controls)]
-                statement_token: statement.token(),
-            },
-            sql,
-            Box::new(query),
-            state,
-            purpose,
-        )?;
-        #[cfg(novarocks_dev_controls)]
-        let handoff_statement = statement.token();
-        #[cfg(novarocks_dev_controls)]
-        let handoff_target = self
-            .service
-            .statement_observation
-            .as_ref()
-            .and_then(|o| o.bound_statement(handoff_statement))
-            .and_then(|h| h.statement_target());
-        let result = self
-            .execute_observed_statement_action(statement, action)
-            .await?;
-        #[cfg(novarocks_dev_controls)]
-        self.finish_observed_read_handoff(handoff_statement, handoff_target, &result)
-            .await?;
-        Ok(result)
-    }
-
-    #[cfg(novarocks_dev_controls)]
     pub(super) fn finish_observed_read_handoff<'session>(
         &'session self,
         statement: StatementToken,
@@ -888,7 +807,6 @@ pub(super) fn build_read_action(
         cancellation,
         window,
         planning_cpu,
-        root_session_admitted,
         #[cfg(novarocks_dev_controls)]
         observation,
         #[cfg(novarocks_dev_controls)]
@@ -949,7 +867,6 @@ pub(super) fn build_read_action(
         optimizer_limit: environment.optimizer_limit,
         sql,
         query,
-        root_session_admitted,
         state,
         deadline,
         cancellation,

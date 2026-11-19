@@ -1076,11 +1076,7 @@ mod tests {
     use super::*;
 
     fn query_ast(sql: &str) -> Box<novarocks_parser::ast::Query> {
-        let mut statements = novarocks_parser::parse(sql).unwrap();
-        assert_eq!(statements.len(), 1);
-        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
-            panic!("expected one query");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         Box::new(query)
     }
 

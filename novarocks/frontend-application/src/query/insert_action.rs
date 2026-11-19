@@ -151,9 +151,6 @@ pub(crate) fn prepare(
     let reference = match input.reference {
         crate::dml::insert::InsertTargetRef::Main => "main".to_owned(),
         crate::dml::insert::InsertTargetRef::Branch(name) => name,
-        crate::dml::insert::InsertTargetRef::Tag(_) => {
-            unreachable!("tag rejected by original author")
-        }
     };
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         &kernel,

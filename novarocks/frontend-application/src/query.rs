@@ -43,15 +43,15 @@ use crate::query_execution::maintenance::command::MaintenanceCommandExecutor;
 use crate::statistics::command::StatisticsCommandExecutor;
 use crate::view::command::ViewCommandExecutor;
 use async_trait::async_trait;
-use novarocks_parser::ast::{self, Statement as ParsedStatement};
+use novarocks_parser::ast;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_proto_models::novarocks;
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_query_application::api::{BackendTopologyService, BackendTopologySnapshot};
 use novarocks_query_application::api::{
     CatalogCommandConsumer, CommandContext, CommandError, CommandErrorKind, CommandFuture,
-    MaintenanceCommandConsumer, MaterializedViewCommand, MaterializedViewCommandConsumer,
-    OptionalCommandFuture, QueryExecutionError, StatisticsCommandConsumer,
+    MaintenanceCommandConsumer, OptionalCommandFuture, QueryExecutionError,
+    StatisticsCommandConsumer,
 };
 use novarocks_query_application::api::{QueryResult, build_string_query_result};
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
@@ -83,20 +83,11 @@ use novarocks_query_application::session_outcome::{
     governed_query_deadline, governed_query_execution_error, governed_statement_begin_error,
 };
 use novarocks_query_application::session_value::StatementSessionError;
-use novarocks_query_application::sql::admission::{
-    requires_lake_publication_deadline, typed_statement_work_class,
-};
 use novarocks_query_application::sql::catalog::SessionCatalogService;
-use novarocks_query_application::sql::dml_admission::validate_table_statement_admission;
 use novarocks_query_application::sql::session::{SessionExecutionSettings, SessionSqlState};
-use novarocks_query_application::sql::session_admit::SessionAdmitError;
 use novarocks_query_application::sql::trino_admission::TrinoSessionAction;
 use novarocks_query_application::sql::{
-    PreparedMaintenanceCall, SpecializedStatementRoute, parse_single_statement,
-    query_service_parse_error,
-};
-use novarocks_query_application::sql::{
-    ProductCommandRouter, ProductSqlCommand, lower_product_sql_command,
+    PreparedMaintenanceCall, ProductCommandRouter, ProductSqlCommand,
 };
 use novarocks_query_application::statement_kind::StatementKind;
 use novarocks_type_contract::CompileControlError;
@@ -590,7 +581,6 @@ pub(crate) fn product_command_router(
 #[derive(Clone)]
 struct TypedCommandRoute {
     view: ViewCommandExecutor,
-    mv: Arc<dyn MaterializedViewCommandConsumer>,
     mv_call: MvCommandExecutor,
     executor: QueryBlockingExecutor,
 }
@@ -598,20 +588,18 @@ struct TypedCommandRoute {
 impl TypedCommandRoute {
     fn new(
         view: ViewCommandExecutor,
-        mv: Arc<dyn MaterializedViewCommandConsumer>,
         mv_call: MvCommandExecutor,
         executor: QueryBlockingExecutor,
     ) -> Self {
         Self {
             view,
-            mv,
             mv_call,
             executor,
         }
     }
 }
 
-impl SpecializedStatementRoute for TypedCommandRoute {
+impl TypedCommandRoute {
     fn execute_maintenance_call(
         &self,
         statement: Arc<PreparedMaintenanceCall>,
@@ -628,42 +616,6 @@ impl SpecializedStatementRoute for TypedCommandRoute {
                     &statement,
                     context.session().current_database(),
                     command_context.principal(),
-                    command_context.connector_context(),
-                )
-            },
-        )
-    }
-
-    fn prepare_materialized_view_statement_action(
-        &self,
-        statement: novarocks_parser::ast::MaterializedViewStatement,
-        context: RequestContext,
-        command_context: CommandContext,
-    ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
-        self.mv.prepare_statement_action(
-            MaterializedViewCommand::new(statement),
-            context,
-            command_context,
-        )
-    }
-
-    fn execute_view(
-        &self,
-        statement: &novarocks_parser::ast::ViewStatement,
-        context: &RequestContext,
-        command_context: &CommandContext,
-    ) -> CommandFuture {
-        let view = self.view.clone();
-        let statement = statement.clone();
-        execute_product_command_edge(
-            self.executor.clone(),
-            context.clone(),
-            command_context.clone(),
-            move |context, command_context| {
-                view.execute(
-                    &statement,
-                    context.session().current_catalog(),
-                    context.session().current_database(),
                     command_context.connector_context(),
                 )
             },
@@ -1045,6 +997,7 @@ pub struct FrontendQueryService {
     query_compiler: FrontendQueryCompiler,
     command_executor: Arc<TypedCommandRoute>,
     product_command_router: ProductCommandRouter,
+    alter_mv_guard: table_mutation_action::AlterTableMvGuard,
     statistics_command: crate::statistics::command::StatisticsCommandExecutor,
     iceberg_ref_command: IcebergRefCommandExecutor,
     maintenance_command: MaintenanceCommandExecutor,
@@ -1107,11 +1060,11 @@ impl FrontendQueryService {
         required_constant_interpreter: Arc<crate::RequiredConstantInterpreter>,
         query_compiler: FrontendQueryCompiler,
         product_command_router: ProductCommandRouter,
+        alter_mv_guard: table_mutation_action::AlterTableMvGuard,
         statistics_command: crate::statistics::command::StatisticsCommandExecutor,
         iceberg_ref_command: IcebergRefCommandExecutor,
         maintenance_command: MaintenanceCommandExecutor,
         view_command_executor: ViewCommandExecutor,
-        mv_command_consumer: Arc<dyn MaterializedViewCommandConsumer>,
         mv_command_executor: MvCommandExecutor,
         query_control: QueryControlService,
         logical_execution_launcher: Arc<dyn LogicalExecutionLauncher>,
@@ -1142,11 +1095,11 @@ impl FrontendQueryService {
             query_compiler,
             command_executor: Arc::new(TypedCommandRoute::new(
                 view_command_executor,
-                mv_command_consumer,
                 mv_command_executor,
                 query_blocking_executor.clone(),
             )),
             product_command_router,
+            alter_mv_guard,
             statistics_command,
             iceberg_ref_command,
             maintenance_command,
@@ -1292,93 +1245,6 @@ impl FrontendQuerySession {
             })
     }
 
-    async fn execute_one_statement(
-        &self,
-        statement: &str,
-    ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
-    {
-        let source = statement_execution_source(statement);
-        let parsed_statement = parse_single_statement(source)
-            .map_err(|error| query_service_parse_error(error, source))?;
-        novarocks_query_application::sql::admission::admit_statement_session(&parsed_statement)?;
-        let admitted = novarocks_query_application::session::StatementAdmission::from_statement(
-            &parsed_statement,
-        );
-        let kind = admitted.kind;
-        if query_session_action::uses_legacy_root_hints(&parsed_statement) {
-            return self
-                .execute_legacy_scoped_query_family(Arc::from(source), parsed_statement)
-                .await
-                .map(|output| {
-                    novarocks_query_application::session::QuerySessionStatement::output_owned(
-                        output, kind,
-                    )
-                });
-        }
-        self.admission.publish(admitted);
-        *self.output_shape.lock().unwrap_or_else(|p| p.into_inner()) = Some(admitted.shape);
-        let result = match parsed_statement {
-            ParsedStatement::Session(statement) => {
-                self.execute_session_statement(source, &statement).await
-            }
-            ParsedStatement::Query(_) => {
-                return self
-                    .execute_governed_read(source.to_string(), parsed_statement)
-                    .await
-                    .map(|output| {
-                        novarocks_query_application::session::QuerySessionStatement::output_owned(
-                            output, kind,
-                        )
-                    });
-            }
-            statement => {
-                self.execute_typed_statement(source.to_string(), statement)
-                    .await
-            }
-        };
-        result.map(|output| {
-            novarocks_query_application::session::QuerySessionStatement::output_owned(output, kind)
-        })
-    }
-
-    async fn execute_session_statement(
-        &self,
-        source: &str,
-        statement: &ast::SessionStatement,
-    ) -> Result<StatementResult, QueryServiceError> {
-        let source: Arc<str> = Arc::from(source);
-        let (governed, deadline) =
-            self.begin_session_action(&source, matches!(statement, ast::SessionStatement::Set(_)))?;
-        match statement {
-            ast::SessionStatement::Set(statement) => {
-                self.execute_observed_set(source, statement.clone(), deadline, governed).await
-            }
-            ast::SessionStatement::Use(statement) => {
-                let schema = statement.catalog.as_ref().map_or_else(
-                    || statement.database.value.clone(),
-                    |catalog| format!("{}.{}", catalog.value, statement.database.value),
-                );
-                Ok(self.execute_session_use(SessionNamespace::Legacy(&schema), governed).await)
-            }
-            ast::SessionStatement::Kill(_) => {
-                unreachable!("connection management is refused before statement admission")
-            }
-            ast::SessionStatement::TransactionControl(statement) => Ok(self.governed_typed_error(
-                QueryServiceError::from_user_error(
-                    SessionAdmitError::TransactionUnsupported.to_user_error(
-                        &source,
-                        statement.span,
-                        format!(
-                            "{} is not supported because NovaRocks only provides statement-level autocommit frontiers",
-                            statement.kind.sql()
-                        ),
-                    ),
-                ),
-                governed,
-            )),
-        }
-    }
-
     pub(super) async fn execute_trino_session_action(
         &self,
         source: Arc<str>,
@@ -1394,7 +1260,7 @@ impl FrontendQuerySession {
         let output = match work {
             TrinoSessionWork::Use { catalog, schema } => {
                 self.execute_session_use(
-                    SessionNamespace::Trino {
+                    SessionNamespace {
                         catalog: catalog.as_ref(),
                         schema: &schema,
                         source: &source,
@@ -1514,828 +1380,6 @@ impl FrontendQuerySession {
         let effects = SessionEffects::set_catalog_schema(context.catalog, context.database);
         state.apply_effects(&effects)?;
         Ok(effects)
-    }
-
-    async fn execute_governed_read(
-        &self,
-        sql: String,
-        parsed_statement: ParsedStatement,
-    ) -> Result<StatementResult, QueryServiceError> {
-        let sql: Arc<str> = sql.into();
-        let ParsedStatement::Query(_) = &parsed_statement else {
-            return Err(internal_error("read admission requires a query statement"));
-        };
-        let purpose = FrontendQueryPurpose::ClientRows;
-        let (deadline, timeout_ms) = {
-            let state = self.state.lock().map_err(poisoned_state)?;
-            governed_query_deadline(&state)?
-        };
-        let token = self.token()?;
-        let statement = self
-            .service
-            .query_control
-            .begin_queued_governed_query_statement_with_result(
-                token,
-                &self.service.workload_root_admission,
-                deadline.map(tokio::time::Instant::from_std),
-                timeout_ms,
-                Some(Arc::clone(&sql)),
-                purpose.window_class(),
-            )
-            .await
-            .map_err(|error| self.governed_statement_begin_error(error))?;
-        #[cfg(novarocks_dev_controls)]
-        if let Some(owner) = &self.service.statement_observation
-            && let Err(error) = owner.bind_statement(statement.token(), &sql)
-        {
-            return Ok(self.governed_typed_error(internal_error(error), statement));
-        }
-
-        let state = self.state.lock().map_err(poisoned_state)?.clone();
-        self.execute_observed_read(sql, parsed_statement, state, deadline, statement, purpose)
-            .await
-    }
-
-    async fn execute_typed_statement(
-        &self,
-        sql: String,
-        parsed_statement: ParsedStatement,
-    ) -> Result<StatementResult, QueryServiceError> {
-        reject_plain_query_from_legacy_typed_route(&parsed_statement)?;
-        let query_timeout_secs = self
-            .state
-            .lock()
-            .map_err(poisoned_state)?
-            .execution_settings()
-            .query_timeout_secs();
-        let session_deadline = match query_timeout_secs {
-            Some(seconds) => Instant::now()
-                .checked_add(Duration::from_secs(seconds))
-                .ok_or_else(|| {
-                    QueryServiceError::new(
-                        QueryServiceErrorKind::Internal,
-                        "query deadline exceeds monotonic clock range",
-                    )
-                })?,
-            None => Instant::now(),
-        };
-        let session_deadline = query_timeout_secs.map(|_| session_deadline);
-        let deadline = if requires_lake_publication_deadline(&parsed_statement) {
-            Some(
-                self.service
-                    .lake_publication_runtime_policy
-                    .admit_deadline(Instant::now(), session_deadline)
-                    .map_err(internal_error)?,
-            )
-        } else {
-            session_deadline
-        };
-        let timeout_duration =
-            deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-        let timeout_ms = timeout_duration.map(timeout_message_millis);
-        let token = self.token()?;
-        let work_class = typed_statement_work_class(&parsed_statement);
-        let window_class = typed_statement_result_window_class(&parsed_statement);
-        let mut statement = if work_class == WorkClass::Query {
-            self.service
-                .query_control
-                .begin_queued_governed_query_statement_with_result(
-                    token,
-                    &self.service.workload_root_admission,
-                    deadline.map(tokio::time::Instant::from_std),
-                    timeout_ms,
-                    Some(Arc::from(sql.as_str())),
-                    window_class,
-                )
-                .await
-        } else {
-            self.service
-                .query_control
-                .begin_governed_statement_with_result(
-                    token,
-                    &self.service.workload_root_admission,
-                    work_class,
-                    deadline.map(tokio::time::Instant::from_std),
-                    timeout_ms,
-                    Some(Arc::from(sql.as_str())),
-                    window_class,
-                )
-        }
-        .map_err(|error| self.governed_statement_begin_error(error))?;
-        #[cfg(novarocks_dev_controls)]
-        let observation = match self
-            .service
-            .statement_observation
-            .as_ref()
-            .map(|owner| owner.bind_statement(statement.token(), &sql))
-            .transpose()
-        {
-            Ok(handle) => handle.flatten(),
-            Err(error) => return Ok(self.governed_typed_error(internal_error(error), statement)),
-        };
-        let state = self.state.lock().map_err(poisoned_state)?.clone();
-        novarocks_query_application::sql::admission::admit_persisted_definition_semantics(
-            &sql,
-            &parsed_statement,
-            state.sql_semantics(),
-        )?;
-        let parsed_statement = match parsed_statement {
-            ParsedStatement::ExplainQuery(explain) => {
-                return self
-                    .execute_observed_explain(
-                        sql,
-                        explain,
-                        state,
-                        deadline,
-                        statement,
-                        #[cfg(novarocks_dev_controls)]
-                        observation,
-                    )
-                    .await;
-            }
-            other => other,
-        };
-        let cancellation = QueryCancellationView::governed(
-            statement.cancellation().clone(),
-            statement.timeout_ms(),
-        );
-        let topology = match self.service.topology.snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return Ok(self.governed_typed_error(
-                    QueryServiceError::new(QueryServiceErrorKind::Internal, error.to_string()),
-                    statement,
-                ));
-            }
-        };
-        let topology = if topology.targets().is_empty()
-            && matches!(
-                parsed_statement,
-                ParsedStatement::Query(_)
-                    | ParsedStatement::ExplainQuery(_)
-                    | ParsedStatement::Dml(_)
-            ) {
-            let wait_deadline =
-                deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
-            let wait_after_revision = topology.revision();
-            match wait_for_eligible_query_topology_after(
-                &self.service.topology,
-                &cancellation,
-                wait_after_revision,
-                wait_deadline,
-            )
-            .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(error) => return Ok(self.governed_typed_error(error, statement)),
-            }
-        } else {
-            topology
-        };
-        let presentation = state.presentation().copied();
-        let (
-            current_catalog,
-            current_database,
-            execution_settings,
-            mut optimizer_settings,
-            sql_semantics,
-            property_inputs,
-        ) = state.into_query_attempt_inputs();
-        let sql_semantics =
-            novarocks_sql::sql_mode::statement_sql_semantics(&sql_semantics, &parsed_statement)
-                .map_err(|error| {
-                    QueryServiceError::from_user_error(error.to_user_error(Some(&sql)))
-                })?;
-        // A session `SET` wins; otherwise admission freezes the process budget so
-        // SQL costing never consults a process-global configuration.
-        if optimizer_settings.optimizer_query_mem_limit_bytes.is_none() {
-            optimizer_settings.optimizer_query_mem_limit_bytes =
-                Some(self.service.optimizer_query_mem_limit_bytes as f64);
-        }
-        let context = RequestContext::admit(
-            RequestAdmission::new(
-                current_catalog,
-                current_database,
-                self.service.role,
-                topology,
-                deadline,
-                cancellation.clone(),
-                optimizer_settings,
-                sql_semantics.clone(),
-                presentation,
-            )
-            .with_session_property_inputs(property_inputs),
-        );
-        let command_executor = Arc::clone(&self.service.command_executor);
-        let product_command_router = self.service.product_command_router.clone();
-        let dml = Arc::clone(&self.service.dml);
-        let insert_engine = Arc::clone(&self.service.insert_engine);
-        let delete_engine = Arc::clone(&self.service.delete_engine);
-        let mutation_engine = Arc::clone(&self.service.mutation_engine);
-        let add_files_engine = Arc::clone(&self.service.add_files_engine);
-        let ctas_engine = Arc::clone(&self.service.ctas_engine);
-        let truncate_engine = Arc::clone(&self.service.truncate_engine);
-        let window = match statement.result_window_alias() {
-            Some(window) => window,
-            None => {
-                return Ok(self.governed_typed_error(
-                    internal_error("typed statement has no admitted result capacity"),
-                    statement,
-                ));
-            }
-        };
-        let capacity = match novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(statement.scope(), window) {
-            Ok(capacity) => capacity,
-            Err(error) => return Ok(self.governed_typed_error(internal_error(error.to_string()), statement)),
-        };
-        let context = match context.with_result_capacity(capacity) {
-            Ok(context) => context,
-            Err(error) => {
-                return Ok(self.governed_typed_error(internal_error(error.to_string()), statement));
-            }
-        };
-        let query_options = with_query_hints(
-            query_options_from_session_settings(&execution_settings),
-            &sql_semantics,
-            match &parsed_statement {
-                ParsedStatement::ExplainQuery(explain) => Some(&explain.query),
-                ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Insert(insert)) => {
-                    Some(&insert.source)
-                }
-                ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::CreateTableAsSelect(
-                    ctas,
-                )) => Some(&ctas.query),
-                _ => None,
-            },
-        );
-        let connector_context =
-            match crate::connector::connector_request_context_for_query_on_runtime(
-                self.service.query_compiler.connector_runtime(),
-                Some(&query_options),
-                cancellation.clone(),
-            ) {
-                Ok(context) => context,
-                Err(error) => {
-                    return Ok(self.governed_typed_error(internal_error(error), statement));
-                }
-            };
-        let statement_token = statement.token();
-        #[cfg(novarocks_dev_controls)]
-        #[cfg(novarocks_dev_controls)]
-        if let Some(nomination) = observation.as_ref().and_then(|handle| handle.nomination()) {
-            let installed =
-                connector_context.request_scope_extension_or_insert_with(|| nomination.clone());
-            if installed.as_ref() != &nomination {
-                return Ok(self.governed_typed_error(
-                    internal_error("typed statement nomination conflicts with its request scope"),
-                    statement,
-                ));
-            }
-        }
-        #[cfg(novarocks_dev_controls)]
-        let context = match observation.as_ref().and_then(|handle| handle.nomination()) {
-            Some(nomination) => {
-                match context.with_test_statement_nomination(Arc::new(nomination)) {
-                    Ok(context) => context,
-                    Err(error) => {
-                        return Ok(self.governed_typed_error(internal_error(error), statement));
-                    }
-                }
-            }
-            None => context,
-        };
-        let command_context = CommandContext::new(
-            statement.scope().clone(),
-            connector_context,
-            statement_token,
-            Arc::clone(&self.principal),
-        );
-        let command_context = match statement.result_window_alias() {
-            Some(window) => match command_context.with_result_window(window) {
-                Ok(context) => context,
-                Err(error) => {
-                    return Ok(
-                        self.governed_typed_error(internal_error(error.to_string()), statement)
-                    );
-                }
-            },
-            None => command_context,
-        };
-        let parsed_statement = match parsed_statement {
-            ParsedStatement::Table(table) => {
-                if let Err(error) = validate_table_statement_admission(&table, &sql) {
-                    return Ok(self.governed_typed_error(
-                        QueryServiceError::from_user_error(error),
-                        statement,
-                    ));
-                }
-                let ast::TableStatement::Create(create) = table;
-                return self
-                    .execute_observed_table_create(
-                        Arc::from(sql),
-                        create,
-                        context,
-                        command_context,
-                        deadline,
-                        statement,
-                    )
-                    .await;
-            }
-            ParsedStatement::Catalog(ast::CatalogStatement::CreateCatalog(create)) => {
-                return self
-                    .execute_observed_catalog_create(
-                        Arc::from(sql),
-                        create,
-                        context,
-                        command_context,
-                        deadline,
-                        statement,
-                    )
-                    .await;
-            }
-            other => other,
-        };
-        if let Ok(Some(ProductSqlCommand::Catalog(command))) =
-            lower_product_sql_command(&parsed_statement)
-            && matches!(
-                command.as_ref(),
-                novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(_)
-                    | novarocks_sql::semantic::CatalogSqlCommand::DropCatalog { .. }
-            )
-        {
-            let action = match self
-                .service
-                .product_command_router
-                .prepare_catalog_statement_action(*command, context, command_context)
-            {
-                Ok(action) => action,
-                Err(error) => {
-                    return Ok(self.governed_typed_error(
-                        routed_execution_service_error(product_command_error(error)),
-                        statement,
-                    ));
-                }
-            };
-            return self
-                .execute_observed_statement_action(statement, action)
-                .await;
-        }
-        if let Ok(Some(ProductSqlCommand::Statistics(
-            command @ (novarocks_sql::semantic::StatisticsSqlCommand::AnalyzeTable { .. }
-            | novarocks_sql::semantic::StatisticsSqlCommand::ShowStats { .. }),
-        ))) = lower_product_sql_command(&parsed_statement)
-        {
-            let action = match self
-                .service
-                .product_command_router
-                .prepare_statistics_statement_action(command, context, command_context)
-            {
-                Ok(action) => action,
-                Err(error) => {
-                    return Ok(self.governed_typed_error(
-                        routed_execution_service_error(product_command_error(error)),
-                        statement,
-                    ));
-                }
-            };
-            return self
-                .execute_observed_statement_action(statement, action)
-                .await;
-        }
-        if let Ok(Some(ProductSqlCommand::Maintenance(command))) =
-            lower_product_sql_command(&parsed_statement)
-            && crate::query_execution::maintenance::command::is_async_metadata_command(
-                &command,
-                context.session().current_catalog(),
-                context.session().current_database(),
-            )
-            .unwrap_or(false)
-        {
-            let action = match self
-                .service
-                .product_command_router
-                .prepare_maintenance_statement_action(command, context, command_context)
-            {
-                Ok(action) => action,
-                Err(error) => {
-                    return Ok(self.governed_typed_error(
-                        routed_execution_service_error(product_command_error(error)),
-                        statement,
-                    ));
-                }
-            };
-            return self
-                .execute_observed_statement_action(statement, action)
-                .await;
-        }
-        if let ParsedStatement::MaterializedView(mv) = &parsed_statement {
-            use novarocks_parser::ast::MaterializedViewStatement;
-            if matches!(
-                mv,
-                MaterializedViewStatement::Refresh(_)
-                    | MaterializedViewStatement::ExplainRefresh(_)
-                    | MaterializedViewStatement::Create(_)
-                    | MaterializedViewStatement::Drop(_)
-                    | MaterializedViewStatement::Alter(_)
-            ) {
-                let action = match self
-                    .service
-                    .command_executor
-                    .prepare_materialized_view_statement_action(
-                        mv.clone(),
-                        context,
-                        command_context,
-                    ) {
-                    Ok(action) => action,
-                    Err(error) => {
-                        return Ok(self.governed_typed_error(
-                            routed_execution_service_error(product_command_error(error)),
-                            statement,
-                        ));
-                    }
-                };
-                return self
-                    .execute_observed_statement_action(statement, action)
-                    .await;
-            }
-        }
-        if let ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Insert(insert)) =
-            &parsed_statement
-        {
-            let (command, reference) = match dml.prepare_insert_shape(insert, &sql) {
-                Ok(value) => value,
-                Err(error) => {
-                    return Ok(self.governed_typed_error(
-                        routed_execution_service_error(dml_result::<()>(Err(error)).unwrap_err()),
-                        statement,
-                    ));
-                }
-            };
-            let action = match insert_engine.prepare_statement_action(
-                crate::query_execution::dml::insert::InsertStatementInput {
-                    command,
-                    reference,
-                    sql,
-                    context,
-                    query_options,
-                    launcher: self.statement_logical_execution_launcher(),
-                    #[cfg(novarocks_dev_controls)]
-                    observation,
-                },
-            ) {
-                Ok(action) => action,
-                Err(error) => {
-                    return Ok(self.governed_typed_error(error.into_service(), statement));
-                }
-            };
-            return self
-                .execute_observed_statement_action(statement, action)
-                .await;
-        }
-        let parsed_statement = match parsed_statement {
-            ParsedStatement::Dml(
-                value @ (novarocks_parser::ast::DmlStatement::Update(_)
-                | novarocks_parser::ast::DmlStatement::Merge(_)),
-            ) => {
-                let lowered = match dml.prepare_mutation_shape(&value, &sql) {
-                    Ok(lowered) => lowered,
-                    Err(error) => {
-                        return Ok(self.governed_typed_error(
-                            routed_execution_service_error(
-                                dml_result::<()>(Err(error)).unwrap_err(),
-                            ),
-                            statement,
-                        ));
-                    }
-                };
-                let action = match mutation_engine.prepare_statement_action(
-                    crate::query_execution::dml::mutation::MutationStatementInput {
-                        statement: lowered,
-                        sql,
-                        context,
-                        query_options,
-                        launcher: self.statement_logical_execution_launcher(),
-                        #[cfg(novarocks_dev_controls)]
-                        observation,
-                    },
-                ) {
-                    Ok(action) => action,
-                    Err(error) => {
-                        return Ok(self.governed_typed_error(error.into_service(), statement));
-                    }
-                };
-                return self
-                    .execute_observed_statement_action(statement, action)
-                    .await;
-            }
-            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::CreateTableAsSelect(
-                value,
-            )) => {
-                let action = match ctas_engine.prepare_statement_action(
-                    crate::query_execution::dml::ctas::CtasStatementInput {
-                        statement: value,
-                        sql,
-                        context,
-                        query_options,
-                        launcher: self.statement_logical_execution_launcher(),
-                        #[cfg(novarocks_dev_controls)]
-                        observation,
-                    },
-                ) {
-                    Ok(action) => action,
-                    Err(error) => {
-                        return Ok(self.governed_typed_error(
-                            routed_execution_service_error(
-                                dml_result::<()>(Err(error)).unwrap_err(),
-                            ),
-                            statement,
-                        ));
-                    }
-                };
-                return self
-                    .execute_observed_statement_action(statement, action)
-                    .await;
-            }
-            other => other,
-        };
-        let (parsed_statement, delete_statement) = match parsed_statement {
-            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Delete(statement)) => (
-                None,
-                Some(
-                    crate::query_execution::dml::delete::OwnedDeleteStatement::Predicate(
-                        crate::query_execution::dml::delete::PreparedPredicateDelete::from_legacy(
-                            statement,
-                        ),
-                    ),
-                ),
-            ),
-            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::AddEqualityDelete(
-                statement,
-            )) => (
-                None,
-                Some(
-                    crate::query_execution::dml::delete::OwnedDeleteStatement::Equality(statement),
-                ),
-            ),
-            statement => (Some(statement), None),
-        };
-        if let Some(delete_statement) = delete_statement {
-            use crate::query_execution::dml::delete::{DeleteStatement, OwnedDeleteStatement};
-            let borrowed = match &delete_statement {
-                OwnedDeleteStatement::Predicate(value) => DeleteStatement::Predicate(value),
-                OwnedDeleteStatement::Equality(_) => DeleteStatement::Equality,
-                #[cfg(novarocks_dev_controls)]
-                OwnedDeleteStatement::TrinoEquality { .. } => DeleteStatement::Equality,
-            };
-            if let Err(error) = dml.admit_delete_shape(borrowed, &sql) {
-                return Ok(self.governed_typed_error(
-                    routed_execution_service_error(dml_result::<()>(Err(error)).unwrap_err()),
-                    statement,
-                ));
-            }
-            let action = match delete_engine.prepare_statement_action(
-                crate::query_execution::dml::delete::DeleteStatementInput {
-                    statement: delete_statement,
-                    sql,
-                    context,
-                    query_options,
-                    launcher: self.statement_logical_execution_launcher(),
-                    #[cfg(novarocks_dev_controls)]
-                    observation,
-                },
-            ) {
-                Ok(action) => action,
-                Err(error) => {
-                    return Ok(self.governed_typed_error(error.into_service(), statement));
-                }
-            };
-            return self
-                .execute_observed_statement_action(statement, action)
-                .await;
-        }
-        let parsed_statement = parsed_statement.expect("remaining typed statement is retained");
-        let producer_window = command_context.result_window_alias();
-        let execution_owner = statement
-            .take_execution_owner()
-            .expect("governed typed statement transfers its execution owner exactly once");
-        let worker_cancellation = cancellation.clone();
-        let synchronous_command_executor = self.service.query_blocking_executor.clone();
-        let mut worker: Pin<Box<dyn Future<Output = _> + Send>> = match parsed_statement {
-            ParsedStatement::ExplainQuery(_) => {
-                unreachable!("EXPLAIN was transferred to its original statement source")
-            }
-            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Delete(_)) => {
-                unreachable!("DELETE was transferred to its original statement action")
-            }
-            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Insert(_)) => {
-                unreachable!("INSERT was transferred to its original statement action")
-            }
-            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::AddEqualityDelete(_)) => {
-                unreachable!("equality DELETE was transferred to its original statement action")
-            }
-            ParsedStatement::Dml(
-                novarocks_parser::ast::DmlStatement::Update(_)
-                | novarocks_parser::ast::DmlStatement::Merge(_)
-                | novarocks_parser::ast::DmlStatement::CreateTableAsSelect(_),
-            ) => {
-                unreachable!("mutation or CTAS was transferred to its original statement action")
-            }
-            ParsedStatement::Table(table_statement) => Box::pin(async move {
-                let command = validate_table_statement_admission(&table_statement, &sql)
-                    .map_err(RoutedExecutionError::User)
-                    .and_then(|()| {
-                        lower_product_sql_command(&ParsedStatement::Table(table_statement))
-                            .map_err(RoutedExecutionError::Engine)
-                    })
-                    .and_then(|command| {
-                        command.ok_or_else(|| {
-                            RoutedExecutionError::Engine(
-                                "table parser admission did not produce a product command"
-                                    .to_string(),
-                            )
-                        })
-                    });
-                match command {
-                    Ok(command) => {
-                        execute_product_statement(
-                            product_command_router,
-                            command,
-                            context,
-                            command_context,
-                            execution_owner,
-                        )
-                        .await
-                    }
-                    Err(error) => Ok((Err(error), execution_owner)),
-                }
-            }),
-            ParsedStatement::Catalog(novarocks_parser::ast::CatalogStatement::TruncateTable(
-                statement,
-            )) => {
-                let command =
-                    crate::query_execution::dml::truncate::command_from_typed_statement(&statement);
-                let prepare_dml = Arc::clone(&dml);
-                let prepare_truncate_engine = Arc::clone(&truncate_engine);
-                Box::pin(execute_prepared_dml_statement(
-                    synchronous_command_executor,
-                    worker_cancellation,
-                    execution_owner,
-                    producer_window,
-                    move || {
-                        prepare_dml
-                            .prepare_truncate(
-                                prepare_truncate_engine.as_ref(),
-                                command,
-                                &context,
-                                Some(&query_options),
-                            )
-                            .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
-                    },
-                    move |prepared| {
-                        dml.execute_prepared_truncate(truncate_engine.as_ref(), prepared)
-                            .map(|()| StatementResult::Ok)
-                            .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
-                    },
-                ))
-            }
-            ParsedStatement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(
-                statement,
-            )) => Box::pin(async move {
-                match crate::query_execution::dml::add_files::command_from_typed_statement(
-                    &statement,
-                ) {
-                    Ok(command) => {
-                        let prepare_dml = Arc::clone(&dml);
-                        let prepare_add_files_engine = Arc::clone(&add_files_engine);
-                        execute_prepared_dml_statement(
-                            synchronous_command_executor,
-                            worker_cancellation,
-                            execution_owner,
-                            producer_window,
-                            move || {
-                                let result = prepare_dml.prepare_add_files(
-                                    prepare_add_files_engine.as_ref(),
-                                    command,
-                                    &context,
-                                    Some(&query_options),
-                                );
-                                match result {
-                                    Err(error) if error.application_error().is_none() => {
-                                        Err(RoutedExecutionError::Engine(error.to_string()))
-                                    }
-                                    result => dml_result(result),
-                                }
-                            },
-                            move |prepared| {
-                                dml.execute_prepared_add_files(add_files_engine.as_ref(), prepared)
-                                    .map_err(|error| {
-                                        RoutedExecutionError::Engine(error.to_string())
-                                    })
-                                    .and_then(|count| {
-                                        add_files_status(count)
-                                            .map(StatementResult::Query)
-                                            .map_err(RoutedExecutionError::Engine)
-                                    })
-                            },
-                        )
-                        .await
-                    }
-                    Err(_) => {
-                        let command = lower_product_sql_command(&ParsedStatement::Iceberg(
-                            novarocks_parser::ast::IcebergStatement::AlterTable(statement),
-                        ))
-                        .map_err(RoutedExecutionError::Engine)
-                        .and_then(|command| {
-                            command.ok_or_else(|| {
-                                RoutedExecutionError::Engine(
-                                    "Iceberg parser admission did not produce a product command"
-                                        .to_string(),
-                                )
-                            })
-                        });
-                        match command {
-                            Ok(command) => {
-                                execute_product_statement(
-                                    product_command_router,
-                                    command,
-                                    context,
-                                    command_context,
-                                    execution_owner,
-                                )
-                                .await
-                            }
-                            Err(error) => Ok((Err(error), execution_owner)),
-                        }
-                    }
-                }
-            }),
-            ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
-                statement,
-            )) => Box::pin(async move {
-                let call = Arc::new(PreparedMaintenanceCall::from_legacy(&statement));
-                let special_result = command_executor
-                    .execute_maintenance_call(call.clone(), &context, &command_context)
-                    .await
-                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
-                match special_result {
-                    Err(error) => Ok((Err(error), execution_owner)),
-                    Ok(Some(result)) => Ok((Ok(result), execution_owner)),
-                    Ok(None) => {
-                        let command = call
-                            .maintenance_command()
-                            .map(ProductSqlCommand::Maintenance)
-                            .map_err(RoutedExecutionError::Engine);
-                        match command {
-                            Ok(command) => {
-                                execute_product_statement(
-                                    product_command_router,
-                                    command,
-                                    context,
-                                    command_context,
-                                    execution_owner,
-                                )
-                                .await
-                            }
-                            Err(error) => Ok((Err(error), execution_owner)),
-                        }
-                    }
-                }
-            }),
-            ParsedStatement::View(statement) => Box::pin(async move {
-                let result = command_executor
-                    .execute_view(&statement, &context, &command_context)
-                    .await
-                    .map_err(|error| error.with_analysis_source(&sql))
-                    .map_err(product_command_error);
-                Ok((result, execution_owner))
-            }),
-            other_statement => Box::pin(async move {
-                let command = lower_product_sql_command(&other_statement)
-                    .map_err(RoutedExecutionError::Engine)
-                    .and_then(|command| {
-                        command.ok_or_else(|| {
-                            RoutedExecutionError::Engine(
-                                "typed statement has no declared product owner".to_string(),
-                            )
-                        })
-                    });
-                match command {
-                    Ok(command) => {
-                        execute_product_statement(
-                            product_command_router,
-                            command,
-                            context,
-                            command_context,
-                            execution_owner,
-                        )
-                        .await
-                    }
-                    Err(error) => Ok((Err(error), execution_owner)),
-                }
-            }),
-        };
-        self.finish_command_worker(statement, cancellation, timeout_duration, &mut worker)
-            .await
     }
 
     async fn finish_command_worker(
@@ -2478,29 +1522,12 @@ impl FrontendQuerySession {
     }
 }
 
-fn reject_plain_query_from_legacy_typed_route(
-    statement: &ParsedStatement,
-) -> Result<(), QueryServiceError> {
-    if matches!(statement, ParsedStatement::Query(_)) {
-        return Err(internal_error(
-            "plain query reached the legacy typed execution route instead of the governed launcher",
-        ));
-    }
-    Ok(())
-}
-
-fn with_query_hints(
+fn with_query_sql_semantics(
     query_options: QueryOptions,
     sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
-    query: Option<&novarocks_parser::ast::Query>,
 ) -> QueryOptions {
     let mut raw = *query_options.as_proto();
     raw.allow_throw_exception = sql_semantics.sql_mode().allow_throw_exception();
-    if let Some(query) = query
-        && let Some(limit) = novarocks_sql::admission::query_mem_limit_hint(query)
-    {
-        raw.query_mem_limit = limit;
-    }
     QueryOptions::from_proto(raw)
 }
 
@@ -2511,7 +1538,8 @@ impl QuerySession for FrontendQuerySession {
         statement: &str,
     ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
     {
-        self.execute_one_statement(statement).await
+        self.execute_trino_one_statement(Arc::from(statement_execution_source(statement)))
+            .await
     }
 
     fn cancel_current(&self, reason: QueryCancellationReason) {
@@ -2578,26 +1606,16 @@ fn lower_trino_session_action(action: TrinoSessionAction) -> (StatementKind, Tri
     }
 }
 
-enum SessionNamespace<'a> {
-    Legacy(&'a str),
-    Trino {
-        catalog: Option<&'a ast::Ident>,
-        schema: &'a ast::Ident,
-        source: &'a str,
-    },
+struct SessionNamespace<'a> {
+    catalog: Option<&'a ast::Ident>,
+    schema: &'a ast::Ident,
+    source: &'a str,
 }
 
-fn normalize_session_namespace_part(raw: &str, typed: bool) -> Result<String, QueryServiceError> {
-    let normalized = normalize_identifier(raw).map_err(|error| {
-        if typed {
-            QueryServiceError::new(QueryServiceErrorKind::BadDatabase, error)
-        } else {
-            internal_error(error)
-        }
-    })?;
-    // The original catalog author canonicalizes simple names. A decoded
-    // identifier must not acquire the legacy string grammar's trim or unquote.
-    if typed && !normalized.eq_ignore_ascii_case(raw) {
+fn normalize_session_namespace_part(raw: &str) -> Result<String, QueryServiceError> {
+    let normalized = normalize_identifier(raw)
+        .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::BadDatabase, error))?;
+    if !normalized.eq_ignore_ascii_case(raw) {
         return Err(QueryServiceError::new(
             QueryServiceErrorKind::BadDatabase,
             format!("unsupported identifier `{raw}`"),
@@ -2613,44 +1631,20 @@ async fn resolve_database_context(
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<DatabaseContext, QueryServiceError> {
-    let (catalog, database, display, typed) = match namespace {
-        SessionNamespace::Legacy(display) => {
-            let mut parts = display.split('.').map(|part| part.trim().trim_matches('`'));
-            let first = parts.next().expect("split returns at least one component");
-            let (catalog, database) = match (parts.next(), parts.next()) {
-                (None, None) => (None, first),
-                (Some(database), None) => (Some(first), database),
-                _ => {
-                    return Err(QueryServiceError::new(
-                        QueryServiceErrorKind::BadDatabase,
-                        format!(
-                            "unknown database `{display}`; expected `<database>` or `<catalog>.<database>`"
-                        ),
-                    ));
-                }
-            };
-            (catalog, database, display, false)
-        }
-        SessionNamespace::Trino {
-            catalog,
-            schema,
-            source,
-        } => {
-            let start = catalog.map_or(schema.span.start(), |catalog| catalog.span.start());
-            let display = source.get(start..schema.span.end()).ok_or_else(|| {
-                internal_error("session namespace does not retain its original source range")
-            })?;
-            (
-                catalog.map(|catalog| catalog.value.as_str()),
-                schema.value.as_str(),
-                display,
-                true,
-            )
-        }
-    };
+    let SessionNamespace {
+        catalog,
+        schema,
+        source,
+    } = namespace;
+    let start = catalog.map_or(schema.span.start(), |catalog| catalog.span.start());
+    let display = source.get(start..schema.span.end()).ok_or_else(|| {
+        internal_error("session namespace does not retain its original source range")
+    })?;
+    let catalog = catalog.map(|catalog| catalog.value.as_str());
+    let database = schema.value.as_str();
     let catalog = match catalog {
         Some(catalog) => {
-            let normalized = normalize_session_namespace_part(catalog, typed)?;
+            let normalized = normalize_session_namespace_part(catalog)?;
             if normalized == DEFAULT_CATALOG {
                 None
             } else {
@@ -2661,7 +1655,7 @@ async fn resolve_database_context(
         }
         None => current_catalog.map(ToOwned::to_owned),
     };
-    let database = normalize_session_namespace_part(database, typed)?;
+    let database = normalize_session_namespace_part(database)?;
     let exists = match &catalog {
         Some(catalog) => {
             resolver
@@ -2702,37 +1696,6 @@ fn timeout_message_millis(timeout: Duration) -> u64 {
 /// independently selects its result capacity. Foreground MV refresh and
 /// repartition and foreground distributed maintenance rewrites are management
 /// commands whose writes produce InternalFacts.
-fn typed_statement_result_window_class(statement: &ParsedStatement) -> ResultWindowClass {
-    match statement {
-        ParsedStatement::Dml(_)
-        | ParsedStatement::Maintenance(ast::MaintenanceStatement::Optimize(_))
-        | ParsedStatement::Statistics(ast::StatisticsStatement::AnalyzeTable(_))
-        | ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Refresh(_)) => {
-            ResultWindowClass::Internal
-        }
-        ParsedStatement::ExplainQuery(explain) if explain.format == ast::ExplainFormat::Analyze => {
-            ResultWindowClass::Internal
-        }
-        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Alter(alter))
-            if matches!(
-                alter.action,
-                ast::MaterializedViewAlterAction::Repartition(_)
-            ) =>
-        {
-            ResultWindowClass::Internal
-        }
-        ParsedStatement::Maintenance(ast::MaintenanceStatement::Call(call))
-            if matches!(call.procedure.parts.as_slice(), [_, namespace, procedure]
-                if namespace.value.eq_ignore_ascii_case("system")
-                    && (procedure.value.eq_ignore_ascii_case("rewrite_data_files")
-                        || procedure.value.eq_ignore_ascii_case("rewrite_position_delete_files"))) =>
-        {
-            ResultWindowClass::Internal
-        }
-        _ => ResultWindowClass::Local,
-    }
-}
-
 async fn wait_for_initial_query_topology(
     topology: &BackendTopologyService,
     cancellation: &QueryCancellationView,
@@ -2867,9 +1830,9 @@ mod tests {
                 sql.as_ptr(),
                 "the original source prefix stays borrowed"
             );
-            let error = parse_single_statement(source)
+            let error = novarocks_query_application::sql::parse_single_statement(source)
                 .expect_err("actual parser must reject the closing parenthesis");
-            let error = query_service_parse_error(error, source);
+            let error = QueryServiceError::from_user_error(error.to_user_error(source));
             let location = error.user_error().unwrap().location().unwrap();
             assert_eq!(
                 (location.line(), location.column()),
@@ -2880,7 +1843,7 @@ mod tests {
         let sql = "  -- original prefix\n SELECT '中😀';;;  ";
         let source = statement_execution_source(sql);
         assert!(
-            parse_single_statement(source).is_ok(),
+            novarocks_query_application::sql::parse_single_statement(source).is_ok(),
             "trailing-semicolon tolerance stays intact"
         );
         assert_eq!(source.as_ptr(), sql.as_ptr());
@@ -3001,61 +1964,6 @@ mod tests {
     use novarocks_workload_control::{
         CancellationReason as WorkCancellationReason, ResourceConfig,
     };
-
-    #[test]
-    fn typed_command_result_capacity_follows_output_purpose() {
-        let refresh = parse_single_statement("REFRESH MATERIALIZED VIEW mv")
-            .expect("parse foreground MV refresh");
-        assert_eq!(typed_statement_work_class(&refresh), WorkClass::Management);
-        assert_eq!(
-            typed_statement_result_window_class(&refresh),
-            ResultWindowClass::Internal
-        );
-
-        for sql in [
-            "INSERT INTO target VALUES (1)",
-            "ALTER TABLE ice.db.target OPTIMIZE",
-            "ANALYZE TABLE ice.db.target",
-            "EXPLAIN ANALYZE SELECT 1",
-            "CALL ice.system.rewrite_data_files(table => 'db.orders')",
-            "CALL ice.system.rewrite_position_delete_files(table => 'db.orders')",
-            "CALL ice.SYSTEM.REWRITE_POSITION_DELETE_FILES(table => 'db.orders')",
-        ] {
-            let statement = parse_single_statement(sql).expect("parse internal output command");
-            assert_eq!(
-                typed_statement_result_window_class(&statement),
-                ResultWindowClass::Internal,
-                "{sql}"
-            );
-        }
-        let repartition =
-            parse_single_statement("ALTER MATERIALIZED VIEW mv REPARTITION BY (bucket(id, 4))")
-                .expect("parse foreground MV repartition");
-        assert_eq!(
-            typed_statement_work_class(&repartition),
-            WorkClass::Management
-        );
-        assert_eq!(
-            typed_statement_result_window_class(&repartition),
-            ResultWindowClass::Internal
-        );
-        for sql in [
-            "EXPLAIN SELECT 1",
-            "SHOW STATS FOR ice.db.orders",
-            "ALTER MATERIALIZED VIEW mv PAUSE REFRESH",
-            "CREATE DATABASE result_capacity_test",
-            "CALL ice.system.rewrite_manifests(table => 'db.orders')",
-            "CALL ice.system.expire_snapshots(table => 'db.orders', retain_last => 1)",
-            "CALL ice.other.rewrite_position_delete_files(table => 'db.orders')",
-        ] {
-            let statement = parse_single_statement(sql).expect("parse local output command");
-            assert_eq!(
-                typed_statement_result_window_class(&statement),
-                ResultWindowClass::Local,
-                "{sql}"
-            );
-        }
-    }
 
     #[test]
     fn frontend_projects_query_application_session_settings_to_native_options() {
@@ -3827,21 +2735,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_typed_route_rejects_plain_query_but_keeps_explain() {
-        let plain = novarocks_parser::parse("SELECT 1").expect("plain query parses");
-        let explain = novarocks_parser::parse("EXPLAIN ANALYZE SELECT 1")
-            .expect("explain analyze query parses");
-
-        assert_eq!(plain.len(), 1);
-        let error = reject_plain_query_from_legacy_typed_route(&plain[0])
-            .expect_err("plain query must use governed launcher");
-        assert_eq!(error.kind(), QueryServiceErrorKind::Internal);
-        assert_eq!(explain.len(), 1);
-        reject_plain_query_from_legacy_typed_route(&explain[0])
-            .expect("EXPLAIN remains on the legacy typed execution route");
-    }
-
-    #[test]
     fn cancellation_errors_keep_timeout_distinct_from_interrupts() {
         assert_eq!(
             cancellation_error(QueryCancellationReason::DeadlineExceeded { timeout_ms: 25 }).kind(),
@@ -3929,30 +2822,20 @@ mod tests {
                 "GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION",
             ),
         );
-        let statements = novarocks_parser::parse(
-            "SELECT /*+ SET_VAR(sql_mode=68719477248) */ /*+ SET_VAR(sql_mode=32) */ \
-             /*+ SET_VAR(query_mem_limit=9) */ 1",
-        )
-        .unwrap();
-        let [ParsedStatement::Query(query)] = statements.as_slice() else {
-            panic!("query");
-        };
+        let query =
+            novarocks_parser::parser::parse_query("WITH SESSION sql_mode = '32' SELECT 1").unwrap();
         let mut execution = SessionExecutionSettings::default();
-        execution.set_query_mem_limit_bytes(7).unwrap();
-        let options = with_query_hints(
+        execution.set_query_mem_limit_bytes(9).unwrap();
+        let options = with_query_sql_semantics(
             query_options_from_session_settings(&execution),
-            &novarocks_sql::sql_mode::query_sql_semantics(&session, query).unwrap(),
-            Some(query),
+            &novarocks_sql::sql_mode::query_sql_semantics(&session, &query).unwrap(),
         );
         assert!(!options.as_proto().allow_throw_exception);
         assert_eq!(options.as_proto().query_mem_limit, 9);
-        let restored = with_query_hints(
-            query_options_from_session_settings(&execution),
-            &session,
-            None,
-        );
+        let restored =
+            with_query_sql_semantics(query_options_from_session_settings(&execution), &session);
         assert!(restored.as_proto().allow_throw_exception);
-        assert_eq!(restored.as_proto().query_mem_limit, 7);
+        assert_eq!(restored.as_proto().query_mem_limit, 9);
         assert!(session.sql_mode().group_concat_legacy());
     }
 }

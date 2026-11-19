@@ -19,7 +19,10 @@
 
 use super::*;
 use crate::query::{
-    property_cpu_context::PropertyCpuContext, table_property_computation::TablePropertyCpuInput,
+    property_cpu_context::PropertyCpuContext,
+    table_property_computation::{
+        TrinoTablePropertyCpuInput, TrinoTablePropertyOutput, TrinoTablePropertySyntax,
+    },
 };
 use crate::query_execution::{
     completion_facts::FrontendPlanningCpuSource,
@@ -56,7 +59,7 @@ use std::{
 
 mod like_read_tests;
 
-const DDL: &str = "CREATE TABLE ice.atomic.events (id BIGINT NOT NULL DEFAULT 7, event_day DATE, amount DECIMAL(10,2) DEFAULT '12.30') PARTITION BY (month(event_day)) PROPERTIES ('format-version'='3') COMMENT 'owned source'";
+const DDL: &str = "CREATE TABLE ice.atomic.events (id BIGINT DEFAULT 7 NOT NULL, event_day DATE, amount DECIMAL(10,2) DEFAULT '12.30') COMMENT 'owned source' WITH (format_version = 3, partitioning = ARRAY['month(event_day)'])";
 
 struct CpuWitness {
     cancellation: QueryCancellationView,
@@ -100,6 +103,13 @@ impl Fixture {
     fn new_with_provider_setup(
         seed_source: impl FnOnce(&ConnectorCatalogMutationSession, &ConnectorInstanceId),
     ) -> Self {
+        Self::new_with_control_role(false, seed_source)
+    }
+
+    fn new_with_control_role(
+        use_role_binding: bool,
+        seed_source: impl FnOnce(&ConnectorCatalogMutationSession, &ConnectorInstanceId),
+    ) -> Self {
         let runtime = tokio::runtime::Handle::current();
         let warehouse = tempfile::tempdir().unwrap();
         let resources = IcebergMetadataResources::new(
@@ -112,7 +122,7 @@ impl Fixture {
             ),
             runtime.clone(),
         );
-        let factory = IcebergConnectorFactory::new(resources);
+        let provider_id = ConnectorProviderId::parse("iceberg").unwrap();
         let instance = ConnectorInstanceId::parse("ice").unwrap();
         let properties = vec![(
             "iceberg.catalog.warehouse".to_owned(),
@@ -120,7 +130,7 @@ impl Fixture {
         )];
         let catalog_properties = CatalogProperties::new(
             CatalogHandle::new(instance.clone(), CatalogVersion::from_bytes([0x39; 32])),
-            factory.provider_id().clone(),
+            provider_id.clone(),
             1,
             properties
                 .iter()
@@ -129,18 +139,37 @@ impl Fixture {
             Vec::new(),
         )
         .unwrap();
-        let request = ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            instance.clone(),
-            properties,
-        )
-        .unwrap()
-        .with_catalog_properties(catalog_properties.clone())
-        .unwrap();
-        let (binding, _durable) = factory.create_control(request).unwrap().into_parts();
         let host = ConnectorControlHost::new();
-        host.register(binding.with_catalog_properties(catalog_properties).unwrap())
+        if use_role_binding {
+            let factory = novarocks_connector_iceberg::IcebergControlRoleBindingFactory::new(
+                resources,
+                std::num::NonZeroUsize::new(1).unwrap(),
+            );
+            let catalog = factory.open_catalog(CatalogScopeIdentity::new(
+                provider_id,
+                instance.clone(),
+                uuid::Uuid::now_v7(),
+            ));
+            let normalized = factory.normalize_and_validate(catalog_properties).unwrap();
+            let binding = tokio::task::block_in_place(|| {
+                runtime.block_on(catalog.materialize(
+                    normalized,
+                    MaterializationContext::new(Instant::now() + Duration::from_secs(10)),
+                ))
+            })
             .unwrap();
+            host.register_role_binding(binding).unwrap();
+        } else {
+            let factory = IcebergConnectorFactory::new(resources);
+            let request =
+                ConnectorControlFactoryRequest::try_new(provider_id, instance.clone(), properties)
+                    .unwrap()
+                    .with_catalog_properties(catalog_properties.clone())
+                    .unwrap();
+            let (binding, _durable) = factory.create_control(request).unwrap().into_parts();
+            host.register(binding.with_catalog_properties(catalog_properties).unwrap())
+                .unwrap();
+        }
         // Real Provider setup precedes this statement's Root admission. It is
         // not counted as the Table Action's execution or resource evidence.
         {
@@ -175,6 +204,9 @@ impl Fixture {
             seed_source(&setup, &instance);
         }
         let planning_pin = host.acquire_current(&instance).unwrap();
+        if use_role_binding {
+            let _documents = planning_pin.derive_document_storage_lease().unwrap();
+        }
         let key = ConnectorProviderBindingKey {
             instance_id: instance,
             incarnation: planning_pin.binding().incarnation(),
@@ -260,35 +292,61 @@ impl Fixture {
             planning_pin,
         )
         .unwrap();
-        let statement = novarocks_query_application::sql::parse_single_statement(ddl).unwrap();
-        let novarocks_parser::ast::Statement::Table(novarocks_parser::ast::TableStatement::Create(
-            statement,
-        )) = statement
-        else {
-            panic!("real old-parser CREATE TABLE input");
-        };
         let witness = Arc::new(CpuWitness {
             cancellation: self.query_cancellation.clone(),
             first_thread: Mutex::new(None),
         });
-        let input=TablePropertyCpuInput {
-            source:Arc::from(ddl),statement,binding,command:self.command.as_ref().unwrap().clone(),like_columns,
-            context:PropertyCpuContext {
-                current_database:"atomic".into(),sql_semantics:Default::default(),
-                interpreter:Arc::new(crate::query_execution::required_constant_eval::test_required_constant_interpreter()),
-                control:SqlCompileControl::new(None,witness.clone()),scope:self.scope.clone(),
-                window:self.window.as_ref().unwrap().clone(),catalog:Arc::new(RwLock::new(Default::default())),
-                functions:Arc::new(novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap()),
-                policy:crate::application::test_constant_policy(),
-            },
+        let context = PropertyCpuContext {
+            current_database: "atomic".into(),
+            sql_semantics: Default::default(),
+            interpreter: Arc::new(
+                crate::query_execution::required_constant_eval::test_required_constant_interpreter(
+                ),
+            ),
+            control: SqlCompileControl::new(None, witness.clone()),
+            scope: self.scope.clone(),
+            window: self.window.as_ref().unwrap().clone(),
+            catalog: Arc::new(RwLock::new(Default::default())),
+            functions: Arc::new(
+                novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
+                    .unwrap(),
+            ),
+            policy: crate::application::test_constant_policy(),
         };
         let source = self.planning.as_ref().unwrap().clone();
-        let prepared =
-            tokio::time::timeout(Duration::from_secs(10), source.table_properties(input))
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+        let command = self.command.as_ref().unwrap().clone();
+        let novarocks_parser::ast::TrinoStatement::CreateTable(statement) =
+            novarocks_parser::parser::parse_statement(ddl).unwrap()
+        else {
+            panic!("real CREATE TABLE input");
+        };
+        let input = TrinoTablePropertyCpuInput {
+            source: Arc::from(ddl),
+            syntax: TrinoTablePropertySyntax::Create(statement),
+            binding,
+            command,
+            context,
+        };
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            source.trino_table_properties(input),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let prepared = match (output, like_columns) {
+            (TrinoTablePropertyOutput::Mutation(prepared), None) => prepared,
+            (TrinoTablePropertyOutput::Like(table), Some(columns)) => tokio::time::timeout(
+                Duration::from_secs(10),
+                source.finish_trino_table_like(table, columns),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+            _ => panic!("CREATE TABLE preparation must match its LIKE input"),
+        };
         assert_eq!(
             self.planning
                 .as_ref()
@@ -322,6 +380,82 @@ impl Fixture {
             self.creator.runtime(),
             self.query_cancellation.clone(),
             tokio::runtime::Handle::current(),
+            None,
+        )
+        .unwrap();
+        (action, operation_id)
+    }
+    async fn set_properties_action(&mut self) -> (Action, ConnectorMutationOperationId) {
+        let sql = "ALTER TABLE ice.atomic.events SET PROPERTIES gc_enabled = false";
+        let parsed = novarocks_parser::parser::parse_statement(sql).unwrap();
+        use novarocks_query_application::sql::trino_admission::{
+            TrinoStatementAction, TrinoStatementPreparation,
+        };
+        let admitted =
+            novarocks_query_application::sql::trino_admission::admit_trino_statement(sql, parsed)
+                .unwrap();
+        let TrinoStatementAction::Prepare(TrinoStatementPreparation::SetTableProperties {
+            name,
+            properties,
+            ..
+        }) = admitted
+        else {
+            panic!("typed SET PROPERTIES admission");
+        };
+        let parts = novarocks_query_application::sql::lower_object_name(&name).parts;
+        assert_eq!(parts, ["ice", "atomic", "events"]);
+        let table = ConnectorTableIdentity {
+            instance_id: self.key.instance_id.clone(),
+            namespace: Arc::from(parts[1].as_str()),
+            table: Arc::from(parts[2].as_str()),
+        };
+        let pin = self.host.acquire_current(&self.key.instance_id).unwrap();
+        assert_eq!(pin.binding().incarnation(), self.key.incarnation);
+        let command = self.command.as_ref().unwrap().clone();
+        let input = TrinoTablePropertyCpuInput {
+            source: Arc::from(sql),
+            syntax: TrinoTablePropertySyntax::Set(properties),
+            binding: CatalogTablePropertyBinding::try_new(table, pin).unwrap(),
+            command: command.clone(),
+            context: PropertyCpuContext {
+                current_database: "atomic".into(),
+                sql_semantics: Default::default(),
+                interpreter: Arc::new(crate::query_execution::required_constant_eval::test_required_constant_interpreter()),
+                control: SqlCompileControl::unbounded(),
+                scope: self.scope.clone(),
+                window: self.window.as_ref().unwrap().clone(),
+                catalog: Arc::new(RwLock::new(Default::default())),
+                functions: Arc::new(novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap()),
+                policy: crate::application::test_constant_policy(),
+            },
+        };
+        let source = self.planning.as_ref().unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            source.trino_table_properties(input),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let TrinoTablePropertyOutput::Mutation(prepared) = output else {
+            panic!("typed SET property command");
+        };
+        source.close().await.unwrap();
+        let operation_id = prepared.original_request.operation_id;
+        assert_eq!(prepared.original_request.target, self.key);
+        let guard = AlterTableMvGuard::new(
+            Arc::new(UnavailableMvStorageObservationPort),
+            crate::mv::domain::test_admission::test_readiness(),
+        );
+        let action = prepare_owned(
+            prepared,
+            None,
+            command,
+            self.creator.runtime(),
+            self.query_cancellation.clone(),
+            tokio::runtime::Handle::current(),
+            Some(guard),
         )
         .unwrap();
         (action, operation_id)
@@ -477,30 +611,36 @@ fn assert_actual_closed(action: &Action) {
         ));
     }
 }
+fn applied_receipt(
+    action: &Action,
+    operation_id: ConnectorMutationOperationId,
+    operation_kind: &str,
+) -> ConnectorCatalogMutationReceipt {
+    let source = action.source.as_ref().unwrap();
+    let observed = source.execute.receiving.observation();
+    assert!(observed.provider_exited());
+    assert!(!source.execute.receiving.foreign_exit_unproven());
+    let Some(Ok(Outcome::KnownCommitted {
+        effect: ExternalMutationEffect::Applied,
+        receipt,
+        finalization: ExternalMutationFinalization::Complete,
+        cleanup: ExternalMutationFinalization::Complete,
+    })) = observed.validated_outcome()
+    else {
+        panic!("real Hadoop mutation must supply an Applied committed outcome");
+    };
+    assert_eq!(receipt.operation_id(), operation_id);
+    assert_eq!(receipt.operation_kind(), operation_kind);
+    assert_eq!(Some(receipt), observed.applied_receipt());
+    assert!(observed.original_owner().is_some());
+    receipt.clone()
+}
+
 fn committed_metadata(
     action: &Action,
     operation_id: ConnectorMutationOperationId,
 ) -> TableMetadata {
-    let source = action.source.as_ref().unwrap();
-    let receipt = {
-        let observed = source.execute.receiving.observation();
-        assert!(observed.provider_exited());
-        assert!(!source.execute.receiving.foreign_exit_unproven());
-        let Some(Ok(Outcome::KnownCommitted {
-            effect: ExternalMutationEffect::Applied,
-            receipt,
-            finalization: ExternalMutationFinalization::Complete,
-            cleanup: ExternalMutationFinalization::Complete,
-        })) = observed.validated_outcome()
-        else {
-            panic!("real Hadoop CREATE must supply an Applied committed outcome");
-        };
-        assert_eq!(receipt.operation_id(), operation_id);
-        assert_eq!(receipt.operation_kind(), "create-table");
-        assert_eq!(Some(receipt), observed.applied_receipt());
-        assert!(observed.original_owner().is_some());
-        receipt.clone()
-    };
+    let receipt = applied_receipt(action, operation_id, "create-table");
     let version: serde_json::Value =
         serde_json::from_slice(receipt.provider_version().unwrap()).unwrap();
     let location = version["metadata_location"].as_str().unwrap();
@@ -618,6 +758,80 @@ async fn real_hadoop_create_keeps_same_source_after_borrowed_wait_drop_and_relea
     assert_eq!(partition.len(), 1);
     assert_eq!(partition[0].source_id, date.id);
     assert_eq!(partition[0].transform, Transform::Month);
+    fixture.close(action, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guarded_set_properties_uses_the_original_retained_generation_and_metadata_cpu() {
+    let mut fixture = Fixture::new_with_control_role(true, |setup, instance| {
+        let outcome = setup
+            .execute_operation(
+                ConnectorMutationOperationId::new(),
+                ConnectorCatalogMutationOperation::CreateTable {
+                    table: ConnectorTableIdentity {
+                        instance_id: instance.clone(),
+                        namespace: Arc::from("atomic"),
+                        table: Arc::from("events"),
+                    },
+                    columns: vec![ConnectorColumnDefinition {
+                        name: Arc::from("id"),
+                        data_type: ConnectorDataType::BigInt,
+                        nullable: false,
+                        default: None,
+                    }],
+                    comment: None,
+                    properties: vec![
+                        ("format".into(), DdlPropertyValue::Varchar("PARQUET".into())),
+                        ("format_version".into(), DdlPropertyValue::Integer(2)),
+                        (
+                            "partitioning".into(),
+                            DdlPropertyValue::ArrayVarchar(Vec::new()),
+                        ),
+                    ],
+                    policy: CreatePolicy::FailIfExists,
+                },
+                crate::connector::test_request_context(),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            Outcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                ..
+            }
+        ));
+    });
+    let (mut action, operation_id) = fixture.set_properties_action().await;
+    fixture.retire_current();
+    assert!(matches!(
+        fixture
+            .finish_action(&mut action)
+            .await
+            .unwrap_or_else(|e| {
+                let cause = e
+                    .failure_cause()
+                    .and_then(|c| c.downcast_ref::<ConnectorError>());
+                panic!("guarded SET failed: {e:?}; original connector cause: {cause:?}");
+            }),
+        StatementActionValue::Ok(StatementCommandCompletion::Empty),
+    ));
+    applied_receipt(&action, operation_id, "set-table-properties");
+    // Existing-table Hadoop receipts do not carry the CREATE receipt's
+    // metadata location. Verify the actual second version through its hint.
+    let directory = fixture.warehouse.path().join("atomic/events/metadata");
+    let version = std::fs::read_to_string(directory.join("version-hint.text")).unwrap();
+    assert_eq!(version.trim(), "2");
+    let metadata = std::fs::read(directory.join("v2.metadata.json")).unwrap();
+    let m: TableMetadata = serde_json::from_slice(&metadata).unwrap();
+    assert_eq!(
+        m.properties().get("gc.enabled").map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        action.external_effect_disposition(),
+        Some(Effect::KnownCommitted)
+    );
+    assert!(action.source.as_ref().unwrap().execute.guarded);
     fixture.close(action, false).await;
 }
 

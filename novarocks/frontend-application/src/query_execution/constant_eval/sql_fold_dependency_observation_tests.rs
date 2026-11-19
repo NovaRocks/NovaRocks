@@ -35,11 +35,7 @@ use novarocks_type_contract::{
 use std::sync::{Arc, LazyLock, Mutex};
 
 fn query_ast(sql: &str) -> Box<novarocks_parser::ast::Query> {
-    let mut statements = novarocks_parser::parse(sql).unwrap();
-    assert_eq!(statements.len(), 1);
-    let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
-        panic!("expected one query");
-    };
+    let query = novarocks_parser::parser::parse_query(sql).unwrap();
     Box::new(query)
 }
 
@@ -718,7 +714,10 @@ fn native_decimal_array_and_temporal_literal_compile_sources_remain_valid() {
             DataType::Boolean,
         ),
         // An explicit DOUBLE item declaration remains distinct from inference.
-        ("SELECT ARRAY<DOUBLE>[0.0,0.25,0.5,1.0]", double_items),
+        (
+            "SELECT CAST([0.0,0.25,0.5,1.0] AS ARRAY<DOUBLE>)",
+            double_items,
+        ),
     ] {
         let owner = compile_typed(sql, super::constant_evaluator(), None)
             .unwrap_or_else(|error| panic!("real FE literal completion for {sql}: {error:#?}"));

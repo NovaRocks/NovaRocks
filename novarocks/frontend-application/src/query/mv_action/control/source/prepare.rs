@@ -222,28 +222,6 @@ impl ControlSource {
                 });
             }
             MvControlRequest::Alter { statement, .. } => match &statement.action {
-                MvAlterAction::Repartition(_) => {
-                    return Err(invalid(
-                        "ALTER MATERIALIZED VIEW REPARTITION requires its original data-producing step",
-                    ));
-                }
-                MvAlterAction::LegacyStorageProperties(properties) => {
-                    body.operation = Some(ConnectorCatalogMutationOperation::AlterProperties {
-                        table,
-                        changes: properties
-                            .iter()
-                            .map(|(key, value)| {
-                                novarocks_spi::connector::ConnectorPropertyChange::Set {
-                                    key: Arc::from(key.as_str()),
-                                    value: Arc::from(value.as_str()),
-                                }
-                            })
-                            .collect(),
-                        authority:
-                            novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
-                        expected_committed_partitioning: None,
-                    });
-                }
                 MvAlterAction::StorageProperties { properties, .. } => {
                     if properties
                         .iter()

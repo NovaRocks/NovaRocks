@@ -40,6 +40,16 @@ use std::sync::{
 };
 use std::time::Duration;
 
+struct SystemOnly;
+impl SessionCatalogPropertyPort for SystemOnly {
+    fn session_property_catalog(
+        &self,
+        _: &str,
+    ) -> Result<SessionCatalogPropertyAdmission, QueryServiceError> {
+        panic!("a system property has no catalog scope")
+    }
+}
+
 struct CheckpointGate {
     armed: AtomicBool,
     cancelled: AtomicBool,
@@ -142,13 +152,17 @@ impl Fixture {
     }
     fn input(&self, sql: &str, control: SqlCompileControl) -> SessionPropertyCpuInput {
         let source: Arc<str> = Arc::from(sql);
-        let mut statements = novarocks_parser::parse(sql).unwrap();
-        assert_eq!(statements.len(), 1);
-        let ast::Statement::Session(ast::SessionStatement::Set(set)) = statements.pop().unwrap()
-        else {
-            panic!("one original SET")
+        let (_, TrinoSessionWork::Mutation(mutation)) = parse_session_action(sql) else {
+            panic!("one original SET SESSION");
         };
-        self.mutation_input(source, SessionPropertyMutation::LegacySet(set), control)
+        self.mutation_input(
+            source,
+            SessionPropertyMutation {
+                mutation: Box::new(mutation),
+                catalogs: Arc::new(SystemOnly),
+            },
+            control,
+        )
     }
     fn mutation_input(
         &self,
@@ -321,13 +335,13 @@ async fn set_whole_cpu_business_failure_is_atomic_and_resource_source_is_not_pro
         let fixture = Fixture::new(capacity);
         let mut tail = fixture.tail();
         tail.start(fixture.input(
-            "SET SESSION pipeline_dop = 2 + 0, query_timeout = 1 / 0",
+            "SET SESSION query_timeout = 2 + 1 / 0",
             SqlCompileControl::unbounded(),
         ));
         closed(&mut tail).await;
         let error = match tail.prepared.take().unwrap() {
             Err(error) => error,
-            Ok(_) => panic!("the complete batch must reject"),
+            Ok(_) => panic!("the assignment must reject"),
         };
         assert_old_live(&fixture);
         if resource_refusal {
@@ -350,7 +364,7 @@ async fn set_whole_cpu_business_failure_is_atomic_and_resource_source_is_not_pro
             );
             assert!(
                 error.message().contains("query_timeout"),
-                "the later assignment authored the actual Data refusal"
+                "the assignment authored the actual Data refusal"
             );
             assert_eq!(
                 error.failure_cause().unwrap().failure_fact().class(),
@@ -456,7 +470,7 @@ async fn scoped_set_and_reset_use_the_same_catalog_key_and_original_cpu() {
         let mut tail = fixture.tail();
         tail.start(fixture.mutation_input(
             Arc::from(source),
-            SessionPropertyMutation::Scoped {
+            SessionPropertyMutation {
                 mutation: Box::new(mutation),
                 catalogs: Arc::new(ObservedCatalog(Arc::clone(&metadata))),
             },
@@ -501,7 +515,7 @@ async fn scoped_set_and_reset_use_the_same_catalog_key_and_original_cpu() {
 }
 
 fn parse_session_action(source: &str) -> (StatementKind, TrinoSessionWork) {
-    let statement = novarocks_parser::trino_parser::parse_statement(source).unwrap();
+    let statement = novarocks_parser::parser::parse_statement(source).unwrap();
     let TrinoStatementAction::Session(action) = admit_trino_statement(source, statement).unwrap()
     else {
         panic!("expected an admitted session action");
@@ -511,16 +525,6 @@ fn parse_session_action(source: &str) -> (StatementKind, TrinoSessionWork) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn trino_system_set_and_reset_do_not_consult_the_catalog() {
-    struct SystemOnly;
-    impl SessionCatalogPropertyPort for SystemOnly {
-        fn session_property_catalog(
-            &self,
-            _: &str,
-        ) -> Result<SessionCatalogPropertyAdmission, QueryServiceError> {
-            panic!("a system property has no catalog scope")
-        }
-    }
-
     for (source, expected_kind, expected_dop) in [
         (
             r#"SET SESSION "PIPELINE_DOP" = 1 + 2"#,
@@ -541,7 +545,7 @@ async fn trino_system_set_and_reset_do_not_consult_the_catalog() {
         let mut tail = fixture.tail();
         tail.start(fixture.mutation_input(
             Arc::from(source),
-            SessionPropertyMutation::Scoped {
+            SessionPropertyMutation {
                 mutation: Box::new(mutation),
                 catalogs: Arc::new(SystemOnly),
             },
@@ -650,7 +654,7 @@ async fn trino_use_preserves_identifiers_and_resolves_the_actual_namespace() {
         let result = resolve_database_context(
             &resolver,
             current,
-            SessionNamespace::Trino {
+            SessionNamespace {
                 catalog: catalog.as_ref(),
                 schema: &schema,
                 source,

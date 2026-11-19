@@ -27,7 +27,7 @@ use crate::{
     query_execution::{
         completion_facts::FrontendPlanningCpuSource,
         dml::ctas::{
-            CtasCommand, CtasStorage, CtasTargetBinding, CtasTargetPreflightOutcome,
+            CtasCommand, CtasTargetBinding, CtasTargetPreflightOutcome,
             PreparedCtasTargetPreflight, TrinoCtasInput,
         },
         kernels::DmlExecutionKernel,
@@ -119,7 +119,7 @@ impl TrinoCtasPropertyInput {
             target_parts: table.name.parts,
             if_not_exists: table.if_not_exists,
             source: statement.query.into_inner(),
-            storage: CtasStorage::Evaluated(storage),
+            storage,
         })
     }
 }

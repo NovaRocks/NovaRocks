@@ -49,7 +49,6 @@ impl FrontendQueryCompiler {
         &self,
         explain: ExplainInput,
         detail: novarocks_query_application::sql::session::ExplainDetail,
-        root_session_admitted: bool,
         context: &RequestContext,
         query_options: Option<QueryOptions>,
         scope: &novarocks_workload_control::WorkScope,
@@ -62,34 +61,11 @@ impl FrontendQueryCompiler {
         let execution = context.execution();
         let current_catalog = context.session().current_catalog();
         let current_database = context.session().current_database();
-        let metadata: Result<_, FrontendQueryCompilerError> = async {
-            let connector_planning_context = if root_session_admitted {
-                let request = crate::connector::connector_request_context_for_execution_on_runtime(
-                    query_options.as_ref(),
-                    context.execution(),
-                    self.connector_blocking_io.runtime(),
-                )?;
-                novarocks_spi::connector::ConnectorPlanningContext::try_from_request(request)
-                    .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?
-            } else {
-                connector_planning_context_for_query_on_runtime(
-                    self.connector_blocking_io.runtime(),
-                    query_options.as_ref(),
-                    context.execution().cancellation().clone(),
-                )?
-            };
-            let connector_planning_context =
-                novarocks_spi::connector::ConnectorPlanningContext::try_from_request(
-                    connector_planning_context
-                        .request()
-                        .clone()
-                        .with_io_admission(Arc::clone(&ports.io)),
-                )
-                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
-            Ok(connector_planning_context)
-        }
-        .await;
-        let connector_planning_context = match metadata {
+        let connector_planning_context = match self.connector_planning_context(
+            execution,
+            query_options.as_ref(),
+            Arc::clone(&ports.io),
+        ) {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
@@ -101,7 +77,6 @@ impl FrontendQueryCompiler {
             return self
                 .complete_async_profile(
                     &query,
-                    root_session_admitted,
                     context,
                     Some(query_options_for_explain_analyze(query_options)),
                     &connector_planning_context,
@@ -124,7 +99,7 @@ impl FrontendQueryCompiler {
             );
             let mut logical = match planning_cpu
                 .logical_catalog_for_input(
-                    super::read_query_input(Box::new(query), root_session_admitted),
+                    SqlStatementInput::query_with_admitted_session(Box::new(query)),
                     SqlSessionContext {
                         sql_semantics: execution.sql_semantics().clone(),
                         current_catalog: current_catalog.map(str::to_owned),
@@ -194,7 +169,6 @@ impl FrontendQueryCompiler {
         }
         self.complete_async_explain(
             &query,
-            root_session_admitted,
             current_catalog,
             current_database,
             query_options,
@@ -210,7 +184,6 @@ impl FrontendQueryCompiler {
     async fn complete_async_explain(
         &self,
         query: &Query,
-        root_session_admitted: bool,
         current_catalog: Option<&str>,
         current_database: &str,
         query_options: Option<QueryOptions>,
@@ -266,7 +239,7 @@ impl FrontendQueryCompiler {
             .map_err(FrontendQueryCompilerError::Engine)?;
             Ok(novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
                 crate::query_execution::physical_encoding::mint_plan_version(),
-                super::read_query_input(Box::new(query.clone()), root_session_admitted),
+                SqlStatementInput::query_with_admitted_session(Box::new(query.clone())),
                 SqlCompileIntent::Explain {
                     level,
                     analyze: false,
@@ -321,7 +294,6 @@ impl FrontendQueryCompiler {
     async fn complete_async_profile(
         &self,
         query: &Query,
-        root_session_admitted: bool,
         context: &RequestContext,
         query_options: Option<QueryOptions>,
         connector_planning_context: &novarocks_spi::connector::ConnectorPlanningContext,
@@ -383,7 +355,7 @@ impl FrontendQueryCompiler {
             Ok((
                 novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
                     version,
-                    super::read_query_input(Box::new(query.clone()), root_session_admitted),
+                    SqlStatementInput::query_with_admitted_session(Box::new(query.clone())),
                     SqlCompileIntent::Explain {
                         level: ExplainLevel::Analyze,
                         analyze: true,

@@ -48,10 +48,7 @@ impl Fixture {
     fn with_capacity(config: ResultCapacityConfig) -> Self {
         let compile = SqlCompileControl::unbounded();
         let (interpreter, metadata) = super::test_support::test_product();
-        let statements = novarocks_parser::parse("SELECT 1").unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("empty captured catalogue fixture");
-        };
+        let query = novarocks_parser::parser::parse_query("SELECT 1").unwrap();
         let catalog =
             SqlCapturedCatalogPreparation::try_new(query.clone(), None, "db", compile.clone())
                 .unwrap()
@@ -92,8 +89,7 @@ impl Fixture {
         target: RequiredConstantTarget,
         control: &SqlCompileControl,
     ) -> PreparedRequiredConstant {
-        let tokens = novarocks_parser::lex(sql).unwrap();
-        let expr = novarocks_parser::parser::parse_expression(sql, &tokens).unwrap();
+        let expr = novarocks_parser::parser::parse_expression(sql).unwrap();
         let functions: Arc<dyn SqlFunctionCatalog> = self.metadata.clone();
         prepare_required_constant(RequiredConstantRequest {
             input: RequiredConstantInput::Expression(&expr),
@@ -431,7 +427,7 @@ impl Fixture {
         sql: &str,
         control: &SqlCompileControl,
     ) -> PreparedRequiredConstant {
-        let expression = novarocks_parser::trino_parser::parse_expression(sql).unwrap();
+        let expression = novarocks_parser::parser::parse_expression(sql).unwrap();
         let functions: Arc<dyn SqlFunctionCatalog> = self.metadata.clone();
         prepare_required_constant(RequiredConstantRequest {
             input: RequiredConstantInput::Expression(&expression),
@@ -777,7 +773,7 @@ impl Fixture {
             },
         };
         use novarocks_spi::connector::{DdlPropertyDeclaration, DdlPropertyValue};
-        let expression = novarocks_parser::trino_parser::parse_expression(source).unwrap();
+        let expression = novarocks_parser::parser::parse_expression(source).unwrap();
         let declaration =
             DdlPropertyDeclaration::new("value", value_type, DdlPropertyValue::Null, false)
                 .unwrap();
@@ -958,7 +954,7 @@ fn required_array_child_buffers_keep_original_result_custody_until_last_alias_ex
 
 #[test]
 fn table_procedure_timestamp_uses_the_original_required_constant_interpreter() {
-    use novarocks_parser::{Span, ast::TrinoStatement, trino_parser::parse_statement};
+    use novarocks_parser::{Span, ast::TrinoStatement, parser::parse_statement};
     use novarocks_query_application::{
         session_error::QueryServiceError,
         sql::{

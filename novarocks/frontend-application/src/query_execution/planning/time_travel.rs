@@ -687,26 +687,22 @@ mod tests {
 
     #[test]
     fn time_travel_lookup_preserves_classified_suffix_and_quoted_ordinary_identity() {
-        use novarocks_parser::ast::{Relation, SetExpr, Statement};
+        use novarocks_parser::ast::{Relation, SetExpr};
         for (sql, expected_table, expected_suffix, quoted) in [
             (
-                "SELECT * FROM ice.db.orders$files FOR VERSION AS OF 42",
+                "SELECT * FROM ice.db.\"orders$files\" FOR VERSION AS OF 42",
                 "orders",
                 Some("$files"),
                 false,
             ),
             (
-                "SELECT * FROM ice.db.`orders$files` FOR VERSION AS OF 42",
+                "SELECT * FROM ice.db.\"orders$files\" FOR VERSION AS OF 42",
                 "orders$files",
                 None,
                 true,
             ),
         ] {
-            let [Statement::Query(query)]: [Statement; 1] =
-                novarocks_parser::parse(sql).unwrap().try_into().unwrap()
-            else {
-                panic!("query");
-            };
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
             let SetExpr::Select(select) = query.body.as_ref() else {
                 panic!("SELECT");
             };

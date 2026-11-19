@@ -15,16 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Ordinary CREATE TABLE retains its admitted generation through publication,
-//! one permitted observation, and actual Provider/CPU/I/O exit.
+//! CREATE TABLE and SET PROPERTIES retain the admitted generation through
+//! publication, one permitted observation, and actual Provider/CPU/I/O exit.
 
 use super::{
     QueryCancellationView, QueryServiceError, governed_cancellation_error,
     product_command_service_error,
 };
+use crate::catalog_application::resolver::TargetBackend;
 use crate::connector::mutation::{
     CompletedCatalogMutation, MutationDispatchState, ResolvedCatalogMutation,
     command_error_from_connector, present_catalog_mutation_command_result,
+};
+use crate::mv::domain::{
+    iceberg_guard::{
+        IcebergMvUserMutation,
+        reject_if_iceberg_mv_table_with_governed_planning_pin_and_context_async,
+    },
+    readiness::MvReadinessPort,
 };
 use crate::query_execution::{
     internal_result_cpu::InternalResultCpu, maintenance::io_admission::MetadataIoAdmission,
@@ -43,8 +51,9 @@ use novarocks_query_application::{
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReceiving, ConnectorCatalogMutationReconcileRequest,
-    ConnectorCatalogMutationRequest, ConnectorError, ConnectorErrorKind, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationOutcome, ProviderMetadataCpuPort,
+    ConnectorCatalogMutationRequest, ConnectorError, ConnectorErrorKind, ConnectorOperationControl,
+    ConnectorRequestContext, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationOutcome, MvStorageObservationPort, ProviderMetadataCpuPort,
 };
 use novarocks_workload_control::{ResultWindowAlias, WorkError};
 use std::{
@@ -55,7 +64,65 @@ use std::{
 };
 
 type Outcome = ExternalMutationOutcome<ConnectorCatalogMutationReceipt>;
-type MutationFuture = Pin<Box<dyn Future<Output = Result<(), ConnectorError>> + Send>>;
+type MutationFuture = Pin<Box<dyn Future<Output = CallResult> + Send>>;
+
+enum CallResult {
+    GuardRefused(QueryServiceError),
+    Provider(Result<(), ConnectorError>),
+}
+
+/// Process-owned inputs to the existing MV mutation guard. A SET borrows
+/// its own retained generation, I/O admission, control and metadata CPU.
+#[derive(Clone)]
+pub(crate) struct AlterTableMvGuard {
+    storage: Arc<dyn MvStorageObservationPort>,
+    readiness: Arc<MvReadinessPort>,
+}
+
+impl AlterTableMvGuard {
+    pub(crate) fn new(
+        storage: Arc<dyn MvStorageObservationPort>,
+        readiness: Arc<MvReadinessPort>,
+    ) -> Self {
+        Self { storage, readiness }
+    }
+
+    async fn check(
+        self,
+        binding: &MutationBinding,
+        context: ConnectorRequestContext,
+    ) -> Result<(), QueryServiceError> {
+        let MutationBinding::Table(table) = binding else {
+            return Err(work_service(WorkError::Conflict));
+        };
+        let identity = table.table();
+        let cpu = context
+            .metadata_cpu()
+            .cloned()
+            .ok_or_else(|| work_service(WorkError::Conflict))?;
+        let target = TargetBackend {
+            provider_id: table.mutation().descriptor().provider_id.clone(),
+            catalog: identity.instance_id.as_str().to_owned(),
+            namespace: identity.namespace.to_string(),
+            table: identity.table.to_string(),
+        };
+        reject_if_iceberg_mv_table_with_governed_planning_pin_and_context_async(
+            self.storage.as_ref(),
+            table.planning(),
+            self.readiness.as_ref(),
+            &target,
+            IcebergMvUserMutation::AlterTable,
+            context.clone(),
+            cpu,
+        )
+        .await?;
+        // A cancellation can arrive while the original guard is awaiting
+        // metadata. Observe it before installing the Provider mutation call.
+        context
+            .check_active()
+            .map_err(|error| product_command_service_error(command_error_from_connector(error)))
+    }
+}
 
 #[derive(Debug, Default)]
 struct Wake(futures::task::AtomicWaker);
@@ -165,31 +232,70 @@ struct Input {
 struct Call {
     future: Option<MutationFuture>,
     receiving: Arc<ConnectorCatalogMutationReceiving>,
-    result: Option<Result<(), ConnectorError>>,
+    result: Option<CallResult>,
     started: bool,
+    guarded: bool,
     in_poll: bool,
     dropping: bool,
     exited: bool,
 }
 impl Call {
-    fn start_execute(&mut self, input: Arc<Input>, request: ConnectorCatalogMutationRequest) {
-        assert!(!self.started, "one original catalog execute call");
-        self.started = true;
+    fn start_execute(
+        &mut self,
+        input: Arc<Input>,
+        request: ConnectorCatalogMutationRequest,
+        guard: Option<AlterTableMvGuard>,
+    ) {
         let receiving = self.receiving.clone();
-        self.future = Some(Box::pin(async move {
+        let guard_input = guard.map(|guard| (guard, Arc::clone(&input), request.context.clone()));
+        let execute = async move {
             input
                 .binding
                 .mutation()
                 .execute_async_in(request, &receiving)
                 .await
+        };
+        if let Some((guard, input, context)) = guard_input {
+            self.start_guarded(
+                async move { guard.check(&input.binding, context).await },
+                execute,
+            );
+        } else {
+            assert!(!self.started, "one original catalog execute call");
+            self.started = true;
+            self.future = Some(Box::pin(async move { CallResult::Provider(execute.await) }));
+        }
+    }
+    fn start_guarded(
+        &mut self,
+        guard: impl Future<Output = Result<(), QueryServiceError>> + Send + 'static,
+        execute: impl Future<Output = Result<(), ConnectorError>> + Send + 'static,
+    ) {
+        assert!(!self.started, "one original guarded catalog execute call");
+        self.started = true;
+        self.guarded = true;
+        self.future = Some(Box::pin(async move {
+            match guard.await {
+                Ok(()) => CallResult::Provider(execute.await),
+                Err(error) => CallResult::GuardRefused(error),
+            }
         }));
+    }
+    fn possible_dispatch(&self) -> bool {
+        self.started && (!self.guarded || self.receiving.observation().operation_id().is_some())
+    }
+    fn guard_refusal(&self) -> Option<&QueryServiceError> {
+        match self.result.as_ref() {
+            Some(CallResult::GuardRefused(error)) => Some(error),
+            _ => None,
+        }
     }
     fn start_reconcile(&mut self, input: Arc<Input>, evidence: ExternalMutationEvidence) {
         assert!(!self.started, "one original catalog observation call");
         self.started = true;
         let receiving = self.receiving.clone();
         self.future = Some(Box::pin(async move {
-            input
+            let result = input
                 .binding
                 .mutation()
                 .reconcile_async_in(
@@ -200,7 +306,8 @@ impl Call {
                     },
                     &receiving,
                 )
-                .await
+                .await;
+            CallResult::Provider(result)
         }));
     }
     fn poll(&mut self, cx: &mut Context<'_>) {
@@ -252,7 +359,7 @@ impl Call {
             Some(Ok(outcome)) => Ok(outcome.clone()),
             Some(Err(error)) => Err(error.clone()),
             None => match self.result.as_ref() {
-                Some(Err(error)) => Err(error.clone()),
+                Some(CallResult::Provider(Err(error))) => Err(error.clone()),
                 _ => Err(ConnectorError::new(
                     ConnectorErrorKind::Internal,
                     "table mutation exited without an original validated outcome",
@@ -278,6 +385,7 @@ struct Source {
     setup_attempted: bool,
     bootstrap_ready: bool,
     execute: Call,
+    alter_guard: Option<AlterTableMvGuard>,
     reconcile: Call,
     initial_unknown: Option<Outcome>,
     resolved: Option<ResolvedCatalogMutation>,
@@ -322,7 +430,7 @@ impl Source {
                 | ResolvedCatalogMutation::ContractFailure { .. },
             ) => Some(Effect::CommitUnknown),
             // None means no supplied fact; it is never proof of non-commit.
-            None if self.execute.started => Some(Effect::CommitUnknown),
+            None if self.execute.possible_dispatch() => Some(Effect::CommitUnknown),
             None => None,
         }
     }
@@ -413,7 +521,8 @@ impl Source {
                 request: original_request,
             });
             self.input = Some(input.clone());
-            self.execute.start_execute(input, execute_request);
+            self.execute
+                .start_execute(input, execute_request, self.alter_guard.take());
             Ok::<_, CommandError>(())
         })();
         if let Err(error) = result {
@@ -447,6 +556,15 @@ impl Source {
     }
     fn select(&mut self) {
         if self.resolved.is_some() || !self.execute.started || !self.execute.closed() {
+            return;
+        }
+        if let Some(error) = self.execute.guard_refusal() {
+            assert!(
+                !self.execute.possible_dispatch(),
+                "guard refusal precedes Provider mutation"
+            );
+            self.before_call_failure
+                .get_or_insert_with(|| error.clone());
             return;
         }
         if self.initial_unknown.is_none() {
@@ -713,9 +831,23 @@ pub(crate) fn prepare(
     cpu: InternalResultCpu,
     cancellation: QueryCancellationView,
     runtime: tokio::runtime::Handle,
+    mv_guard: &AlterTableMvGuard,
 ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
-    prepare_owned(prepared, continued_io, command, cpu, cancellation, runtime)
-        .map(|action| Box::new(action) as Box<dyn GovernedStatementAction>)
+    let guard = matches!(
+        &prepared.original_request.operation,
+        ConnectorCatalogMutationOperation::SetTableProperties { .. }
+    )
+    .then(|| mv_guard.clone());
+    prepare_owned(
+        prepared,
+        continued_io,
+        command,
+        cpu,
+        cancellation,
+        runtime,
+        guard,
+    )
+    .map(|action| Box::new(action) as Box<dyn GovernedStatementAction>)
 }
 
 fn prepare_owned(
@@ -725,6 +857,7 @@ fn prepare_owned(
     cpu: InternalResultCpu,
     cancellation: QueryCancellationView,
     runtime: tokio::runtime::Handle,
+    guard: Option<AlterTableMvGuard>,
 ) -> Result<Action, CommandError> {
     prepare_mutation_owned(
         prepared,
@@ -732,6 +865,7 @@ fn prepare_owned(
         command,
         Some((cpu, runtime)),
         cancellation,
+        guard,
     )
 }
 
@@ -740,7 +874,7 @@ pub(crate) fn prepare_namespace(
     command: CommandContext,
     cancellation: QueryCancellationView,
 ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
-    prepare_mutation_owned(prepared, None, command, None, cancellation)
+    prepare_mutation_owned(prepared, None, command, None, cancellation, None)
         .map(|action| Box::new(action) as Box<dyn GovernedStatementAction>)
 }
 
@@ -750,7 +884,15 @@ fn prepare_mutation_owned(
     command: CommandContext,
     metadata_cpu_source: Option<(InternalResultCpu, tokio::runtime::Handle)>,
     cancellation: QueryCancellationView,
+    alter_guard: Option<AlterTableMvGuard>,
 ) -> Result<Action, CommandError> {
+    let requires_guard = matches!(
+        &prepared.original_request.operation,
+        ConnectorCatalogMutationOperation::SetTableProperties { .. }
+    );
+    if requires_guard != alter_guard.is_some() {
+        return Err(work_command(WorkError::Conflict));
+    }
     let window = command
         .result_window_alias()
         .ok_or_else(|| work_command(WorkError::Conflict))?;
@@ -771,6 +913,7 @@ fn prepare_mutation_owned(
             setup_attempted: false,
             bootstrap_ready: false,
             execute: Call::default(),
+            alter_guard,
             reconcile: Call::default(),
             initial_unknown: None,
             resolved: None,
@@ -822,6 +965,12 @@ mod tests {
             })
         }
         fn call(self: &Arc<Self>) -> Call {
+            self.call_with_guard(None::<std::future::Ready<Result<(), QueryServiceError>>>)
+        }
+        fn call_with_guard(
+            self: &Arc<Self>,
+            guard: Option<impl Future<Output = Result<(), QueryServiceError>> + Send + 'static>,
+        ) -> Call {
             let session = ConnectorCatalogMutationSession::new(
                 self.descriptor.clone(),
                 ConnectorControlRuntimeId::new(),
@@ -836,16 +985,31 @@ mod tests {
                     instance_id: self.descriptor.instance_id.clone(),
                     incarnation: self.epoch,
                 },
-                operation: ConnectorCatalogMutationOperation::CreateTable {
-                    table: ConnectorTableIdentity {
-                        instance_id: self.descriptor.instance_id.clone(),
-                        namespace: Arc::from("db"),
-                        table: Arc::from("t"),
-                    },
-                    columns: Vec::new(),
-                    comment: None,
-                    properties: Vec::new(),
-                    policy: CreatePolicy::FailIfExists,
+                operation: if guard.is_some() {
+                    ConnectorCatalogMutationOperation::SetTableProperties {
+                        table: ConnectorTableIdentity {
+                            instance_id: self.descriptor.instance_id.clone(),
+                            namespace: Arc::from("db"),
+                            table: Arc::from("t"),
+                        },
+                        properties: vec![(
+                            Arc::from("gc_enabled"),
+                            DdlPropertyChange::Set(DdlPropertyValue::Boolean(false)),
+                        )]
+                        .into(),
+                    }
+                } else {
+                    ConnectorCatalogMutationOperation::CreateTable {
+                        table: ConnectorTableIdentity {
+                            instance_id: self.descriptor.instance_id.clone(),
+                            namespace: Arc::from("db"),
+                            table: Arc::from("t"),
+                        },
+                        columns: Vec::new(),
+                        comment: None,
+                        properties: Vec::new(),
+                        policy: CreatePolicy::FailIfExists,
+                    }
                 },
                 context: ConnectorRequestContext::try_new(
                     std::time::Instant::now() + std::time::Duration::from_secs(30),
@@ -855,16 +1019,17 @@ mod tests {
                 )
                 .unwrap(),
             };
-            let mut call = Call {
-                started: true,
-                ..Call::default()
-            };
+            let mut call = Call::default();
             let receiving = call.receiving.clone();
             // Exercise the actual SPI original child and the Action's exact
             // Poll/Drop custody. This is not a metadata CPU fixture.
-            call.future = Some(Box::pin(async move {
-                session.execute_async_in(request, &receiving).await
-            }));
+            let execute = async move { session.execute_async_in(request, &receiving).await };
+            if let Some(guard) = guard {
+                call.start_guarded(guard, execute);
+            } else {
+                call.started = true;
+                call.future = Some(Box::pin(async move { CallResult::Provider(execute.await) }));
+            }
             call
         }
     }
@@ -982,6 +1147,68 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn alter_guard_refusal_has_no_provider_dispatch_and_requires_actual_exit() {
+        let provider = Provider::new(false, false);
+        let guard_ready = Arc::new(AtomicBool::new(false));
+        let guard_view = guard_ready.clone();
+        let mut call = provider.call_with_guard(Some(std::future::poll_fn(move |_| {
+            if !guard_view.load(Ordering::Acquire) {
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(crate::query::internal_error(
+                "original MV guard refused",
+            )))
+        })));
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut borrowed = Box::pin(std::future::poll_fn(|cx| {
+                call.poll(cx);
+                Poll::<()>::Pending
+            }));
+            assert!(borrowed.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(!call.possible_dispatch());
+        assert!(!call.closed());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        guard_ready.store(true, Ordering::Release);
+        call.poll(&mut cx);
+        assert!(call.closed());
+        assert!(!call.possible_dispatch());
+        assert_eq!(
+            call.guard_refusal().unwrap().message(),
+            "original MV guard refused"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.drops.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn ordinary_table_proceeds_only_after_the_guard_opens() {
+        let provider = Provider::new(false, false);
+        let guard_ready = Arc::new(AtomicBool::new(false));
+        let guard_view = guard_ready.clone();
+        let mut call = provider.call_with_guard(Some(std::future::poll_fn(move |_| {
+            if guard_view.load(Ordering::Acquire) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })));
+        let mut cx = Context::from_waker(Waker::noop());
+        call.poll(&mut cx);
+        assert!(!call.possible_dispatch());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        guard_ready.store(true, Ordering::Release);
+        call.poll(&mut cx);
+        assert!(call.possible_dispatch());
+        assert!(!call.closed());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        provider.released.store(true, Ordering::Release);
+        call.poll(&mut cx);
+        assert!(call.closed());
+        assert!(matches!(call.outcome(), Ok(Outcome::KnownCommitted { .. })));
         assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
     }
     #[test]

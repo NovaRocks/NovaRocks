@@ -293,7 +293,7 @@ async fn like_columns_and_create_publish_with_one_original_metadata_admission() 
     .unwrap();
     let (mut action, operation_id) = fixture
         .action_for(
-            "CREATE TABLE ice.atomic.events LIKE ice.atomic.like_source",
+            "CREATE TABLE ice.atomic.events (LIKE ice.atomic.like_source)",
             Some(columns),
             Some(io),
         )

@@ -43,7 +43,6 @@ use novarocks_query_application::{
         GovernedActionContext, GovernedStatementAction, GovernedStatementResidual,
         StatementActionValue,
     },
-    sql::dml_admission::DmlAdmissionError,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorMetadataCleanupResponsibility, ConnectorRequestContext,
@@ -243,43 +242,6 @@ struct CtasSource {
     completed: bool,
     health: StatementNativeHealthFailure,
     close_failure: Option<StatementNativeHealthFailure>,
-}
-
-pub(crate) fn prepare(
-    kernel: crate::query_execution::kernels::DmlExecutionKernel,
-    input: CtasStatementInput,
-) -> Result<Box<dyn GovernedStatementAction>, DmlError> {
-    let command = CtasCommand::from_typed(&input.statement, &input.sql).map_err(|error| {
-        DmlError::admit(DmlAdmissionError::CreateTableUnsupportedForm.to_user_error(
-            &input.sql,
-            error.span,
-            error.message,
-        ))
-    })?;
-    let root = execution_root(&input.context)?;
-    let current_catalog = input
-        .context
-        .session()
-        .current_catalog()
-        .map(ToOwned::to_owned);
-    let current_database = input.context.session().current_database().to_string();
-    let CtasTargetPreflightOutcome::Ready(preflight) = kernel
-        .preflight_governed_ctas_target(&command, current_catalog.as_deref(), &current_database)
-        .map_err(|error| error.into_governed_dml_error(&input.sql))?;
-    prepare_from_preflight(
-        kernel,
-        command,
-        CtasExecutionInput {
-            sql: Arc::from(input.sql),
-            context: input.context,
-            query_options: input.query_options,
-            launcher: input.launcher,
-            #[cfg(novarocks_dev_controls)]
-            observation: input.observation,
-        },
-        preflight,
-        root,
-    )
 }
 
 pub(crate) struct CtasExecutionInput {

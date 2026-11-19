@@ -865,7 +865,7 @@ mod tests {
             definition: CreateMvDefinitionRequest {
                 query_definition: PersistedQueryDefinition::new(
                     "SELECT 1",
-                    PersistedQueryDialect::StarRocks,
+                    PersistedQueryDialect::Trino,
                     "ice",
                     "db",
                 )
@@ -1227,7 +1227,7 @@ mod create_contract_tests {
                 definition: CreateMvDefinitionRequest {
                     query_definition: PersistedQueryDefinition::new(
                         "SELECT 1",
-                        PersistedQueryDialect::StarRocks,
+                        PersistedQueryDialect::Trino,
                         "iceberg",
                         "db",
                     )
@@ -1336,7 +1336,7 @@ mod create_contract_tests {
             definition: CreateMvDefinitionRequest {
                 query_definition: PersistedQueryDefinition::new(
                     "SELECT 1",
-                    PersistedQueryDialect::StarRocks,
+                    PersistedQueryDialect::Trino,
                     "iceberg",
                     "db",
                 )

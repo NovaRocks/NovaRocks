@@ -125,7 +125,7 @@ fn retired_metadata_commands_are_syntax_errors_at_the_trino_boundary() {
         "ANALYZE SAMPLE TABLE t",
         "ANALYZE TABLE t WITH SYNC MODE",
     ] {
-        let parse = novarocks_parser::parse(sql)
+        let parse = novarocks_parser::parser::parse_statement(sql)
             .expect_err("retired metadata command must fail in parsing");
         let user = parse.to_user_error(sql);
         assert_eq!(user.code().as_str(), "sql.parse.unexpected_token", "{sql}");

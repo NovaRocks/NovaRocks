@@ -669,11 +669,6 @@ fn build_frontend_query_session_factory_from_role_products(
             products.system_relations.clone(),
         ))
         .with_execution_services(products.mv_execution_services.clone());
-    let mv_command_consumer: Arc<
-        dyn novarocks_query_application::api::MaterializedViewCommandConsumer,
-    > = Arc::new(crate::mv::command::FrontendMvCommandConsumer::new(
-        mv_command_executor.clone(),
-    ));
     let maintenance_command_executor =
         core_capabilities::maintenance_command_executor(maintenance_ports);
     let product_command_router = crate::query::product_command_router(
@@ -688,6 +683,10 @@ fn build_frontend_query_session_factory_from_role_products(
         host.test_session
             .as_ref()
             .and_then(|session| session.statement.clone()),
+    );
+    let alter_mv_guard = crate::query::table_mutation_action::AlterTableMvGuard::new(
+        Arc::clone(&mv_storage_observation),
+        Arc::clone(&mv_readiness),
     );
     let dml_engines = core_capabilities::dml_engines(
         core_capabilities::DmlEnginePorts::new(
@@ -718,11 +717,11 @@ fn build_frontend_query_session_factory_from_role_products(
         host.required_constant_interpreter(),
         query_compiler,
         product_command_router,
+        alter_mv_guard,
         statistics_command_executor,
         iceberg_ref_command_executor,
         maintenance_command_executor,
         view_command_executor,
-        mv_command_consumer,
         mv_command_executor,
         products.query_control.clone(),
         Arc::clone(&products.logical_execution_launcher),
@@ -1646,7 +1645,7 @@ mod tests {
             novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance ID");
 
         let result = session
-            .execute_statement(r#"CREATE EXTERNAL CATALOG warehouse PROPERTIES("type"="iceberg")"#)
+            .execute_statement(r#"CREATE CATALOG warehouse USING iceberg"#)
             .await
             .expect("CREATE CATALOG commits a durable StateStore attachment");
         settle_governed_completion(result);
@@ -1896,7 +1895,7 @@ mod tests {
             ))
             .expect("open frontend query session");
         let result = session
-            .execute_statement("ANALYZE TABLE system.metadata.materialized_views")
+            .execute_statement("ANALYZE system.metadata.materialized_views")
             .await
             .expect("configured statistics application selects the system-relation refusal");
         let (output, terminal) = result.into_parts();

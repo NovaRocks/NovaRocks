@@ -30,7 +30,6 @@ use crate::query::session_property_computation::{
 use crate::query_execution::completion_facts::FrontendPlanningCpuSource;
 use crate::query_execution::planning::sql_cancellation_observation;
 use crate::query_execution::required_constant_eval::RequiredConstantInterpreter;
-use novarocks_parser::ast;
 use novarocks_query_application::api::StatementNativeHealthFailure;
 use novarocks_query_application::session_control::{
     GovernedActionContext, GovernedQueryStatementOwner, GovernedStatementAction,
@@ -269,22 +268,6 @@ impl GovernedStatementAction for SetStatementAction {
 }
 
 impl FrontendQuerySession {
-    pub(super) async fn execute_observed_set(
-        &self,
-        source: Arc<str>,
-        set: ast::SetStatement,
-        deadline: Option<Instant>,
-        statement: GovernedQueryStatementOwner,
-    ) -> Result<StatementResult, QueryServiceError> {
-        self.execute_observed_session_mutation(
-            source,
-            SessionPropertyMutation::LegacySet(set),
-            deadline,
-            statement,
-        )
-        .await
-    }
-
     pub(super) async fn execute_observed_scoped_session_mutation(
         &self,
         source: Arc<str>,
@@ -297,7 +280,7 @@ impl FrontendQuerySession {
         > = self.service.session_catalog_resolver.clone();
         self.execute_observed_session_mutation(
             source,
-            SessionPropertyMutation::Scoped {
+            SessionPropertyMutation {
                 mutation: Box::new(mutation),
                 catalogs,
             },

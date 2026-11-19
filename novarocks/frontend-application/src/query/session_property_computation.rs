@@ -20,12 +20,11 @@ use super::property_cpu_context::PropertyCpuContext;
 use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
 use novarocks_parser::{Span, ast};
 use novarocks_query_application::sql::session::registry::{
-    SessionCatalogPropertyPort, SessionPropertyError, SessionPropertyOrigin,
-    SessionPropertyRegistry, SessionPropertyType, sql_session_property_error_at,
+    SessionCatalogPropertyPort, SessionPropertyRegistry, SessionPropertyType,
+    sql_session_property_error_at,
 };
 use novarocks_query_application::sql::{
-    session::{SessionSqlState, admit_session_set_assignment, session_property_error},
-    session_admit::SessionAdmitError,
+    session::SessionSqlState, session_admit::SessionAdmitError,
 };
 use novarocks_query_application::{
     session_effects::SessionEffects, session_error::QueryServiceError,
@@ -52,12 +51,9 @@ pub(crate) enum ScopedSessionMutation {
     },
 }
 
-pub(crate) enum SessionPropertyMutation {
-    LegacySet(ast::SetStatement),
-    Scoped {
-        mutation: Box<ScopedSessionMutation>,
-        catalogs: Arc<dyn SessionCatalogPropertyPort>,
-    },
+pub(crate) struct SessionPropertyMutation {
+    pub(crate) mutation: Box<ScopedSessionMutation>,
+    pub(crate) catalogs: Arc<dyn SessionCatalogPropertyPort>,
 }
 
 pub(crate) struct SessionPropertyCpuInput {
@@ -88,33 +84,11 @@ impl SessionPropertyCpuInput {
             functions: &self.functions,
             policy: self.policy,
         };
-        let effects = match &self.mutation {
-            SessionPropertyMutation::LegacySet(set) => {
-                let mut effects = SessionEffects::default();
-                for assignment in &set.assignments {
-                    admit_session_set_assignment(&self.source, assignment)?;
-                    let span = assignment.value.span();
-                    let declaration = self
-                        .registry
-                        .lookup_system(&assignment.name.value, SessionPropertyOrigin::Sql)
-                        .map_err(|e| property_error_at(e, &self.source, span))?;
-                    let value = evaluator.evaluate(
-                        &self.staged,
-                        &assignment.value,
-                        &assignment.name.value,
-                        declaration.value_type(),
-                    )?;
-                    let property = declaration
-                        .validate_sql_value(&value, &self.control)
-                        .map_err(|e| property_error_at(e, &self.source, span))?;
-                    effects.append(SessionEffects::property(property));
-                }
-                effects
-            }
-            SessionPropertyMutation::Scoped { mutation, catalogs } => {
-                self.prepare_scoped(&evaluator, mutation, catalogs.as_ref())?
-            }
-        };
+        let effects = self.prepare_scoped(
+            &evaluator,
+            &self.mutation.mutation,
+            self.mutation.catalogs.as_ref(),
+        )?;
         // Projection is still CPU work. The live session is untouched until
         // this whole computation has returned and its original worker exited.
         self.staged.apply_effects(&effects)?;
@@ -437,15 +411,6 @@ impl SessionPropertyEvaluation<'_> {
     }
 }
 
-fn property_error_at(error: SessionPropertyError, source: &str, span: Span) -> QueryServiceError {
-    match error {
-        e @ (SessionPropertyError::UnknownProperty { .. }
-        | SessionPropertyError::InvalidValue { .. }) => QueryServiceError::from_user_error(
-            SessionAdmitError::InvalidSessionProperty.to_user_error(source, span, e.to_string()),
-        ),
-        other => session_property_error(other),
-    }
-}
 fn compile_error(error: SqlCompileError) -> QueryServiceError {
     use novarocks_type_contract::CompileControlError as C;
     match error {
@@ -524,6 +489,19 @@ mod tests {
         WorkloadControl,
     };
 
+    struct SystemOnly;
+    impl SessionCatalogPropertyPort for SystemOnly {
+        fn session_property_catalog(
+            &self,
+            _: &str,
+        ) -> Result<
+            novarocks_query_application::sql::session::registry::SessionCatalogPropertyAdmission,
+            QueryServiceError,
+        > {
+            panic!("a system property has no catalog scope")
+        }
+    }
+
     struct Fixture {
         root: RootWork,
         window: ResultWindowAlias,
@@ -558,13 +536,22 @@ mod tests {
             }
         }
         fn input(&self, sql: &str, staged: SessionSqlState) -> SessionPropertyCpuInput {
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let [ast::Statement::Session(ast::SessionStatement::Set(set))] = statements.as_slice()
+            let ast::TrinoStatement::SetSession(set) =
+                novarocks_parser::parser::parse_statement(sql).unwrap()
             else {
-                panic!("SET fixture");
+                panic!("SET SESSION fixture");
+            };
+            let mutation = ScopedSessionMutation::Set {
+                name: set.name,
+                value: set.value,
             };
             SessionPropertyCpuInput {
-                source: Arc::from(sql), mutation: SessionPropertyMutation::LegacySet(set.clone()), staged,
+                source: Arc::from(sql),
+                mutation: SessionPropertyMutation {
+                    mutation: Box::new(mutation),
+                    catalogs: Arc::new(SystemOnly),
+                },
+                staged,
                 registry: Arc::new(SessionPropertyRegistry::new().unwrap()),
                 interpreter: Arc::new(crate::query_execution::required_constant_eval::test_required_constant_interpreter()),
                 control: SqlCompileControl::unbounded(), scope: self.root.owner.scope(), window: self.window.clone(),
@@ -603,7 +590,7 @@ mod tests {
         let registry = Arc::new(SessionPropertyRegistry::new().unwrap());
         let live = SessionSqlState::default();
         let source = "WITH SESSION query_timeout = 1 + 2, decimal_overflow_to_double = true AND true, explain_detail = 'LOGICAL_COSTS' SELECT 1 AS answer";
-        let parsed = novarocks_parser::trino_parser::parse_query(source).unwrap();
+        let parsed = novarocks_parser::parser::parse_query(source).unwrap();
         let catalogs = Arc::new(
             crate::query_execution::kernels::SessionCatalogResolver::new(
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
@@ -652,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_set_prepares_typed_values_and_effects_without_optional_folding() {
+    fn set_prepares_typed_values_and_effects_without_optional_folding() {
         let fixture = Fixture::new();
         let mut state = SessionSqlState::default();
         state
@@ -664,7 +651,7 @@ mod tests {
             .unwrap();
         let prepared = fixture
             .input(
-                "SET pipeline_dop = 1 + 2, enable_global_runtime_filter = false AND (1 / 0 = 1)",
+                "SET SESSION pipeline_dop = 1 + CASE WHEN false AND (1 / 0 = 1) THEN 0 ELSE 2 END",
                 state,
             )
             .run()
@@ -672,24 +659,18 @@ mod tests {
         assert_eq!(prepared.staged.execution_settings().pipeline_dop(), Some(3));
         assert_eq!(
             prepared.effects.set_properties().collect::<Vec<_>>(),
-            vec![
-                ("pipeline_dop".into(), "3".into()),
-                ("enable_global_runtime_filter".into(), "false".into())
-            ]
+            vec![("pipeline_dop".into(), "3".into())]
         );
         assert!(fixture.window.retained_payload_bytes() > 0);
         drop(prepared);
         fixture.close();
     }
     #[test]
-    fn later_assignment_refusal_does_not_publish_any_earlier_property() {
+    fn refused_assignment_does_not_publish_session_state() {
         let fixture = Fixture::new();
         let state = SessionSqlState::default();
         let error = fixture
-            .input(
-                "SET pipeline_dop = 1 + 2, trc_unknown = true",
-                state.clone(),
-            )
+            .input("SET SESSION trc_unknown = true", state.clone())
             .run()
             .err()
             .unwrap();
@@ -707,13 +688,13 @@ mod tests {
     fn property_locations_distinguish_lookup_validation_and_required_evaluation() {
         let fixture = Fixture::new();
         for (sql, location) in [
-            ("SET trc_unknown = 1", true),
-            ("SET query_timeout = -1", true),
-            ("SET pipeline_dop = 1.5", false),
-            ("SET pipeline_dop = NULL", false),
-            ("SET pipeline_dop = missing_column", false),
-            ("SET pipeline_dop = (SELECT 1)", false),
-            ("SET pipeline_dop = 1 / 0", false),
+            ("SET SESSION trc_unknown = 1", true),
+            ("SET SESSION query_timeout = -1", true),
+            ("SET SESSION pipeline_dop = 1.5", false),
+            ("SET SESSION pipeline_dop = NULL", false),
+            ("SET SESSION pipeline_dop = missing_column", false),
+            ("SET SESSION pipeline_dop = (SELECT 1)", false),
+            ("SET SESSION pipeline_dop = 1 / 0", false),
         ] {
             let error = fixture
                 .input(sql, SessionSqlState::default())

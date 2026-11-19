@@ -20,15 +20,12 @@
 use super::{
     property_cpu_context::PropertyCpuContext, table_mutation_action::PreparedTableMutationInput,
 };
-use novarocks_parser::ast::{AstVec, StatementProperty, TrinoCreateTable, legacy::CreateTable};
+use novarocks_parser::ast::{AstVec, StatementProperty, TrinoCreateTable};
 use novarocks_query_application::{
     api::{CatalogTablePropertyBinding, CommandContext},
     session_error::{QueryServiceError, QueryServiceErrorKind},
-    sql::{
-        LegacyCreateTableColumnsPort, prepare_legacy_create_table,
-        property_evaluation::table::{
-            prepare_trino_create_table, prepare_trino_set_table_properties,
-        },
+    sql::property_evaluation::table::{
+        prepare_trino_create_table, prepare_trino_set_table_properties,
     },
 };
 use novarocks_spi::connector::{
@@ -38,58 +35,10 @@ use novarocks_spi::connector::{
 };
 use novarocks_sql::{
     compiler::SqlCompileControl,
-    semantic::{
-        TableColumnDef,
-        command::{CreateTableSqlCommand, TableColumnSqlCommand},
-    },
+    semantic::{TableColumnDef, command::CreateTableSqlCommand},
 };
 use novarocks_type_contract::{CompilePhase, PureCompileControl};
 use std::sync::Arc;
-
-pub(crate) struct TablePropertyCpuInput {
-    pub(crate) source: Arc<str>,
-    pub(crate) statement: CreateTable,
-    pub(crate) binding: CatalogTablePropertyBinding,
-    pub(crate) command: CommandContext,
-    pub(crate) like_columns: Option<Vec<TableColumnDef>>,
-    pub(crate) context: PropertyCpuContext,
-}
-impl TablePropertyCpuInput {
-    pub(crate) fn run(self) -> Result<PreparedTableMutationInput, QueryServiceError> {
-        let Self {
-            source,
-            statement,
-            binding,
-            command,
-            like_columns,
-            context,
-        } = self;
-        verify_original_scope(&context, &command)?;
-        let mut constants = context.constant_port();
-        let mut columns_port = TableColumnsPort::default();
-        let prepared = prepare_legacy_create_table(
-            &source,
-            &statement,
-            binding.mutation(),
-            command.connector_context(),
-            &mut constants,
-            &mut columns_port,
-            &context.control,
-        )?;
-        let columns = match (prepared.like.is_some(), like_columns) {
-            (false, None) => columns_port.prepared.take().ok_or_else(|| {
-                internal("ordinary table columns were not prepared by their original author")
-            })?,
-            (true, Some(columns)) if columns_port.prepared.is_none() => columns,
-            _ => {
-                return Err(internal(
-                    "table LIKE columns differ from their original CPU preparation branch",
-                ));
-            }
-        };
-        freeze_create(binding, command, prepared, columns)
-    }
-}
 
 pub(crate) enum TrinoTablePropertySyntax {
     Create(TrinoCreateTable),
@@ -157,7 +106,7 @@ impl TrinoTablePropertyCpuInput {
                     crate::catalog_application::statement::lower_semantic_create_table_columns(
                         &table.columns,
                     )
-                    .map_err(legacy_column_error)?;
+                    .map_err(column_lowering_error)?;
                 freeze_create(binding, command, table, columns)
                     .map(TrinoTablePropertyOutput::Mutation)
             }
@@ -203,7 +152,7 @@ fn freeze_create(
         .iter()
         .map(crate::catalog_application::statement::connector_column)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(legacy_column_error)?;
+        .map_err(column_lowering_error)?;
     let operation = ConnectorCatalogMutationOperation::CreateTable {
         table: binding.table().clone(),
         columns,
@@ -241,28 +190,6 @@ fn freeze_mutation(
         .map_err(super::product_command_service_error)
 }
 
-#[derive(Default)]
-struct TableColumnsPort {
-    prepared: Option<Vec<TableColumnDef>>,
-}
-impl LegacyCreateTableColumnsPort for TableColumnsPort {
-    fn prepare_columns(
-        &mut self,
-        columns: &[TableColumnSqlCommand],
-    ) -> Result<(), QueryServiceError> {
-        if self.prepared.is_some() {
-            return Err(internal(
-                "ordinary table columns were prepared more than once",
-            ));
-        }
-        self.prepared = Some(
-            crate::catalog_application::statement::lower_semantic_create_table_columns(columns)
-                .map_err(legacy_column_error)?,
-        );
-        Ok(())
-    }
-}
-
 pub(crate) struct LikeColumnsCpuInput {
     pub(crate) metadata: ConnectorTableMetadata,
     pub(crate) control: SqlCompileControl,
@@ -273,7 +200,7 @@ impl LikeColumnsCpuInput {
             .checkpoint(CompilePhase::Validate, 1)
             .map_err(QueryServiceError::from_compile_control)?;
         let source = crate::connector::sql_columns_from_connector_metadata(&self.metadata)
-            .map_err(legacy_column_error)?;
+            .map_err(column_lowering_error)?;
         let mut columns = Vec::with_capacity(source.len());
         for column in &source {
             self.control
@@ -281,7 +208,7 @@ impl LikeColumnsCpuInput {
                 .map_err(QueryServiceError::from_compile_control)?;
             columns.push(
                 crate::catalog_application::command::create_like_column(column)
-                    .map_err(legacy_column_error)?,
+                    .map_err(column_lowering_error)?,
             );
         }
         Ok(columns)
@@ -290,7 +217,7 @@ impl LikeColumnsCpuInput {
 fn internal(message: &'static str) -> QueryServiceError {
     QueryServiceError::new(QueryServiceErrorKind::Internal, message)
 }
-fn legacy_column_error(error: String) -> QueryServiceError {
+fn column_lowering_error(error: String) -> QueryServiceError {
     // Preserve the old column/default author's actual command presentation.
     super::product_command_service_error(error.into())
 }
@@ -298,13 +225,12 @@ fn legacy_column_error(error: String) -> QueryServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_sql::semantic::command::TableColumnSqlCommand;
     use novarocks_sql::semantic::{DefaultLiteral, command::CommandLiteral};
     use novarocks_types::schema::SqlType;
 
     #[test]
     fn ordinary_port_keeps_real_default_type_value_and_declared_nullability() {
-        let mut port = TableColumnsPort::default();
-        assert!(port.prepared.is_none());
         let columns = [
             TableColumnSqlCommand {
                 name: "id".into(),
@@ -324,10 +250,12 @@ mod tests {
                 comment: None,
             },
         ];
-        port.prepare_columns(&columns).unwrap();
+        let prepared =
+            crate::catalog_application::statement::lower_semantic_create_table_columns(&columns)
+                .unwrap();
         assert_eq!(
-            port.prepared.as_ref().unwrap(),
-            &vec![
+            prepared,
+            vec![
                 TableColumnDef {
                     name: "id".into(),
                     data_type: SqlType::BigInt,
@@ -348,11 +276,9 @@ mod tests {
                 },
             ]
         );
-        assert!(port.prepare_columns(&columns).is_err());
     }
     #[test]
     fn failed_original_default_does_not_publish_a_partial_column_vector() {
-        let mut port = TableColumnsPort::default();
         let columns = [
             TableColumnSqlCommand {
                 name: "valid".into(),
@@ -369,8 +295,10 @@ mod tests {
                 comment: None,
             },
         ];
-        let actual = port.prepare_columns(&columns).unwrap_err();
-        assert!(port.prepared.is_none());
+        let actual =
+            crate::catalog_application::statement::lower_semantic_create_table_columns(&columns)
+                .map_err(column_lowering_error)
+                .unwrap_err();
         assert_eq!(actual.kind(), QueryServiceErrorKind::Internal);
         assert!(
             actual

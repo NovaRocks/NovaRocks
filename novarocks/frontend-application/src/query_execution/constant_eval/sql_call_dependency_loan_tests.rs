@@ -145,7 +145,7 @@ fn sql_call_dependency_loan_real_upper_keeps_original_unconstrained_and_constant
 #[test]
 fn sql_call_dependency_loan_empty_array_keeps_unknown_source_and_outer_json_target() {
     for sql in [
-        "SELECT ARRAY<JSON>[] AS source_array",
+        "SELECT CAST([] AS ARRAY<JSON>) AS source_array",
         "SELECT CAST([] AS ARRAY<JSON>) AS source_array",
     ] {
         let owner = exact(sql);
@@ -333,7 +333,7 @@ fn sql_call_dependency_loan_does_not_add_scope_step_or_success_footer_and_latche
 #[test]
 fn sql_call_dependency_loan_real_table_unnest_retains_relation_and_channels() {
     let owner =
-        exact("SELECT u.* FROM (SELECT [1, 2] AS a) q CROSS JOIN LATERAL UNNEST(q.a) AS u(value)");
+        exact("SELECT u.* FROM (SELECT ARRAY[1, 2] AS a) q CROSS JOIN UNNEST(q.a) AS u(value)");
     let control = SqlCompileControl::unbounded();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let mut count = 0;

@@ -18,58 +18,34 @@
 //! CREATE CATALOG property computation on the original supervised planning CPU.
 
 use super::property_cpu_context::PropertyCpuContext;
-use novarocks_parser::ast::{TrinoCreateCatalog, legacy::CreateCatalog};
+use novarocks_parser::ast::TrinoCreateCatalog;
 use novarocks_query_application::{
-    session_error::QueryServiceError,
-    sql::property_evaluation::{prepare_legacy_create_catalog, prepare_trino_create_catalog},
+    session_error::QueryServiceError, sql::property_evaluation::prepare_trino_create_catalog,
 };
 use novarocks_sql::semantic::command::CatalogCreateCommand;
 use std::sync::Arc;
 
-pub(crate) enum CatalogCreateInput {
-    Legacy(CreateCatalog),
-    Trino(TrinoCreateCatalog),
-}
-
-impl CatalogCreateInput {
-    pub(super) fn name(&self) -> &str {
-        match self {
-            Self::Legacy(statement) => &statement.name.value,
-            Self::Trino(statement) => &statement.catalog_name.value,
-        }
-    }
-}
-
 pub(crate) struct CatalogPropertyCpuInput {
     pub(crate) source: Arc<str>,
-    pub(crate) statement: CatalogCreateInput,
+    pub(crate) statement: TrinoCreateCatalog,
     pub(crate) context: PropertyCpuContext,
 }
 impl CatalogPropertyCpuInput {
     pub(crate) fn run(self) -> Result<CatalogCreateCommand, QueryServiceError> {
         let mut port = self.context.constant_port();
-        match self.statement {
-            CatalogCreateInput::Legacy(statement) => prepare_legacy_create_catalog(
-                &self.source,
-                &statement,
-                &mut port,
-                &self.context.control,
-            ),
-            CatalogCreateInput::Trino(statement) => prepare_trino_create_catalog(
-                &self.source,
-                &statement,
-                &mut port,
-                &self.context.control,
-            ),
-        }
+        prepare_trino_create_catalog(
+            &self.source,
+            &self.statement,
+            &mut port,
+            &self.context.control,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::ast::{CatalogStatement, Statement};
-    use novarocks_query_application::sql::{parse_single_statement, session::SessionSqlState};
+    use novarocks_query_application::sql::session::SessionSqlState;
     use novarocks_sql::compiler::SqlCompileControl;
     use novarocks_workload_control::{
         ResourceConfig, ResultCapacityConfig, ResultWindowAlias, RootWork, WorkClass, WorkRequest,
@@ -110,16 +86,24 @@ mod tests {
                 _control: control,
             }
         }
-        fn input(&self, source: &str) -> CatalogPropertyCpuInput {
-            let Statement::Catalog(CatalogStatement::CreateCatalog(statement)) =
-                parse_single_statement(source).unwrap()
+        fn trino_input(&self, source: &str) -> CatalogPropertyCpuInput {
+            let novarocks_parser::ast::TrinoStatement::CreateCatalog(statement) =
+                novarocks_parser::parser::parse_statement(source).unwrap()
             else {
-                panic!("real CREATE CATALOG");
+                panic!("real typed CREATE CATALOG");
             };
+            self.input_with_syntax(source, statement)
+        }
+
+        fn input_with_syntax(
+            &self,
+            source: &str,
+            statement: TrinoCreateCatalog,
+        ) -> CatalogPropertyCpuInput {
             let frozen = SessionSqlState::default();
             CatalogPropertyCpuInput {
                 source: Arc::from(source),
-                statement: CatalogCreateInput::Legacy(statement),
+                statement,
                 context: PropertyCpuContext {
                     current_database: frozen.current_database().to_owned(),
                     sql_semantics: frozen.sql_semantics().clone(),
@@ -141,10 +125,10 @@ mod tests {
         }
     }
 
-    pub(crate) fn prepare_legacy_catalog_for_test(source: &str) -> CatalogCreateCommand {
+    pub(crate) fn prepare_catalog_for_test(source: &str) -> CatalogCreateCommand {
         let fixture = Fixture::new();
         let command = fixture
-            .input(source)
+            .trino_input(source)
             .run()
             .expect("real catalog property preparation");
         fixture.close();
@@ -152,26 +136,24 @@ mod tests {
     }
 
     #[test]
-    fn catalog_cpu_prepares_complete_configuration_without_publishing_partial_properties() {
+    fn typed_catalog_cpu_preserves_connector_properties_and_guard_exit() {
         let fixture = Fixture::new();
-        let input = fixture.input("CREATE EXTERNAL CATALOG IF NOT EXISTS Warehouse COMMENT 'admitted' PROPERTIES ('type'='iceberg', 'MixedKey'='selected中')");
+        let input = fixture.trino_input("CREATE CATALOG IF NOT EXISTS Warehouse USING iceberg COMMENT 'admitted' WITH (\"MixedKey\" = 'selected中')");
         let original_catalog = input.context.catalog.clone();
         let command = input.run().unwrap();
         assert_eq!(command.name, "Warehouse");
         assert!(command.if_not_exists);
+        assert_eq!(command.connector_name.as_deref(), Some("iceberg"));
         assert_eq!(
             command.properties,
-            vec![
-                ("type".into(), "iceberg".into()),
-                ("MixedKey".into(), "selected中".into())
-            ]
+            vec![("MixedKey".into(), "selected中".into())]
         );
-        // No read guard survives the computation; the block around prepare
-        // additionally keeps it outside every interpreter call in production.
         drop(original_catalog.try_write().expect("catalog guard exited"));
         drop(command);
         let error = fixture
-            .input("CREATE CATALOG Warehouse PROPERTIES ('same'='first','same'='second')")
+            .trino_input(
+                "CREATE CATALOG Warehouse USING iceberg WITH (same = 'first', same = 'second')",
+            )
             .run()
             .unwrap_err();
         assert_eq!(
@@ -185,4 +167,4 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(crate) use tests::prepare_legacy_catalog_for_test;
+pub(crate) use tests::prepare_catalog_for_test;

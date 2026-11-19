@@ -75,7 +75,7 @@ impl FrontendQuerySession {
         source: Arc<str>,
     ) -> Result<QuerySessionStatement, QueryServiceError> {
         let statement_started_at = std::time::SystemTime::now();
-        let statement = novarocks_parser::trino_parser::parse_statement(&source)
+        let statement = novarocks_query_application::sql::parse_single_statement(&source)
             .map_err(|error| QueryServiceError::from_user_error(error.to_user_error(&source)))?;
         match admit_trino_statement(&source, statement)? {
             TrinoStatementAction::Query(action) => {
@@ -227,11 +227,8 @@ impl FrontendQuerySession {
             optimizer.optimizer_query_mem_limit_bytes =
                 Some(self.service.optimizer_query_mem_limit_bytes as f64);
         }
-        let options = with_query_hints(
-            query_options_from_session_settings(&settings),
-            &semantics,
-            None,
-        );
+        let options =
+            with_query_sql_semantics(query_options_from_session_settings(&settings), &semantics);
         let entered = (|| {
             let window = statement
                 .result_window_alias()
@@ -403,7 +400,7 @@ fn preparation_plan(
             publication_deadline: true,
             waits_for_topology: false,
         },
-        Prep::ExplainRefreshMaterializedView(_) => {
+        Prep::ExplainRefreshMaterializedView(..) => {
             CommandPlan::management(ExplainMaterializedViewRefresh, ResultSet, false)
         }
         Prep::SetMaterializedViewProperties { properties, .. } => {
@@ -616,8 +613,17 @@ impl FrontendQuerySession {
         use novarocks_sql::semantic::CatalogSqlCommand;
 
         let CommandEntry { statement, input } = entry;
+        if let Err(error) =
+            novarocks_query_application::sql::trino_admission::admit_persisted_definition_semantics(
+                &source,
+                &preparation,
+                input.request.execution().sql_semantics(),
+            )
+        {
+            return Ok(self.governed_typed_error(error, statement));
+        }
         let catalog = |value| ProductSqlCommand::Catalog(Box::new(value));
-        let explain_refresh = matches!(&preparation, Prep::ExplainRefreshMaterializedView(_));
+        let explain_refresh = matches!(&preparation, Prep::ExplainRefreshMaterializedView(..));
         let command = match preparation {
             Prep::CreateCatalog(node) => {
                 return self
@@ -894,7 +900,7 @@ impl FrontendQuerySession {
                     .map_err(product_command_service_error);
                 return self.run_trino_action(statement, action).await;
             }
-            Prep::RefreshMaterializedView(node) | Prep::ExplainRefreshMaterializedView(node) => {
+            Prep::RefreshMaterializedView(node) | Prep::ExplainRefreshMaterializedView(node, _) => {
                 let action = self
                     .service
                     .command_executor
@@ -1419,7 +1425,7 @@ mod branch_delete_tests {
     #[test]
     fn whole_branch_delete_uses_the_same_target_with_delete_completion() {
         let sql = "DELETE FROM lake.db.t @dev";
-        let parsed = novarocks_parser::trino_parser::parse_statement(sql).unwrap();
+        let parsed = novarocks_parser::parser::parse_statement(sql).unwrap();
         let TrinoStatementAction::Prepare(preparation) =
             admit_trino_statement(sql, parsed).unwrap()
         else {
@@ -1436,19 +1442,7 @@ mod branch_delete_tests {
         let TrinoStatementPreparation::DeleteEntireBranch { table, branch } = preparation else {
             panic!("expected whole-branch delete preparation");
         };
-        let legacy = novarocks_query_application::sql::parse_single_statement(
-            "TRUNCATE TABLE lake.db.t.branch_dev",
-        )
-        .unwrap();
-        let ast::Statement::Catalog(ast::CatalogStatement::TruncateTable(legacy)) = legacy else {
-            panic!("expected legacy branch TRUNCATE");
-        };
-        assert_eq!(
-            TruncateCommand {
-                target_parts: table.parts,
-                target_ref: branch,
-            },
-            crate::query_execution::dml::truncate::command_from_typed_statement(&legacy)
-        );
+        assert_eq!(table.parts, ["lake", "db", "t"]);
+        assert_eq!(branch, "dev");
     }
 }

@@ -122,9 +122,8 @@ impl Fixture {
     }
     fn input(&self, source: &str, control: SqlCompileControl) -> CatalogPropertyCpuInput {
         let statement = novarocks_query_application::sql::parse_single_statement(source).unwrap();
-        let ast::Statement::Catalog(ast::CatalogStatement::CreateCatalog(statement)) = statement
-        else {
-            panic!("one actual legacy CREATE CATALOG");
+        let ast::TrinoStatement::CreateCatalog(statement) = statement else {
+            panic!("one actual CREATE CATALOG");
         };
         let frozen = novarocks_query_application::sql::session::SessionSqlState::default();
         let functions: Arc<dyn SqlFunctionCatalog> = Arc::new(
@@ -133,7 +132,7 @@ impl Fixture {
         );
         CatalogPropertyCpuInput {
             source: Arc::from(source),
-            statement: CatalogCreateInput::Legacy(statement),
+            statement: statement,
             context: PropertyCpuContext {
                 current_database: frozen.current_database().to_owned(),
                 sql_semantics: frozen.sql_semantics().clone(),
@@ -182,7 +181,7 @@ async fn catalog_borrowed_wait_drop_preserves_actual_cpu_until_receive_and_close
     let release = ReleaseGate(gate.clone());
     let mut tail = fixture.tail();
     tail.start(fixture.input(
-        "CREATE EXTERNAL CATALOG IF NOT EXISTS Warehouse PROPERTIES ('type'='iceberg', 'MixedKey'='selected中')",
+        "CREATE CATALOG IF NOT EXISTS Warehouse USING iceberg WITH (\"MixedKey\" = 'selected中')",
         SqlCompileControl::new(None, gate.clone()),
     ));
     let mut borrowed = Box::pin(std::future::poll_fn(|cx| tail.poll_cpu_closed(cx)));
@@ -229,7 +228,7 @@ async fn catalog_cancelled_checkpoint_cannot_close_or_publish_before_actual_cpu_
     let release = ReleaseGate(gate.clone());
     let mut tail = fixture.tail();
     tail.start(fixture.input(
-        "CREATE CATALOG Warehouse PROPERTIES ('type'='iceberg')",
+        "CREATE CATALOG Warehouse USING iceberg",
         SqlCompileControl::new(None, gate.clone()),
     ));
     let mut borrowed = Box::pin(std::future::poll_fn(|cx| tail.poll_cpu_closed(cx)));
@@ -265,11 +264,11 @@ async fn catalog_cancelled_checkpoint_cannot_close_or_publish_before_actual_cpu_
 async fn catalog_duplicate_and_type_refusals_wait_for_real_close_without_partial_command() {
     for (source, duplicate) in [
         (
-            "CREATE CATALOG Warehouse PROPERTIES ('same'='first','same'='second')",
+            "CREATE CATALOG Warehouse USING iceberg WITH (same = 'first', same = 'second')",
             true,
         ),
         (
-            "CREATE CATALOG Warehouse PROPERTIES ('first'='selected','later'=12)",
+            "CREATE CATALOG Warehouse USING iceberg WITH (first = 'selected', later = 12)",
             false,
         ),
     ] {
@@ -278,13 +277,11 @@ async fn catalog_duplicate_and_type_refusals_wait_for_real_close_without_partial
         let release = ReleaseGate(gate.clone());
         let mut tail = fixture.tail();
         let input = fixture.input(source, SqlCompileControl::new(None, gate.clone()));
-        let CatalogCreateInput::Legacy(original) = &input.statement else {
-            panic!("legacy CREATE CATALOG fixture");
-        };
+        let property = &input.statement.properties[1];
         let refused_span = if duplicate {
-            original.properties[1].key.span
+            property.name.span
         } else {
-            original.properties[1].value.span
+            property.value.as_ref().unwrap().span()
         };
         let expected_location = refused_span.to_user_error_location(source);
         tail.start(input);

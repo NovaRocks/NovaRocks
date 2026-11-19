@@ -558,19 +558,19 @@ mod tests {
             ("ALLOW_THROW_EXCEPTION", "SELECT 1", true),
             (
                 "32",
-                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1",
+                "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT 1",
                 true,
             ),
             (
                 "ALLOW_THROW_EXCEPTION",
-                "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+                "WITH SESSION sql_mode = '32' SELECT 1",
                 false,
             ),
         ] {
             let session = SqlSemanticSettings::default()
                 .with_sql_mode(SqlMode::from_assignment(session_mode));
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let admitted_semantics = statement_sql_semantics(&session, &statements[0]).unwrap();
+            let statement = novarocks_parser::parser::parse_statement(sql).unwrap();
+            let admitted_semantics = statement_sql_semantics(&session, &statement).unwrap();
             let cancellation = QueryCancellationSource::new();
             let context = RequestContext::admit(RequestAdmission::new(
                 None,
