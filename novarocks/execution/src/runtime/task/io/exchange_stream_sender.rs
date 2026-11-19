@@ -185,6 +185,10 @@ pub struct ExchangeUnitSendScheduler {
 }
 
 impl ExchangeUnitSendScheduler {
+    pub fn max_unit_bytes(&self) -> usize {
+        self.max_unit_bytes
+    }
+
     pub fn try_new(
         max_bytes: usize,
         max_calls_per_peer: usize,

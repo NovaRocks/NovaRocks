@@ -2014,8 +2014,18 @@ mod tests {
                 },
                 Arc::new(functions.seal().unwrap()),
                 crate::backend_test_support::test_memory_authority(),
-                ExchangeFlowLimits::try_new(2, 3, 1, 2, std::time::Duration::from_millis(7))
-                    .unwrap(),
+                ExchangeFlowLimits::try_new(
+                    2,
+                    3,
+                    1,
+                    2,
+                    std::time::Duration::from_millis(7),
+                    std::num::NonZeroUsize::new(
+                        novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+                    )
+                    .expect("unit bound"),
+                )
+                .unwrap(),
             )
             .unwrap(),
         );

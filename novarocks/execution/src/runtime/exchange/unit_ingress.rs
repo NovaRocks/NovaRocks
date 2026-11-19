@@ -558,14 +558,30 @@ mod tests {
 
     impl Fixture {
         fn new(slots: usize) -> Self {
-            let limits =
-                ExchangeFlowLimits::try_new(slots, slots, 0, 2, Duration::from_secs(30)).unwrap();
-            Self::with_registry(Arc::new(ExecutionExchangeRegistry::with_flow_limits(
-                limits,
-            )))
+            Self::with_grantable(slots, 64 * 1024 * 1024)
         }
 
-        fn with_registry(registry: Arc<ExecutionExchangeRegistry>) -> Self {
+        fn with_grantable(slots: usize, grantable: u64) -> Self {
+            let limits =
+                ExchangeFlowLimits::try_new(
+                    slots,
+                    slots,
+                    0,
+                    2,
+                    Duration::from_secs(30),
+                    std::num::NonZeroUsize::new(
+                        novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+                    )
+                    .expect("unit bound"),
+                )
+                .unwrap();
+            Self::with_registry(
+                Arc::new(ExecutionExchangeRegistry::with_flow_limits(limits)),
+                grantable,
+            )
+        }
+
+        fn with_registry(registry: Arc<ExecutionExchangeRegistry>, grantable: u64) -> Self {
             let task = Owner::new();
             let destination = task.identity();
             let key = ExchangeKey {
@@ -610,7 +626,7 @@ mod tests {
                     Arc::new(RuntimeErrorState::for_task(Arc::new(
                         task.view(TaskFailurePhase::Execution),
                     ))),
-                    64 * 1024 * 1024,
+                    grantable,
                 )
                 .unwrap();
             Self {
@@ -705,11 +721,22 @@ mod tests {
                 base.config().clone(),
                 base.function_set().clone(),
                 base.memory_authority().clone(),
-                ExchangeFlowLimits::try_new(1, 1, 0, 2, Duration::from_secs(30)).unwrap(),
+                ExchangeFlowLimits::try_new(
+                    1,
+                    1,
+                    0,
+                    2,
+                    Duration::from_secs(30),
+                    std::num::NonZeroUsize::new(
+                        novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+                    )
+                    .expect("unit bound"),
+                )
+                .unwrap(),
             )
             .unwrap(),
         );
-        let f = Fixture::with_registry(runtime.exchange_registry());
+        let f = Fixture::with_registry(runtime.exchange_registry(), 64 * 1024 * 1024);
         let control = Arc::new(RuntimeErrorState::for_task(Arc::new(
             f.task.view(TaskFailurePhase::Execution),
         )));
@@ -907,20 +934,46 @@ mod tests {
     #[test]
     fn native_unit_limit_rejection_keeps_the_receipts_resource_failure_identity() {
         use novarocks_failure_contract::{FailureClass, FailureProjection};
-        let fixture = Fixture::new(1);
-        let error = fixture.registry.register_unit_demand(fixture.key, ExchangeDemandEntry {
-            stream: fixture.stream,
-            operation: ExchangeDemandOperation::Register(ExchangeUnitDemand {
-                sequence: ExchangeUnitSequence::FIRST,
-                wire_bytes: novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64 + 1,
-            }),
-        }).unwrap_err();
+        let limit = 96 * 1024 * 1024;
+        let fixture = Fixture::with_grantable(1, limit);
+        let accepted = 65 * 1024 * 1024;
+        fixture
+            .registry
+            .register_unit_demand(
+                fixture.key,
+                ExchangeDemandEntry {
+                    stream: fixture.stream,
+                    operation: ExchangeDemandOperation::Register(ExchangeUnitDemand {
+                        sequence: ExchangeUnitSequence::FIRST,
+                        wire_bytes: accepted,
+                    }),
+                },
+            )
+            .expect("a demand inside the configured grant is accepted");
+        let requested = limit + 1;
+        let error = fixture
+            .registry
+            .register_unit_demand(
+                fixture.key,
+                ExchangeDemandEntry {
+                    stream: fixture.stream,
+                    operation: ExchangeDemandOperation::Register(ExchangeUnitDemand {
+                        sequence: ExchangeUnitSequence::try_new(2).unwrap(),
+                        wire_bytes: requested,
+                    }),
+                },
+            )
+            .unwrap_err();
         let fact = error.failure_fact();
         assert_eq!(fact.class(), FailureClass::Resource);
-        assert_eq!(fact, novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeReceiptError::UnitTooLarge {
-                requested: novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64 + 1,
-                limit: novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64,
-            }.failure_fact());
+        assert_eq!(
+            fact,
+            novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeReceiptError::UnitTooLarge {
+                requested,
+                limit,
+            }
+            .failure_fact()
+        );
         fixture.registry.cancel_exchange_key(fixture.key);
     }
 

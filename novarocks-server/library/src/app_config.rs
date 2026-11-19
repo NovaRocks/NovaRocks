@@ -2804,12 +2804,22 @@ impl ExecutionServicesConfig {
 impl RuntimeConfig {
     /// Resolves the exchange structural limits without constructing a runtime.
     pub fn exchange_flow_limits(&self) -> Result<ExchangeFlowLimits> {
+        let unit = novarocks_native_adapter::grantable_delivery_payload_bytes(
+            self.native_ingress.ordinary_request_max_bytes,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime.native_ingress.ordinary_request_max_bytes must exceed the exchange delivery envelope of {} bytes",
+                novarocks_native_adapter::max_delivery_non_payload_bytes()
+            )
+        })?;
         ExchangeFlowLimits::try_new(
             self.exchange_instance_floor_slots,
             self.exchange_instance_max_slots,
             self.exchange_floating_slots,
             self.exchange_stream_window,
             Duration::from_millis(self.exchange_transport_timeout_ms),
+            unit,
         )
         .context("resolve runtime exchange flow limits")
     }
@@ -3168,24 +3178,54 @@ mod tests {
     #[test]
     fn exchange_flow_defaults_parse_and_resolve_to_the_execution_limits() {
         let absent = toml::from_str::<RuntimeConfig>("").expect("omitted settings use defaults");
-        let expected = super::ExchangeFlowLimits::default();
+        let resolved = absent.exchange_flow_limits().expect("valid defaults");
+        let explicit = RuntimeConfig::default()
+            .exchange_flow_limits()
+            .expect("valid explicit defaults");
+        assert_eq!(resolved, explicit);
+        let fallback = super::ExchangeFlowLimits::default();
         assert_eq!(
-            absent.exchange_flow_limits().expect("valid defaults"),
-            expected
+            resolved.instance_floor_slots(),
+            fallback.instance_floor_slots()
         );
+        assert_eq!(resolved.instance_max_slots(), fallback.instance_max_slots());
+        assert_eq!(resolved.floating_slots(), fallback.floating_slots());
+        assert_eq!(resolved.stream_window(), fallback.stream_window());
+        assert_eq!(resolved.transport_timeout(), fallback.transport_timeout());
+        let envelope = novarocks_native_adapter::max_delivery_non_payload_bytes();
         assert_eq!(
-            RuntimeConfig::default()
-                .exchange_flow_limits()
-                .expect("valid explicit defaults"),
-            expected
+            resolved.max_unit_payload_bytes(),
+            novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
+                - envelope
         );
-        assert_eq!(expected.instance_floor_slots(), 1);
-        assert_eq!(expected.instance_max_slots(), 32);
-        assert_eq!(expected.floating_slots(), 8192);
-        assert_eq!(expected.stream_window(), 2);
+        assert_ne!(
+            resolved.max_unit_payload_bytes(),
+            fallback.max_unit_payload_bytes()
+        );
+        assert_eq!(resolved.instance_floor_slots(), 1);
+        assert_eq!(resolved.instance_max_slots(), 32);
+        assert_eq!(resolved.floating_slots(), 8192);
+        assert_eq!(resolved.stream_window(), 2);
         assert_eq!(
-            expected.transport_timeout(),
+            resolved.transport_timeout(),
             std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn exchange_unit_bound_refuses_a_request_limit_that_cannot_hold_the_envelope() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.native_ingress.ordinary_request_max_bytes = 128;
+        runtime.native_ingress.ordinary_response_max_bytes = 128;
+        runtime.native_ingress.control_request_max_bytes = 128;
+        runtime.native_ingress.control_response_max_bytes = 128;
+        let error = runtime
+            .exchange_flow_limits()
+            .expect_err("the envelope must fit inside the request limit")
+            .to_string();
+        assert!(
+            error.contains("runtime.native_ingress.ordinary_request_max_bytes"),
+            "{error}"
         );
     }
 

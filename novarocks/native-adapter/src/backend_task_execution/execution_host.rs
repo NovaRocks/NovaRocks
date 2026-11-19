@@ -1227,7 +1227,9 @@ impl NativeTaskExecutionHost {
                             Arc::clone(&kernel_control),
                         ),
                     ),
-                    novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64,
+                    self.execution_runtime
+                        .exchange_flow_limits()
+                        .max_unit_payload_bytes() as u64,
                 )
                 .map_err(host_failure)?;
         }

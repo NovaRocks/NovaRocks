@@ -190,6 +190,7 @@ fn run_backend(
         runtime.handle().clone(),
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
+        backend.native_ingress.message_limits(),
     );
     let primary = runtime
         .block_on(crate::roles::backend::run_until_shutdown(
@@ -277,6 +278,7 @@ async fn run_all_in_one(
         runtime.clone(),
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
+        backend.native_ingress.message_limits(),
     );
     let backend_scan_io = scan_io.services();
     let (frontend_stop_tx, frontend_stop_rx) = tokio::sync::watch::channel(false);

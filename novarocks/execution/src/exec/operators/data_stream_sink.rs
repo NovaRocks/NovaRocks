@@ -1749,6 +1749,7 @@ impl OperatorFactory for DataStreamSinkFactory {
             pending_payloads_per_dest: Vec::new(),
             // Replaced at runtime binding with the host-frozen value.
             max_transmit_batched_bytes: 1,
+            max_unit_payload_bytes: novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
             finished: AtomicBool::new(false),
             aborting: AtomicBool::new(false),
             finishing: AtomicBool::new(false),
@@ -1800,6 +1801,12 @@ enum PayloadEnqueue {
     /// The destination's edge was closed by a normal downstream cancellation,
     /// so the payload is dropped rather than parked or sent.
     Discarded,
+    /// The encoded payload exceeds this process's unit bound and the chunk has
+    /// more than one row. The encoded bytes were dropped and no sequence was
+    /// consumed. The caller splits the original chunk and retries.
+    Oversized {
+        encoded_len: usize,
+    },
 }
 
 struct DataStreamSinkOperator {
@@ -1817,6 +1824,8 @@ struct DataStreamSinkOperator {
     pending_bytes_per_dest: Vec<usize>,
     pending_payloads_per_dest: Vec<Option<PendingPayload>>,
     max_transmit_batched_bytes: usize,
+    /// Wire upper bound on one unit payload. Not a memory budget.
+    max_unit_payload_bytes: usize,
     finished: AtomicBool,
     aborting: AtomicBool,
     finishing: AtomicBool,
@@ -1930,23 +1939,28 @@ impl OperatorLifecycle for DataStreamSinkOperator {
             .execution_runtime()
             .ok_or(crate::runtime::runtime_state::RuntimeBindingFailure::MissingExecutionRuntime)?;
         self.max_transmit_batched_bytes = runtime.config().exchange_max_transmit_batched_bytes;
+        self.max_unit_payload_bytes = runtime.exchange_flow_limits().max_unit_payload_bytes();
         let gates = self
             .edge_gates
             .clone()
             .ok_or_else(|| stream_contract("exchange sender has no frozen Installed barrier"))?;
-        let configs = self.destinations().iter()
+        let configs = self
+            .destinations()
+            .iter()
             .filter(|destination| !Self::is_pseudo_destination(destination))
-            .map(|destination| Ok(ExchangeStreamSenderConfig {
-                stream: self.stream_for_destination(destination)?,
-                destination: destination.endpoint().clone(),
-                sender_count: destination.sender_count(),
-                sender_id: self.sender_id,
-                backend_number: self.be_number,
-                delivery: self.input.delivery,
-                retained_window: runtime.exchange_flow_limits().stream_window(),
-                max_unit_bytes: novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
-                retry_delay: std::time::Duration::from_millis(10),
-            }))
+            .map(|destination| {
+                Ok(ExchangeStreamSenderConfig {
+                    stream: self.stream_for_destination(destination)?,
+                    destination: destination.endpoint().clone(),
+                    sender_count: destination.sender_count(),
+                    sender_id: self.sender_id,
+                    backend_number: self.be_number,
+                    delivery: self.input.delivery,
+                    retained_window: runtime.exchange_flow_limits().stream_window(),
+                    max_unit_bytes: self.max_unit_payload_bytes,
+                    retry_delay: std::time::Duration::from_millis(10),
+                })
+            })
             .collect::<ExecutionResult<Vec<_>>>()?;
         self.send_group.bind(
             state.error_state(),
@@ -2766,6 +2780,19 @@ impl DataStreamSinkOperator {
         };
         let encode_ns = encode_start.elapsed().as_nanos();
         let payload_bytes = payload.len();
+        if payload_bytes > self.max_unit_payload_bytes {
+            let rows = chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
+            if rows > 1 {
+                // Drop the encoded bytes before any sequence is consumed.
+                drop(payload);
+                return Ok(PayloadEnqueue::Oversized {
+                    encoded_len: payload_bytes,
+                });
+            }
+            return Err(crate::runtime::task::ExecutionFailure::from_domain(
+                crate::runtime::task::io::exchange_stream_sender::ExchangeUnitSenderError::UnitTooLarge,
+            ));
+        }
         let payload_capacity_bytes = payload.capacity().max(payload_bytes);
 
         if let Some(profile) = self.profiles.as_ref() {
@@ -2813,11 +2840,66 @@ impl DataStreamSinkOperator {
                 Ok(PayloadEnqueue::Discarded)
             }
             PayloadEnqueue::NoCapacity(payload) => Ok(PayloadEnqueue::NoCapacity(payload)),
+            PayloadEnqueue::Oversized { .. } => Err(stream_contract(
+                "parked exchange payload cannot request another row split",
+            )),
         }
     }
 
     /// Drops everything still owed to one abandoned destination: its buffered
     /// chunks, their byte accounting, and its single parked payload.
+    fn requeue_encoded_oversize(
+        &mut self,
+        dest_idx: usize,
+        chunk: Chunk,
+        encoded_len: usize,
+    ) -> ExecutionResult<()> {
+        let rows = chunk.len();
+        if rows <= 1 {
+            return Err(crate::runtime::task::ExecutionFailure::from_domain(
+                crate::runtime::task::io::exchange_stream_sender::ExchangeUnitSenderError::UnitTooLarge,
+            ));
+        }
+        let per_row = encoded_len.div_ceil(rows).max(1);
+        let rows_per_slice = (self.max_unit_payload_bytes / per_row).max(1);
+        let factory = self
+            .construction_factory
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let split = split_oversized_chunks_with_creation(
+            vec![chunk],
+            1,
+            Some(rows_per_slice),
+            factory.as_ref(),
+        )?;
+        if split.chunks.len() <= 1 {
+            return Err(crate::runtime::task::ExecutionFailure::from_domain(
+                crate::runtime::task::io::exchange_stream_sender::ExchangeUnitSenderError::UnitTooLarge,
+            ));
+        }
+        let mut slices = split.chunks;
+        if let Some(tracker) = self.pending_chunks_mem_tracker.as_ref() {
+            for slice in slices.iter_mut() {
+                slice.transfer_to(tracker);
+            }
+        }
+        let added = slices
+            .iter()
+            .map(|slice| slice.record_batch().get_array_memory_size())
+            .sum::<usize>();
+        let pending = self
+            .pending_per_dest
+            .get_mut(dest_idx)
+            .ok_or_else(|| stream_contract("pending buffer index out of range"))?;
+        for slice in slices.into_iter().rev() {
+            pending.push_front(slice);
+        }
+        if let Some(total) = self.pending_bytes_per_dest.get_mut(dest_idx) {
+            *total = total.saturating_add(added);
+        }
+        Ok(())
+    }
+
     fn discard_pending_for_dest(&mut self, dest_idx: usize) {
         if let Some(chunks) = self.pending_per_dest.get_mut(dest_idx) {
             chunks.clear();
@@ -2867,23 +2949,21 @@ impl DataStreamSinkOperator {
             if chunks.is_empty() || Self::is_pseudo_destination(&dests[i]) {
                 continue;
             }
-            // Upstream operators (notably hash join with a high per-key
-            // fan-out) can emit a single chunk many MB in size — large enough
-            // that its Arrow-IPC encoding exceeds `GRPC_MAX_MESSAGE_BYTES`
-            // (64 MiB), causing h2 to reject the payload with a generic
-            // protocol error. Slice oversize chunks down well below the wire
-            // limit, but keep the slices large enough that downstream
-            // per-chunk overhead (sort/analytic frame buffers) does not blow
-            // up from a 360× fan-out. The drainer batches smaller chunks
-            // back together up to `max_transmit_batched_bytes` per gRPC
-            // payload, so the slice size is a hard upper bound only.
-            let max_chunk_bytes = OVERSIZED_CHUNK_SPLIT_TARGET_BYTES;
+            // Memory estimate is an efficiency granularity. It never exceeds
+            // this process's unit payload bound. Encoding can still overshoot,
+            // and that path splits again by encoded size.
+            let max_chunk_bytes =
+                OVERSIZED_CHUNK_SPLIT_TARGET_BYTES.min(self.max_unit_payload_bytes.max(1));
             let factory = self
                 .construction_factory
                 .as_ref()
                 .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-            let split =
-                split_oversized_chunks_with_creation(chunks, max_chunk_bytes, factory.as_ref())?;
+            let split = split_oversized_chunks_with_creation(
+                chunks,
+                max_chunk_bytes,
+                None,
+                factory.as_ref(),
+            )?;
             let mut chunks = split.chunks;
             if let Some(tracker) = self.pending_chunks_mem_tracker.as_ref() {
                 for chunk in chunks.iter_mut() {
@@ -2962,6 +3042,11 @@ impl DataStreamSinkOperator {
                         }
                         return Ok(());
                     }
+                    PayloadEnqueue::Oversized { .. } => {
+                        return Err(stream_contract(
+                            "parked exchange payload cannot request another row split",
+                        ));
+                    }
                 }
             }
 
@@ -2984,6 +3069,10 @@ impl DataStreamSinkOperator {
                             break;
                         }
                         return Ok(());
+                    }
+                    PayloadEnqueue::Oversized { encoded_len } => {
+                        self.requeue_encoded_oversize(i, chunk, encoded_len)?;
+                        continue;
                     }
                 }
                 if !force {
@@ -3054,6 +3143,11 @@ impl DataStreamSinkOperator {
                 PayloadEnqueue::NoCapacity(payload) => {
                     self.pending_payloads_per_dest[i] = Some(payload);
                     return Ok(());
+                }
+                PayloadEnqueue::Oversized { .. } => {
+                    return Err(stream_contract(
+                        "exchange end marker cannot request a row split",
+                    ));
                 }
             }
         }
@@ -3411,13 +3505,9 @@ impl DataStreamSinkFinishState {
     }
 }
 
-/// Target slice size for [`split_oversized_chunks`]. Sits well below
-/// `GRPC_MAX_MESSAGE_BYTES` (64 MiB) so even with Arrow-IPC framing overhead
-/// the encoded payload stays under the wire limit, while large enough that a
-/// runaway hash-join chunk produces only a handful of slices — not the
-/// hundreds we'd get if we reused the much smaller `max_transmit_batched_bytes`
-/// (256 KiB) value, which blew up downstream window-operator per-chunk
-/// bookkeeping for the F1-with_join JOIN-then-window pipeline.
+/// Efficiency granularity for the memory estimate split. It is not a wire
+/// guarantee: the caller caps it by the unit payload bound, and an encoded
+/// payload that still exceeds that bound is split again by row.
 const OVERSIZED_CHUNK_SPLIT_TARGET_BYTES: usize = 16 * 1024 * 1024;
 
 /// Slice each chunk that exceeds `target_bytes` in memory into a series of
@@ -3428,6 +3518,7 @@ const OVERSIZED_CHUNK_SPLIT_TARGET_BYTES: usize = 16 * 1024 * 1024;
 fn split_oversized_chunks_core<E>(
     chunks: Vec<Chunk>,
     target_bytes: usize,
+    rows_per_slice_override: Option<usize>,
     mut initial: impl FnMut(usize) -> Result<(), E>,
     mut before_push: impl FnMut(&Vec<Chunk>) -> Result<(), E>,
     mut measure: impl FnMut(&Chunk) -> Result<(usize, usize), E>,
@@ -3438,7 +3529,7 @@ fn split_oversized_chunks_core<E>(
     let mut out = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         let (bytes, rows) = measure(&chunk)?;
-        if rows <= 1 || bytes <= target_bytes {
+        if rows <= 1 || (rows_per_slice_override.is_none() && bytes <= target_bytes) {
             before_push(&out)?;
             out.push(chunk);
             continue;
@@ -3446,9 +3537,11 @@ fn split_oversized_chunks_core<E>(
         // ceil_div(bytes, target_bytes) — number of slices needed for the
         // chunk to fit under the target. `bytes_per_row` is the implied
         // per-row footprint; rows_per_slice is sized so that one slice is
-        // ~target_bytes.
+        // ~target_bytes. An encoded-size retry passes the row count directly.
         let bytes_per_row = bytes.div_ceil(rows).max(1);
-        let rows_per_slice = (target_bytes / bytes_per_row).max(1);
+        let rows_per_slice = rows_per_slice_override
+            .unwrap_or_else(|| target_bytes / bytes_per_row)
+            .max(1);
         let mut offset = 0;
         while offset < rows {
             let len = rows_per_slice.min(rows - offset);
@@ -3535,6 +3628,7 @@ fn split_oversized_chunks(chunks: Vec<Chunk>, target_bytes: usize) -> Vec<Chunk>
     split_oversized_chunks_core::<std::convert::Infallible>(
         chunks,
         target_bytes,
+        None,
         |_| Ok(()),
         |_| Ok(()),
         |chunk| Ok((chunk.record_batch().get_array_memory_size(), chunk.len())),
@@ -3549,6 +3643,7 @@ struct SplitChunkHeaders {
 fn split_oversized_chunks_with_creation(
     chunks: Vec<Chunk>,
     target_bytes: usize,
+    rows_per_slice: Option<usize>,
     factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
 ) -> ExecutionResult<SplitChunkHeaders> {
     use crate::exec::pipeline::operator::ConstructionFailure;
@@ -3565,6 +3660,7 @@ fn split_oversized_chunks_with_creation(
         split_oversized_chunks_core::<ExecutionFailure>(
             chunks,
             target_bytes,
+            rows_per_slice,
             |count| {
                 headers.request(std::alloc::Layout::array::<Chunk>(count).map_err(|_| {
                     ConstructionFailure::Resource(LayoutResourceError::Arithmetic)

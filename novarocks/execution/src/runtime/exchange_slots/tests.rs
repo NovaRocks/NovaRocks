@@ -23,7 +23,18 @@ use std::sync::{Barrier, LazyLock};
 use std::time::Duration;
 
 fn limits(floor: usize, cap: usize, floating: usize) -> ExchangeFlowLimits {
-    ExchangeFlowLimits::try_new(floor, cap, floating, 2, Duration::from_secs(30)).unwrap()
+    ExchangeFlowLimits::try_new(
+        floor,
+        cap,
+        floating,
+        2,
+        Duration::from_secs(30),
+        std::num::NonZeroUsize::new(
+            novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+        )
+        .expect("unit bound"),
+    )
+    .unwrap()
 }
 
 fn registration(query: i64, ordinal: u32, senders: u32) -> ExchangeSlotRegistration {

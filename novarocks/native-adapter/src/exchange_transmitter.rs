@@ -199,7 +199,7 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
             payload: frame.receiver.payload,
             next_demand: frame.receiver.next_demand,
         });
-        if let Err(fact) = checked_envelope(&request) {
+        if let Err(fact) = checked_envelope(&request, self.runtime.message_limits()) {
             done(ExchangeCallOutcome::Refused(fact));
             drop(activity);
             return;
@@ -320,7 +320,7 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
                 return;
             }
         };
-        if let Err(fact) = checked_envelope(&request) {
+        if let Err(fact) = checked_envelope(&request, self.runtime.message_limits()) {
             done(ExchangeDemandCallOutcome::Refused(fact));
             return;
         }
@@ -421,9 +421,9 @@ fn unit_failure(
 
 fn checked_envelope(
     value: &impl Message,
+    limits: crate::TransportMessageLimits,
 ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
-    if value.encoded_len() > novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
-    {
+    if value.encoded_len() > limits.ordinary_request_max_bytes {
         Err(unit_failure(
             novarocks_execution_contract::failure::FailureClass::Resource,
             463,
@@ -451,6 +451,60 @@ pub(crate) mod tests {
     use novarocks_types::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId, UniqueId,
     };
+
+    #[test]
+    fn checked_envelope_uses_the_runtime_request_limit() {
+        use novarocks_execution_contract::failure::FailureClass;
+        let source = TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        let destination = TaskIdentity::new(
+            source.query_execution_id(),
+            StageId::new(2).unwrap(),
+            TaskId::new(2).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        let stream = ExchangeStreamIdentity::try_new(
+            ExchangeSource::new(source, UniqueId::new(1, 1), 0),
+            destination,
+            UniqueId::new(2, 2),
+            FragmentNodeId::new(1),
+        )
+        .unwrap();
+        let mut limits = crate::TransportMessageLimits::DEFAULT;
+        limits.ordinary_request_max_bytes = 4096;
+        let small = codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
+            stream,
+            sender_count: 1,
+            sender_id: 0,
+            backend_number: 0,
+            item: ExchangeUnitItem::End(ExchangeUnitSequence::try_new(1).unwrap()),
+            payload: Bytes::new(),
+            next_demand: None,
+        });
+        assert!(checked_envelope(&small, limits).is_ok());
+        let large = codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
+            stream,
+            sender_count: 1,
+            sender_id: 0,
+            backend_number: 0,
+            item: ExchangeUnitItem::Unit {
+                demand: novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitDemand {
+                    sequence: ExchangeUnitSequence::try_new(1).unwrap(),
+                    wire_bytes: 5000,
+                },
+                end_after_unit: false,
+            },
+            payload: Bytes::from(vec![9u8; 5000]),
+            next_demand: None,
+        });
+        let error = checked_envelope(&large, limits).expect_err("over the request limit");
+        assert_eq!(error.class(), FailureClass::Resource);
+        assert_eq!(error.reason().code(), 463);
+    }
 
     fn task() -> TaskIdentity {
         TaskIdentity::new(
@@ -605,6 +659,7 @@ pub(crate) mod tests {
             carrier.handle().clone(),
             crate::backend_test_support::test_backend_native_trust(),
             crate::BackendNativeTransport::Plaintext,
+            crate::TransportMessageLimits::DEFAULT,
         );
         let transmitter = grpc_exchange_transmitter(
             runtime,

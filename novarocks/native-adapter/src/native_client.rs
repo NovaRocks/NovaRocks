@@ -34,9 +34,6 @@ use crate::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
 use crate::native_lane::{NativeDial, NativeLane, NativeLaneChannel, admitted_connector_service};
 use crate::native_transport_admission::TransportClass;
 
-const GRPC_MAX_MESSAGE_BYTES: usize =
-    novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
-
 #[cfg(test)]
 #[path = "native_peer_key_tests.rs"]
 mod peer_key_tests;
@@ -255,7 +252,13 @@ impl NativeRpcClient {
         tokio::time::timeout_at(deadline_at, get_or_create_channel(&self.runtime, key))
             .await
             .map_err(|_| format!("{operation} deadline exceeded during channel acquisition"))?
-            .map(|channel| client_from_channel(channel, self.runtime.native_trust().as_ref()))
+            .map(|channel| {
+                client_from_channel(
+                    channel,
+                    self.runtime.native_trust().as_ref(),
+                    self.runtime.message_limits(),
+                )
+            })
             .map_err(|error| format!("{operation} channel acquisition failed: {error}"))
     }
 
@@ -381,10 +384,11 @@ pub(crate) fn admitted_connector(
 fn client_from_channel(
     channel: NativeLaneChannel,
     trust: &NativeTrust,
+    limits: crate::TransportMessageLimits,
 ) -> AuthenticatedNovaRocksGrpcClient {
     NovaRocksGrpcClient::with_interceptor(channel, trust.client_interceptor())
-        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(limits.ordinary_request_max_bytes)
+        .max_decoding_message_size(limits.ordinary_response_max_bytes)
 }
 
 async fn get_or_create_channel(

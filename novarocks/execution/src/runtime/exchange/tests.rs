@@ -451,6 +451,10 @@ impl UnitFixture {
             0,
             2,
             std::time::Duration::from_secs(30),
+            std::num::NonZeroUsize::new(
+                novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+            )
+            .expect("unit bound"),
         )
         .unwrap();
         let registry = Arc::new(ExecutionExchangeRegistry::with_flow_limits(limits));

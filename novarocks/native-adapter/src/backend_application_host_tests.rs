@@ -125,6 +125,7 @@ fn host_accepts_an_empty_sealed_execution_role_binding_factory_set() {
             runtime.handle().clone(),
             test_native_trust(),
             BackendNativeTransport::Plaintext,
+            crate::TransportMessageLimits::DEFAULT,
         ),
     )
     .expect("empty sealed catalog runtime set must start");

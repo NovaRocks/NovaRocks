@@ -54,6 +54,7 @@ fn make_test_operator(fixture: &Fixture) -> DataStreamSinkOperator {
         pending_bytes_per_dest: Vec::new(),
         pending_payloads_per_dest: Vec::new(),
         max_transmit_batched_bytes: 1,
+        max_unit_payload_bytes: novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
         finished: AtomicBool::new(false),
         aborting: AtomicBool::new(false),
         finishing: AtomicBool::new(false),
@@ -1350,6 +1351,110 @@ fn split_oversized_chunks_passes_small_chunks_through_unchanged() {
 }
 
 #[test]
+fn split_target_follows_a_unit_bound_below_the_memory_granularity() {
+    let fixture = Fixture::new();
+    let mut op = make_test_operator(&fixture);
+    op.input.destinations = vec![make_test_destination(&fixture)];
+    prepare_test_operator(&fixture, &mut op);
+    op.max_unit_payload_bytes = 1024;
+    op.buffer_chunk(typed_int64_chunk(10_000)).unwrap();
+    assert!(op.pending_chunk_count_total() > 1);
+    let rows: usize = op.pending_per_dest[0].iter().map(|chunk| chunk.len()).sum();
+    assert_eq!(rows, 10_000);
+}
+
+fn decoded_int64_rows(sink: &DataStreamSinkOperator, payload: &[u8]) -> Vec<i64> {
+    let sample = typed_int64_chunk(1);
+    let schema = std::sync::Arc::new(sample.chunk_schema().clone());
+    crate::runtime::exchange::online_unit::decode(
+        sink.recipe.as_deref().expect("prepared recipe"),
+        payload,
+        &schema,
+        sink.construction_factory.as_ref().unwrap().as_ref(),
+    )
+    .expect("encoded exchange payload")
+    .into_iter()
+    .flat_map(|chunk| {
+        chunk
+            .record_batch()
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("int64 column")
+            .values()
+            .to_vec()
+    })
+    .collect()
+}
+
+fn prepared_destination(fixture: &Fixture) -> DataStreamSinkOperator {
+    let mut op = make_test_operator(fixture);
+    gate_destinations(&mut op, vec![make_test_destination(fixture)]);
+    prepare_test_operator(fixture, &mut op);
+    open_edges(&op, &[edge_id(1)]);
+    op
+}
+
+#[test]
+fn encoded_multirow_over_the_unit_bound_is_split_in_order_without_consuming_a_sequence() {
+    use novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitItem;
+    let one_row = {
+        let fixture = Fixture::new();
+        let mut probe = prepared_destination(&fixture);
+        probe.buffer_chunk(typed_int64_chunk(1)).unwrap();
+        probe.flush_pending(true).unwrap();
+        let frames = fixture.transport().frames();
+        assert_eq!(frames.len(), 1);
+        frames[0].receiver.payload.len()
+    };
+    let many_rows = {
+        let fixture = Fixture::new();
+        let mut wide = prepared_destination(&fixture);
+        wide.buffer_chunk(typed_int64_chunk(32)).unwrap();
+        wide.flush_pending(true).unwrap();
+        let frames = fixture.transport().frames();
+        assert_eq!(frames.len(), 1);
+        frames[0].receiver.payload.len()
+    };
+    assert!(many_rows > one_row);
+
+    let fixture = Fixture::new();
+    let mut sink = prepared_destination(&fixture);
+    sink.max_unit_payload_bytes = many_rows - 1;
+    sink.buffer_chunk(typed_int64_chunk(32)).unwrap();
+    sink.flush_pending(true).unwrap();
+    let frames = fixture.transport().frames();
+    assert!(
+        frames.len() > 1,
+        "encoded payload must be split across units"
+    );
+    let mut rows = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        match frame.receiver.item {
+            ExchangeUnitItem::Unit { demand, .. } => {
+                assert_eq!(demand.sequence.get(), (index + 1) as u64);
+                assert!(frame.receiver.payload.len() <= sink.max_unit_payload_bytes);
+                rows.extend(decoded_int64_rows(&sink, &frame.receiver.payload));
+            }
+            ExchangeUnitItem::End(_) => panic!("data flush must not emit End"),
+        }
+    }
+    assert_eq!(rows, (0..32).collect::<Vec<_>>());
+
+    let fixture = Fixture::new();
+    let mut sink = prepared_destination(&fixture);
+    sink.max_unit_payload_bytes = one_row - 1;
+    sink.buffer_chunk(typed_int64_chunk(1)).unwrap();
+    let error = sink.flush_pending(true).unwrap_err();
+    use novarocks_failure_contract::FailureProjection;
+    assert_eq!(
+        error.failure_fact().class(),
+        novarocks_failure_contract::FailureClass::Resource
+    );
+    assert!(fixture.transport().frames().is_empty());
+}
+
+#[test]
 fn split_oversized_chunks_slices_large_chunk_into_pieces_with_row_count_preserved() {
     // 10_000 int64 rows ≈ 80 KiB in-memory. Slice at a 8 KiB target. The
     // sliced chunks share the underlying Arrow buffers and therefore
@@ -1512,6 +1617,7 @@ mod typed_sender_header_tests {
         let out = split_oversized_chunks_with_creation(
             vec![source.clone()],
             1,
+            None,
             sink.construction_factory.as_ref().unwrap().as_ref(),
         )
         .unwrap();
@@ -1549,6 +1655,7 @@ mod typed_sender_header_tests {
         let out = split_oversized_chunks_with_creation(
             vec![source.clone()],
             1,
+            None,
             sink.construction_factory.as_ref().unwrap().as_ref(),
         )
         .unwrap();
@@ -1701,6 +1808,7 @@ mod typed_sender_header_tests {
         let refusal = split_oversized_chunks_with_creation(
             vec![source.clone()],
             1,
+            None,
             sink.construction_factory.as_ref().unwrap().as_ref(),
         )
         .err()

@@ -1636,8 +1636,18 @@ mod tests {
         };
 
         let exchange_flow_limits =
-            super::ExchangeFlowLimits::try_new(2, 5, 0, 3, Duration::from_millis(71))
-                .expect("explicit exchange configuration is valid");
+            super::ExchangeFlowLimits::try_new(
+                2,
+                5,
+                0,
+                3,
+                Duration::from_millis(71),
+                std::num::NonZeroUsize::new(
+                    novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+                )
+                .expect("unit bound"),
+            )
+            .expect("explicit exchange configuration is valid");
         let services = compose_backend_application_services(
             test_data_runtime(),
             BackendProcessId::new_v7(),

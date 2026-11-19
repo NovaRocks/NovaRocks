@@ -34,6 +34,10 @@ struct TestPort {
     listener: Mutex<Option<Arc<dyn ExchangeUnitStateListener>>>,
     deliveries: AtomicU64,
     delivery_hold: Mutex<Option<Arc<DeliveryHold>>>,
+    /// Zero means this double does not apply a unit bound. A positive value is
+    /// the receiver's grantable payload bytes.
+    grantable: AtomicU64,
+    accepted: Mutex<Vec<(u64, usize)>>,
 }
 
 #[derive(Default)]
@@ -95,6 +99,19 @@ impl ExchangeReceiverPort for TestPort {
         entry: novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandEntry,
     ) -> Result<ExchangeStreamObservation, FailureFact> {
         use novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandOperation;
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeReceiptError;
+        let limit = self.grantable.load(Ordering::Relaxed);
+        if let ExchangeDemandOperation::Register(demand) = entry.operation
+            && limit > 0
+            && demand.wire_bytes > limit
+        {
+            return Err(ExchangeReceiptError::UnitTooLarge {
+                requested: demand.wire_bytes,
+                limit,
+            }
+            .failure_fact());
+        }
         let facts = {
             let mut states = self.states.lock().unwrap();
             let facts = states.entry(entry.stream).or_default();
@@ -126,6 +143,10 @@ impl ExchangeReceiverPort for TestPort {
             "piggyback is registered once by the adapter"
         );
         self.deliveries.fetch_add(1, Ordering::Relaxed);
+        self.accepted
+            .lock()
+            .unwrap()
+            .push((frame.item.sequence().get(), frame.payload.len()));
         let hold = self.delivery_hold.lock().unwrap().clone();
         if let Some(hold) = hold {
             hold.block();
@@ -956,6 +977,7 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
         tokio::runtime::Handle::current(),
         trust,
         crate::BackendNativeTransport::Plaintext,
+        crate::TransportMessageLimits::DEFAULT,
     );
     let client = NativeRpcClient::new_backend_endpoint(
         runtime.clone(),
@@ -1409,6 +1431,7 @@ fn start_real_unit_receiver_service(
         tokio::runtime::Handle::current(),
         trust,
         crate::BackendNativeTransport::Plaintext,
+        crate::TransportMessageLimits::DEFAULT,
     );
     let client = Arc::new(NativeRpcClient::new_backend_endpoint(
         runtime,
@@ -1660,4 +1683,193 @@ async fn authenticated_tonic_stop_before_first_demand_fences_the_real_frozen_rec
     fixture.port.cancel(fixture.key);
     server.stop().unwrap();
     result.expect("real native stop-before-demand regression exceeded its failure watchdog");
+}
+
+#[tokio::test]
+async fn tonic_exchange_accepts_a_unit_above_64_mib_and_refuses_a_smaller_receiver_at_demand() {
+    use crate::native_transport_admission::{NativeTransportAdmission, TransportClass};
+    use novarocks_execution_contract::failure::FailureProjection;
+    use novarocks_execution_contract::ordered_retained_stream::exchange::{
+        ExchangeReceiptError, ExchangeUnitDemand, ExchangeUnitItem,
+    };
+    use novarocks_native_trust::{NativeIncomingAdapter, NativeProcessIdentity};
+    use novarocks_proto_codec::native_rpc::NativeEndpointDomain;
+    let wide = 96 * 1024 * 1024;
+    let payload_len = 65 * 1024 * 1024;
+    let base = base_stream();
+    let stream = ExchangeStreamIdentity::try_new(
+        ExchangeSource::new(base.source().task(), base.source().task_key(), 0),
+        base.destination(),
+        base.destination_task_key(),
+        base.destination_node(),
+    )
+    .unwrap();
+    let port = Arc::new(TestPort::default());
+    port.grantable.store(wide as u64, Ordering::Relaxed);
+    let (_, capabilities) = installed_plane(stream, port.clone());
+    let trust = crate::backend_test_support::test_backend_native_trust();
+    trust
+        .bind_process_identity(NativeProcessIdentity::Backend(
+            stream.source().task().backend_process_id(),
+        ))
+        .unwrap();
+    let receiver_trust = crate::backend_test_support::test_backend_native_trust();
+    receiver_trust
+        .bind_process_identity(NativeProcessIdentity::Backend(
+            stream.destination().backend_process_id(),
+        ))
+        .unwrap();
+    let descriptor = novarocks_execution_contract::BackendProcessDescriptor::try_new(
+        stream.destination().backend_process_id(),
+        RuntimeEndpoint::new("127.0.0.1", 9090).unwrap(),
+        RuntimeEndpoint::new("127.0.0.1", 9091).unwrap(),
+        "test",
+        "test",
+        novarocks_types::NativeCompatibilityId::new([1; 32]),
+        1,
+    )
+    .unwrap();
+    let service = crate::backend_rpc_service::BackendRpcService::new(
+        Arc::new(UnusedIngress),
+        Arc::new(UnusedIngress),
+        Arc::new(UnusedIngress),
+        port.clone(),
+        capabilities,
+        crate::backend_heartbeat::BackendHeartbeatResponder::new(
+            descriptor,
+            Arc::new(novarocks_worker::WorkerDrainState::new()),
+            Arc::new(UnusedIngress),
+        ),
+    );
+    let mut server = crate::NativeRpcListener::start_with_admission(
+        "127.0.0.1",
+        0,
+        service,
+        receiver_trust,
+        NativeIncomingAdapter::plaintext(),
+        "exchange-wide-unit-test",
+        NativeEndpointDomain::BackendData,
+        "exchange-wide-unit-test",
+        || {},
+        || {},
+        crate::native_server::NativeIngressConfig {
+            worker_threads: 2,
+            ordinary_request_max_bytes: wide,
+            ordinary_response_max_bytes: wide,
+            control_response_max_bytes: wide,
+            ..Default::default()
+        },
+        NativeTransportAdmission::new().unwrap(),
+        TransportClass::Data,
+        None,
+    )
+    .unwrap();
+    let runtime = BackendDataRuntime::new(
+        tokio::runtime::Handle::current(),
+        trust,
+        crate::BackendNativeTransport::Plaintext,
+        crate::TransportMessageLimits {
+            ordinary_request_max_bytes: wide,
+            ordinary_response_max_bytes: wide,
+            control_request_max_bytes: 1024 * 1024,
+            control_response_max_bytes: wide,
+        },
+    );
+    let client = NativeRpcClient::new_backend_endpoint(
+        runtime,
+        RuntimeEndpoint::from_socket_addr(server.bound_addr())
+            .native_endpoint()
+            .clone(),
+        stream.destination().backend_process_id(),
+    );
+    let payload = Bytes::from(vec![7u8; payload_len]);
+    let demand = ExchangeUnitDemand {
+        sequence: ExchangeUnitSequence::try_new(1).unwrap(),
+        wire_bytes: payload.len() as u64,
+    };
+    let reply = client
+        .register_exchange_demand_async(
+            codec::encode_demand_request(
+                &[codec::DecodedExchangeDemandEntry {
+                    stream,
+                    operation: codec::ExchangeDemandOperation::Demand(demand),
+                }],
+                FieldPath::root("test"),
+            )
+            .unwrap(),
+            Duration::from_secs(20),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        codec::decode_demand_response(&reply, &[stream], FieldPath::root("test")).unwrap()[0]
+            .outcome
+            .is_ok()
+    );
+    let reply = client
+        .deliver_exchange_unit_async(
+            codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
+                stream,
+                sender_count: 1,
+                sender_id: 0,
+                backend_number: 0,
+                item: ExchangeUnitItem::Unit {
+                    demand,
+                    end_after_unit: false,
+                },
+                payload: payload.clone(),
+                next_demand: None,
+            }),
+            Duration::from_secs(20),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        codec::decode_delivery_response(&reply, stream, demand.sequence, FieldPath::root("test"))
+            .unwrap(),
+        codec::DecodedExchangeDeliveryOutcome::Observed { .. }
+    ));
+    assert_eq!(
+        port.accepted.lock().unwrap().as_slice(),
+        &[(1, payload_len)]
+    );
+
+    let narrow = 64 * 1024 * 1024;
+    port.grantable.store(narrow as u64, Ordering::Relaxed);
+    let requested = payload_len as u64;
+    let reply = client
+        .register_exchange_demand_async(
+            codec::encode_demand_request(
+                &[codec::DecodedExchangeDemandEntry {
+                    stream,
+                    operation: codec::ExchangeDemandOperation::Demand(ExchangeUnitDemand {
+                        sequence: ExchangeUnitSequence::try_new(2).unwrap(),
+                        wire_bytes: requested,
+                    }),
+                }],
+                FieldPath::root("test"),
+            )
+            .unwrap(),
+            Duration::from_secs(20),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let outcome = codec::decode_demand_response(&reply, &[stream], FieldPath::root("test"))
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .outcome;
+    assert_eq!(
+        outcome.expect_err("receiver grant is smaller than the demand"),
+        ExchangeReceiptError::UnitTooLarge {
+            requested,
+            limit: narrow as u64,
+        }
+        .failure_fact()
+    );
+    server.stop().unwrap();
 }
