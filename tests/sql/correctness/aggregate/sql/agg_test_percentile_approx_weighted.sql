@@ -619,12 +619,12 @@ insert into t1_convert_to_serialize_format values(1,2,3),(4,5,6),(7,8,9);
 
 -- query 133
 USE ${case_db};
-select  percentile_approx_weighted(v2, 10, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';
+select  percentile_approx_weighted(v2, 10, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format CROSS JOIN t1_convert_to_serialize_format group by 'a';
 
 -- query 134
 USE ${case_db};
-select  percentile_approx_weighted(v2, 0, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';
+select  percentile_approx_weighted(v2, 0, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format CROSS JOIN t1_convert_to_serialize_format group by 'a';
 
 -- query 135
 USE ${case_db};
-select  percentile_approx_weighted(v2, v1, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';
+select  percentile_approx_weighted(v2, v1, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format CROSS JOIN t1_convert_to_serialize_format group by 'a';
