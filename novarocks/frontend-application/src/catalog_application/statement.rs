@@ -474,7 +474,6 @@ pub(crate) fn execute_drop_table_statement(
     current_catalog: Option<&str>,
     current_database: &str,
     if_exists: bool,
-    _force: bool,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, CommandError> {
     let target = match crate::catalog_application::resolver::resolve_existing_table_target(
@@ -1646,7 +1645,6 @@ mod drop_table_if_exists_tests {
                     None,
                     "db",
                     if_exists,
-                    false,
                     &crate::connector::test_request_context(),
                 )
                 .unwrap_err();

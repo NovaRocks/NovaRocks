@@ -314,7 +314,6 @@ fn lower_catalog_command(
         CatalogStatement::DropTable(statement) => CatalogSqlCommand::DropTable {
             name: lower_object_name(&statement.name),
             if_exists: statement.if_exists,
-            force: statement.force,
         },
         CatalogStatement::ShowCreateTable(statement) => CatalogSqlCommand::ShowCreateTable {
             name: lower_object_name(&statement.name),

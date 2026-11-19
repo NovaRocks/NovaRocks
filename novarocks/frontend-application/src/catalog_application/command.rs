@@ -264,17 +264,12 @@ impl CatalogCommandExecutor {
                 *force,
                 connector_context,
             ),
-            CatalogSqlCommand::DropTable {
-                name,
-                if_exists,
-                force,
-            } => execute_drop_table_statement(
+            CatalogSqlCommand::DropTable { name, if_exists } => execute_drop_table_statement(
                 self,
                 name,
                 current_catalog,
                 current_database,
                 *if_exists,
-                *force,
                 connector_context,
             ),
             CatalogSqlCommand::ShowCreateTable { name } => execute_show_create_table(

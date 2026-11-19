@@ -51,7 +51,6 @@ pub enum CatalogSqlCommand {
     DropTable {
         name: ObjectName,
         if_exists: bool,
-        force: bool,
     },
     ShowCreateTable {
         name: ObjectName,

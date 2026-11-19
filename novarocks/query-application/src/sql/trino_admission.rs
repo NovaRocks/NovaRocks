@@ -222,7 +222,6 @@ pub fn admit_trino_statement(
         Statement::DropTable(node) => catalog(CatalogSqlCommand::DropTable {
             name: lower_object_name(&node.table_name),
             if_exists: node.exists,
-            force: false,
         }),
         Statement::TruncateTable(node) => catalog(CatalogSqlCommand::TruncateTable {
             table: lower_object_name(&node.table_name),
@@ -587,16 +586,19 @@ mod tests {
         else {
             panic!("drop table");
         };
-        let CatalogSqlCommand::DropTable {
-            name,
-            if_exists,
-            force,
-        } = *command
+        let legacy =
+            crate::sql::parse_single_statement("DROP TABLE IF EXISTS lake.db.t FORCE").unwrap();
+        let Some(ProductSqlCommand::Catalog(legacy_command)) =
+            crate::sql::lower_product_sql_command(&legacy).unwrap()
         else {
+            panic!("legacy drop table command");
+        };
+        assert_eq!(legacy_command, command);
+        let CatalogSqlCommand::DropTable { name, if_exists } = *command else {
             panic!("exact drop table command");
         };
         assert_eq!(name.parts, ["lake", "db", "t"]);
-        assert!(if_exists && !force);
+        assert!(if_exists);
         assert!(matches!(
             admit("CREATE TABLE t (id BIGINT)").unwrap(),
             TrinoStatementAction::Prepare(TrinoStatementPreparation::CreateTable(_))
