@@ -27,18 +27,17 @@
 CREATE TABLE ${case_db}.t_analytic_session_number_gap (
     grp VARCHAR(10),
     ts INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_session_number_gap VALUES
-    ('A', 1),
-    ('A', 3),
-    ('A', 10),
-    ('A', 11),
-    ('A', 20),
-    ('B', 5),
-    ('B', 7),
-    ('B', 30);
+    ROW('A', 1),
+    ROW('A', 3),
+    ROW('A', 10),
+    ROW('A', 11),
+    ROW('A', 20),
+    ROW('B', 5),
+    ROW('B', 7),
+    ROW('B', 30);
 
 SELECT
     grp,

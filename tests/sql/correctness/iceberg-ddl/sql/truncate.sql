@@ -33,19 +33,18 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_v3 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t_v3 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 -- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
-INSERT INTO ${case_db}.t_v3 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+INSERT INTO ${case_db}.t_v3 VALUES ROW(1, 'a'), ROW(2, 'b'), ROW(3, 'c');
 
 -- query 3
 -- Sanity check: 3 rows present before TRUNCATE.
-SELECT COUNT() AS n FROM ${case_db}.t_v3;
+SELECT COUNT(*) AS n FROM ${case_db}.t_v3;
 
 -- query 4
 -- @skip_result_check=true
@@ -57,12 +56,12 @@ TRUNCATE TABLE ${case_db}.t_v3;
 
 -- query 5
 -- After TRUNCATE the table reads as empty.
-SELECT COUNT() AS n FROM ${case_db}.t_v3;
+SELECT COUNT(*) AS n FROM ${case_db}.t_v3;
 
 -- query 6
 -- @skip_result_check=true
 -- INSERT after TRUNCATE — proves the snapshot chain is healthy and schema preserved.
-INSERT INTO ${case_db}.t_v3 VALUES (10, 'after');
+INSERT INTO ${case_db}.t_v3 VALUES ROW(10, 'after');
 
 -- query 7
 -- Only the post-TRUNCATE row should be visible.
@@ -74,18 +73,17 @@ SELECT id, v FROM ${case_db}.t_v3 ORDER BY id;
 
 -- query 8
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_v2 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "2");
+CREATE TABLE ${case_db}.t_v2 (id INT, v VARCHAR(16)) WITH (format_version = 2);
 
 -- query 9
 -- @skip_result_check=true
 -- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
-INSERT INTO ${case_db}.t_v2 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+INSERT INTO ${case_db}.t_v2 VALUES ROW(1, 'x'), ROW(2, 'y'), ROW(3, 'z');
 
 -- query 10
-SELECT COUNT() AS n FROM ${case_db}.t_v2;
+SELECT COUNT(*) AS n FROM ${case_db}.t_v2;
 
 -- query 11
 -- @skip_result_check=true
@@ -95,11 +93,11 @@ SELECT COUNT() AS n FROM ${case_db}.t_v2;
 TRUNCATE TABLE ${case_db}.t_v2;
 
 -- query 12
-SELECT COUNT() AS n FROM ${case_db}.t_v2;
+SELECT COUNT(*) AS n FROM ${case_db}.t_v2;
 
 -- query 13
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_v2 VALUES (42, 'reborn');
+INSERT INTO ${case_db}.t_v2 VALUES ROW(42, 'reborn');
 
 -- query 14
 SELECT id, v FROM ${case_db}.t_v2 ORDER BY id;
@@ -110,12 +108,11 @@ SELECT id, v FROM ${case_db}.t_v2 ORDER BY id;
 
 -- query 15
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_empty (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t_empty (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 16
 -- Empty before TRUNCATE.
-SELECT COUNT() AS n FROM ${case_db}.t_empty;
+SELECT COUNT(*) AS n FROM ${case_db}.t_empty;
 
 -- query 17
 -- @skip_result_check=true
@@ -126,12 +123,12 @@ SELECT COUNT() AS n FROM ${case_db}.t_empty;
 TRUNCATE TABLE ${case_db}.t_empty;
 
 -- query 18
-SELECT COUNT() AS n FROM ${case_db}.t_empty;
+SELECT COUNT(*) AS n FROM ${case_db}.t_empty;
 
 -- query 19
 -- @skip_result_check=true
 -- INSERT after TRUNCATE-on-empty must still succeed.
-INSERT INTO ${case_db}.t_empty VALUES (1, 'first');
+INSERT INTO ${case_db}.t_empty VALUES ROW(1, 'first');
 
 -- query 20
 SELECT id, v FROM ${case_db}.t_empty ORDER BY id;
@@ -143,25 +140,24 @@ SELECT id, v FROM ${case_db}.t_empty ORDER BY id;
 -- query 21
 -- @skip_result_check=true
 -- v3 + row-lineage required for branch writes.
-CREATE TABLE ${case_db}.t_branch (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t_branch (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 22
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_branch VALUES (1, 'main_a'), (2, 'main_b');
+INSERT INTO ${case_db}.t_branch VALUES ROW(1, 'main_a'), ROW(2, 'main_b');
 
 -- query 23
 -- @skip_result_check=true
 -- ALTER TABLE for branch DDL requires 3-part name (catalog.db.table); see
 -- src/engine/iceberg_ref_flow.rs::resolve_table_parts.
-ALTER TABLE iceberg_ddl_cat_${suite_uuid0}.${case_db}.t_branch CREATE BRANCH dev;
+CREATE BRANCH dev IN TABLE iceberg_ddl_cat_${suite_uuid0}.${case_db}.t_branch;
 
 -- query 24
 -- @skip_result_check=true
 -- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
-INSERT INTO ${case_db}.t_branch.branch_dev VALUES (3, 'dev_only');
+INSERT INTO ${case_db}.t_branch @dev VALUES (3, 'dev_only');
 
 -- query 25
 -- Pre-TRUNCATE: dev sees 3 rows.
@@ -174,11 +170,11 @@ SELECT id, v FROM ${case_db}.t_branch
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- TRUNCATE only the dev branch.
-TRUNCATE TABLE ${case_db}.t_branch.branch_dev;
+DELETE FROM ${case_db}.t_branch @dev;
 
 -- query 27
 -- dev now empty.
-SELECT COUNT() AS n FROM ${case_db}.t_branch
+SELECT COUNT(*) AS n FROM ${case_db}.t_branch
   FOR VERSION AS OF 'dev';
 
 -- query 28
@@ -188,7 +184,7 @@ SELECT id, v FROM ${case_db}.t_branch
 
 -- query 29
 -- @skip_result_check=true
-ALTER TABLE iceberg_ddl_cat_${suite_uuid0}.${case_db}.t_branch DROP BRANCH IF EXISTS dev;
+DROP BRANCH IF EXISTS dev IN TABLE iceberg_ddl_cat_${suite_uuid0}.${case_db}.t_branch;
 
 -- ---------------------------------------------------------------------------
 -- Case 5: TRUNCATE after DELETE (exercises deletion-vector / position-delete entries)
@@ -196,15 +192,14 @@ ALTER TABLE iceberg_ddl_cat_${suite_uuid0}.${case_db}.t_branch DROP BRANCH IF EX
 
 -- query 30
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_dv (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t_dv (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 31
 -- @skip_result_check=true
 -- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
-INSERT INTO ${case_db}.t_dv VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+INSERT INTO ${case_db}.t_dv VALUES ROW(1, 'a'), ROW(2, 'b'), ROW(3, 'c'), ROW(4, 'd');
 
 -- query 32
 -- @skip_result_check=true
@@ -226,7 +221,7 @@ TRUNCATE TABLE ${case_db}.t_dv;
 
 -- query 35
 -- After TRUNCATE: empty.
-SELECT COUNT() AS n FROM ${case_db}.t_dv;
+SELECT COUNT(*) AS n FROM ${case_db}.t_dv;
 
 -- ---------------------------------------------------------------------------
 -- Case 6 & 7: parser-level rejection of PARTITION / WHERE clauses
@@ -234,13 +229,12 @@ SELECT COUNT() AS n FROM ${case_db}.t_dv;
 
 -- query 36
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_reject (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "2");
+CREATE TABLE ${case_db}.t_reject (id INT, v VARCHAR(16)) WITH (format_version = 2);
 
 -- query 37
--- @expect_error=PARTITION
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 TRUNCATE TABLE ${case_db}.t_reject PARTITION (id=1);
 
 -- query 38
--- @expect_error=WHERE
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 TRUNCATE TABLE ${case_db}.t_reject WHERE id = 1;

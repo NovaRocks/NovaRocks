@@ -29,15 +29,14 @@ CREATE TABLE ${case_db}.t_agg_statistic_null_window (
     no INT,
     k DECIMAL(10, 2),
     v DECIMAL(10, 2)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_statistic_null_window VALUES
-    (1, 10, NULL),
-    (2, 10, 11),
-    (2, 20, 22),
-    (2, 25, NULL),
-    (2, 30, 35);
+    ROW(1, 10, NULL),
+    ROW(2, 10, 11),
+    ROW(2, 20, 22),
+    ROW(2, 25, NULL),
+    ROW(2, 30, 35);
 SELECT
     corr(k, v) IS NULL AS corr_empty_is_null,
     covar_samp(k, v) IS NULL AS covar_samp_empty_is_null,

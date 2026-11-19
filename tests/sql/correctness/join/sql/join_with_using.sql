@@ -40,8 +40,7 @@ CREATE TABLE ${case_db}.left_table (
     id2 INT,
     salary DECIMAL(10,2),
     status VARCHAR(10)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
@@ -50,27 +49,26 @@ CREATE TABLE ${case_db}.right_table (
     id1 INT,
     bonus DECIMAL(8,2),
     id2 INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
 INSERT INTO ${case_db}.left_table VALUES
-    ('Alice', 1, 25, 'New York', 100, 5000.00, 'Active'),
-    ('Bob', 2, 30, 'Boston', 200, 6000.00, 'Active'),
-    ('Charlie', 3, 35, 'Chicago', 300, 7000.00, 'Inactive'),
-    ('David', 4, 28, 'Denver', NULL, 5500.00, 'Active'),
-    ('Eve', 5, 32, 'Seattle', 500, 6500.00, 'Active'),
-    ('Frank', 6, 40, NULL, 600, 8000.00, 'Inactive');
+    ROW('Alice', 1, 25, 'New York', 100, 5000.00, 'Active'),
+    ROW('Bob', 2, 30, 'Boston', 200, 6000.00, 'Active'),
+    ROW('Charlie', 3, 35, 'Chicago', 300, 7000.00, 'Inactive'),
+    ROW('David', 4, 28, 'Denver', NULL, 5500.00, 'Active'),
+    ROW('Eve', 5, 32, 'Seattle', 500, 6500.00, 'Active'),
+    ROW('Frank', 6, 40, NULL, 600, 8000.00, 'Inactive');
 
 -- query 6
 -- @skip_result_check=true
 INSERT INTO ${case_db}.right_table VALUES
-    ('Engineering', 1, 1000.00, 100),
-    ('Marketing', 2, 800.00, 200),
-    ('Sales', 7, 1200.00, 700),
-    ('HR', 8, 900.00, NULL),
-    ('Finance', 9, NULL, 900);
+    ROW('Engineering', 1, 1000.00, 100),
+    ROW('Marketing', 2, 800.00, 200),
+    ROW('Sales', 7, 1200.00, 700),
+    ROW('HR', 8, 900.00, NULL),
+    ROW('Finance', 9, NULL, 900);
 
 -- query 7
 -- INNER JOIN with multi-key USING
@@ -266,7 +264,7 @@ SELECT * FROM (
 -- @order_sensitive=true
 SELECT outer_query.id1, outer_query.total_count
 FROM (
-    SELECT id1, COUNT() as total_count
+    SELECT id1, COUNT(*) as total_count
     FROM ${case_db}.left_table L JOIN ${case_db}.right_table R USING(id1)
     GROUP BY id1
 ) outer_query

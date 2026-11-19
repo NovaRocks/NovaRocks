@@ -30,25 +30,22 @@ DROP TABLE IF EXISTS ${case_db}.rf_outer_dim;
 CREATE TABLE ${case_db}.rf_outer_l (
     id INT,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.rf_outer_r (
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.rf_outer_dim (
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.rf_outer_l VALUES
-    (1, 10),
-    (2, NULL),
-    (3, 30);
-INSERT INTO ${case_db}.rf_outer_r VALUES (10), (40);
-INSERT INTO ${case_db}.rf_outer_dim VALUES (10), (30), (40);
+    ROW(1, 10),
+    ROW(2, NULL),
+    ROW(3, 30);
+INSERT INTO ${case_db}.rf_outer_r VALUES ROW(10), ROW(40);
+INSERT INTO ${case_db}.rf_outer_dim VALUES ROW(10), ROW(30), ROW(40);
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (PARTITIONED, FULL OUTER
 -- @explain_not_contains=RUNTIME FILTER GRAPH
 WITH x AS (
@@ -71,7 +68,7 @@ SELECT id, k, rk
 FROM q
 ORDER BY COALESCE(id, 999999), COALESCE(k, rk);
 
-SET disable_optimizer_rules = 'RuntimeFilterPushDown';
+SET SESSION disable_optimizer_rules = 'RuntimeFilterPushDown';
 WITH x AS (
     SELECT l.id, l.k, r.k AS rk
     FROM ${case_db}.rf_outer_l l
@@ -92,4 +89,4 @@ SELECT id, k, rk
 FROM q
 ORDER BY COALESCE(id, 999999), COALESCE(k, rk);
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

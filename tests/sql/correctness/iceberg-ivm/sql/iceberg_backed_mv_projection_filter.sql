@@ -27,39 +27,18 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mv_phase4a_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE mv_phase4a_${uuid0}.ns_${uuid0};
+CREATE CATALOG mv_phase4a_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA mv_phase4a_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_phase4a_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
   v2 BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO mv_phase4a_${uuid0}.ns_${uuid0}.orders VALUES
-  (1, 10), (1, 20), (2, 40), (3, 0);
+  ROW(1, 10), ROW(1, 20), ROW(2, 40), ROW(3, 0);
 
 USE mv_phase4a_${uuid0}.ns_${uuid0};
 
-CREATE MATERIALIZED VIEW proj_mv
-DISTRIBUTED BY HASH(k1) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k1, v2 FROM orders WHERE v2 > 0;
+CREATE MATERIALIZED VIEW proj_mv AS SELECT k1, v2 FROM orders WHERE v2 > 0;
 
 -- query 2
 -- @skip_result_check=true
@@ -71,7 +50,7 @@ SELECT k1, v2 FROM proj_mv ORDER BY k1, v2;
 -- query 4
 -- @skip_result_check=true
 INSERT INTO mv_phase4a_${uuid0}.ns_${uuid0}.orders VALUES
-  (1, 70), (4, 5);
+  ROW(1, 70), ROW(4, 5);
 
 -- query 5
 -- @skip_result_check=true
@@ -89,6 +68,6 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mv_p
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW proj_mv;
-DROP TABLE mv_phase4a_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE mv_phase4a_${uuid0}.ns_${uuid0};
+DROP TABLE mv_phase4a_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA mv_phase4a_${uuid0}.ns_${uuid0};
 DROP CATALOG mv_phase4a_${uuid0};

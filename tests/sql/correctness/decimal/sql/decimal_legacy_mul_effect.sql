@@ -21,17 +21,17 @@
 
 -- query 1
 -- @skip_result_check=true
-SET sql_mode='32';
-SET decimal_overflow_to_double=false;
-CREATE TABLE ${case_db}.legacy_mul_effect (k INT,a DECIMAL(38,0)) TBLPROPERTIES ("format-version"="3");
-INSERT INTO ${case_db}.legacy_mul_effect VALUES (1,1),(2,CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))),(3,NULL);
+SET SESSION sql_mode = '32';
+SET SESSION decimal_overflow_to_double = false;
+CREATE TABLE ${case_db}.legacy_mul_effect (k INT,a DECIMAL(38,0)) WITH (format_version = 3);
+INSERT INTO ${case_db}.legacy_mul_effect VALUES ROW(1,1),ROW(2,CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))),ROW(3,NULL);
 
 -- query 2
 SELECT k,CAST(a*2 AS VARCHAR) AS v FROM ${case_db}.legacy_mul_effect ORDER BY k;
 
 -- query 3
 -- @skip_result_check=true
-SET sql_mode='ALLOW_THROW_EXCEPTION';
+SET SESSION sql_mode = 'ALLOW_THROW_EXCEPTION';
 
 -- query 4
 -- @skip_result_check=true
@@ -73,5 +73,5 @@ SELECT k FROM (SELECT k,CAST(a AS DECIMAL(76,0)) AS safe_widening FROM ${case_db
 
 -- query 10
 -- @skip_result_check=true
-SET sql_mode='32';
+SET SESSION sql_mode = '32';
 DROP TABLE ${case_db}.legacy_mul_effect;

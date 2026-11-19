@@ -22,15 +22,14 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS lake_publication_${suite_uuid0}.ns_${uuid0} FORCE;
-CREATE DATABASE lake_publication_${suite_uuid0}.ns_${uuid0};
+DROP SCHEMA IF EXISTS lake_publication_${suite_uuid0}.ns_${uuid0} CASCADE;
+CREATE SCHEMA lake_publication_${suite_uuid0}.ns_${uuid0};
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows (
   id INT,
   value VARCHAR(16)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows VALUES
-  (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+  ROW(1, 'alpha'), ROW(2, 'beta'), ROW(3, 'gamma');
 
 -- query 2
 -- The proxy answers the stage with HTTP 400 without forwarding it. A 400 is
@@ -41,8 +40,7 @@ INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows VALUES
 -- @publication_catalog_fault=stage-create,before-dispatch
 -- @expect_sql_code=query.execution.dependency
 -- @expect_error=disposition=KnownUncommitted
-CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch AS
-  SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
+CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch AS SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
 -- query 3
 -- The proxy rejects the stage with HTTP 403 without forwarding it. A 403 is a
@@ -51,8 +49,7 @@ CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch AS
 -- @publication_catalog_fault=stage-create,before-dispatch-forbidden
 -- @expect_sql_code=query.execution.dependency
 -- @expect_error=disposition=KnownUncommitted
-CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch_forbidden AS
-  SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
+CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch_forbidden AS SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
 -- query 4
 -- The single standard NotExist table commit succeeded at the Catalog but its
@@ -62,8 +59,7 @@ CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch_forbidd
 -- @publication_catalog_fault=table-commit,after-commit-before-response
 -- @skip_result_check=true
 -- @restart_fe_after_step=true
-CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.response_lost AS
-  SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
+CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.response_lost AS SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
 -- query 5
 -- The table commit has succeeded in the real Catalog, but the proxy keeps its
@@ -72,8 +68,7 @@ CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.response_lost AS
 -- recovery/replay owner.
 -- @publication_catalog_fault=table-commit,after-commit-hold-for-frontend-kill
 -- @skip_result_check=true
-CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.inflight_fe_kill AS
-  SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
+CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.inflight_fe_kill AS SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
 -- query 6
 -- The external-state observation is the authority, not the prior error text.
@@ -86,12 +81,10 @@ SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.inflight_fe_ki
 -- restart must not resume a completed CTAS as a second Catalog mutation.
 -- @skip_result_check=true
 -- @restart_fe_after_step=true
-CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success
-TBLPROPERTIES ('write.row-lineage'='false') AS
-  SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
+CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success WITH (extra_properties = MAP(ARRAY['write.row-lineage'], ARRAY['false'])) AS SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
 -- query 8
-SELECT COUNT() AS n, COUNT(_row_id) AS assigned_ids,
+SELECT COUNT(*) AS n, COUNT(_row_id) AS assigned_ids,
        COUNT(_last_updated_sequence_number) AS assigned_sequences
   FROM lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success;
 
@@ -103,13 +96,9 @@ SELECT COUNT() AS n, COUNT(_row_id) AS assigned_ids,
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutation (
   id BIGINT,
   k BIGINT
-)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "novarocks.statistics.collect-on-write" = "true"
-);
+) WITH (format_version = 3, statistics_collect_on_write = true);
 INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutation VALUES
-  (1, 10), (2, 20);
+  ROW(1, 10), ROW(2, 20);
 
 -- query 10
 -- The proxy stops this commit before dispatch. Spark then commits DELETE(1)
@@ -199,4 +188,4 @@ printf '%s\n' "$spark_out" | tr '\r' '\n' | grep -Fx 'CTAS_FORMAT_LINEAGE_PROPER
 -- query 14
 -- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE lake_publication_${suite_uuid0}.ns_${uuid0} FORCE;
+DROP SCHEMA lake_publication_${suite_uuid0}.ns_${uuid0} CASCADE;

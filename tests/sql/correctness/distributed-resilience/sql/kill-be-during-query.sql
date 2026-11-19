@@ -41,14 +41,13 @@
 CREATE TABLE ${case_db}.resilience_series (
   id BIGINT,
   delay_s BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.resilience_series
-VALUES (1, 1);
+VALUES ROW(1, 1);
 INSERT INTO ${case_db}.resilience_series
-VALUES (2, 1);
+VALUES ROW(2, 1);
 INSERT INTO ${case_db}.resilience_series
-VALUES (3, 1);
+VALUES ROW(3, 1);
 
 -- query 2
 -- @kill_be_after_be_log_contains=1,NOVAROCKS_TASK_CREATE_APPLIED
@@ -62,7 +61,7 @@ VALUES (3, 1);
 -- The completed result after one participant disappears proves the successor
 -- was activated without requiring the unreachable Worker to report a stop.
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,2
-SELECT COUNT()
+SELECT COUNT(*)
 FROM ${case_db}.resilience_series
 WHERE sleep(delay_s);
 

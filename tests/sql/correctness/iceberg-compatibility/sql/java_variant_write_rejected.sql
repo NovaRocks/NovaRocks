@@ -31,7 +31,7 @@ grep -E '^IRU9_(SHREDDED_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 -- query 2
 -- @expect_error_tier=drift
 -- @expect_error=Iceberg Variant writes are not supported
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} VALUES (9,parse_json('1'));
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} VALUES ROW(9,parse_json('1'));
 
 -- query 3
 -- @expect_error_tier=drift
@@ -46,29 +46,26 @@ MERGE INTO iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid
 -- query 5
 -- OPTIMIZE reports the provider schema refusal within the statement.
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} OPTIMIZE;
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} EXECUTE optimize;
 
 -- query 6
 -- @expect_error_tier=drift
 -- @expect_error=Iceberg Variant writes are not supported
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ADD FILES FROM 's3://warehouse/iru9-does-not-exist-${uuid0}';
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} EXECUTE add_files(location => 's3://warehouse/iru9-does-not-exist-${uuid0}');
 
 -- query 7
 -- The ordinary id column has no Variant semantics. REST staging admission
 -- must still reject this property before probing or staging the target.
 -- @expect_error_tier=drift
 -- @expect_error=write.parquet.variant-shredding.
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_shredding_ctas_rejected_${uuid0}
-TBLPROPERTIES ('write.parquet.variant-shredding.payload' = 'a:int') AS SELECT 1 AS id;
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_shredding_ctas_rejected_${uuid0} WITH (extra_properties = MAP(ARRAY['write.parquet.variant-shredding.payload'], ARRAY['a:int'])) AS SELECT 1 AS id;
 
 -- query 8
 -- REST staged creation must refuse the actual logical Variant result type
 -- obtained from the external Java table before staging a new target.
 -- @expect_error_tier=drift
 -- @expect_error=Iceberg Variant writes are not supported
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_ctas_rejected_${uuid0}
-TBLPROPERTIES ('format-version' = '3') AS
-SELECT id,v FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0};
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_ctas_rejected_${uuid0} WITH (format_version = 3) AS SELECT id,v FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0};
 
 -- query 9
 -- @result_contains=IRU9_UNCHANGED_OK
@@ -82,7 +79,7 @@ receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 -- LIKE keeps the external logical declaration and refuses its new target.
 -- @expect_error_tier=drift
 -- @expect_error=Iceberg Variant writes are not supported yet: table iceberg_compat_${suite_uuid0}.${case_db}.java_variant_like_rejected_${uuid0}, column v
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_like_rejected_${uuid0} LIKE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0};
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_like_rejected_${uuid0} (LIKE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0});
 
 -- query 11
 -- @expect_error_tier=drift
@@ -92,12 +89,12 @@ ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uui
 -- query 12
 -- @expect_error_tier=drift
 -- @expect_error=Iceberg Variant writes are not supported yet: table iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0}, column extra_struct.v
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ADD COLUMN extra_struct STRUCT<v VARIANT>;
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ADD COLUMN extra_struct ROW(v VARIANT);
 
 -- query 13
 -- @expect_error_tier=drift
 -- @expect_error=unsupported Iceberg type evolution from int to variant
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} MODIFY COLUMN id VARIANT;
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ALTER COLUMN id SET DATA TYPE VARIANT;
 
 -- query 14
 -- Default-format CTAS refuses the same logical Variant as explicit-v3 query9.
@@ -110,9 +107,9 @@ CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_default_ctas_
 -- @skip_result_check=true
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ADD COLUMN note_text STRING;
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} RENAME COLUMN note_text TO note_renamed;
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ALTER COLUMN note_renamed COMMENT 'ordinary metadata remains supported';
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ALTER COLUMN v COMMENT 'external Variant remains readable';
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} MODIFY COLUMN v VARIANT;
+COMMENT ON COLUMN iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0}.note_renamed IS 'ordinary metadata remains supported';
+COMMENT ON COLUMN iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0}.v IS 'external Variant remains readable';
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ALTER COLUMN v SET DATA TYPE VARIANT;
 
 -- query 16
 SELECT id,note_renamed FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ORDER BY id;
@@ -120,8 +117,8 @@ SELECT id,note_renamed FROM iceberg_compat_${suite_uuid0}.${case_db}.java_varian
 -- query 17
 -- @skip_result_check=true
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} DROP COLUMN note_renamed;
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} SET ('iru9.metadata-control' = 'allowed');
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} UNSET TBLPROPERTIES ('iru9.metadata-control');
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} SET PROPERTIES extra_properties = MAP(ARRAY['iru9.metadata-control'], ARRAY['allowed']);
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} EXECUTE unset_extra_properties(keys => ARRAY['iru9.metadata-control'], if_exists => false);
 
 -- query 18
 -- @result_contains=IRU9_UNCHANGED_OK
@@ -133,4 +130,4 @@ receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 
 -- query 19
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ;

@@ -27,21 +27,24 @@
 CREATE TABLE ${case_db}.t_agg_group_concat_distinct_all_null_group (
     g INT,
     s STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_group_concat_distinct_all_null_group VALUES
-    (1, NULL),
-    (1, NULL),
-    (2, 'a'),
-    (2, 'c'),
-    (2, 'a'),
-    (2, NULL),
-    (2, 'b');
+    ROW(1, NULL),
+    ROW(1, NULL),
+    ROW(2, 'a'),
+    ROW(2, 'c'),
+    ROW(2, 'a'),
+    ROW(2, NULL),
+    ROW(2, 'b');
 
 SELECT
     g,
-    group_concat(DISTINCT s ORDER BY s DESC SEPARATOR '|') AS gc
+    string_agg(DISTINCT s
+,
+ '|'
+ORDER BY s DESC
+) AS gc
 FROM ${case_db}.t_agg_group_concat_distinct_all_null_group
 GROUP BY g
 ORDER BY g;

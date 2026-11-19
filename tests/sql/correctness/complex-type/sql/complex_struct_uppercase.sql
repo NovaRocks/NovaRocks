@@ -24,10 +24,9 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.struct_upper_case
     (c1 int,
-    c2 struct<c2_sub1 int, C2_SUB2 int>)
-TBLPROPERTIES ("format-version" = "3");
+    c2 ROW(c2_sub1 int, C2_SUB2 int)) WITH (format_version = 3);
 
-insert into ${case_db}.struct_upper_case values (1, named_struct('c2_sub1', 1, 'c2_sub2', 1)), (2, named_struct('C2_SUB1', 2, 'C2_SUB2', 2));
+insert into ${case_db}.struct_upper_case values ROW(1, named_struct('c2_sub1', 1, 'c2_sub2', 1)), ROW(2, named_struct('C2_SUB1', 2, 'C2_SUB2', 2));
 
 -- query 2
 -- Access uppercase field C2_SUB2 via uppercase alias C2

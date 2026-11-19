@@ -28,13 +28,12 @@ CREATE TABLE ${case_db}.t_agg_map_agg_extract (
     g INT,
     k VARCHAR(10),
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_map_agg_extract VALUES
-    (1, 'a', 10),
-    (1, 'b', 20),
-    (2, 'a', 30);
+    ROW(1, 'a', 10),
+    ROW(1, 'b', 20),
+    ROW(2, 'a', 30);
 
 SELECT
     g,

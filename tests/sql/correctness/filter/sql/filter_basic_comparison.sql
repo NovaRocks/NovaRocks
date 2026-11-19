@@ -29,13 +29,12 @@ CREATE TABLE ${case_db}.t_filter_basic_comparison (
   id INT,
   v INT,
   name STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_filter_basic_comparison VALUES
-  (1, 10, 'a'),
-  (2, 20, 'b'),
-  (3, NULL, 'c'),
-  (4, 30, NULL);
+  ROW(1, 10, 'a'),
+  ROW(2, 20, 'b'),
+  ROW(3, NULL, 'c'),
+  ROW(4, 30, NULL);
 -- @explain_contains=stats={rows=
 -- @explain_contains=SCAN
 SELECT id, v, name

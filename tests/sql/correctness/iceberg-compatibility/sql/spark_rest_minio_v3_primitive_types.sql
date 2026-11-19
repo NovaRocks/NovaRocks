@@ -54,7 +54,7 @@ SPARK_SQL
 printf 'SPARK_SQL_OK\n'
 
 -- query 2
-SELECT COUNT() AS rows_total,
+SELECT COUNT(*) AS rows_total,
        COUNT(c_bool) AS bool_nonnull,
        SUM(CASE WHEN c_bool THEN 1 ELSE 0 END) AS bool_true,
        SUM(c_int) AS sum_int,
@@ -66,4 +66,4 @@ SELECT COUNT() AS rows_total,
 FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_types_${uuid0};
 
 -- query 3
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_types_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_types_${uuid0} ;

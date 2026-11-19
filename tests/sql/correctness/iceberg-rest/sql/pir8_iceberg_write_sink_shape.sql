@@ -24,7 +24,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.pir8_sink_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.pir8_sink_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -32,16 +32,14 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.pir8_sink_db_${uuid0}.t_sink_${uuid0} (
   id INT,
   region STRING,
   amount INT
-)
-PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (partitioning = ARRAY['region'], format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO iceberg_rest_${suite_uuid0}.pir8_sink_db_${uuid0}.t_sink_${uuid0}
 VALUES
-  (1, 'east', 10),
-  (2, 'west', 20);
+  ROW(1, 'east', 10),
+  ROW(2, 'west', 20);
 
 -- query 4
 -- @skip_result_check=true
@@ -61,4 +59,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.pir8_sink_db_${uuid0}.t_sink_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.pir8_sink_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.pir8_sink_db_${uuid0};

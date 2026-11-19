@@ -31,205 +31,117 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.row_util_base (
-  k1 BIGINT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 BIGINT
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.row_util_base SELECT generate_series FROM TABLE(generate_series(0, 5000 - 1));
 INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 10000
 INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 20000
 
 CREATE TABLE ${case_db}.row_util (
-  idx BIGINT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  idx BIGINT
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.row_util SELECT row_number() over() AS idx FROM ${case_db}.row_util_base;
 
 -- Main test tables
 CREATE TABLE ${case_db}.t1 (
-  k1 BIGINT NULL,
-  c_bool_1_null BOOLEAN NULL,
+  k1 BIGINT ,
+  c_bool_1_null BOOLEAN ,
   c_bool_2_notnull BOOLEAN NOT NULL,
-  c_tinyint_1_null TINYINT NULL,
+  c_tinyint_1_null TINYINT ,
   c_tinyint_2_notnull TINYINT NOT NULL,
-  c_smallint_1_null SMALLINT NULL,
+  c_smallint_1_null SMALLINT ,
   c_smallint_2_notnull SMALLINT NOT NULL,
-  c_int_1_null INT NULL,
+  c_int_1_null INT ,
   c_int_2_notnull INT NOT NULL,
-  c_bigint_1_null BIGINT NULL,
+  c_bigint_1_null BIGINT ,
   c_bigint_2_notnull BIGINT NOT NULL,
-  c_date_1_null DATE NULL,
-  c_date_2_notnull DATE NULL,
-  c_decimal64_1_null DECIMAL(18) NULL,
+  c_date_1_null DATE ,
+  c_date_2_notnull DATE ,
+  c_decimal64_1_null DECIMAL(18) ,
   c_decimal64_2_notnull DECIMAL(18) NOT NULL,
-  c_str_1_null STRING NULL,
+  c_str_1_null STRING ,
   c_str_2_notnull STRING NOT NULL,
-  c_str_3_low_null STRING NULL,
+  c_str_3_low_null STRING ,
   c_str_4_low_notnull STRING NOT NULL,
-  c_datetime_1_seq DATETIME NULL,
+  c_datetime_1_seq DATETIME ,
   c_datetime_2_seq DATETIME NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- t2: small value interval, triggers bitset filter
 CREATE TABLE ${case_db}.t2 (
-  k1 BIGINT NULL,
-  c_bool_1_null BOOLEAN NULL,
+  k1 BIGINT ,
+  c_bool_1_null BOOLEAN ,
   c_bool_2_notnull BOOLEAN NOT NULL,
-  c_tinyint_1_null TINYINT NULL,
+  c_tinyint_1_null TINYINT ,
   c_tinyint_2_notnull TINYINT NOT NULL,
-  c_smallint_1_null SMALLINT NULL,
+  c_smallint_1_null SMALLINT ,
   c_smallint_2_notnull SMALLINT NOT NULL,
-  c_int_1_null INT NULL,
+  c_int_1_null INT ,
   c_int_2_notnull INT NOT NULL,
-  c_bigint_1_null BIGINT NULL,
+  c_bigint_1_null BIGINT ,
   c_bigint_2_notnull BIGINT NOT NULL,
-  c_date_1_null DATE NULL,
-  c_date_2_notnull DATE NULL,
-  c_decimal64_1_null DECIMAL(18) NULL,
+  c_date_1_null DATE ,
+  c_date_2_notnull DATE ,
+  c_decimal64_1_null DECIMAL(18) ,
   c_decimal64_2_notnull DECIMAL(18) NOT NULL,
-  c_str_1_null STRING NULL,
+  c_str_1_null STRING ,
   c_str_2_notnull STRING NOT NULL,
-  c_str_3_low_null STRING NULL,
+  c_str_3_low_null STRING ,
   c_str_4_low_notnull STRING NOT NULL,
-  c_datetime_1_seq DATETIME NULL,
+  c_datetime_1_seq DATETIME ,
   c_datetime_2_seq DATETIME NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- t3: large value interval, should NOT trigger bitset filter
 CREATE TABLE ${case_db}.t3 (
-  k1 BIGINT NULL,
-  c_bool_1_null BOOLEAN NULL,
+  k1 BIGINT ,
+  c_bool_1_null BOOLEAN ,
   c_bool_2_notnull BOOLEAN NOT NULL,
-  c_tinyint_1_null TINYINT NULL,
+  c_tinyint_1_null TINYINT ,
   c_tinyint_2_notnull TINYINT NOT NULL,
-  c_smallint_1_null SMALLINT NULL,
+  c_smallint_1_null SMALLINT ,
   c_smallint_2_notnull SMALLINT NOT NULL,
-  c_int_1_null INT NULL,
+  c_int_1_null INT ,
   c_int_2_notnull INT NOT NULL,
-  c_bigint_1_null BIGINT NULL,
+  c_bigint_1_null BIGINT ,
   c_bigint_2_notnull BIGINT NOT NULL,
-  c_date_1_null DATE NULL,
-  c_date_2_notnull DATE NULL,
-  c_decimal64_1_null DECIMAL(18) NULL,
+  c_date_1_null DATE ,
+  c_date_2_notnull DATE ,
+  c_decimal64_1_null DECIMAL(18) ,
   c_decimal64_2_notnull DECIMAL(18) NOT NULL,
-  c_str_1_null STRING NULL,
+  c_str_1_null STRING ,
   c_str_2_notnull STRING NOT NULL,
-  c_str_3_low_null STRING NULL,
+  c_str_3_low_null STRING ,
   c_str_4_low_notnull STRING NOT NULL,
-  c_datetime_1_seq DATETIME NULL,
+  c_datetime_1_seq DATETIME ,
   c_datetime_2_seq DATETIME NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- Insert t2: small value interval (idx % N for bounded values)
 INSERT INTO ${case_db}.t2
-SELECT
-    idx,
-    idx % 2 = 0, idx % 2 = 0,
-    idx % 128, idx % 128,
-    idx % 32768, idx % 32768,
-    idx % 2147483648, idx % 2147483648,
-    idx, idx,
-    cast(days_add('2023-01-01', idx) as date),
-    cast(days_add('2023-01-01', idx) as date),
-    idx, idx,
-    concat('str-abc-', idx), concat('str-abc-', idx),
-    concat('str-abc-', idx % 256), concat('str-abc-', idx % 256),
-    cast(seconds_add('2023-01-01', idx) as datetime),
-    cast(seconds_add('2023-01-01', idx) as datetime)
-FROM ${case_db}.row_util
-ORDER BY idx LIMIT 500;
+SELECT idx, ((idx % 2) = 0), ((idx % 2) = 0), (idx % 128), (idx % 128), (idx % 32768), (idx % 32768), (idx % 2147483648), (idx % 2147483648), idx, idx, CAST(days_add('2023-01-01', idx) AS date), CAST(days_add('2023-01-01', idx) AS date), idx, idx, concat('str-abc-', idx), concat('str-abc-', idx), concat('str-abc-', (idx % 256)), concat('str-abc-', (idx % 256)), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC LIMIT 500;
 
 -- Insert t2 rows with some NULLs
 INSERT INTO ${case_db}.t2
-SELECT
-    idx,
-    NULL, idx % 2 = 0,
-    NULL, idx % 128,
-    NULL, idx % 32768,
-    NULL, idx % 2147483648,
-    NULL, idx,
-    NULL, cast(days_add('2023-01-01', idx) as date),
-    NULL, idx,
-    NULL, concat('str-abc-', idx),
-    NULL, concat('str-abc-', idx % 256),
-    NULL, cast(seconds_add('2023-01-01', idx) as datetime)
-FROM ${case_db}.row_util
-ORDER BY idx LIMIT 500, 50;
+SELECT idx, NULL, ((idx % 2) = 0), NULL, (idx % 128), NULL, (idx % 32768), NULL, (idx % 2147483648), NULL, idx, NULL, CAST(days_add('2023-01-01', idx) AS date), NULL, idx, NULL, concat('str-abc-', idx), NULL, concat('str-abc-', (idx % 256)), NULL, CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC OFFSET 500 ROWS LIMIT 50;
 
 -- Insert t3: large value interval (idx * 370 for spread values)
 INSERT INTO ${case_db}.t3
-SELECT
-    idx,
-    idx % 2 = 0, idx % 2 = 0,
-    idx % 128, idx % 128,
-    idx % 32768, idx % 32768,
-    idx * 370 % 2147483648, idx * 370 % 2147483648,
-    idx * 370, idx * 370,
-    cast(days_add('2023-01-01', idx * 370) as date),
-    cast(days_add('2023-01-01', idx * 370) as date),
-    idx * 370, idx * 370,
-    concat('str-abc-', idx), concat('str-abc-', idx),
-    concat('str-abc-', idx % 256), concat('str-abc-', idx % 256),
-    cast(seconds_add('2023-01-01', idx) as datetime),
-    cast(seconds_add('2023-01-01', idx) as datetime)
-FROM ${case_db}.row_util
-ORDER BY idx LIMIT 500;
+SELECT idx, ((idx % 2) = 0), ((idx % 2) = 0), (idx % 128), (idx % 128), (idx % 32768), (idx % 32768), ((idx * 370) % 2147483648), ((idx * 370) % 2147483648), (idx * 370), (idx * 370), CAST(days_add('2023-01-01', (idx * 370)) AS date), CAST(days_add('2023-01-01', (idx * 370)) AS date), (idx * 370), (idx * 370), concat('str-abc-', idx), concat('str-abc-', idx), concat('str-abc-', (idx % 256)), concat('str-abc-', (idx % 256)), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC LIMIT 500;
 
 -- Insert t3 rows with some NULLs
 INSERT INTO ${case_db}.t3
-SELECT
-    idx,
-    NULL, idx % 2 = 0,
-    NULL, idx % 128,
-    NULL, idx % 32768,
-    NULL, idx * 370 % 2147483648,
-    NULL, idx * 370,
-    NULL, cast(days_add('2023-01-01', idx * 370) as date),
-    NULL, idx * 370,
-    NULL, concat('str-abc-', idx),
-    NULL, concat('str-abc-', idx % 256),
-    NULL, cast(seconds_add('2023-01-01', idx) as datetime)
-FROM ${case_db}.row_util
-ORDER BY idx LIMIT 500, 50;
+SELECT idx, NULL, ((idx % 2) = 0), NULL, (idx % 128), NULL, (idx % 32768), NULL, ((idx * 370) % 2147483648), NULL, (idx * 370), NULL, CAST(days_add('2023-01-01', (idx * 370)) AS date), NULL, (idx * 370), NULL, concat('str-abc-', idx), NULL, concat('str-abc-', (idx % 256)), NULL, CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC OFFSET 500 ROWS LIMIT 50;
 
 -- Insert t1: all rows from row_util (1.28M rows non-null)
 INSERT INTO ${case_db}.t1
-SELECT
-    idx,
-    idx % 2 = 0, idx % 2 = 0,
-    idx % 128, idx % 128,
-    idx % 32768, idx % 32768,
-    idx % 2147483648, idx % 2147483648,
-    idx, idx,
-    cast(days_add('2023-01-01', idx) as date),
-    cast(days_add('2023-01-01', idx) as date),
-    idx, idx,
-    concat('str-abc-', idx), concat('str-abc-', idx),
-    concat('str-abc-', idx % 256), concat('str-abc-', idx % 256),
-    cast(seconds_add('2023-01-01', idx) as datetime),
-    cast(seconds_add('2023-01-01', idx) as datetime)
-FROM ${case_db}.row_util;
+SELECT idx, ((idx % 2) = 0), ((idx % 2) = 0), (idx % 128), (idx % 128), (idx % 32768), (idx % 32768), (idx % 2147483648), (idx % 2147483648), idx, idx, CAST(days_add('2023-01-01', idx) AS date), CAST(days_add('2023-01-01', idx) AS date), idx, idx, concat('str-abc-', idx), concat('str-abc-', idx), concat('str-abc-', (idx % 256)), concat('str-abc-', (idx % 256)), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util;
 
 -- Insert t1 rows with some NULLs
 INSERT INTO ${case_db}.t1
-SELECT
-    idx,
-    NULL, idx % 2 = 0,
-    NULL, idx % 128,
-    NULL, idx % 32768,
-    NULL, idx % 2147483648,
-    NULL, idx,
-    NULL, cast(days_add('2023-01-01', idx) as date),
-    NULL, idx,
-    NULL, concat('str-abc-', idx),
-    NULL, concat('str-abc-', idx % 256),
-    NULL, cast(seconds_add('2023-01-01', idx) as datetime)
-FROM ${case_db}.row_util
-ORDER BY idx LIMIT 5000, 500;
+SELECT idx, NULL, ((idx % 2) = 0), NULL, (idx % 128), NULL, (idx % 32768), NULL, (idx % 2147483648), NULL, idx, NULL, CAST(days_add('2023-01-01', idx) AS date), NULL, idx, NULL, concat('str-abc-', idx), NULL, concat('str-abc-', (idx % 256)), NULL, CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC OFFSET 5000 ROWS LIMIT 500;
 
 -- ===========================================================================
 -- Section 1: type coverage - broadcast join with small build side (limit 10)
@@ -287,50 +199,50 @@ select count(1) from ${case_db}.t1 join  ${case_db}.t2 using(c_datetime_2_seq);
 -- ===========================================================================
 -- query 22
 with w1 as (select * from ${case_db}.t2 order by k1 limit 10)
-select count(1) from ${case_db}.t1 join  w1 on t1.c_bool_1_null <=> w1.c_bool_1_null;
+select count(1) from ${case_db}.t1 join  w1 on t1.c_bool_1_null  IS NOT DISTINCT FROM  w1.c_bool_1_null;
 -- query 23
 with w1 as (select * from ${case_db}.t2 order by k1 limit 10)
-select count(1) from ${case_db}.t1 join  w1 on t1.c_bool_2_notnull <=> w1.c_bool_2_notnull;
+select count(1) from ${case_db}.t1 join  w1 on t1.c_bool_2_notnull  IS NOT DISTINCT FROM  w1.c_bool_2_notnull;
 -- query 24
 with w1 as (select * from ${case_db}.t2 order by k1 limit 10)
-select count(1) from ${case_db}.t1 join  w1 on t1.c_tinyint_1_null <=> w1.c_tinyint_1_null;
+select count(1) from ${case_db}.t1 join  w1 on t1.c_tinyint_1_null  IS NOT DISTINCT FROM  w1.c_tinyint_1_null;
 -- query 25
 with w1 as (select * from ${case_db}.t2 order by k1 limit 10)
-select count(1) from ${case_db}.t1 join  w1 on t1.c_tinyint_2_notnull <=> w1.c_tinyint_2_notnull;
+select count(1) from ${case_db}.t1 join  w1 on t1.c_tinyint_2_notnull  IS NOT DISTINCT FROM  w1.c_tinyint_2_notnull;
 -- query 26
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_smallint_1_null <=> t2.c_smallint_1_null;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_smallint_1_null  IS NOT DISTINCT FROM  t2.c_smallint_1_null;
 -- query 27
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_smallint_2_notnull <=> t2.c_smallint_2_notnull;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_smallint_2_notnull  IS NOT DISTINCT FROM  t2.c_smallint_2_notnull;
 -- query 28
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_int_1_null <=> t2.c_int_1_null;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_int_1_null  IS NOT DISTINCT FROM  t2.c_int_1_null;
 -- query 29
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_int_2_notnull <=> t2.c_int_2_notnull;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_int_2_notnull  IS NOT DISTINCT FROM  t2.c_int_2_notnull;
 -- query 30
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_bigint_1_null <=> t2.c_bigint_1_null;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_bigint_1_null  IS NOT DISTINCT FROM  t2.c_bigint_1_null;
 -- query 31
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_bigint_2_notnull <=> t2.c_bigint_2_notnull;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_bigint_2_notnull  IS NOT DISTINCT FROM  t2.c_bigint_2_notnull;
 -- query 32
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_date_1_null <=> t2.c_date_1_null;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_date_1_null  IS NOT DISTINCT FROM  t2.c_date_1_null;
 -- query 33
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_date_2_notnull <=> t2.c_date_2_notnull;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_date_2_notnull  IS NOT DISTINCT FROM  t2.c_date_2_notnull;
 -- query 34
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_decimal64_1_null <=> t2.c_decimal64_1_null;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_decimal64_1_null  IS NOT DISTINCT FROM  t2.c_decimal64_1_null;
 -- query 35
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_decimal64_2_notnull <=> t2.c_decimal64_2_notnull;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_decimal64_2_notnull  IS NOT DISTINCT FROM  t2.c_decimal64_2_notnull;
 -- query 36
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_str_1_null <=> t2.c_str_1_null;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_str_1_null  IS NOT DISTINCT FROM  t2.c_str_1_null;
 -- query 37
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_str_2_notnull <=> t2.c_str_2_notnull;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_str_2_notnull  IS NOT DISTINCT FROM  t2.c_str_2_notnull;
 -- query 38
 with w1 as (select * from ${case_db}.t2 order by k1 limit 10)
-select count(1) from ${case_db}.t1 join  w1 on t1.c_str_3_low_null <=> w1.c_str_3_low_null;
+select count(1) from ${case_db}.t1 join  w1 on t1.c_str_3_low_null  IS NOT DISTINCT FROM  w1.c_str_3_low_null;
 -- query 39
 with w1 as (select * from ${case_db}.t2 order by k1 limit 10)
-select count(1) from ${case_db}.t1 join  w1 on t1.c_str_4_low_notnull <=> w1.c_str_4_low_notnull;
+select count(1) from ${case_db}.t1 join  w1 on t1.c_str_4_low_notnull  IS NOT DISTINCT FROM  w1.c_str_4_low_notnull;
 -- query 40
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_datetime_1_seq <=> t2.c_datetime_1_seq;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_datetime_1_seq  IS NOT DISTINCT FROM  t2.c_datetime_1_seq;
 -- query 41
-select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_datetime_2_seq <=> t2.c_datetime_2_seq;
+select count(1) from ${case_db}.t1 join  ${case_db}.t2 on t1.c_datetime_2_seq  IS NOT DISTINCT FROM  t2.c_datetime_2_seq;
 
 -- ===========================================================================
 -- Section 3: left scan and broadcast join cross exchange (distinct before join)

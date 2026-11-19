@@ -22,22 +22,19 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.lineage_absent_${uuid0} (id BIGINT, v STRING)
-TBLPROPERTIES ('format-version'='3', 'novarocks.update.mode'='merge-on-read');
-CREATE TABLE ${case_db}.lineage_false_${uuid0} (id BIGINT, v STRING)
-TBLPROPERTIES ('format-version'='3', 'write.row-lineage'='false', 'novarocks.update.mode'='merge-on-read');
-INSERT INTO ${case_db}.lineage_absent_${uuid0} VALUES (1,'a'),(2,'b');
-INSERT INTO ${case_db}.lineage_false_${uuid0} VALUES (1,'a'),(2,'b');
-CREATE TABLE ${case_db}.lineage_source_${uuid0} (id BIGINT, v STRING)
-TBLPROPERTIES ('format-version'='3');
-INSERT INTO ${case_db}.lineage_source_${uuid0} VALUES (2,'bb'),(3,'c');
+CREATE TABLE ${case_db}.lineage_absent_${uuid0} (id BIGINT, v STRING) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
+CREATE TABLE ${case_db}.lineage_false_${uuid0} (id BIGINT, v STRING) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['false', 'merge-on-read']));
+INSERT INTO ${case_db}.lineage_absent_${uuid0} VALUES ROW(1,'a'),ROW(2,'b');
+INSERT INTO ${case_db}.lineage_false_${uuid0} VALUES ROW(1,'a'),ROW(2,'b');
+CREATE TABLE ${case_db}.lineage_source_${uuid0} (id BIGINT, v STRING) WITH (format_version = 3);
+INSERT INTO ${case_db}.lineage_source_${uuid0} VALUES ROW(2,'bb'),ROW(3,'c');
 
 -- query 2
-SELECT 'absent' AS property_value, COUNT() AS total_rows, COUNT(_row_id) AS assigned_ids,
+SELECT 'absent' AS property_value, COUNT(*) AS total_rows, COUNT(_row_id) AS assigned_ids,
        COUNT(_last_updated_sequence_number) AS assigned_sequences
 FROM ${case_db}.lineage_absent_${uuid0}
 UNION ALL
-SELECT 'false', COUNT(), COUNT(_row_id), COUNT(_last_updated_sequence_number)
+SELECT 'false', COUNT(*), COUNT(_row_id), COUNT(_last_updated_sequence_number)
 FROM ${case_db}.lineage_false_${uuid0}
 ORDER BY property_value;
 
@@ -61,19 +58,18 @@ SELECT 'false', id, v FROM ${case_db}.lineage_false_${uuid0}
 ORDER BY property_value,id;
 
 -- query 5
-SELECT 'absent' AS property_value, COUNT() AS total_rows, COUNT(_row_id) AS assigned_ids,
+SELECT 'absent' AS property_value, COUNT(*) AS total_rows, COUNT(_row_id) AS assigned_ids,
        COUNT(DISTINCT _row_id) AS unique_ids, COUNT(_last_updated_sequence_number) AS assigned_sequences
 FROM ${case_db}.lineage_absent_${uuid0}
 UNION ALL
-SELECT 'false', COUNT(), COUNT(_row_id), COUNT(DISTINCT _row_id), COUNT(_last_updated_sequence_number)
+SELECT 'false', COUNT(*), COUNT(_row_id), COUNT(DISTINCT _row_id), COUNT(_last_updated_sequence_number)
 FROM ${case_db}.lineage_false_${uuid0}
 ORDER BY property_value;
 
 -- query 6
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.lineage_v2_${uuid0} (id BIGINT, v STRING)
-TBLPROPERTIES ('format-version'='2');
-INSERT INTO ${case_db}.lineage_v2_${uuid0} VALUES (1,'a');
+CREATE TABLE ${case_db}.lineage_v2_${uuid0} (id BIGINT, v STRING) WITH (format_version = 2);
+INSERT INTO ${case_db}.lineage_v2_${uuid0} VALUES ROW(1,'a');
 
 -- query 7
 -- @expect_error_tier=target
@@ -106,7 +102,7 @@ SELECT id,v FROM ${case_db}.lineage_v2_${uuid0} ORDER BY id;
 -- query 11
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.lineage_absent_${uuid0} FORCE;
-DROP TABLE IF EXISTS ${case_db}.lineage_false_${uuid0} FORCE;
-DROP TABLE IF EXISTS ${case_db}.lineage_source_${uuid0} FORCE;
-DROP TABLE IF EXISTS ${case_db}.lineage_v2_${uuid0} FORCE;
+DROP TABLE IF EXISTS ${case_db}.lineage_absent_${uuid0} ;
+DROP TABLE IF EXISTS ${case_db}.lineage_false_${uuid0} ;
+DROP TABLE IF EXISTS ${case_db}.lineage_source_${uuid0} ;
+DROP TABLE IF EXISTS ${case_db}.lineage_v2_${uuid0} ;

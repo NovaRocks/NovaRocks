@@ -31,8 +31,7 @@ create table t0 (
     c1 STRING NOT NULL,
     c2 int,
     c3 int NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -42,7 +41,7 @@ insert into t0 SELECT generate_series, generate_series, generate_series, generat
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-set pipeline_dop = 1;
+SET SESSION pipeline_dop = 1;
 
 -- query 5
 USE ${case_db};

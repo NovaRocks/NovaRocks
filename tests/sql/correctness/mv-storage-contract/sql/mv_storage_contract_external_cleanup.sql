@@ -9,49 +9,28 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvclean_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvclean_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvclean_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvclean_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
-CREATE TABLE mvclean_${uuid0}.ns_${uuid0}.fact (k STRING, v BIGINT)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE mvclean_${uuid0}.ns_${uuid0}.fact (k STRING, v BIGINT) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO mvclean_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
+INSERT INTO mvclean_${uuid0}.ns_${uuid0}.fact VALUES ROW('east', 10);
 
 -- query 5
 -- @skip_result_check=true
 USE mvclean_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW cleanup_mv
-PARTITION BY bucket(k, 4)
-DISTRIBUTED BY HASH(k) BUCKETS 1 REFRESH DEFERRED MANUAL
-PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k, v FROM fact;
-REFRESH MATERIALIZED VIEW cleanup_mv WITH SYNC MODE;
-INSERT INTO fact VALUES ('west', 20);
-REFRESH MATERIALIZED VIEW cleanup_mv WITH SYNC MODE;
-ALTER MATERIALIZED VIEW cleanup_mv REPARTITION BY (truncate(k, 2));
+CREATE MATERIALIZED VIEW cleanup_mv WITH (partitioning = ARRAY['bucket(k, 4)'], refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
+REFRESH MATERIALIZED VIEW cleanup_mv;
+INSERT INTO fact VALUES ROW('west', 20);
+REFRESH MATERIALIZED VIEW cleanup_mv;
+ALTER MATERIALIZED VIEW cleanup_mv SET PROPERTIES partitioning = ARRAY['truncate(k, 2)'];
 
 -- query 6
 -- Every action operates on this exact table, with no shared-warehouse sweep.
@@ -108,7 +87,7 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvcl
 -- query 8
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.cleanup_mv,publications=2,slot-changes=0,table-commits=5
-REFRESH MATERIALIZED VIEW cleanup_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW cleanup_mv;
 
 -- query 9
 SELECT k, v FROM cleanup_mv ORDER BY k;
@@ -117,12 +96,10 @@ SELECT k, v FROM cleanup_mv ORDER BY k;
 -- This second MV is disposable after an external data rewrite. Separate
 -- publications guarantee two candidate files; rewrite-all must really commit.
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW rewrite_mv
-DISTRIBUTED BY HASH(k) BUCKETS 1 REFRESH DEFERRED MANUAL
-PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k, v FROM fact;
-REFRESH MATERIALIZED VIEW rewrite_mv WITH SYNC MODE;
-INSERT INTO fact VALUES ('north', 30);
-REFRESH MATERIALIZED VIEW rewrite_mv WITH SYNC MODE;
+CREATE MATERIALIZED VIEW rewrite_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
+REFRESH MATERIALIZED VIEW rewrite_mv;
+INSERT INTO fact VALUES ROW('north', 30);
+REFRESH MATERIALIZED VIEW rewrite_mv;
 
 -- query 11
 -- @result_contains=MV_EXTERNAL_REWRITE_NO_RECORD
@@ -148,7 +125,7 @@ printf '%s\n' "$spark_out" | grep -F MV_EXTERNAL_REWRITE_NO_RECORD
 
 -- query 12
 -- @expect_error=external
-REFRESH MATERIALIZED VIEW rewrite_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW rewrite_mv;
 
 -- query 13
 -- @cleanup=true
@@ -156,6 +133,6 @@ REFRESH MATERIALIZED VIEW rewrite_mv WITH SYNC MODE;
 USE mvclean_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS rewrite_mv;
 DROP MATERIALIZED VIEW IF EXISTS cleanup_mv;
-DROP TABLE mvclean_${uuid0}.ns_${uuid0}.fact FORCE;
-DROP DATABASE mvclean_${uuid0}.ns_${uuid0};
+DROP TABLE mvclean_${uuid0}.ns_${uuid0}.fact ;
+DROP SCHEMA mvclean_${uuid0}.ns_${uuid0};
 DROP CATALOG mvclean_${uuid0};

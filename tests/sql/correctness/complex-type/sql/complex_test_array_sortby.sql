@@ -34,23 +34,22 @@ CREATE TABLE t1 (
     array_col2 ARRAY<DOUBLE>,
     array_col3 ARRAY<VARCHAR(20)>,
     array_col4 ARRAY<DATE>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t1 VALUES
-(1, [4, 3, 5], [1.1, 2.2, 2.2], ['a', 'b', 'c'], ['2023-01-01', '2023-01-02', '2023-01-03']),
-(2, [6, 7, 8], [6.6, 5.5, 6.6], ['d', 'e', 'd'], ['2023-01-04', '2023-01-05', '2023-01-06']),
-(3, NULL, [7.7, 8.8, 8.8], ['g', 'h', 'h'], ['2023-01-07', '2023-01-08', '2023-01-09']),
-(4, [9, 10, 11], NULL, ['k', 'k', 'j'], ['2023-01-10', '2023-01-12', '2023-01-11']),
-(5, [12, 13, 14], [10.10, 11.11, 11.11], NULL, ['2023-01-13', '2023-01-14', '2023-01-15']),
-(6, [15, 16, 17], [14.14, 13.13, 14.14], ['m', 'o', 'o'], NULL),
-(7, [18, 19, 20], [16.16, 16.16, 18.18], ['p', 'p', 'r'], ['2023-01-16', NULL, '2023-01-18']),
-(8, [21, 22, 23], [19.19, 20.20, 19.19], ['a', 't', 'a'], ['2023-01-19', '2023-01-20', '2023-01-21']),
-(9, [24, 25, 26], NULL, ['y', 'y', 'z'], ['2023-01-25', '2023-01-24', '2023-01-26']),
-(10, [24, 25, 26], NULL, ['y', 'y', 'z'], ['2023-01-25', NULL, '2023-01-26']);
+ROW(1, [4, 3, 5], [1.1, 2.2, 2.2], ['a', 'b', 'c'], ['2023-01-01', '2023-01-02', '2023-01-03']),
+ROW(2, [6, 7, 8], [6.6, 5.5, 6.6], ['d', 'e', 'd'], ['2023-01-04', '2023-01-05', '2023-01-06']),
+ROW(3, NULL, [7.7, 8.8, 8.8], ['g', 'h', 'h'], ['2023-01-07', '2023-01-08', '2023-01-09']),
+ROW(4, [9, 10, 11], NULL, ['k', 'k', 'j'], ['2023-01-10', '2023-01-12', '2023-01-11']),
+ROW(5, [12, 13, 14], [10.10, 11.11, 11.11], NULL, ['2023-01-13', '2023-01-14', '2023-01-15']),
+ROW(6, [15, 16, 17], [14.14, 13.13, 14.14], ['m', 'o', 'o'], NULL),
+ROW(7, [18, 19, 20], [16.16, 16.16, 18.18], ['p', 'p', 'r'], ['2023-01-16', NULL, '2023-01-18']),
+ROW(8, [21, 22, 23], [19.19, 20.20, 19.19], ['a', 't', 'a'], ['2023-01-19', '2023-01-20', '2023-01-21']),
+ROW(9, [24, 25, 26], NULL, ['y', 'y', 'z'], ['2023-01-25', '2023-01-24', '2023-01-26']),
+ROW(10, [24, 25, 26], NULL, ['y', 'y', 'z'], ['2023-01-25', NULL, '2023-01-26']);
 
 -- query 4
 USE ${case_db};
@@ -69,9 +68,8 @@ select id, array_col1, array_col2, array_sortby(array_col1, array_col2) from t1 
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE __row_util_base (
-  k1 bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 bigint
+) WITH (format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
@@ -86,10 +84,9 @@ insert into __row_util_base select * from __row_util_base; -- 4000
 insert into __row_util_base select * from __row_util_base; -- 8000; all aggregate fingerprints below assert this scaled cardinality.
 
 CREATE TABLE __row_util (
-  idx bigint NULL,
+  idx bigint ,
   array_c1 ARRAY<INT>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 10
 -- @skip_result_check=true
@@ -110,8 +107,7 @@ CREATE TABLE t1 (
     int_2 ARRAY<INT>,
     str_1 ARRAY<VARCHAR(20)>,
     date_1 ARRAY<DATE>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 12
 -- @skip_result_check=true
@@ -151,7 +147,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 16
@@ -162,7 +158,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 17
@@ -174,8 +170,7 @@ CREATE TABLE t2 (
     int_2 ARRAY<INT>,
     str_1 ARRAY<VARCHAR(20)>,
     date_1 ARRAY<DATE>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 18
 -- @skip_result_check=true
@@ -215,7 +210,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 22
@@ -226,7 +221,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 23
@@ -238,8 +233,7 @@ CREATE TABLE t3 (
     int_2 ARRAY<INT> not null,
     str_1 ARRAY<VARCHAR(20)> not null,
     date_1 ARRAY<DATE> not null
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 24
 -- @skip_result_check=true
@@ -279,7 +273,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 28
@@ -290,7 +284,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select count() AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 29
@@ -369,9 +363,9 @@ select array_sortby([1,2,3,4,5,6], ['a', 'b', null, null, 'b', 'a'], [11, 22, 32
 -- query 45
 USE ${case_db};
 with w1 as (select column_0 as source, column_1 as key1, column_2 as key2 from (values
-          ([1, 2], null, [1, 1]),
-          ([3, 4], [40, 30], [1, 1]),
-          ([5, 6], null, [1, 1])
+          ROW([1, 2], null, [1, 1]),
+          ROW([3, 4], [40, 30], [1, 1]),
+          ROW([5, 6], null, [1, 1])
 ) t(column_0, column_1, column_2))
 select array_sortby(source, key1, key2), source, key1, key2 from w1;
 
@@ -398,63 +392,62 @@ CREATE TABLE test_array_sortby (
     array_date ARRAY<DATE>,
     -- Iceberg persists JSON as STRING; readback has the STRING domain.
     array_json ARRAY<VARCHAR>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 47
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO test_array_sortby VALUES
-(1, [true, false], [1, 3], [100, 50], [10, 5], [1000, 500], [9223372036854775806, 9223372036854775807], 
+ROW(1, [true, false], [1, 3], [100, 50], [10, 5], [1000, 500], [9223372036854775806, 9223372036854775807],
  [1.5, 2.5], [2.345, 1.234], [12345.67, 45678.90], [1234567890.12, 987654321.12], 
  [12345678901234567890.1234567890, 9876543210987654321.1234567890], 
  [12345.67, 67890.12], ['apple', 'banana'], 
  ['2025-01-24 10:30:00', '2024-12-31 23:59:59'], 
  ['2025-01-24', '2024-12-31'], 
  ['{"key":"value1"}', '{"key":"value2"}']),
-(2, [false, true], [5, 7], [200, 150], [30, 20], [1500, 1250], [9223372036854775803, 9223372036854775802],
+ROW(2, [false, true], [5, 7], [200, 150], [30, 20], [1500, 1250], [9223372036854775803, 9223372036854775802],
  [0.1, 0.3], [5.678, 4.567], [56789.01, 67890.12], [2345678901.23, 3456789012.34],
  [456789123456789123.1234567890, 123456789012345678.9876543210],
  [34567.89, 23456.78], ['grape', 'pear'],
  ['2025-02-01 12:00:00', '2025-01-01 08:15:00'],
  ['2025-02-01', '2025-01-15'],
  ['{"key":"value4"}', '{"key":"value5"}']),
-(3, [true, true], [2, 1], [75, 100], [15, 10], [750, 1000], [9223372036854775807, 9223372036854775806],
+ROW(3, [true, true], [2, 1], [75, 100], [15, 10], [750, 1000], [9223372036854775807, 9223372036854775806],
  [1.5, 0.5], [3.456, 1.234], [78901.12, 12345.67], [987654321.12, 1234567890.12],
  [9876543210987654321.1234567890, 12345678901234567890.1234567890],
  [78901.34, 12345.67], ['cherry', 'apple'],
  ['2025-01-01 00:00:00', '2024-12-31 23:59:59'],
  ['2025-01-01', '2024-12-31'],
  ['{"key":"value7"}', '{"key":"value8"}']),
-(4, [false], [6], [300], [45], [2000], [9223372036854775804],
+ROW(4, [false], [6], [300], [45], [2000], [9223372036854775804],
  [0.8], [6.789], [12345.67], [6789012345.67],
  [7891234567890123456.1234567890],
  [45678.90], ['mango'],
  ['2025-03-01 10:10:10'],
  ['2025-03-01'],
  ['{"key":"value10"}']),
-(5, [true, false, true], [9, 3, 6], [400, 200, 100], [60, 30, 10], [3000, 1500, 500], [9223372036854775805, 9223372036854775803, 9223372036854775802], 
+ROW(5, [true, false, true], [9, 3, 6], [400, 200, 100], [60, 30, 10], [3000, 1500, 500], [9223372036854775805, 9223372036854775803, 9223372036854775802],
  [2.0, 1.0, 3.0], [7.123, 6.234, 8.456], [45678.12, 23456.34, 78901.56], [3456789012.45, 2345678901.23, 1234567890.12], 
  [1234567890123456789.1234567890, 987654321098765432.1234567890, 456789123456789123.1234567890], 
  [56789.12, 23456.34, 78901.56], ['kiwi', 'orange', 'pear'], 
  ['2025-04-15 15:30:00', '2025-04-16 10:00:00', '2025-04-17 08:15:00'], 
  ['2025-04-15', '2025-04-16', '2025-04-17'], 
  ['{"key":"value11"}', '{"key":"value12"}', '{"key":"value13"}']),
-(6, [false, false], [1, 1], [10, 20], [5, 15], [50, 150], [9223372036854775801, 9223372036854775801], 
+ROW(6, [false, false], [1, 1], [10, 20], [5, 15], [50, 150], [9223372036854775801, 9223372036854775801],
  [0.5, 0.5], [1.123, 1.123], [1234.56, 1234.56], [123456.78, 123456.78], 
  [1234567890.1234567890, 1234567890.1234567890], 
  [1234.56, 1234.56], ['lemon', 'lime'], 
  ['2025-05-01 12:00:00', '2025-05-01 12:00:00'], 
  ['2025-05-01', '2025-05-01'], 
  ['{"key":"value14"}', '{"key":"value14"}']),
-(7, [true], [8], [250], [20], [1200], [9223372036854775806], 
+ROW(7, [true], [8], [250], [20], [1200], [9223372036854775806],
  [1.7], [4.321], [23456.78], [345678901.23], 
  [9876543210123456789.9876543210], 
  [12345.67], ['melon'], 
  ['2025-06-01 13:30:00'], 
  ['2025-06-01'], 
  ['{"key":"value15"}']),
-(8, [false, true, false], [2, 4, 8], [75, 100, 50], [15, 10, 5], [1500, 1000, 500], [9223372036854775807, 9223372036854775806, 9223372036854775805],
+ROW(8, [false, true, false], [2, 4, 8], [75, 100, 50], [15, 10, 5], [1500, 1000, 500], [9223372036854775807, 9223372036854775806, 9223372036854775805],
  [2.5, 1.5, 0.5], [1.234, 3.456, 2.345], [12345.67, 78901.12, 45678.90], [987654321.12, 123123123.45, 1234567890.12],
  [12345678901234567890.1234567890, 456789123456789123.1234567890, 9876543210987654321.1234567890],
  [67890.12, 78901.34, 12345.67], ['apple', 'banana', 'cherry'],

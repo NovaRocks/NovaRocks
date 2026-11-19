@@ -30,20 +30,18 @@ DROP TABLE IF EXISTS ${case_db}.m1_right_side;
 CREATE TABLE ${case_db}.m1_left_side (
   k INT,
   v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.m1_right_side (
   k INT,
   payload INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.m1_left_side VALUES
-  (1, 10),
-  (2, 20),
-  (3, 30);
+  ROW(1, 10),
+  ROW(2, 20),
+  ROW(3, 30);
 INSERT INTO ${case_db}.m1_right_side VALUES
-  (1, 100),
-  (3, 300);
+  ROW(1, 100),
+  ROW(3, 300);
 SELECT v
 FROM ${case_db}.m1_left_side
 WHERE EXISTS (

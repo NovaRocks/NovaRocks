@@ -28,14 +28,13 @@
 CREATE TABLE ${case_db}.sqlx1_timeout_cleanup (
   id BIGINT,
   delay_s BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.sqlx1_timeout_cleanup VALUES (1, 3);
-INSERT INTO ${case_db}.sqlx1_timeout_cleanup VALUES (2, 3);
-INSERT INTO ${case_db}.sqlx1_timeout_cleanup VALUES (3, 3);
+INSERT INTO ${case_db}.sqlx1_timeout_cleanup VALUES ROW(1, 3);
+INSERT INTO ${case_db}.sqlx1_timeout_cleanup VALUES ROW(2, 3);
+INSERT INTO ${case_db}.sqlx1_timeout_cleanup VALUES ROW(3, 3);
 
 -- query 3
 -- Statement admission freezes the one-second deadline before SQL compilation
@@ -47,15 +46,15 @@ INSERT INTO ${case_db}.sqlx1_timeout_cleanup VALUES (3, 3);
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.deadline_exceeded]
 -- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ABORT_APPLIED,3
-SET query_timeout = 1;
-SELECT COUNT()
+SET SESSION query_timeout = 1;
+SELECT COUNT(*)
 FROM ${case_db}.sqlx1_timeout_cleanup
 WHERE sleep(delay_s);
 
 -- query 4
 -- @skip_result_check=true
-SET query_timeout = 0;
+SET SESSION query_timeout = 0;
 
 -- query 5
 -- @result_contains=3
-SELECT COUNT() FROM ${case_db}.sqlx1_timeout_cleanup;
+SELECT COUNT(*) FROM ${case_db}.sqlx1_timeout_cleanup;

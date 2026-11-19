@@ -44,8 +44,7 @@ CREATE TABLE ${case_db}.t1 (
     k1 INT,
     k2 INT,
     v1 VARCHAR(10)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 6
 -- @skip_result_check=true
@@ -53,8 +52,7 @@ CREATE TABLE ${case_db}.t2 (
     k1 INT,
     k2 INT,
     v2 VARCHAR(10)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 7
 -- @skip_result_check=true
@@ -62,8 +60,7 @@ CREATE TABLE ${case_db}.t3 (
     k1 INT,
     k2 INT,
     v3 VARCHAR(10)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
@@ -71,44 +68,43 @@ CREATE TABLE ${case_db}.t4 (
     k1 INT,
     k2 INT,
     v4 VARCHAR(10)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 9
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t1 VALUES
-    (1, 10, 'a1'),
-    (2, 20, 'a2'),
-    (3, NULL, 'a3'),
-    (NULL, 40, 'a4'),
-    (NULL, NULL, 'a5');
+    ROW(1, 10, 'a1'),
+    ROW(2, 20, 'a2'),
+    ROW(3, NULL, 'a3'),
+    ROW(NULL, 40, 'a4'),
+    ROW(NULL, NULL, 'a5');
 
 -- query 10
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t2 VALUES
-    (1, 10, 'b1'),
-    (4, 40, 'b2'),
-    (5, NULL, 'b3'),
-    (NULL, 60, 'b4'),
-    (NULL, NULL, 'b5');
+    ROW(1, 10, 'b1'),
+    ROW(4, 40, 'b2'),
+    ROW(5, NULL, 'b3'),
+    ROW(NULL, 60, 'b4'),
+    ROW(NULL, NULL, 'b5');
 
 -- query 11
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t3 VALUES
-    (1, 10, 'c1'),
-    (2, 20, 'c2'),
-    (6, 60, 'c3'),
-    (NULL, 70, 'c4'),
-    (NULL, NULL, 'c5');
+    ROW(1, 10, 'c1'),
+    ROW(2, 20, 'c2'),
+    ROW(6, 60, 'c3'),
+    ROW(NULL, 70, 'c4'),
+    ROW(NULL, NULL, 'c5');
 
 -- query 12
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t4 VALUES
-    (1, 10, 'd1'),
-    (7, 70, 'd2'),
-    (8, NULL, 'd3'),
-    (NULL, 80, 'd4'),
-    (NULL, NULL, 'd5');
+    ROW(1, 10, 'd1'),
+    ROW(7, 70, 'd2'),
+    ROW(8, NULL, 'd3'),
+    ROW(NULL, 80, 'd4'),
+    ROW(NULL, NULL, 'd5');
 
 -- query 13
 -- FULL OUTER JOIN single-key USING
@@ -142,7 +138,7 @@ ORDER BY k1, k2;
 -- query 17
 -- FULL OUTER JOIN single-key USING + aggregation
 -- @order_sensitive=true
-SELECT k1, COUNT() as cnt, COUNT(v1) as cnt_v1, COUNT(v2) as cnt_v2
+SELECT k1, COUNT(*) as cnt, COUNT(v1) as cnt_v1, COUNT(v2) as cnt_v2
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1)
 GROUP BY k1
 ORDER BY k1;
@@ -150,7 +146,7 @@ ORDER BY k1;
 -- query 18
 -- FULL OUTER JOIN single-key USING + HAVING
 -- @order_sensitive=true
-SELECT k1, COUNT() as cnt
+SELECT k1, COUNT(*) as cnt
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1)
 GROUP BY k1
 HAVING k1 > 1 OR k1 IS NULL
@@ -264,7 +260,7 @@ ORDER BY k1, k2, v1, v2, v3, v4;
 -- Four-table FULL OUTER single-key USING + aggregation HAVING
 -- @order_sensitive=true
 SELECT k1,
-       COUNT() as total_rows,
+       COUNT(*) as total_rows,
        COUNT(v1) as t1_rows,
        COUNT(v2) as t2_rows,
        COUNT(v3) as t3_rows,
@@ -273,7 +269,7 @@ FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1)
         FULL OUTER JOIN ${case_db}.t3 USING(k1)
         FULL OUTER JOIN ${case_db}.t4 USING(k1)
 GROUP BY k1
-HAVING COUNT() > 1
+HAVING COUNT(*) > 1
 ORDER BY k1;
 
 -- query 32
@@ -319,7 +315,7 @@ ORDER BY k1, k2;
 -- Four-table FULL OUTER USING + aggregation with COUNT DISTINCT
 -- @order_sensitive=true
 SELECT k1, k2,
-       COUNT() as cnt,
+       COUNT(*) as cnt,
        COUNT(DISTINCT v1) as dist_v1,
        COUNT(DISTINCT v2) as dist_v2,
        MAX(v3) as max_v3,
@@ -363,7 +359,7 @@ ORDER BY k1, k2;
 -- query 40
 -- Four-table FULL OUTER USING + GROUP BY ROLLUP
 -- @order_sensitive=false
-SELECT k1, k2, COUNT() as cnt
+SELECT k1, k2, COUNT(*) as cnt
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t4 USING(k1, k2)
@@ -383,7 +379,7 @@ ORDER BY k1, v1, v2, v3, v4;
 -- Four-table single-key FULL OUTER USING + non_null_values HAVING
 -- @order_sensitive=true
 SELECT k1,
-       COUNT() as total,
+       COUNT(*) as total,
        SUM(CASE WHEN v1 IS NOT NULL THEN 1 ELSE 0 END) +
        SUM(CASE WHEN v2 IS NOT NULL THEN 1 ELSE 0 END) +
        SUM(CASE WHEN v3 IS NOT NULL THEN 1 ELSE 0 END) +
@@ -509,7 +505,7 @@ SELECT k1, k2, v1, v2,
                   END,
                   COALESCE(v1, v2)
        ) as rn,
-       COUNT() OVER (PARTITION BY k1) as cnt_per_k1
+       COUNT(*) OVER (PARTITION BY k1) as cnt_per_k1
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
 ORDER BY k1, k2,
          CASE
@@ -527,7 +523,7 @@ SELECT k1, k2, v1, v2, v3, v4
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t4 USING(k1, k2)
-WHERE k1 BETWEEN 1 AND 5 OR
+WHERE (k1 BETWEEN 1 AND 5) OR
       (k1 IS NULL AND k2 IS NOT NULL) OR
       (k2 > 50 AND k1 IS NOT NULL)
 ORDER BY k1, k2;
@@ -621,7 +617,7 @@ SELECT k1,
            WHEN v1 IS NOT NULL OR v2 IS NOT NULL THEN 1
            ELSE 0
        END) as match_score,
-       COUNT() as total
+       COUNT(*) as total
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1)
 GROUP BY k1
 ORDER BY match_score DESC, k1;
@@ -656,52 +652,52 @@ ORDER BY k1, k2,
 -- Inline VALUES: single-key FULL OUTER JOIN USING
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES (1, 'a')) AS t(k, v1) FULL OUTER JOIN
-    (VALUES (2, 'b')) AS u(k, v2) USING (k)
+    (VALUES ROW(1, 'a')) AS t(k, v1) FULL OUTER JOIN
+    (VALUES ROW(2, 'b')) AS u(k, v2) USING (k)
 ORDER BY k;
 
 -- query 66
 -- Inline VALUES: multi-key FULL OUTER JOIN USING
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES (0, 1, 2), (3, 6, 5)) a(x1, y, z1) FULL OUTER JOIN
-    (VALUES (3, 1, 5), (0, 4, 2)) b(x2, y, z2) USING (y)
+    (VALUES ROW(0, 1, 2), ROW(3, 6, 5)) a(x1, y, z1) FULL OUTER JOIN
+    (VALUES ROW(3, 1, 5), ROW(0, 4, 2)) b(x2, y, z2) USING (y)
 ORDER BY y, x1, z1, x2, z2;
 
 -- query 67
 -- Inline VALUES: FULL OUTER with NULLs
 -- @order_sensitive=true
 SELECT y, x1, x2 FROM
-    (VALUES (0, 1, 2), (3, 6, 5), (3, NULL, 5)) a(x1, y, z1) FULL OUTER JOIN
-    (VALUES (3, 1, 5), (0, 4, 2)) b(x2, y, z2) USING (y)
+    (VALUES ROW(0, 1, 2), ROW(3, 6, 5), ROW(3, NULL, 5)) a(x1, y, z1) FULL OUTER JOIN
+    (VALUES ROW(3, 1, 5), ROW(0, 4, 2)) b(x2, y, z2) USING (y)
 ORDER BY y, x1, x2;
 
 -- query 68
 -- Inline VALUES: type promotion TINYINT vs INT
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES (CAST(1 AS TINYINT), 'a')) AS t(k, v1) JOIN
-    (VALUES (1, 'b')) AS u(k, v2) USING (k);
+    (VALUES ROW(CAST(1 AS TINYINT), 'a')) AS t(k, v1) JOIN
+    (VALUES ROW(1, 'b')) AS u(k, v2) USING (k);
 
 -- query 69
 -- Inline VALUES: type promotion SMALLINT vs BIGINT
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES (CAST(1 AS SMALLINT), 'a')) AS t(k, v1) JOIN
-    (VALUES (CAST(1 AS BIGINT), 'b')) AS u(k, v2) USING (k);
+    (VALUES ROW(CAST(1 AS SMALLINT), 'a')) AS t(k, v1) JOIN
+    (VALUES ROW(CAST(1 AS BIGINT), 'b')) AS u(k, v2) USING (k);
 
 -- query 70
 -- Inline VALUES: USING column not first position
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES ('a', 1)) AS t(v1, k) JOIN
-    (VALUES (1, 'b')) AS u(k, v2) USING (k);
+    (VALUES ROW('a', 1)) AS t(v1, k) JOIN
+    (VALUES ROW(1, 'b')) AS u(k, v2) USING (k);
 
 -- query 71
 -- Inline VALUES + persistent table USING
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES (1, 'inline')) AS inline_t(k1, val) LEFT JOIN ${case_db}.t1 USING(k1)
+    (VALUES ROW(1, 'inline')) AS inline_t(k1, val) LEFT JOIN ${case_db}.t1 USING(k1)
 ORDER BY k1, val;
 
 -- query 72
@@ -709,7 +705,7 @@ ORDER BY k1, val;
 -- @order_sensitive=true
 SELECT * FROM
     ${case_db}.t1 FULL OUTER JOIN
-    (VALUES (10, 20, 'inline')) AS inline_t(k1, k2, val) USING(k1, k2)
+    (VALUES ROW(10, 20, 'inline')) AS inline_t(k1, k2, val) USING(k1, k2)
 ORDER BY k1, k2;
 
 -- query 73
@@ -717,7 +713,7 @@ ORDER BY k1, k2;
 -- @order_sensitive=true
 SELECT k1, k2, v1, val, v2 FROM
     ${case_db}.t1 FULL OUTER JOIN
-    (VALUES (1, 10, 'inline1'), (2, 20, 'inline2')) AS inline_t(k1, k2, val) USING(k1, k2)
+    (VALUES ROW(1, 10, 'inline1'), ROW(2, 20, 'inline2')) AS inline_t(k1, k2, val) USING(k1, k2)
     LEFT JOIN ${case_db}.t2 USING(k1, k2)
 ORDER BY k1, k2;
 
@@ -725,9 +721,9 @@ ORDER BY k1, k2;
 -- Three inline VALUES FULL OUTER chained
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES (1, 'a')) AS t1_val(k, v1) FULL OUTER JOIN
-    (VALUES (2, 'b')) AS t2_val(k, v2) USING (k) FULL OUTER JOIN
-    (VALUES (1, 'c'), (3, 'd')) AS t3_val(k, v3) USING (k)
+    (VALUES ROW(1, 'a')) AS t1_val(k, v1) FULL OUTER JOIN
+    (VALUES ROW(2, 'b')) AS t2_val(k, v2) USING (k) FULL OUTER JOIN
+    (VALUES ROW(1, 'c'), ROW(3, 'd')) AS t3_val(k, v3) USING (k)
 ORDER BY k;
 
 -- query 75
@@ -735,8 +731,8 @@ ORDER BY k;
 -- @order_sensitive=true
 SELECT k, COUNT() as cnt, COUNT(v1) as cnt_v1, COUNT(v2) as cnt_v2
 FROM
-    (VALUES (1, 'a'), (1, 'aa'), (2, 'b')) AS t(k, v1) FULL OUTER JOIN
-    (VALUES (1, 'x'), (3, 'y')) AS u(k, v2) USING (k)
+    (VALUES ROW(1, 'a'), ROW(1, 'aa'), ROW(2, 'b')) AS t(k, v1) FULL OUTER JOIN
+    (VALUES ROW(1, 'x'), ROW(3, 'y')) AS u(k, v2) USING (k)
 GROUP BY k
 ORDER BY k;
 
@@ -745,8 +741,8 @@ ORDER BY k;
 -- @order_sensitive=true
 SELECT k, v1, v2 FROM (
     SELECT * FROM
-        (VALUES (1, 'a')) AS t(k, v1) FULL OUTER JOIN
-        (VALUES (1, 'b'), (2, 'c')) AS u(k, v2) USING (k)
+        (VALUES ROW(1, 'a')) AS t(k, v1) FULL OUTER JOIN
+        (VALUES ROW(1, 'b'), ROW(2, 'c')) AS u(k, v2) USING (k)
 ) sub
 ORDER BY k;
 
@@ -754,8 +750,8 @@ ORDER BY k;
 -- Inline VALUES FULL OUTER + WHERE filter
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS t(k, v1) FULL OUTER JOIN
-    (VALUES (2, 'x'), (3, 'y'), (4, 'z')) AS u(k, v2) USING (k)
+    (VALUES ROW(1, 'a'), ROW(2, 'b'), ROW(3, 'c')) AS t(k, v1) FULL OUTER JOIN
+    (VALUES ROW(2, 'x'), ROW(3, 'y'), ROW(4, 'z')) AS u(k, v2) USING (k)
 WHERE k >= 2
 ORDER BY k;
 
@@ -764,8 +760,8 @@ ORDER BY k;
 -- @order_sensitive=true
 SELECT k, k * 10 as k_scaled, CONCAT('K', CAST(k AS STRING)) as k_str, v1, v2
 FROM
-    (VALUES (1, 'a'), (2, 'b')) AS t(k, v1) FULL OUTER JOIN
-    (VALUES (2, 'x'), (3, 'y')) AS u(k, v2) USING (k)
+    (VALUES ROW(1, 'a'), ROW(2, 'b')) AS t(k, v1) FULL OUTER JOIN
+    (VALUES ROW(2, 'x'), ROW(3, 'y')) AS u(k, v2) USING (k)
 WHERE k IS NOT NULL
 ORDER BY k;
 
@@ -777,33 +773,33 @@ SELECT k,
        COALESCE(v1, 'NULL_V1') as v1_safe,
        COALESCE(v2, 'NULL_V2') as v2_safe
 FROM
-    (VALUES (1, 'a'), (3, 'c')) AS t(k, v1) FULL OUTER JOIN
-    (VALUES (2, 'b'), (3, 'd')) AS u(k, v2) USING (k)
+    (VALUES ROW(1, 'a'), ROW(3, 'c')) AS t(k, v1) FULL OUTER JOIN
+    (VALUES ROW(2, 'b'), ROW(3, 'd')) AS u(k, v2) USING (k)
 ORDER BY k;
 
 -- query 80
 -- Inline VALUES: larger overlapping sets
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')) AS t(k, v1) FULL OUTER JOIN
-    (VALUES (3, 'x'), (4, 'y'), (5, 'z'), (6, 'w'), (7, 'v')) AS u(k, v2) USING (k)
+    (VALUES ROW(1, 'a'), ROW(2, 'b'), ROW(3, 'c'), ROW(4, 'd'), ROW(5, 'e')) AS t(k, v1) FULL OUTER JOIN
+    (VALUES ROW(3, 'x'), ROW(4, 'y'), ROW(5, 'z'), ROW(6, 'w'), ROW(7, 'v')) AS u(k, v2) USING (k)
 ORDER BY k;
 
 -- query 81
 -- Inline VALUES: NULLs in join keys
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES (1, 'a'), (NULL, 'b'), (2, 'c')) AS t(k, v1) FULL OUTER JOIN
-    (VALUES (1, 'x'), (NULL, 'y'), (3, 'z')) AS u(k, v2) USING (k)
+    (VALUES ROW(1, 'a'), ROW(NULL, 'b'), ROW(2, 'c')) AS t(k, v1) FULL OUTER JOIN
+    (VALUES ROW(1, 'x'), ROW(NULL, 'y'), ROW(3, 'z')) AS u(k, v2) USING (k)
 ORDER BY k, v1, v2;
 
 -- query 82
 -- Three inline VALUES with increasing sizes
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES (1, 'a')) AS t1_val(k, v1) FULL OUTER JOIN
-    (VALUES (1, 'b'), (2, 'bb')) AS t2_val(k, v2) USING (k) FULL OUTER JOIN
-    (VALUES (1, 'c'), (2, 'cc'), (3, 'ccc')) AS t3_val(k, v3) USING (k)
+    (VALUES ROW(1, 'a')) AS t1_val(k, v1) FULL OUTER JOIN
+    (VALUES ROW(1, 'b'), ROW(2, 'bb')) AS t2_val(k, v2) USING (k) FULL OUTER JOIN
+    (VALUES ROW(1, 'c'), ROW(2, 'cc'), ROW(3, 'ccc')) AS t3_val(k, v3) USING (k)
 ORDER BY k;
 
 -- query 83
@@ -811,7 +807,7 @@ ORDER BY k;
 -- @order_sensitive=true
 SELECT k1, v1, val, v2 FROM
     ${case_db}.t1 FULL OUTER JOIN
-    (VALUES (CAST(1 AS TINYINT), 100), (CAST(5 AS TINYINT), 500)) AS inline_t(k1, val) USING(k1)
+    (VALUES ROW(CAST(1 AS TINYINT), 100), ROW(CAST(5 AS TINYINT), 500)) AS inline_t(k1, val) USING(k1)
     LEFT JOIN ${case_db}.t2 USING(k1)
 ORDER BY k1;
 
@@ -819,8 +815,8 @@ ORDER BY k1;
 -- Inline VALUES FULL OUTER + complex WHERE with BETWEEN
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES (1, 10), (2, 20), (3, 30)) AS t(k, v1) FULL OUTER JOIN
-    (VALUES (2, 100), (3, 200), (4, 300)) AS u(k, v2) USING (k)
+    (VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30)) AS t(k, v1) FULL OUTER JOIN
+    (VALUES ROW(2, 100), ROW(3, 200), ROW(4, 300)) AS u(k, v2) USING (k)
 WHERE k IS NULL OR (k BETWEEN 2 AND 3 AND (v1 > 15 OR v2 > 150))
 ORDER BY k;
 
@@ -831,8 +827,8 @@ SELECT k, v1, v2,
        k + 100 as k_offset,
        CASE WHEN k IS NULL THEN -1 ELSE k END as k_safe
 FROM
-    (VALUES (1, 'a'), (3, 'c')) AS t(k, v1) FULL OUTER JOIN
-    (VALUES (2, 'b'), (3, 'd'), (4, 'e')) AS u(k, v2) USING (k)
+    (VALUES ROW(1, 'a'), ROW(3, 'c')) AS t(k, v1) FULL OUTER JOIN
+    (VALUES ROW(2, 'b'), ROW(3, 'd'), ROW(4, 'e')) AS u(k, v2) USING (k)
 ORDER BY COALESCE(k, 999), v1, v2;
 
 -- query 86
@@ -840,16 +836,16 @@ ORDER BY COALESCE(k, 999), v1, v2;
 -- @order_sensitive=true
 SELECT DISTINCT k
 FROM
-    (VALUES (1, 'a'), (1, 'aa'), (2, 'b')) AS t(k, v1) FULL OUTER JOIN
-    (VALUES (1, 'x'), (1, 'xx'), (2, 'y')) AS u(k, v2) USING (k)
+    (VALUES ROW(1, 'a'), ROW(1, 'aa'), ROW(2, 'b')) AS t(k, v1) FULL OUTER JOIN
+    (VALUES ROW(1, 'x'), ROW(1, 'xx'), ROW(2, 'y')) AS u(k, v2) USING (k)
 ORDER BY k;
 
 -- query 87
 -- Inline VALUES FULL OUTER with STRING keys
 -- @order_sensitive=true
 SELECT * FROM
-    (VALUES ('apple', 1), ('banana', 2)) AS t(name, v1) FULL OUTER JOIN
-    (VALUES ('banana', 10), ('cherry', 20)) AS u(name, v2) USING (name)
+    (VALUES ROW('apple', 1), ROW('banana', 2)) AS t(name, v1) FULL OUTER JOIN
+    (VALUES ROW('banana', 10), ROW('cherry', 20)) AS u(name, v2) USING (name)
 ORDER BY name;
 
 -- query 88
@@ -857,9 +853,9 @@ ORDER BY name;
 -- @order_sensitive=true
 SELECT k1, v1, val1, v2, val2 FROM
     ${case_db}.t1 FULL OUTER JOIN
-    (VALUES (1, 'V1'), (2, 'V2')) AS v1_t(k1, val1) USING(k1) LEFT JOIN
+    (VALUES ROW(1, 'V1'), ROW(2, 'V2')) AS v1_t(k1, val1) USING(k1) LEFT JOIN
     ${case_db}.t2 USING(k1) FULL OUTER JOIN
-    (VALUES (1, 'V3'), (5, 'V5')) AS v2_t(k1, val2) USING(k1)
+    (VALUES ROW(1, 'V3'), ROW(5, 'V5')) AS v2_t(k1, val2) USING(k1)
 ORDER BY k1, v1, val1, v2, val2
 LIMIT 20;
 
@@ -915,7 +911,7 @@ ORDER BY k1, k2;
 -- query 93
 -- Three-table FULL OUTER USING + aggregation HAVING with AVG
 -- @order_sensitive=true
-SELECT k1, COUNT() as cnt, AVG(k2) as avg_k2
+SELECT k1, COUNT(*) as cnt, AVG(k2) as avg_k2
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)
 GROUP BY k1
@@ -924,4 +920,4 @@ ORDER BY k1;
 
 -- query 94
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS ${case_db};
+DROP SCHEMA IF EXISTS ${case_db};

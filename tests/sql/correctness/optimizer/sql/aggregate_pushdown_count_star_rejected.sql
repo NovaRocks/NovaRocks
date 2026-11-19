@@ -24,11 +24,11 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_pd_neg_a;
 DROP TABLE IF EXISTS ${case_db}.t_agg_pd_neg_b;
 CREATE TABLE ${case_db}.t_agg_pd_neg_a (k INT);
 CREATE TABLE ${case_db}.t_agg_pd_neg_b (k INT);
-INSERT INTO ${case_db}.t_agg_pd_neg_a VALUES (1), (2);
-INSERT INTO ${case_db}.t_agg_pd_neg_b VALUES (1);
-ANALYZE TABLE ${case_db}.t_agg_pd_neg_a;
-ANALYZE TABLE ${case_db}.t_agg_pd_neg_b;
-EXPLAIN VERBOSE
-SELECT COUNT()
+INSERT INTO ${case_db}.t_agg_pd_neg_a VALUES ROW(1), ROW(2);
+INSERT INTO ${case_db}.t_agg_pd_neg_b VALUES ROW(1);
+ANALYZE ${case_db}.t_agg_pd_neg_a;
+ANALYZE ${case_db}.t_agg_pd_neg_b;
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT COUNT(*)
 FROM ${case_db}.t_agg_pd_neg_a a
 INNER JOIN ${case_db}.t_agg_pd_neg_b b ON a.k = b.k;

@@ -30,31 +30,29 @@ CREATE TABLE ${case_db}.t_naaj_corr_not_in_l (
     id INT,
     g INT,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_naaj_corr_not_in_r (
     g INT,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_naaj_corr_not_in_l VALUES
-    (1, 1, 2),
-    (2, NULL, 0),
-    (3, NULL, 1),
-    (4, 3, 1),
-    (5, 3, -1),
-    (6, NULL, 1),
-    (7, NULL, NULL),
-    (8, 3, 2),
-    (9, 2, 2);
+    ROW(1, 1, 2),
+    ROW(2, NULL, 0),
+    ROW(3, NULL, 1),
+    ROW(4, 3, 1),
+    ROW(5, 3, -1),
+    ROW(6, NULL, 1),
+    ROW(7, NULL, NULL),
+    ROW(8, 3, 2),
+    ROW(9, 2, 2);
 
 INSERT INTO ${case_db}.t_naaj_corr_not_in_r VALUES
-    (NULL, 1),
-    (1, 1),
-    (NULL, 2),
-    (3, 2),
-    (2, NULL);
+    ROW(NULL, 1),
+    ROW(1, 1),
+    ROW(NULL, 2),
+    ROW(3, 2),
+    ROW(2, NULL);
 
 SELECT l.id
 FROM ${case_db}.t_naaj_corr_not_in_l l

@@ -26,28 +26,23 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.analytics_${uuid0};
-CREATE DATABASE iceberg_rest_${suite_uuid0}.sales_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.analytics_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.sales_${uuid0};
 CREATE TABLE iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0} (
   id INT,
   name STRING
-) TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 INSERT INTO iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0}
-VALUES (1, 'a'), (2, 'b');
+VALUES ROW(1, 'a'), ROW(2, 'b');
 USE iceberg_rest_${suite_uuid0}.sales_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW analytics_${uuid0}.mv_orders_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT /* effective raw source */ id, name
+CREATE MATERIALIZED VIEW analytics_${uuid0}.mv_orders_${uuid0} AS SELECT /* effective raw source */ id, name
 FROM orders_${uuid0};
 
 -- query 3
-SELECT COUNT() AS n FROM analytics_${uuid0}.mv_orders_${uuid0};
+SELECT COUNT(*) AS n FROM analytics_${uuid0}.mv_orders_${uuid0};
 
 -- query 4
 -- @skip_result_check=true
@@ -63,10 +58,7 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'iceb
 -- query 7
 -- @expect_error=Iceberg MV target table iceberg_rest_${suite_uuid0}.analytics_${uuid0}.mv_conflict_${uuid0} already exists
 CREATE TABLE analytics_${uuid0}.mv_conflict_${uuid0} (id INT);
-CREATE MATERIALIZED VIEW analytics_${uuid0}.mv_conflict_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT id FROM orders_${uuid0};
+CREATE MATERIALIZED VIEW analytics_${uuid0}.mv_conflict_${uuid0} AS SELECT id FROM orders_${uuid0};
 
 -- query 8
 -- @skip_result_check=true
@@ -75,10 +67,7 @@ DROP TABLE analytics_${uuid0}.mv_conflict_${uuid0};
 -- query 9
 -- @expect_error=requires current Iceberg catalog context
 USE default_catalog.default;
-CREATE MATERIALIZED VIEW mv_bad_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT id
+CREATE MATERIALIZED VIEW mv_bad_${uuid0} AS SELECT id
 FROM iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0};
 
 -- query 10
@@ -88,7 +77,7 @@ DROP MATERIALIZED VIEW analytics_${uuid0}.mv_orders_${uuid0};
 
 -- query 11
 -- @expect_error=unknown table
-SELECT COUNT() FROM analytics_${uuid0}.mv_orders_${uuid0};
+SELECT COUNT(*) FROM analytics_${uuid0}.mv_orders_${uuid0};
 
 -- query 12
 -- @cleanup=true
@@ -98,5 +87,5 @@ DROP MATERIALIZED VIEW IF EXISTS analytics_${uuid0}.mv_orders_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS analytics_${uuid0}.mv_conflict_${uuid0};
 DROP TABLE IF EXISTS iceberg_rest_${suite_uuid0}.analytics_${uuid0}.mv_conflict_${uuid0};
 DROP TABLE IF EXISTS iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0};
-DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.analytics_${uuid0};
-DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.sales_${uuid0};
+DROP SCHEMA IF EXISTS iceberg_rest_${suite_uuid0}.analytics_${uuid0};
+DROP SCHEMA IF EXISTS iceberg_rest_${suite_uuid0}.sales_${uuid0};

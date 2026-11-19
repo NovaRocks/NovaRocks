@@ -21,22 +21,18 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_target FORCE;
-DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_source FORCE;
+DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_target ;
+DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_source ;
 CREATE TABLE ${case_db}.sqlx2_update_from_target (
   id BIGINT,
   v STRING
-) TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.sqlx2_update_from_source (
   id BIGINT,
   new_v STRING
-) TBLPROPERTIES (
-  "format-version" = "3"
-);
-INSERT INTO ${case_db}.sqlx2_update_from_target VALUES (1, 'a'), (2, 'b');
-INSERT INTO ${case_db}.sqlx2_update_from_source VALUES (2, 'bb');
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.sqlx2_update_from_target VALUES ROW(1, 'a'), ROW(2, 'b');
+INSERT INTO ${case_db}.sqlx2_update_from_source VALUES ROW(2, 'bb');
 
 -- query 2
 -- @skip_result_check=true
@@ -52,7 +48,7 @@ ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.sqlx2_update_from_source VALUES (2, 'cc');
+INSERT INTO ${case_db}.sqlx2_update_from_source VALUES ROW(2, 'cc');
 
 -- query 5
 -- @expect_error_tier=drift
@@ -69,5 +65,5 @@ ORDER BY id;
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE ${case_db}.sqlx2_update_from_target FORCE;
-DROP TABLE ${case_db}.sqlx2_update_from_source FORCE;
+DROP TABLE ${case_db}.sqlx2_update_from_target ;
+DROP TABLE ${case_db}.sqlx2_update_from_source ;

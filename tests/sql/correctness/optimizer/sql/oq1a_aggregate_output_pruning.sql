@@ -23,15 +23,15 @@ CREATE TABLE ${case_db}.oq1a_t (
     b BIGINT
 );
 INSERT INTO ${case_db}.oq1a_t VALUES
-    (1, 10, 100),
-    (1, 20, 200),
-    (2, 30, 300);
+    ROW(1, 10, 100),
+    ROW(1, 20, 200),
+    ROW(2, 30, 300);
 
 -- @skip_result_check=true
 -- @explain_contains=HASH AGGREGATE
 -- @explain_contains=sum
 -- @explain_not_contains=count(b)
-EXPLAIN VERBOSE SELECT sum(s) AS s
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT sum(s) AS s
 FROM (
     SELECT k, sum(a) AS s, count(b) AS unused_count
     FROM ${case_db}.oq1a_t
@@ -48,16 +48,16 @@ FROM (
 -- @skip_result_check=true
 -- @explain_contains=HASH AGGREGATE
 -- @explain_contains=count
-EXPLAIN VERBOSE SELECT count() AS c
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT count(*) AS c
 FROM ${case_db}.oq1a_t;
 
-SELECT count() AS c
+SELECT count(*) AS c
 FROM ${case_db}.oq1a_t;
 
 -- @skip_result_check=true
 -- @explain_contains=HASH AGGREGATE
 -- @explain_contains=sum
-EXPLAIN VERBOSE SELECT sum_a
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT sum_a
 FROM (
     SELECT k, sum(a) AS sum_a
     FROM ${case_db}.oq1a_t

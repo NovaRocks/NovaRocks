@@ -29,13 +29,12 @@ CREATE TABLE ${case_db}.t_project_case_coalesce (
   id INT,
   score INT,
   note STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_project_case_coalesce VALUES
-  (1, 95, 'top'),
-  (2, 82, NULL),
-  (3, NULL, 'missing'),
-  (4, 60, NULL);
+  ROW(1, 95, 'top'),
+  ROW(2, 82, NULL),
+  ROW(3, NULL, 'missing'),
+  ROW(4, 60, NULL);
 SELECT
   id,
   CASE

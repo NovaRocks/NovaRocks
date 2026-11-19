@@ -25,28 +25,20 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.ivm_${uuid0} FORCE;
-CREATE DATABASE iceberg_rest_${suite_uuid0}.ivm_${uuid0};
+DROP SCHEMA IF EXISTS iceberg_rest_${suite_uuid0}.ivm_${uuid0} CASCADE;
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.ivm_${uuid0};
 CREATE TABLE iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0} (
   id INT NOT NULL,
   customer STRING,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 INSERT INTO iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0} VALUES
-  (1, 'Alice', 100),
-  (2, 'Bob', 40);
+  ROW(1, 'Alice', 100),
+  ROW(2, 'Bob', 40);
 USE iceberg_rest_${suite_uuid0}.ivm_${uuid0};
-CREATE MATERIALIZED VIEW orders_projection_mv_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT id, amount
+CREATE MATERIALIZED VIEW orders_projection_mv_${uuid0} AS SELECT id, amount
 FROM iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0};
-CREATE MATERIALIZED VIEW orders_sum_mv_${uuid0}
-DISTRIBUTED BY HASH(customer) BUCKETS 1
-PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT customer, SUM(amount) AS total_amount
+CREATE MATERIALIZED VIEW orders_sum_mv_${uuid0} AS SELECT customer, SUM(amount) AS total_amount
 FROM iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0}
 GROUP BY customer;
 
@@ -68,7 +60,7 @@ ORDER BY customer;
 -- query 5
 -- @skip_result_check=true
 INSERT OVERWRITE iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0}
-VALUES (1, 'Alice', 80), (2, 'Bob', 40);
+VALUES ROW(1, 'Alice', 80), ROW(2, 'Bob', 40);
 
 -- query 6
 SELECT id, customer, amount
@@ -93,7 +85,7 @@ ORDER BY customer;
 -- query 10
 -- @skip_result_check=true
 INSERT OVERWRITE iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0}
-VALUES (2, 'Bob', 40);
+VALUES ROW(2, 'Bob', 40);
 
 -- query 11
 SELECT id, customer, amount
@@ -121,4 +113,4 @@ ORDER BY customer;
 USE iceberg_rest_${suite_uuid0}.ivm_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ivm_${uuid0}.orders_sum_mv_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ivm_${uuid0}.orders_projection_mv_${uuid0};
-DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.ivm_${uuid0} FORCE;
+DROP SCHEMA IF EXISTS iceberg_rest_${suite_uuid0}.ivm_${uuid0} CASCADE;

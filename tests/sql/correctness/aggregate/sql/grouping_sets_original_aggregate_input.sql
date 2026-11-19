@@ -21,13 +21,13 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_grouping_input (a INT, b INT);
-INSERT INTO ${case_db}.t_grouping_input VALUES (1, 10);
-INSERT INTO ${case_db}.t_grouping_input VALUES (1, 20);
-INSERT INTO ${case_db}.t_grouping_input VALUES (2, 30);
-INSERT INTO ${case_db}.t_grouping_input VALUES (NULL, 40);
+INSERT INTO ${case_db}.t_grouping_input VALUES ROW(1, 10);
+INSERT INTO ${case_db}.t_grouping_input VALUES ROW(1, 20);
+INSERT INTO ${case_db}.t_grouping_input VALUES ROW(2, 30);
+INSERT INTO ${case_db}.t_grouping_input VALUES ROW(NULL, 40);
 
 -- query 2
-SELECT GROUPING(a) AS g, a, count() AS rows_seen,
+SELECT GROUPING(a) AS g, a, count(*) AS rows_seen,
        count(a) AS nonnull_a, count(DISTINCT a) AS distinct_a,
        sum(a) AS sum_a, sum(b) AS sum_b,
        array_agg(a ORDER BY b) AS ordered_a
@@ -56,11 +56,11 @@ GROUP BY ROLLUP(a)
 ORDER BY g, a NULLS FIRST;
 
 -- query 6
-SELECT GROUPING(`sum(a)`) AS g, `sum(a)` AS k, sum(a) AS total
-FROM (SELECT a, b AS `sum(a)` FROM ${case_db}.t_grouping_input) AS s
-GROUP BY ROLLUP(`sum(a)`)
+SELECT GROUPING("sum(a)") AS g, "sum(a)" AS k, sum(a) AS total
+FROM (SELECT a, b AS "sum(a)" FROM ${case_db}.t_grouping_input) AS s
+GROUP BY ROLLUP("sum(a)")
 ORDER BY g, k NULLS FIRST;
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_grouping_input FORCE;
+DROP TABLE ${case_db}.t_grouping_input ;

@@ -32,11 +32,10 @@
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t_subq;
 CREATE TABLE ${case_db}.t_subq (
-    id BIGINT NULL,
-    v BIGINT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.t_subq VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+    id BIGINT ,
+    v BIGINT
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.t_subq VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30), ROW(4, 40), ROW(5, 50);
 
 -- query 2
 -- IN-then-scalar in WHERE — q14 shape. id IN {1,2,3} and v greater than min v (=10).

@@ -28,8 +28,8 @@ INSERT INTO ${case_db}.oq12_stats_mj_l
 INSERT INTO ${case_db}.oq12_stats_mj_r
     SELECT generate_series % 50, generate_series % 20, generate_series * 10
     FROM TABLE(generate_series(1, 100));
-ANALYZE TABLE ${case_db}.oq12_stats_mj_l;
-ANALYZE TABLE ${case_db}.oq12_stats_mj_r;
+ANALYZE ${case_db}.oq12_stats_mj_l;
+ANALYZE ${case_db}.oq12_stats_mj_r;
 
 -- r is intentionally an order of magnitude smaller than l (100 vs 1000 rows)
 -- while keeping comparable per-key NDV, so r is unambiguously the smaller
@@ -38,7 +38,7 @@ ANALYZE TABLE ${case_db}.oq12_stats_mj_r;
 -- recorded plan-tree shape flaky under parallel workers. Commutativity is also
 -- pinned for good measure; the objective here is the multi-key cardinality
 -- estimate, not the join order.
-SET disable_optimizer_rules = 'JoinCommutativity';
+SET SESSION disable_optimizer_rules = 'JoinCommutativity';
 
 -- @explain_contains=HASH JOIN
 -- @explain_contains=eq: [
@@ -46,10 +46,10 @@ SET disable_optimizer_rules = 'JoinCommutativity';
 -- @explain_contains=k2
 -- @explain_contains=oq12_stats_mj_l
 -- @explain_contains=oq12_stats_mj_r
-EXPLAIN VERBOSE SELECT l.k1, l.k2, COUNT() AS match_count
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT l.k1, l.k2, COUNT(*) AS match_count
 FROM ${case_db}.oq12_stats_mj_l l
 INNER JOIN ${case_db}.oq12_stats_mj_r r
     ON l.k1 = r.k1 AND l.k2 = r.k2
 GROUP BY l.k1, l.k2;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

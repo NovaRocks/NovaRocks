@@ -29,9 +29,8 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
-  k1 bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 bigint
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
@@ -48,9 +47,8 @@ insert into ${case_db}.__row_util_base select * from ${case_db}.__row_util_base;
 -- query 5
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
-  idx bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  idx bigint
+) WITH (format_version = 3);
 
 -- query 6
 -- @skip_result_check=true
@@ -59,27 +57,26 @@ insert into ${case_db}.__row_util select row_number() over() as idx from ${case_
 -- query 7
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-    k1 bigint NULL,
+    k1 bigint ,
     c_bool boolean,
-    c_bool_null boolean NULL,
+    c_bool_null boolean ,
     c_tinyint tinyint,
-    c_tinyint_null tinyint NULL,
+    c_tinyint_null tinyint ,
     c_smallint smallint,
-    c_smallint_null smallint NULL,
+    c_smallint_null smallint ,
     c_int int,
-    c_int_null int NULL,
+    c_int_null int ,
     c_bigint bigint,
-    c_bigint_null bigint NULL,
+    c_bigint_null bigint ,
     c_float float,
-    c_float_null float NULL,
+    c_float_null float ,
     c_double double,
-    c_double_null double NULL,
+    c_double_null double ,
     c_date date,
-    c_date_null date NULL,
+    c_date_null date ,
     c_datetime datetime,
-    c_datetime_null datetime NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    c_datetime_null datetime
+) WITH (format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
@@ -124,12 +121,12 @@ from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_smallint_null = t2.c_smallint_n
 -- join with <=> on bool_null + tinyint_null and = on smallint_null
 -- query 12
 select count(1)
-from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_bool_null <=> t2.c_bool_null and t1.c_tinyint_null <=> t2.c_tinyint_null and t1.c_smallint_null = t2.c_smallint_null;
+from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_bool_null  IS NOT DISTINCT FROM  t2.c_bool_null and t1.c_tinyint_null  IS NOT DISTINCT FROM  t2.c_tinyint_null and t1.c_smallint_null = t2.c_smallint_null;
 
 -- full join with <=> on bool_null + tinyint_null and = on smallint_null
 -- query 13
 select count(1)
-from ${case_db}.t1 full join ${case_db}.t1 t2 on t1.c_bool_null <=> t2.c_bool_null and t1.c_tinyint_null <=> t2.c_tinyint_null and t1.c_smallint_null = t2.c_smallint_null;
+from ${case_db}.t1 full join ${case_db}.t1 t2 on t1.c_bool_null  IS NOT DISTINCT FROM  t2.c_bool_null and t1.c_tinyint_null  IS NOT DISTINCT FROM  t2.c_tinyint_null and t1.c_smallint_null = t2.c_smallint_null;
 
 -- join on bool_null + tinyint_null + int
 -- query 14
@@ -179,12 +176,12 @@ from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_datetime = t2.c_datetime and t1
 -- join with <=> on bool_null + = on tinyint_null + smallint_null + int
 -- query 23
 select count(1)
-from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_bool_null <=> t2.c_bool_null and t1.c_tinyint_null = t2.c_tinyint_null and t1.c_smallint_null = t2.c_smallint_null and t1.c_int = t2.c_int;
+from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_bool_null  IS NOT DISTINCT FROM  t2.c_bool_null and t1.c_tinyint_null = t2.c_tinyint_null and t1.c_smallint_null = t2.c_smallint_null and t1.c_int = t2.c_int;
 
 -- full join with <=> on bool_null + = on tinyint_null + smallint_null + int
 -- query 24
 select count(1)
-from ${case_db}.t1 full join ${case_db}.t1 t2 on t1.c_bool_null <=> t2.c_bool_null and t1.c_tinyint_null = t2.c_tinyint_null and t1.c_smallint_null = t2.c_smallint_null and t1.c_int = t2.c_int;
+from ${case_db}.t1 full join ${case_db}.t1 t2 on t1.c_bool_null  IS NOT DISTINCT FROM  t2.c_bool_null and t1.c_tinyint_null = t2.c_tinyint_null and t1.c_smallint_null = t2.c_smallint_null and t1.c_int = t2.c_int;
 
 -- join on double + int
 -- query 25
@@ -199,7 +196,7 @@ from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_double_null = t2.c_double_null 
 -- join with <=> on float_null + = on int
 -- query 27
 select count(1)
-from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_float_null <=> t2.c_float_null and t1.c_int = t2.c_int;
+from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_float_null  IS NOT DISTINCT FROM  t2.c_float_null and t1.c_int = t2.c_int;
 
 -- join on bigint + int
 -- query 28

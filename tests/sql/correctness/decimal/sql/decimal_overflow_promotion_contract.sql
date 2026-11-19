@@ -23,37 +23,36 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.decimal_promotion_contract
-(seq INT, d DECIMAL(30,10), e DECIMAL(18,9))
-TBLPROPERTIES ("format-version" = "3");
+(seq INT, d DECIMAL(30,10), e DECIMAL(18,9)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_promotion_contract VALUES
-(1,12345678901234567890.1234567890,123456789.123456789),
-(2,0,123456789.123456789),(3,NULL,123456789.123456789);
+ROW(1,12345678901234567890.1234567890,123456789.123456789),
+ROW(2,0,123456789.123456789),ROW(3,NULL,123456789.123456789);
 
 -- query 2
-SET decimal_overflow_to_double=false;
+SET SESSION decimal_overflow_to_double = false;
 SELECT seq,d*e AS product FROM ${case_db}.decimal_promotion_contract ORDER BY seq;
 
 -- query 3
-SET decimal_overflow_to_double=true;
+SET SESSION decimal_overflow_to_double = true;
 SELECT seq,d*e AS product FROM ${case_db}.decimal_promotion_contract ORDER BY seq;
 
 -- query 4
-SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ seq,d*e AS product
+WITH SESSION decimal_overflow_to_double = false SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ seq,d*e AS product
 FROM ${case_db}.decimal_promotion_contract ORDER BY seq;
 
 -- query 5
 SELECT seq,d*e AS product FROM ${case_db}.decimal_promotion_contract ORDER BY seq;
 
 -- query 6
-SET decimal_overflow_to_double=false;
-SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ seq,d*e AS product
+SET SESSION decimal_overflow_to_double = false;
+WITH SESSION decimal_overflow_to_double = true SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ seq,d*e AS product
 FROM ${case_db}.decimal_promotion_contract ORDER BY seq;
 
 -- query 7
 SELECT seq,d*e AS product FROM ${case_db}.decimal_promotion_contract ORDER BY seq;
 
 -- query 8
-SET decimal_overflow_to_double=true;
+SET SESSION decimal_overflow_to_double = true;
 SELECT CAST(123456789.123456789 AS DECIMAL(18,9)) *
        CAST(123456789.123456789 AS DECIMAL(18,9)) AS exact_product;
 
@@ -64,19 +63,27 @@ CREATE VIEW default_catalog.${case_db}.decimal_promotion_view AS SELECT 1 AS v;
 
 -- query 10
 -- @skip_result_check=true
+SET SESSION decimal_overflow_to_double = false
+;
 CREATE VIEW default_catalog.${case_db}.decimal_promotion_view AS
-SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ 1 AS v;
+SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ 1 AS v
+;
+RESET SESSION decimal_overflow_to_double;
 DROP VIEW default_catalog.${case_db}.decimal_promotion_view;
 
 -- query 11
 -- @skip_result_check=true
-SET decimal_overflow_to_double=false;
+SET SESSION decimal_overflow_to_double = false;
 
 -- query 12
 -- @skip_result_check=true
 -- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
+SET SESSION decimal_overflow_to_double = true
+;
 CREATE VIEW default_catalog.${case_db}.decimal_promotion_hint_view AS
-SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v;
+SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v
+;
+RESET SESSION decimal_overflow_to_double;
 
 -- query 13
 WITH promoted AS (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS v),
@@ -85,12 +92,12 @@ SELECT promoted.v AS promoted,checked.v AS checked,CAST(12345678901234567890.123
 FROM promoted CROSS JOIN checked;
 
 -- query 14
-SET decimal_overflow_to_double=true;
+SET SESSION decimal_overflow_to_double = true;
 SELECT t.v AS checked,CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS inherited
 FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS v) t;
 
 -- query 15
-SET decimal_overflow_to_double=false;
+SET SESSION decimal_overflow_to_double = false;
 SELECT (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9))) AS promoted,
        (SELECT CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9))) AS checked,CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS outer_checked;
 
@@ -111,14 +118,21 @@ ORDER BY branch;
 -- @skip_result_check=true
 -- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
 -- D32 target migration: reject an uncaptured root setting, retaining the derived query.
+SET SESSION decimal_overflow_to_double = true
+;
 CREATE VIEW default_catalog.${case_db}.decimal_promotion_nested_view AS
-SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ v FROM (SELECT 1 AS v) t;
+SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ v FROM (SELECT 1 AS v) t
+;
+RESET SESSION decimal_overflow_to_double;
 
 -- query 21
 -- @skip_result_check=true
 -- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
-CREATE MATERIALIZED VIEW ${case_db}.decimal_promotion_hint_mv DISTRIBUTED BY HASH(v) BUCKETS 1 AS
-SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v;
+SET SESSION decimal_overflow_to_double = true
+;
+CREATE MATERIALIZED VIEW ${case_db}.decimal_promotion_hint_mv AS SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v
+;
+RESET SESSION decimal_overflow_to_double;
 
 -- query 22
 -- @skip_result_check=true
@@ -127,7 +141,7 @@ SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v;
 -- @expect_error_at=1:47
 -- @expect_error_tier=target
 -- D32 target migration: validate the same invalid value at the root query boundary.
-SELECT /*+ SET_VAR(decimal_overflow_to_double='invalid') */ 1 FROM (SELECT 1 AS v) t;
+WITH SESSION decimal_overflow_to_double = 'invalid' SELECT /*+ SET_VAR(decimal_overflow_to_double='invalid') */ 1 FROM (SELECT 1 AS v) t;
 
 -- query 23
 -- @skip_result_check=true
@@ -135,12 +149,12 @@ DROP TABLE ${case_db}.decimal_promotion_contract;
 
 -- query 24
 -- @skip_result_check=true
-SET decimal_overflow_to_double=false;
+SET SESSION decimal_overflow_to_double = false;
 CREATE VIEW default_catalog.${case_db}.decimal_replay_control_view AS SELECT CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS product;
 
 -- query 25
 -- @skip_result_check=true
-SET decimal_overflow_to_double=true;
+SET SESSION decimal_overflow_to_double = true;
 
 -- query 26
 -- @skip_result_check=true
@@ -148,17 +162,17 @@ SET decimal_overflow_to_double=true;
 SELECT product FROM default_catalog.${case_db}.decimal_replay_control_view;
 
 -- query 27
-SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ product
+WITH SESSION decimal_overflow_to_double = false SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ product
 FROM default_catalog.${case_db}.decimal_replay_control_view;
 
 -- query 28
 -- @skip_result_check=true
-SET decimal_overflow_to_double=false;
+SET SESSION decimal_overflow_to_double = false;
 DROP VIEW default_catalog.${case_db}.decimal_replay_control_view;
 
 -- query 29
 -- @skip_result_check=true
-SET decimal_overflow_to_double=true;
+SET SESSION decimal_overflow_to_double = true;
 
 -- query 30
 -- @skip_result_check=true
@@ -172,4 +186,4 @@ EXPLAIN REFRESH MATERIALIZED VIEW ${case_db}.decimal_uncaptured_missing_mv;
 
 -- query 32
 -- @skip_result_check=true
-SET decimal_overflow_to_double=false;
+SET SESSION decimal_overflow_to_double = false;

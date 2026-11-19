@@ -22,7 +22,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT 7 AS value;
-SET sql_mode='GROUP_CONCAT_LEGACY';
+SET SESSION sql_mode = 'GROUP_CONCAT_LEGACY';
 
 -- query 2
 -- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
@@ -35,7 +35,7 @@ CREATE VIEW default_catalog.${case_db}.v_forbidden_mode AS SELECT 1;
 SELECT * FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 4
-SELECT /*+ SET_VAR(sql_mode='32') */ value FROM default_catalog.${case_db}.v_persisted_mode;
+WITH SESSION sql_mode = '32' SELECT /*+ SET_VAR(sql_mode='32') */ value FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 5
 -- @expect_error=GROUP_CONCAT_LEGACY is not captured
@@ -45,7 +45,7 @@ EXPLAIN SELECT * FROM default_catalog.${case_db}.v_persisted_mode;
 -- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
 -- @expect_sql_phase=Admit
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
-CREATE MATERIALIZED VIEW ${case_db}.mv_forbidden_mode DISTRIBUTED BY HASH(k) BUCKETS 1 AS SELECT k FROM definitely_missing_table;
+CREATE MATERIALIZED VIEW ${case_db}.mv_forbidden_mode AS SELECT k FROM definitely_missing_table;
 
 -- query 7
 -- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
@@ -58,7 +58,7 @@ SELECT group_concat('a','b') AS value;
 
 -- query 9
 -- @skip_result_check=true
-SET sql_mode='32';
+SET SESSION sql_mode = '32';
 
 -- query 10
 SELECT value FROM default_catalog.${case_db}.v_persisted_mode;
@@ -66,13 +66,17 @@ SELECT value FROM default_catalog.${case_db}.v_persisted_mode;
 -- query 11
 -- @expect_error=GROUP_CONCAT_LEGACY is not captured
 -- The root policy reaches VIEW replay; SELECT-local overrides are retired.
-SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ * FROM (SELECT * FROM default_catalog.${case_db}.v_persisted_mode) d;
+WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ * FROM (SELECT * FROM default_catalog.${case_db}.v_persisted_mode) d;
 
 -- query 12
 -- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
 -- @expect_sql_phase=Admit
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
-CREATE OR REPLACE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 9 AS value;
+SET SESSION sql_mode = 'GROUP_CONCAT_LEGACY'
+;
+CREATE OR REPLACE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 9 AS value
+;
+RESET SESSION sql_mode;
 
 -- query 13
 SELECT value FROM default_catalog.${case_db}.v_persisted_mode;

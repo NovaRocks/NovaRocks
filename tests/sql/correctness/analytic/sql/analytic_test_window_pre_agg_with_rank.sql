@@ -30,20 +30,18 @@ CREATE TABLE ${case_db}.t1 (
     c1 INT NOT NULL,
     c2 INT NOT NULL,
     c3 INT NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t2 (
     c4 INT NOT NULL,
     c5 INT NOT NULL,
     c6 INT NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t1 (c1, c2, c3) VALUES
-(1, 1, 1), (2, 1, 11), (3, 1, 111),
-(4, 2, 2), (5, 2, 22), (6, 2, 222);
+ROW(1, 1, 1), ROW(2, 1, 11), ROW(3, 1, 111),
+ROW(4, 2, 2), ROW(5, 2, 22), ROW(6, 2, 222);
 INSERT INTO ${case_db}.t2 (c4, c5, c6) VALUES
-(1, 1, 1), (2, 1, 11), (3, 1, 111),
-(4, 2, 2), (5, 2, 22), (6, 2, 222);
+ROW(1, 1, 1), ROW(2, 1, 11), ROW(3, 1, 111),
+ROW(4, 2, 2), ROW(5, 2, 22), ROW(6, 2, 222);
 
 -- query 2
 -- case1: row_number <= 2 without agg function
@@ -87,7 +85,7 @@ WHERE _rowid <= 2 ORDER BY c4, c6;
 SELECT 1
 FROM (
     SELECT
-        COUNT() OVER (PARTITION BY c1) AS _count,
+        COUNT(*) OVER (PARTITION BY c1) AS _count,
         ROW_NUMBER() OVER (PARTITION BY c1 ORDER BY RAND()) AS rn
     FROM ${case_db}.t1
 ) AS x
@@ -98,12 +96,11 @@ WHERE rn <= 2;
 CREATE TABLE ${case_db}.t_rank_bitmap_crash (
     k INT,
     ts INT,
-    uid BIGINT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    uid BIGINT
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_rank_bitmap_crash VALUES
-(1, 100, 1), (1, 90, 2), (1, 80, NULL), (1, 70, 3),
-(2, 100, 4), (2, 90, NULL), (2, 80, 5);
+ROW(1, 100, 1), ROW(1, 90, 2), ROW(1, 80, NULL), ROW(1, 70, 3),
+ROW(2, 100, 4), ROW(2, 90, NULL), ROW(2, 80, 5);
 
 -- query 7
 -- bitmap_union_count combined with rank() — crash guard test

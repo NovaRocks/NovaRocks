@@ -28,45 +28,22 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_pday_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_pday_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_pday_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_pday_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_pday_${uuid0}.ns_${uuid0}.orders (
   ts DATE,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 USE ice_ivm_pday_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ice_ivm_pday_${uuid0}.ns_${uuid0}.orders VALUES
-  ('2026-01-10', 10),
-  ('2026-01-10', 20),
-  ('2026-01-11', 5),
-  ('2026-01-12', 15);
-CREATE MATERIALIZED VIEW pday_mv_${uuid0}
-PARTITION BY day(ts)
-DISTRIBUTED BY HASH(ts) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT ts, COUNT(*) AS c, SUM(amount) AS s
+  ROW('2026-01-10', 10),
+  ROW('2026-01-10', 20),
+  ROW('2026-01-11', 5),
+  ROW('2026-01-12', 15);
+CREATE MATERIALIZED VIEW pday_mv_${uuid0} WITH (partitioning = ARRAY['day(ts)']) AS SELECT ts, COUNT(*) AS c, SUM(amount) AS s
 FROM ice_ivm_pday_${uuid0}.ns_${uuid0}.orders
 GROUP BY ts;
 REFRESH MATERIALIZED VIEW pday_mv_${uuid0};
@@ -91,7 +68,7 @@ SELECT ts, c, s
 FROM pday_mv_${uuid0}
 ORDER BY ts;
 
-SELECT ts, COUNT() AS c, SUM(amount) AS s
+SELECT ts, COUNT(*) AS c, SUM(amount) AS s
 FROM ice_ivm_pday_${uuid0}.ns_${uuid0}.orders
 GROUP BY ts
 ORDER BY ts;
@@ -101,5 +78,5 @@ ORDER BY ts;
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW pday_mv_${uuid0};
 DROP TABLE ice_ivm_pday_${uuid0}.ns_${uuid0}.orders;
-DROP DATABASE ice_ivm_pday_${uuid0}.ns_${uuid0};
+DROP SCHEMA ice_ivm_pday_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_pday_${uuid0};

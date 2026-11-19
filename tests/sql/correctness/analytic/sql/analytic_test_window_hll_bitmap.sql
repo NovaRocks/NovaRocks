@@ -29,21 +29,20 @@ CREATE TABLE ${case_db}.test_ignore_nulls_page_uv (
     visit_date datetime NOT NULL,
     visit_users BITMAP NOT NULL,
     click_times hll
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
-INSERT INTO ${case_db}.test_ignore_nulls_page_uv VALUES (1, '2020-06-23 01:30:30', to_bitmap(1001), hll_hash(5));
-INSERT INTO ${case_db}.test_ignore_nulls_page_uv VALUES (1, '2020-06-23 01:30:30', to_bitmap(1001), hll_hash(5));
-INSERT INTO ${case_db}.test_ignore_nulls_page_uv VALUES (1, '2020-06-23 01:30:30', to_bitmap(1002), hll_hash(10));
-INSERT INTO ${case_db}.test_ignore_nulls_page_uv VALUES (1, '2020-06-23 02:30:30', to_bitmap(1002), hll_hash(5));
+INSERT INTO ${case_db}.test_ignore_nulls_page_uv VALUES ROW(1, '2020-06-23 01:30:30', to_bitmap(1001), hll_hash(5));
+INSERT INTO ${case_db}.test_ignore_nulls_page_uv VALUES ROW(1, '2020-06-23 01:30:30', to_bitmap(1001), hll_hash(5));
+INSERT INTO ${case_db}.test_ignore_nulls_page_uv VALUES ROW(1, '2020-06-23 01:30:30', to_bitmap(1002), hll_hash(10));
+INSERT INTO ${case_db}.test_ignore_nulls_page_uv VALUES ROW(1, '2020-06-23 02:30:30', to_bitmap(1002), hll_hash(5));
 
 -- query 2
 -- @order_sensitive=true
-SELECT HLL_CARDINALITY(lag(click_times IGNORE NULLS) OVER(ORDER BY visit_date)) AS val FROM ${case_db}.test_ignore_nulls_page_uv ORDER BY val;
+SELECT HLL_CARDINALITY(lag(click_times ) IGNORE NULLS OVER(ORDER BY visit_date)) AS val FROM ${case_db}.test_ignore_nulls_page_uv ORDER BY val;
 
 -- query 3
 -- @order_sensitive=true
-SELECT HLL_CARDINALITY(lead(click_times IGNORE NULLS) OVER(ORDER BY visit_date)) AS val FROM ${case_db}.test_ignore_nulls_page_uv ORDER BY val;
+SELECT HLL_CARDINALITY(lead(click_times ) IGNORE NULLS OVER(ORDER BY visit_date)) AS val FROM ${case_db}.test_ignore_nulls_page_uv ORDER BY val;
 
 -- query 4
 -- @order_sensitive=true

@@ -24,41 +24,38 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0};
+CREATE SCHEMA iceberg_cat_${suite_uuid0}.trc_opt_${uuid0};
 CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.empty_rows (k BIGINT);
 CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows (k BIGINT);
-CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows (k BIGINT, p STRING)
-PARTITION BY (p);
-CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows (k BIGINT)
-TBLPROPERTIES ('format-version' = '2');
-CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows (k BIGINT)
-TBLPROPERTIES ('format-version' = '3');
+CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows (k BIGINT, p STRING) WITH (partitioning = ARRAY['p']);
+CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows (k BIGINT) WITH (format_version = 2);
+CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows (k BIGINT) WITH (format_version = 3);
 
 -- query 2
-ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.empty_rows OPTIMIZE;
+ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.empty_rows EXECUTE optimize;
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows VALUES (1);
-INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows VALUES (2);
-INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows VALUES (3);
+INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows VALUES ROW(1);
+INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows VALUES ROW(2);
+INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows VALUES ROW(3);
 
 -- query 4
-ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows OPTIMIZE;
+ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows EXECUTE optimize;
 
 -- query 5
 -- Freeze the exact snapshot before the singleton no-op. Tag creation changes
 -- reference metadata, not the data snapshot, and provides an independent oracle.
 -- @skip_result_check=true
-ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows CREATE TAG before_noop;
+ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows EXECUTE create_tag(name => 'before_noop', replace => false, if_not_exists => false);
 
 -- query 6
 -- A single current-spec file without deletes is skipped.
-ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows OPTIMIZE;
+ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows EXECUTE optimize;
 
 -- query 7
 -- A no-op retains the exact saved snapshot; this does not assume a history count.
-SELECT count() AS main_matches_before_noop
+SELECT count(*) AS main_matches_before_noop
 FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}."tiny_rows$refs" AS current_ref
 JOIN iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}."tiny_rows$refs" AS before_ref
   ON current_ref.snapshot_id = before_ref.snapshot_id
@@ -66,40 +63,40 @@ WHERE current_ref.name = 'main' AND before_ref.name = 'before_noop';
 
 -- query 8
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows VALUES (1, 'a');
-INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows VALUES (2, 'a');
-INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows VALUES (3, 'b');
+INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows VALUES ROW(1, 'a');
+INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows VALUES ROW(2, 'a');
+INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows VALUES ROW(3, 'b');
 
 -- query 9
 -- Only the two-file partition is selected; partition b must survive untouched.
-ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows OPTIMIZE;
+ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows EXECUTE optimize;
 
 -- query 10
 -- Return the original partition ROW without requiring struct-field expressions.
-SELECT `partition`, record_count AS physical_rows
+SELECT "partition", record_count AS physical_rows
 FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}."partition_rows$files"
 WHERE content = 0 ORDER BY record_count DESC;
 
 -- query 11
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows VALUES (1), (2);
+INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows VALUES ROW(1), ROW(2);
 DELETE FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows WHERE k = 1;
 
 -- query 12
 -- A singleton carrying a position delete is selected.
-ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows OPTIMIZE;
+ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows EXECUTE optimize;
 
 -- query 13
 SELECT k FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows ORDER BY k;
 
 -- query 14
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows VALUES (1), (2);
-INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows VALUES (3), (4);
+INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows VALUES ROW(1), ROW(2);
+INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows VALUES ROW(3), ROW(4);
 DELETE FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows WHERE k IN (1, 3);
 
 -- query 15
-ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows OPTIMIZE;
+ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows EXECUTE optimize;
 
 -- query 16
 SELECT k FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows ORDER BY k;
@@ -107,9 +104,9 @@ SELECT k FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows ORDER BY k
 -- query 17
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.empty_rows FORCE;
-DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows FORCE;
-DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows FORCE;
-DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows FORCE;
-DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows FORCE;
-DROP DATABASE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0};
+DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.empty_rows ;
+DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows ;
+DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows ;
+DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows ;
+DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows ;
+DROP SCHEMA IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0};

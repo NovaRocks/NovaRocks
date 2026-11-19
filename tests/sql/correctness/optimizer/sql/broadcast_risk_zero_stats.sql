@@ -21,11 +21,11 @@
 -- Thus the join/import names become generate_series = k, not k = k.
 -- Preserve build filters/projections, both hash exchanges, partitioned join,
 -- and the 11250000000000 estimate; no row-count or broadcast policy changes.
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
-SET cbo_broadcast_backend_count = 3;
-SET disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
-EXPLAIN VERBOSE
+SET SESSION cbo_broadcast_backend_count = 3;
+SET SESSION disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 WITH big_probe AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 1000000))

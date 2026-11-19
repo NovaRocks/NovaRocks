@@ -37,7 +37,7 @@ SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0}
 -- query 4
 -- The ordinary id key writes no Variant column into an equality-delete file.
 -- @skip_result_check=true
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0} ADD EQUALITY DELETE (id) VALUES (2);
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0} EXECUTE add_equality_delete(columns => ARRAY['id'], rows => ARRAY[ROW(2)]);
 
 -- query 5
 SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0} ORDER BY id;
@@ -47,8 +47,8 @@ SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0}
 TRUNCATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0};
 
 -- query 7
-SELECT COUNT() AS remaining_rows FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0};
+SELECT COUNT(*) AS remaining_rows FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0};
 
 -- query 8
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_dv_${uuid0} ;

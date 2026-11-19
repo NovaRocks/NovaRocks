@@ -36,7 +36,7 @@ DROP TABLE IF EXISTS ${case_db}.t_delete_data_file_rows_span_chunks;
 CREATE TABLE ${case_db}.t_delete_data_file_rows_span_chunks (
   id INT,
   amount BIGINT
-) TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_delete_data_file_rows_span_chunks
 SELECT CAST(n AS INT), CAST(n AS BIGINT)
 FROM TABLE(generate_series(1, 20000)) t(n) ORDER BY n;
@@ -54,5 +54,5 @@ WHERE id <= 18000
    OR (id > 20000 AND id <= 38000)
    OR (id > 40000 AND id <= 58000)
    OR (id > 60000 AND id <= 78000);
-SELECT COUNT() AS live_rows, MIN(id) AS min_id, MAX(id) AS max_id, SUM(amount) AS total_amount
+SELECT COUNT(*) AS live_rows, MIN(id) AS min_id, MAX(id) AS max_id, SUM(amount) AS total_amount
 FROM ${case_db}.t_delete_data_file_rows_span_chunks;

@@ -29,29 +29,22 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_merge_matched_delete FORCE;
-DROP TABLE IF EXISTS ${case_db}.s_v3_merge_matched_delete FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_merge_matched_delete ;
+DROP TABLE IF EXISTS ${case_db}.s_v3_merge_matched_delete ;
 CREATE TABLE ${case_db}.t_v3_merge_matched_delete (
   id BIGINT,
   v STRING
-)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "novarocks.update.mode" = "merge-on-read"
-);
+) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 INSERT INTO ${case_db}.t_v3_merge_matched_delete VALUES
-  (1, 'a'),
-  (2, 'b'),
-  (3, 'c');
+  ROW(1, 'a'),
+  ROW(2, 'b'),
+  ROW(3, 'c');
 CREATE TABLE ${case_db}.s_v3_merge_matched_delete (
   id BIGINT,
   v STRING
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.s_v3_merge_matched_delete VALUES
-  (2, 'b');
+  ROW(2, 'b');
 
 -- query 2
 SELECT id, v
@@ -60,7 +53,7 @@ ORDER BY id;
 
 -- query 3
 -- Atomicity proof: capture the snapshot count immediately before the MERGE.
-SELECT count() AS snaps_before
+SELECT count(*) AS snaps_before
 FROM ${case_db}."t_v3_merge_matched_delete$snapshots";
 
 -- query 4
@@ -73,7 +66,7 @@ WHEN MATCHED THEN DELETE;
 -- query 5
 -- Atomicity proof: a single-branch matched-DELETE MERGE commits one
 -- RowDeltaDvFromFiles snapshot, so snaps_after - snaps_before MUST be 1.
-SELECT count() AS snaps_after
+SELECT count(*) AS snaps_after
 FROM ${case_db}."t_v3_merge_matched_delete$snapshots";
 
 -- query 6
@@ -82,10 +75,10 @@ FROM ${case_db}.t_v3_merge_matched_delete
 ORDER BY id;
 
 -- query 7
-SELECT COUNT(DISTINCT _row_id) = COUNT() AS row_ids_unique
+SELECT COUNT(DISTINCT _row_id) = COUNT(*) AS row_ids_unique
 FROM ${case_db}.t_v3_merge_matched_delete;
 
 -- query 8
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_merge_matched_delete FORCE;
-DROP TABLE ${case_db}.s_v3_merge_matched_delete FORCE;
+DROP TABLE ${case_db}.t_v3_merge_matched_delete ;
+DROP TABLE ${case_db}.s_v3_merge_matched_delete ;

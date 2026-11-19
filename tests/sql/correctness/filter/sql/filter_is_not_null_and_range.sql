@@ -29,14 +29,13 @@ CREATE TABLE ${case_db}.t_filter_is_not_null_and_range (
   id INT,
   k INT,
   payload STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_filter_is_not_null_and_range VALUES
-  (1, NULL, 'n1'),
-  (2, 5, 'p2'),
-  (3, 10, 'p3'),
-  (4, 11, 'p4'),
-  (5, 20, 'p5');
+  ROW(1, NULL, 'n1'),
+  ROW(2, 5, 'p2'),
+  ROW(3, 10, 'p3'),
+  ROW(4, 11, 'p4'),
+  ROW(5, 20, 'p5');
 SELECT id, k, payload
 FROM ${case_db}.t_filter_is_not_null_and_range
 WHERE k IS NOT NULL AND k >= 10 AND k < 20

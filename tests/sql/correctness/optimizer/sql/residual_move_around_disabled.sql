@@ -28,7 +28,7 @@ CREATE TABLE ${case_db}.residual_mad_a (k INT, payload INT);
 CREATE TABLE ${case_db}.residual_mad_b (k INT, payload INT);
 CREATE TABLE ${case_db}.residual_mad_c (k INT, payload INT);
 
-SET disable_optimizer_rules = 'PushDownPredicateJoin,JoinReorder,JoinCommutativity';
+SET SESSION disable_optimizer_rules = 'PushDownPredicateJoin,JoinReorder,JoinCommutativity';
 
 -- @skip_result_check=true
 -- @result_contains=INNER, eq: [k = b.k]
@@ -39,13 +39,13 @@ SET disable_optimizer_rules = 'PushDownPredicateJoin,JoinReorder,JoinCommutativi
 -- continues to require their absence.
 -- @result_contains=7 = b.k
 -- @result_contains=7 = c.k
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.payload, b.payload, c.payload
 FROM (SELECT k, payload FROM ${case_db}.residual_mad_a WHERE k = 7) a
 JOIN ${case_db}.residual_mad_b b ON a.k = b.k
 JOIN ${case_db}.residual_mad_c c ON b.k = c.k;
 
-SET disable_optimizer_rules = 'JoinPredicateMoveAround,PushDownPredicateJoin,JoinReorder,JoinCommutativity';
+SET SESSION disable_optimizer_rules = 'JoinPredicateMoveAround,PushDownPredicateJoin,JoinReorder,JoinCommutativity';
 
 -- @skip_result_check=true
 -- @result_contains=INNER, eq: [k = b.k]
@@ -57,10 +57,10 @@ SET disable_optimizer_rules = 'JoinPredicateMoveAround,PushDownPredicateJoin,Joi
 -- @result_not_contains=CAST(c.k AS Int64) = 7
 -- @result_not_contains=7 = c.k
 -- @result_not_contains=c.k = 7
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.payload, b.payload, c.payload
 FROM (SELECT k, payload FROM ${case_db}.residual_mad_a WHERE k = 7) a
 JOIN ${case_db}.residual_mad_b b ON a.k = b.k
 JOIN ${case_db}.residual_mad_c c ON b.k = c.k;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

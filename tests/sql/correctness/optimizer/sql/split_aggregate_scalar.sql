@@ -20,11 +20,11 @@
 CREATE TABLE ${case_db}.t_split_agg_l (k INT, payload INT);
 CREATE TABLE ${case_db}.t_split_agg_r (k INT, payload INT);
 INSERT INTO ${case_db}.t_split_agg_l VALUES
-    (1, 10), (1, 11), (2, 20), (2, 21), (3, 30), (4, 40);
+    ROW(1, 10), ROW(1, 11), ROW(2, 20), ROW(2, 21), ROW(3, 30), ROW(4, 40);
 INSERT INTO ${case_db}.t_split_agg_r VALUES
-    (1, 100), (1, 101), (2, 200), (5, 500);
-ANALYZE TABLE ${case_db}.t_split_agg_l;
-ANALYZE TABLE ${case_db}.t_split_agg_r;
+    ROW(1, 100), ROW(1, 101), ROW(2, 200), ROW(5, 500);
+ANALYZE ${case_db}.t_split_agg_l;
+ANALYZE ${case_db}.t_split_agg_r;
 
 -- @explain_contains=HASH AGGREGATE (LOCAL)
 -- @explain_contains=HASH AGGREGATE (GLOBAL)

@@ -25,40 +25,19 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_target_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_target_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_target_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_target_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_target_${uuid0}.ns_${uuid0}.base_orders (
   order_id INT,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ice_ivm_target_${uuid0}.ns_${uuid0}.base_orders VALUES
-  (1, 10),
-  (2, 20);
+  ROW(1, 10),
+  ROW(2, 20);
 
 USE ice_ivm_target_${uuid0}.ns_${uuid0};
 
-CREATE MATERIALIZED VIEW target_mv
-DISTRIBUTED BY HASH(order_id) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT order_id, amount FROM base_orders;
+CREATE MATERIALIZED VIEW target_mv AS SELECT order_id, amount FROM base_orders;
 
 REFRESH MATERIALIZED VIEW target_mv;
 
@@ -87,6 +66,6 @@ SELECT COUNT() FROM target_mv;
 -- query 7
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE ice_ivm_target_${uuid0}.ns_${uuid0}.base_orders FORCE;
-DROP DATABASE ice_ivm_target_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_target_${uuid0}.ns_${uuid0}.base_orders ;
+DROP SCHEMA ice_ivm_target_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_target_${uuid0};

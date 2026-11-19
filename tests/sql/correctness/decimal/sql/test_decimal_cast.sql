@@ -25,22 +25,21 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-    k1 bigint NULL,
-    c_tinyint tinyint null,
-    c_int int null,
-    c_bigint bigint null,
-    c_largeint largeint null
-)
-TBLPROPERTIES ("format-version" = "3");
+    k1 bigint ,
+    c_tinyint tinyint ,
+    c_int int ,
+    c_bigint bigint ,
+    c_largeint largeint
+) WITH (format_version = 3);
 insert into ${case_db}.t1 values
-    (1, 127, 2147483647, 9223372036854775807, CAST('170141183460469231731687303715884105727' AS LARGEINT)),
-    (2, -128, -2147483648, -9223372036854775808, CAST('-170141183460469231731687303715884105728' AS LARGEINT)),
-    (3, null, null, null, null),
-    (4, 0, 0, 0, 0),
-    (5, 1, 1, 1, 1),
-    (6, -1, -1, -1, -1),
-    (7, 12, 214748364, 922337203685477580, CAST('17014118346046923173168730371588410572' AS LARGEINT)),
-    (8, -12, -214748364, -922337203685477580, CAST('-17014118346046923173168730371588410572' AS LARGEINT));
+    ROW(1, 127, 2147483647, 9223372036854775807, CAST('170141183460469231731687303715884105727' AS LARGEINT)),
+    ROW(2, -128, -2147483648, -9223372036854775808, CAST('-170141183460469231731687303715884105728' AS LARGEINT)),
+    ROW(3, null, null, null, null),
+    ROW(4, 0, 0, 0, 0),
+    ROW(5, 1, 1, 1, 1),
+    ROW(6, -1, -1, -1, -1),
+    ROW(7, 12, 214748364, 922337203685477580, CAST('17014118346046923173168730371588410572' AS LARGEINT)),
+    ROW(8, -12, -214748364, -922337203685477580, CAST('-17014118346046923173168730371588410572' AS LARGEINT));
 
 -- query 2
 select
@@ -103,10 +102,10 @@ from ${case_db}.t1
 order by k1;
 
 -- query 8
-select k1, c_tinyint * 0, c_int * 0, c_bigint * 0, CAST(c_largeint * 0 AS VARCHAR) AS `c_largeint * 0` from ${case_db}.t1 order by k1;
+select k1, c_tinyint * 0, c_int * 0, c_bigint * 0, CAST(c_largeint * 0 AS VARCHAR) AS "c_largeint * 0" from ${case_db}.t1 order by k1;
 
 -- query 9
-select k1, c_tinyint * 1, c_int * 1, c_bigint * 1, CAST(c_largeint * 1 AS VARCHAR) AS `c_largeint * 1` from ${case_db}.t1 order by k1;
+select k1, c_tinyint * 1, c_int * 1, c_bigint * 1, CAST(c_largeint * 1 AS VARCHAR) AS "c_largeint * 1" from ${case_db}.t1 order by k1;
 
 -- query 10
 select k1, cast(c_tinyint * 0 as decimal(38, 0)), cast(c_int * 0 as decimal(38, 0)), cast(c_bigint * 0 as decimal(38, 0)), cast(c_largeint * 0 as decimal(38, 0)) from ${case_db}.t1 order by k1;

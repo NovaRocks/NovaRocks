@@ -40,30 +40,29 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t1 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t1 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES (1, 'a');
+INSERT INTO ${case_db}.t1 VALUES ROW(1, 'a');
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES (2, 'b');
+INSERT INTO ${case_db}.t1 VALUES ROW(2, 'b');
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES (3, 'c');
+INSERT INTO ${case_db}.t1 VALUES ROW(3, 'c');
 
 -- query 5
 -- Sanity: 3 rows present before EXPIRE.
-SELECT COUNT() AS n FROM ${case_db}.t1;
+SELECT COUNT(*) AS n FROM ${case_db}.t1;
 
 -- query 6
 -- @skip_result_check=true
 -- EXPIRE OLDER THAN far-future date: all snapshots are on the live main chain
 -- so this is a noop.
-ALTER TABLE ${case_db}.t1 EXPIRE SNAPSHOTS OLDER THAN '2099-01-01 00:00:00';
+ALTER TABLE ${case_db}.t1 EXECUTE expire_snapshots(older_than => '2099-01-01 00:00:00');
 
 -- query 7
 -- All 3 rows must remain visible after the noop expire.
@@ -71,7 +70,7 @@ SELECT id, v FROM ${case_db}.t1 ORDER BY id;
 
 -- query 8
 -- Row count still 3 after noop expire.
-SELECT COUNT() AS n FROM ${case_db}.t1;
+SELECT COUNT(*) AS n FROM ${case_db}.t1;
 
 -- ---------------------------------------------------------------------------
 -- Case 2: RETAIN LAST clause syntax acceptance
@@ -81,33 +80,32 @@ SELECT COUNT() AS n FROM ${case_db}.t1;
 
 -- query 9
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t2 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t2 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 10
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2 VALUES (10, 'x');
+INSERT INTO ${case_db}.t2 VALUES ROW(10, 'x');
 
 -- query 11
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2 VALUES (20, 'y');
+INSERT INTO ${case_db}.t2 VALUES ROW(20, 'y');
 
 -- query 12
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2 VALUES (30, 'z');
+INSERT INTO ${case_db}.t2 VALUES ROW(30, 'z');
 
 -- query 13
 -- Baseline: 3 rows before EXPIRE.
-SELECT COUNT() AS n FROM ${case_db}.t2;
+SELECT COUNT(*) AS n FROM ${case_db}.t2;
 
 -- query 14
 -- @skip_result_check=true
 -- RETAIN LAST 1 on main-chain table: all snapshots are live, so noop.
-ALTER TABLE ${case_db}.t2 EXPIRE SNAPSHOTS RETAIN LAST 1;
+ALTER TABLE ${case_db}.t2 EXECUTE expire_snapshots(retain_last => 1);
 
 -- query 15
 -- After noop EXPIRE: all 3 rows still present.
-SELECT COUNT() AS n FROM ${case_db}.t2;
+SELECT COUNT(*) AS n FROM ${case_db}.t2;
 
 -- ---------------------------------------------------------------------------
 -- Case 3: Both clauses together (OLDER THAN + RETAIN LAST)
@@ -116,21 +114,20 @@ SELECT COUNT() AS n FROM ${case_db}.t2;
 
 -- query 16
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t3 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t3 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 17
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t3 VALUES (1, 'p');
+INSERT INTO ${case_db}.t3 VALUES ROW(1, 'p');
 
 -- query 18
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t3 VALUES (2, 'q');
+INSERT INTO ${case_db}.t3 VALUES ROW(2, 'q');
 
 -- query 19
 -- @skip_result_check=true
 -- Both clauses: OLDER THAN and RETAIN LAST together.
-ALTER TABLE ${case_db}.t3 EXPIRE SNAPSHOTS OLDER THAN '2026-01-01 00:00:00' RETAIN LAST 5;
+ALTER TABLE ${case_db}.t3 EXECUTE expire_snapshots(older_than => '2026-01-01 00:00:00', retain_last => 5);
 
 -- query 20
 -- Data intact after combined-clause expire.
@@ -144,39 +141,38 @@ SELECT id, v FROM ${case_db}.t3 ORDER BY id;
 
 -- query 21
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t4 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t4 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 22
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t4 VALUES (1, 'alpha');
+INSERT INTO ${case_db}.t4 VALUES ROW(1, 'alpha');
 
 -- query 23
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t4 VALUES (2, 'beta');
+INSERT INTO ${case_db}.t4 VALUES ROW(2, 'beta');
 
 -- query 24
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t4 VALUES (3, 'gamma');
+INSERT INTO ${case_db}.t4 VALUES ROW(3, 'gamma');
 
 -- query 25
 -- @skip_result_check=true
 -- Create a branch pointing at current snapshot (3-part name required for ref DDL).
-ALTER TABLE iceberg_cat_${suite_uuid0}.${case_db}.t4 CREATE BRANCH dev;
+CREATE BRANCH dev IN TABLE iceberg_cat_${suite_uuid0}.${case_db}.t4;
 
 -- query 26
 -- @skip_result_check=true
 -- Create a tag pointing at current snapshot (3-part name required for ref DDL).
-ALTER TABLE iceberg_cat_${suite_uuid0}.${case_db}.t4 CREATE TAG release_v1;
+ALTER TABLE iceberg_cat_${suite_uuid0}.${case_db}.t4 EXECUTE create_tag(name => 'release_v1', replace => false, if_not_exists => false);
 
 -- query 27
 -- 3 rows visible through main branch.
-SELECT COUNT() AS n FROM ${case_db}.t4;
+SELECT COUNT(*) AS n FROM ${case_db}.t4;
 
 -- query 28
 -- @skip_result_check=true
 -- EXPIRE: all snapshots protected by main + branch + tag, noop.
-ALTER TABLE ${case_db}.t4 EXPIRE SNAPSHOTS OLDER THAN '2099-01-01 00:00:00';
+ALTER TABLE ${case_db}.t4 EXECUTE expire_snapshots(older_than => '2099-01-01 00:00:00');
 
 -- query 29
 -- Data unchanged after noop expire with branch+tag present.
@@ -189,11 +185,10 @@ SELECT id, v FROM ${case_db}.t4 ORDER BY id;
 
 -- query 30
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t5 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "2");
+CREATE TABLE ${case_db}.t5 (id INT, v VARCHAR(16)) WITH (format_version = 2);
 
 -- query 31
--- @expect_error=requires at least
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 ALTER TABLE ${case_db}.t5 EXPIRE SNAPSHOTS;
 
 -- ---------------------------------------------------------------------------
@@ -203,12 +198,11 @@ ALTER TABLE ${case_db}.t5 EXPIRE SNAPSHOTS;
 
 -- query 32
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t6 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "2");
+CREATE TABLE ${case_db}.t6 (id INT, v VARCHAR(16)) WITH (format_version = 2);
 
 -- query 33
 -- @expect_error=must be >= 1
-ALTER TABLE ${case_db}.t6 EXPIRE SNAPSHOTS RETAIN LAST 0;
+ALTER TABLE ${case_db}.t6 EXECUTE expire_snapshots(retain_last => 0);
 
 -- ---------------------------------------------------------------------------
 -- Case 7: Branch suffix -> reject
@@ -217,12 +211,11 @@ ALTER TABLE ${case_db}.t6 EXPIRE SNAPSHOTS RETAIN LAST 0;
 
 -- query 34
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t7 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t7 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 35
 -- @expect_error=does not support branch
-ALTER TABLE ${case_db}.t7.branch_dev EXPIRE SNAPSHOTS RETAIN LAST 5;
+ALTER TABLE ${case_db}.t7.branch_dev EXECUTE expire_snapshots(retain_last => 5);
 
 -- ---------------------------------------------------------------------------
 -- Case 8: V2 table support
@@ -231,25 +224,24 @@ ALTER TABLE ${case_db}.t7.branch_dev EXPIRE SNAPSHOTS RETAIN LAST 5;
 
 -- query 36
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t8 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "2");
+CREATE TABLE ${case_db}.t8 (id INT, v VARCHAR(16)) WITH (format_version = 2);
 
 -- query 37
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t8 VALUES (1, 'first');
+INSERT INTO ${case_db}.t8 VALUES ROW(1, 'first');
 
 -- query 38
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t8 VALUES (2, 'second');
+INSERT INTO ${case_db}.t8 VALUES ROW(2, 'second');
 
 -- query 39
 -- Baseline before EXPIRE on v2 table.
-SELECT COUNT() AS n FROM ${case_db}.t8;
+SELECT COUNT(*) AS n FROM ${case_db}.t8;
 
 -- query 40
 -- @skip_result_check=true
 -- EXPIRE on v2 table: noop (all live) and no error.
-ALTER TABLE ${case_db}.t8 EXPIRE SNAPSHOTS OLDER THAN '2099-01-01 00:00:00';
+ALTER TABLE ${case_db}.t8 EXECUTE expire_snapshots(older_than => '2099-01-01 00:00:00');
 
 -- query 41
 -- Data intact after EXPIRE on v2 table.
@@ -262,23 +254,22 @@ SELECT id, v FROM ${case_db}.t8 ORDER BY id;
 
 -- query 42
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t9 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t9 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 43
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t9 VALUES (1, 'one');
+INSERT INTO ${case_db}.t9 VALUES ROW(1, 'one');
 
 -- query 44
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t9 VALUES (2, 'two');
+INSERT INTO ${case_db}.t9 VALUES ROW(2, 'two');
 
 -- query 45
 -- @skip_result_check=true
 -- Epoch-ms integer form: 1700000000000 is 2023-11-14 which is before our data.
 -- All our snapshots are newer than that cutoff but they are on the live chain
 -- so they are still protected and this remains a noop in practice.
-ALTER TABLE ${case_db}.t9 EXPIRE SNAPSHOTS OLDER THAN 1700000000000;
+ALTER TABLE ${case_db}.t9 EXECUTE expire_snapshots(older_than => 1700000000000);
 
 -- query 46
 -- Data intact after epoch-ms EXPIRE.
@@ -291,16 +282,15 @@ SELECT id, v FROM ${case_db}.t9 ORDER BY id;
 
 -- query 47
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t10 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t10 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 48
--- @expect_error=duplicate
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 ALTER TABLE ${case_db}.t10 EXPIRE SNAPSHOTS OLDER THAN '2026-01-01 00:00:00' OLDER THAN '2026-02-01 00:00:00';
 
 -- query 49
 -- A syntax rejection must not remove the target table.
-SELECT COUNT() AS n FROM ${case_db}.t10;
+SELECT COUNT(*) AS n FROM ${case_db}.t10;
 
 -- ---------------------------------------------------------------------------
 -- Case 11: After EXPIRE, table still readable + INSERT works
@@ -310,26 +300,25 @@ SELECT COUNT() AS n FROM ${case_db}.t10;
 
 -- query 50
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t11 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t11 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 51
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t11 VALUES (1, 'row1');
+INSERT INTO ${case_db}.t11 VALUES ROW(1, 'row1');
 
 -- query 52
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t11 VALUES (2, 'row2');
+INSERT INTO ${case_db}.t11 VALUES ROW(2, 'row2');
 
 -- query 53
 -- @skip_result_check=true
 -- EXPIRE noop: all snapshots live.
-ALTER TABLE ${case_db}.t11 EXPIRE SNAPSHOTS OLDER THAN '2099-01-01 00:00:00';
+ALTER TABLE ${case_db}.t11 EXECUTE expire_snapshots(older_than => '2099-01-01 00:00:00');
 
 -- query 54
 -- @skip_result_check=true
 -- INSERT after EXPIRE proves snapshot parent chain is healthy.
-INSERT INTO ${case_db}.t11 VALUES (3, 'row3');
+INSERT INTO ${case_db}.t11 VALUES ROW(3, 'row3');
 
 -- query 55
 -- All 3 rows visible: pre-EXPIRE rows plus the post-EXPIRE INSERT.
@@ -337,4 +326,4 @@ SELECT id, v FROM ${case_db}.t11 ORDER BY id;
 
 -- query 56
 -- Total row count confirms no data loss.
-SELECT COUNT() AS n FROM ${case_db}.t11;
+SELECT COUNT(*) AS n FROM ${case_db}.t11;

@@ -29,25 +29,23 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_inner_null_key_r;
 CREATE TABLE ${case_db}.t_rf_inner_null_key_l (
     id INT,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_inner_null_key_r (
     k INT,
     tag VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_rf_inner_null_key_l VALUES
-    (1, 10),
-    (2, 20),
-    (3, NULL),
-    (4, 30),
-    (5, NULL);
+    ROW(1, 10),
+    ROW(2, 20),
+    ROW(3, NULL),
+    ROW(4, 30),
+    ROW(5, NULL);
 
 INSERT INTO ${case_db}.t_rf_inner_null_key_r VALUES
-    (10, 'r10'),
-    (NULL, 'rnull'),
-    (30, 'r30');
+    ROW(10, 'r10'),
+    ROW(NULL, 'rnull'),
+    ROW(30, 'r30');
 
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding

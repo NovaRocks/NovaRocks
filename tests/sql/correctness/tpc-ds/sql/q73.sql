@@ -23,7 +23,7 @@ select c_last_name
        ,cnt from
    (select ss_ticket_number
           ,ss_customer_sk
-          ,count() cnt
+          ,count(*) cnt
     from store_sales,date_dim,store,household_demographics
     where store_sales.ss_sold_date_sk = date_dim.d_date_sk
     and store_sales.ss_store_sk = store.s_store_sk  

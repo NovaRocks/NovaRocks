@@ -24,4 +24,4 @@
 select bitmap_to_base64(null);
 
 -- query 2
-select bitmap_to_base64(bitmap_from_string("abc"));
+select bitmap_to_base64(bitmap_from_string('abc'));

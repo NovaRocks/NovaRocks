@@ -32,14 +32,12 @@
 CREATE TABLE ${case_db}.rf_dist_part_probe (
     id INT NOT NULL,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.rf_dist_part_build (
     k INT,
     flag VARCHAR(8)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- 2000 probe rows, key space 0..199 (10 probe rows per key).
 INSERT INTO ${case_db}.rf_dist_part_probe
@@ -65,19 +63,19 @@ SELECT generate_series % 200 AS k,
        CASE WHEN (generate_series % 200) % 2 = 0 THEN 'Y' ELSE 'N' END AS flag
 FROM TABLE(generate_series(135, 200));
 
-ANALYZE TABLE ${case_db}.rf_dist_part_probe;
-ANALYZE TABLE ${case_db}.rf_dist_part_build;
+ANALYZE ${case_db}.rf_dist_part_probe;
+ANALYZE ${case_db}.rf_dist_part_build;
 
 -- Force a Shuffle (PARTITIONED) hash join: make broadcast prohibitively
 -- expensive, and relax the RF build-size/selectivity gates so the M2 probe
 -- placement is exercised deterministically regardless of ANALYZE stats
 -- shape (mirrors tests/sql/correctness/optimizer/sql/runtime_filter_cross_fragment_shuffle.sql).
-SET global_runtime_filter_build_max_size = 10737418240;
-SET global_runtime_filter_probe_min_selectivity = 0.0;
-SET cbo_broadcast_node_mem_budget_bytes = 0;
+SET SESSION global_runtime_filter_build_max_size = 10737418240;
+SET SESSION global_runtime_filter_probe_min_selectivity = 0.0;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 0;
 
-SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT 'partitioned_probe' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SET SESSION disable_optimizer_rules = 'RuntimeFilterPushDown';
+SELECT 'partitioned_probe' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_part_probe p
 JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -86,12 +84,12 @@ WHERE b.flag = 'Y';
 -- @normalize_explain_timing=true
 -- @result_not_contains=RuntimeFilterApply:
 EXPLAIN ANALYZE
-SELECT COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_part_probe p
 JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k
 WHERE b.flag = 'Y';
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_contains=HASH_PARTITIONED (p.k)
 -- @explain_contains=HASH_PARTITIONED (b.k)
@@ -107,7 +105,7 @@ SET disable_optimizer_rules = '';
 -- @expect_runtime_filter_total_at_least=transport_sent_count,1
 -- @expect_runtime_filter_total_at_least=transport_acked_count,1
 -- @expect_runtime_filter_total_at_least=consumer_input_rows,1
-SELECT 'partitioned_probe' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'partitioned_probe' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_part_probe p
 JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -118,7 +116,7 @@ WHERE b.flag = 'Y';
 -- @result_contains=Profile: tasks=
 -- @result_contains=HASH JOIN (PARTITIONED
 EXPLAIN ANALYZE
-SELECT COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_part_probe p
 JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -126,8 +124,8 @@ WHERE b.flag = 'Y';
 -- The preceding @explain_contains directives already assert this plan shape.
 -- Do not golden unstable query-local runtime-filter channel/binding ids.
 -- @skip_result_check=true
-EXPLAIN VERBOSE
-SELECT 'partitioned_probe' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT 'partitioned_probe' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_part_probe p
 JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k
 WHERE b.flag = 'Y';
@@ -135,27 +133,27 @@ WHERE b.flag = 'Y';
 -- Add nullable rows only after the existing ordinary-equality proof so its
 -- stable row-count and RuntimeFilterApply assertions remain unchanged.
 INSERT INTO ${case_db}.rf_dist_part_probe VALUES
-    (2001, NULL),
-    (2002, NULL);
+    ROW(2001, NULL),
+    ROW(2002, NULL);
 
 INSERT INTO ${case_db}.rf_dist_part_build VALUES
-    (NULL, 'Y');
+    ROW(NULL, 'Y');
 
-ANALYZE TABLE ${case_db}.rf_dist_part_probe;
-ANALYZE TABLE ${case_db}.rf_dist_part_build;
+ANALYZE ${case_db}.rf_dist_part_probe;
+ANALYZE ${case_db}.rf_dist_part_build;
 
-SET disable_optimizer_rules = 'RuntimeFilterPushDown';
+SET SESSION disable_optimizer_rules = 'RuntimeFilterPushDown';
 -- @result_contains=partitioned_null_safe_ok
 SELECT CASE
-         WHEN COUNT() = 2 AND COALESCE(SUM(p.id), 0) = 4003
+         WHEN COUNT(*) = 2 AND COALESCE(SUM(p.id), 0) = 4003
            THEN 'partitioned_null_safe_ok'
          ELSE 'partitioned_null_safe_bad'
        END AS verdict
 FROM ${case_db}.rf_dist_part_probe p
-JOIN ${case_db}.rf_dist_part_build b ON p.k <=> b.k
+JOIN ${case_db}.rf_dist_part_build b ON p.k  IS NOT DISTINCT FROM  b.k
 WHERE p.id >= 2001 AND b.flag = 'Y';
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 -- @result_contains=partitioned_null_safe_ok
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_contains=HASH_PARTITIONED (p.k)
@@ -173,10 +171,10 @@ SET disable_optimizer_rules = '';
 -- @expect_runtime_filter_total_at_least=transport_acked_count,1
 -- @expect_runtime_filter_total_at_least=consumer_input_rows,1
 SELECT CASE
-         WHEN COUNT() = 2 AND COALESCE(SUM(p.id), 0) = 4003
+         WHEN COUNT(*) = 2 AND COALESCE(SUM(p.id), 0) = 4003
            THEN 'partitioned_null_safe_ok'
          ELSE 'partitioned_null_safe_bad'
        END AS verdict
 FROM ${case_db}.rf_dist_part_probe p
-JOIN ${case_db}.rf_dist_part_build b ON p.k <=> b.k
+JOIN ${case_db}.rf_dist_part_build b ON p.k  IS NOT DISTINCT FROM  b.k
 WHERE p.id >= 2001 AND b.flag = 'Y';

@@ -30,10 +30,7 @@ CREATE TABLE ${case_db}.t_decimal_insert_sink (
   id BIGINT,
   v DECIMAL(10, 3)
 );
-INSERT INTO ${case_db}.t_decimal_insert_src VALUES
-  (1, 123.456000),
-  (2, -99.125000),
-  (3, NULL);
+INSERT INTO ${case_db}.t_decimal_insert_src VALUES ROW(1, DECIMAL '123.456000'), ROW(2, (- (DECIMAL '99.125000'))), ROW(3, NULL);
 INSERT INTO ${case_db}.t_decimal_insert_sink
 SELECT id, v
 FROM ${case_db}.t_decimal_insert_src;

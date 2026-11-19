@@ -37,28 +37,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvrw_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvrw_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvrw_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
@@ -67,13 +50,13 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.user_tags (
   user_id INT,
   user_name STRING,
   tag_id INT
-) TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- Commit v3 lineage, then leave the source empty for every initial COUNT
 -- oracle. A zero-row INSERT can be a no-op without a snapshot.
 -- @skip_result_check=true
-INSERT INTO mvrw_${uuid0}.ns_${uuid0}.user_tags VALUES ('seed', 0, 'seed', 0);
+INSERT INTO mvrw_${uuid0}.ns_${uuid0}.user_tags VALUES ROW('seed', 0, 'seed', 0);
 DELETE FROM mvrw_${uuid0}.ns_${uuid0}.user_tags WHERE dt = 'seed';
 
 -- query 5
@@ -85,14 +68,11 @@ USE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW cnt_mv
-DISTRIBUTED BY HASH(user_id) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT user_id, dt, COUNT(tag_id) AS cnt FROM user_tags GROUP BY user_id, dt;
+CREATE MATERIALIZED VIEW cnt_mv AS SELECT user_id, dt, COUNT(tag_id) AS cnt FROM user_tags GROUP BY user_id, dt;
 
 -- query 8
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW cnt_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW cnt_mv;
 
 -- query 9
 -- scalar COUNT over the empty table: exactly one row of 0
@@ -117,7 +97,7 @@ SELECT COUNT(user_id) AS c FROM user_tags;
 
 -- query 14
 -- @skip_result_check=true
-INSERT INTO mvrw_${uuid0}.ns_${uuid0}.user_tags VALUES ('2023-04-13', 1, 'a', 1);
+INSERT INTO mvrw_${uuid0}.ns_${uuid0}.user_tags VALUES ROW('2023-04-13', 1, 'a', 1);
 
 -- query 15
 -- base advanced past the MV pin -> strict freshness MISS
@@ -139,7 +119,7 @@ SELECT user_id, COUNT(tag_id) AS c FROM user_tags GROUP BY user_id ORDER BY user
 
 -- query 19
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW cnt_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW cnt_mv;
 
 -- query 20
 -- fresh again: results stay correct (rewrite eligibility restored; the CBO
@@ -165,12 +145,12 @@ DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.cnt_mv;
 -- query 25
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.user_tags FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.user_tags ;
 
 -- query 26
 -- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
+DROP SCHEMA IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 27
 -- @cleanup=true

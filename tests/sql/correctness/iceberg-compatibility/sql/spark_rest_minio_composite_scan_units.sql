@@ -39,7 +39,7 @@ done
 printf 'SPARK_SQL_OK\n'
 
 -- query 2
-SELECT count() AS n_data_files
+SELECT count(*) AS n_data_files
 FROM iceberg_compat_${suite_uuid0}.${case_db}."composite_units_${uuid0}$files"
 WHERE content = 0;
 
@@ -47,9 +47,9 @@ WHERE content = 0;
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN,12
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE,12
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN,12
-SELECT count() AS rows
+SELECT count(*) AS rows
 FROM iceberg_compat_${suite_uuid0}.${case_db}.composite_units_${uuid0};
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.composite_units_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.composite_units_${uuid0} ;

@@ -136,8 +136,7 @@ SELECT bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(group_concat(c
 CREATE TABLE ${case_db}.test_bitmap_table1(
     k1 INT,
     v1 BITMAP
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 37
 -- @skip_result_check=true

@@ -25,25 +25,8 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG trc_metadata_${uuid0}
-PROPERTIES (
-    "type"="iceberg",
-    "iceberg.catalog.type"="rest",
-    "uri"="${iceberg_rest_uri}",
-    "warehouse"="${iceberg_rest_warehouse}",
-    "credential.object-store-metadata.consumer-role" = "frontend",
-    "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-    "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-    "credential.object-store-data.consumer-role" = "backend",
-    "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-    "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-    "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.region"="${oss_region}",
-    "aws.s3.enable_path_style_access"="${oss_path_style}"
-);
-CREATE DATABASE trc_metadata_${uuid0}.metadata_${uuid0};
+CREATE CATALOG trc_metadata_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA trc_metadata_${uuid0}.metadata_${uuid0};
 CREATE TABLE trc_metadata_${uuid0}.metadata_${uuid0}.metadata_base (a BIGINT);
 CREATE VIEW trc_metadata_${uuid0}.metadata_${uuid0}.metadata_view
 AS SELECT a FROM trc_metadata_${uuid0}.metadata_${uuid0}.metadata_base;
@@ -102,8 +85,7 @@ SELECT a FROM trc_metadata_${uuid0}.metadata_${uuid0}.metadata_base ORDER BY a;
 
 -- query 11
 -- @skip_result_check=true
-CREATE TABLE trc_metadata_${uuid0}.metadata_${uuid0}.metadata_capture AS
-SELECT table_name, table_type FROM system.information_schema.tables
+CREATE TABLE trc_metadata_${uuid0}.metadata_${uuid0}.metadata_capture AS SELECT table_name, table_type FROM system.information_schema.tables
 WHERE table_schema = 'metadata' AND table_name = 'materialized_views';
 
 -- query 12
@@ -117,5 +99,5 @@ DROP VIEW IF EXISTS trc_metadata_${uuid0}.metadata_${uuid0}.metadata_view;
 DROP TABLE IF EXISTS trc_metadata_${uuid0}.metadata_${uuid0}.metadata_capture;
 DROP TABLE IF EXISTS trc_metadata_${uuid0}.metadata_${uuid0}.metadata_base;
 USE iceberg_ddl_cat_${suite_uuid0}.${case_db};
-DROP DATABASE IF EXISTS trc_metadata_${uuid0}.metadata_${uuid0};
+DROP SCHEMA IF EXISTS trc_metadata_${uuid0}.metadata_${uuid0};
 DROP CATALOG trc_metadata_${uuid0};

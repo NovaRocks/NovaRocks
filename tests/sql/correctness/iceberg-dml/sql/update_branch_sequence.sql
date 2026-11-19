@@ -23,12 +23,10 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_update_ref_sequence (id BIGINT, v STRING)
-TBLPROPERTIES ("format-version" = "3",
- "write.update.mode" = "copy-on-write");
-INSERT INTO ${case_db}.t_update_ref_sequence VALUES (1, 'a'), (2, 'b');
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_update_ref_sequence CREATE BRANCH dev;
-INSERT INTO ${case_db}.t_update_ref_sequence.branch_dev VALUES (3, 'dev');
+CREATE TABLE ${case_db}.t_update_ref_sequence (id BIGINT, v STRING) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.update.mode'], ARRAY['copy-on-write']));
+INSERT INTO ${case_db}.t_update_ref_sequence VALUES ROW(1, 'a'), ROW(2, 'b');
+CREATE BRANCH dev IN TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_update_ref_sequence;
+INSERT INTO ${case_db}.t_update_ref_sequence @dev VALUES (3, 'dev');
 
 -- query 2
 SELECT id, v FROM ${case_db}.t_update_ref_sequence ORDER BY id;
@@ -44,15 +42,15 @@ SELECT id, v FROM ${case_db}.t_update_ref_sequence ORDER BY id;
 SELECT id, v FROM ${case_db}.t_update_ref_sequence FOR VERSION AS OF 'dev' ORDER BY id;
 
 -- query 6
-SELECT COUNT() AS preserved_row_ids FROM ${case_db}.t_update_ref_sequence cur
+SELECT COUNT(*) AS preserved_row_ids FROM ${case_db}.t_update_ref_sequence cur
 JOIN (SELECT id, _row_id AS rid FROM ${case_db}.t_update_ref_sequence
  FOR VERSION AS OF 'dev') old ON cur.id = old.id AND cur._row_id = old.rid;
 
 -- query 7
 -- The legacy copy-on-write property is ignored: UPDATE published a delete artifact.
-SELECT count() > 0 AS has_delete_artifacts
+SELECT count(*) > 0 AS has_delete_artifacts
 FROM ${case_db}."t_update_ref_sequence$files" WHERE content=1;
 
 -- query 8
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_update_ref_sequence FORCE;
+DROP TABLE ${case_db}.t_update_ref_sequence ;

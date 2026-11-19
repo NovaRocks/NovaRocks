@@ -28,29 +28,19 @@ CREATE TABLE ${case_db}.trc_l7_measurements (
   d DECIMAL(20, 4),
   s STRING,
   ts DATETIME
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
--- @expect_error=Iceberg IMV refresh contract requires exactly one argument for aggregate function `avg`
-CREATE MATERIALIZED VIEW ${case_db}.trc_l7_bad_avg_star
-DISTRIBUTED BY HASH(k) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k, AVG(*) AS invalid_avg FROM ${case_db}.trc_l7_measurements GROUP BY k;
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+CREATE MATERIALIZED VIEW ${case_db}.trc_l7_bad_avg_star AS SELECT k, AVG(*) AS invalid_avg FROM ${case_db}.trc_l7_measurements GROUP BY k;
 
 -- query 3
 -- @expect_trino_error=MISSING_COLUMN_NAME,USER_ERROR
-CREATE MATERIALIZED VIEW ${case_db}.trc_l7_bad_avg_string
-DISTRIBUTED BY HASH(k) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k, AVG(s) FROM ${case_db}.trc_l7_measurements GROUP BY k;
+CREATE MATERIALIZED VIEW ${case_db}.trc_l7_bad_avg_string AS SELECT k, AVG(s) FROM ${case_db}.trc_l7_measurements GROUP BY k;
 
 -- query 4
--- @expect_error=Iceberg IMV refresh contract requires exactly one argument for aggregate function `min`
-CREATE MATERIALIZED VIEW ${case_db}.trc_l7_bad_min_star
-DISTRIBUTED BY HASH(k) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k, MIN(*) AS invalid_min FROM ${case_db}.trc_l7_measurements GROUP BY k;
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+CREATE MATERIALIZED VIEW ${case_db}.trc_l7_bad_min_star AS SELECT k, MIN(*) AS invalid_min FROM ${case_db}.trc_l7_measurements GROUP BY k;
 
 -- query 5
 -- @cleanup=true
@@ -58,4 +48,4 @@ AS SELECT k, MIN(*) AS invalid_min FROM ${case_db}.trc_l7_measurements GROUP BY 
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_avg_star;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_avg_string;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_min_star;
-DROP TABLE ${case_db}.trc_l7_measurements FORCE;
+DROP TABLE ${case_db}.trc_l7_measurements ;

@@ -16,7 +16,7 @@
 -- under the License.
 
 -- @tags=optimizer,bc1,distribution
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
 CREATE TABLE probe_1m (k INT, v BIGINT);
 CREATE TABLE build_1000 (k INT);
@@ -24,13 +24,13 @@ INSERT INTO probe_1m
     SELECT generate_series, generate_series FROM TABLE(generate_series(1, 1000000));
 INSERT INTO build_1000
     SELECT generate_series FROM TABLE(generate_series(1, 1000));
-ANALYZE TABLE probe_1m;
-ANALYZE TABLE build_1000;
-SET cbo_broadcast_backend_count = 3;
-SET cbo_broadcast_node_mem_budget_bytes = 268435456;
+ANALYZE probe_1m;
+ANALYZE build_1000;
+SET SESSION cbo_broadcast_backend_count = 3;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (BROADCAST
 -- @explain_contains=bcast_verdict=feasible
 SELECT COUNT() AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT COUNT() AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;

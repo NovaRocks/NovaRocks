@@ -20,12 +20,12 @@
 -- Lock in compact consecutive TopN planning and the rule-disable escape hatch.
 
 -- query 1
-SET disable_optimizer_rules = 'SplitTopN';
+SET SESSION disable_optimizer_rules = 'SplitTopN';
 
 -- query 2
 -- @explain_contains=TOP-N
 -- @explain_contains=stats={rows=
-EXPLAIN VERBOSE SELECT *
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT *
 FROM (
     SELECT id, score
     FROM (
@@ -41,11 +41,11 @@ ORDER BY score DESC, id ASC
 LIMIT 2;
 
 -- query 3
-SET disable_optimizer_rules = 'SplitTopN,PushTopNThroughProject,MergeConsecutiveTopN';
+SET SESSION disable_optimizer_rules = 'SplitTopN,PushTopNThroughProject,MergeConsecutiveTopN';
 
 -- query 4
 -- @explain_contains=TOP-N
-EXPLAIN VERBOSE SELECT *
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT *
 FROM (
     SELECT id, score
     FROM (
@@ -61,4 +61,4 @@ ORDER BY score DESC, id ASC
 LIMIT 2;
 
 -- query 5
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

@@ -29,22 +29,22 @@ CREATE TABLE ${case_db}.t_merge_target (
   city_id INT,
   population INT,
   city STRING
-) TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_merge_source (
   city_id INT,
   population INT,
   city STRING
-) TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_merge_target VALUES
-  (1, 100, 'Beijing'),
-  (2, 200, 'Shanghai');
+  ROW(1, 100, 'Beijing'),
+  ROW(2, 200, 'Shanghai');
 INSERT INTO ${case_db}.t_merge_source VALUES
-  (2, 250, 'Shanghai-updated'),
-  (3, 300, 'Shenzhen');
+  ROW(2, 250, 'Shanghai-updated'),
+  ROW(3, 300, 'Shenzhen');
 
 -- query 2
 -- Atomicity proof: capture the snapshot count immediately before the MERGE.
-SELECT count() AS snaps_before_merge
+SELECT count(*) AS snaps_before_merge
 FROM ${case_db}."t_merge_target$snapshots";
 
 -- query 3
@@ -58,7 +58,7 @@ MERGE INTO ${case_db}.t_merge_target AS t
 -- query 4
 -- Atomicity proof: the MATCHED UPDATE and NOT-MATCHED INSERT fold into a
 -- single Iceberg snapshot, so snaps_after_merge - snaps_before_merge MUST be 1.
-SELECT count() AS snaps_after_merge
+SELECT count(*) AS snaps_after_merge
 FROM ${case_db}."t_merge_target$snapshots";
 
 -- query 5
@@ -74,7 +74,7 @@ WHERE city_id = 1;
 -- query 7
 -- The follow-up standalone DELETE is its own snapshot, so this count is
 -- snaps_after_merge + 1.
-SELECT count() AS snaps_after_delete
+SELECT count(*) AS snaps_after_delete
 FROM ${case_db}."t_merge_target$snapshots";
 
 -- query 8

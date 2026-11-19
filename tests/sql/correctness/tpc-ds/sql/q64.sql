@@ -20,7 +20,7 @@
 -- per-BE pipeline fan-out at one so the 1FE+3BE correctness run stays within
 -- the fixed CI timeout while preserving the standard result contract.
 -- @skip_result_check=true
-SET pipeline_dop = 1;
+SET SESSION pipeline_dop = 1;
 
 -- query 2
 with cs_ui as

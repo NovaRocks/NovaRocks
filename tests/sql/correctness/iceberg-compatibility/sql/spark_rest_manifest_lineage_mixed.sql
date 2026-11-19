@@ -22,7 +22,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
+CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 
 -- query 2
 -- @result_contains=UEA4G_FIXTURE_OK
@@ -33,7 +33,7 @@ receipt_dir="$(mktemp -d "$repo/logs/rwm14/mixed-${uuid0}-XXXXXX")"
 "$repo/tests/sql/fixtures/iceberg-delete-applicability/run.sh" --mode lineage --lineage-phase mixed --namespace ${case_db} --prefix rwm14_${uuid0} --output "$receipt_dir"
 
 -- query 3
-SELECT value, COUNT() AS rows_in_file, MIN(_row_id) AS first_id, MAX(_row_id) AS last_id,
+SELECT value, COUNT(*) AS rows_in_file, MIN(_row_id) AS first_id, MAX(_row_id) AS last_id,
        MIN(_last_updated_sequence_number) AS sequence_number
 FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_mixed
 WHERE id > 0 GROUP BY value ORDER BY value;
@@ -47,4 +47,4 @@ WHERE record_count IN (10, 25, 50) ORDER BY record_count;
 -- owned scratch namespace to the runner's actual-exit cleanup.
 -- query 5
 -- @skip_result_check=true
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_mixed FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_mixed ;

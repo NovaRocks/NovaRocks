@@ -32,23 +32,22 @@ CREATE TABLE ${case_db}.t_replace_partition (
   id BIGINT,
   ts DATETIME,
   val DOUBLE
-)
-PARTITION BY month(ts);
+) WITH (partitioning = ARRAY['month(ts)']);
 INSERT INTO ${case_db}.t_replace_partition VALUES
-  (1, '2024-01-15 10:00:00', 10.0),
-  (2, '2024-01-20 11:00:00', 20.0),
-  (3, '2024-02-10 12:00:00', 30.0);
-ALTER TABLE ${case_db}.t_replace_partition DROP PARTITION COLUMN month(ts);
-ALTER TABLE ${case_db}.t_replace_partition ADD PARTITION COLUMN day(ts);
+  ROW(1, '2024-01-15 10:00:00', 10.0),
+  ROW(2, '2024-01-20 11:00:00', 20.0),
+  ROW(3, '2024-02-10 12:00:00', 30.0);
+ALTER TABLE ${case_db}.t_replace_partition SET PROPERTIES partitioning = ARRAY[];
+ALTER TABLE ${case_db}.t_replace_partition SET PROPERTIES partitioning = ARRAY['day(ts)'];
 INSERT INTO ${case_db}.t_replace_partition VALUES
-  (4, '2024-01-15 13:00:00', 40.0),
-  (5, '2024-02-10 14:00:00', 50.0),
-  (6, '2024-03-05 15:00:00', 60.0);
-SELECT COUNT() AS cnt, SUM(val) AS sum_val FROM ${case_db}.t_replace_partition;
+  ROW(4, '2024-01-15 13:00:00', 40.0),
+  ROW(5, '2024-02-10 14:00:00', 50.0),
+  ROW(6, '2024-03-05 15:00:00', 60.0);
+SELECT COUNT(*) AS cnt, SUM(val) AS sum_val FROM ${case_db}.t_replace_partition;
 
 -- query 2
 -- Verify grouping by month still works across both partition specs.
-SELECT DATE_FORMAT(ts, '%Y-%m') AS ym, COUNT() AS cnt, SUM(val) AS sum_val
+SELECT DATE_FORMAT(ts, '%Y-%m') AS ym, COUNT(*) AS cnt, SUM(val) AS sum_val
 FROM ${case_db}.t_replace_partition
 GROUP BY DATE_FORMAT(ts, '%Y-%m')
 ORDER BY ym;
@@ -66,22 +65,21 @@ CREATE TABLE ${case_db}.t_replace_identity_to_bucket (
   id BIGINT,
   city STRING,
   amount DOUBLE
-)
-PARTITION BY (city);
+) WITH (partitioning = ARRAY['city']);
 INSERT INTO ${case_db}.t_replace_identity_to_bucket VALUES
-  (1, 'Beijing', 100.0),
-  (2, 'Shanghai', 200.0),
-  (3, 'Beijing', 150.0);
-ALTER TABLE ${case_db}.t_replace_identity_to_bucket DROP PARTITION COLUMN city;
-ALTER TABLE ${case_db}.t_replace_identity_to_bucket ADD PARTITION COLUMN bucket(city, 4);
+  ROW(1, 'Beijing', 100.0),
+  ROW(2, 'Shanghai', 200.0),
+  ROW(3, 'Beijing', 150.0);
+ALTER TABLE ${case_db}.t_replace_identity_to_bucket SET PROPERTIES partitioning = ARRAY[];
+ALTER TABLE ${case_db}.t_replace_identity_to_bucket SET PROPERTIES partitioning = ARRAY['bucket(city, 4)'];
 INSERT INTO ${case_db}.t_replace_identity_to_bucket VALUES
-  (4, 'Guangzhou', 300.0),
-  (5, 'Beijing', 250.0);
-SELECT COUNT() AS cnt, SUM(amount) AS total FROM ${case_db}.t_replace_identity_to_bucket;
+  ROW(4, 'Guangzhou', 300.0),
+  ROW(5, 'Beijing', 250.0);
+SELECT COUNT(*) AS cnt, SUM(amount) AS total FROM ${case_db}.t_replace_identity_to_bucket;
 
 -- query 5
 -- Verify group-by on the original column works after replace.
-SELECT city, COUNT() AS cnt, SUM(amount) AS total
+SELECT city, COUNT(*) AS cnt, SUM(amount) AS total
 FROM ${case_db}.t_replace_identity_to_bucket
 GROUP BY city
 ORDER BY city;
@@ -89,5 +87,5 @@ ORDER BY city;
 -- query 6
 -- @skip_result_check=true
 -- Cleanup
-DROP TABLE ${case_db}.t_replace_partition FORCE;
-DROP TABLE ${case_db}.t_replace_identity_to_bucket FORCE;
+DROP TABLE ${case_db}.t_replace_partition ;
+DROP TABLE ${case_db}.t_replace_identity_to_bucket ;

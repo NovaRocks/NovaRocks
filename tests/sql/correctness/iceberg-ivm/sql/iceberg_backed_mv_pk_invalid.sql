@@ -29,93 +29,54 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mv_ivm_pk_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE mv_ivm_pk_${uuid0}.ns_${uuid0};
+CREATE CATALOG mv_ivm_pk_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA mv_ivm_pk_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_ivm_pk_${uuid0}.ns_${uuid0}.orders (
   order_id BIGINT NOT NULL,
   customer STRING,
   amount DOUBLE,
   tags ARRAY<STRING>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO mv_ivm_pk_${uuid0}.ns_${uuid0}.orders VALUES
-  (1, 'A', 100.0, ['x']),
-  (2, 'B', 200.0, ['y']);
+  ROW(1, 'A', 100.0, ['x']),
+  ROW(2, 'B', 200.0, ['y']);
 USE mv_ivm_pk_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @expect_error=iceberg-backed aggregate materialized views do not support PRIMARY KEY
-CREATE MATERIALIZED VIEW mv_pk_missing
-DISTRIBUTED BY HASH(customer) BUCKETS 2
-PRIMARY KEY (bogus)
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT customer, count(*) AS c
+CREATE MATERIALIZED VIEW mv_pk_missing WITH (primary_key = ARRAY['bogus']) AS SELECT customer, count(*) AS c
 FROM orders
 GROUP BY customer;
 
 -- query 3
 -- @expect_error=iceberg-backed aggregate materialized views do not support PRIMARY KEY
-CREATE MATERIALIZED VIEW mv_pk_nullable
-DISTRIBUTED BY HASH(customer) BUCKETS 2
-PRIMARY KEY (customer)
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT customer, count(*) AS c
+CREATE MATERIALIZED VIEW mv_pk_nullable WITH (primary_key = ARRAY['customer']) AS SELECT customer, count(*) AS c
 FROM orders
 GROUP BY customer;
 
 -- query 4
 -- @expect_error=iceberg-backed aggregate materialized views do not support PRIMARY KEY
-CREATE MATERIALIZED VIEW mv_pk_nullable2
-DISTRIBUTED BY HASH(customer) BUCKETS 2
-PRIMARY KEY (amount)
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT customer, count(*) AS c
+CREATE MATERIALIZED VIEW mv_pk_nullable2 WITH (primary_key = ARRAY['amount']) AS SELECT customer, count(*) AS c
 FROM orders
 GROUP BY customer;
 
 -- query 5
--- @expect_error=PRIMARY KEY clause requires at least one column
-CREATE MATERIALIZED VIEW mv_pk_empty
-DISTRIBUTED BY HASH(customer) BUCKETS 2
-PRIMARY KEY ()
-PROPERTIES ('storage_engine' = 'iceberg')
+-- @expect_trino_error=INVALID_MATERIALIZED_VIEW_PROPERTY,USER_ERROR
+CREATE MATERIALIZED VIEW mv_pk_empty WITH (primary_key = ARRAY[])
 AS SELECT customer, count(*) AS c
 FROM orders
 GROUP BY customer;
 
 -- query 6
--- @expect_error=duplicate column `order_id` in PRIMARY KEY clause
-CREATE MATERIALIZED VIEW mv_pk_dupe
-DISTRIBUTED BY HASH(customer) BUCKETS 2
-PRIMARY KEY (order_id, order_id)
-PROPERTIES ('storage_engine' = 'iceberg')
+-- @expect_trino_error=INVALID_MATERIALIZED_VIEW_PROPERTY,USER_ERROR
+CREATE MATERIALIZED VIEW mv_pk_dupe WITH (primary_key = ARRAY['order_id', 'order_id'])
 AS SELECT customer, count(*) AS c
 FROM orders
 GROUP BY customer;
 
 -- query 7
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW mv_no_pk
-DISTRIBUTED BY HASH(customer) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT customer, count(*) AS c
+CREATE MATERIALIZED VIEW mv_no_pk AS SELECT customer, count(*) AS c
 FROM orders
 GROUP BY customer;
 
@@ -123,6 +84,6 @@ GROUP BY customer;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_no_pk;
-DROP TABLE mv_ivm_pk_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE mv_ivm_pk_${uuid0}.ns_${uuid0};
+DROP TABLE mv_ivm_pk_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA mv_ivm_pk_${uuid0}.ns_${uuid0};
 DROP CATALOG mv_ivm_pk_${uuid0};

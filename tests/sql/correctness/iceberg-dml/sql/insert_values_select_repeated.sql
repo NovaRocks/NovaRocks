@@ -24,8 +24,8 @@ DROP TABLE IF EXISTS ${case_db}.t_insert_values_select_repeated;
 CREATE TABLE ${case_db}.t_insert_values_select_repeated (
   c1 BIGINT
 );
-INSERT INTO ${case_db}.t_insert_values_select_repeated VALUES (11);
-INSERT INTO ${case_db}.t_insert_values_select_repeated VALUES (22), (33);
-INSERT INTO ${case_db}.t_insert_values_select_repeated VALUES (44);
+INSERT INTO ${case_db}.t_insert_values_select_repeated VALUES ROW(11);
+INSERT INTO ${case_db}.t_insert_values_select_repeated VALUES ROW(22), ROW(33);
+INSERT INTO ${case_db}.t_insert_values_select_repeated VALUES ROW(44);
 SELECT c1
 FROM ${case_db}.t_insert_values_select_repeated;

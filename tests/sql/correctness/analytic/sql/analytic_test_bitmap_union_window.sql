@@ -25,10 +25,9 @@
 CREATE TABLE ${case_db}.t1(
     c1 int,
     c2 bitmap
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
-INSERT INTO ${case_db}.t1 VALUES (1, to_bitmap(11)), (2, to_bitmap(22)), (3, null), (4, bitmap_empty()), (5, to_bitmap(55));
+INSERT INTO ${case_db}.t1 VALUES ROW(1, to_bitmap(11)), ROW(2, to_bitmap(22)), ROW(3, null), ROW(4, bitmap_empty()), ROW(5, to_bitmap(55));
 
 -- query 2
 -- @order_sensitive=true

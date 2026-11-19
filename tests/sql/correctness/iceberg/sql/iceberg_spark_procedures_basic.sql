@@ -23,51 +23,34 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG proc_ice_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_test_warehouse}/proc_ice_${uuid0}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE proc_ice_${uuid0}.ns_${uuid0};
+CREATE CATALOG proc_ice_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "iceberg.catalog.warehouse" = '${iceberg_test_warehouse}/proc_ice_${uuid0}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA proc_ice_${uuid0}.ns_${uuid0};
 CREATE TABLE proc_ice_${uuid0}.ns_${uuid0}.orders (
   id INT,
   amount INT
-) TBLPROPERTIES (
-  "format-version" = "3"
-);
-INSERT INTO proc_ice_${uuid0}.ns_${uuid0}.orders VALUES (1, 10);
+) WITH (format_version = 3);
+INSERT INTO proc_ice_${uuid0}.ns_${uuid0}.orders VALUES ROW(1, 10);
 
 -- query 2
 -- @skip_result_check=true
 -- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
-INSERT INTO proc_ice_${uuid0}.ns_${uuid0}.orders VALUES (2, 20);
+INSERT INTO proc_ice_${uuid0}.ns_${uuid0}.orders VALUES ROW(2, 20);
 
 -- query 3
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
-CALL proc_ice_${uuid0}.system.rewrite_manifests(table => 'ns_${uuid0}.orders');
+CALL proc_ice_${uuid0}.system.rewrite_manifests("table" => 'ns_${uuid0}.orders');
 
 -- query 4
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
-CALL proc_ice_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.orders');
+CALL proc_ice_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.orders');
 
 -- query 5
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
@@ -77,7 +60,7 @@ CALL proc_ice_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
-CALL proc_ice_${uuid0}.system.remove_orphan_files(table => 'ns_${uuid0}.orders', older_than => TIMESTAMP '2020-01-01 00:00:00');
+CALL proc_ice_${uuid0}.system.remove_orphan_files("table" => 'ns_${uuid0}.orders', older_than => TIMESTAMP '2020-01-01 00:00:00');
 
 -- query 6
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
@@ -88,16 +71,16 @@ SELECT id, amount FROM orders ORDER BY id;
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
-CALL proc_ice_${uuid0}.system.expire_snapshots(table => 'ns_${uuid0}.orders', retain_last => 1);
+CALL proc_ice_${uuid0}.system.expire_snapshots("table" => 'ns_${uuid0}.orders', retain_last => 1);
 
 -- query 8
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
 -- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- @skip_result_check=true
-CALL proc_ice_${uuid0}.system.rewrite_data_files(table => 'ns_${uuid0}.orders', options => map('rewrite-all', 'true'));
+CALL proc_ice_${uuid0}.system.rewrite_data_files("table" => 'ns_${uuid0}.orders', options => map('rewrite-all', 'true'));
 
 -- query 9
 -- @skip_result_check=true
-DROP TABLE proc_ice_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE proc_ice_${uuid0}.ns_${uuid0};
+DROP TABLE proc_ice_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA proc_ice_${uuid0}.ns_${uuid0};
 DROP CATALOG proc_ice_${uuid0};

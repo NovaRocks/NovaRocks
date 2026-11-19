@@ -29,9 +29,9 @@ INSERT INTO ${case_db}.t_dnn_al
 INSERT INTO ${case_db}.t_dnn_ar
     SELECT CASE WHEN generate_series % 12 = 0 THEN generate_series ELSE NULL END
     FROM TABLE(generate_series(1, 2000));
-ANALYZE TABLE ${case_db}.t_dnn_al;
-ANALYZE TABLE ${case_db}.t_dnn_ar;
-EXPLAIN VERBOSE
+ANALYZE ${case_db}.t_dnn_al;
+ANALYZE ${case_db}.t_dnn_ar;
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.v
 FROM ${case_db}.t_dnn_al l
 WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t_dnn_ar r WHERE l.k = r.k);

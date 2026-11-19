@@ -33,20 +33,19 @@ CREATE TABLE ${case_db}.t_agg_topk_extrema_misc (
     flag BOOLEAN,
     big_v BIGINT,
     w BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_topk_extrema_misc VALUES
-    (1, 1, 10, 'delta', TRUE, 10000000, 3),
-    (2, 1, 20, 'alpha', TRUE, 40000000, 5),
-    (3, 1, 20, 'beta', FALSE, 40000000, 5),
-    (4, 1, 30, 'gamma', FALSE, 40000000, 5),
-    (5, 2, 10, 'zeta', TRUE, 10000000, 3),
-    (6, 2, 10, 'eta', FALSE, 40000000, 5),
-    (7, 2, 20, 'theta', FALSE, 40000000, 5),
-    (8, 2, NULL, NULL, NULL, NULL, NULL),
-    (9, 3, 40, 'iota', TRUE, 10000000, 3),
-    (10, 3, 40, 'kappa', FALSE, 40000000, 5);
+    ROW(1, 1, 10, 'delta', TRUE, 10000000, 3),
+    ROW(2, 1, 20, 'alpha', TRUE, 40000000, 5),
+    ROW(3, 1, 20, 'beta', FALSE, 40000000, 5),
+    ROW(4, 1, 30, 'gamma', FALSE, 40000000, 5),
+    ROW(5, 2, 10, 'zeta', TRUE, 10000000, 3),
+    ROW(6, 2, 10, 'eta', FALSE, 40000000, 5),
+    ROW(7, 2, 20, 'theta', FALSE, 40000000, 5),
+    ROW(8, 2, NULL, NULL, NULL, NULL, NULL),
+    ROW(9, 3, 40, 'iota', TRUE, 10000000, 3),
+    ROW(10, 3, 40, 'kappa', FALSE, 40000000, 5);
 WITH w1 AS (
     SELECT approx_top_k(v, 3) AS x
     FROM ${case_db}.t_agg_topk_extrema_misc

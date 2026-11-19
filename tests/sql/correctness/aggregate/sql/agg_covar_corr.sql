@@ -28,16 +28,15 @@ CREATE TABLE ${case_db}.t_agg_covar_corr (
     g INT,
     x INT,
     y INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_covar_corr VALUES
-    (1, 1, 2),
-    (1, 2, 4),
-    (1, 3, 6),
-    (2, 1, 9),
-    (2, 2, 7),
-    (2, 3, 5);
+    ROW(1, 1, 2),
+    ROW(1, 2, 4),
+    ROW(1, 3, 6),
+    ROW(2, 1, 9),
+    ROW(2, 2, 7),
+    ROW(2, 3, 5);
 
 SELECT
     g,

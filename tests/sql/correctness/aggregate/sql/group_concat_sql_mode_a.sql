@@ -22,8 +22,8 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_concat_mode (id INT, v VARCHAR, sep VARCHAR);
 CREATE TABLE ${case_db}.t_concat_output (v VARCHAR);
-INSERT INTO ${case_db}.t_concat_mode VALUES (1,'a','|'),(2,'b','|');
-SET sql_mode='GROUP_CONCAT_LEGACY';
+INSERT INTO ${case_db}.t_concat_mode VALUES ROW(1,'a','|'),ROW(2,'b','|');
+SET SESSION sql_mode = 'GROUP_CONCAT_LEGACY';
 
 -- query 2
 SELECT group_concat(v ORDER BY id) FROM ${case_db}.t_concat_mode;
@@ -32,43 +32,47 @@ SELECT group_concat(v ORDER BY id) FROM ${case_db}.t_concat_mode;
 SELECT group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 4
-SELECT /*+ SET_VAR(sql_mode='32') */ group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
+WITH SESSION sql_mode = '32' SELECT /*+ SET_VAR(sql_mode='32') */ group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 5
 SELECT group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 6
-SELECT /*  SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ /*+ SET_VAR('sql_mode'='32') */  group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
+WITH SESSION sql_mode = '32' SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ /*+ SET_VAR('sql_mode'='32') */  group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 7
 SELECT group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 8
-SELECT group_concat(v,'-' ORDER BY id SEPARATOR '|') AS value FROM ${case_db}.t_concat_mode;
+SELECT string_agg(v,'-'
+,
+ '|'
+ORDER BY id
+) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 9
-SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat(v,sep ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
+WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat(v,sep ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 10
 -- @expect_error=ORDER BY position 2 is not in group_concat output list.
-SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat(v,'-' ORDER BY 2) FROM ${case_db}.t_concat_mode;
+WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat(v,'-' ORDER BY 2) FROM ${case_db}.t_concat_mode;
 
 -- query 11
-SELECT /*+ SET_VAR(sql_mode='32') */ group_concat(v,'-' ORDER BY 2,id) AS value FROM ${case_db}.t_concat_mode;
+WITH SESSION sql_mode = '32' SELECT /*+ SET_VAR(sql_mode='32') */ group_concat(v,'-' ORDER BY 2,id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 12
 SELECT string_agg(v,sep ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 13
 -- @skip_result_check=true
-SET sql_mode='ERROR_IF_OVERFLOW,STRUCT_CAST_BY_NAME';
+SET SESSION sql_mode = 'ERROR_IF_OVERFLOW,STRUCT_CAST_BY_NAME';
 
 -- query 14
 SELECT group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 15
 -- @skip_result_check=true
-SET sql_mode='GROUP_CONCAT_LEGACY';
+SET SESSION sql_mode = 'GROUP_CONCAT_LEGACY';
 INSERT INTO ${case_db}.t_concat_output SELECT group_concat(v,'-' ORDER BY id) FROM ${case_db}.t_concat_mode;
 
 -- query 16
@@ -76,23 +80,23 @@ SELECT v AS value FROM ${case_db}.t_concat_output;
 
 -- query 17
 -- @skip_result_check=true
-EXPLAIN SELECT /*+ SET_VAR(sql_mode='32') */ group_concat(v,'-' ORDER BY id) FROM ${case_db}.t_concat_mode;
+EXPLAIN WITH SESSION sql_mode = '32'  SELECT /*+ SET_VAR(sql_mode='32') */ group_concat(v,'-' ORDER BY id) FROM ${case_db}.t_concat_mode;
 
 -- query 18
 SELECT group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 19
 -- @skip_result_check=true
-SET sql_mode='32';
+SET SESSION sql_mode = '32';
 
 -- query 20
 -- One root policy reaches the CTE; the next step checks connection isolation.
-WITH c AS (SELECT group_concat(v ORDER BY id) AS x FROM ${case_db}.t_concat_mode) SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ x AS value FROM c;
+WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' WITH c AS (SELECT group_concat(v ORDER BY id) AS x FROM ${case_db}.t_concat_mode) SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ x AS value FROM c;
 
 -- query 21
 SELECT group_concat(v,'-' ORDER BY id) AS value FROM ${case_db}.t_concat_mode;
 
 -- query 22
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_concat_output FORCE;
-DROP TABLE ${case_db}.t_concat_mode FORCE;
+DROP TABLE ${case_db}.t_concat_output ;
+DROP TABLE ${case_db}.t_concat_mode ;

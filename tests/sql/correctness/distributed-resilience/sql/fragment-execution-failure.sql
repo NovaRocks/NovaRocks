@@ -52,20 +52,19 @@
 CREATE TABLE ${case_db}.fragment_execution_failure (
   id BIGINT,
   delay_s BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_execution_failure VALUES (1, 5);
+INSERT INTO ${case_db}.fragment_execution_failure VALUES ROW(1, 5);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_execution_failure VALUES (2, 5);
+INSERT INTO ${case_db}.fragment_execution_failure VALUES ROW(2, 5);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_execution_failure VALUES (3, 5);
+INSERT INTO ${case_db}.fragment_execution_failure VALUES ROW(3, 5);
 
 -- query 5
 -- @query_lifecycle_fault=task-execution-failure,1
@@ -87,11 +86,11 @@ INSERT INTO ${case_db}.fragment_execution_failure VALUES (3, 5);
 -- nothing. ABORT_APPLIED therefore fires on the participants minus that one,
 -- which is why this is one fewer than the count above rather than equal to it.
 -- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ABORT_APPLIED,1
-SELECT COUNT()
+SELECT COUNT(*)
 FROM ${case_db}.fragment_execution_failure
 WHERE sleep(delay_s);
 
 -- query 6
 -- A destructive local executor failure must leave the following query healthy.
 -- @result_contains=3
-SELECT COUNT() FROM ${case_db}.fragment_execution_failure;
+SELECT COUNT(*) FROM ${case_db}.fragment_execution_failure;

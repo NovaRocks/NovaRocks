@@ -21,34 +21,34 @@
 -- internal CSE Project item while user-visible query output stays unchanged.
 DROP TABLE IF EXISTS ${case_db}.cse_projection_t;
 CREATE TABLE ${case_db}.cse_projection_t (a BIGINT, b BIGINT);
-INSERT INTO ${case_db}.cse_projection_t VALUES (3, 4), (5, 6);
+INSERT INTO ${case_db}.cse_projection_t VALUES ROW(3, 4), ROW(5, 6);
 
-SELECT a + b AS x, (a + b) + a AS y
+SELECT (a + b) AS x, (a + b) + a AS y
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
 
 -- @skip_result_check=true
 -- @result_contains=__cse_
-EXPLAIN VERBOSE SELECT a + b AS x, (a + b) + a AS y
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT (a + b) AS x, (a + b) + a AS y
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
 
-SET enable_common_subexpr_reuse = false;
+SET SESSION enable_common_subexpr_reuse = false;
 
 -- @skip_result_check=true
 -- @result_not_contains=__cse_
-EXPLAIN VERBOSE SELECT a + b AS x, (a + b) + a AS y
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT (a + b) AS x, (a + b) + a AS y
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
 
-SET enable_common_subexpr_reuse = true;
+SET SESSION enable_common_subexpr_reuse = true;
 
-SET disable_optimizer_rules = 'CommonSubexpressionReuse';
+SET SESSION disable_optimizer_rules = 'CommonSubexpressionReuse';
 
 -- @skip_result_check=true
 -- @result_not_contains=__cse_
-EXPLAIN VERBOSE SELECT a + b AS x, (a + b) + a AS y
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT (a + b) AS x, (a + b) + a AS y
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

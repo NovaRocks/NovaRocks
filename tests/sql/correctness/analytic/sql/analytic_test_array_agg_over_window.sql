@@ -26,15 +26,14 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t0` (
-  `v1` int(11) NULL COMMENT "",
-  `v2` int(11) NULL COMMENT "",
-  `v3` bigint(20) NULL COMMENT "",
-  `v4` varchar(50) NULL COMMENT "",
-  `v5` decimal(10,2) NULL COMMENT "",
-  `v6` float NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t0" (
+  "v1" int(11),
+  "v2" int(11),
+  "v3" bigint(20),
+  "v4" varchar(50),
+  "v5" decimal(10,2),
+  "v6" float
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -534,7 +533,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
-  array_agg(-9876543210.987654321) over(partition by v1 order by v2) as arr_basic
+  array_agg(-DECIMAL '9876543210.987654321') over(partition by v1 order by v2) as arr_basic
   from t0
 ) as t;
 
@@ -573,30 +572,29 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 -- query 58
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t1` (
-  `v1` int(11) NULL COMMENT "",
-  `v2` int(11) NULL COMMENT "",
-  `v3` bigint(20) NULL COMMENT "",
-  `v4` varchar(50) NULL COMMENT "",
-  `v5` decimal(10,2) NULL COMMENT "",
-  `v6` float NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t1" (
+  "v1" int(11),
+  "v2" int(11),
+  "v3" bigint(20),
+  "v4" varchar(50),
+  "v5" decimal(10,2),
+  "v6" float
+) WITH (format_version = 3);
 
 -- query 59
 -- @skip_result_check=true
 USE ${case_db};
 insert into t1 values
-  (1, 1, 100, 'a', 1.1, 1.1),
-  (1, 2, NULL, 'b', 2.2, NULL),
-  (1, NULL, 300, NULL, 3.3, 3.3),
-  (NULL, 4, 400, 'd', NULL, 4.4),
-  (2, 1, 500, 'e', 5.5, 5.5),
-  (2, NULL, NULL, NULL, NULL, NULL),
-  (2, 3, 700, 'g', 7.7, 7.7),
-  (NULL, NULL, NULL, NULL, NULL, NULL),
-  (3, 1, 900, 'i', 9.9, 9.9),
-  (3, 2, 1000, 'j', 10.1, 10.1);
+  ROW(1, 1, 100, 'a', 1.1, 1.1),
+  ROW(1, 2, NULL, 'b', 2.2, NULL),
+  ROW(1, NULL, 300, NULL, 3.3, 3.3),
+  ROW(NULL, 4, 400, 'd', NULL, 4.4),
+  ROW(2, 1, 500, 'e', 5.5, 5.5),
+  ROW(2, NULL, NULL, NULL, NULL, NULL),
+  ROW(2, 3, 700, 'g', 7.7, 7.7),
+  ROW(NULL, NULL, NULL, NULL, NULL, NULL),
+  ROW(3, 1, 900, 'i', 9.9, 9.9),
+  ROW(3, 2, 1000, 'j', 10.1, 10.1);
 
 -- query 60
 USE ${case_db};

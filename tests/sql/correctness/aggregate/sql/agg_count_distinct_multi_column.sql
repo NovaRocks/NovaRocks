@@ -27,15 +27,14 @@
 CREATE TABLE ${case_db}.t_agg_count_distinct_multi_column (
     a INT,
     b VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_count_distinct_multi_column VALUES
-    (1, 'x'),
-    (1, 'x'),
-    (1, 'y'),
-    (2, 'x'),
-    (2, 'x');
+    ROW(1, 'x'),
+    ROW(1, 'x'),
+    ROW(1, 'y'),
+    ROW(2, 'x'),
+    ROW(2, 'x');
 
 SELECT COUNT(DISTINCT a, b) AS cd_ab
 FROM ${case_db}.t_agg_count_distinct_multi_column;

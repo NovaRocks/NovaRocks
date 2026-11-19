@@ -22,16 +22,16 @@
 
 CREATE TABLE ${case_db}.customer_demographics (k INT, v INT);
 CREATE TABLE ${case_db}.rf_probe (k INT, v INT);
-INSERT INTO ${case_db}.customer_demographics VALUES (1, 1), (2, 2), (3, 3);
+INSERT INTO ${case_db}.customer_demographics VALUES ROW(1, 1), ROW(2, 2), ROW(3, 3);
 INSERT INTO ${case_db}.rf_probe
     SELECT generate_series, generate_series FROM TABLE(generate_series(1, 100000));
-ANALYZE TABLE ${case_db}.customer_demographics;
-ANALYZE TABLE ${case_db}.rf_probe;
+ANALYZE ${case_db}.customer_demographics;
+ANALYZE ${case_db}.rf_probe;
 
 -- @explain_contains=producer binding
 -- @explain_contains=expr = (b.k)
 -- @explain_contains=consumer binding
 -- @explain_contains=expr = (p.k)
-SELECT count()
+SELECT count(*)
 FROM ${case_db}.rf_probe p
 JOIN ${case_db}.customer_demographics b ON p.k = b.k;

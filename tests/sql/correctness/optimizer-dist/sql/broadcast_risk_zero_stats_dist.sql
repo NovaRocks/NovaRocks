@@ -16,9 +16,9 @@
 -- under the License.
 
 -- @tags=optimizer,bc1,distribution,dist-only
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
-SET disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
+SET SESSION disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
 -- Assert the selected distribution and the edge contract, without node numbers.
 -- @skip_result_check=true
 -- @result_contains=HASH JOIN (PARTITIONED, INNER
@@ -31,7 +31,7 @@ SET disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
 -- @result_not_contains=memory=inf
 -- @result_contains=GENERATE_SERIES(1, 100000000, 1)
 -- @result_contains=predicate: k > 0
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 WITH big_probe AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 1000000))
@@ -47,7 +47,7 @@ no_stats AS (
 SELECT COUNT() AS cnt
 FROM big_probe p JOIN no_stats b ON p.k = b.k;
 
-SET cbo_broadcast_node_mem_budget_bytes = 268435456;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- The build has ten i64 keys: 80 payload bytes; every backend receives it.
 -- @skip_result_check=true
 -- @result_contains=HASH JOIN (BROADCAST, INNER
@@ -58,7 +58,7 @@ SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @result_contains=activation = BlockingSnapshot
 -- @result_not_contains=HASH JOIN (PARTITIONED
 -- @query_stats_contract={"tables":[],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"exact","bytes":80},"hash_table":{"kind":"exact","build_rows":10,"load_factor":0.75,"per_row_overhead_bytes":16}}
-EXPLAIN COSTS
+EXPLAIN WITH SESSION explain_detail = 'COSTS'
 WITH p AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 1000))

@@ -32,9 +32,8 @@ DROP TABLE IF EXISTS ${case_db}.__row_util_base;
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
-  k1 bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 bigint
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -55,9 +54,8 @@ DROP TABLE IF EXISTS ${case_db}.__row_util;
 -- query 7
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
-  idx bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  idx bigint
+) WITH (format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
@@ -70,27 +68,26 @@ DROP TABLE IF EXISTS ${case_db}.t1;
 -- query 10
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-    k1 bigint NULL,
+    k1 bigint ,
     c_bool boolean,
-    c_bool_null boolean NULL,
+    c_bool_null boolean ,
     c_tinyint tinyint,
-    c_tinyint_null tinyint NULL,
+    c_tinyint_null tinyint ,
     c_smallint smallint,
-    c_smallint_null smallint NULL,
+    c_smallint_null smallint ,
     c_int int,
-    c_int_null int NULL,
+    c_int_null int ,
     c_bigint bigint,
-    c_bigint_null bigint NULL,
+    c_bigint_null bigint ,
     c_float float,
-    c_float_null float NULL,
+    c_float_null float ,
     c_double double,
-    c_double_null double NULL,
+    c_double_null double ,
     c_date date,
-    c_date_null date NULL,
+    c_date_null date ,
     c_datetime datetime,
-    c_datetime_null datetime NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    c_datetime_null datetime
+) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true

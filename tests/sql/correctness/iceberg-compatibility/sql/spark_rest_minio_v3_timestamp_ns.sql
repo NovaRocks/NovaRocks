@@ -58,8 +58,7 @@ printf 'NAMESPACE_OK ns=nr_compat_%s\n' "${suite_uuid0}"
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0} (
     id     BIGINT,
     ts     TIMESTAMP_NS
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- Insert rows with sub-microsecond nanosecond precision.
@@ -69,9 +68,9 @@ TBLPROPERTIES ("format-version" = "3");
 -- @skip_result_check=true
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0}
 VALUES
-    (1, '2024-01-02 03:04:05.123456789'),
-    (2, '2024-01-02 03:04:05.000000001'),
-    (3, '1970-01-01 00:00:00.000000000');
+    ROW(1, '2024-01-02 03:04:05.123456789'),
+    ROW(2, '2024-01-02 03:04:05.000000001'),
+    ROW(3, '1970-01-01 00:00:00.000000000');
 
 -- query 4
 -- Cross-engine catalog verification via the Iceberg REST API.
@@ -130,10 +129,10 @@ SELECT id, CAST(ts AS STRING) AS s
 -- ts > '2024-01-02 03:04:05.000000001' matches only row 1 (.123456789).
 -- If the predicate were rounded to microseconds (.000000), rows 1 and 2 would
 -- both pass (COUNT=2), proving the nanosecond path is exercised end-to-end.
-SELECT COUNT() AS cnt
+SELECT COUNT(*) AS cnt
   FROM iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0}
   WHERE ts > '2024-01-02 03:04:05.000000001';
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0} ;

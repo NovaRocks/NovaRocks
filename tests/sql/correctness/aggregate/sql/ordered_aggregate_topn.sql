@@ -58,8 +58,7 @@ create table all_t0 (
     c22 char(100) NOT NULL,
     c23 float NOT NULL,
     c24 double NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -69,22 +68,22 @@ insert into all_t0 SELECT x%200, x%200, x%200, x%200, x%200, x, x, x%200, x, x, 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into all_t0 values (null, null, null, null, null, null, null, null, null, null, null, null, -1,-2,-3,-4,-5, '2000-01-28', '2000-01-28', 'literal', 'literal', 'literal', -1, -1);
+insert into all_t0 values ROW(null, null, null, null, null, null, null, null, null, null, null, null, -1,-2,-3,-4,-5, '2000-01-28', '2000-01-28', 'literal', 'literal', 'literal', -1, -1);
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into all_t0 values (-1, -2, -3, null, null, null, null, null, null, null, null, null, -1,-2,-3,-4,-5, '2000-01-28', '2000-01-28', 'literal', 'literal', 'literal', -1, -1);
+insert into all_t0 values ROW(-1, -2, -3, null, null, null, null, null, null, null, null, null, -1,-2,-3,-4,-5, '2000-01-28', '2000-01-28', 'literal', 'literal', 'literal', -1, -1);
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-set pipeline_dop=2;
+SET SESSION pipeline_dop = 2;
 
 -- query 7
 -- @skip_result_check=true
 USE ${case_db};
-set group_concat_max_len=65535;
+SET SESSION group_concat_max_len = 65535;
 
 -- query 8
 USE ${case_db};

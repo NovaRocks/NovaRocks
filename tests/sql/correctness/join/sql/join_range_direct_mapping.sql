@@ -41,9 +41,8 @@ DROP TABLE IF EXISTS ${case_db}.t1;
 -- query 4
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
-  k1 bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 bigint
+) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
@@ -60,9 +59,8 @@ INSERT INTO ${case_db}.__row_util_base SELECT * FROM ${case_db}.__row_util_base;
 -- query 8
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
-  idx bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  idx bigint
+) WITH (format_version = 3);
 
 -- query 9
 -- @skip_result_check=true
@@ -71,19 +69,18 @@ INSERT INTO ${case_db}.__row_util SELECT row_number() over() as idx FROM ${case_
 -- query 10
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-    k1 bigint NULL,
+    k1 bigint ,
     c_int int,
-    c_int_null int NULL,
+    c_int_null int ,
     c_bigint bigint,
-    c_bigint_null bigint NULL,
+    c_bigint_null bigint ,
     c_largeint bigint,
-    c_largeint_null bigint NULL,
+    c_largeint_null bigint ,
     c_double double,
-    c_double_null double NULL,
+    c_double_null double ,
     c_string STRING,
-    c_string_null STRING NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    c_string_null STRING
+) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true

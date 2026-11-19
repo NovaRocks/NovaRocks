@@ -21,40 +21,40 @@
 -- Each SELECT confirms the table is still queryable after each property change.
 
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.tblprops_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.tblprops_${uuid0};
 DROP TABLE IF EXISTS p;
-CREATE TABLE p (id INT) TBLPROPERTIES ("format-version" = "2");
-INSERT INTO p VALUES (1);
+CREATE TABLE p (id INT) WITH (format_version = 2);
+INSERT INTO p VALUES ROW(1);
 
 -- query 2
 SELECT id FROM p ORDER BY id;
 
 -- query 3
-ALTER TABLE p SET TBLPROPERTIES ('write.parquet.compression-codec' = 'zstd');
+ALTER TABLE p SET PROPERTIES extra_properties = MAP(ARRAY['write.parquet.compression-codec'], ARRAY['zstd']);
 
 -- query 4
 SELECT id FROM p ORDER BY id;
 
 -- query 5
-ALTER TABLE p SET TBLPROPERTIES ('comment' = 'hello', 'gc.enabled' = 'true');
+ALTER TABLE p SET PROPERTIES gc_enabled = true, extra_properties = MAP(ARRAY['comment'], ARRAY['hello']);
 
 -- query 6
 SELECT id FROM p ORDER BY id;
 
 -- query 7
 -- Overwrite an existing key.
-ALTER TABLE p SET TBLPROPERTIES ('comment' = 'world');
+ALTER TABLE p SET PROPERTIES extra_properties = MAP(ARRAY['comment'], ARRAY['world']);
 
 -- query 8
 SELECT id FROM p ORDER BY id;
 
 -- query 9
-ALTER TABLE p UNSET TBLPROPERTIES ('comment');
+ALTER TABLE p EXECUTE unset_extra_properties(keys => ARRAY['comment'], if_exists => false);
 
 -- query 10
 SELECT id FROM p ORDER BY id;
 
 -- query 11
 DROP TABLE p;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_${uuid0};
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.tblprops_${uuid0};

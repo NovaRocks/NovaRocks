@@ -34,58 +34,42 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG uniq_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_test_warehouse}/uniq_${uuid0}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE uniq_${uuid0}.ns_${uuid0};
-CREATE TABLE uniq_${uuid0}.ns_${uuid0}.uniq (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3");
+CREATE CATALOG uniq_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "iceberg.catalog.warehouse" = '${iceberg_test_warehouse}/uniq_${uuid0}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA uniq_${uuid0}.ns_${uuid0};
+CREATE TABLE uniq_${uuid0}.ns_${uuid0}.uniq (id INT, v INT) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO uniq_${uuid0}.ns_${uuid0}.uniq VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t1;
+INSERT INTO uniq_${uuid0}.ns_${uuid0}.uniq VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30), ROW(4, 40), ROW(5, 50);
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE create_tag(name => 't1', replace => false, if_not_exists => false);
 
 -- query 3
 -- @skip_result_check=true
 DELETE FROM uniq_${uuid0}.ns_${uuid0}.uniq WHERE id = 4;
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t2;
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE create_tag(name => 't2', replace => false, if_not_exists => false);
 
 -- query 4
 -- @skip_result_check=true
 UPDATE uniq_${uuid0}.ns_${uuid0}.uniq SET v = v + 1 WHERE id = 1;
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t3;
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE create_tag(name => 't3', replace => false, if_not_exists => false);
 
 -- query 5
 -- @db=uniq_${uuid0}.ns_${uuid0}
-ALTER TABLE uniq OPTIMIZE;
+ALTER TABLE uniq EXECUTE optimize;
 
 -- query 6
 -- @skip_result_check=true
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t4;
-INSERT INTO uniq_${uuid0}.ns_${uuid0}.uniq VALUES (10, 100), (20, 200);
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t5;
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE create_tag(name => 't4', replace => false, if_not_exists => false);
+INSERT INTO uniq_${uuid0}.ns_${uuid0}.uniq VALUES ROW(10, 100), ROW(20, 200);
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE create_tag(name => 't5', replace => false, if_not_exists => false);
 
 -- query 7
 -- @db=uniq_${uuid0}.ns_${uuid0}
-ALTER TABLE uniq OPTIMIZE;
+ALTER TABLE uniq EXECUTE optimize;
 
 -- query 8
 -- @skip_result_check=true
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t6;
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE create_tag(name => 't6', replace => false, if_not_exists => false);
 
 -- query 9
 -- I1 — current snapshot intra-snapshot uniqueness.
@@ -129,12 +113,12 @@ SELECT max(distinct_row_ids) AS max_row_ids_per_id
 
 -- query 12
 -- @skip_result_check=true
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq DROP TAG t1;
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq DROP TAG t2;
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq DROP TAG t3;
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq DROP TAG t4;
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq DROP TAG t5;
-ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq DROP TAG t6;
-DROP TABLE uniq_${uuid0}.ns_${uuid0}.uniq FORCE;
-DROP DATABASE uniq_${uuid0}.ns_${uuid0};
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE drop_tag(name => 't1', if_exists => false);
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE drop_tag(name => 't2', if_exists => false);
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE drop_tag(name => 't3', if_exists => false);
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE drop_tag(name => 't4', if_exists => false);
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE drop_tag(name => 't5', if_exists => false);
+ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq EXECUTE drop_tag(name => 't6', if_exists => false);
+DROP TABLE uniq_${uuid0}.ns_${uuid0}.uniq ;
+DROP SCHEMA uniq_${uuid0}.ns_${uuid0};
 DROP CATALOG uniq_${uuid0};

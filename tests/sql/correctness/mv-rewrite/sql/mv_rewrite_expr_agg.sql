@@ -38,28 +38,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvrw_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvrw_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvrw_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- k1: 4 distinct dates; k6: small int driving the conditions; k9: payload
@@ -68,7 +51,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.t1 (
   k1 STRING,
   k6 INT,
   k9 BIGINT
-) TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
@@ -89,14 +72,11 @@ USE mvrw_${uuid0}.ns_${uuid0};
 -- query 7
 -- plain-SUM MV grouped by (k1, k6): the conditional-derivation miss guard
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW mv_plain
-DISTRIBUTED BY HASH(k1) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k1, k6, SUM(k9) AS s9 FROM t1 GROUP BY k1, k6;
+CREATE MATERIALIZED VIEW mv_plain AS SELECT k1, k6, SUM(k9) AS s9 FROM t1 GROUP BY k1, k6;
 
 -- query 8
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW mv_plain WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW mv_plain;
 
 -- query 9
 -- deriving SUM(CASE WHEN k6 > 1 ...) from plain SUM(k9)+group-key k6 would
@@ -115,10 +95,7 @@ DROP MATERIALIZED VIEW mv_plain;
 -- query 12
 -- expression-aggregate MV: SUM(IF(...)), SUM(CASE WHEN ...), SUM, COUNT, AVG
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW mv_cond
-DISTRIBUTED BY HASH(k1) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT
+CREATE MATERIALIZED VIEW mv_cond AS SELECT
   k1,
   k6,
   SUM(IF(k6 > 1, k9, 0)) AS s_if,
@@ -130,7 +107,7 @@ FROM t1 GROUP BY k1, k6;
 
 -- query 13
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW mv_cond WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW mv_cond;
 
 -- query 14
 -- direct 1:1: identical expression aggregates, group-by equal (AVG included)
@@ -212,12 +189,12 @@ DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.mv_plain;
 -- query 30
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.t1 FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.t1 ;
 
 -- query 31
 -- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
+DROP SCHEMA IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 32
 -- @cleanup=true

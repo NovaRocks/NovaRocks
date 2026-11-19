@@ -29,20 +29,18 @@ DROP TABLE IF EXISTS ${case_db}.t_join_not_exists_r;
 CREATE TABLE ${case_db}.t_join_not_exists_l (
   id INT,
   v STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_not_exists_r (
   id INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_not_exists_l VALUES
-  (1, 'a'),
-  (2, 'b'),
-  (3, 'c'),
-  (4, 'd');
+  ROW(1, 'a'),
+  ROW(2, 'b'),
+  ROW(3, 'c'),
+  ROW(4, 'd');
 INSERT INTO ${case_db}.t_join_not_exists_r VALUES
-  (2),
-  (4);
+  ROW(2),
+  ROW(4);
 SELECT l.id, l.v
 FROM ${case_db}.t_join_not_exists_l l
 WHERE NOT EXISTS (

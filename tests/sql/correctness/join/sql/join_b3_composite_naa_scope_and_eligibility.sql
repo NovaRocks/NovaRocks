@@ -21,54 +21,54 @@
 
 -- query 1
 WITH p AS (SELECT * FROM (VALUES
-(1,1,1,10,0),(2,1,NULL,10,NULL),(3,1,2,20,0),(4,2,NULL,20,NULL),
-(5,NULL,1,10,0),(6,3,NULL,99,NULL),(7,2,9,90,0),(7,2,9,90,0)) v(id,g,a,b,cutoff)),
+ROW(1,1,1,10,0),ROW(2,1,NULL,10,NULL),ROW(3,1,2,20,0),ROW(4,2,NULL,20,NULL),
+ROW(5,NULL,1,10,0),ROW(6,3,NULL,99,NULL),ROW(7,2,9,90,0),ROW(7,2,9,90,0)) v(id,g,a,b,cutoff)),
 b AS (SELECT * FROM (VALUES
-(1,1,10,1),(1,1,10,1),(1,NULL,30,1),(1,2,NULL,1),(2,4,20,1),
-(NULL,1,10,1),(3,1,10,1),(3,NULL,30,1)) v(g,a,b,weight))
+ROW(1,1,10,1),ROW(1,1,10,1),ROW(1,NULL,30,1),ROW(1,2,NULL,1),ROW(2,4,20,1),
+ROW(NULL,1,10,1),ROW(3,1,10,1),ROW(3,NULL,30,1)) v(g,a,b,weight))
 SELECT p.id FROM p WHERE (p.a,p.b) NOT IN (SELECT b.a,b.b FROM b WHERE b.g=p.g) ORDER BY p.id;
 
 -- query 2
 WITH p AS (SELECT * FROM (VALUES
-(1,1,1,10,0),(2,1,NULL,10,NULL),(3,1,2,20,0),(4,2,NULL,20,NULL),
-(5,NULL,1,10,0),(6,3,NULL,99,NULL),(7,2,9,90,0),(7,2,9,90,0)) v(id,g,a,b,cutoff)),
+ROW(1,1,1,10,0),ROW(2,1,NULL,10,NULL),ROW(3,1,2,20,0),ROW(4,2,NULL,20,NULL),
+ROW(5,NULL,1,10,0),ROW(6,3,NULL,99,NULL),ROW(7,2,9,90,0),ROW(7,2,9,90,0)) v(id,g,a,b,cutoff)),
 b AS (SELECT * FROM (VALUES
-(1,1,10,1),(1,1,10,1),(1,NULL,30,1),(1,2,NULL,1),(2,4,20,1),
-(NULL,1,10,1),(3,1,10,1),(3,NULL,30,1)) v(g,a,b,weight))
-SELECT p.id FROM p WHERE (p.a,p.b) NOT IN (SELECT b.a,b.b FROM b WHERE b.g <=> p.g) ORDER BY p.id;
+ROW(1,1,10,1),ROW(1,1,10,1),ROW(1,NULL,30,1),ROW(1,2,NULL,1),ROW(2,4,20,1),
+ROW(NULL,1,10,1),ROW(3,1,10,1),ROW(3,NULL,30,1)) v(g,a,b,weight))
+SELECT p.id FROM p WHERE (p.a,p.b) NOT IN (SELECT b.a,b.b FROM b WHERE b.g  IS NOT DISTINCT FROM  p.g) ORDER BY p.id;
 
 -- query 3
 WITH p AS (SELECT * FROM (VALUES
-(1,1,1,10,0),(2,1,NULL,10,NULL),(3,1,2,20,0),(4,2,NULL,20,NULL),
-(5,NULL,1,10,0),(6,3,NULL,99,NULL),(7,2,9,90,0),(7,2,9,90,0)) v(id,g,a,b,cutoff)),
+ROW(1,1,1,10,0),ROW(2,1,NULL,10,NULL),ROW(3,1,2,20,0),ROW(4,2,NULL,20,NULL),
+ROW(5,NULL,1,10,0),ROW(6,3,NULL,99,NULL),ROW(7,2,9,90,0),ROW(7,2,9,90,0)) v(id,g,a,b,cutoff)),
 b AS (SELECT * FROM (VALUES
-(1,1,10,1),(1,1,10,1),(1,NULL,30,1),(1,2,NULL,1),(2,4,20,1),
-(NULL,1,10,1),(3,1,10,1),(3,NULL,30,1)) v(g,a,b,weight))
+ROW(1,1,10,1),ROW(1,1,10,1),ROW(1,NULL,30,1),ROW(1,2,NULL,1),ROW(2,4,20,1),
+ROW(NULL,1,10,1),ROW(3,1,10,1),ROW(3,NULL,30,1)) v(g,a,b,weight))
 SELECT p.id FROM p WHERE (p.a,p.b) NOT IN (SELECT b.a,b.b FROM b WHERE b.g=p.g AND b.weight>p.cutoff) ORDER BY p.id;
 
 -- query 4
 WITH p AS (SELECT * FROM (VALUES
-(1,1,1,10,0),(2,1,NULL,10,NULL),(3,1,2,20,0),(4,2,NULL,20,NULL),
-(5,NULL,1,10,0),(6,3,NULL,99,NULL),(7,2,9,90,0),(7,2,9,90,0)) v(id,g,a,b,cutoff)),
+ROW(1,1,1,10,0),ROW(2,1,NULL,10,NULL),ROW(3,1,2,20,0),ROW(4,2,NULL,20,NULL),
+ROW(5,NULL,1,10,0),ROW(6,3,NULL,99,NULL),ROW(7,2,9,90,0),ROW(7,2,9,90,0)) v(id,g,a,b,cutoff)),
 b AS (SELECT * FROM (VALUES
-(1,1,10,1),(1,1,10,1),(1,NULL,30,1),(1,2,NULL,1),(2,4,20,1),
-(NULL,1,10,1),(3,1,10,1),(3,NULL,30,1)) v(g,a,b,weight))
-SELECT p.id FROM p WHERE (p.a,p.b) NOT IN (SELECT b.a,b.b FROM b WHERE b.g <=> p.g AND b.weight>p.cutoff) ORDER BY p.id;
+ROW(1,1,10,1),ROW(1,1,10,1),ROW(1,NULL,30,1),ROW(1,2,NULL,1),ROW(2,4,20,1),
+ROW(NULL,1,10,1),ROW(3,1,10,1),ROW(3,NULL,30,1)) v(g,a,b,weight))
+SELECT p.id FROM p WHERE (p.a,p.b) NOT IN (SELECT b.a,b.b FROM b WHERE b.g  IS NOT DISTINCT FROM  p.g AND b.weight>p.cutoff) ORDER BY p.id;
 
 -- query 5
 WITH p AS (SELECT * FROM (VALUES
-(1,1,1,10,0),(2,1,NULL,10,NULL),(3,1,2,20,0),(4,2,NULL,20,NULL),
-(5,NULL,1,10,0),(6,3,NULL,99,NULL),(7,2,9,90,0),(7,2,9,90,0)) v(id,g,a,b,cutoff)),
+ROW(1,1,1,10,0),ROW(2,1,NULL,10,NULL),ROW(3,1,2,20,0),ROW(4,2,NULL,20,NULL),
+ROW(5,NULL,1,10,0),ROW(6,3,NULL,99,NULL),ROW(7,2,9,90,0),ROW(7,2,9,90,0)) v(id,g,a,b,cutoff)),
 b AS (SELECT * FROM (VALUES
-(1,1,10,1),(1,1,10,1),(1,NULL,30,1),(1,2,NULL,1),(2,4,20,1),
-(NULL,1,10,1),(3,1,10,1),(3,NULL,30,1)) v(g,a,b,weight))
+ROW(1,1,10,1),ROW(1,1,10,1),ROW(1,NULL,30,1),ROW(1,2,NULL,1),ROW(2,4,20,1),
+ROW(NULL,1,10,1),ROW(3,1,10,1),ROW(3,NULL,30,1)) v(g,a,b,weight))
 SELECT p.id FROM p WHERE (p.a,p.b) NOT IN (SELECT b.a,b.b FROM b WHERE b.g=p.g AND b.weight<0) ORDER BY p.id;
 
 -- query 6
 WITH p AS (SELECT * FROM (VALUES
-(1,1,1,10,0),(2,1,NULL,10,NULL),(3,1,2,20,0),(4,2,NULL,20,NULL),
-(5,NULL,1,10,0),(6,3,NULL,99,NULL),(7,2,9,90,0),(7,2,9,90,0)) v(id,g,a,b,cutoff)),
+ROW(1,1,1,10,0),ROW(2,1,NULL,10,NULL),ROW(3,1,2,20,0),ROW(4,2,NULL,20,NULL),
+ROW(5,NULL,1,10,0),ROW(6,3,NULL,99,NULL),ROW(7,2,9,90,0),ROW(7,2,9,90,0)) v(id,g,a,b,cutoff)),
 b AS (SELECT * FROM (VALUES
-(1,1,10,1),(1,1,10,1),(1,NULL,30,1),(1,2,NULL,1),(2,4,20,1),
-(NULL,1,10,1),(3,1,10,1),(3,NULL,30,1)) v(g,a,b,weight))
+ROW(1,1,10,1),ROW(1,1,10,1),ROW(1,NULL,30,1),ROW(1,2,NULL,1),ROW(2,4,20,1),
+ROW(NULL,1,10,1),ROW(3,1,10,1),ROW(3,NULL,30,1)) v(g,a,b,weight))
 SELECT p.id FROM p WHERE (p.a,p.b) NOT IN (SELECT b.a,b.b FROM b WHERE TRUE) ORDER BY p.id;

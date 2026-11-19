@@ -23,13 +23,13 @@
 --    (which probes the non-empty / unsupported forms).
 
 DROP TABLE IF EXISTS ${case_db}.t;
-CREATE TABLE ${case_db}.t (id INT, name STRING) TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.t VALUES (1, 'alice'), (2, 'bob');
+CREATE TABLE ${case_db}.t (id INT, name STRING) WITH (format_version = 3);
+INSERT INTO ${case_db}.t VALUES ROW(1, 'alice'), ROW(2, 'bob');
 
 ALTER TABLE ${case_db}.t ADD COLUMN tags ARRAY<INT> DEFAULT '[]';
 ALTER TABLE ${case_db}.t ADD COLUMN counts MAP<STRING, INT> DEFAULT '{}';
 
 SELECT id, name, tags, counts FROM ${case_db}.t ORDER BY id;
 
-INSERT INTO ${case_db}.t (id, name) VALUES (3, 'charlie');
+INSERT INTO ${case_db}.t (id, name) VALUES ROW(3, 'charlie');
 SELECT id, name, tags, counts FROM ${case_db}.t ORDER BY id;

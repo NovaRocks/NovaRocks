@@ -55,20 +55,19 @@
 CREATE TABLE ${case_db}.fe_crash (
   id BIGINT,
   delay_s BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fe_crash VALUES (1, 15);
+INSERT INTO ${case_db}.fe_crash VALUES ROW(1, 15);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fe_crash VALUES (2, 15);
+INSERT INTO ${case_db}.fe_crash VALUES ROW(2, 15);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fe_crash VALUES (3, 15);
+INSERT INTO ${case_db}.fe_crash VALUES ROW(3, 15);
 
 -- query 5
 -- @kill_fe_after_be_log_contains=NOVAROCKS_PARTICIPATION_LEASE_RENEWED
@@ -90,10 +89,10 @@ INSERT INTO ${case_db}.fe_crash VALUES (3, 15);
 -- asserted on every context; this asserts that termination really followed on
 -- more than one backend rather than pinning a count a sleep can delay.
 -- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_TERMINATION_COMPLETED,2
-SELECT COUNT()
+SELECT COUNT(*)
 FROM ${case_db}.fe_crash
 WHERE sleep(delay_s);
 
 -- query 6
 -- @result_contains=3
-SELECT COUNT() FROM ${case_db}.fe_crash;
+SELECT COUNT(*) FROM ${case_db}.fe_crash;

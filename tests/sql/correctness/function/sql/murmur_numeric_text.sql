@@ -19,16 +19,15 @@
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE murmur_numeric_text (id INT, f FLOAT, d DOUBLE, n BIGINT)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO murmur_numeric_text VALUES (1,0,7,-9223372036854775808),(2,1.25,1.25,0),(3,NULL,NULL,NULL);
+CREATE TABLE murmur_numeric_text (id INT, f FLOAT, d DOUBLE, n BIGINT) WITH (format_version = 3);
+INSERT INTO murmur_numeric_text VALUES ROW(1,0,7,-9223372036854775808),ROW(2,1.25,1.25,0),ROW(3,NULL,NULL,NULL);
 
 -- query 2
 USE ${case_db};
 SELECT id, CAST(f AS VARCHAR) AS f_text, CAST(d AS VARCHAR) AS d_text,
-       murmur_hash3_32(f) <=> murmur_hash3_32(CAST(f AS VARCHAR)) AS f_same,
-       murmur_hash3_32(d) <=> murmur_hash3_32(CAST(d AS VARCHAR)) AS d_same,
-       murmur_hash3_32(n) <=> murmur_hash3_32(CAST(n AS VARCHAR)) AS n_same
+       murmur_hash3_32(f)  IS NOT DISTINCT FROM  murmur_hash3_32(CAST(f AS VARCHAR)) AS f_same,
+       murmur_hash3_32(d)  IS NOT DISTINCT FROM  murmur_hash3_32(CAST(d AS VARCHAR)) AS d_same,
+       murmur_hash3_32(n)  IS NOT DISTINCT FROM  murmur_hash3_32(CAST(n AS VARCHAR)) AS n_same
 FROM murmur_numeric_text ORDER BY id;
 
 -- query 3

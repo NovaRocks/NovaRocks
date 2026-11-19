@@ -29,21 +29,19 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_right_join_preserve_r;
 CREATE TABLE ${case_db}.t_rf_right_join_preserve_l (
     k INT,
     tag_l VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_right_join_preserve_r (
     k INT,
     tag_r VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_rf_right_join_preserve_l VALUES
-    (1, 'l1'),
-    (2, 'l2');
+    ROW(1, 'l1'),
+    ROW(2, 'l2');
 
 INSERT INTO ${case_db}.t_rf_right_join_preserve_r VALUES
-    (2, 'r2'),
-    (3, 'r3');
+    ROW(2, 'r2'),
+    ROW(3, 'r3');
 
 SELECT l.k AS lk, l.tag_l, r.k AS rk, r.tag_r
 FROM ${case_db}.t_rf_right_join_preserve_l l

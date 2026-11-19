@@ -26,7 +26,7 @@ DROP TABLE IF EXISTS ${case_db}.residual_rng_r;
 CREATE TABLE ${case_db}.residual_rng_l (k INT, score INT, payload INT);
 CREATE TABLE ${case_db}.residual_rng_r (k INT, score INT, payload INT);
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.payload, r.payload
 FROM ${case_db}.residual_rng_l l
 JOIN ${case_db}.residual_rng_r r ON l.k = r.k

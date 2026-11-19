@@ -29,69 +29,66 @@ CREATE TABLE ${case_db}.t0 (
     c0 INT NOT NULL,
     c1 VARCHAR(32) NOT NULL,
     c2 VARCHAR(32) NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t1 (
     c0 INT NOT NULL,
     c1 VARCHAR(32) NOT NULL,
     c2 VARCHAR(32) NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t2 (
     c0 INT NOT NULL,
     c1 VARCHAR(32) NOT NULL,
     c2 VARCHAR(32) NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t0 (c0, c1, c2) VALUES
-    (4, 'DvvRNNLAAKj5mc3e', 'oHHGEp'),
-    (8, 'YMV5W6K3Jcv5kp', 'dm9h5J8cHtX6GfDZ8J7odAIJxyZdJSa'),
-    (4, 'nqrRk', 'D1ephlGonrHHWnY4ThjhO11'),
-    (6, 'A9fWZWnk1WWTJ37', 'V'),
-    (9, 'A6f2iV', 'kd2S'),
-    (2, 'KxNCswN6q1xZgBmvGxjr24Y', '6SqBgNekQtxOWiZXBrZuaAI1r'),
-    (2, 'Sl4ZtHpUMR6JKt0uYkcHvjsNs', 'TmysYNLEyxNGnkgk4NlbSAkS'),
-    (8, '985m0SmtQLKH4zZHS', '9BRWRd8pAbBjtqFYfdaeu'),
-    (7, 'TRXAIbYTmrTPV1F0', 'KJHp'),
-    (3, 'GLRmc1tmqiHpyi4dMaAb0F', 'Q3OkhuxxGMDwTfo273');
+    ROW(4, 'DvvRNNLAAKj5mc3e', 'oHHGEp'),
+    ROW(8, 'YMV5W6K3Jcv5kp', 'dm9h5J8cHtX6GfDZ8J7odAIJxyZdJSa'),
+    ROW(4, 'nqrRk', 'D1ephlGonrHHWnY4ThjhO11'),
+    ROW(6, 'A9fWZWnk1WWTJ37', 'V'),
+    ROW(9, 'A6f2iV', 'kd2S'),
+    ROW(2, 'KxNCswN6q1xZgBmvGxjr24Y', '6SqBgNekQtxOWiZXBrZuaAI1r'),
+    ROW(2, 'Sl4ZtHpUMR6JKt0uYkcHvjsNs', 'TmysYNLEyxNGnkgk4NlbSAkS'),
+    ROW(8, '985m0SmtQLKH4zZHS', '9BRWRd8pAbBjtqFYfdaeu'),
+    ROW(7, 'TRXAIbYTmrTPV1F0', 'KJHp'),
+    ROW(3, 'GLRmc1tmqiHpyi4dMaAb0F', 'Q3OkhuxxGMDwTfo273');
 
 INSERT INTO ${case_db}.t1 (c0, c1, c2) VALUES
-    (7, '5WUQFPf', '9GszO3v'),
-    (4, 'uGywLy7', 'XdPwCy8Kb9wgLzco'),
-    (6, '', 'QiWAR1yoW2TsD4hrC16saOw'),
-    (8, 'a1HBEfnDhbed4gLtlq', '7QgGrBQDn14bTfdOLSKF'),
-    (4, 'r2Igrl0jHPT', 'BPhnKYMqDSTQtXKUEKpjyKodTeLFI9'),
-    (4, 'SAztGc55aDcK9jeAnq57eMsXEfYdHA', 'NEfQ'),
-    (11, 'mtXUECE2TG23OLToBhvxpPaO', 'zxX'),
-    (6, '', 'tji7m72J'),
-    (6, '00RSjBQ71AuYlAZg', 'yGGjrU3Y'),
-    (9, 'w', 'f9VzBNpbKLt5');
+    ROW(7, '5WUQFPf', '9GszO3v'),
+    ROW(4, 'uGywLy7', 'XdPwCy8Kb9wgLzco'),
+    ROW(6, '', 'QiWAR1yoW2TsD4hrC16saOw'),
+    ROW(8, 'a1HBEfnDhbed4gLtlq', '7QgGrBQDn14bTfdOLSKF'),
+    ROW(4, 'r2Igrl0jHPT', 'BPhnKYMqDSTQtXKUEKpjyKodTeLFI9'),
+    ROW(4, 'SAztGc55aDcK9jeAnq57eMsXEfYdHA', 'NEfQ'),
+    ROW(11, 'mtXUECE2TG23OLToBhvxpPaO', 'zxX'),
+    ROW(6, '', 'tji7m72J'),
+    ROW(6, '00RSjBQ71AuYlAZg', 'yGGjrU3Y'),
+    ROW(9, 'w', 'f9VzBNpbKLt5');
 
 INSERT INTO ${case_db}.t2 (c0, c1, c2) VALUES
-    (10, 'hHG9GCIJaE0R1LGw1YOON14EP', 'TSIquQ1H9SuiyrkWXHsPAb'),
-    (12, 'GZjvI0nqA29SNPeJu', 'Jv8hlqasc4X'),
-    (13, 'yZRjWXPvJ5K7', 'Yy8BcdS'),
-    (13, 'Eq3zv98', 'enUAyzJ'),
-    (11, 'KfXyxjNoR1UMJLQVov9gqvqW', 'D8tVXXUt'),
-    (13, '0EMj6DoEnTBfu', '46aDAUNOiCYdlhFt7N1AUtkQduVmr0'),
-    (7, 'sMPdn6duIpSPEakZvgWTHaqGmVCx', 'EXN0OJXKgpJ5GXS5M527hGCutewN2Y'),
-    (8, 'GwtKaeSezvRskPeKQA', '2Q3oSkQI4FjMyNKgBA3qZZwPfAL'),
-    (6, 'RlUBfggH9iqhgxsUcU4e', 'x8xTgfsJX5ymxNUr'),
-    (13, 'RrpepqVmxIYhRv', 'JkLAXbF3n0qFrhKJBFiektS3K1vajU');
+    ROW(10, 'hHG9GCIJaE0R1LGw1YOON14EP', 'TSIquQ1H9SuiyrkWXHsPAb'),
+    ROW(12, 'GZjvI0nqA29SNPeJu', 'Jv8hlqasc4X'),
+    ROW(13, 'yZRjWXPvJ5K7', 'Yy8BcdS'),
+    ROW(13, 'Eq3zv98', 'enUAyzJ'),
+    ROW(11, 'KfXyxjNoR1UMJLQVov9gqvqW', 'D8tVXXUt'),
+    ROW(13, '0EMj6DoEnTBfu', '46aDAUNOiCYdlhFt7N1AUtkQduVmr0'),
+    ROW(7, 'sMPdn6duIpSPEakZvgWTHaqGmVCx', 'EXN0OJXKgpJ5GXS5M527hGCutewN2Y'),
+    ROW(8, 'GwtKaeSezvRskPeKQA', '2Q3oSkQI4FjMyNKgBA3qZZwPfAL'),
+    ROW(6, 'RlUBfggH9iqhgxsUcU4e', 'x8xTgfsJX5ymxNUr'),
+    ROW(13, 'RrpepqVmxIYhRv', 'JkLAXbF3n0qFrhKJBFiektS3K1vajU');
 
 -- ANALYZE to give FE stats for GRF decisions (result contains dynamic db name, skip check)
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t0;
+ANALYZE ${case_db}.t0;
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t1;
+ANALYZE ${case_db}.t1;
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t2;
+ANALYZE ${case_db}.t2;
 
 -- INNER JOIN[broadcast] pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 
 -- query 2
 with cte0 as (
@@ -111,7 +108,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 3
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -131,7 +128,7 @@ select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- LEFT JOIN[broadcast] pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 -- query 4
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -150,7 +147,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 5
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -170,7 +167,7 @@ select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- FULL JOIN[shuffle] pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 -- query 6
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -189,7 +186,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 7
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -209,7 +206,7 @@ select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- CROSS JOIN pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 -- query 8
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -228,7 +225,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 9
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -248,7 +245,7 @@ select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- LEFT SEMI JOIN[broadcast] pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 -- query 10
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -268,7 +265,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 11
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -289,7 +286,7 @@ select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- LEFT ANTI JOIN[broadcast] pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 -- query 12
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -309,7 +306,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 13
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -330,7 +327,7 @@ select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- RIGHT SEMI JOIN[shuffle] pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 -- query 14
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -350,7 +347,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 15
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -371,7 +368,7 @@ select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- RIGHT ANTI JOIN[shuffle] pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 -- query 16
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -391,7 +388,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 17
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -412,7 +409,7 @@ select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- NOT IN subquery pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 -- query 18
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -432,7 +429,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 19
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -453,7 +450,7 @@ select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- IN subquery pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 -- query 20
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -473,7 +470,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 21
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -494,7 +491,7 @@ select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- EXISTS subquery pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 -- query 22
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -514,7 +511,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 23
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -535,7 +532,7 @@ select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- NOT EXISTS subquery pair
-set enable_global_runtime_filter=false;
+SET SESSION enable_global_runtime_filter = false;
 -- query 24
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
@@ -555,7 +552,7 @@ from cte1 inner join t2 on cte1.c0 = t2.c0
 select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
 from cte2;
 
-set enable_global_runtime_filter=true;
+SET SESSION enable_global_runtime_filter = true;
 -- query 25
 with cte0 as (
 select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2

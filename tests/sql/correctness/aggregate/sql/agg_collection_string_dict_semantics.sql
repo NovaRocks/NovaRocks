@@ -36,17 +36,16 @@ CREATE TABLE ${case_db}.t_agg_collection_string_dict (
     city_null STRING,
     city_array ARRAY<STRING>,
     city_array_null ARRAY<STRING>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_collection_string_dict VALUES
-    (1, 1, 'Tom', 90, [90, 90], ['a', 'b'], 'beijing', 'beijing', ['beijing', 'shanghai'], NULL),
-    (1, 2, 'Tom', 80, [80], ['a', 'c'], 'beijing', NULL, ['shenzhen', 'shanghai'], ['shenzhen', 'shanghai']),
-    (1, 3, 'May', NULL, [80], ['z'], 'shanghai', 'shanghai', ['shenzhen', NULL], ['shenzhen', NULL]),
-    (2, 4, 'Ti', 98, [98], NULL, 'shanghai', NULL, ['beijing', NULL, 'shanghai'], NULL),
-    (2, 5, 'Ti', 99, [99], ['x'], 'hangzhou', 'hangzhou', ['hangzhou'], ['hangzhou']),
-    (2, 6, NULL, NULL, [], [], 'hangzhou', NULL, ['hangzhou', 'shanghai'], ['hangzhou', 'shanghai']),
-    (3, 7, 'Zoe', 70, [70], ['n'], 'nanjing', 'nanjing', ['nanjing'], ['nanjing']);
+    ROW(1, 1, 'Tom', 90, [90, 90], ['a', 'b'], 'beijing', 'beijing', ['beijing', 'shanghai'], NULL),
+    ROW(1, 2, 'Tom', 80, [80], ['a', 'c'], 'beijing', NULL, ['shenzhen', 'shanghai'], ['shenzhen', 'shanghai']),
+    ROW(1, 3, 'May', NULL, [80], ['z'], 'shanghai', 'shanghai', ['shenzhen', NULL], ['shenzhen', NULL]),
+    ROW(2, 4, 'Ti', 98, [98], NULL, 'shanghai', NULL, ['beijing', NULL, 'shanghai'], NULL),
+    ROW(2, 5, 'Ti', 99, [99], ['x'], 'hangzhou', 'hangzhou', ['hangzhou'], ['hangzhou']),
+    ROW(2, 6, NULL, NULL, [], [], 'hangzhou', NULL, ['hangzhou', 'shanghai'], ['hangzhou', 'shanghai']),
+    ROW(3, 7, 'Zoe', 70, [70], ['n'], 'nanjing', 'nanjing', ['nanjing'], ['nanjing']);
 SELECT
     g,
     ARRAY_AGG(name ORDER BY id) AS names_all,

@@ -30,26 +30,24 @@ CREATE TABLE ${case_db}.t_join_multi_key_null_l (
   k1 INT,
   k2 INT,
   lv STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_multi_key_null_r (
   k1 INT,
   k2 INT,
   rv STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_multi_key_null_l VALUES
-  (1, 1, 'l11'),
-  (1, NULL, 'l1n'),
-  (NULL, 1, 'ln1'),
-  (2, 2, 'l22'),
-  (2, 3, 'l23');
+  ROW(1, 1, 'l11'),
+  ROW(1, NULL, 'l1n'),
+  ROW(NULL, 1, 'ln1'),
+  ROW(2, 2, 'l22'),
+  ROW(2, 3, 'l23');
 INSERT INTO ${case_db}.t_join_multi_key_null_r VALUES
-  (1, 1, 'r11'),
-  (1, NULL, 'r1n'),
-  (NULL, 1, 'rn1'),
-  (2, 2, 'r22'),
-  (2, 4, 'r24');
+  ROW(1, 1, 'r11'),
+  ROW(1, NULL, 'r1n'),
+  ROW(NULL, 1, 'rn1'),
+  ROW(2, 2, 'r22'),
+  ROW(2, 4, 'r24');
 SELECT l.k1, l.k2, l.lv, r.rv
 FROM ${case_db}.t_join_multi_key_null_l l
 INNER JOIN ${case_db}.t_join_multi_key_null_r r

@@ -25,14 +25,14 @@ CREATE TABLE ${case_db}.residual_lcj_a (k INT, bucket INT, payload INT);
 CREATE TABLE ${case_db}.residual_lcj_b (k INT, bucket INT, payload INT);
 CREATE TABLE ${case_db}.residual_lcj_c (k INT, flag INT, payload INT);
 
-SET disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
+SET SESSION disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
 
 -- @skip_result_check=true
 -- @result_contains=INNER, eq: [a.k = b.k]
 -- @result_contains=other: a.bucket = b.bucket OR a.payload = b.payload
 -- @result_contains=INNER, eq: [b.k = c.k]
 -- @result_contains=predicates: c.flag = 1 AND c.k IS NOT NULL
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.payload, b.payload, c.payload
 FROM ${case_db}.residual_lcj_a a
 JOIN ${case_db}.residual_lcj_b b
@@ -41,4 +41,4 @@ JOIN ${case_db}.residual_lcj_c c
   ON b.k = c.k
 WHERE c.flag = 1;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

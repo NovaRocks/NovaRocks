@@ -33,18 +33,15 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.powers_of_2 (
     power_250 DECIMAL(38,0)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- pow(2, 250)
 insert into ${case_db}.powers_of_2 select 18092513943330;
 
-create table ${case_db}.test_256max_result(d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+create table ${case_db}.test_256max_result(d1 decimal(38,0)) WITH (format_version = 3);
 insert into ${case_db}.test_256max_result select 14965776766268;
 
-create table ${case_db}.test_256min_result(d1 decimal(38,0), d2 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+create table ${case_db}.test_256min_result(d1 decimal(38,0), d2 decimal(38,0)) WITH (format_version = 3);
 insert into ${case_db}.test_256min_result select 34028236692093, -17014118346046;
 
 CREATE TABLE ${case_db}.test_decimal_multiply_overflow (
@@ -56,12 +53,11 @@ CREATE TABLE ${case_db}.test_decimal_multiply_overflow (
     d76_38 DECIMAL(38,38),
     d50_0  DECIMAL(38,0),
     d38_0  DECIMAL(38, 0)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.test_decimal_multiply_overflow VALUES
 -- 1. Small values
-(1, 'Small values',
+ROW(1, 'Small values',
  1.123456789012345678901234567890,
  12.12345678901234567890,
  123.1234567890,
@@ -70,7 +66,7 @@ INSERT INTO ${case_db}.test_decimal_multiply_overflow VALUES
  12345),
 
 -- 2. Medium values
-(2, 'Medium values',
+ROW(2, 'Medium values',
  12345678.123456789012345678901234567890,
  1234567890.12345678901234567890,
  12345678901234.1234567890,
@@ -79,7 +75,7 @@ INSERT INTO ${case_db}.test_decimal_multiply_overflow VALUES
  12345678901234),
 
 -- 3. Near maximum values for each type
-(3, 'Near max positive values',
+ROW(3, 'Near max positive values',
  99999999.999999999999999999999999999999,
  9999999999.99999999999999999999,
  99999999999999.9999999999,
@@ -88,11 +84,11 @@ INSERT INTO ${case_db}.test_decimal_multiply_overflow VALUES
  99999999999999),
 
 -- 4. Corresponding negative values
-(4, 'Near max negative values',
- -99999999.999999999999999999999999999999,
- -9999999999.99999999999999999999,
- -99999999999999.9999999999,
- -0.99999999999999999999999999999999999999,
+ROW(4, 'Near max negative values',
+ (- (DECIMAL '99999999.999999999999999999999999999999')),
+ (- (DECIMAL '9999999999.99999999999999999999')),
+ (- (DECIMAL '99999999999999.9999999999')),
+ (- (DECIMAL '0.99999999999999999999999999999999999999')),
  -99999999999999,
  -99999999999999);
 
@@ -104,12 +100,11 @@ CREATE TABLE ${case_db}.test_boundary_values (
     val_19_0 DECIMAL(19, 0),
     val_25_0 DECIMAL(25, 0),
     val_high_scale DECIMAL(38,38)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.test_boundary_values VALUES
 -- 1. Near 76-digit decimal maximum
-(1, 'Near 76-digit decimal max',
+ROW(1, 'Near 76-digit decimal max',
  99999999999999,
  99999999999999,
  99999999999999,
@@ -117,15 +112,15 @@ INSERT INTO ${case_db}.test_boundary_values VALUES
  0.00000000000000000000000000000000000000),
 
 -- 2. Corresponding negative values
-(2, 'Near 76-digit decimal min',
+ROW(2, 'Near 76-digit decimal min',
  -99999999999999,
  -99999999999999,
  -99999999999999,
  -99999999999999,
- -0.00000000000000000000000000000000000000),
+ (- (DECIMAL '0.00000000000000000000000000000000000000'))),
 
 -- 3. Values for testing multiplication overflow
-(3, 'Multiplication overflow test values',
+ROW(3, 'Multiplication overflow test values',
  10000000000000,
  10000000000000,
  10000000000000,
@@ -133,7 +128,7 @@ INSERT INTO ${case_db}.test_boundary_values VALUES
  0.00000000000000000000000000000000000000),
 
 -- 4. Medium size values
-(4, 'Medium size values',
+ROW(4, 'Medium size values',
  50000000000000,
  50000000000000,
  50000000000000,
@@ -144,17 +139,16 @@ CREATE TABLE ${case_db}.test_progressive_boundary (
     id INT,
     digits INT,
     test_val DECIMAL(38,0)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.test_progressive_boundary VALUES
-(1, 10, 9999999999),
-(2, 15, 999999999999999),
-(3, 20, 99999999999999),
-(4, 25, 99999999999999),
-(5, 30, 99999999999999),
-(6, 35, 99999999999999),
-(7, 38, 99999999999999);
+ROW(1, 10, 9999999999),
+ROW(2, 15, 999999999999999),
+ROW(3, 20, 99999999999999),
+ROW(4, 25, 99999999999999),
+ROW(5, 30, 99999999999999),
+ROW(6, 35, 99999999999999),
+ROW(7, 38, 99999999999999);
 
 -- query 2
 -- INT_256MAX
@@ -475,7 +469,7 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 6.4: Large * -1
 SELECT
     'Test 6.4: Large * -1' as test_case,
-    cast(val_76_0 * -1 as string) as result,
+    cast(val_76_0 * (-1) as string) as result,
     'Should return negative of original' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 

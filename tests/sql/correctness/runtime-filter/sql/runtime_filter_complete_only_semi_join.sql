@@ -27,25 +27,23 @@ DROP TABLE IF EXISTS ${case_db}.rf_co_r;
 CREATE TABLE ${case_db}.rf_co_l (
     id INT,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.rf_co_r (
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.rf_co_l VALUES
-    (1, 10),
-    (2, 20),
-    (3, 30),
-    (4, 40);
+    ROW(1, 10),
+    ROW(2, 20),
+    ROW(3, 30),
+    ROW(4, 40);
 
 INSERT INTO ${case_db}.rf_co_r VALUES
-    (20),
-    (40);
+    ROW(20),
+    ROW(40);
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (
 -- @explain_contains=LEFT SEMI
 -- @explain_contains=producer binding
@@ -55,10 +53,10 @@ FROM ${case_db}.rf_co_l l
 WHERE l.k IN (SELECT k FROM ${case_db}.rf_co_r)
 ORDER BY l.id;
 
-SET disable_optimizer_rules = 'RuntimeFilterPushDown';
+SET SESSION disable_optimizer_rules = 'RuntimeFilterPushDown';
 SELECT l.id, l.k
 FROM ${case_db}.rf_co_l l
 WHERE l.k IN (SELECT k FROM ${case_db}.rf_co_r)
 ORDER BY l.id;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

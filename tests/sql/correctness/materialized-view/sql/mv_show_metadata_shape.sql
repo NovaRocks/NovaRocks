@@ -24,7 +24,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 
 -- query 2
 SELECT * FROM system.runtime.materialized_view_states WHERE false;
@@ -34,15 +34,9 @@ SELECT * FROM system.runtime.materialized_view_states WHERE false;
 CREATE TABLE ${case_db}.orders_shape (
   k1 INT NOT NULL,
   v2 BIGINT
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
-INSERT INTO ${case_db}.orders_shape VALUES (1, 10);
-CREATE MATERIALIZED VIEW ${case_db}.orders_shape_mv
-DISTRIBUTED BY HASH(k1) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k1, v2 FROM ${case_db}.orders_shape;
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.orders_shape VALUES ROW(1, 10);
+CREATE MATERIALIZED VIEW ${case_db}.orders_shape_mv AS SELECT k1, v2 FROM ${case_db}.orders_shape;
 
 -- query 4
 -- @result_contains=orders_shape_mv
@@ -54,5 +48,5 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mate
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.orders_shape_mv;
-DROP TABLE IF EXISTS ${case_db}.orders_shape FORCE;
-DROP DATABASE IF EXISTS ${case_db};
+DROP TABLE IF EXISTS ${case_db}.orders_shape ;
+DROP SCHEMA IF EXISTS ${case_db};

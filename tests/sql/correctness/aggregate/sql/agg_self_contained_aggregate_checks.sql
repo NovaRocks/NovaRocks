@@ -27,34 +27,32 @@
 CREATE TABLE ${case_db}.t_agg_regression_customer_metrics (
     c_custkey INT,
     c_region VARCHAR(32)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_agg_regression_lineorder_metrics (
     lo_revenue BIGINT,
     lo_quantity INT,
     lo_discount INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_regression_customer_metrics VALUES
-    (1, 'ASIA'),
-    (2, 'AMERICA'),
-    (3, 'EUROPE'),
-    (4, 'AFRICA'),
-    (5, 'MIDDLE EAST'),
-    (6, 'ASIA');
+    ROW(1, 'ASIA'),
+    ROW(2, 'AMERICA'),
+    ROW(3, 'EUROPE'),
+    ROW(4, 'AFRICA'),
+    ROW(5, 'MIDDLE EAST'),
+    ROW(6, 'ASIA');
 
 INSERT INTO ${case_db}.t_agg_regression_lineorder_metrics VALUES
-    (100, 10, 1),
-    (200, 24, 3),
-    (50, 25, 2),
-    (400, 5, 4),
-    (300, 20, 2),
-    (10, 1, 0);
+    ROW(100, 10, 1),
+    ROW(200, 24, 3),
+    ROW(50, 25, 2),
+    ROW(400, 5, 4),
+    ROW(300, 20, 2),
+    ROW(10, 1, 0);
 
 SELECT metric, value
 FROM (
-    SELECT 'customer_count' AS metric, CAST(COUNT() AS BIGINT) AS value
+    SELECT 'customer_count' AS metric, CAST(COUNT(*) AS BIGINT) AS value
     FROM ${case_db}.t_agg_regression_customer_metrics
     UNION ALL
     SELECT 'lineorder_filtered_sum_revenue', CAST(SUM(lo_revenue) AS BIGINT)

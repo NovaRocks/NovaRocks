@@ -29,11 +29,11 @@ CREATE TABLE ${case_db}.t_int_insert_regression (
 );
 -- query 3
 -- query 4
-INSERT INTO ${case_db}.t_int_insert_regression VALUES (1, 1);
+INSERT INTO ${case_db}.t_int_insert_regression VALUES ROW(1, 1);
 -- query 5
-INSERT INTO ${case_db}.t_int_insert_regression VALUES (2, 2);
+INSERT INTO ${case_db}.t_int_insert_regression VALUES ROW(2, 2);
 -- query 6
-INSERT INTO ${case_db}.t_int_insert_regression VALUES (3, 3);
+INSERT INTO ${case_db}.t_int_insert_regression VALUES ROW(3, 3);
 -- query 7
 SELECT id, v
 FROM ${case_db}.t_int_insert_regression

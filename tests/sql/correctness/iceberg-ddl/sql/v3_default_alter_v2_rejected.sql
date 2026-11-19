@@ -22,7 +22,7 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_default_alter_v2 FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_default_alter_v2 ;
 CREATE TABLE ${case_db}.t_v3_default_alter_v2 (
   a INT
 );
@@ -33,4 +33,4 @@ ALTER TABLE ${case_db}.t_v3_default_alter_v2 ADD COLUMN b INT DEFAULT 5;
 
 -- query 3
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_default_alter_v2 FORCE;
+DROP TABLE ${case_db}.t_v3_default_alter_v2 ;

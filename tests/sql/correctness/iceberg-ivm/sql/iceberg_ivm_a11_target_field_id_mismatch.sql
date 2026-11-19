@@ -29,42 +29,21 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_a11_tgt_fid_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_a11_tgt_fid_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} (
   id INT NOT NULL,
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES
-  (1, 'US', 100),
-  (2, 'EU', 50);
+  ROW(1, 'US', 100),
+  ROW(2, 'EU', 50);
 
 -- query 2
 -- @skip_result_check=true
 USE ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW mv_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT id, region, amount FROM base_${uuid0};
+CREATE MATERIALIZED VIEW mv_${uuid0} AS SELECT id, region, amount FROM base_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
@@ -77,7 +56,7 @@ SELECT id, region, amount FROM mv_${uuid0} ORDER BY id;
 -- query 5
 -- Insert new data into base and refresh once more to get a stable contract baseline.
 -- @skip_result_check=true
-INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES (3, 'AP', 300);
+INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES ROW(3, 'AP', 300);
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 6
@@ -94,7 +73,7 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 7
 -- @skip_result_check=true
-INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES (4, 'US', 400);
+INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES ROW(4, 'US', 400);
 
 -- query 8
 -- DROP COLUMN changes the target schema version while canonical L is unchanged.
@@ -107,6 +86,6 @@ REFRESH MATERIALIZED VIEW mv_${uuid0};
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_${uuid0};
-DROP TABLE ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} FORCE;
-DROP DATABASE ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} ;
+DROP SCHEMA ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_a11_tgt_fid_${uuid0};

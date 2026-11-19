@@ -29,39 +29,22 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvsc_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvsc_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvsc_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvsc_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE mvsc_${uuid0}.ns_${uuid0}.orders (
   region STRING,
   amount BIGINT
-) TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO mvsc_${uuid0}.ns_${uuid0}.orders VALUES ('east', 10), ('east', 20), ('west', 7);
+INSERT INTO mvsc_${uuid0}.ns_${uuid0}.orders VALUES ROW('east', 10), ROW('east', 20), ROW('west', 7);
 
 -- query 5
 -- @skip_result_check=true
@@ -72,18 +55,14 @@ USE mvsc_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW orders_total
-DISTRIBUTED BY HASH(region) BUCKETS 1
-REFRESH DEFERRED MANUAL
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT region, SUM(amount) AS total FROM orders GROUP BY region;
+CREATE MATERIALIZED VIEW orders_total WITH (refresh_policy = 'MANUAL') AS SELECT region, SUM(amount) AS total FROM orders GROUP BY region;
 
 -- query 8
 -- The refresh commits and the frontend dies before recording it.
 -- @kill_fe_after_mv_known_committed_before_projector_cas=true
 -- @expect_error_tier=drift
 -- @expect_error=Trino transport failure
-REFRESH MATERIALIZED VIEW orders_total WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW orders_total;
 
 -- query 9
 -- The published result is there, found from the lake by the next process.
@@ -120,8 +99,8 @@ SELECT 1;
 -- @skip_result_check=true
 USE mvsc_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW orders_total;
-DROP TABLE mvsc_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE mvsc_${uuid0}.ns_${uuid0};
+DROP TABLE mvsc_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA mvsc_${uuid0}.ns_${uuid0};
 -- Dropping the attachment matters: two attachments onto one warehouse make the
 -- same physical MV discoverable under two catalog names, and its management
 -- binds to whichever attachment discovered it first -- so the next case's

@@ -29,17 +29,11 @@
 CREATE TABLE orders_base_${uuid0} (
   k1 INT NOT NULL,
   v2 BIGINT
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 INSERT INTO orders_base_${uuid0} VALUES
-  (1, 10),
-  (2, 20);
-CREATE MATERIALIZED VIEW orders_mv_${uuid0}
-DISTRIBUTED BY HASH(k1) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k1, v2 FROM orders_base_${uuid0};
+  ROW(1, 10),
+  ROW(2, 20);
+CREATE MATERIALIZED VIEW orders_mv_${uuid0} AS SELECT k1, v2 FROM orders_base_${uuid0};
 
 -- query 2
 SELECT k1, v2 FROM orders_mv_${uuid0} ORDER BY k1;
@@ -53,7 +47,7 @@ SELECT k1, v2 FROM orders_mv_${uuid0} ORDER BY k1;
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO orders_base_${uuid0} VALUES (3, 30);
+INSERT INTO orders_base_${uuid0} VALUES ROW(3, 30);
 
 -- query 6
 SELECT k1, v2 FROM orders_mv_${uuid0} ORDER BY k1;
@@ -69,4 +63,4 @@ SELECT k1, v2 FROM orders_mv_${uuid0} ORDER BY k1;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS orders_mv_${uuid0};
-DROP TABLE IF EXISTS orders_base_${uuid0} FORCE;
+DROP TABLE IF EXISTS orders_base_${uuid0} ;

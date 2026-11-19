@@ -24,42 +24,21 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_agg_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_agg_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_agg_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_agg_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_agg_${uuid0}.ns_${uuid0}.orders (
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 USE ice_ivm_agg_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ice_ivm_agg_${uuid0}.ns_${uuid0}.orders VALUES
-  ('east', 10),
-  ('east', 20),
-  ('west', NULL);
-CREATE MATERIALIZED VIEW agg_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region, COUNT(*) AS c, COUNT(amount) AS c_amount, SUM(amount) AS s, AVG(amount) AS a
+  ROW('east', 10),
+  ROW('east', 20),
+  ROW('west', NULL);
+CREATE MATERIALIZED VIEW agg_mv_${uuid0} AS SELECT region, COUNT(*) AS c, COUNT(amount) AS c_amount, SUM(amount) AS s, AVG(amount) AS a
 FROM ice_ivm_agg_${uuid0}.ns_${uuid0}.orders
 GROUP BY region;
 REFRESH MATERIALIZED VIEW agg_mv_${uuid0};
@@ -71,7 +50,7 @@ ORDER BY region;
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ice_ivm_agg_${uuid0}.ns_${uuid0}.orders VALUES ('east', 30);
+INSERT INTO ice_ivm_agg_${uuid0}.ns_${uuid0}.orders VALUES ROW('east', 30);
 
 -- query 5
 -- @skip_result_check=true
@@ -87,7 +66,7 @@ ORDER BY region;
 
 -- query 7
 -- @skip_result_check=true
-INSERT INTO ice_ivm_agg_${uuid0}.ns_${uuid0}.orders VALUES ('north', 5);
+INSERT INTO ice_ivm_agg_${uuid0}.ns_${uuid0}.orders VALUES ROW('north', 5);
 DELETE FROM ice_ivm_agg_${uuid0}.ns_${uuid0}.orders WHERE region = 'west';
 UPDATE ice_ivm_agg_${uuid0}.ns_${uuid0}.orders SET amount = 40 WHERE region = 'east' AND amount = 10;
 
@@ -112,6 +91,6 @@ SELECT __agg_state_c FROM agg_mv_${uuid0};
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW agg_mv_${uuid0};
-DROP TABLE ice_ivm_agg_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE ice_ivm_agg_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_agg_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA ice_ivm_agg_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_agg_${uuid0};

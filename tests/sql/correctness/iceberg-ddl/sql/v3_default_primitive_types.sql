@@ -22,14 +22,11 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_default_types FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_default_types ;
 CREATE TABLE ${case_db}.t_v3_default_types (
   id INT
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
-INSERT INTO ${case_db}.t_v3_default_types VALUES (1);
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.t_v3_default_types VALUES ROW(1);
 ALTER TABLE ${case_db}.t_v3_default_types ADD COLUMN c_bool BOOLEAN DEFAULT TRUE;
 ALTER TABLE ${case_db}.t_v3_default_types ADD COLUMN c_tinyint TINYINT DEFAULT 1;
 ALTER TABLE ${case_db}.t_v3_default_types ADD COLUMN c_smallint SMALLINT DEFAULT 2;
@@ -49,4 +46,4 @@ ORDER BY id;
 
 -- query 3
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_default_types FORCE;
+DROP TABLE ${case_db}.t_v3_default_types ;

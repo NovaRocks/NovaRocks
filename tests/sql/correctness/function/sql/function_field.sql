@@ -27,13 +27,12 @@
 -- Setup: create table t1
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE t1 (c1 int, c2 varchar(100), c3 double)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE t1 (c1 int, c2 varchar(100), c3 double) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1(c1, c2, c3) VALUES (0, "hello", 5.5), (1, "world", 6.01), (2, "star", 5.0), (3, "rocks", 1.1111);
+INSERT INTO t1(c1, c2, c3) VALUES ROW(0, 'hello', 5.5), ROW(1, 'world', 6.01), ROW(2, 'star', 5.0), ROW(3, 'rocks', 1.1111);
 
 -- query 3
 -- FIELD with matching int literals
@@ -94,12 +93,12 @@ SELECT *, c1, field(c1, 1, 1, 1, 1) FROM t1 ORDER BY field(c1, 1, 1, 1, 1);
 -- query 16
 -- ORDER BY field() on string column asc
 USE ${case_db};
-SELECT * FROM t1 ORDER BY field(c2, "star", "rocks", "hello", "world") asc;
+SELECT * FROM t1 ORDER BY field(c2, 'star', 'rocks', 'hello', 'world') asc;
 
 -- query 17
 -- ORDER BY field() on string column desc
 USE ${case_db};
-SELECT * FROM t1 ORDER BY field(c2, "star", "rocks", "hello", "world") desc;
+SELECT * FROM t1 ORDER BY field(c2, 'star', 'rocks', 'hello', 'world') desc;
 
 -- query 18
 -- ORDER BY field() on double column with expressions
@@ -109,25 +108,8 @@ SELECT * FROM t1 ORDER BY field(c3, 1.1111, 6 - 1, 6.01, 5 + 0.5);
 -- query 19
 -- Setup views for cross-type field() tests
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG IF NOT EXISTS `function_view_rest_${suite_uuid0}`
-PROPERTIES (
-    "type"="iceberg",
-    "iceberg.catalog.type"="rest",
-    "uri"="${iceberg_rest_uri}",
-    "warehouse"="${iceberg_rest_warehouse}",
-    "credential.object-store-metadata.consumer-role" = "frontend",
-    "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-    "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-    "credential.object-store-data.consumer-role" = "backend",
-    "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-    "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-    "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.region"="${oss_region}",
-    "aws.s3.enable_path_style_access"="${oss_path_style}"
-);
-CREATE DATABASE IF NOT EXISTS function_view_rest_${suite_uuid0}.${case_db};
+CREATE CATALOG IF NOT EXISTS "function_view_rest_${suite_uuid0}" USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA IF NOT EXISTS function_view_rest_${suite_uuid0}.${case_db};
 USE function_view_rest_${suite_uuid0}.${case_db};
 DROP VIEW IF EXISTS vvv;
 DROP VIEW IF EXISTS vv;
@@ -197,14 +179,13 @@ DROP VIEW IF EXISTS v;
 DROP VIEW IF EXISTS dv;
 DROP VIEW IF EXISTS dvv;
 USE function_cat_${suite_uuid0}.${case_db};
-CREATE TABLE t2 (c1 int, c2 string)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE t2 (c1 int, c2 string) WITH (format_version = 3);
 
 -- query 31
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t2 VALUES (1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"), (6, "f"), (7, "g"), (8, "h"), (9, "i"),
-                      (10, "j"), (11, "k"), (12, "l"), (13, "m"), (14, "n"), (15, "o"), (16, "p");
+INSERT INTO t2 VALUES ROW(1, 'a'), ROW(2, 'b'), ROW(3, 'c'), ROW(4, 'd'), ROW(5, 'e'), ROW(6, 'f'), ROW(7, 'g'), ROW(8, 'h'), ROW(9, 'i'),
+                      ROW(10, 'j'), ROW(11, 'k'), ROW(12, 'l'), ROW(13, 'm'), ROW(14, 'n'), ROW(15, 'o'), ROW(16, 'p');
 
 -- query 32
 -- Concurrency test: repeated identical queries to detect constant-value race conditions

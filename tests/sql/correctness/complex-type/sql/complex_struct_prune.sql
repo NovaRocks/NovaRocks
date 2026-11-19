@@ -23,34 +23,32 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.sc2 (
-  `v1` bigint(20) NULL COMMENT "",
-  `map1` MAP<int,MAP<int,MAP<int,int>>> NULL COMMENT "",
-  `st1` STRUCT<s1 int, sm2 MAP<int,int>, sm3 MAP<int,MAP<int,int>>> NULL COMMENT "",
-  `st2` STRUCT<s1 int, sa2 ARRAY<int>, ss3 STRUCT<sss1 int, sss2 STRUCT<ssss1 int, ssss2 int>>> NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+  "v1" bigint(20),
+  "map1" MAP<int,MAP<int,MAP<int,int>>>,
+  "st1" ROW(s1 int, sm2 MAP<int,int>, sm3 MAP<int,MAP<int,int>>),
+  "st2" ROW(s1 int, sa2 ARRAY<int>, ss3 ROW(sss1 int, sss2 ROW(ssss1 int, ssss2 int)))
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t1 (
-  `v1` bigint(20) NULL COMMENT "",
-  `v2` bigint(20) NULL COMMENT "",
-  `v3` bigint(20) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+  "v1" bigint(20),
+  "v2" bigint(20),
+  "v3" bigint(20)
+) WITH (format_version = 3);
 
-insert into ${case_db}.t1 values (1, 2, 3);
-insert into ${case_db}.t1 values (2, 2, 2);
-insert into ${case_db}.t1 values (3, 3, 3);
-insert into ${case_db}.t1 values (4, 4, 4);
-insert into ${case_db}.t1 values (5, 5, 5);
+insert into ${case_db}.t1 values ROW(1, 2, 3);
+insert into ${case_db}.t1 values ROW(2, 2, 2);
+insert into ${case_db}.t1 values ROW(3, 3, 3);
+insert into ${case_db}.t1 values ROW(4, 4, 4);
+insert into ${case_db}.t1 values ROW(5, 5, 5);
 
-insert into ${case_db}.sc2 values (1, map{1: map{10:map{100: 101}}}, row(1, map{10: 101}, map{10: map{100: 101}}), row(1, [1,10,101], row(1, row(10, 11))));
-insert into ${case_db}.sc2 values (2, map{2: map{20:map{200: 202}}}, row(2, map{20: 202}, map{20: map{200: 202}}), row(2, [2,20,202], row(2, row(20, 22))));
-insert into ${case_db}.sc2 values (3, map{3: map{30:map{300: 303}}}, row(3, map{30: 303}, map{30: map{300: 303}}), row(3, [3,30,303], row(3, row(30, 33))));
-insert into ${case_db}.sc2 values (4, map{4: map{40:map{400: 404}}}, row(4, map{40: 404}, map{40: map{400: 404}}), row(4, [4,40,404], row(4, row(40, 44))));
-insert into ${case_db}.sc2 values (5, map{5: map{50:map{500: 505}}}, row(5, map{50: 505}, map{50: map{500: 505}}), row(5, [5,50,505], row(5, row(50, 55))));
-insert into ${case_db}.sc2 values (5, map{5: map{50:map{500: 506}}}, row(5, map{50: 506}, map{50: map{500: 506}}), row(5, [5,50,506], row(5, row(50, 56))));
-insert into ${case_db}.sc2 values (5, map{5: map{50:map{500: 507}}}, row(5, map{50: 507}, map{50: map{500: 507}}), row(5, [5,50,507], row(5, row(50, 57))));
-insert into ${case_db}.sc2 values (5, map{5: map{50:map{500: 508}}}, row(5, map{50: 508}, map{50: map{500: 508}}), row(5, [5,50,508], row(5, row(50, 58))));
+insert into ${case_db}.sc2 values ROW(1, map(1, map(10,map(100, 101))), row(1, map(10, 101), map(10, map(100, 101))), row(1, [1,10,101], row(1, row(10, 11))));
+insert into ${case_db}.sc2 values ROW(2, map(2, map(20,map(200, 202))), row(2, map(20, 202), map(20, map(200, 202))), row(2, [2,20,202], row(2, row(20, 22))));
+insert into ${case_db}.sc2 values ROW(3, map(3, map(30,map(300, 303))), row(3, map(30, 303), map(30, map(300, 303))), row(3, [3,30,303], row(3, row(30, 33))));
+insert into ${case_db}.sc2 values ROW(4, map(4, map(40,map(400, 404))), row(4, map(40, 404), map(40, map(400, 404))), row(4, [4,40,404], row(4, row(40, 44))));
+insert into ${case_db}.sc2 values ROW(5, map(5, map(50,map(500, 505))), row(5, map(50, 505), map(50, map(500, 505))), row(5, [5,50,505], row(5, row(50, 55))));
+insert into ${case_db}.sc2 values ROW(5, map(5, map(50,map(500, 506))), row(5, map(50, 506), map(50, map(500, 506))), row(5, [5,50,506], row(5, row(50, 56))));
+insert into ${case_db}.sc2 values ROW(5, map(5, map(50,map(500, 507))), row(5, map(50, 507), map(50, map(500, 507))), row(5, [5,50,507], row(5, row(50, 57))));
+insert into ${case_db}.sc2 values ROW(5, map(5, map(50,map(500, 508))), row(5, map(50, 508), map(50, map(500, 508))), row(5, [5,50,508], row(5, row(50, 58))));
 
 -- query 2
 select st1.s1, st2.sa2 from ${case_db}.sc2;
@@ -112,10 +110,10 @@ select named_struct('a', st1, 'b', st2)[1].sm2 from ${case_db}.sc2;
 
 -- query 21
 -- Cast struct to different field types
-select cast(row(1,2,3) as STRUCT<a double, b string, c BIGINT>);
+select cast(row(1,2,3) as ROW(a double, b string, c BIGINT));
 
 -- query 22
-select cast(named_struct('1', 1, '2', 2, '3', 3) as STRUCT<a double, b string, c BIGINT>);
+select cast(named_struct('1', 1, '2', 2, '3', 3) as ROW(a double, b string, c BIGINT));
 
 -- query 23
 with input as (select struct([1, 2, 3], [4, 5, 6]) as s union all select struct([5, 6, 7], [6, 7]) as s) select s, s.col1 from input;

@@ -20,35 +20,12 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG lnp3d_retain_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE lnp3d_retain_${uuid0}.ns_${uuid0};
-CREATE TABLE lnp3d_retain_${uuid0}.ns_${uuid0}.orders (k1 INT NOT NULL, v1 BIGINT)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO lnp3d_retain_${uuid0}.ns_${uuid0}.orders VALUES (1, 10), (2, 20);
+CREATE CATALOG lnp3d_retain_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA lnp3d_retain_${uuid0}.ns_${uuid0};
+CREATE TABLE lnp3d_retain_${uuid0}.ns_${uuid0}.orders (k1 INT NOT NULL, v1 BIGINT) WITH (format_version = 3);
+INSERT INTO lnp3d_retain_${uuid0}.ns_${uuid0}.orders VALUES ROW(1, 10), ROW(2, 20);
 USE lnp3d_retain_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW orders_mv
-DISTRIBUTED BY HASH(k1) BUCKETS 1
-PRIMARY KEY (k1)
-REFRESH ASYNC EVERY INTERVAL 1 HOUR
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k1, v1 FROM orders;
+CREATE MATERIALIZED VIEW orders_mv WITH (primary_key = ARRAY['k1'], refresh_policy = 'INTERVAL', refresh_interval = '1h') AS SELECT k1, v1 FROM orders;
 
 -- query 2
 -- @skip_result_check=true
@@ -102,7 +79,7 @@ SELECT 1;
 -- query 9
 -- A new manual refresh belongs only to the new FE process after readmission.
 -- @skip_result_check=true
-INSERT INTO lnp3d_retain_${uuid0}.ns_${uuid0}.orders VALUES (3, 30);
+INSERT INTO lnp3d_retain_${uuid0}.ns_${uuid0}.orders VALUES ROW(3, 30);
 USE lnp3d_retain_${uuid0}.ns_${uuid0};
 REFRESH MATERIALIZED VIEW orders_mv;
 
@@ -118,6 +95,6 @@ SELECT k1, v1 FROM lnp3d_retain_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
 -- @skip_result_check=true
 USE lnp3d_retain_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW orders_mv;
-DROP TABLE lnp3d_retain_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE lnp3d_retain_${uuid0}.ns_${uuid0};
+DROP TABLE lnp3d_retain_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA lnp3d_retain_${uuid0}.ns_${uuid0};
 DROP CATALOG lnp3d_retain_${uuid0};

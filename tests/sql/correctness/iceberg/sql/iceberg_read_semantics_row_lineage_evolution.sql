@@ -22,19 +22,17 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.read_sem_rl FORCE;
+DROP TABLE IF EXISTS ${case_db}.read_sem_rl ;
 CREATE TABLE ${case_db}.read_sem_rl (
   id BIGINT NOT NULL,
   amount FLOAT
-) TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.read_sem_rl VALUES
-  (1, 10.5),
-  (2, 20.5);
+  ROW(1, 10.5),
+  ROW(2, 20.5);
 ALTER TABLE ${case_db}.read_sem_rl RENAME COLUMN amount TO total_amount;
-ALTER TABLE ${case_db}.read_sem_rl MODIFY COLUMN total_amount DOUBLE;
-INSERT INTO ${case_db}.read_sem_rl VALUES (3, 30.5);
+ALTER TABLE ${case_db}.read_sem_rl ALTER COLUMN total_amount SET DATA TYPE DOUBLE;
+INSERT INTO ${case_db}.read_sem_rl VALUES ROW(3, 30.5);
 
 -- query 2
 SELECT id,
@@ -46,4 +44,4 @@ ORDER BY id;
 
 -- query 3
 -- @skip_result_check=true
-DROP TABLE ${case_db}.read_sem_rl FORCE;
+DROP TABLE ${case_db}.read_sem_rl ;

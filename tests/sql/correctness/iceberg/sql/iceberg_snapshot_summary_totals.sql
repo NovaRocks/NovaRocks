@@ -22,20 +22,19 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_cat_${suite_uuid0}.iv32_db_${uuid0};
+CREATE SCHEMA iceberg_cat_${suite_uuid0}.iv32_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
-CREATE TABLE iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} (id INT, v INT) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} VALUES (1, 10), (2, 20);
+INSERT INTO iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} VALUES ROW(1, 10), ROW(2, 20);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} VALUES (3, 30);
+INSERT INTO iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} VALUES ROW(3, 30);
 
 -- query 5
 -- Latest append summary carries exact total records/data-files + engine-name.
@@ -77,4 +76,4 @@ FROM (
 
 -- query 8
 -- @skip_result_check=true
-DROP DATABASE iceberg_cat_${suite_uuid0}.iv32_db_${uuid0};
+DROP SCHEMA iceberg_cat_${suite_uuid0}.iv32_db_${uuid0};

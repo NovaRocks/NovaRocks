@@ -21,23 +21,18 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.sqlx2_mor_update_target FORCE;
-DROP TABLE IF EXISTS ${case_db}.sqlx2_mor_update_source FORCE;
+DROP TABLE IF EXISTS ${case_db}.sqlx2_mor_update_target ;
+DROP TABLE IF EXISTS ${case_db}.sqlx2_mor_update_source ;
 CREATE TABLE ${case_db}.sqlx2_mor_update_target (
   id BIGINT,
   v STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "novarocks.update.mode" = "merge-on-read"
-);
+) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 CREATE TABLE ${case_db}.sqlx2_mor_update_source (
   id BIGINT,
   new_v STRING
-) TBLPROPERTIES (
-  "format-version" = "3"
-);
-INSERT INTO ${case_db}.sqlx2_mor_update_target VALUES (1, 'a');
-INSERT INTO ${case_db}.sqlx2_mor_update_source VALUES (1, 'x'), (1, 'y');
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.sqlx2_mor_update_target VALUES ROW(1, 'a');
+INSERT INTO ${case_db}.sqlx2_mor_update_source VALUES ROW(1, 'x'), ROW(1, 'y');
 
 -- query 2
 -- @expect_error_tier=drift
@@ -54,5 +49,5 @@ ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE ${case_db}.sqlx2_mor_update_target FORCE;
-DROP TABLE ${case_db}.sqlx2_mor_update_source FORCE;
+DROP TABLE ${case_db}.sqlx2_mor_update_target ;
+DROP TABLE ${case_db}.sqlx2_mor_update_source ;

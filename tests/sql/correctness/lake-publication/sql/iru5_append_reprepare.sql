@@ -23,17 +23,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE lake_publication_${suite_uuid0}.ns_${uuid0};
+CREATE SCHEMA lake_publication_${suite_uuid0}.ns_${uuid0};
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows (
   id BIGINT, writer VARCHAR(16)
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "commit.retry.num-retries" = "3",
-  "commit.retry.min-wait-ms" = "0",
-  "commit.retry.max-wait-ms" = "0",
-  "commit.retry.total-timeout-ms" = "60000"
-);
-INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows VALUES (1, 'seed');
+) WITH (format_version = 3, max_commit_retry = 3, extra_properties = MAP(ARRAY['commit.retry.min-wait-ms', 'commit.retry.max-wait-ms', 'commit.retry.total-timeout-ms'], ARRAY['0', '0', '60000']));
+INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows VALUES ROW(1, 'seed');
 
 -- query 2
 -- @result_contains=IRU5_APPEND_TRAFFIC_BASELINE_OK
@@ -118,4 +112,4 @@ printf '%s\n' "$spark_out" | grep -F IRU5_APPEND_REPREPARE_OK
 
 -- query 6
 -- @skip_result_check=true
-DROP DATABASE lake_publication_${suite_uuid0}.ns_${uuid0} FORCE;
+DROP SCHEMA lake_publication_${suite_uuid0}.ns_${uuid0} CASCADE;

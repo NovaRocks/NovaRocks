@@ -20,12 +20,12 @@
 -- inputs so each group is finalized on one node. Plan-shape golden.
 CREATE TABLE ${case_db}.t_split_agg_grouped (k INT, v INT);
 INSERT INTO ${case_db}.t_split_agg_grouped VALUES
-    (1, 10), (1, 20), (1, 30),
-    (2, 5),  (2, 15), (2, 25),
-    (3, 7),  (3, 11), (3, 13),
-    (4, 1),  (4, 2),  (4, 3);
-ANALYZE TABLE ${case_db}.t_split_agg_grouped;
-EXPLAIN VERBOSE
+    ROW(1, 10), ROW(1, 20), ROW(1, 30),
+    ROW(2, 5),  ROW(2, 15), ROW(2, 25),
+    ROW(3, 7),  ROW(3, 11), ROW(3, 13),
+    ROW(4, 1),  ROW(4, 2),  ROW(4, 3);
+ANALYZE ${case_db}.t_split_agg_grouped;
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT k, SUM(v) AS s
 FROM ${case_db}.t_split_agg_grouped
 GROUP BY k

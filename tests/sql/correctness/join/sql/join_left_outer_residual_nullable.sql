@@ -29,23 +29,21 @@ DROP TABLE IF EXISTS ${case_db}.t_join_left_outer_residual_nullable_r;
 CREATE TABLE ${case_db}.t_join_left_outer_residual_nullable_l (
   id INT,
   lv INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_left_outer_residual_nullable_r (
   id INT,
   rv INT,
   flag STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_left_outer_residual_nullable_l VALUES
-  (1, 5),
-  (2, 8),
-  (3, 10);
+  ROW(1, 5),
+  ROW(2, 8),
+  ROW(3, 10);
 INSERT INTO ${case_db}.t_join_left_outer_residual_nullable_r VALUES
-  (1, 7, 'Y'),
-  (1, 9, NULL),
-  (2, 6, NULL),
-  (4, 1, 'Y');
+  ROW(1, 7, 'Y'),
+  ROW(1, 9, NULL),
+  ROW(2, 6, NULL),
+  ROW(4, 1, 'Y');
 SELECT l.id, l.lv, r.rv, r.flag
 FROM ${case_db}.t_join_left_outer_residual_nullable_l l
 LEFT OUTER JOIN ${case_db}.t_join_left_outer_residual_nullable_r r

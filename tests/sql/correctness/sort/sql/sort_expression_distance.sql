@@ -28,13 +28,12 @@ DROP TABLE IF EXISTS ${case_db}.t_sort_expression_distance;
 CREATE TABLE ${case_db}.t_sort_expression_distance (
   id INT,
   v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_sort_expression_distance VALUES
-  (1, 7),
-  (2, 12),
-  (3, 9),
-  (4, 15);
+  ROW(1, 7),
+  ROW(2, 12),
+  ROW(3, 9),
+  ROW(4, 15);
 SELECT trc2_output.id AS id, trc2_output.v AS v,
   CAST(trc2_output.dist AS VARCHAR) AS dist
 FROM (

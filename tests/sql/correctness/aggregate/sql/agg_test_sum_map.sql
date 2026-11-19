@@ -31,16 +31,15 @@ CREATE TABLE t1 (
     c2 map<int, int>,
     c3 map<varchar(10), bigint>,
     c4 map<int, double>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t1 values
-    (1, map{1:10, 2:20, 3:30}, map{"a":100, "b":200}, map{1:1.5, 2:2.5}),
-    (2, map{1:5, 2:15, 4:40}, map{"a":50, "c":150}, map{1:0.5, 3:3.5}),
-    (3, map{2:25, 3:35, 5:50}, map{"b":250, "c":350}, map{2:1.0, 3:2.0});
+    ROW(1, map(1,10, 2,20, 3,30), map('a',100, 'b',200), map(1,1.5, 2,2.5)),
+    ROW(2, map(1,5, 2,15, 4,40), map('a',50, 'c',150), map(1,0.5, 3,3.5)),
+    ROW(3, map(2,25, 3,35, 5,50), map('b',250, 'c',350), map(2,1.0, 3,2.0));
 
 -- query 4
 USE ${case_db};
@@ -48,7 +47,7 @@ select sum_map(c2)[1], sum_map(c2)[2], sum_map(c2)[3], sum_map(c2)[4], sum_map(c
 
 -- query 5
 USE ${case_db};
-select sum_map(c3)["a"], sum_map(c3)["b"], sum_map(c3)["c"] from t1;
+select sum_map(c3)['a'], sum_map(c3)['b'], sum_map(c3)['c'] from t1;
 
 -- query 6
 USE ${case_db};
@@ -65,7 +64,7 @@ select sum_map(c2)[1], sum_map(c2)[2], sum_map(c2)[3], sum_map(c2)[4] from t1 wh
 -- query 9
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 values (4, null, null, null);
+INSERT INTO t1 values ROW(4, null, null, null);
 
 -- query 10
 USE ${case_db};
@@ -74,7 +73,7 @@ select sum_map(c2)[1], sum_map(c2)[2], sum_map(c2)[3], sum_map(c2)[4], sum_map(c
 -- query 11
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 values (5, map{}, map{}, map{});
+INSERT INTO t1 values ROW(5, map(), map(), map());
 
 -- query 12
 USE ${case_db};
@@ -110,7 +109,7 @@ select sum_map(c2)[1], sum_map(c2)[2], sum_map(c2)[3], sum_map(c2)[4], sum_map(c
 
 -- query 20
 USE ${case_db};
-select sum_map(c3)["a"], sum_map(c3)["b"], sum_map(c3)["c"] from t1;
+select sum_map(c3)['a'], sum_map(c3)['b'], sum_map(c3)['c'] from t1;
 
 -- query 21
 USE ${case_db};
@@ -130,7 +129,7 @@ select sum_map(c2)[1], sum_map(c2)[2], sum_map(c2)[3], sum_map(c2)[4], sum_map(c
 
 -- query 25
 USE ${case_db};
-select sum_map(c3)["a"], sum_map(c3)["b"], sum_map(c3)["c"] from t1;
+select sum_map(c3)['a'], sum_map(c3)['b'], sum_map(c3)['c'] from t1;
 
 -- query 26
 USE ${case_db};
@@ -156,17 +155,16 @@ CREATE TABLE t2 (
     m_largeint map<int, largeint>,
     m_float map<int, float>,
     m_double map<int, double>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 30
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t2 values
-    (1, map{1:10, 2:20}, map{1:100, 2:200}, map{1:1000, 2:2000}, map{1:10000, 2:20000},
-        map{1:100000, 2:200000}, map{1:1.5, 2:2.5}, map{1:10.5, 2:20.5}),
-    (2, map{1:5, 3:30}, map{1:50, 3:300}, map{1:500, 3:3000}, map{1:5000, 3:30000},
-        map{1:50000, 3:300000}, map{1:0.5, 3:3.5}, map{1:5.5, 3:30.5});
+    ROW(1, map(1,10, 2,20), map(1,100, 2,200), map(1,1000, 2,2000), map(1,10000, 2,20000),
+        map(1,100000, 2,200000), map(1,1.5, 2,2.5), map(1,10.5, 2,20.5)),
+    ROW(2, map(1,5, 3,30), map(1,50, 3,300), map(1,500, 3,3000), map(1,5000, 3,30000),
+        map(1,50000, 3,300000), map(1,0.5, 3,3.5), map(1,5.5, 3,30.5));
 
 -- query 31
 USE ${case_db};
@@ -207,17 +205,16 @@ CREATE TABLE t3 (
     m_key_bigint map<bigint, int>,
     m_key_largeint map<largeint, int>,
     m_key_varchar map<varchar(20), int>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 39
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t3 values
-    (1, map{1:10, 2:20}, map{1:100, 2:200}, map{1:1000, 2:2000},
-        map{1:10000, 2:20000}, map{1:100000, 2:200000}, map{"a":10, "b":20}),
-    (2, map{1:5, 3:30}, map{1:50, 3:300}, map{1:500, 3:3000},
-        map{1:5000, 3:30000}, map{1:50000, 3:300000}, map{"a":5, "c":30});
+    ROW(1, map(1,10, 2,20), map(1,100, 2,200), map(1,1000, 2,2000),
+        map(1,10000, 2,20000), map(1,100000, 2,200000), map('a',10, 'b',20)),
+    ROW(2, map(1,5, 3,30), map(1,50, 3,300), map(1,500, 3,3000),
+        map(1,5000, 3,30000), map(1,50000, 3,300000), map('a',5, 'c',30));
 
 -- query 40
 USE ${case_db};
@@ -241,7 +238,7 @@ select sum_map(m_key_largeint)[1], sum_map(m_key_largeint)[2], sum_map(m_key_lar
 
 -- query 45
 USE ${case_db};
-select sum_map(m_key_varchar)["a"], sum_map(m_key_varchar)["b"], sum_map(m_key_varchar)["c"] from t3;
+select sum_map(m_key_varchar)['a'], sum_map(m_key_varchar)['b'], sum_map(m_key_varchar)['c'] from t3;
 
 -- query 46
 USE ${case_db};
@@ -250,11 +247,11 @@ select sum_map(NULL);
 -- query 47
 USE ${case_db};
 select sum_map(m)[1], sum_map(m)[2], sum_map(m)[3] from (
-    select map{1:10, 2:20} as m
+    select map(1,10, 2,20) as m
     union all
     select NULL as m
     union all
-    select map{1:5, 3:30} as m
+    select map(1,5, 3,30) as m
 ) t;
 
 -- query 48
@@ -273,15 +270,14 @@ USE ${case_db};
 CREATE TABLE t5 (
     id int,
     m_nullable map<int, int>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 50
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t5 values
-    (1, map{1:10, 2:20}),
-    (2, map{1:5, 3:30});
+    ROW(1, map(1,10, 2,20)),
+    ROW(2, map(1,5, 3,30));
 
 -- query 51
 USE ${case_db};
@@ -291,7 +287,7 @@ select sum_map(m_nullable)[1], sum_map(m_nullable)[2], sum_map(m_nullable)[3], s
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t5 values
-    (3, map{1:15, 2:NULL, 4:40});
+    ROW(3, map(1,15, 2,NULL, 4,40));
 
 -- query 53
 USE ${case_db};
@@ -301,7 +297,7 @@ select sum_map(m_nullable)[1], sum_map(m_nullable)[2], sum_map(m_nullable)[3], s
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t5 values
-    (4, map{5:NULL, 6:60});
+    ROW(4, map(5,NULL, 6,60));
 
 -- query 55
 USE ${case_db};
@@ -309,51 +305,51 @@ select sum_map(m_nullable)[1], sum_map(m_nullable)[2], sum_map(m_nullable)[3], s
 
 -- query 56
 USE ${case_db};
-select sum_map(m)[1], sum_map(m)[2] from (select map{1:10, 2:20} as m) t;
+select sum_map(m)[1], sum_map(m)[2] from (select map(1,10, 2,20) as m) t;
 
 -- query 57
 USE ${case_db};
-select sum_map(m) from ( select map{} as m union all select map{} as m union all select map{} as m ) t;
+select sum_map(m) from ( select map() as m union all select map() as m union all select map() as m ) t;
 
 -- query 58
 USE ${case_db};
 select sum_map(m)[1], sum_map(m)[2] from (
-    select map{1:10} as m
+    select map(1,10) as m
     union all
-    select map{} as m
+    select map() as m
     union all
-    select map{1:5, 2:20} as m
+    select map(1,5, 2,20) as m
 ) t;
 
 -- query 59
 USE ${case_db};
 select sum_map(m)[1], sum_map(m)[2], sum_map(m)[5], sum_map(m)[10] from (
-    select map{1:1, 2:2, 3:3, 4:4, 5:5, 6:6, 7:7, 8:8, 9:9, 10:10} as m
+    select map(1,1, 2,2, 3,3, 4,4, 5,5, 6,6, 7,7, 8,8, 9,9, 10,10) as m
     union all
-    select map{1:1, 2:2, 3:3, 4:4, 5:5, 6:6, 7:7, 8:8, 9:9, 10:10} as m
+    select map(1,1, 2,2, 3,3, 4,4, 5,5, 6,6, 7,7, 8,8, 9,9, 10,10) as m
 ) t;
 
 -- query 60
 USE ${case_db};
 select sum_map(m)[1], sum_map(m)[2], sum_map(m)[3], sum_map(m)[4] from (
-    select map{1:-10, 2:20, 3:-30} as m
+    select map(1,-10, 2,20, 3,-30) as m
     union all
-    select map{1:5, 2:-15, 4:40} as m
+    select map(1,5, 2,-15, 4,40) as m
 ) t;
 
 -- query 61
 USE ${case_db};
 select sum_map(m)[1], sum_map(m)[2] from (
-    select map{1:0, 2:10} as m
+    select map(1,0, 2,10) as m
     union all
-    select map{1:5, 2:0} as m
+    select map(1,5, 2,0) as m
 ) t;
 
 -- query 62
 -- @expect_error=sum_map only support scalar KV
 USE ${case_db};
 select sum_map(m) from (
-    select map{1:map{1:10}} as m
+    select map(1,map(1,10)) as m
 ) t;
 
 -- query 63
@@ -367,7 +363,7 @@ select sum_map(m) from (
 -- @expect_error=sum_map only support scalar KV
 USE ${case_db};
 select sum_map(m) from (
-    select map{1:row(1, 'a')} as m
+    select map(1,row(1, 'a')) as m
 ) t;
 
 -- query 65
@@ -376,32 +372,31 @@ USE ${case_db};
 CREATE TABLE t8 (
     category varchar(20),
     metrics map<varchar(20), int>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 66
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t8 values
-    ('A', map{"clicks":100, "views":200}),
-    ('A', map{"clicks":50, "impressions":150}),
-    ('B', map{"views":300, "impressions":250}),
-    ('B', map{"clicks":75, "views":100});
+    ROW('A', map('clicks',100, 'views',200)),
+    ROW('A', map('clicks',50, 'impressions',150)),
+    ROW('B', map('views',300, 'impressions',250)),
+    ROW('B', map('clicks',75, 'views',100));
 
 -- query 67
 USE ${case_db};
-select category, sum_map(metrics)["clicks"], sum_map(metrics)["views"], sum_map(metrics)["impressions"], count() from t8 group by category order by category;
+select category, sum_map(metrics)['clicks'], sum_map(metrics)['views'], sum_map(metrics)['impressions'], count(*) from t8 group by category order by category;
 
 -- query 68
 USE ${case_db};
-select category, sum_map(metrics)["clicks"] as clicks_total, sum_map(metrics)["views"] as views_total, sum_map(metrics)["impressions"] as impressions_total from t8 group by category having count() > 1 order by category;
+select category, sum_map(metrics)['clicks'] as clicks_total, sum_map(metrics)['views'] as views_total, sum_map(metrics)['impressions'] as impressions_total from t8 group by category having count(*) > 1 order by category;
 
 -- query 69
 USE ${case_db};
 select sum_map(m)[1], sum_map(m)[2], sum_map(m)[3] from (
-    select map{3:30, 1:10, 2:20} as m
+    select map(3,30, 1,10, 2,20) as m
     union all
-    select map{2:25, 3:35, 1:15} as m
+    select map(2,25, 3,35, 1,15) as m
 ) t;
 
 -- query 70
@@ -410,15 +405,14 @@ USE ${case_db};
 CREATE TABLE t10 (
     id int,
     data map<int, bigint>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 71
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t10 select
     generate_series as id,
-    map{1:generate_series, 2:generate_series*2, 3:generate_series*3} as data
+    map(1,generate_series, 2,generate_series*2, 3,generate_series*3) as data
 from table(generate_series(1, 100));
 
 -- query 72
@@ -498,75 +492,74 @@ CREATE TABLE t11_type_matrix (
     m_i_date map<int, date>,
     m_i_dt map<int, datetime>,
     m_i_str map<int, varchar(10)>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 74
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t11_type_matrix VALUES (
+INSERT INTO t11_type_matrix VALUES ROW(
     1,
     -- tinyint keys
-    map{1:10, 2:20}, map{1:100, 2:200}, map{1:1000, 2:2000}, map{1:10000, 2:20000},
-    map{1:100000, 2:200000}, map{1:1.5, 2:2.5}, map{1:10.5, 2:20.5},
+    map(1,10, 2,20), map(1,100, 2,200), map(1,1000, 2,2000), map(1,10000, 2,20000),
+    map(1,100000, 2,200000), map(1,1.5, 2,2.5), map(1,10.5, 2,20.5),
     -- smallint keys
-    map{1:10, 2:20}, map{1:100, 2:200}, map{1:1000, 2:2000}, map{1:10000, 2:20000},
-    map{1:100000, 2:200000}, map{1:1.5, 2:2.5}, map{1:10.5, 2:20.5},
+    map(1,10, 2,20), map(1,100, 2,200), map(1,1000, 2,2000), map(1,10000, 2,20000),
+    map(1,100000, 2,200000), map(1,1.5, 2,2.5), map(1,10.5, 2,20.5),
     -- int keys
-    map{1:10, 2:20}, map{1:100, 2:200}, map{1:1000, 2:2000}, map{1:10000, 2:20000},
-    map{1:100000, 2:200000}, map{1:1.5, 2:2.5}, map{1:10.5, 2:20.5},
+    map(1,10, 2,20), map(1,100, 2,200), map(1,1000, 2,2000), map(1,10000, 2,20000),
+    map(1,100000, 2,200000), map(1,1.5, 2,2.5), map(1,10.5, 2,20.5),
     -- bigint keys
-    map{1:10, 2:20}, map{1:100, 2:200}, map{1:1000, 2:2000}, map{1:10000, 2:20000},
-    map{1:100000, 2:200000}, map{1:1.5, 2:2.5}, map{1:10.5, 2:20.5},
+    map(1,10, 2,20), map(1,100, 2,200), map(1,1000, 2,2000), map(1,10000, 2,20000),
+    map(1,100000, 2,200000), map(1,1.5, 2,2.5), map(1,10.5, 2,20.5),
     -- largeint keys
-    map{1:10, 2:20}, map{1:100, 2:200}, map{1:1000, 2:2000}, map{1:10000, 2:20000},
-    map{1:100000, 2:200000}, map{1:1.5, 2:2.5}, map{1:10.5, 2:20.5},
+    map(1,10, 2,20), map(1,100, 2,200), map(1,1000, 2,2000), map(1,10000, 2,20000),
+    map(1,100000, 2,200000), map(1,1.5, 2,2.5), map(1,10.5, 2,20.5),
     -- float keys
-    map{1.0:10, 2.0:20}, map{1.0:100, 2.0:200}, map{1.0:1000, 2.0:2000}, map{1.0:10000, 2.0:20000},
-    map{1.0:100000, 2.0:200000}, map{1.0:1.5, 2.0:2.5}, map{1.0:10.5, 2.0:20.5},
+    map(1.0,10, 2.0,20), map(1.0,100, 2.0,200), map(1.0,1000, 2.0,2000), map(1.0,10000, 2.0,20000),
+    map(1.0,100000, 2.0,200000), map(1.0,1.5, 2.0,2.5), map(1.0,10.5, 2.0,20.5),
     -- double keys
-    map{1.0:10, 2.0:20}, map{1.0:100, 2.0:200}, map{1.0:1000, 2.0:2000}, map{1.0:10000, 2.0:20000},
-    map{1.0:100000, 2.0:200000}, map{1.0:1.5, 2.0:2.5}, map{1.0:10.5, 2.0:20.5},
+    map(1.0,10, 2.0,20), map(1.0,100, 2.0,200), map(1.0,1000, 2.0,2000), map(1.0,10000, 2.0,20000),
+    map(1.0,100000, 2.0,200000), map(1.0,1.5, 2.0,2.5), map(1.0,10.5, 2.0,20.5),
     -- date/datetime/string keys with numeric values
-    map{'2024-01-01':100, '2024-01-02':200}, map{'2024-01-01 10:00:00':100, '2024-01-01 11:00:00':200},
-    map{"a":100, "b":200},
+    map('2024-01-01',100, '2024-01-02',200), map('2024-01-01 10:00:00',100, '2024-01-01 11:00:00',200),
+    map('a',100, 'b',200),
     -- Non-numeric values (will cause errors if tested)
-    map{1:'2024-01-01', 2:'2024-01-02'}, map{1:'2024-01-01 10:00:00', 2:'2024-01-01 11:00:00'},
-    map{1:"a", 2:"b"}
+    map(1,'2024-01-01', 2,'2024-01-02'), map(1,'2024-01-01 10:00:00', 2,'2024-01-01 11:00:00'),
+    map(1,'a', 2,'b')
 );
 
 -- query 75
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t11_type_matrix VALUES (
+INSERT INTO t11_type_matrix VALUES ROW(
     2,
     -- tinyint keys
-    map{1:5, 3:30}, map{1:50, 3:300}, map{1:500, 3:3000}, map{1:5000, 3:30000},
-    map{1:50000, 3:300000}, map{1:0.5, 3:3.5}, map{1:5.5, 3:30.5},
+    map(1,5, 3,30), map(1,50, 3,300), map(1,500, 3,3000), map(1,5000, 3,30000),
+    map(1,50000, 3,300000), map(1,0.5, 3,3.5), map(1,5.5, 3,30.5),
     -- smallint keys
-    map{1:5, 3:30}, map{1:50, 3:300}, map{1:500, 3:3000}, map{1:5000, 3:30000},
-    map{1:50000, 3:300000}, map{1:0.5, 3:3.5}, map{1:5.5, 3:30.5},
+    map(1,5, 3,30), map(1,50, 3,300), map(1,500, 3,3000), map(1,5000, 3,30000),
+    map(1,50000, 3,300000), map(1,0.5, 3,3.5), map(1,5.5, 3,30.5),
     -- int keys
-    map{1:5, 3:30}, map{1:50, 3:300}, map{1:500, 3:3000}, map{1:5000, 3:30000},
-    map{1:50000, 3:300000}, map{1:0.5, 3:3.5}, map{1:5.5, 3:30.5},
+    map(1,5, 3,30), map(1,50, 3,300), map(1,500, 3,3000), map(1,5000, 3,30000),
+    map(1,50000, 3,300000), map(1,0.5, 3,3.5), map(1,5.5, 3,30.5),
     -- bigint keys
-    map{1:5, 3:30}, map{1:50, 3:300}, map{1:500, 3:3000}, map{1:5000, 3:30000},
-    map{1:50000, 3:300000}, map{1:0.5, 3:3.5}, map{1:5.5, 3:30.5},
+    map(1,5, 3,30), map(1,50, 3,300), map(1,500, 3,3000), map(1,5000, 3,30000),
+    map(1,50000, 3,300000), map(1,0.5, 3,3.5), map(1,5.5, 3,30.5),
     -- largeint keys
-    map{1:5, 3:30}, map{1:50, 3:300}, map{1:500, 3:3000}, map{1:5000, 3:30000},
-    map{1:50000, 3:300000}, map{1:0.5, 3:3.5}, map{1:5.5, 3:30.5},
+    map(1,5, 3,30), map(1,50, 3,300), map(1,500, 3,3000), map(1,5000, 3,30000),
+    map(1,50000, 3,300000), map(1,0.5, 3,3.5), map(1,5.5, 3,30.5),
     -- float keys
-    map{1.0:5, 3.0:30}, map{1.0:50, 3.0:300}, map{1.0:500, 3.0:3000}, map{1.0:5000, 3.0:30000},
-    map{1.0:50000, 3.0:300000}, map{1.0:0.5, 3.0:3.5}, map{1.0:5.5, 3.0:30.5},
+    map(1.0,5, 3.0,30), map(1.0,50, 3.0,300), map(1.0,500, 3.0,3000), map(1.0,5000, 3.0,30000),
+    map(1.0,50000, 3.0,300000), map(1.0,0.5, 3.0,3.5), map(1.0,5.5, 3.0,30.5),
     -- double keys
-    map{1.0:5, 3.0:30}, map{1.0:50, 3.0:300}, map{1.0:500, 3.0:3000}, map{1.0:5000, 3.0:30000},
-    map{1.0:50000, 3.0:300000}, map{1.0:0.5, 3.0:3.5}, map{1.0:5.5, 3.0:30.5},
+    map(1.0,5, 3.0,30), map(1.0,50, 3.0,300), map(1.0,500, 3.0,3000), map(1.0,5000, 3.0,30000),
+    map(1.0,50000, 3.0,300000), map(1.0,0.5, 3.0,3.5), map(1.0,5.5, 3.0,30.5),
     -- date/datetime/string keys with numeric values
-    map{'2024-01-01':50, '2024-01-03':300}, map{'2024-01-01 10:00:00':50, '2024-01-01 12:00:00':300},
-    map{"a":50, "c":300},
+    map('2024-01-01',50, '2024-01-03',300), map('2024-01-01 10:00:00',50, '2024-01-01 12:00:00',300),
+    map('a',50, 'c',300),
     -- Non-numeric values
-    map{1:'2024-01-03', 3:'2024-01-04'}, map{1:'2024-01-01 12:00:00', 3:'2024-01-01 13:00:00'},
-    map{1:"c", 3:"d"}
+    map(1,'2024-01-03', 3,'2024-01-04'), map(1,'2024-01-01 12:00:00', 3,'2024-01-01 13:00:00'),
+    map(1,'c', 3,'d')
 );
 
 -- query 76
@@ -775,7 +768,7 @@ select sum_map(m_dt_i)['2024-01-01 10:00:00'], sum_map(m_dt_i)['2024-01-01 11:00
 
 -- query 127
 USE ${case_db};
-select sum_map(m_str_i)["a"], sum_map(m_str_i)["b"], sum_map(m_str_i)["c"] from t11_type_matrix;
+select sum_map(m_str_i)['a'], sum_map(m_str_i)['b'], sum_map(m_str_i)['c'] from t11_type_matrix;
 
 -- query 128
 -- @expect_error=unsupported value type:DATE

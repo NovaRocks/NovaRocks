@@ -475,5 +475,5 @@ FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} ORDER B
 -- query 18
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} FORCE;
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_source_${uuid0} FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} ;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_source_${uuid0} ;

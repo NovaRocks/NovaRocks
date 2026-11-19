@@ -27,15 +27,14 @@
 CREATE TABLE ${case_db}.t_agg_having_threshold (
     g INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_having_threshold VALUES
-    (1, 5),
-    (1, 7),
-    (2, 9),
-    (2, 15),
-    (3, 30);
+    ROW(1, 5),
+    ROW(1, 7),
+    ROW(2, 9),
+    ROW(2, 15),
+    ROW(3, 30);
 
 SELECT
     g,

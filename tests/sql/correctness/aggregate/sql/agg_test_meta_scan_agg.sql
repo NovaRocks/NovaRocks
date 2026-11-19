@@ -30,8 +30,7 @@ create table t0 (
     c0 DATE,
     c1 INT,
     c2 BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -39,12 +38,12 @@ USE ${case_db};
 
 -- query 4
 USE ${case_db};
-select count() from t0;
+select count(*) from t0;
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 values ('2024-01-01', 1, 1), ('2024-01-02', 2, 2), ('2024-01-03', 3, 3), ('2024-01-04', 4, 4), ('2024-01-05', 5, 5);
+insert into t0 values ROW('2024-01-01', 1, 1), ROW('2024-01-02', 2, 2), ROW('2024-01-03', 3, 3), ROW('2024-01-04', 4, 4), ROW('2024-01-05', 5, 5);
 
 -- query 6
 -- @skip_result_check=true
@@ -92,7 +91,7 @@ select count(1) from t0;
 
 -- query 17
 USE ${case_db};
-select count() from t0;
+select count(*) from t0;
 
 -- query 18
 -- @skip_result_check=true
@@ -100,13 +99,12 @@ USE ${case_db};
 create table t1 (
     c0 DATE,
     c1 INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 19
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 values ('2024-01-15', 10), ('2024-01-20', 20), ('2024-02-10', 30), ('2024-02-15', 40);
+insert into t1 values ROW('2024-01-15', 10), ROW('2024-01-20', 20), ROW('2024-02-10', 30), ROW('2024-02-15', 40);
 
 -- name: test_meta_scan_with_renamed_column
 -- query 20
@@ -114,21 +112,20 @@ insert into t1 values ('2024-01-15', 10), ('2024-01-20', 20), ('2024-02-10', 30)
 USE ${case_db};
 create table t2 (
     c0 INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 21
 -- @skip_result_check=true
 USE ${case_db};
-insert into t2 values (1), (2), (3);
+insert into t2 values ROW(1), ROW(2), ROW(3);
 
 -- query 22
 USE ${case_db};
-select count() from t2;
+select count(*) from t2;
 
 -- query 23
 USE ${case_db};
-select count() from t2;
+select count(*) from t2;
 
 -- query 24
 -- @skip_result_check=true
@@ -137,11 +134,11 @@ alter table t2 rename column c0 to c1;
 
 -- query 25
 USE ${case_db};
-select count() from t2;
+select count(*) from t2;
 
 -- query 26
 USE ${case_db};
-select count() from t2;
+select count(*) from t2;
 
 -- query 27
 -- @skip_result_check=true
@@ -150,8 +147,8 @@ alter table t2 rename column c1 to c2;
 
 -- query 28
 USE ${case_db};
-select count() from t2;
+select count(*) from t2;
 
 -- query 29
 USE ${case_db};
-select count() from t2;
+select count(*) from t2;

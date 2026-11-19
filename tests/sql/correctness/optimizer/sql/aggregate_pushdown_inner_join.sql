@@ -31,8 +31,8 @@ INSERT INTO ${case_db}.t_agg_pd_a
     SELECT generate_series % 100, generate_series FROM TABLE(generate_series(1, 20000));
 INSERT INTO ${case_db}.t_agg_pd_b
     SELECT DISTINCT generate_series % 100 FROM TABLE(generate_series(1, 20000));
-ANALYZE TABLE ${case_db}.t_agg_pd_a;
-ANALYZE TABLE ${case_db}.t_agg_pd_b;
+ANALYZE ${case_db}.t_agg_pd_a;
+ANALYZE ${case_db}.t_agg_pd_b;
 -- @skip_result_check=true
 -- @result_contains=HASH AGGREGATE (SINGLE, group by: [a.k])
 -- @result_contains=aggregations: sum(sum(a.v))
@@ -40,7 +40,7 @@ ANALYZE TABLE ${case_db}.t_agg_pd_b;
 -- @result_contains=INNER, eq:
 -- @result_contains=HASH AGGREGATE (GLOBAL, group by: [a.k])
 -- @result_contains=HASH AGGREGATE (LOCAL, group by: [a.k])
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.k, SUM(a.v)
 FROM ${case_db}.t_agg_pd_a a
 INNER JOIN ${case_db}.t_agg_pd_b b ON a.k = b.k

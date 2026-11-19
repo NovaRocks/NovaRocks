@@ -29,21 +29,19 @@ DROP TABLE IF EXISTS ${case_db}.t_join_right_anti_r;
 CREATE TABLE ${case_db}.t_join_right_anti_l (
   id INT,
   lv STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_right_anti_r (
   id INT,
   rv STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_right_anti_l VALUES
-  (2, 'L2'),
-  (4, 'L4');
+  ROW(2, 'L2'),
+  ROW(4, 'L4');
 INSERT INTO ${case_db}.t_join_right_anti_r VALUES
-  (1, 'R1'),
-  (2, 'R2'),
-  (3, 'R3'),
-  (4, 'R4');
+  ROW(1, 'R1'),
+  ROW(2, 'R2'),
+  ROW(3, 'R3'),
+  ROW(4, 'R4');
 SELECT r.id, r.rv
 FROM ${case_db}.t_join_right_anti_r r
 WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t_join_right_anti_l l WHERE l.id = r.id)

@@ -29,34 +29,16 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_dep_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_dep_${uuid0}.dep_${uuid0};
+CREATE CATALOG ice_ivm_dep_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_dep_${uuid0}.dep_${uuid0};
 CREATE TABLE ice_ivm_dep_${uuid0}.dep_${uuid0}.orders_${uuid0} (
   id BIGINT,
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ice_ivm_dep_${uuid0}.dep_${uuid0}.orders_${uuid0} VALUES
-  (1, 'east', 10),
-  (2, 'west', 20);
+  ROW(1, 'east', 10),
+  ROW(2, 'west', 20);
 
 -- query 2
 -- @skip_result_check=true
@@ -64,10 +46,7 @@ USE ice_ivm_dep_${uuid0}.dep_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW mv_orders_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT id, region, amount FROM orders_${uuid0};
+CREATE MATERIALIZED VIEW mv_orders_${uuid0} AS SELECT id, region, amount FROM orders_${uuid0};
 
 -- query 4
 -- @skip_result_check=true
@@ -75,10 +54,7 @@ REFRESH MATERIALIZED VIEW mv_orders_${uuid0};
 
 -- query 5
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW mv_region_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT region, SUM(amount) AS total_amount, COUNT(*) AS row_count
+CREATE MATERIALIZED VIEW mv_region_${uuid0} AS SELECT region, SUM(amount) AS total_amount, COUNT(*) AS row_count
 FROM mv_orders_${uuid0}
 GROUP BY region;
 
@@ -107,7 +83,7 @@ SELECT region, total_amount, row_count FROM mv_region_${uuid0} ORDER BY region;
 -- query 9
 -- @skip_result_check=true
 INSERT INTO ice_ivm_dep_${uuid0}.dep_${uuid0}.orders_${uuid0} VALUES
-  (3, 'east', 7);
+  ROW(3, 'east', 7);
 
 -- query 10
 -- REFRESH on the downstream MV should cascade and refresh the upstream first,
@@ -131,6 +107,6 @@ DROP MATERIALIZED VIEW mv_orders_${uuid0};
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS mv_region_${uuid0};
 DROP MATERIALIZED VIEW mv_orders_${uuid0};
-DROP TABLE ice_ivm_dep_${uuid0}.dep_${uuid0}.orders_${uuid0} FORCE;
-DROP DATABASE ice_ivm_dep_${uuid0}.dep_${uuid0};
+DROP TABLE ice_ivm_dep_${uuid0}.dep_${uuid0}.orders_${uuid0} ;
+DROP SCHEMA ice_ivm_dep_${uuid0}.dep_${uuid0};
 DROP CATALOG ice_ivm_dep_${uuid0};

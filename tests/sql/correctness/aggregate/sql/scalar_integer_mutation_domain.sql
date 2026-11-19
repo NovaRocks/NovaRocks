@@ -18,13 +18,12 @@
 -- @order_sensitive=true
 -- Exercise the signed narrow domain through row mutation and delete recipes.
 -- query 1
-CREATE TABLE ${case_db}.scalar_integer_mutation(id INT,t TINYINT,age SMALLINT)
-TBLPROPERTIES ("format-version"="3");
-INSERT INTO ${case_db}.scalar_integer_mutation VALUES (1,127,32767),(2,-128,-32768),(3,NULL,7);
+CREATE TABLE ${case_db}.scalar_integer_mutation(id INT,t TINYINT,age SMALLINT) WITH (format_version = 3);
+INSERT INTO ${case_db}.scalar_integer_mutation VALUES ROW(1,127,32767),ROW(2,-128,-32768),ROW(3,NULL,7);
 SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
 
 -- query 2
-UPDATE ${case_db}.scalar_integer_mutation AS m SET age=32768 WHERE m.id=1;
+UPDATE ${case_db}.scalar_integer_mutation SET age=32768 WHERE id=1;
 SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
 
 -- query 3
@@ -32,17 +31,16 @@ DELETE FROM ${case_db}.scalar_integer_mutation WHERE t=-128;
 SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
 
 -- query 4
-CREATE TABLE ${case_db}.scalar_integer_partition(id INT,t TINYINT,age SMALLINT)
-PARTITION BY t TBLPROPERTIES ("format-version"="2");
-INSERT INTO ${case_db}.scalar_integer_partition VALUES (1,127,1),(2,-128,2),(3,NULL,3);
+CREATE TABLE ${case_db}.scalar_integer_partition(id INT,t TINYINT,age SMALLINT) WITH (partitioning = ARRAY['t'], format_version = 2);
+INSERT INTO ${case_db}.scalar_integer_partition VALUES ROW(1,127,1),ROW(2,-128,2),ROW(3,NULL,3);
 DELETE FROM ${case_db}.scalar_integer_partition WHERE t=-128;
 SELECT id,t,age FROM ${case_db}.scalar_integer_partition ORDER BY id;
 
 -- query 5
-ALTER TABLE ${case_db}.scalar_integer_mutation ADD EQUALITY DELETE (t) VALUES (127);
+ALTER TABLE ${case_db}.scalar_integer_mutation EXECUTE add_equality_delete(columns => ARRAY['t'], rows => ARRAY[ROW(127)]);
 SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
 
 -- query 6
 -- @skip_result_check=true
-DROP TABLE ${case_db}.scalar_integer_mutation FORCE;
-DROP TABLE ${case_db}.scalar_integer_partition FORCE;
+DROP TABLE ${case_db}.scalar_integer_mutation ;
+DROP TABLE ${case_db}.scalar_integer_partition ;

@@ -26,36 +26,35 @@
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE tc (
-    `i` int(11) NULL COMMENT "",
-    `ai` array<int(11)> NULL COMMENT "",
-    `ass` array<varchar(100)> NULL COMMENT "",
-    `mi` map<int(11),int> NULL COMMENT "",
-    `ms` map<int(11),varchar(100)> NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+    "i" int(11),
+    "ai" array<int(11)>,
+    "ass" array<varchar(100)>,
+    "mi" map<int(11),int>,
+    "ms" map<int(11),varchar(100)>
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO tc VALUES (4, null, null, null, null);
+INSERT INTO tc VALUES ROW(4, null, null, null, null);
 
 -- query 3
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped the null-key entry from ms (kept the non-null 1:null entry)
 USE ${case_db};
-INSERT INTO tc VALUES (3, null, ['a','b'], null, map{1:null});
+INSERT INTO tc VALUES ROW(3, null, ['a','b'], null, map(1,null));
 
 -- query 4
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped the null-key entry from mi (kept the non-null 1:1 entry)
 USE ${case_db};
-INSERT INTO tc VALUES (1, [1,2], null, map{1:1}, null);
+INSERT INTO tc VALUES ROW(1, [1,2], null, map(1,1), null);
 
 -- query 5
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped the null-key entries from mi and ms (kept the non-null entries)
 USE ${case_db};
-INSERT INTO tc VALUES (2, [1,2], ['a','b'], map{1:1}, map{1:'b'});
+INSERT INTO tc VALUES ROW(2, [1,2], ['a','b'], map(1,1), map(1,'b'));
 
 -- query 6
 -- CASE WHEN with array columns (with else)
@@ -165,4 +164,4 @@ SELECT i, mi, ms, mi IS NULL AS mi_parent_null, ms IS NULL AS ms_parent_null FRO
 
 -- query 27
 USE ${case_db};
-SELECT COUNT() AS rows_total, COUNT(mi) AS mi_present, COUNT(ms) AS ms_present, COUNT(ms[1]) AS ms_nonnull_values FROM tc;
+SELECT COUNT(*) AS rows_total, COUNT(mi) AS mi_present, COUNT(ms) AS ms_present, COUNT(ms[1]) AS ms_nonnull_values FROM tc;

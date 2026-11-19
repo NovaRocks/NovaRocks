@@ -25,10 +25,10 @@
 DROP TABLE IF EXISTS ${case_db}.rw_sales;
 CREATE TABLE ${case_db}.rw_sales (region VARCHAR(20), amount INT);
 INSERT INTO ${case_db}.rw_sales VALUES
-    ('A',100),('A',200),('A',50),
-    ('B',300),('B',150),('B',400),
-    ('C',10),('C',20);
-ANALYZE TABLE ${case_db}.rw_sales;
+    ROW('A',100),ROW('A',200),ROW('A',50),
+    ROW('B',300),ROW('B',150),ROW('B',400),
+    ROW('C',10),ROW('C',20);
+ANALYZE ${case_db}.rw_sales;
 
 -- Guard (a): window has rank() AND avg() over the same partition.
 -- Truncating the partition would corrupt avg's full-partition accumulation,

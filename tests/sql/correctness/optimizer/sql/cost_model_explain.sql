@@ -28,22 +28,22 @@
 -- the label is the full iceberg_opt.case_db.cost_model_explain_t identity.
 -- This adds one provenance row per query; preserve the old operators,
 -- 990/100/10 output estimates, broadcast sizing, and both TopN phases.
-SET cbo_broadcast_backend_count = 3;
+SET SESSION cbo_broadcast_backend_count = 3;
 DROP TABLE IF EXISTS ${case_db}.cost_model_explain_t;
 CREATE TABLE ${case_db}.cost_model_explain_t (k INT, v INT);
 INSERT INTO ${case_db}.cost_model_explain_t
     SELECT generate_series, generate_series * 10
     FROM TABLE(generate_series(1, 1000));
-ANALYZE TABLE ${case_db}.cost_model_explain_t;
+ANALYZE ${case_db}.cost_model_explain_t;
 
-EXPLAIN COSTS
+EXPLAIN WITH SESSION explain_detail = 'COSTS'
 SELECT * FROM ${case_db}.cost_model_explain_t WHERE v > 10;
 
-EXPLAIN COSTS
+EXPLAIN WITH SESSION explain_detail = 'COSTS'
 SELECT cost_model_explain_t.k, cost_model_explain_t.v, gs.generate_series AS rk
 FROM ${case_db}.cost_model_explain_t
 JOIN TABLE(generate_series(1, 100)) gs
     ON cost_model_explain_t.k = gs.generate_series;
 
-EXPLAIN COSTS
+EXPLAIN WITH SESSION explain_detail = 'COSTS'
 SELECT * FROM ${case_db}.cost_model_explain_t ORDER BY v DESC LIMIT 10;

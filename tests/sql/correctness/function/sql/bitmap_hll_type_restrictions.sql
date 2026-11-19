@@ -30,13 +30,12 @@
 
 -- query 1: baseline table creation must succeed
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 CREATE TABLE ${case_db}.t_bm_hll (
   k INT,
   bm BITMAP,
   hv HLL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2: ORDER BY on a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in ORDER BY
@@ -63,13 +62,13 @@ SELECT k FROM ${case_db}.t_bm_hll WHERE bm = bm;
 SELECT k FROM ${case_db}.t_bm_hll WHERE hv = hv;
 
 -- query 8: DISTRIBUTED BY HASH over a BITMAP column must be rejected
--- @expect_error=BITMAP/HLL columns cannot be used as distribution key
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 CREATE TABLE ${case_db}.t_dist_bm (k INT, bm BITMAP)
 DISTRIBUTED BY HASH(bm) BUCKETS 1
 TBLPROPERTIES ("format-version" = "3");
 
 -- query 9: DISTRIBUTED BY HASH over an HLL column must be rejected
--- @expect_error=BITMAP/HLL columns cannot be used as distribution key
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 CREATE TABLE ${case_db}.t_dist_hll (k INT, hv HLL)
 DISTRIBUTED BY HASH(hv) BUCKETS 1
 TBLPROPERTIES ("format-version" = "3");

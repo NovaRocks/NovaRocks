@@ -22,12 +22,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.`nt0` (
-  `c0` bigint DEFAULT NULL,
-  `c1` bigint DEFAULT NULL,
-  `c2` bigint DEFAULT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}."nt0" (
+  "c0" bigint DEFAULT NULL,
+  "c1" bigint DEFAULT NULL,
+  "c2" bigint DEFAULT NULL
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.nt0 SELECT generate_series %4096, 4096 - generate_series, generate_series %4096 FROM TABLE(generate_series(1, 8192));
 INSERT INTO ${case_db}.nt0 SELECT * FROM ${case_db}.nt0;
@@ -36,29 +35,26 @@ INSERT INTO ${case_db}.nt0 SELECT * FROM ${case_db}.nt0;
 -- not advertise atomic staged publication for CTAS. Keep CTAS coverage in the
 -- dedicated Iceberg DML suite and build these fixtures through supported DDL
 -- and INSERT paths.
-CREATE TABLE ${case_db}.`nt1` (
-  `c0` bigint DEFAULT NULL,
-  `c1` bigint DEFAULT NULL,
-  `c2` bigint DEFAULT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}."nt1" (
+  "c0" bigint DEFAULT NULL,
+  "c1" bigint DEFAULT NULL,
+  "c2" bigint DEFAULT NULL
+) WITH (format_version = 3);
 
-CREATE TABLE ${case_db}.`nt2` (
-  `c0` bigint DEFAULT NULL,
-  `c1` bigint DEFAULT NULL,
-  `c2` bigint DEFAULT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}."nt2" (
+  "c0" bigint DEFAULT NULL,
+  "c1" bigint DEFAULT NULL,
+  "c2" bigint DEFAULT NULL
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.nt1 SELECT * FROM ${case_db}.nt0;
 INSERT INTO ${case_db}.nt2 SELECT * FROM ${case_db}.nt0;
 
-CREATE TABLE ${case_db}.`nt3` (
-  `c0` bigint DEFAULT NULL,
-  `c1` bigint DEFAULT NULL,
-  `c2` bigint DEFAULT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}."nt3" (
+  "c0" bigint DEFAULT NULL,
+  "c1" bigint DEFAULT NULL,
+  "c2" bigint DEFAULT NULL
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.nt3 SELECT * FROM ${case_db}.nt0;
 

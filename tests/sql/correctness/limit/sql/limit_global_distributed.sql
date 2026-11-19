@@ -29,31 +29,30 @@ DROP TABLE IF EXISTS ${case_db}.t_limit_global;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_limit_global (
   k1 INT NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_limit_global VALUES
-  (1), (2), (3);
+  ROW(1), ROW(2), ROW(3);
 
 -- query 4
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_limit_global VALUES
-  (4), (5), (6);
+  ROW(4), ROW(5), ROW(6);
 
 -- query 5
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_limit_global VALUES
-  (7), (8), (9);
+  ROW(7), ROW(8), ROW(9);
 
 -- query 6
-SELECT COUNT() FROM (
+SELECT COUNT(*) FROM (
   SELECT 1 AS marker FROM ${case_db}.t_limit_global LIMIT 1
 ) x;
 
 -- query 7
-SELECT COUNT() FROM (
+SELECT COUNT(*) FROM (
   SELECT 42 AS host_key
 ) h
 LEFT JOIN (

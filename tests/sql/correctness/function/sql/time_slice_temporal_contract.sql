@@ -28,7 +28,7 @@ SELECT date_slice('2023-12-31 03:12:04',2147483647, 'year') AS sliced;
 SELECT time_slice(CAST('2020-01-01' AS DATE),1, 'day','ceil') AS sliced;
 
 -- query 4
-SELECT date_slice(CAST('2020-01-01 17:00:00' AS DATETIME),1, 'day','ceil') AS sliced;
+SELECT date_slice(CAST('2020-01-01 17:00:00' AS DATETIME), 1, 'day', 'ceil') AS sliced;
 
 -- query 5
 SELECT time_slice('2023-10-31 23:59:59.123456',17, 'microsecond','ceil') AS sliced;

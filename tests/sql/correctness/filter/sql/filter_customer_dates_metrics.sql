@@ -29,43 +29,41 @@ DROP TABLE IF EXISTS ${case_db}.t_filter_dates_metrics;
 CREATE TABLE ${case_db}.t_filter_customer_metrics (
     c_custkey INT,
     c_region VARCHAR(32)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_filter_dates_metrics (
     d_datekey INT,
     d_year INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_filter_customer_metrics VALUES
-    (1, 'ASIA'),
-    (2, 'ASIA'),
-    (3, 'AMERICA'),
-    (4, 'EUROPE'),
-    (5, 'AMERICA'),
-    (6, 'AFRICA');
+    ROW(1, 'ASIA'),
+    ROW(2, 'ASIA'),
+    ROW(3, 'AMERICA'),
+    ROW(4, 'EUROPE'),
+    ROW(5, 'AMERICA'),
+    ROW(6, 'AFRICA');
 
 INSERT INTO ${case_db}.t_filter_dates_metrics VALUES
-    (19920101, 1992),
-    (19930101, 1993),
-    (19931231, 1993),
-    (19940101, 1994);
+    ROW(19920101, 1992),
+    ROW(19930101, 1993),
+    ROW(19931231, 1993),
+    ROW(19940101, 1994);
 
 SELECT metric, value
 FROM (
-    SELECT 'asia_america_customers' AS metric, COUNT() AS value
+    SELECT 'asia_america_customers' AS metric, COUNT(*) AS value
     FROM ${case_db}.t_filter_customer_metrics
     WHERE c_region IN ('ASIA', 'AMERICA')
     UNION ALL
-    SELECT 'asia_customers', COUNT()
+    SELECT 'asia_customers', COUNT(*)
     FROM ${case_db}.t_filter_customer_metrics
     WHERE c_region = 'ASIA'
     UNION ALL
-    SELECT 'datekey_19920101', COUNT()
+    SELECT 'datekey_19920101', COUNT(*)
     FROM ${case_db}.t_filter_dates_metrics
     WHERE d_datekey = 19920101
     UNION ALL
-    SELECT 'dates_1993', COUNT()
+    SELECT 'dates_1993', COUNT(*)
     FROM ${case_db}.t_filter_dates_metrics
     WHERE d_year = 1993
 ) t

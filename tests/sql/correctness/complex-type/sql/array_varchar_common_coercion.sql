@@ -31,15 +31,15 @@ CREATE TABLE input_values (
     strings ARRAY<STRING>,
     datetimes ARRAY<DATETIME>,
     timestamp_strings ARRAY<STRING>
-) TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO input_values VALUES
-    (1, [10.0], [10.0], ['10'], ['1970-01-01 00:00:00'], ['1970-01-01 00:00:00']),
-    (2, [1.25], [1.25], ['1.25'], ['1970-01-01 00:00:00'], ['1970-01-01T00:00:00']),
-    (3, [], [], ['10'], [], ['1970-01-01 00:00:00']),
-    (4, NULL, NULL, ['10'], NULL, ['1970-01-01 00:00:00']);
+    ROW(1, [10.0], [10.0], ['10'], ['1970-01-01 00:00:00'], ['1970-01-01 00:00:00']),
+    ROW(2, [1.25], [1.25], ['1.25'], ['1970-01-01 00:00:00'], ['1970-01-01T00:00:00']),
+    ROW(3, [], [], ['10'], [], ['1970-01-01 00:00:00']),
+    ROW(4, NULL, NULL, ['10'], NULL, ['1970-01-01 00:00:00']);
 
 -- query 4
 SELECT pk, arrays_overlap(floats, strings) AS forward_overlap,
@@ -63,8 +63,7 @@ SELECT pk, array_intersect(datetimes, ['1970-01-01T00:00:00']) AS spelling_inter
 FROM input_values ORDER BY pk;
 
 -- query 8
-SELECT CAST(CAST(10 AS DOUBLE) AS STRING) AS float_text,
-       CAST(CAST('1970-01-01 00:00:00' AS DATETIME) AS STRING) AS datetime_text;
+SELECT CAST(CAST(10 AS DOUBLE) AS STRING) AS float_text, CAST(CAST('1970-01-01 00:00:00' AS DATETIME) AS STRING) AS datetime_text;
 
 -- query 9
 SELECT arrays_overlap(CAST([[10], [1.25, NULL]] AS ARRAY<ARRAY<DOUBLE>>), [['10']]) AS nested_overlap,

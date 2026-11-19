@@ -22,11 +22,9 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} (id BIGINT, value INT)
-TBLPROPERTIES ("format-version"="3",
-  "novarocks.update.mode"="merge-on-read");
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} VALUES (1,10),(2,20),(3,30),(4,40);
+CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} (id BIGINT, value INT) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} VALUES ROW(1,10),ROW(2,20),ROW(3,30),ROW(4,40);
 UPDATE iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} SET value = 220 WHERE id = 2;
 
 -- query 2
@@ -75,7 +73,7 @@ printf '%s\n' "$spark_out" | grep -Fx 'SPARK_MOR_MERGE_LINEAGE_OK'
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} VALUES (6,600);
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} VALUES ROW(6,600);
 
 -- query 6
 -- @result_contains=SPARK_MOR_APPEND_LINEAGE_OK
@@ -100,4 +98,4 @@ SELECT id, value FROM iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uui
 
 -- query 8
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.mor_lineage_${uuid0} ;

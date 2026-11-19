@@ -56,11 +56,10 @@ c24 varchar(100),
 c25 json,
 c26 varbinary,
 c27 map<varchar(1048576),varchar(1048576)>,
-c28 struct<col1 array<varchar(1048576)>>,
-c29 array<varchar(100)>)
-TBLPROPERTIES ("format-version" = "3");
+c28 ROW(col1 array<varchar(1048576)>),
+c29 array<varchar(100)>) WITH (format_version = 3);
 INSERT INTO ${case_db}.t1 VALUES
-(
+ROW(
   '2024-01-01',                    -- k1
   TRUE,                            -- c0
   127,                             -- c1
@@ -88,12 +87,12 @@ INSERT INTO ${case_db}.t1 VALUES
   ['2024-01-01 12:34:56', '2024-01-02 12:34:56'], -- c26 (<datetime>)
   'ExampleVarcharData',            -- c12
   '{"key": "value"}',              -- c13 (JSON data)
-  x'4D7956617262696E61727944617461', -- c14 (VARBINARY data in hexadecimal format)
-  MAP{'key1':'value1', 'key2':'value2'}, -- c27 (map<varchar, varchar>)
+  X'4D7956617262696E61727944617461', -- c14 (VARBINARY data in hexadecimal format)
+  map('key1','value1', 'key2','value2'), -- c27 (map<varchar, varchar>)
   row('val1'),    -- c28 (struct<col1 <varchar(1048576)>>)
   ['str1', 'str2', 'str3']    -- c29 (<varchar(100)>)
 ),
-(
+ROW(
   '2024-01-02',                    -- k1
   FALSE,                            -- c0
   128,                             -- c1
@@ -121,12 +120,12 @@ INSERT INTO ${case_db}.t1 VALUES
   ['2024-01-01 12:34:56', '2024-01-02 12:34:56'], -- c26 (<datetime>)
   'ExampleVarcharData',            -- c12
   '{"key": "value"}',              -- c13 (JSON data)
-  x'4D7956617262696E61727944617461', -- c14 (VARBINARY data in hexadecimal format)
-  MAP{'key1':'value1', 'key2':'value2'}, -- c27 (map<varchar, varchar>)
+  X'4D7956617262696E61727944617461', -- c14 (VARBINARY data in hexadecimal format)
+  map('key1','value1', 'key2','value2'), -- c27 (map<varchar, varchar>)
   row('val1'),    -- c28 (struct<col1 <varchar(1048576)>>)
   ['str1', 'str2', 'str3']    -- c29 (<varchar(100)>)
 ),
-(
+ROW(
   '2024-01-03',                    -- k1
   FALSE,                            -- c0
   128,                             -- c1
@@ -154,12 +153,12 @@ INSERT INTO ${case_db}.t1 VALUES
   ['2024-01-01 12:34:56', '2024-01-02 12:34:56'], -- c26 (<datetime>)
   'ExampleVarcharData',            -- c12
   '{"key": "value"}',              -- c13 (JSON data)
-  x'4D7956617262696E61727944617461', -- c14 (VARBINARY data in hexadecimal format)
-  MAP{'key1':'value1', 'key2':'value2'}, -- c27 (map<varchar, varchar>)
+  X'4D7956617262696E61727944617461', -- c14 (VARBINARY data in hexadecimal format)
+  map('key1','value1', 'key2','value2'), -- c27 (map<varchar, varchar>)
   row('val1'),    -- c28 (struct<col1 <varchar(1048576)>>)
   ['str1', 'str2', 'str3']    -- c29 (<varchar(100)>)
 ),
-(
+ROW(
   '2024-01-04',                    -- k1
   FALSE,                            -- c0
   128,                             -- c1
@@ -187,12 +186,12 @@ INSERT INTO ${case_db}.t1 VALUES
   ['2024-01-01 12:34:56', '2024-01-02 12:34:56'], -- c26 (<datetime>)
   'ExampleVarcharData',            -- c12
   '{"key": "value"}',              -- c13 (JSON data)
-  x'4D7956617262696E61727944617461', -- c14 (VARBINARY data in hexadecimal format)
-  MAP{'key1':'value1', 'key2':'value2'}, -- c27 (map<varchar, varchar>)
+  X'4D7956617262696E61727944617461', -- c14 (VARBINARY data in hexadecimal format)
+  map('key1','value1', 'key2','value2'), -- c27 (map<varchar, varchar>)
   row('val1'),    -- c28 (struct<col1 <varchar(1048576)>>)
   ['str1', 'str2', 'str3']    -- c29 (<varchar(100)>)
 ),
-(
+ROW(
   '2024-01-05',                    -- k1
   NULL,                            -- c0
   NULL,                             -- c1
@@ -291,13 +290,13 @@ SELECT FIRST_VALUE(c19) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CU
 SELECT FIRST_VALUE(c20) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 23
-with cte as( SELECT FIRST_VALUE(c21) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT FIRST_VALUE(c21) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 24
-with cte as( SELECT FIRST_VALUE(c22) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT FIRST_VALUE(c22) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 25
-with cte as( SELECT FIRST_VALUE(c23) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT FIRST_VALUE(c23) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 26
 SELECT FIRST_VALUE(c24) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
@@ -349,31 +348,31 @@ SELECT FIRST_VALUE(c25) OVER(ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND CURRENT RO
 SELECT FIRST_VALUE(c25) OVER(ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 40
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 41
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 42
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 PRECEDING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 PRECEDING) wv FROM ${case_db}.t1;
 
 -- query 43
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 44
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN 10 PRECEDING AND 5 PRECEDING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN 10 PRECEDING AND 5 PRECEDING) wv FROM ${case_db}.t1;
 
 -- query 45
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 46
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN 5 FOLLOWING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN 5 FOLLOWING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 47
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 48
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 49
 -- FIRST_VALUE(HAS_NULL) with partition by
@@ -404,31 +403,31 @@ SELECT FIRST_VALUE(c25) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 PRECEDIN
 SELECT FIRST_VALUE(c25) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 58
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 59
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 60
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 PRECEDING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 PRECEDING) wv FROM ${case_db}.t1;
 
 -- query 61
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 62
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 10 PRECEDING AND 5 PRECEDING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 10 PRECEDING AND 5 PRECEDING) wv FROM ${case_db}.t1;
 
 -- query 63
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 64
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 FOLLOWING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 FOLLOWING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 65
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 66
-SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 67
 -- ========================================================= LAST_VALUE =========================================================
@@ -495,13 +494,13 @@ SELECT LAST_VALUE(c19) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CUR
 SELECT LAST_VALUE(c20) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 88
-with cte as( SELECT LAST_VALUE(c21) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT LAST_VALUE(c21) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 89
-with cte as( SELECT LAST_VALUE(c22) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT LAST_VALUE(c22) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 90
-with cte as( SELECT LAST_VALUE(c23) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT LAST_VALUE(c23) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 91
 SELECT LAST_VALUE(c24) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
@@ -551,31 +550,31 @@ SELECT LAST_VALUE(c25) OVER(ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND CURRENT ROW
 SELECT LAST_VALUE(c25) OVER(ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 105
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 106
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 107
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 PRECEDING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 PRECEDING) wv FROM ${case_db}.t1;
 
 -- query 108
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 109
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN 10 PRECEDING AND 5 PRECEDING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN 10 PRECEDING AND 5 PRECEDING) wv FROM ${case_db}.t1;
 
 -- query 110
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 111
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN 5 FOLLOWING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN 5 FOLLOWING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 112
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 113
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 114
 -- LAST_VALUE(HAS_NULL) with partition by
@@ -606,31 +605,31 @@ SELECT LAST_VALUE(c25) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 PRECEDING
 SELECT LAST_VALUE(c25) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 123
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 124
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 125
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 PRECEDING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 PRECEDING) wv FROM ${case_db}.t1;
 
 -- query 126
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN UNBOUNDED PRECEDING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 127
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 10 PRECEDING AND 5 PRECEDING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 10 PRECEDING AND 5 PRECEDING) wv FROM ${case_db}.t1;
 
 -- query 128
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 129
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 FOLLOWING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 FOLLOWING AND 10 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 130
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 131
-SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING) wv FROM ${case_db}.t1;
 
 -- query 132
 -- ========================================================= LAST_VALUE =========================================================
@@ -697,13 +696,13 @@ SELECT LEAD(c19) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
 SELECT LEAD(c20) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
 
 -- query 153
-with cte as( SELECT LEAD(c21) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT LEAD(c21) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 154
-with cte as( SELECT LEAD(c22) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT LEAD(c22) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 155
-with cte as( SELECT LEAD(c23) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT LEAD(c23) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 156
 SELECT LEAD(c24) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
@@ -743,10 +742,10 @@ SELECT LEAD(c25, 3) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 SELECT LEAD(c25, 5, -1) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 164
-SELECT LEAD(c25 IGNORE NULLS) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LEAD(c25 ) IGNORE NULLS OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 165
-SELECT LEAD(c25 IGNORE NULLS, 3) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LEAD(c25 , 3) IGNORE NULLS OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 166
 -- @skip_result_check=true
@@ -754,7 +753,7 @@ SELECT LEAD(c25 IGNORE NULLS, 3) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 -- INT default is incompatible with the JSON value column. NovaRocks coerces
 -- the default to the column type (intentional broader coverage), so the
 -- query succeeds; just confirm it runs.
-SELECT LEAD(c25 IGNORE NULLS, 5, -1) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LEAD(c25 , 5, -1) IGNORE NULLS OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 167
 -- LEAD(HAS_NULL) with partition by
@@ -772,10 +771,10 @@ SELECT LEAD(c25, 3) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
 SELECT LEAD(c25, 5, -1) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 170
-SELECT LEAD(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LEAD(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 171
-SELECT LEAD(c25 IGNORE NULLS, 3) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LEAD(c25 , 3) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 172
 -- @skip_result_check=true
@@ -783,7 +782,7 @@ SELECT LEAD(c25 IGNORE NULLS, 3) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${
 -- INT default is incompatible with the JSON value column. NovaRocks coerces
 -- the default to the column type (intentional broader coverage), so the
 -- query succeeds; just confirm it runs.
-SELECT LEAD(c25 IGNORE NULLS, 5, -1) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LEAD(c25 , 5, -1) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 173
 -- ========================================================= LAG =========================================================
@@ -850,13 +849,13 @@ SELECT LAG(c19) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
 SELECT LAG(c20) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
 
 -- query 194
-with cte as( SELECT LAG(c21) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT LAG(c21) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 195
-with cte as( SELECT LAG(c22) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT LAG(c22) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 196
-with cte as( SELECT LAG(c23) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),","))) from cte;
+with cte as( SELECT LAG(c23) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(array_map(x->murmur_hash3_32(x),wv),','))) from cte;
 
 -- query 197
 SELECT LAG(c24) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
@@ -896,10 +895,10 @@ SELECT LAG(c25, 3) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 SELECT LAG(c25, 5, -1) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 205
-SELECT LAG(c25 IGNORE NULLS) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LAG(c25 ) IGNORE NULLS OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 206
-SELECT LAG(c25 IGNORE NULLS, 3) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LAG(c25 , 3) IGNORE NULLS OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 207
 -- @skip_result_check=true
@@ -907,7 +906,7 @@ SELECT LAG(c25 IGNORE NULLS, 3) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 -- INT default is incompatible with the JSON value column. NovaRocks coerces
 -- the default to the column type (intentional broader coverage), so the
 -- query succeeds; just confirm it runs.
-SELECT LAG(c25 IGNORE NULLS, 5, -1) OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LAG(c25 , 5, -1) IGNORE NULLS OVER(ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 208
 -- LAG(HAS_NULL) with partition by
@@ -925,10 +924,10 @@ SELECT LAG(c25, 3) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
 SELECT LAG(c25, 5, -1) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 211
-SELECT LAG(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LAG(c25 ) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 212
-SELECT LAG(c25 IGNORE NULLS, 3) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LAG(c25 , 3) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 213
 -- @skip_result_check=true
@@ -936,7 +935,7 @@ SELECT LAG(c25 IGNORE NULLS, 3) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${c
 -- INT default is incompatible with the JSON value column. NovaRocks coerces
 -- the default to the column type (intentional broader coverage), so the
 -- query succeeds; just confirm it runs.
-SELECT LAG(c25 IGNORE NULLS, 5, -1) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
+SELECT LAG(c25 , 5, -1) IGNORE NULLS OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
 
 -- query 214
 -- Direct column evidence separates INSERT narrowing from window evaluation.
@@ -948,6 +947,6 @@ SELECT CAST(127 AS TINYINT) AS upper_valid, CAST(128 AS TINYINT) AS upper_overfl
        CAST(-128 AS TINYINT) AS lower_valid, CAST(-129 AS TINYINT) AS lower_overflow;
 
 -- query 216
-SELECT COUNT() AS row_count, COUNT(c1) AS valid_count,
+SELECT COUNT(*) AS row_count, COUNT(c1) AS valid_count,
        SUM(CASE WHEN c1 IS NULL THEN 1 ELSE 0 END) AS null_count
 FROM ${case_db}.t1;

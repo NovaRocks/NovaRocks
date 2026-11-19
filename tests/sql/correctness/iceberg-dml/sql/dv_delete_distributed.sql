@@ -23,28 +23,24 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_dv_delete_distributed FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_dv_delete_distributed ;
 CREATE TABLE ${case_db}.t_dv_delete_distributed (
   id BIGINT,
   g BIGINT,
   v INT
-)
-PARTITION BY bucket(g, 4)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (partitioning = ARRAY['bucket(g, 4)'], format_version = 3);
 INSERT INTO ${case_db}.t_dv_delete_distributed VALUES
-  (1, 10, 100),
-  (2, 20, 200),
-  (3, 30, 300),
-  (4, 40, 400),
-  (5, 50, 500),
-  (6, 60, 600);
+  ROW(1, 10, 100),
+  ROW(2, 20, 200),
+  ROW(3, 30, 300),
+  ROW(4, 40, 400),
+  ROW(5, 50, 500),
+  ROW(6, 60, 600);
 DELETE FROM ${case_db}.t_dv_delete_distributed WHERE id IN (2, 5);
 DELETE FROM ${case_db}.t_dv_delete_distributed WHERE v > 550;
 
 -- query 2
-SELECT COUNT() AS cnt
+SELECT COUNT(*) AS cnt
 FROM ${case_db}.t_dv_delete_distributed;
 
 -- query 3
@@ -54,4 +50,4 @@ ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_dv_delete_distributed FORCE;
+DROP TABLE ${case_db}.t_dv_delete_distributed ;

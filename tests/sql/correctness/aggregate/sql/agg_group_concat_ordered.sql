@@ -27,15 +27,18 @@
 CREATE TABLE ${case_db}.t_agg_group_concat_ordered (
     k INT,
     s STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_group_concat_ordered VALUES
-    (1, 'b'),
-    (2, 'a'),
-    (3, 'b'),
-    (4, NULL),
-    (5, 'c');
+    ROW(1, 'b'),
+    ROW(2, 'a'),
+    ROW(3, 'b'),
+    ROW(4, NULL),
+    ROW(5, 'c');
 
-SELECT group_concat(s ORDER BY s SEPARATOR '|') AS gc
+SELECT string_agg(s
+,
+ '|'
+ORDER BY s
+) AS gc
 FROM ${case_db}.t_agg_group_concat_ordered;

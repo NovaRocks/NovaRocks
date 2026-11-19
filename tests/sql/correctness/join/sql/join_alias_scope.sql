@@ -25,10 +25,10 @@
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.alias_scope_rows;
 CREATE TABLE ${case_db}.alias_scope_rows (c1 INT, c2 INT);
-INSERT INTO ${case_db}.alias_scope_rows VALUES (1, 1), (2, 20), (3, 30), (4, 40);
+INSERT INTO ${case_db}.alias_scope_rows VALUES ROW(1, 1), ROW(2, 20), ROW(3, 30), ROW(4, 40);
 
 -- query 2
-SELECT CAST(count() AS integer) AS matched
+SELECT CAST(count(*) AS integer) AS matched
 FROM ${case_db}.alias_scope_rows
 WHERE EXISTS (
   SELECT 1 FROM ${case_db}.alias_scope_rows inner_t
@@ -36,7 +36,7 @@ WHERE EXISTS (
 );
 
 -- query 3
-SELECT CAST(count() AS integer) AS matched
+SELECT CAST(count(*) AS integer) AS matched
 FROM ${case_db}.alias_scope_rows outer_t
 WHERE EXISTS (
   SELECT 1 FROM ${case_db}.alias_scope_rows inner_t
@@ -44,7 +44,7 @@ WHERE EXISTS (
 );
 
 -- query 4
-SELECT CAST(count() AS integer) AS unmatched
+SELECT CAST(count(*) AS integer) AS unmatched
 FROM ${case_db}.alias_scope_rows
 WHERE NOT EXISTS (
   SELECT 1 FROM ${case_db}.alias_scope_rows inner_t
@@ -52,7 +52,7 @@ WHERE NOT EXISTS (
 );
 
 -- query 5
-SELECT CAST(count() AS integer) AS unmatched
+SELECT CAST(count(*) AS integer) AS unmatched
 FROM ${case_db}.alias_scope_rows outer_t
 WHERE NOT EXISTS (
   SELECT 1 FROM ${case_db}.alias_scope_rows inner_t
@@ -60,19 +60,19 @@ WHERE NOT EXISTS (
 );
 
 -- query 6
-SELECT CAST(count() AS integer) AS matched
+SELECT CAST(count(*) AS integer) AS matched
 FROM ${case_db}.alias_scope_rows renamed
 WHERE renamed.c1 = 1;
 
 -- query 7
 -- @expect_trino_error=COLUMN_NOT_FOUND,USER_ERROR
-SELECT CAST(count() AS integer)
+SELECT CAST(count(*) AS integer)
 FROM ${case_db}.alias_scope_rows renamed
 WHERE alias_scope_rows.c1 = 1;
 
 -- query 8
 -- @expect_trino_error=COLUMN_NOT_FOUND,USER_ERROR
-SELECT CAST(count() AS integer)
+SELECT CAST(count(*) AS integer)
 FROM ${case_db}.alias_scope_rows renamed
 WHERE ${case_db}.alias_scope_rows.c1 = 1;
 

@@ -23,22 +23,21 @@
 CREATE TABLE ${case_db}.rf_topn_source (
     k INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.rf_topn_source VALUES
-    (5, 10), (5, 20), (20, 1), (20, 2),
-    (40, 3), (60, 4), (80, 5), (100, 6);
+    ROW(5, 10), ROW(5, 20), ROW(20, 1), ROW(20, 2),
+    ROW(40, 3), ROW(60, 4), ROW(80, 5), ROW(100, 6);
 
-SET enable_global_runtime_filter = false;
+SET SESSION enable_global_runtime_filter = false;
 SELECT k, SUM(v) AS total
 FROM ${case_db}.rf_topn_source
 GROUP BY k
 ORDER BY k ASC NULLS LAST
 LIMIT 2;
 
-SET enable_global_runtime_filter = true;
-SET disable_optimizer_rules = '';
+SET SESSION enable_global_runtime_filter = true;
+SET SESSION disable_optimizer_rules = '';
 -- Default numeric Partial pruning has no admitted direct-partial ordered filter.
 -- @explain_contains=LOCAL TOP-N (limit=2, offset=0) [k ASC NULLS LAST]
 -- @explain_contains=HASH AGGREGATE (LOCAL, group by: [k])
@@ -54,7 +53,7 @@ LIMIT 2;
 
 -- Keep SplitTopN enabled and disable only the earlier local pruning rewrite.
 -- The original ordered-filter producer/consumer and runtime assertions remain.
-SET disable_optimizer_rules = 'PushDownTopNToPreAgg';
+SET SESSION disable_optimizer_rules = 'PushDownTopNToPreAgg';
 -- @explain_contains=domain = OrderedBound(key=Int32 ASC NULLS LAST, inclusive=true)
 -- @explain_contains=producer binding 1
 -- @explain_contains=activation = NonBlockingLive(Batch)
@@ -81,7 +80,7 @@ GROUP BY k
 ORDER BY k ASC NULLS LAST
 LIMIT 2;
 
-SET disable_optimizer_rules = 'SplitTopN';
+SET SESSION disable_optimizer_rules = 'SplitTopN';
 -- @explain_not_contains=domain = OrderedBound
 SELECT k, SUM(v) AS total
 FROM ${case_db}.rf_topn_source
@@ -89,4 +88,4 @@ GROUP BY k
 ORDER BY k ASC NULLS LAST
 LIMIT 2;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

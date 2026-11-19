@@ -50,21 +50,20 @@
 CREATE TABLE ${case_db}.lease_renewal (
   id BIGINT,
   delay_s BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.lease_renewal VALUES (1, 15);
+INSERT INTO ${case_db}.lease_renewal VALUES ROW(1, 15);
 
 -- query 3
 -- @query_lifecycle_fault=lease-renewal-ack-drop,0
 -- @skip_result_check=true
 -- @be_log_count_at_least=NOVAROCKS_PARTICIPATION_LEASE_RENEWED,1
-SELECT COUNT()
+SELECT COUNT(*)
 FROM ${case_db}.lease_renewal
 WHERE sleep(delay_s);
 
 -- query 4
 -- @result_contains=1
-SELECT COUNT() FROM ${case_db}.lease_renewal;
+SELECT COUNT(*) FROM ${case_db}.lease_renewal;

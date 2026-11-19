@@ -26,11 +26,11 @@ CREATE TABLE paimon_${suite_uuid0}.fixture.forbidden (id INT);
 
 -- query 3
 -- @expect_error=no metadata maintenance capability
-ALTER TABLE paimon_${suite_uuid0}.fixture.pk_default OPTIMIZE;
+ALTER TABLE paimon_${suite_uuid0}.fixture.pk_default EXECUTE optimize;
 
 -- query 4
 -- @expect_error=no statistics capability
-ANALYZE TABLE paimon_${suite_uuid0}.fixture.pk_default;
+ANALYZE paimon_${suite_uuid0}.fixture.pk_default;
 
 -- query 5
 -- @expect_error=only Paimon Parquet data files are supported

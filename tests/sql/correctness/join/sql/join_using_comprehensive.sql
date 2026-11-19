@@ -61,136 +61,128 @@ DROP TABLE IF EXISTS ${case_db}.t8;
 CREATE TABLE ${case_db}.t1 (
     id TINYINT,
     v1 VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 10
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t2 (
     id SMALLINT,
     v2 VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t3 (
     id INT,
     v3 VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 12
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t4 (
     id BIGINT,
     v4 VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 13
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t5 (
     id TINYINT,
     v5 VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 14
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t6 (
     id INT,
     v6 VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 15
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t7 (
     id BIGINT,
     v7 VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 16
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t8 (
     id SMALLINT,
     v8 VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 17
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t1 VALUES
-(1, 't1_1'),
-(2, 't1_2'),
-(3, 't1_3'),
-(NULL, 't1_null'),
-(10, 't1_10');
+ROW(1, 't1_1'),
+ROW(2, 't1_2'),
+ROW(3, 't1_3'),
+ROW(NULL, 't1_null'),
+ROW(10, 't1_10');
 
 -- query 18
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t2 VALUES
-(1, 't2_1'),
-(2, 't2_2'),
-(4, 't2_4'),
-(NULL, 't2_null'),
-(20, 't2_20');
+ROW(1, 't2_1'),
+ROW(2, 't2_2'),
+ROW(4, 't2_4'),
+ROW(NULL, 't2_null'),
+ROW(20, 't2_20');
 
 -- query 19
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t3 VALUES
-(1, 't3_1'),
-(3, 't3_3'),
-(5, 't3_5'),
-(NULL, 't3_null'),
-(30, 't3_30');
+ROW(1, 't3_1'),
+ROW(3, 't3_3'),
+ROW(5, 't3_5'),
+ROW(NULL, 't3_null'),
+ROW(30, 't3_30');
 
 -- query 20
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t4 VALUES
-(2, 't4_2'),
-(4, 't4_4'),
-(6, 't4_6'),
-(NULL, 't4_null'),
-(40, 't4_40');
+ROW(2, 't4_2'),
+ROW(4, 't4_4'),
+ROW(6, 't4_6'),
+ROW(NULL, 't4_null'),
+ROW(40, 't4_40');
 
 -- query 21
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t5 VALUES
-(1, 't5_1'),
-(3, 't5_3'),
-(7, 't5_7'),
-(NULL, 't5_null'),
-(50, 't5_50');
+ROW(1, 't5_1'),
+ROW(3, 't5_3'),
+ROW(7, 't5_7'),
+ROW(NULL, 't5_null'),
+ROW(50, 't5_50');
 
 -- query 22
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t6 VALUES
-(2, 't6_2'),
-(5, 't6_5'),
-(8, 't6_8'),
-(NULL, 't6_null'),
-(60, 't6_60');
+ROW(2, 't6_2'),
+ROW(5, 't6_5'),
+ROW(8, 't6_8'),
+ROW(NULL, 't6_null'),
+ROW(60, 't6_60');
 
 -- query 23
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t7 VALUES
-(1, 't7_1'),
-(4, 't7_4'),
-(9, 't7_9'),
-(NULL, 't7_null'),
-(70, 't7_70');
+ROW(1, 't7_1'),
+ROW(4, 't7_4'),
+ROW(9, 't7_9'),
+ROW(NULL, 't7_null'),
+ROW(70, 't7_70');
 
 -- query 24
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t8 VALUES
-(2, 't8_2'),
-(6, 't8_6'),
-(3, 't8_3'),
-(NULL, 't8_null'),
-(80, 't8_80');
+ROW(2, 't8_2'),
+ROW(6, 't8_6'),
+ROW(3, 't8_3'),
+ROW(NULL, 't8_null'),
+ROW(80, 't8_80');
 
 -- query 25
 -- FULL OUTER with inline scalar subquery
@@ -399,7 +391,7 @@ LIMIT 100;
 -- 6-table mixed: aggregation COUNT per source
 -- @order_sensitive=true
 SELECT id,
-       COUNT() as row_count,
+       COUNT(*) as row_count,
        COUNT(v1) as t1_count,
        COUNT(v2) as t2_count,
        COUNT(v3) as t3_count,
@@ -454,7 +446,7 @@ ORDER BY id;
 -- 6-table mixed: aggregation with GROUP BY + HAVING
 -- @order_sensitive=true
 SELECT id,
-       COUNT() as cnt,
+       COUNT(*) as cnt,
        MAX(v1) as max_v1,
        MIN(v2) as min_v2
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(id)
@@ -464,7 +456,7 @@ FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(id)
         FULL OUTER JOIN ${case_db}.t6 USING(id)
 WHERE id > 0
 GROUP BY id
-HAVING COUNT() > 0
+HAVING COUNT(*) > 0
 ORDER BY id;
 
 -- query 44
@@ -558,7 +550,7 @@ WHERE id IN (
     FROM ${case_db}.t5
     WHERE id IS NOT NULL
     GROUP BY id
-    HAVING COUNT() > 0
+    HAVING COUNT(*) > 0
 )
   AND (v1 IS NOT NULL OR v2 IS NOT NULL OR v3 IS NOT NULL)
 ORDER BY id
@@ -578,7 +570,7 @@ FROM (
     WHERE id > 0
 ) main
 CROSS JOIN (
-    SELECT COUNT() AS total_matches,
+    SELECT COUNT(*) AS total_matches,
            AVG(LENGTH(COALESCE(v3, v4, ''))) AS avg_len
     FROM ${case_db}.t3 FULL OUTER JOIN ${case_db}.t4 USING(id)
     WHERE id > 0
@@ -588,7 +580,7 @@ WHERE main.id IN (
     FROM ${case_db}.t5 FULL OUTER JOIN ${case_db}.t6 USING(id)
     WHERE id IS NOT NULL
     GROUP BY id
-    HAVING COUNT() > 0
+    HAVING COUNT(*) > 0
 )
 ORDER BY main.id
 LIMIT 50;
@@ -619,12 +611,12 @@ WITH join_result AS (
     WHERE id IS NOT NULL
 )
 SELECT id,
-       COUNT() AS row_count,
+       COUNT(*) AS row_count,
        MAX(CONCAT(COALESCE(v1, ''), COALESCE(v2, ''))) AS concat_result,
        SUM(CASE WHEN v3 IS NOT NULL THEN 1 ELSE 0 END) AS v3_non_null
 FROM join_result
 GROUP BY id
-HAVING COUNT() > 0
+HAVING COUNT(*) > 0
 ORDER BY id
 LIMIT 50;
 
@@ -693,7 +685,7 @@ LIMIT 50;
 -- Inline VALUES + persistent tables: FULL OUTER chain
 -- @order_sensitive=true
 SELECT id, val, v1, v2
-FROM (VALUES (1, 'val1'), (2, 'val2'), (3, 'val3'), (NULL, 'valN')) AS vals(id, val)
+FROM (VALUES ROW(1, 'val1'), ROW(2, 'val2'), ROW(3, 'val3'), ROW(NULL, 'valN')) AS vals(id, val)
      FULL OUTER JOIN ${case_db}.t1 USING(id)
      FULL OUTER JOIN ${case_db}.t2 USING(id)
 WHERE id IS NOT NULL OR val IS NOT NULL
@@ -704,8 +696,8 @@ LIMIT 50;
 -- Two inline VALUES + three persistent tables: FULL OUTER chain
 -- @order_sensitive=true
 SELECT id, val1, val2, v1, v2, v3
-FROM (VALUES (1, 'A'), (2, 'B'), (5, 'E'), (NULL, 'N1')) AS v1(id, val1)
-     FULL OUTER JOIN (VALUES (1, 'X'), (3, 'Y'), (5, 'Z'), (NULL, 'N2')) AS v2(id, val2) USING(id)
+FROM (VALUES ROW(1, 'A'), ROW(2, 'B'), ROW(5, 'E'), ROW(NULL, 'N1')) AS v1(id, val1)
+     FULL OUTER JOIN (VALUES ROW(1, 'X'), ROW(3, 'Y'), ROW(5, 'Z'), ROW(NULL, 'N2')) AS v2(id, val2) USING(id)
      FULL OUTER JOIN ${case_db}.t1 USING(id)
      FULL OUTER JOIN ${case_db}.t2 USING(id)
      FULL OUTER JOIN ${case_db}.t3 USING(id)
@@ -794,7 +786,7 @@ WITH base_data AS (
 )
 SELECT id,
        v1, v2, v3, v4, v5,
-       COUNT() OVER (PARTITION BY
+       COUNT(*) OVER (PARTITION BY
            CASE WHEN id <= 3 THEN 'LOW' WHEN id <= 6 THEN 'MID' ELSE 'HIGH' END
        ) AS range_count,
        ROW_NUMBER() OVER (
@@ -830,7 +822,7 @@ LIMIT 50;
 -- @skip_result_check=true
 WITH agg_level1 AS (
     SELECT id,
-           COUNT() AS l1_count,
+           COUNT(*) AS l1_count,
            MAX(v1) AS l1_max_v1,
            MIN(v2) AS l1_min_v2,
            SUM(CASE WHEN v3 IS NOT NULL THEN 1 ELSE 0 END) AS l1_v3_count

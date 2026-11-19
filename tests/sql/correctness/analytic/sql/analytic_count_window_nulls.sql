@@ -28,20 +28,19 @@ CREATE TABLE ${case_db}.t_analytic_count_window_nulls (
     grp VARCHAR(10),
     ts INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_count_window_nulls VALUES
-    ('A', 1, 10),
-    ('A', 2, NULL),
-    ('A', 3, 30),
-    ('B', 1, NULL);
+    ROW('A', 1, 10),
+    ROW('A', 2, NULL),
+    ROW('A', 3, 30),
+    ROW('B', 1, NULL);
 
 SELECT
     grp,
     ts,
     v,
-    COUNT() OVER (PARTITION BY grp ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cnt_all,
+    COUNT(*) OVER (PARTITION BY grp ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cnt_all,
     COUNT(v) OVER (PARTITION BY grp ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cnt_v
 FROM ${case_db}.t_analytic_count_window_nulls
 ORDER BY grp, ts;

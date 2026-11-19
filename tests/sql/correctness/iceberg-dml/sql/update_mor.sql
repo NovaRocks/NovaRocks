@@ -27,18 +27,14 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_update_mor FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_update_mor ;
 CREATE TABLE ${case_db}.t_v3_update_mor (
   id BIGINT,
   v STRING
-)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "novarocks.update.mode" = "merge-on-read"
-);
+) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 INSERT INTO ${case_db}.t_v3_update_mor VALUES
-  (1, 'a'),
-  (2, 'b');
+  ROW(1, 'a'),
+  ROW(2, 'b');
 
 -- query 2
 SELECT id, v
@@ -47,7 +43,7 @@ ORDER BY id;
 
 -- query 3
 -- @skip_result_check=true
-UPDATE ${case_db}.t_v3_update_mor AS t SET v = 'bb' WHERE t.id = 2;
+UPDATE ${case_db}.t_v3_update_mor SET v = 'bb' WHERE id = 2;
 
 -- query 4
 SELECT id, v
@@ -55,9 +51,9 @@ FROM ${case_db}.t_v3_update_mor
 ORDER BY id;
 
 -- query 5
-SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT() AS total_rows
+SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT(*) AS total_rows
 FROM ${case_db}.t_v3_update_mor;
 
 -- query 6
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_update_mor FORCE;
+DROP TABLE ${case_db}.t_v3_update_mor ;

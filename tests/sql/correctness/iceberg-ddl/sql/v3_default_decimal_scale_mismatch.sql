@@ -24,7 +24,4 @@
 -- @expect_error=scale
 CREATE TABLE ${case_db}.t_v3_default_dec (
   c DECIMAL(10,2) DEFAULT 1.234
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);

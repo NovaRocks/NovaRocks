@@ -27,15 +27,14 @@
 CREATE TABLE ${case_db}.t_agg_count_if_global (
     k INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_count_if_global VALUES
-    (1, 10),
-    (2, 20),
-    (3, NULL),
-    (4, 30),
-    (5, 15);
+    ROW(1, 10),
+    ROW(2, 20),
+    ROW(3, NULL),
+    ROW(4, 30),
+    ROW(5, 15);
 
 SELECT
     count_if(v > 15) AS c_gt_15,

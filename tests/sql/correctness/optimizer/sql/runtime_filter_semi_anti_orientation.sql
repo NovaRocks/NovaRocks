@@ -27,20 +27,20 @@ CREATE TABLE ${case_db}.rf_side_r (k INT, v INT);
 INSERT INTO ${case_db}.rf_side_l
     SELECT generate_series, generate_series
     FROM TABLE(generate_series(1, 100000));
-INSERT INTO ${case_db}.rf_side_r VALUES (1, 10), (2, 20), (3, 30);
-ANALYZE TABLE ${case_db}.rf_side_l;
-ANALYZE TABLE ${case_db}.rf_side_r;
+INSERT INTO ${case_db}.rf_side_r VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30);
+ANALYZE ${case_db}.rf_side_l;
+ANALYZE ${case_db}.rf_side_r;
 
 -- @explain_contains=HASH JOIN (BROADCAST, LEFT SEMI
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
-SELECT count()
+SELECT count(*)
 FROM ${case_db}.rf_side_l l
 WHERE EXISTS (SELECT 1 FROM ${case_db}.rf_side_r r WHERE r.k = l.k);
 
 -- @explain_contains=HASH JOIN (BROADCAST, LEFT ANTI
 -- @explain_not_contains=producer binding
 -- @explain_not_contains=consumer binding
-SELECT count()
+SELECT count(*)
 FROM ${case_db}.rf_side_l l
 WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.rf_side_r r WHERE r.k = l.k);

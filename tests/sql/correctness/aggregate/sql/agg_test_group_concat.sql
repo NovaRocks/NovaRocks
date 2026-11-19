@@ -26,11 +26,10 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE IF NOT EXISTS `lineorder` (
-    `lo_orderkey` int(11) NOT NULL COMMENT "",
-    `lo_shipmode` varchar(11) NOT NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE IF NOT EXISTS "lineorder" (
+    "lo_orderkey" int(11) NOT NULL,
+    "lo_shipmode" varchar(11) NOT NULL
+) WITH (format_version = 3);
 
 -- query 3
 USE ${case_db};
@@ -39,83 +38,82 @@ SELECT GROUP_CONCAT(lo_shipmode) orgs FROM lineorder WHERE 1 = 2;
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `ss` (
-  `id` int(11) NULL COMMENT "",
-  `name` varchar(255) NULL COMMENT "",
-  `subject` varchar(255) NULL COMMENT "",
-  `score` int(11) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "ss" (
+  "id" int(11),
+  "name" varchar(255),
+  "subject" varchar(255),
+  "score" int(11)
+) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (1,"Tom","English",90);
+insert into ss values ROW(1,'Tom','English',90);
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (1,"Tom","Math",80);
+insert into ss values ROW(1,'Tom','Math',80);
 
 -- query 7
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (2,"Tom","English",NULL);
+insert into ss values ROW(2,'Tom','English',NULL);
 
 -- query 8
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (2,"Tom",NULL,NULL);
+insert into ss values ROW(2,'Tom',NULL,NULL);
 
 -- query 9
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (3,"May",NULL,NULL);
+insert into ss values ROW(3,'May',NULL,NULL);
 
 -- query 10
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (3,"Ti","English",98);
+insert into ss values ROW(3,'Ti','English',98);
 
 -- query 11
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (4,NULL,NULL,NULL);
+insert into ss values ROW(4,NULL,NULL,NULL);
 
 -- query 12
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (NULL,NULL,NULL,NULL);
+insert into ss values ROW(NULL,NULL,NULL,NULL);
 
 -- query 13
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (NULL,"Ti","物理Phy",99);
+insert into ss values ROW(NULL,'Ti','物理Phy',99);
 
 -- query 14
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (11,"张三此地无银三百两","英文English",98);
+insert into ss values ROW(11,'张三此地无银三百两','英文English',98);
 
 -- query 15
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (11,"张三掩耳盗铃","Math数学欧拉方程",78);
+insert into ss values ROW(11,'张三掩耳盗铃','Math数学欧拉方程',78);
 
 -- query 16
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (12,"李四大闹天空","英语外语美誉",NULL);
+insert into ss values ROW(12,'李四大闹天空','英语外语美誉',NULL);
 
 -- query 17
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (2,"王武程咬金","语文北京上海",22);
+insert into ss values ROW(2,'王武程咬金','语文北京上海',22);
 
 -- query 18
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (3,"欧阳诸葛方程","数学大不列颠",NULL);
+insert into ss values ROW(3,'欧阳诸葛方程','数学大不列颠',NULL);
 
 -- query 19
 USE ${case_db};
@@ -1041,32 +1039,48 @@ select group_concat(',');
 
 -- query 240
 USE ${case_db};
-select group_concat("中国",name order by 2, id) from ss;
+select group_concat('中国',name order by 2, id) from ss;
 
 -- query 241
 USE ${case_db};
-select group_concat("中国",name order by 2, id separator NULL) from ss;
+select string_agg('中国',name
+,
+ NULL
+order by 2, id
+) from ss;
 
 -- query 242
 USE ${case_db};
-select group_concat("中国",name order by 2, "第一", id) from ss;
+select group_concat('中国',name order by 2, '第一', id) from ss;
 
 -- query 243
 USE ${case_db};
-select instr(gc, '\n') > 0 as has_lf_separator
+select instr(gc, U&'\000A') > 0 as has_lf_separator
 from (
-  select group_concat("中国",name order by 2, "第一", id separator '\n') as gc
+  select string_agg('中国',name
+,
+ U&'\000A'
+order by 2, '第一', id
+) as gc
   from ss
 ) t;
 
 -- query 244
 USE ${case_db};
-select group_concat("中国",name order by 2, "第一", subject,id separator subject) from ss;
+select string_agg('中国',name
+,
+ subject
+order by 2, '第一', subject,id
+) from ss;
 
 -- query 245
 -- @expect_error=group_concat requires separator to be of getType() STRING: group_concat('中国', 1).
 USE ${case_db};
-select group_concat("中国" order by "第一" separator 1) from ss;
+select string_agg('中国'
+,
+ 1
+order by '第一'
+) from ss;
 
 -- query 246
 -- @expect_error=Unexpected input '(', the most similar input is {<EOF>, ';'}.
@@ -1074,7 +1088,7 @@ USE ${case_db};
 select group_concat(  order by score) from ss order by 1;
 
 -- query 247
--- @expect_error=Unexpected input 'order', the most similar input is {a legal identifier}.
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2
 USE ${case_db};
 select group_concat(distinct  order by score) from ss order by 1;
 
@@ -1085,7 +1099,7 @@ select group_concat([1,2]) from ss;
 
 -- query 249
 USE ${case_db};
-select group_concat(json_object('2:3', NULL)) from ss;
+select group_concat(JSON_OBJECT('2:3': NULL)) from ss;
 
 -- query 250
 -- @expect_error=No matching function with signature: group_concat(map<int(11),int(11)>, varchar).
@@ -1097,19 +1111,19 @@ USE ${case_db};
 select group_concat(null);
 
 -- query 252
--- @expect_error=Unexpected input '(', the most similar input is {<EOF>, ';'}.
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2
 USE ${case_db};
 select group_concat(order by 1 separator '');
 
 -- query 253
--- @expect_error=No viable statement for input 'group_concat(separator NULL'.
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2
 USE ${case_db};
 select group_concat(separator NULL);
 
 -- query 254
 -- @skip_result_check=true
 USE ${case_db};
-set group_concat_max_len = -121;
+SET SESSION group_concat_max_len = -121;
 
 -- query 255
 USE ${case_db};
@@ -1118,7 +1132,7 @@ select group_concat(name,subject order by 1,2) from ss group by id order by 1;
 -- query 256
 -- @skip_result_check=true
 USE ${case_db};
-set group_concat_max_len = 1;
+SET SESSION group_concat_max_len = 1;
 
 -- query 257
 USE ${case_db};
@@ -1127,7 +1141,7 @@ select group_concat(name,subject order by 1,2) from ss group by id order by 1;
 -- query 258
 -- @skip_result_check=true
 USE ${case_db};
-set group_concat_max_len = 5;
+SET SESSION group_concat_max_len = 5;
 
 -- query 259
 USE ${case_db};
@@ -1136,7 +1150,7 @@ select group_concat(name,subject order by 1,2) from ss group by id order by 1;
 -- query 260
 -- @skip_result_check=true
 USE ${case_db};
-set group_concat_max_len = 6;
+SET SESSION group_concat_max_len = 6;
 
 -- query 261
 USE ${case_db};
@@ -1145,7 +1159,7 @@ select group_concat(name,subject order by 1,2) from ss group by id order by 1;
 -- query 262
 -- @skip_result_check=true
 USE ${case_db};
-set group_concat_max_len = 7;
+SET SESSION group_concat_max_len = 7;
 
 -- query 263
 USE ${case_db};
@@ -1154,7 +1168,7 @@ select group_concat(name,subject order by 1,2) from ss group by id order by 1;
 -- query 264
 -- @skip_result_check=true
 USE ${case_db};
-set group_concat_max_len = 8;
+SET SESSION group_concat_max_len = 8;
 
 -- query 265
 USE ${case_db};
@@ -1163,7 +1177,7 @@ select group_concat(name,subject order by 1,2) from ss group by id order by 1;
 -- query 266
 -- @skip_result_check=true
 USE ${case_db};
-set group_concat_max_len = 9;
+SET SESSION group_concat_max_len = 9;
 
 -- query 267
 USE ${case_db};
@@ -1172,7 +1186,7 @@ select group_concat(name,subject order by 1,2) from ss group by id order by 1;
 -- query 268
 -- @skip_result_check=true
 USE ${case_db};
-set group_concat_max_len = 121;
+SET SESSION group_concat_max_len = 121;
 
 -- query 269
 USE ${case_db};
@@ -1183,31 +1197,30 @@ select group_concat(name,subject order by 1,2) from ss group by id order by 1;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t1 (
-    id        tinyint(4)      NULL,
-    value   varchar(65533)  NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    id        tinyint(4)      ,
+    value   varchar(65533)
+) WITH (format_version = 3);
 
 -- query 271
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t1 VALUES
-(1,'fruit'),
-(1,'fruit'),
-(1,'fruit'),
-(2,'fruit'),
-(2,'fruit'),
-(2,'fruit');
+ROW(1,'fruit'),
+ROW(1,'fruit'),
+ROW(1,'fruit'),
+ROW(2,'fruit'),
+ROW(2,'fruit'),
+ROW(2,'fruit');
 
 -- query 272
 -- @skip_result_check=true
 USE ${case_db};
-set group_concat_max_len = 1024;
+SET SESSION group_concat_max_len = 1024;
 
 -- query 273
 -- @skip_result_check=true
 USE ${case_db};
-set sql_mode = 'GROUP_CONCAT_LEGACY';
+SET SESSION sql_mode = 'GROUP_CONCAT_LEGACY';
 
 -- query 274
 USE ${case_db};
@@ -1228,20 +1241,20 @@ select group_concat( value, '-' ) from t1;
 -- query 278
 -- @skip_result_check=true
 USE ${case_db};
-set sql_mode = '32';
+SET SESSION sql_mode = '32';
 
 -- query 279
 USE ${case_db};
-select /*+ set_var(sql_mode = 'GROUP_CONCAT_LEGACY') */ id, group_concat( value ) from t1 group by id order by id;
+WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' select /*+ set_var(sql_mode = 'GROUP_CONCAT_LEGACY') */ id, group_concat( value ) from t1 group by id order by id;
 
 -- query 280
 USE ${case_db};
-select /*+ set_var(sql_mode = '68719476736') */ group_concat( value, '-' ) from t1;
+WITH SESSION sql_mode = '68719476736' select /*+ set_var(sql_mode = '68719476736') */ group_concat( value, '-' ) from t1;
 
 -- query 281
 USE ${case_db};
-select /*+ set_var(sql_mode = 'ONLY_FULL_GROUP_BY') */ id, group_concat( value, '-' ) from t1 group by id order by id;
+WITH SESSION sql_mode = 'ONLY_FULL_GROUP_BY' select /*+ set_var(sql_mode = 'ONLY_FULL_GROUP_BY') */ id, group_concat( value, '-' ) from t1 group by id order by id;
 
 -- query 282
 USE ${case_db};
-select /*+ set_var(sql_mode = '32') */ group_concat( value ) from t1;
+WITH SESSION sql_mode = '32' select /*+ set_var(sql_mode = '32') */ group_concat( value ) from t1;

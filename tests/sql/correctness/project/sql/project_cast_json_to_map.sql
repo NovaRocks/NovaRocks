@@ -27,18 +27,17 @@ DROP TABLE IF EXISTS ${case_db}.t_cast_json_to_map;
 CREATE TABLE ${case_db}.t_cast_json_to_map (
     c1 INT,
     c2 JSON
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_cast_json_to_map VALUES
-(1, '[1,2,3]'),
-(2, '"abc"'),
-(3, 'null'),
-(4, 'true'),
-(5, '1'),
-(6, '{"1":1, "2":true, "3":null, "4":[5,6,7], "5":{"k51":"v51","k52":"v52"}}');
+ROW(1, '[1,2,3]'),
+ROW(2, '"abc"'),
+ROW(3, 'null'),
+ROW(4, 'true'),
+ROW(5, '1'),
+ROW(6, '{"1":1, "2":true, "3":null, "4":[5,6,7], "5":{"k51":"v51","k52":"v52"}}');
 
 -- query 3
 -- @order_sensitive=true
@@ -68,7 +67,7 @@ select c1, cast(c2 as map<string,array<int>>) as m from ${case_db}.t_cast_json_t
 -- query 8
 -- @order_sensitive=true
 -- Map<string,struct<k51,k52>>: only key "5" has matching struct; others map to null
-select c1, cast(c2 as map<string,struct<k51 string,k52 string>>) as m from ${case_db}.t_cast_json_to_map order by c1;
+select c1, cast(c2 as map<string,ROW(k51 string,k52 string)>) as m from ${case_db}.t_cast_json_to_map order by c1;
 
 -- query 9
 -- @order_sensitive=true

@@ -26,9 +26,9 @@ CREATE TABLE ${case_db}.t_pushdown_topn_preagg (city INT, sales INT);
 INSERT INTO ${case_db}.t_pushdown_topn_preagg
     SELECT generate_series % 1000, generate_series
     FROM TABLE(generate_series(1, 100000));
-ANALYZE TABLE ${case_db}.t_pushdown_topn_preagg;
+ANALYZE ${case_db}.t_pushdown_topn_preagg;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 
 -- Default pruning adds a lower budget over Partial grouped states. Its
 -- Int32/UNION input has no admitted Partial scan filter, and the Global probe
@@ -39,7 +39,7 @@ SET disable_optimizer_rules = '';
 -- @result_contains=HASH AGGREGATE (LOCAL, group by: [city])
 -- @result_not_contains=domain = OrderedBound
 -- @result_not_contains=activation = NonBlockingLive(Batch)
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT city, SUM(sales)
 FROM (
     SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg
@@ -50,7 +50,7 @@ GROUP BY city
 ORDER BY city
 LIMIT 10;
 
-SET disable_optimizer_rules = 'PushDownTopNToPreAgg';
+SET SESSION disable_optimizer_rules = 'PushDownTopNToPreAgg';
 
 -- Disable only pre-aggregate pruning. SplitTopN still ranks complete Global
 -- groups and retains the original Int32 ordered-bound publication contract.
@@ -59,7 +59,7 @@ SET disable_optimizer_rules = 'PushDownTopNToPreAgg';
 -- @result_contains=HASH AGGREGATE (GLOBAL, group by: [city])
 -- @result_contains=domain = OrderedBound(key=Int32 ASC NULLS FIRST, inclusive=true)
 -- @result_contains=activation = NonBlockingLive(Batch)
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT city, SUM(sales)
 FROM (
     SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg
@@ -70,7 +70,7 @@ GROUP BY city
 ORDER BY city
 LIMIT 10;
 
-SET disable_optimizer_rules = 'SplitTopN';
+SET SESSION disable_optimizer_rules = 'SplitTopN';
 
 -- A single Rows budget still completes the answer, without a split producer.
 -- @skip_result_check=true
@@ -78,7 +78,7 @@ SET disable_optimizer_rules = 'SplitTopN';
 -- @result_contains=HASH AGGREGATE (
 -- @result_not_contains=LOCAL TOP-N
 -- @result_not_contains=domain = OrderedBound
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT city, SUM(sales)
 FROM (
     SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg
@@ -89,13 +89,13 @@ GROUP BY city
 ORDER BY city
 LIMIT 10;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 
 -- Ranking an aggregate result cannot publish a bound on its input group key.
 -- @skip_result_check=true
 -- @result_contains=sum(sales) DESC NULLS LAST
 -- @result_not_contains=domain = OrderedBound
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT city, SUM(sales) AS s
 FROM (
     SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg
@@ -110,7 +110,7 @@ LIMIT 10;
 -- @skip_result_check=true
 -- @result_contains=group by: [city, sales]
 -- @result_not_contains=domain = OrderedBound
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT city, sales, SUM(sales) AS s
 FROM (
     SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg
@@ -121,4 +121,4 @@ GROUP BY city, sales
 ORDER BY city
 LIMIT 10;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

@@ -19,13 +19,12 @@
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE nested_null_comparison (id INT, a ARRAY<VARCHAR(10)>)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO nested_null_comparison VALUES (1, ['a','b']), (2, ['aa',NULL]), (3,NULL);
+CREATE TABLE nested_null_comparison (id INT, a ARRAY<VARCHAR(10)>) WITH (format_version = 3);
+INSERT INTO nested_null_comparison VALUES ROW(1, ['a','b']), ROW(2, ['aa',NULL]), ROW(3,NULL);
 
 -- query 2
 USE ${case_db};
-SELECT id, a = a AS eq, a != a AS ne, a <=> a AS safe
+SELECT id, a = a AS eq, a != a AS ne, a  IS NOT DISTINCT FROM  a AS safe
 FROM nested_null_comparison ORDER BY id;
 
 -- query 3
@@ -43,9 +42,9 @@ SELECT [1,CAST(NULL AS BIGINT)] = [2,CAST(NULL AS BIGINT)] AS early_mismatch,
 USE ${case_db};
 SELECT [[1,CAST(NULL AS BIGINT)]] = [[1,CAST(NULL AS BIGINT)]] AS nested_eq,
        [[1,CAST(NULL AS BIGINT)]] != [[1,CAST(NULL AS BIGINT)]] AS nested_ne,
-       [[1,CAST(NULL AS BIGINT)]] <=> [[1,CAST(NULL AS BIGINT)]] AS nested_safe,
+       [[1,CAST(NULL AS BIGINT)]]  IS NOT DISTINCT FROM  [[1,CAST(NULL AS BIGINT)]] AS nested_safe,
        MAP(1,CAST(NULL AS BIGINT)) = MAP(1,CAST(NULL AS BIGINT)) AS map_eq,
-       MAP(1,CAST(NULL AS BIGINT)) <=> MAP(1,CAST(NULL AS BIGINT)) AS map_safe;
+       MAP(1,CAST(NULL AS BIGINT))  IS NOT DISTINCT FROM  MAP(1,CAST(NULL AS BIGINT)) AS map_safe;
 
 -- query 6
 -- @skip_result_check=true

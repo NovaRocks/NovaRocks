@@ -29,16 +29,15 @@ CREATE TABLE ${case_db}.t_topn_null_order_limit_offset (
   id INT,
   k INT,
   s STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_topn_null_order_limit_offset VALUES
-  (1, NULL, 'a'),
-  (2, 2, 'x'),
-  (3, 1, 'z'),
-  (4, NULL, 'b'),
-  (5, 1, NULL),
-  (6, 3, 'm');
+  ROW(1, NULL, 'a'),
+  ROW(2, 2, 'x'),
+  ROW(3, 1, 'z'),
+  ROW(4, NULL, 'b'),
+  ROW(5, 1, NULL),
+  ROW(6, 3, 'm');
 SELECT id, k, s
 FROM ${case_db}.t_topn_null_order_limit_offset
 ORDER BY k ASC NULLS LAST, s DESC NULLS FIRST, id ASC
-LIMIT 4 OFFSET 1;
+OFFSET 1 LIMIT 4;

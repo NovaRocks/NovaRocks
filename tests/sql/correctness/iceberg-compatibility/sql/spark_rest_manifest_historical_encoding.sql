@@ -22,7 +22,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
+CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 
 -- query 2
 -- @result_contains=UEA4G_FIXTURE_OK
@@ -34,8 +34,8 @@ receipt_dir="$repo/logs/rwm14/historical-${uuid0}"
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_old_bucket VALUES (3, 'new');
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_promoted_identity VALUES (13, 3000000002, CAST(3.75 AS DOUBLE));
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_old_bucket VALUES ROW(3, 'new');
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_promoted_identity VALUES ROW(13, 3000000002, CAST(3.75 AS DOUBLE));
 
 -- query 4
 -- @result_contains=UEA4G_FIXTURE_OK
@@ -56,5 +56,5 @@ FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_promoted_i
 -- owned scratch namespace to the runner's actual-exit cleanup.
 -- query 7
 -- @skip_result_check=true
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_old_bucket FORCE;
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_promoted_identity FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_old_bucket ;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_promoted_identity ;

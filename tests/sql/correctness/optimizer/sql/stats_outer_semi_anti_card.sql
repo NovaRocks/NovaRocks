@@ -28,15 +28,15 @@ INSERT INTO ${case_db}.oq12_stats_join_l
 INSERT INTO ${case_db}.oq12_stats_join_r
     SELECT generate_series % 80, generate_series % 2
     FROM TABLE(generate_series(1, 800));
-ANALYZE TABLE ${case_db}.oq12_stats_join_l;
-ANALYZE TABLE ${case_db}.oq12_stats_join_r;
+ANALYZE ${case_db}.oq12_stats_join_l;
+ANALYZE ${case_db}.oq12_stats_join_r;
 
 -- @explain_contains=HASH JOIN
 -- @explain_contains=LEFT OUTER
 -- @explain_contains=oq12_stats_join_l
 -- @explain_contains=oq12_stats_join_r
 -- @explain_not_contains=stats={rows=1}
-EXPLAIN VERBOSE SELECT l.k, r.flag
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT l.k, r.flag
 FROM ${case_db}.oq12_stats_join_l l
 LEFT OUTER JOIN ${case_db}.oq12_stats_join_r r ON l.k = r.k;
 
@@ -45,7 +45,7 @@ LEFT OUTER JOIN ${case_db}.oq12_stats_join_r r ON l.k = r.k;
 -- @explain_contains=oq12_stats_join_l
 -- @explain_contains=oq12_stats_join_r
 -- @explain_not_contains=stats={rows=1}
-EXPLAIN VERBOSE SELECT l.k
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT l.k
 FROM ${case_db}.oq12_stats_join_l l
 WHERE EXISTS (SELECT 1 FROM ${case_db}.oq12_stats_join_r r WHERE l.k = r.k);
 
@@ -54,6 +54,6 @@ WHERE EXISTS (SELECT 1 FROM ${case_db}.oq12_stats_join_r r WHERE l.k = r.k);
 -- @explain_contains=oq12_stats_join_l
 -- @explain_contains=oq12_stats_join_r
 -- @explain_not_contains=stats={rows=1}
-EXPLAIN VERBOSE SELECT l.k
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT l.k
 FROM ${case_db}.oq12_stats_join_l l
 WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.oq12_stats_join_r r WHERE l.k = r.k);

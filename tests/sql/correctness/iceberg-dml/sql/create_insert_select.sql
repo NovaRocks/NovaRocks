@@ -27,9 +27,9 @@ CREATE TABLE ${case_db}.t_basic (
   qty BIGINT
 );
 INSERT INTO ${case_db}.t_basic VALUES
-  (1, 'apple', 10),
-  (2, 'banana', 20),
-  (3, 'banana', NULL);
+  ROW(1, 'apple', 10),
+  ROW(2, 'banana', 20),
+  ROW(3, 'banana', NULL);
 SELECT id, name, qty
 FROM ${case_db}.t_basic
 ORDER BY id;

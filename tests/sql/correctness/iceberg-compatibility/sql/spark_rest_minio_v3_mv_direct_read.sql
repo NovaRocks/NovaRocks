@@ -21,24 +21,19 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
+CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 USE iceberg_compat_${suite_uuid0}.${case_db};
 DROP MATERIALIZED VIEW IF EXISTS mv_direct_read_${uuid0};
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_direct_base_${uuid0} FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_direct_base_${uuid0} ;
 CREATE TABLE mv_direct_base_${uuid0} (
   id BIGINT,
   metric INT
-) TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 INSERT INTO mv_direct_base_${uuid0} VALUES
-  (1, 10),
-  (2, 20),
-  (3, 30);
-CREATE MATERIALIZED VIEW mv_direct_read_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT id, metric
+  ROW(1, 10),
+  ROW(2, 20),
+  ROW(3, 30);
+CREATE MATERIALIZED VIEW mv_direct_read_${uuid0} AS SELECT id, metric
 FROM mv_direct_base_${uuid0}
 WHERE metric >= 20;
 REFRESH MATERIALIZED VIEW mv_direct_read_${uuid0};
@@ -88,4 +83,4 @@ printf 'SPARK_SQL_OK\n'
 -- @skip_result_check=true
 USE iceberg_compat_${suite_uuid0}.${case_db};
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_direct_read_${uuid0};
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_direct_base_${uuid0} FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_direct_base_${uuid0} ;

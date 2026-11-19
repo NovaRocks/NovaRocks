@@ -40,23 +40,20 @@ SELECT field(cast('9007199254740993.00' AS DECIMAL(20,2)), cast(9007199254740993
        field(cast('170141183460469231731687303715884105727' AS LARGEINT), cast('170141183460469231731687303715884105727.00' AS DECIMAL(41,2))) AS largeint_decimal;
 
 -- query 5
-SELECT field(cast(-0.0 AS DOUBLE), cast(0.0 AS DOUBLE)) AS signed_zero,
-       field(cast(1 AS FLOAT), cast(1 AS DOUBLE)) AS float_double,
-       field(TRUE, cast(1 AS FLOAT)) AS boolean_numeric;
+SELECT field(CAST((- (DECIMAL '0.0')) AS DOUBLE), CAST(DECIMAL '0.0' AS DOUBLE)) AS signed_zero, field(CAST(1 AS FLOAT), CAST(1 AS DOUBLE)) AS float_double, field(TRUE, CAST(1 AS FLOAT)) AS boolean_numeric;
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE field_keys (id INT, text_key VARCHAR(20), int_key BIGINT, candidate BIGINT, decimal_key DECIMAL(20,2))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE field_keys (id INT, text_key VARCHAR(20), int_key BIGINT, candidate BIGINT, decimal_key DECIMAL(20,2)) WITH (format_version = 3);
 
 -- query 7
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO field_keys VALUES
-(1, '01', 1, 2, 1.00), (2, '2', 2, 2, 2.00),
-(3, 'bad', 3, 3, 3.00), (4, NULL, NULL, 4, NULL),
-(5, '9007199254740993', 9007199254740993, 9007199254740992, 9007199254740993.00);
+ROW(1, '01', 1, 2, 1.00), ROW(2, '2', 2, 2, 2.00),
+ROW(3, 'bad', 3, 3, 3.00), ROW(4, NULL, NULL, 4, NULL),
+ROW(5, '9007199254740993', 9007199254740993, 9007199254740992, 9007199254740993.00);
 
 -- query 8
 USE ${case_db};

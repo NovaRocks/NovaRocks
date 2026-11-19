@@ -39,26 +39,25 @@ CREATE TABLE t1 (
     c10 datetime,
     c11 array<int>,
     c12 map<double, double>,
-    c13 struct<a bigint, b double>
-    )
-TBLPROPERTIES ("format-version" = "3");
+    c13 ROW(a bigint, b double)
+    ) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
 insert into t1
-    select generate_series, generate_series,  11, 111, 1111, 11111, "111111", 1.1, "2024-09-01", "2024-09-01 18:00:00", [1, 2, 3], map(1, 5.5), row(100, 100)
+    select generate_series, generate_series,  11, 111, 1111, 11111, '111111', 1.1, '2024-09-01', '2024-09-01 18:00:00', [1, 2, 3], map(1, 5.5), row(100, 100)
     from table(generate_series(1, 50000, 3));
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
 insert into t1 values
-    (1, 1, 11, 111, 1111, 11111, "111111", 1.1, "2024-09-01", "2024-09-01 18:00:00", [1, 2, 3], map(1, 5.5), row(100, 100)),
-    (2, 2, 22, 222, 2222, 22222, "222222", 2.2, "2024-09-02", "2024-09-02 11:00:00", [3, 4, 5], map(1, 511.2), row(200, 200)),
-    (3, 3, 33, 333, 3333, 33333, "333333", 3.3,  "2024-09-03", "2024-09-03 00:00:00", [4, 1, 2], map(1, 666.6), row(300, 300)),
-    (4, 4, 11, 444, 4444, 44444, "444444", 4.4, "2024-09-04", "2024-09-04 12:00:00", [7, 7, 5], map(1, 444.4), row(400, 400)),
-    (5, null, null, null, null, null, null, null, null, null, null, null, null);
+    ROW(1, 1, 11, 111, 1111, 11111, '111111', 1.1, '2024-09-01', '2024-09-01 18:00:00', [1, 2, 3], map(1, 5.5), row(100, 100)),
+    ROW(2, 2, 22, 222, 2222, 22222, '222222', 2.2, '2024-09-02', '2024-09-02 11:00:00', [3, 4, 5], map(1, 511.2), row(200, 200)),
+    ROW(3, 3, 33, 333, 3333, 33333, '333333', 3.3,  '2024-09-03', '2024-09-03 00:00:00', [4, 1, 2], map(1, 666.6), row(300, 300)),
+    ROW(4, 4, 11, 444, 4444, 44444, '444444', 4.4, '2024-09-04', '2024-09-04 12:00:00', [7, 7, 5], map(1, 444.4), row(400, 400)),
+    ROW(5, null, null, null, null, null, null, null, null, null, null, null, null);
 
 -- query 5
 USE ${case_db};
@@ -272,16 +271,16 @@ select cast(percentile_approx_weighted(c13.b, 1, 0.5) as int) from t1;
 
 -- query 56
 USE ${case_db};
-with tt as (select 0.5 as v1, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
+with tt as (select (0.5) as v1, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
 
 -- query 57
 USE ${case_db};
-with tt as (select 0.5 as v1, 4096 as v2, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
+with tt as (select (0.5) as v1, (4096) as v2, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
 
 -- query 58
 -- @skip_result_check=true
 USE ${case_db};
-set pipeline_dop=1;
+SET SESSION pipeline_dop = 1;
 
 -- query 59
 USE ${case_db};
@@ -461,25 +460,24 @@ select cast(percentile_approx_weighted(c13.b, 1, 0.5) as int) from t1;
 
 -- query 102
 USE ${case_db};
-with tt as (select 0.5 as v1, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
+with tt as (select (0.5) as v1, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
 
 -- query 103
 USE ${case_db};
-with tt as (select 0.5 as v1, 4096 as v2, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
+with tt as (select (0.5) as v1, (4096) as v2, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
 
 -- query 104
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t2` (
-  `k` int(11) NULL COMMENT "",
-  `v` int(11) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t2" (
+  "k" int(11),
+  "v" int(11)
+) WITH (format_version = 3);
 
 -- query 105
 -- @skip_result_check=true
 USE ${case_db};
-insert into t2 values(2,1),(3,2),(4,3);
+insert into t2 values ROW(2,1),ROW(3,2),ROW(4,3);
 
 -- query 106
 USE ${case_db};
@@ -493,7 +491,7 @@ select percentile_approx_weighted(1, 1, 1.5) from t2;
 -- query 108
 -- @expect_error=Type check failed. percentile parameter must be between 0 and 1 in percentile_approx_weighted, but got: -0.1
 USE ${case_db};
-select percentile_approx_weighted(1, 1, -0.1) from t2;
+select percentile_approx_weighted(1, 1, -DECIMAL '0.1') from t2;
 
 -- query 109
 USE ${case_db};
@@ -510,12 +508,12 @@ select percentile_approx_weighted(1, 1, 0.5) from t2;
 -- query 112
 -- @expect_error=Type check failed. percentile array element[1] must be between 0 and 1 in percentile_approx_weighted, but got: 1.5
 USE ${case_db};
-select percentile_approx_weighted(k, v, array<double>[0.5, 1.5]) from t2;
+select percentile_approx_weighted(k, v, CAST([0.5, 1.5] AS array<double>)) from t2;
 
 -- query 113
 -- @expect_error=Type check failed. percentile array element[0] must be between 0 and 1 in percentile_approx_weighted, but got: -0.1
 USE ${case_db};
-select percentile_approx_weighted(k, v, [-0.1, 0.5]) from t2;
+select percentile_approx_weighted(k, v, [-DECIMAL '0.1', 0.5]) from t2;
 
 -- query 114
 -- @expect_error=percentile_approx_weighted requires the third parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<NULL_TYPE>.
@@ -524,7 +522,7 @@ select percentile_approx_weighted(k, v, []) from t2;
 
 -- query 115
 USE ${case_db};
-select  percentile_approx_weighted(k, v, array<float>[0.0, 0.5, 1.0]) from t2;
+select  percentile_approx_weighted(k, v, CAST([0.0, 0.5, 1.0] AS array<float>)) from t2;
 
 -- query 116
 USE ${case_db};
@@ -558,73 +556,70 @@ select  percentile_approx_weighted(k, v, [0.25, 0.5, 0.75], 1000) from t2;
 
 -- query 123
 USE ${case_db};
-select percentile_approx_weighted(k, v, array<double>[0.1, 0.5, 0.9], 2048) from t2;
+select percentile_approx_weighted(k, v, CAST([0.1, 0.5, 0.9] AS array<double>), 2048) from t2;
 
 -- query 124
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `test_sorted_streaming_agg_percentile_weighted`
+CREATE TABLE "test_sorted_streaming_agg_percentile_weighted"
 (
-    `id_int` int(11) NOT NULL COMMENT "",
-    `value` double NOT NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+    "id_int" int(11) NOT NULL,
+    "value" double NOT NULL
+) WITH (format_version = 3);
 
 -- query 125
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_sorted_streaming_agg_percentile_weighted values(2,1),(2,6),(4,3),(4,8);
+insert into test_sorted_streaming_agg_percentile_weighted values ROW(2,1),ROW(2,6),ROW(4,3),ROW(4,8);
 
 -- query 126
 USE ${case_db};
-select  percentile_approx_weighted(value, 10, array<double>[0.5, 0.9], 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
+select  percentile_approx_weighted(value, 10, CAST([0.5, 0.9] AS array<double>), 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
 
 -- query 127
 USE ${case_db};
-select  percentile_approx_weighted(value, 0, array<double>[0.5, 0.9], 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
+select  percentile_approx_weighted(value, 0, CAST([0.5, 0.9] AS array<double>), 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
 
 -- query 128
 USE ${case_db};
-select  percentile_approx_weighted(value, value, array<double>[0.5, 0.9], 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
+select  percentile_approx_weighted(value, value, CAST([0.5, 0.9] AS array<double>), 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
 
 -- query 129
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t0_convert_to_serialize_format` (
-  `v1` bigint(20) NULL COMMENT "",
-  `v2` bigint(20) NULL COMMENT "",
-  `v3` bigint(20) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t0_convert_to_serialize_format" (
+  "v1" bigint(20),
+  "v2" bigint(20),
+  "v3" bigint(20)
+) WITH (format_version = 3);
 
 -- query 130
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t1_convert_to_serialize_format` (
-  `v4` bigint(20) NULL COMMENT "",
-  `v5` bigint(20) NULL COMMENT "",
-  `v6` bigint(20) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t1_convert_to_serialize_format" (
+  "v4" bigint(20),
+  "v5" bigint(20),
+  "v6" bigint(20)
+) WITH (format_version = 3);
 
 -- query 131
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0_convert_to_serialize_format values(1,2,3),(4,5,6),(7,8,9);
+insert into t0_convert_to_serialize_format values ROW(1,2,3),ROW(4,5,6),ROW(7,8,9);
 
 -- query 132
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1_convert_to_serialize_format values(1,2,3),(4,5,6),(7,8,9);
+insert into t1_convert_to_serialize_format values ROW(1,2,3),ROW(4,5,6),ROW(7,8,9);
 
 -- query 133
 USE ${case_db};
-select  percentile_approx_weighted(v2, 10, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format CROSS JOIN t1_convert_to_serialize_format group by 'a';
+select  percentile_approx_weighted(v2, 10, CAST([0.1, 0.5, 0.9] AS array<double>), 5000) from t0_convert_to_serialize_format CROSS JOIN t1_convert_to_serialize_format group by 'a';
 
 -- query 134
 USE ${case_db};
-select  percentile_approx_weighted(v2, 0, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format CROSS JOIN t1_convert_to_serialize_format group by 'a';
+select  percentile_approx_weighted(v2, 0, CAST([0.1, 0.5, 0.9] AS array<double>), 5000) from t0_convert_to_serialize_format CROSS JOIN t1_convert_to_serialize_format group by 'a';
 
 -- query 135
 USE ${case_db};
-select  percentile_approx_weighted(v2, v1, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format CROSS JOIN t1_convert_to_serialize_format group by 'a';
+select  percentile_approx_weighted(v2, v1, CAST([0.1, 0.5, 0.9] AS array<double>), 5000) from t0_convert_to_serialize_format CROSS JOIN t1_convert_to_serialize_format group by 'a';

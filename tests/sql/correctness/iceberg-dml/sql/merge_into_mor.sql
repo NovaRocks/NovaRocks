@@ -32,29 +32,22 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_merge_mor FORCE;
-DROP TABLE IF EXISTS ${case_db}.s_v3_merge_mor FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_merge_mor ;
+DROP TABLE IF EXISTS ${case_db}.s_v3_merge_mor ;
 CREATE TABLE ${case_db}.t_v3_merge_mor (
   id BIGINT,
   v STRING
-)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "novarocks.update.mode" = "merge-on-read"
-);
+) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 INSERT INTO ${case_db}.t_v3_merge_mor VALUES
-  (1, 'a'),
-  (2, 'b');
+  ROW(1, 'a'),
+  ROW(2, 'b');
 CREATE TABLE ${case_db}.s_v3_merge_mor (
   id BIGINT,
   v STRING
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.s_v3_merge_mor VALUES
-  (2, 'bb'),
-  (3, 'c');
+  ROW(2, 'bb'),
+  ROW(3, 'c');
 
 -- query 2
 SELECT id, v
@@ -63,7 +56,7 @@ ORDER BY id;
 
 -- query 3
 -- Atomicity proof: capture the snapshot count immediately before the MERGE.
-SELECT count() AS snaps_before
+SELECT count(*) AS snaps_before
 FROM ${case_db}."t_v3_merge_mor$snapshots";
 
 -- query 4
@@ -77,7 +70,7 @@ WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
 -- query 5
 -- Atomicity proof: the MATCHED UPDATE (DV) and NOT-MATCHED INSERT fold into a
 -- single Iceberg snapshot, so snaps_after - snaps_before MUST be exactly 1.
-SELECT count() AS snaps_after
+SELECT count(*) AS snaps_after
 FROM ${case_db}."t_v3_merge_mor$snapshots";
 
 -- query 6
@@ -86,10 +79,10 @@ FROM ${case_db}.t_v3_merge_mor
 ORDER BY id;
 
 -- query 7
-SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT() AS total_rows
+SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT(*) AS total_rows
 FROM ${case_db}.t_v3_merge_mor;
 
 -- query 8
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_merge_mor FORCE;
-DROP TABLE ${case_db}.s_v3_merge_mor FORCE;
+DROP TABLE ${case_db}.t_v3_merge_mor ;
+DROP TABLE ${case_db}.s_v3_merge_mor ;

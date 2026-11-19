@@ -26,24 +26,22 @@
 -- Setup: create t1 (string columns) and t2 (binary columns) for string-to-binary cast test
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE t1(c1 int, c2 string, c3 string)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE t1(c1 int, c2 string, c3 string) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE t2(c1 int, c2 binary, c3 varbinary)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE t2(c1 int, c2 binary, c3 varbinary) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 VALUES (1, "1,2,3,4,5", "6,7,8,9");
+INSERT INTO t1 VALUES ROW(1, '1,2,3,4,5', '6,7,8,9');
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 VALUES (2, null, null);
+INSERT INTO t1 VALUES ROW(2, null, null);
 
 -- query 5
 -- @skip_result_check=true
@@ -59,7 +57,7 @@ USE ${case_db};
 SELECT c1, cast(c2 as binary), cast(c2 as varbinary) FROM t1 ORDER BY c1;
 
 -- query 8
-SELECT cast("1,2,3,4,5" as binary), cast("6,7,8,9.10" as varbinary);
+SELECT cast('1,2,3,4,5' as binary), cast('6,7,8,9.10' as varbinary);
 
 -- query 9
 -- Setup: create t1 (binary columns) and t2 (string columns) for binary-to-string cast test
@@ -75,24 +73,22 @@ DROP TABLE IF EXISTS t2;
 -- query 11
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE t1(c1 int, c2 binary, c3 varbinary)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE t1(c1 int, c2 binary, c3 varbinary) WITH (format_version = 3);
 
 -- query 12
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE t2(c1 int, c2 string, c3 string)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE t2(c1 int, c2 string, c3 string) WITH (format_version = 3);
 
 -- query 13
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 VALUES (1, "1,2,3,4,5", "6,7,8,9");
+INSERT INTO t1 VALUES ROW(1, '1,2,3,4,5', '6,7,8,9');
 
 -- query 14
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 VALUES (2, null, null);
+INSERT INTO t1 VALUES ROW(2, null, null);
 
 -- query 15
 -- @skip_result_check=true
@@ -121,8 +117,7 @@ DROP TABLE IF EXISTS t2;
 -- query 20
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE t1(k1 int, d1 double, f1 float)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE t1(k1 int, d1 double, f1 float) WITH (format_version = 3);
 
 -- query 21
 -- @skip_result_check=true
@@ -131,36 +126,7 @@ INSERT INTO t1
 -- Seed IEEE floating values explicitly. A decimal literal followed by a
 -- DECIMAL-to-DOUBLE cast can round differently at the BIGINT boundary; this
 -- case exercises floating-to-integral casts, not decimal conversion.
-VALUES
-    (1, CAST('9223372036854775000.0' AS DOUBLE), CAST('2147483000.0' AS FLOAT)),
-    (2, CAST('9223372036854775807.0' AS DOUBLE), CAST('2147483647.0' AS FLOAT)),
-    (3, CAST('9223372036854775807.3' AS DOUBLE), CAST('2147483647.3' AS FLOAT)),
-    (4, CAST('9223372036854775808.0' AS DOUBLE), CAST('2147483648.0' AS FLOAT)),
-    (5, CAST('9223372036854775809.0' AS DOUBLE), CAST('2147483649.0' AS FLOAT)),
-    (6, CAST('-9223372036854675807.0' AS DOUBLE), CAST('-2147473647.0' AS FLOAT)),
-    (7, CAST('-9223372036854775807.0' AS DOUBLE), CAST('-2147483647.0' AS FLOAT)),
-    (8, CAST('-9223372036854775808.0' AS DOUBLE), CAST('-2147483648.0' AS FLOAT)),
-    (9, CAST('-9223372036854775809.0' AS DOUBLE), CAST('-2147483649.0' AS FLOAT)),
-    (10, CAST('-9223372036854778808.0' AS DOUBLE), CAST('-2147494649.0' AS FLOAT)),
-    (11, 32767, 32767),
-    (12, 32768, 32768),
-    (13, 32769, 32769),
-    (14, -32765, -32765),
-    (15, -32767, -32767),
-    (16, -32768, -32768),
-    (17, -32770, -32770),
-    (18, 127, 127),
-    (19, 128, 128),
-    (20, 129, 129),
-    (21, -127, -127),
-    (22, -128, -128),
-    (23, -129, -129),
-    (24, 0.1, 0.1),
-    (25, 0.9, 0.9),
-    (26, -0.1, -0.1),
-    (27, -0.9, -0.9),
-    (28, 0.0, 0.0),
-    (29, -0.0, -0.0);
+VALUES ROW(1, CAST('9223372036854775000.0' AS DOUBLE), CAST('2147483000.0' AS FLOAT)), ROW(2, CAST('9223372036854775807.0' AS DOUBLE), CAST('2147483647.0' AS FLOAT)), ROW(3, CAST('9223372036854775807.3' AS DOUBLE), CAST('2147483647.3' AS FLOAT)), ROW(4, CAST('9223372036854775808.0' AS DOUBLE), CAST('2147483648.0' AS FLOAT)), ROW(5, CAST('9223372036854775809.0' AS DOUBLE), CAST('2147483649.0' AS FLOAT)), ROW(6, CAST('-9223372036854675807.0' AS DOUBLE), CAST('-2147473647.0' AS FLOAT)), ROW(7, CAST('-9223372036854775807.0' AS DOUBLE), CAST('-2147483647.0' AS FLOAT)), ROW(8, CAST('-9223372036854775808.0' AS DOUBLE), CAST('-2147483648.0' AS FLOAT)), ROW(9, CAST('-9223372036854775809.0' AS DOUBLE), CAST('-2147483649.0' AS FLOAT)), ROW(10, CAST('-9223372036854778808.0' AS DOUBLE), CAST('-2147494649.0' AS FLOAT)), ROW(11, 32767, 32767), ROW(12, 32768, 32768), ROW(13, 32769, 32769), ROW(14, -32765, -32765), ROW(15, -32767, -32767), ROW(16, -32768, -32768), ROW(17, -32770, -32770), ROW(18, 127, 127), ROW(19, 128, 128), ROW(20, 129, 129), ROW(21, -127, -127), ROW(22, -128, -128), ROW(23, -129, -129), ROW(24, DECIMAL '0.1', DECIMAL '0.1'), ROW(25, DECIMAL '0.9', DECIMAL '0.9'), ROW(26, (- (DECIMAL '0.1')), (- (DECIMAL '0.1'))), ROW(27, (- (DECIMAL '0.9')), (- (DECIMAL '0.9'))), ROW(28, DECIMAL '0.0', DECIMAL '0.0'), ROW(29, (- (DECIMAL '0.0')), (- (DECIMAL '0.0')));
 
 -- query 22
 -- Cast double to bigint, float to int (default mode, silent truncation on overflow)
@@ -184,7 +150,7 @@ SELECT k1, d1, f1, cast(d1 as tinyint), cast(f1 as tinyint) FROM t1 ORDER BY k1;
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
 USE ${case_db};
-SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as bigint), cast(f1 as int) FROM t1 ORDER BY k1;
+WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as bigint), cast(f1 as int) FROM t1 ORDER BY k1;
 
 -- query 26
 -- ALLOW_THROW_EXCEPTION: cast double to smallint, float to smallint (overflow expected)
@@ -193,7 +159,7 @@ SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as big
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
 USE ${case_db};
-SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as smallint), cast(f1 as smallint) FROM t1 WHERE k1 >= 11 ORDER BY k1;
+WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as smallint), cast(f1 as smallint) FROM t1 WHERE k1 >= 11 ORDER BY k1;
 
 -- query 27
 -- ALLOW_THROW_EXCEPTION: cast double to tinyint, float to tinyint (overflow expected)
@@ -202,19 +168,19 @@ SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as sma
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
 USE ${case_db};
-SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as tinyint), cast(f1 as tinyint) FROM t1 WHERE k1 >= 18 ORDER BY k1;
+WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as tinyint), cast(f1 as tinyint) FROM t1 WHERE k1 >= 18 ORDER BY k1;
 
 -- query 28
 -- ALLOW_THROW_EXCEPTION: bigint/int boundary subset
 USE ${case_db};
-SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as bigint), cast(f1 as int) FROM t1 WHERE k1 IN (1, 6, 7, 8, 9) ORDER BY k1;
+WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as bigint), cast(f1 as int) FROM t1 WHERE k1 IN (1, 6, 7, 8, 9) ORDER BY k1;
 
 -- query 29
 -- ALLOW_THROW_EXCEPTION: smallint boundary subset
 USE ${case_db};
-SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as smallint), cast(f1 as smallint) FROM t1 WHERE k1 IN (11, 14, 15, 16) ORDER BY k1;
+WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as smallint), cast(f1 as smallint) FROM t1 WHERE k1 IN (11, 14, 15, 16) ORDER BY k1;
 
 -- query 30
 -- ALLOW_THROW_EXCEPTION: tinyint boundary subset
 USE ${case_db};
-SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as tinyint), cast(f1 as tinyint) FROM t1 WHERE k1 IN (18, 21, 22) ORDER BY k1;
+WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as tinyint), cast(f1 as tinyint) FROM t1 WHERE k1 IN (18, 21, 22) ORDER BY k1;

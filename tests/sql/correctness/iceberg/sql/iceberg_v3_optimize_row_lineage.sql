@@ -36,28 +36,12 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG opt_rl_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_test_warehouse}/opt_rl_${uuid0}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE opt_rl_${uuid0}.ns_${uuid0};
-CREATE TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES (1, 10), (2, 20);
-INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES (3, 30), (4, 40);
-INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES (5, 50), (6, 60);
+CREATE CATALOG opt_rl_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "iceberg.catalog.warehouse" = '${iceberg_test_warehouse}/opt_rl_${uuid0}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA opt_rl_${uuid0}.ns_${uuid0};
+CREATE TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage (id INT, v INT) WITH (format_version = 3);
+INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES ROW(1, 10), ROW(2, 20);
+INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES ROW(3, 30), ROW(4, 40);
+INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES ROW(5, 50), ROW(6, 60);
 UPDATE opt_rl_${uuid0}.ns_${uuid0}.olineage SET v = 99 WHERE id = 2;
 DELETE FROM opt_rl_${uuid0}.ns_${uuid0}.olineage WHERE id = 4;
 
@@ -65,7 +49,7 @@ DELETE FROM opt_rl_${uuid0}.ns_${uuid0}.olineage WHERE id = 4;
 -- @skip_result_check=true
 -- Tag the pre-OPTIMIZE state so we can compare row values and lineage after
 -- the rewrite via FOR VERSION AS OF.
-ALTER TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage CREATE TAG pre_opt;
+ALTER TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage EXECUTE create_tag(name => 'pre_opt', replace => false, if_not_exists => false);
 
 -- query 3
 -- BEFORE OPTIMIZE: 5 surviving rows, each with a unique `_row_id`.
@@ -98,7 +82,7 @@ SELECT count() AS main_matches_pre_opt
 
 -- query 7
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-ALTER TABLE olineage OPTIMIZE;
+ALTER TABLE olineage EXECUTE optimize;
 
 -- query 8
 -- AFTER OPTIMIZE: same row count, same number of unique row-ids.
@@ -114,7 +98,7 @@ SELECT id, v FROM olineage ORDER BY id;
 -- query 10
 -- No post-rewrite row value or lineage may be absent from the baseline.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count() AS rows_changed_by_optimize
+SELECT count(*) AS rows_changed_by_optimize
   FROM (
     SELECT id, v, _row_id, _last_updated_sequence_number FROM olineage
     EXCEPT
@@ -125,7 +109,7 @@ SELECT count() AS rows_changed_by_optimize
 -- query 11
 -- The reverse direction also rejects losing a baseline row or lineage.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count() AS baseline_rows_missing_after_optimize
+SELECT count(*) AS baseline_rows_missing_after_optimize
   FROM (
     SELECT id, v, _row_id, _last_updated_sequence_number
       FROM olineage FOR VERSION AS OF 'pre_opt'
@@ -165,7 +149,7 @@ SELECT count() AS active_delete_files_after_optimize
 -- query 15
 -- @cleanup=true
 -- @skip_result_check=true
-ALTER TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage DROP TAG pre_opt;
-DROP TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage FORCE;
-DROP DATABASE opt_rl_${uuid0}.ns_${uuid0};
+ALTER TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage EXECUTE drop_tag(name => 'pre_opt', if_exists => false);
+DROP TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage ;
+DROP SCHEMA opt_rl_${uuid0}.ns_${uuid0};
 DROP CATALOG opt_rl_${uuid0};

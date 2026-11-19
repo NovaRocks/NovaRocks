@@ -21,118 +21,174 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_concat_limit (id INT, v VARCHAR, u VARCHAR);
-INSERT INTO ${case_db}.t_concat_limit VALUES (1, 'abcdef', '李四');
-INSERT INTO ${case_db}.t_concat_limit VALUES (2, 'ghijkl', '王五');
-INSERT INTO ${case_db}.t_concat_limit VALUES (3, NULL, NULL);
+INSERT INTO ${case_db}.t_concat_limit VALUES ROW(1, 'abcdef', '李四');
+INSERT INTO ${case_db}.t_concat_limit VALUES ROW(2, 'ghijkl', '王五');
+INSERT INTO ${case_db}.t_concat_limit VALUES ROW(3, NULL, NULL);
 
 -- query 2
-SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count() AS rows_seen FROM ${case_db}.t_concat_limit;
+SELECT string_agg(v
+,
+ '|'
+ORDER BY id
+) AS value,
+       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 3
 -- @skip_result_check=true
-SET group_concat_max_len = -121;
+SET SESSION group_concat_max_len = -121;
 
 -- query 4
-SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count() AS rows_seen FROM ${case_db}.t_concat_limit;
+SELECT string_agg(v
+,
+ '|'
+ORDER BY id
+) AS value,
+       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 5
 -- @skip_result_check=true
-SET group_concat_max_len = 0;
+SET SESSION group_concat_max_len = 0;
 
 -- query 6
-SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count() AS rows_seen FROM ${case_db}.t_concat_limit;
+SELECT string_agg(v
+,
+ '|'
+ORDER BY id
+) AS value,
+       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 7
 -- @skip_result_check=true
-SET group_concat_max_len = 1;
+SET SESSION group_concat_max_len = 1;
 
 -- query 8
-SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count() AS rows_seen FROM ${case_db}.t_concat_limit;
+SELECT string_agg(v
+,
+ '|'
+ORDER BY id
+) AS value,
+       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 9
 -- @skip_result_check=true
-SET group_concat_max_len = 4;
+SET SESSION group_concat_max_len = 4;
 
 -- query 10
-SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count() AS rows_seen FROM ${case_db}.t_concat_limit;
+SELECT string_agg(v
+,
+ '|'
+ORDER BY id
+) AS value,
+       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 11
 -- @skip_result_check=true
-SET group_concat_max_len = 5;
+SET SESSION group_concat_max_len = 5;
 
 -- query 12
-SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count() AS rows_seen FROM ${case_db}.t_concat_limit;
+SELECT string_agg(v
+,
+ '|'
+ORDER BY id
+) AS value,
+       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 13
 -- @skip_result_check=true
-SET group_concat_max_len = 7;
+SET SESSION group_concat_max_len = 7;
 
 -- query 14
-SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count() AS rows_seen FROM ${case_db}.t_concat_limit;
+SELECT string_agg(v
+,
+ '|'
+ORDER BY id
+) AS value,
+       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 15
 -- @skip_result_check=true
-SET group_concat_max_len = 8;
+SET SESSION group_concat_max_len = 8;
 
 -- query 16
-SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count() AS rows_seen FROM ${case_db}.t_concat_limit;
+SELECT string_agg(v
+,
+ '|'
+ORDER BY id
+) AS value,
+       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 17
 -- @skip_result_check=true
-SET group_concat_max_len = 13;
+SET SESSION group_concat_max_len = 13;
 
 -- query 18
-SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count() AS rows_seen FROM ${case_db}.t_concat_limit;
+SELECT string_agg(v
+,
+ '|'
+ORDER BY id
+) AS value,
+       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 19
 -- @skip_result_check=true
-SET group_concat_max_len = 1024;
+SET SESSION group_concat_max_len = 1024;
 
 -- query 20
-SELECT group_concat(v ORDER BY id SEPARATOR '|') AS value,
-       count() AS rows_seen FROM ${case_db}.t_concat_limit;
+SELECT string_agg(v
+,
+ '|'
+ORDER BY id
+) AS value,
+       count(*) AS rows_seen FROM ${case_db}.t_concat_limit;
 
 -- query 21
 -- @skip_result_check=true
-SET group_concat_max_len = 4;
+SET SESSION group_concat_max_len = 4;
 
 -- query 22
-SELECT group_concat(u ORDER BY id SEPARATOR '|') AS value
+SELECT string_agg(u
+,
+ '|'
+ORDER BY id
+) AS value
 FROM ${case_db}.t_concat_limit;
 
 -- query 23
 -- @skip_result_check=true
-SET group_concat_max_len = 5;
+SET SESSION group_concat_max_len = 5;
 
 -- query 24
-SELECT group_concat(u ORDER BY id SEPARATOR '|') AS value
+SELECT string_agg(u
+,
+ '|'
+ORDER BY id
+) AS value
 FROM ${case_db}.t_concat_limit;
 
 -- query 25
 -- @skip_result_check=true
-SET group_concat_max_len = 8;
+SET SESSION group_concat_max_len = 8;
 
 -- query 26
-SELECT group_concat(u ORDER BY id SEPARATOR '|') AS value
+SELECT string_agg(u
+,
+ '|'
+ORDER BY id
+) AS value
 FROM ${case_db}.t_concat_limit;
 
 -- query 27
 -- @skip_result_check=true
-SET group_concat_max_len = 1024;
+SET SESSION group_concat_max_len = 1024;
 
 -- query 28
-SELECT group_concat(u ORDER BY id SEPARATOR '|') AS value
+SELECT string_agg(u
+,
+ '|'
+ORDER BY id
+) AS value
 FROM ${case_db}.t_concat_limit;
 
 -- query 29
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_concat_limit FORCE;
+DROP TABLE ${case_db}.t_concat_limit ;

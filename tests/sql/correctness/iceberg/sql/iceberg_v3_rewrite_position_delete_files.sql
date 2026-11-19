@@ -23,34 +23,17 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG dv_proc_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_test_warehouse}/dv_proc_${uuid0}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE dv_proc_${uuid0}.ns_${uuid0};
+CREATE CATALOG dv_proc_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "iceberg.catalog.warehouse" = '${iceberg_test_warehouse}/dv_proc_${uuid0}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA dv_proc_${uuid0}.ns_${uuid0};
 CREATE TABLE dv_proc_${uuid0}.ns_${uuid0}.orders (
   id INT,
   user_id INT,
   amount INT
-) TBLPROPERTIES (
-  "format-version" = "3"
-);
-INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES (1, 10, 100), (2, 20, 200);
-INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES (3, 30, 300), (4, 40, 400);
-INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES (5, 50, 500), (6, 60, 600);
-INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES (7, 70, 700), (8, 80, 800);
+) WITH (format_version = 3);
+INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES ROW(1, 10, 100), ROW(2, 20, 200);
+INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES ROW(3, 30, 300), ROW(4, 40, 400);
+INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES ROW(5, 50, 500), ROW(6, 60, 600);
+INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES ROW(7, 70, 700), ROW(8, 80, 800);
 DELETE FROM dv_proc_${uuid0}.ns_${uuid0}.orders WHERE id = 2;
 DELETE FROM dv_proc_${uuid0}.ns_${uuid0}.orders WHERE id = 4;
 DELETE FROM dv_proc_${uuid0}.ns_${uuid0}.orders WHERE id = 6;
@@ -66,7 +49,7 @@ SELECT id, user_id, amount FROM orders ORDER BY id;
 -- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- @result_contains=rewritten_delete_files_count	added_delete_files_count	rewritten_bytes_count	added_bytes_count
 -- @skip_result_check=true
-CALL dv_proc_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.orders', options => map('rewrite-all', 'true'));
+CALL dv_proc_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.orders', options => map('rewrite-all', 'true'));
 
 -- query 4
 -- @db=dv_proc_${uuid0}.ns_${uuid0}
@@ -80,6 +63,6 @@ SELECT count() AS puffin_delete_files
 
 -- query 6
 -- @skip_result_check=true
-DROP TABLE dv_proc_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE dv_proc_${uuid0}.ns_${uuid0};
+DROP TABLE dv_proc_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA dv_proc_${uuid0}.ns_${uuid0};
 DROP CATALOG dv_proc_${uuid0};

@@ -19,24 +19,7 @@
 -- Variant writes fail before staging; scalar expressions retain their value domains.
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG `iru9_variant_insert_${uuid0}`
-PROPERTIES (
-    "type"="iceberg",
-    "iceberg.catalog.type"="rest",
-    "uri"="${iceberg_rest_uri}",
-    "warehouse"="${iceberg_rest_warehouse}",
-    "credential.object-store-metadata.consumer-role" = "frontend",
-    "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-    "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-    "credential.object-store-data.consumer-role" = "backend",
-    "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-    "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-    "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.region"="${oss_region}",
-    "aws.s3.enable_path_style_access"="${oss_path_style}"
-);
+CREATE CATALOG "iru9_variant_insert_${uuid0}" USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @result_contains=IRU9_EMPTY_INT_OK
@@ -52,10 +35,10 @@ grep -E '^IRU9_(EMPTY_INT_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 -- @expect_error_tier=drift
 -- @expect_error=Iceberg Variant writes are not supported
 INSERT INTO iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant VALUES
-  (1, parse_json('{"a":1,"b":"x"}')),
-  (2, parse_json('[10,20,30]')),
-  (3, parse_json('null')),
-  (4, NULL);
+  ROW(1, parse_json('{"a":1,"b":"x"}')),
+  ROW(2, parse_json('[10,20,30]')),
+  ROW(3, parse_json('null')),
+  ROW(4, NULL);
 
 -- query 4
 SELECT variant_typeof(parse_json('{"a":1}')) AS object_kind,
@@ -69,9 +52,9 @@ SELECT variant_typeof(parse_json('{"a":1}')) AS object_kind,
 SELECT get_json_string(parse_json('{"a":1,"b":"x"}'), '$.b') AS b;
 
 -- query 6
-SELECT COUNT() AS remaining_rows FROM iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant;
+SELECT COUNT(*) AS remaining_rows FROM iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant;
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant FORCE;
+DROP TABLE iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant ;
 DROP CATALOG iru9_variant_insert_${uuid0};

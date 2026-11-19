@@ -23,20 +23,20 @@
 DROP TABLE IF EXISTS ${case_db}.strict_eq_a;
 DROP TABLE IF EXISTS ${case_db}.strict_eq_b;
 DROP TABLE IF EXISTS ${case_db}.strict_eq_c;
-SET cbo_max_reorder_node_use_exhaustive = 2;
+SET SESSION cbo_max_reorder_node_use_exhaustive = 2;
 CREATE TABLE ${case_db}.strict_eq_a (a1 BIGINT, a2 BIGINT, payload BIGINT);
 CREATE TABLE ${case_db}.strict_eq_b (b BIGINT, payload BIGINT);
 CREATE TABLE ${case_db}.strict_eq_c (c BIGINT, payload BIGINT);
 INSERT INTO ${case_db}.strict_eq_a
     SELECT generate_series, generate_series, generate_series * 10
     FROM TABLE(generate_series(1, 10000));
-INSERT INTO ${case_db}.strict_eq_b VALUES (1, 100), (2, 200), (NULL, 300);
-INSERT INTO ${case_db}.strict_eq_c VALUES (1, 1000), (2, 2000), (NULL, 3000);
-ANALYZE TABLE ${case_db}.strict_eq_a;
-ANALYZE TABLE ${case_db}.strict_eq_b;
-ANALYZE TABLE ${case_db}.strict_eq_c;
+INSERT INTO ${case_db}.strict_eq_b VALUES ROW(1, 100), ROW(2, 200), ROW(NULL, 300);
+INSERT INTO ${case_db}.strict_eq_c VALUES ROW(1, 1000), ROW(2, 2000), ROW(NULL, 3000);
+ANALYZE ${case_db}.strict_eq_a;
+ANALYZE ${case_db}.strict_eq_b;
+ANALYZE ${case_db}.strict_eq_c;
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.payload, b.payload, c.payload
 FROM (
     SELECT *
@@ -46,14 +46,14 @@ FROM (
 JOIN ${case_db}.strict_eq_b b ON a.a1 = b.b
 JOIN ${case_db}.strict_eq_c c ON a.a2 = c.c;
 
-SET cbo_max_reorder_node_use_exhaustive = 4;
+SET SESSION cbo_max_reorder_node_use_exhaustive = 4;
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.payload, b.payload, c.payload
 FROM (
     SELECT *
     FROM ${case_db}.strict_eq_a
-    WHERE a1 <=> a2
+    WHERE a1  IS NOT DISTINCT FROM  a2
 ) a
 JOIN ${case_db}.strict_eq_b b ON a.a1 = b.b
 JOIN ${case_db}.strict_eq_c c ON a.a2 = c.c;

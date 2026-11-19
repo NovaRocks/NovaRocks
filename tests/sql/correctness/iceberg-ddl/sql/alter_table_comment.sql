@@ -31,7 +31,7 @@ SHOW CREATE TABLE ${case_db}.t;
 
 -- query 3
 -- @skip_result_check=true
-ALTER TABLE ${case_db}.t COMMENT 'c2';
+COMMENT ON TABLE ${case_db}.t IS 'c2';
 
 -- query 4
 -- @result_contains=COMMENT 'c2'

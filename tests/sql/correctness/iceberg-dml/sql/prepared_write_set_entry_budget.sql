@@ -40,22 +40,21 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_write_set_entry_budget FORCE;
-DROP TABLE IF EXISTS ${case_db}.seed_write_set_entry_budget FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_write_set_entry_budget ;
+DROP TABLE IF EXISTS ${case_db}.seed_write_set_entry_budget ;
 CREATE TABLE ${case_db}.seed_write_set_entry_budget (n BIGINT);
 INSERT INTO ${case_db}.seed_write_set_entry_budget VALUES
-  (0),(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13),(14),(15),
-  (16),(17),(18),(19),(20),(21),(22),(23),(24),(25),(26),(27),(28),(29),(30),(31);
+  ROW(0),ROW(1),ROW(2),ROW(3),ROW(4),ROW(5),ROW(6),ROW(7),ROW(8),ROW(9),ROW(10),ROW(11),ROW(12),ROW(13),ROW(14),ROW(15),
+  ROW(16),ROW(17),ROW(18),ROW(19),ROW(20),ROW(21),ROW(22),ROW(23),ROW(24),ROW(25),ROW(26),ROW(27),ROW(28),ROW(29),ROW(30),ROW(31);
 CREATE TABLE ${case_db}.t_write_set_entry_budget (
   p BIGINT,
   v BIGINT
-)
-PARTITION BY identity(p);
-INSERT INTO ${case_db}.t_write_set_entry_budget VALUES (-1, 1);
+) WITH (partitioning = ARRAY['p']);
+INSERT INTO ${case_db}.t_write_set_entry_budget VALUES ROW(-1, 1);
 
 -- query 2
 -- The committed state the refused write must not disturb.
-SELECT count() AS snaps_before
+SELECT count(*) AS snaps_before
 FROM ${case_db}."t_write_set_entry_budget$snapshots";
 
 -- query 3
@@ -83,10 +82,10 @@ ORDER BY p;
 -- query 5
 -- Stronger than a row check: the refused write produced no snapshot at all,
 -- so the external commit never ran.
-SELECT count() AS snaps_after
+SELECT count(*) AS snaps_after
 FROM ${case_db}."t_write_set_entry_budget$snapshots";
 
 -- query 6
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_write_set_entry_budget FORCE;
-DROP TABLE ${case_db}.seed_write_set_entry_budget FORCE;
+DROP TABLE ${case_db}.t_write_set_entry_budget ;
+DROP TABLE ${case_db}.seed_write_set_entry_budget ;

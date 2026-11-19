@@ -26,24 +26,24 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0};
+CREATE SCHEMA IF NOT EXISTS statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0};
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0} (
     id BIGINT,
     k BIGINT
-) TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
+) WITH (statistics_collect_on_write = false);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0} VALUES
-    (1, 10), (2, 20), (3, 30), (4, 40);
+    ROW(1, 10), ROW(2, 20), ROW(3, 30), ROW(4, 40);
 
 -- query 4
 -- Measure snapshot S.
 -- @skip_result_check=true
-ANALYZE TABLE statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
+ANALYZE statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
 
 -- query 5
 -- On S itself the sketch is published against the queried snapshot, so its
@@ -54,7 +54,7 @@ SHOW STATS FOR statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advan
 -- Advance the table to S'. Nothing re-analyzes it.
 -- @skip_result_check=true
 INSERT INTO statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0} VALUES
-    (5, 50), (6, 60);
+    ROW(5, 50), ROW(6, 60);
 
 -- query 7
 -- The ancestor NDV remains four while current bounds and row count advance.
@@ -65,7 +65,7 @@ SHOW STATS FOR statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advan
 -- snapshot's own manifest, so it reports six rows rather than the four the
 -- sketch was measured over.
 -- @result_contains=6
-SELECT COUNT() FROM statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
+SELECT COUNT(*) FROM statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
 
 -- query 9
 -- @skip_result_check=true

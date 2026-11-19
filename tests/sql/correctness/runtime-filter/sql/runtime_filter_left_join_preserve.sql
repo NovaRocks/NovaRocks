@@ -29,22 +29,20 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_left_join_preserve_r;
 CREATE TABLE ${case_db}.t_rf_left_join_preserve_l (
     id INT,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_left_join_preserve_r (
     k INT,
     tag VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_rf_left_join_preserve_l VALUES
-    (1, 10),
-    (2, 20),
-    (3, 30);
+    ROW(1, 10),
+    ROW(2, 20),
+    ROW(3, 30);
 
 INSERT INTO ${case_db}.t_rf_left_join_preserve_r VALUES
-    (20, 'r20'),
-    (30, 'r30');
+    ROW(20, 'r20'),
+    ROW(30, 'r30');
 
 SELECT l.id, l.k, r.tag
 FROM ${case_db}.t_rf_left_join_preserve_l l

@@ -81,11 +81,11 @@ SELECT TRY_CAST([CAST(1 AS DECIMAL(38,0)),CAST(CAST(['bad'] AS ARRAY<INT>)[1] AS
 SELECT TRY_CAST([CAST(CAST(['bad'] AS ARRAY<INT>)[1] AS DECIMAL(38,38)),CAST(1 AS DECIMAL(38,0)),CAST(0 AS DECIMAL(38,38))] AS ARRAY<DECIMAL(38,38)>) AS first_source_failure;
 
 -- query 19
-SELECT ordinal,[int_value,small_value] AS widened FROM (VALUES (CAST(1 AS INT),CAST(1 AS INT),CAST(2 AS SMALLINT)),(CAST(2 AS INT),CAST(NULL AS INT),CAST(3 AS SMALLINT))) AS inputs(ordinal,int_value,small_value) ORDER BY ordinal;
+SELECT ordinal,[int_value,small_value] AS widened FROM (VALUES ROW(CAST(1 AS INT),CAST(1 AS INT),CAST(2 AS SMALLINT)),ROW(CAST(2 AS INT),CAST(NULL AS INT),CAST(3 AS SMALLINT))) AS inputs(ordinal,int_value,small_value) ORDER BY ordinal;
 
 -- query 20
-SELECT ordinal,[decimal_value,double_value] AS rounded FROM (VALUES (CAST(1 AS INT),CAST(9007199254740993.0 AS DECIMAL(20,1)),1e0),(CAST(2 AS INT),CAST(4503599627370496.5 AS DECIMAL(20,1)),2e0)) AS inputs(ordinal,decimal_value,double_value) ORDER BY ordinal;
+SELECT ordinal,[decimal_value,double_value] AS rounded FROM (VALUES ROW(CAST(1 AS INT),CAST(9007199254740993.0 AS DECIMAL(20,1)),1e0),ROW(CAST(2 AS INT),CAST(4503599627370496.5 AS DECIMAL(20,1)),2e0)) AS inputs(ordinal,decimal_value,double_value) ORDER BY ordinal;
 
 -- query 21
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
-SELECT ordinal,TRY_CAST([whole_value,fraction_value] AS ARRAY<DOUBLE>) AS converted FROM (VALUES (CAST(1 AS INT),CAST(0 AS DECIMAL(38,0)),CAST(0 AS DECIMAL(38,38))),(CAST(2 AS INT),CAST(1 AS DECIMAL(38,0)),CAST(0 AS DECIMAL(38,38)))) AS inputs(ordinal,whole_value,fraction_value) ORDER BY ordinal;
+SELECT ordinal,TRY_CAST([whole_value,fraction_value] AS ARRAY<DOUBLE>) AS converted FROM (VALUES ROW(CAST(1 AS INT),CAST(0 AS DECIMAL(38,0)),CAST(0 AS DECIMAL(38,38))),ROW(CAST(2 AS INT),CAST(1 AS DECIMAL(38,0)),CAST(0 AS DECIMAL(38,38)))) AS inputs(ordinal,whole_value,fraction_value) ORDER BY ordinal;

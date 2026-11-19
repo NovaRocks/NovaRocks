@@ -27,13 +27,13 @@ CREATE TABLE ${case_db}.t_metrics (
   v BIGINT
 );
 INSERT INTO ${case_db}.t_metrics VALUES
-  ('A', 1),
-  ('A', 2),
-  ('A', NULL),
-  ('B', 5),
-  ('B', -1),
-  ('B', NULL);
-SELECT grp, COUNT() AS cnt_all, COUNT(v) AS cnt_v, SUM(v) AS sum_v
+  ROW('A', 1),
+  ROW('A', 2),
+  ROW('A', NULL),
+  ROW('B', 5),
+  ROW('B', -1),
+  ROW('B', NULL);
+SELECT grp, COUNT(*) AS cnt_all, COUNT(v) AS cnt_v, SUM(v) AS sum_v
 FROM ${case_db}.t_metrics
 GROUP BY grp
 ORDER BY grp;

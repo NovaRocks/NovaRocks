@@ -19,17 +19,17 @@ select
   cd_gender,
   cd_marital_status,
   cd_education_status,
-  count() cnt1,
+  count(*) cnt1,
   cd_purchase_estimate,
-  count() cnt2,
+  count(*) cnt2,
   cd_credit_rating,
-  count() cnt3,
+  count(*) cnt3,
   cd_dep_count,
-  count() cnt4,
+  count(*) cnt4,
   cd_dep_employed_count,
-  count() cnt5,
+  count(*) cnt5,
   cd_dep_college_count,
-  count() cnt6
+  count(*) cnt6
  from
   customer c,customer_address ca,customer_demographics
  where

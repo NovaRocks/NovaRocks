@@ -30,20 +30,19 @@ CREATE TABLE ${case_db}.t_filter_nullable_three_valued_logic (
   a INT,
   b INT,
   tag STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_filter_nullable_three_valued_logic VALUES
-  (1, 3, 1, 'n'),
-  (2, 3, 0, 'n'),
-  (3, NULL, 2, 'n'),
-  (4, 5, NULL, 'n'),
-  (5, 1, 1, 'force'),
-  (6, NULL, NULL, 'force');
+  ROW(1, 3, 1, 'n'),
+  ROW(2, 3, 0, 'n'),
+  ROW(3, NULL, 2, 'n'),
+  ROW(4, 5, NULL, 'n'),
+  ROW(5, 1, 1, 'force'),
+  ROW(6, NULL, NULL, 'force');
 SELECT
   id,
   a,
   b,
-  a > b AND b > 0 AS pred
+  (a > b AND b > 0) AS pred
 FROM ${case_db}.t_filter_nullable_three_valued_logic
 WHERE (a > b AND b > 0) OR tag = 'force'
 ORDER BY id;

@@ -29,12 +29,11 @@ CREATE TABLE ${case_db}.t_project_string_functions (
   id INT,
   first_name STRING,
   last_name STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_project_string_functions VALUES
-  (1, 'alice', 'smith'),
-  (2, 'Bob', 'Lee'),
-  (3, NULL, 'Z');
+  ROW(1, 'alice', 'smith'),
+  ROW(2, 'Bob', 'Lee'),
+  ROW(3, NULL, 'Z');
 SELECT
   id,
   UPPER(CONCAT(COALESCE(first_name, ''), '_', COALESCE(last_name, ''))) AS full_key

@@ -30,25 +30,23 @@ CREATE TABLE ${case_db}.t_rf_inner_join_selective_l (
     id INT,
     k INT,
     v VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_inner_join_selective_r (
     k INT,
     tag VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_rf_inner_join_selective_l VALUES
-    (1, 10, 'l1'),
-    (2, 20, 'l2'),
-    (3, 30, 'l3'),
-    (4, 40, 'l4');
+    ROW(1, 10, 'l1'),
+    ROW(2, 20, 'l2'),
+    ROW(3, 30, 'l3'),
+    ROW(4, 40, 'l4');
 
 INSERT INTO ${case_db}.t_rf_inner_join_selective_r VALUES
-    (10, 'drop'),
-    (20, 'keep'),
-    (30, 'keep'),
-    (50, 'keep');
+    ROW(10, 'drop'),
+    ROW(20, 'keep'),
+    ROW(30, 'keep'),
+    ROW(50, 'keep');
 
 SELECT l.id, l.k, r.tag
 FROM ${case_db}.t_rf_inner_join_selective_l l

@@ -27,7 +27,7 @@
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t_insert_exact_scalar;
 CREATE TABLE ${case_db}.t_insert_exact_scalar (id INT, d DECIMAL(18,9));
-INSERT INTO ${case_db}.t_insert_exact_scalar VALUES (1, 123456789.123456789);
+INSERT INTO ${case_db}.t_insert_exact_scalar VALUES ROW(1, 123456789.123456789);
 
 -- query 2
 -- Keep this first assertion independent of arithmetic, containers, and explicit CAST.
@@ -35,17 +35,11 @@ SELECT id, d FROM ${case_db}.t_insert_exact_scalar ORDER BY id;
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_insert_exact_scalar VALUES
-  (2, -123456789.123456789), (3, NULL);
+INSERT INTO ${case_db}.t_insert_exact_scalar VALUES ROW(2, (- (DECIMAL '123456789.123456789'))), ROW(3, NULL);
 INSERT INTO ${case_db}.t_insert_exact_scalar SELECT 4, 123456789.123456789;
 INSERT INTO ${case_db}.t_insert_exact_scalar
   SELECT 5, 123456789.123456789 UNION ALL SELECT 6, 1e0;
-INSERT INTO ${case_db}.t_insert_exact_scalar VALUES
-  (7, CAST(1.2356 AS DECIMAL(10,2))),
-  (8, CAST(2.5 AS DOUBLE)),
-  (9, -2E0),
-  (10, CAST(NULL AS DECIMAL(18,9))),
-  (11, 123456789.123456789);
+INSERT INTO ${case_db}.t_insert_exact_scalar VALUES ROW(7, CAST(DECIMAL '1.2356' AS DECIMAL(10, 2))), ROW(8, CAST(DECIMAL '2.5' AS DOUBLE)), ROW(9, (- (2.0E0))), ROW(10, CAST(NULL AS DECIMAL(18, 9))), ROW(11, DECIMAL '123456789.123456789');
 
 -- query 4
 SELECT id, d FROM ${case_db}.t_insert_exact_scalar ORDER BY id;
@@ -61,10 +55,7 @@ DROP TABLE IF EXISTS ${case_db}.t_insert_exact_wide;
 CREATE TABLE ${case_db}.t_insert_exact_wide (
   id INT, d DECIMAL(38,10), n DECIMAL(38,0)
 );
-INSERT INTO ${case_db}.t_insert_exact_wide VALUES
-  (1, 1234567890.1234567890, CAST('9223372036854775808' AS DECIMAL(38,0))),
-  (2, -1234567890.1234567890, CAST('-9223372036854775809' AS DECIMAL(38,0))),
-  (3, 0.0000000001, NULL);
+INSERT INTO ${case_db}.t_insert_exact_wide VALUES ROW(1, DECIMAL '1234567890.1234567890', CAST('9223372036854775808' AS DECIMAL(38, 0))), ROW(2, (- (DECIMAL '1234567890.1234567890')), CAST('-9223372036854775809' AS DECIMAL(38, 0))), ROW(3, DECIMAL '0.0000000001', NULL);
 
 -- query 7
 SELECT id, d, n FROM ${case_db}.t_insert_exact_wide ORDER BY id;
@@ -76,21 +67,19 @@ CREATE TABLE ${case_db}.t_insert_exact_nested (
   id INT,
   a ARRAY<DECIMAL(18,9)>,
   m MAP<DECIMAL(18,9),DECIMAL(18,9)>,
-  s STRUCT<d DECIMAL(18,9), a ARRAY<DECIMAL(18,9)>>
+  s ROW(d DECIMAL(18,9), a ARRAY<DECIMAL(18,9)>)
 );
 INSERT INTO ${case_db}.t_insert_exact_nested VALUES
-  (1, [123456789.123456789, -123456789.123456789, NULL],
-      map{123456789.123456789:-123456789.123456789},
-      row(123456789.123456789, [-123456789.123456789, NULL])),
-  (2, [], map{}, NULL),
-  (3, NULL, NULL, NULL),
-  (4, [1.0, 2.50], map{1:2.50}, row(NULL, []));
+  ROW(1, [123456789.123456789, -(123456789.123456789), NULL],
+      map(123456789.123456789,-(123456789.123456789)),
+      row(123456789.123456789, [-(123456789.123456789), NULL])),
+  ROW(2, [], map(), NULL),
+  ROW(3, NULL, NULL, NULL),
+  ROW(4, [1.0, 2.50], map(1,2.50), row(NULL, []));
 INSERT INTO ${case_db}.t_insert_exact_nested
-SELECT 5, [-123456789.123456789, NULL],
-       map{123456789.123456789:NULL},
-       named_struct('d', -123456789.123456789, 'a', [123456789.123456789]);
+SELECT 5, ARRAY[(- (DECIMAL '123456789.123456789')), NULL], map(DECIMAL '123456789.123456789', NULL), named_struct('d', (- (DECIMAL '123456789.123456789')), 'a', ARRAY[DECIMAL '123456789.123456789']);
 INSERT INTO ${case_db}.t_insert_exact_nested VALUES
-  (6, [123456789.123456789, 1e0], NULL,
+  ROW(6, [123456789.123456789, 1e0], NULL,
       row(123456789.123456789, [123456789.123456789, 1e0]));
 
 -- query 9
@@ -119,7 +108,7 @@ INSERT INTO ${case_db}.t_insert_exact_controls SELECT 99, 9.99 WHERE FALSE;
 INSERT INTO ${case_db}.t_insert_exact_controls SELECT 98, 9.98 LIMIT 0;
 INSERT INTO ${case_db}.t_insert_exact_controls SELECT DISTINCT 1, 1.2344 WHERE TRUE;
 INSERT INTO ${case_db}.t_insert_exact_controls SELECT 2, CAST(1.2356 AS DECIMAL(10,4)) LIMIT 1;
-INSERT INTO ${case_db}.t_insert_exact_controls VALUES (3, CAST(2.5 AS DOUBLE));
+INSERT INTO ${case_db}.t_insert_exact_controls VALUES ROW(3, CAST(2.5 AS DOUBLE));
 
 -- query 13
 SELECT id, d FROM ${case_db}.t_insert_exact_controls ORDER BY id;
@@ -128,10 +117,10 @@ SELECT id, d FROM ${case_db}.t_insert_exact_controls ORDER BY id;
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t_insert_exact_bytes;
 CREATE TABLE ${case_db}.t_insert_exact_bytes (id INT, b VARBINARY);
-INSERT INTO ${case_db}.t_insert_exact_bytes VALUES (1,'ÿ'),(2,X'FF00');
+INSERT INTO ${case_db}.t_insert_exact_bytes VALUES ROW(1,'ÿ'),ROW(2,X'FF00');
 INSERT INTO ${case_db}.t_insert_exact_bytes SELECT 3,'ÿ';
 INSERT INTO ${case_db}.t_insert_exact_bytes SELECT 4,X'FF00';
-INSERT INTO ${case_db}.t_insert_exact_bytes VALUES (5,NULL),(6,X'FF');
+INSERT INTO ${case_db}.t_insert_exact_bytes VALUES ROW(5,NULL),ROW(6,X'FF');
 INSERT INTO ${case_db}.t_insert_exact_bytes SELECT 7,X'FF00';
 
 -- query 15
@@ -144,7 +133,7 @@ DROP TABLE IF EXISTS ${case_db}.t_insert_exact_source_order;
 CREATE TABLE ${case_db}.t_insert_exact_source_order (a INT, b INT);
 -- ORDER BY 1 denotes source b, before mapping the source to target (a,b).
 INSERT INTO ${case_db}.t_insert_exact_source_order (b,a)
-VALUES (1,2), (2,1) ORDER BY 1 LIMIT 1;
+VALUES ROW(1,2), ROW(2,1) ORDER BY 1 LIMIT 1;
 
 -- query 17
 SELECT a, b FROM ${case_db}.t_insert_exact_source_order ORDER BY a, b;

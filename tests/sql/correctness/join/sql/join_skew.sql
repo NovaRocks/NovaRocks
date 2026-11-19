@@ -49,8 +49,7 @@ CREATE TABLE ${case_db}.t1 (
     c_date     DATE,
     c_datetime DATETIME,
     c_string   STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
@@ -67,8 +66,7 @@ CREATE TABLE ${case_db}.t2 (
     c_date     DATE,
     c_datetime DATETIME,
     c_string   STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
@@ -89,11 +87,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 9
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_tinyint) VALUES (1, 1), (2, 1), (3, 1), (4, 2), (5, 2), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_tinyint) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, 2), ROW(5, 2), ROW(6, 3);
 
 -- query 10
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_tinyint) VALUES (1, 1), (2, 2), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_tinyint) VALUES ROW(1, 1), ROW(2, 2), ROW(3, 3);
 
 -- query 11
 -- @order_sensitive=true
@@ -124,11 +122,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 17
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_int) VALUES (1, 1), (2, 1), (3, 1), (4, 1234567), (5, 1234567), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_int) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, 1234567), ROW(5, 1234567), ROW(6, 3);
 
 -- query 18
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_int) VALUES ROW(1, 1), ROW(2, 1234567), ROW(3, 3);
 
 -- query 19
 -- @order_sensitive=true
@@ -151,11 +149,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 23
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES (1, 1), (2, 1), (3, 1), (4, 12345678912), (5, 12345678912), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, 12345678912), ROW(5, 12345678912), ROW(6, 3);
 
 -- query 24
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES (1, 1), (2, 12345678912), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES ROW(1, 1), ROW(2, 12345678912), ROW(3, 3);
 
 -- query 25
 -- @order_sensitive=true
@@ -178,11 +176,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 29
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_largeint) VALUES (1, 1), (2, 1), (3, 1), (4, CAST('18446744073709551620' AS LARGEINT)), (5, CAST('18446744073709551620' AS LARGEINT)), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_largeint) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, CAST('18446744073709551620' AS LARGEINT)), ROW(5, CAST('18446744073709551620' AS LARGEINT)), ROW(6, 3);
 
 -- query 30
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_largeint) VALUES (1, 1), (2, CAST('18446744073709551620' AS LARGEINT)), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_largeint) VALUES ROW(1, 1), ROW(2, CAST('18446744073709551620' AS LARGEINT)), ROW(3, 3);
 
 -- query 31
 -- @order_sensitive=true
@@ -205,11 +203,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 35
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_double) VALUES (1, 1.1), (2, 1.1), (3, 1.1), (4, 2.1), (5, 2.1), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_double) VALUES ROW(1, 1.1), ROW(2, 1.1), ROW(3, 1.1), ROW(4, 2.1), ROW(5, 2.1), ROW(6, 3);
 
 -- query 36
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_double) VALUES (1, 1.1), (2, 2.1), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_double) VALUES ROW(1, 1.1), ROW(2, 2.1), ROW(3, 3);
 
 -- query 37
 -- @order_sensitive=true
@@ -232,11 +230,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 41
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_decimal) VALUES (1, 1.1), (2, 1.1), (3, 1.1), (4, 2.1), (5, 2.1), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_decimal) VALUES ROW(1, 1.1), ROW(2, 1.1), ROW(3, 1.1), ROW(4, 2.1), ROW(5, 2.1), ROW(6, 3);
 
 -- query 42
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_decimal) VALUES (1, 1.1), (2, 2.1), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_decimal) VALUES ROW(1, 1.1), ROW(2, 2.1), ROW(3, 3);
 
 -- query 43
 -- @order_sensitive=true
@@ -260,12 +258,12 @@ TRUNCATE TABLE ${case_db}.t2;
 -- query 47
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t1(c_key, c_date) VALUES
-    (1, "2024-01-01"), (2, "2024-01-01"), (3, "2024-01-01"),
-    (4, "2024-01-02"), (5, "2024-01-02"), (6, "2024-01-03");
+    ROW(1, '2024-01-01'), ROW(2, '2024-01-01'), ROW(3, '2024-01-01'),
+    ROW(4, '2024-01-02'), ROW(5, '2024-01-02'), ROW(6, '2024-01-03');
 
 -- query 48
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_date) VALUES (1, "2024-01-01"), (2, "2024-01-02"), (3, "2024-01-03");
+INSERT INTO ${case_db}.t2(c_key, c_date) VALUES ROW(1, '2024-01-01'), ROW(2, '2024-01-02'), ROW(3, '2024-01-03');
 
 -- query 49
 -- @order_sensitive=true
@@ -288,11 +286,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 53
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_string) VALUES ("1", "1"), ("2", "1"), ("3", "1"), ("4", "1234567"), ("5", "1234567"), ("6", "3");
+INSERT INTO ${case_db}.t1(c_key, c_string) VALUES ROW('1', '1'), ROW('2', '1'), ROW('3', '1'), ROW('4', '1234567'), ROW('5', '1234567'), ROW('6', '3');
 
 -- query 54
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_string) VALUES ("1", "1"), ("2", "1234567"), ("3", "3");
+INSERT INTO ${case_db}.t2(c_key, c_string) VALUES ROW('1', '1'), ROW('2', '1234567'), ROW('3', '3');
 
 -- query 55
 -- @order_sensitive=true
@@ -315,11 +313,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 59
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_int) VALUES (1, 1), (2, 1), (3, 1), (4, 1234567), (5, 1234567), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_int) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, 1234567), ROW(5, 1234567), ROW(6, 3);
 
 -- query 60
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES (1, 1), (2, 1234567), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES ROW(1, 1), ROW(2, 1234567), ROW(3, 3);
 
 -- query 61
 -- @order_sensitive=true
@@ -342,11 +340,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 65
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES (1, 1), (2, 1), (3, 1), (4, 1234567), (5, 1234567), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, 1234567), ROW(5, 1234567), ROW(6, 3);
 
 -- query 66
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_int) VALUES ROW(1, 1), ROW(2, 1234567), ROW(3, 3);
 
 -- query 67
 -- @order_sensitive=true
@@ -369,11 +367,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 71
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_string) VALUES (1, "1"), (2, "1"), (3, "1"), (4, "1234567"), (5, "1234567"), (6, "3");
+INSERT INTO ${case_db}.t1(c_key, c_string) VALUES ROW(1, '1'), ROW(2, '1'), ROW(3, '1'), ROW(4, '1234567'), ROW(5, '1234567'), ROW(6, '3');
 
 -- query 72
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_int) VALUES ROW(1, 1), ROW(2, 1234567), ROW(3, 3);
 
 -- query 73
 -- @order_sensitive=true

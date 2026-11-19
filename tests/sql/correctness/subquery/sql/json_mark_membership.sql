@@ -18,13 +18,13 @@
 -- @tags=subquery,json,mark_join
 -- Fixed 13 probe values: 0..8 match; 9..12 have no TRUE and encounter SQL NULL.
 -- Object member order differs, and a duplicate RHS occurrence cannot multiply rows.
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
 CREATE TABLE json_mark_probe (id BIGINT, txt STRING);
 CREATE TABLE json_mark_rhs (txt STRING);
 INSERT INTO json_mark_probe SELECT generate_series, CONCAT('{"a":',CAST(generate_series AS STRING),',"b":1}') FROM TABLE(generate_series(0,12));
 INSERT INTO json_mark_rhs SELECT CONCAT('{"b":1,"a":',CAST(generate_series AS STRING),'}') FROM TABLE(generate_series(0,8));
-INSERT INTO json_mark_rhs VALUES(NULL),('{"b":1,"a":0}');
+INSERT INTO json_mark_rhs VALUES ROW(NULL),ROW('{"b":1,"a":0}');
 -- q16 oracle: 9 TRUE, 4 NULL, one output for each probe occurrence.
 SELECT id, parse_json(txt) IN (SELECT parse_json(txt) FROM json_mark_rhs) AS included FROM json_mark_probe ORDER BY id;
 -- q17 oracle: 9 FALSE, 4 NULL; NOT applies once after three-valued reduction.

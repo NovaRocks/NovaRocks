@@ -28,13 +28,13 @@ CREATE TABLE ${case_db}.sq_t1 (k INT, v INT);
 -- query 4
 CREATE TABLE ${case_db}.sq_t2 (k INT, v INT);
 -- query 5
-INSERT INTO ${case_db}.sq_t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+INSERT INTO ${case_db}.sq_t1 VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30), ROW(4, 40);
 -- query 6
-INSERT INTO ${case_db}.sq_t2 VALUES (1, 100), (3, 300), (5, NULL);
+INSERT INTO ${case_db}.sq_t2 VALUES ROW(1, 100), ROW(3, 300), ROW(5, NULL);
 -- query 7
-ANALYZE TABLE ${case_db}.sq_t1;
+ANALYZE ${case_db}.sq_t1;
 -- query 8
-ANALYZE TABLE ${case_db}.sq_t2;
+ANALYZE ${case_db}.sq_t2;
 -- query 9
 
 -- query 10
@@ -63,7 +63,7 @@ WHERE t1.v NOT IN (
 ORDER BY k;
 -- query 12
 
-SET disable_optimizer_rules='QuantifiedApplyToJoin';
+SET SESSION disable_optimizer_rules = 'QuantifiedApplyToJoin';
 -- query 13
 
 -- Disabling QuantifiedApplyToJoin should make the Apply backstop reject the
@@ -78,5 +78,5 @@ WHERE t1.k IN (
 ORDER BY k;
 -- query 14
 
-SET disable_optimizer_rules='';
+SET SESSION disable_optimizer_rules = '';
 -- query 15

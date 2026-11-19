@@ -24,38 +24,16 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_mv_sched_pause_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_mv_sched_pause_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_mv_sched_pause_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_mv_sched_pause_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_mv_sched_pause_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
   v2 BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 USE ice_mv_sched_pause_${uuid0}.ns_${uuid0};
 INSERT INTO ice_mv_sched_pause_${uuid0}.ns_${uuid0}.orders VALUES
-  (1, 10);
-CREATE MATERIALIZED VIEW orders_pause_mv_${uuid0}
-DISTRIBUTED BY HASH(k1) BUCKETS 1
-REFRESH ASYNC EVERY INTERVAL 1 SECOND
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k1, v2 FROM orders;
+  ROW(1, 10);
+CREATE MATERIALIZED VIEW orders_pause_mv_${uuid0} WITH (refresh_policy = 'INTERVAL', refresh_interval = '1s') AS SELECT k1, v2 FROM orders;
 
 -- query 2
 -- @retry_count=30
@@ -64,9 +42,9 @@ SELECT k1, v2 FROM orders_pause_mv_${uuid0} ORDER BY k1;
 
 -- query 3
 -- @skip_result_check=true
-ALTER MATERIALIZED VIEW orders_pause_mv_${uuid0} PAUSE REFRESH;
+ALTER MATERIALIZED VIEW orders_pause_mv_${uuid0} SET PROPERTIES refresh_paused = true;
 INSERT INTO ice_mv_sched_pause_${uuid0}.ns_${uuid0}.orders VALUES
-  (2, 20);
+  ROW(2, 20);
 
 -- query 4
 -- @skip_result_check=true
@@ -77,7 +55,7 @@ SELECT k1, v2 FROM orders_pause_mv_${uuid0} ORDER BY k1;
 
 -- query 6
 -- @skip_result_check=true
-ALTER MATERIALIZED VIEW orders_pause_mv_${uuid0} RESUME REFRESH;
+ALTER MATERIALIZED VIEW orders_pause_mv_${uuid0} SET PROPERTIES refresh_paused = false;
 
 -- query 7
 -- @retry_count=30
@@ -88,6 +66,6 @@ SELECT k1, v2 FROM orders_pause_mv_${uuid0} ORDER BY k1;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_pause_mv_${uuid0};
-DROP TABLE ice_mv_sched_pause_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE ice_mv_sched_pause_${uuid0}.ns_${uuid0};
+DROP TABLE ice_mv_sched_pause_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA ice_mv_sched_pause_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_mv_sched_pause_${uuid0};

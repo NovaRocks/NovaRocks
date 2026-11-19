@@ -44,7 +44,7 @@ SELECT CAST(['abc','{"k":1}','null',NULL] AS ARRAY<JSON>) AS json_values;
 SELECT TRY_CAST(['abc','{"k":1}','null',NULL] AS ARRAY<JSON>) AS json_values;
 
 -- query 8
-SELECT CAST([JSON '100.0',JSON '1e2',JSON 'null',JSON '"a\\n中"',NULL] AS ARRAY<VARCHAR>) AS string_values;
+SELECT CAST([JSON '100.0',JSON '1e2',JSON 'null',JSON '"a\n中"',NULL] AS ARRAY<VARCHAR>) AS string_values;
 
 -- query 9
 -- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR

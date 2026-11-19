@@ -25,11 +25,11 @@ CREATE TABLE ${case_db}.t_insert_delete_select (
   city_id INT,
   population INT,
   city STRING
-) TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_insert_delete_select VALUES
-  (1, 100, 'Beijing'),
-  (2, 200, 'Shanghai'),
-  (3, 300, 'Shenzhen');
+  ROW(1, 100, 'Beijing'),
+  ROW(2, 200, 'Shanghai'),
+  ROW(3, 300, 'Shenzhen');
 DELETE FROM ${case_db}.t_insert_delete_select
 WHERE city_id = 2;
 SELECT city_id, population, city

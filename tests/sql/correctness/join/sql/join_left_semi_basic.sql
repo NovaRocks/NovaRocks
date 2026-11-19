@@ -29,22 +29,20 @@ DROP TABLE IF EXISTS ${case_db}.t_join_left_semi_r;
 CREATE TABLE ${case_db}.t_join_left_semi_l (
   id INT,
   lv STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_left_semi_r (
   id INT,
   rv STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_left_semi_l VALUES
-  (1, 'L1'),
-  (2, 'L2'),
-  (3, 'L3'),
-  (4, 'L4');
+  ROW(1, 'L1'),
+  ROW(2, 'L2'),
+  ROW(3, 'L3'),
+  ROW(4, 'L4');
 INSERT INTO ${case_db}.t_join_left_semi_r VALUES
-  (2, 'R2a'),
-  (2, 'R2b'),
-  (4, 'R4');
+  ROW(2, 'R2a'),
+  ROW(2, 'R2b'),
+  ROW(4, 'R4');
 SELECT l.id, l.lv
 FROM ${case_db}.t_join_left_semi_l l
 WHERE EXISTS (SELECT 1 FROM ${case_db}.t_join_left_semi_r r WHERE l.id = r.id)

@@ -23,19 +23,16 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_update_multi_file FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_update_multi_file ;
 CREATE TABLE ${case_db}.t_v3_update_multi_file (
   id BIGINT,
   v STRING
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
-INSERT INTO ${case_db}.t_v3_update_multi_file VALUES (1, 'a');
-INSERT INTO ${case_db}.t_v3_update_multi_file VALUES (2, 'b');
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.t_v3_update_multi_file VALUES ROW(1, 'a');
+INSERT INTO ${case_db}.t_v3_update_multi_file VALUES ROW(2, 'b');
 
 -- query 2
-SELECT count() AS snaps_before
+SELECT count(*) AS snaps_before
 FROM ${case_db}."t_v3_update_multi_file$snapshots";
 
 -- query 3
@@ -45,7 +42,7 @@ SET v = CONCAT(v, '_updated')
 WHERE id IN (1, 2);
 
 -- query 4
-SELECT count() AS snaps_after
+SELECT count(*) AS snaps_after
 FROM ${case_db}."t_v3_update_multi_file$snapshots";
 
 -- query 5
@@ -54,9 +51,9 @@ FROM ${case_db}.t_v3_update_multi_file
 ORDER BY id;
 
 -- query 6
-SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT() AS total_rows
+SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT(*) AS total_rows
 FROM ${case_db}.t_v3_update_multi_file;
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_update_multi_file FORCE;
+DROP TABLE ${case_db}.t_v3_update_multi_file ;

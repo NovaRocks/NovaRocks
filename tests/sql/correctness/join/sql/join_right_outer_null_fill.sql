@@ -29,20 +29,18 @@ DROP TABLE IF EXISTS ${case_db}.t_join_right_outer_r;
 CREATE TABLE ${case_db}.t_join_right_outer_l (
   id INT,
   lv STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_right_outer_r (
   id INT,
   rv STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_right_outer_l VALUES
-  (2, 'L2'),
-  (3, 'L3');
+  ROW(2, 'L2'),
+  ROW(3, 'L3');
 INSERT INTO ${case_db}.t_join_right_outer_r VALUES
-  (2, 'R2'),
-  (3, 'R3'),
-  (4, 'R4');
+  ROW(2, 'R2'),
+  ROW(3, 'R3'),
+  ROW(4, 'R4');
 SELECT l.id AS lid, l.lv, r.id AS rid, r.rv
 FROM ${case_db}.t_join_right_outer_l l
 RIGHT OUTER JOIN ${case_db}.t_join_right_outer_r r

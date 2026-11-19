@@ -22,11 +22,11 @@ CREATE TABLE ${case_db}.oq1c_cte_src (
     k INT,
     v INT,
     payload INT
-) TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
+) WITH (statistics_collect_on_write = false);
 INSERT INTO ${case_db}.oq1c_cte_src VALUES
-    (1, 10, 100),
-    (2, 20, 200),
-    (3, 30, 300);
+    ROW(1, 10, 100),
+    ROW(2, 20, 200),
+    ROW(3, 30, 300);
 
 -- Single consumer reads one producer column.
 WITH c AS (
@@ -52,7 +52,7 @@ SELECT payload FROM c WHERE v = 30;
 
 -- Aggregate-backed producer keeps its full child output when aggregate pruning is disabled.
 WITH c AS (
-    SELECT k, COUNT() AS cnt FROM ${case_db}.oq1c_cte_src GROUP BY k
+    SELECT k, COUNT(*) AS cnt FROM ${case_db}.oq1c_cte_src GROUP BY k
 )
 SELECT l.k
 FROM c l
@@ -61,7 +61,7 @@ ORDER BY l.k;
 
 -- @skip_result_check=true
 -- @result_contains=CTE
-EXPLAIN LOGICAL
+EXPLAIN WITH SESSION explain_detail = 'LOGICAL'
 WITH c AS (
     SELECT k, v, payload FROM ${case_db}.oq1c_cte_src
 )
@@ -82,7 +82,7 @@ JOIN c r ON l.k = r.k
 WHERE l.v >= 20
 ORDER BY l.k;
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 WITH c AS (
     SELECT k, v, payload FROM ${case_db}.oq1c_cte_src
 )

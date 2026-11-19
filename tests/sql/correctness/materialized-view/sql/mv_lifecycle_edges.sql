@@ -30,17 +30,11 @@
 CREATE TABLE orders_edges_${uuid0} (
   k1 INT NOT NULL,
   v2 BIGINT
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 INSERT INTO orders_edges_${uuid0} VALUES
-  (1, 10),
-  (2, 20);
-CREATE MATERIALIZED VIEW orders_edges_mv_${uuid0}
-DISTRIBUTED BY HASH(k1) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k1, v2 FROM orders_edges_${uuid0} WHERE v2 >= 10;
+  ROW(1, 10),
+  ROW(2, 20);
+CREATE MATERIALIZED VIEW orders_edges_mv_${uuid0} AS SELECT k1, v2 FROM orders_edges_${uuid0} WHERE v2 >= 10;
 
 -- query 2
 -- @skip_result_check=true
@@ -78,4 +72,4 @@ SELECT k1, v2 FROM orders_edges_mv_${uuid0} ORDER BY k1;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS orders_edges_mv_${uuid0};
-DROP TABLE IF EXISTS orders_edges_${uuid0} FORCE;
+DROP TABLE IF EXISTS orders_edges_${uuid0} ;

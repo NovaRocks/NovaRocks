@@ -42,24 +42,7 @@
 -- failed table is not dropped or reused: Java creation must fail explicitly.
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG `iru9_variant_path_${uuid0}`
-PROPERTIES (
-    "type"="iceberg",
-    "iceberg.catalog.type"="rest",
-    "uri"="${iceberg_rest_uri}",
-    "warehouse"="${iceberg_rest_warehouse}",
-    "credential.object-store-metadata.consumer-role" = "frontend",
-    "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-    "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-    "credential.object-store-data.consumer-role" = "backend",
-    "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-    "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-    "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.region"="${oss_region}",
-    "aws.s3.enable_path_style_access"="${oss_path_style}"
-);
+CREATE CATALOG "iru9_variant_path_${uuid0}" USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @result_contains=IRU9_EMPTY_INT_OK
@@ -80,12 +63,12 @@ grep -E '^IRU9_(EMPTY_INT_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 -- @explain_contains=predicate: 1 = __nr_var_v_0
 -- @explain_contains=stats={rows=100000}
 -- @explain_not_contains=predicates:
-EXPLAIN VERBOSE SELECT id
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT id
 FROM iru9_variant_path_${uuid0}.${case_db}.t_variant_path_pushdown
 WHERE variant_get(v, '$.a', 'bigint') = 1;
 
 -- query 4
-SET disable_optimizer_rules = 'VariantPathPushdown';
+SET SESSION disable_optimizer_rules = 'VariantPathPushdown';
 
 -- query 5
 -- @explain_not_contains=variant columns:
@@ -95,13 +78,13 @@ SET disable_optimizer_rules = 'VariantPathPushdown';
 -- @explain_contains=columns: id, v
 -- @explain_contains=stats={rows=100000}
 -- @explain_not_contains=predicates:
-EXPLAIN VERBOSE SELECT id
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT id
 FROM iru9_variant_path_${uuid0}.${case_db}.t_variant_path_pushdown
 WHERE variant_get(v, '$.a', 'bigint') = 1;
 
 -- query 6
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 
 -- query 7
-DROP TABLE iru9_variant_path_${uuid0}.${case_db}.t_variant_path_pushdown FORCE;
+DROP TABLE iru9_variant_path_${uuid0}.${case_db}.t_variant_path_pushdown ;
 DROP CATALOG iru9_variant_path_${uuid0};

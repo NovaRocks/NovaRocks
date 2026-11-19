@@ -17,7 +17,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_paimon_${suite_uuid0}.cross_${uuid0};
+CREATE SCHEMA iceberg_paimon_${suite_uuid0}.cross_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -41,8 +41,8 @@ ORDER BY p.id;
 
 -- query 5
 -- @skip_result_check=true
-DROP TABLE iceberg_paimon_${suite_uuid0}.cross_${uuid0}.dim_${uuid0} FORCE;
+DROP TABLE iceberg_paimon_${suite_uuid0}.cross_${uuid0}.dim_${uuid0} ;
 
 -- query 6
 -- @skip_result_check=true
-DROP DATABASE iceberg_paimon_${suite_uuid0}.cross_${uuid0};
+DROP SCHEMA iceberg_paimon_${suite_uuid0}.cross_${uuid0};

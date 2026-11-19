@@ -15,5 +15,5 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
-DROP CATALOG IF EXISTS `iceberg_paimon_${suite_uuid0}`;
-DROP CATALOG IF EXISTS `paimon_${suite_uuid0}`;
+DROP CATALOG IF EXISTS "iceberg_paimon_${suite_uuid0}";
+DROP CATALOG IF EXISTS "paimon_${suite_uuid0}";

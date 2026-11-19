@@ -28,9 +28,9 @@ INSERT INTO ${case_db}.t_dnn_l
 INSERT INTO ${case_db}.t_dnn_r
     SELECT CASE WHEN generate_series % 12 = 0 THEN generate_series ELSE NULL END, generate_series
     FROM TABLE(generate_series(1, 2000));
-ANALYZE TABLE ${case_db}.t_dnn_l;
-ANALYZE TABLE ${case_db}.t_dnn_r;
+ANALYZE ${case_db}.t_dnn_l;
+ANALYZE ${case_db}.t_dnn_r;
 -- @explain_contains=IS NOT NULL
-EXPLAIN VERBOSE SELECT l.v, r.v
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT l.v, r.v
 FROM ${case_db}.t_dnn_l l
 INNER JOIN ${case_db}.t_dnn_r r ON l.k = r.k;

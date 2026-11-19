@@ -187,7 +187,7 @@ select date_slice('2023-12-31 03:12:04',3.2, 'week');
 -- query 37
 -- @expect_error=date_slice requires second parameter must be a constant interval
 USE ${case_db};
-select date_slice('2023-12-31 03:12:04',-3.2, 'week');
+select date_slice('2023-12-31 03:12:04',-DECIMAL '3.2', 'week');
 
 -- query 38
 -- disable_function_fold_constants=on: ceil mode with max datetime
@@ -352,7 +352,7 @@ select date_slice('2023-12-31 03:12:04',3.2, 'week');
 -- query 74
 -- @expect_error=date_slice requires second parameter must be a constant interval
 USE ${case_db};
-select date_slice('2023-12-31 03:12:04',-3.2, 'week');
+select date_slice('2023-12-31 03:12:04',-DECIMAL '3.2', 'week');
 
 -- query 75
 -- Millisecond granularity tests

@@ -34,9 +34,9 @@ CREATE TABLE ${case_db}.t_two_part_sink (
   v STRING
 );
 INSERT INTO ${case_db}.t_two_part_src VALUES
-  (1, 'alpha'),
-  (2, 'beta'),
-  (3, 'gamma');
+  ROW(1, 'alpha'),
+  ROW(2, 'beta'),
+  ROW(3, 'gamma');
 
 -- Path 1: INSERT INTO db.t1 SELECT FROM db.t2 (both sides 2-part).
 INSERT INTO ${case_db}.t_two_part_sink

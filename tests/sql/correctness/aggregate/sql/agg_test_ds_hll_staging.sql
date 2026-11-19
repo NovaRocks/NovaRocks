@@ -33,19 +33,17 @@ CREATE TABLE ${case_db}.t_stage (
   id BIGINT NOT NULL,
   grp INT NOT NULL,
   dt VARCHAR(10) NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 CREATE TABLE ${case_db}.t_stage_state (
   grp INT NOT NULL,
   ds_id binary
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 INSERT INTO ${case_db}.t_stage
-SELECT generate_series, CAST(generate_series % 8 AS INT), "2026-09-16"
+SELECT generate_series, CAST(generate_series % 8 AS INT), '2026-09-16'
 FROM table(generate_series(1, 100000));
 
 -- query 4
@@ -129,10 +127,10 @@ SELECT
 
 -- query 20
 SELECT
-  grp, ds_hll_count_distinct(id, 10, "HLL_6") AS grouped_hll6
+  grp, ds_hll_count_distinct(id, 10, 'HLL_6') AS grouped_hll6
 FROM ${case_db}.t_stage GROUP BY grp ORDER BY grp;
 
 -- query 21
 SELECT
-  grp, ds_hll_count_distinct(id, 10, "HLL_6") AS grouped_hll6
+  grp, ds_hll_count_distinct(id, 10, 'HLL_6') AS grouped_hll6
 FROM ${case_db}.t_stage GROUP BY grp ORDER BY grp;

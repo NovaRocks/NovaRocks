@@ -27,23 +27,7 @@ shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-hms/fi
 
 -- query 2
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_hms_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hive",
-  "iceberg.catalog.hive.metastore.uris" = "${iceberg_hms_uris}",
-  "iceberg.catalog.warehouse" = "${iceberg_hms_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG ice_hms_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'hive', "iceberg.catalog.hive.metastore.uris" = '${iceberg_hms_uris}', "iceberg.catalog.warehouse" = '${iceberg_hms_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 3
 SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v1 ORDER BY id;
@@ -55,13 +39,13 @@ SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v2 ORDER BY id;
 SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v3 ORDER BY id;
 
 -- query 6
-SELECT COUNT(*) AS snapshots FROM ice_hms_${uuid0}.iru7_${uuid0}.v2$snapshots;
+SELECT COUNT(*) AS snapshots FROM ice_hms_${uuid0}.iru7_${uuid0}."v2$snapshots";
 
 -- query 7
-SELECT content, COUNT(*) AS files FROM ice_hms_${uuid0}.iru7_${uuid0}.v2$files GROUP BY content ORDER BY content;
+SELECT content, COUNT(*) AS files FROM ice_hms_${uuid0}.iru7_${uuid0}."v2$files" GROUP BY content ORDER BY content;
 
 -- query 8
-SELECT content, COUNT(*) AS files FROM ice_hms_${uuid0}.iru7_${uuid0}.v3$files GROUP BY content ORDER BY content;
+SELECT content, COUNT(*) AS files FROM ice_hms_${uuid0}.iru7_${uuid0}."v3$files" GROUP BY content ORDER BY content;
 
 -- query 9
 SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v2 FOR VERSION AS OF 'kept_branch' ORDER BY id;
@@ -73,7 +57,7 @@ SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v2 FOR VERSION AS OF 'kept_tag'
 -- @skip_result_check=true
 -- @result_rows_where=snapshot_id=${hms_first_snapshot_id}
 -- @result_rows_count=1
-SELECT snapshot_id FROM ice_hms_${uuid0}.iru7_${uuid0}.v2$snapshots ORDER BY committed_at LIMIT 1;
+SELECT snapshot_id FROM ice_hms_${uuid0}.iru7_${uuid0}."v2$snapshots" ORDER BY committed_at LIMIT 1;
 
 -- query 12
 SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v2 FOR VERSION AS OF ${hms_first_snapshot_id} ORDER BY id;
@@ -85,12 +69,12 @@ shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-hms/fi
 -- query 14
 -- Create namespace
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-CREATE DATABASE ice_hms_${uuid0}.iru7_${uuid0}_new;
+CREATE SCHEMA ice_hms_${uuid0}.iru7_${uuid0}_new;
 
 -- query 15
 -- Drop namespace
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-DROP DATABASE ice_hms_${uuid0}.iru7_${uuid0} FORCE;
+DROP SCHEMA ice_hms_${uuid0}.iru7_${uuid0} CASCADE;
 
 -- query 16
 -- Create table
@@ -100,7 +84,7 @@ CREATE TABLE ice_hms_${uuid0}.iru7_${uuid0}.new_table (id BIGINT, p INT);
 -- query 17
 -- Create table like
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-CREATE TABLE ice_hms_${uuid0}.iru7_${uuid0}.new_like LIKE ice_hms_${uuid0}.iru7_${uuid0}.v3;
+CREATE TABLE ice_hms_${uuid0}.iru7_${uuid0}.new_like (LIKE ice_hms_${uuid0}.iru7_${uuid0}.v3);
 
 -- query 18
 -- Create table as select
@@ -110,7 +94,7 @@ CREATE TABLE ice_hms_${uuid0}.iru7_${uuid0}.new_ctas AS SELECT id, p FROM ice_hm
 -- query 19
 -- Drop table
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-DROP TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 FORCE;
+DROP TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 ;
 
 -- query 20
 -- Add schema field
@@ -125,7 +109,7 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 RENAME COLUMN note TO renamed;
 -- query 22
 -- Modify schema field
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 MODIFY COLUMN note VARCHAR(128);
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 ALTER COLUMN note SET DATA TYPE VARCHAR(128);
 
 -- query 23
 -- Drop schema field
@@ -135,42 +119,42 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 DROP COLUMN note;
 -- query 24
 -- Set properties
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 SET TBLPROPERTIES ('comment'='refused');
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 SET PROPERTIES extra_properties = MAP(ARRAY['comment'], ARRAY['refused']);
 
 -- query 25
 -- Unset properties
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 UNSET TBLPROPERTIES ('write.delete.mode');
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE unset_extra_properties(keys => ARRAY['write.delete.mode'], if_exists => false);
 
 -- query 26
 -- Add partition field
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 ADD PARTITION COLUMN bucket(id, 4);
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 SET PROPERTIES partitioning = ARRAY['p', 'bucket(id, 4)'];
 
 -- query 27
 -- Drop partition field
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 DROP PARTITION COLUMN p;
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 SET PROPERTIES partitioning = ARRAY[];
 
 -- query 28
 -- Create branch
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 CREATE BRANCH rejected_branch;
+CREATE BRANCH rejected_branch IN TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3;
 
 -- query 29
 -- Drop branch
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v2 DROP BRANCH kept_branch;
+DROP BRANCH kept_branch IN TABLE ice_hms_${uuid0}.iru7_${uuid0}.v2;
 
 -- query 30
 -- Create tag
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 CREATE TAG rejected_tag;
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE create_tag(name => 'rejected_tag', replace => false, if_not_exists => false);
 
 -- query 31
 -- Drop tag
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v2 DROP TAG kept_tag;
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v2 EXECUTE drop_tag(name => 'kept_tag', if_exists => false);
 
 -- query 32
 -- Append
@@ -190,7 +174,7 @@ DELETE FROM ice_hms_${uuid0}.iru7_${uuid0}.v3 WHERE id = 2;
 -- query 35
 -- Equality row delta
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v2 ADD EQUALITY DELETE (id) VALUES (2);
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v2 EXECUTE add_equality_delete(columns => ARRAY['id'], rows => ARRAY[ROW(2)]);
 
 -- query 36
 -- DELETE against a v2 table
@@ -215,17 +199,17 @@ TRUNCATE TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3;
 -- query 40
 -- Register files
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v2 ADD FILES FROM '${iceberg_hms_warehouse}/iru7/iru7_${uuid0}/v1/data';
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v2 EXECUTE add_files(location => '${iceberg_hms_warehouse}/iru7/iru7_${uuid0}/v1/data');
 
 -- query 41
 -- Expire snapshots
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXPIRE SNAPSHOTS RETAIN LAST 1;
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE expire_snapshots(retain_last => 1);
 
 -- query 42
 -- Rewrite manifests
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 REWRITE MANIFESTS;
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE optimize_manifests;
 
 -- query 43
 -- Remove orphan files
@@ -233,33 +217,33 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 REWRITE MANIFESTS;
 -- @expect_sql_code=query.execution.unsupported
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.unsupported] table-maintenance original operation failed
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
 
 -- query 44
 -- Rewrite data files
 -- @expect_sql_code=query.execution.unsupported
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.unsupported] table-maintenance original operation failed
-CALL ice_hms_${uuid0}.system.rewrite_data_files(table => 'iru7_${uuid0}.v3', options => map('rewrite-all','true'));
+CALL ice_hms_${uuid0}.system.rewrite_data_files("table" => 'iru7_${uuid0}.v3', options => map('rewrite-all','true'));
 
 -- query 45
 -- Rewrite position deletes
 -- @expect_sql_code=query.execution.unsupported
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.unsupported] table-maintenance original operation failed
-CALL ice_hms_${uuid0}.system.rewrite_position_delete_files(table => 'iru7_${uuid0}.v2', options => map('rewrite-all','true'));
+CALL ice_hms_${uuid0}.system.rewrite_position_delete_files("table" => 'iru7_${uuid0}.v2', options => map('rewrite-all','true'));
 
 -- query 46
 -- Optimize admission
 -- @expect_sql_code=query.execution.unsupported
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.unsupported] table-maintenance original operation failed
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 OPTIMIZE;
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE optimize;
 
 -- query 47
 -- Analyze admission
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ANALYZE TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 (id);
+ANALYZE ice_hms_${uuid0}.iru7_${uuid0}.v3 WITH (columns = ARRAY['id']);
 
 -- query 48
 -- Create view
@@ -283,7 +267,7 @@ USE ice_hms_${uuid0}.iru7_${uuid0};
 -- query 52
 -- Application-document creation
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-CREATE MATERIALIZED VIEW agg_mv DISTRIBUTED BY HASH(p) BUCKETS 1 PROPERTIES ('storage_engine'='iceberg') AS SELECT p, SUM(id) AS s FROM ice_hms_${uuid0}.iru7_${uuid0}.v3 GROUP BY p;
+CREATE MATERIALIZED VIEW agg_mv AS SELECT p, SUM(id) AS s FROM ice_hms_${uuid0}.iru7_${uuid0}.v3 GROUP BY p;
 
 -- query 53
 -- @result_contains=INVENTORY_UNCHANGED

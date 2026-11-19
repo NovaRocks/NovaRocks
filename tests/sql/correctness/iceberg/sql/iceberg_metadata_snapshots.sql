@@ -23,52 +23,51 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0};
+CREATE SCHEMA iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
-CREATE TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0} (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0} (id INT, v INT) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0} VALUES (1, 10);
+INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0} VALUES ROW(1, 10);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0} VALUES (2, 20);
+INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0} VALUES ROW(2, 20);
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0} VALUES (3, 30);
+INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0} VALUES ROW(3, 30);
 
 -- query 6
 -- 3 snapshots committed.
-SELECT count() AS n_snapshots
+SELECT count(*) AS n_snapshots
   FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metasnap_${uuid0}$snapshots";
 
 -- query 7
 -- All 3 snapshot operations are 'append'.
-SELECT operation, count() AS n
+SELECT operation, count(*) AS n
   FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metasnap_${uuid0}$snapshots"
   GROUP BY operation
   ORDER BY operation;
 
 -- query 8
 -- Exactly one snapshot has parent_id NULL (the first one).
-SELECT count() AS n_root
+SELECT count(*) AS n_root
   FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metasnap_${uuid0}$snapshots"
   WHERE parent_id IS NULL;
 
 -- query 9
 -- All 3 snapshots have non-null snapshot_id.
-SELECT count() AS n_with_id
+SELECT count(*) AS n_with_id
   FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metasnap_${uuid0}$snapshots"
   WHERE snapshot_id IS NOT NULL;
 
 -- query 10
 -- Alias works.
-SELECT count() AS n_root_aliased
+SELECT count(*) AS n_root_aliased
   FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metasnap_${uuid0}$snapshots" AS s
   WHERE s.parent_id IS NULL;
 
@@ -78,4 +77,4 @@ DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0}
 
 -- query 12
 -- @skip_result_check=true
-DROP DATABASE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0};
+DROP SCHEMA iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0};

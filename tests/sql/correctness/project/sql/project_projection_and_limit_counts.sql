@@ -29,40 +29,38 @@ DROP TABLE IF EXISTS ${case_db}.t_project_projection_dates;
 CREATE TABLE ${case_db}.t_project_projection_customer (
     c_custkey INT,
     c_name VARCHAR(32)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_project_projection_dates (
     d_datekey INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_project_projection_customer VALUES
-    (1, 'c1'),
-    (2, 'c2'),
-    (3, 'c3'),
-    (4, 'c4'),
-    (5, 'c5'),
-    (6, 'c6'),
-    (7, 'c7'),
-    (8, 'c8'),
-    (9, 'c9'),
-    (10, 'c10'),
-    (11, 'c11'),
-    (12, 'c12');
+    ROW(1, 'c1'),
+    ROW(2, 'c2'),
+    ROW(3, 'c3'),
+    ROW(4, 'c4'),
+    ROW(5, 'c5'),
+    ROW(6, 'c6'),
+    ROW(7, 'c7'),
+    ROW(8, 'c8'),
+    ROW(9, 'c9'),
+    ROW(10, 'c10'),
+    ROW(11, 'c11'),
+    ROW(12, 'c12');
 
 INSERT INTO ${case_db}.t_project_projection_dates VALUES
-    (19920101),
-    (19920102),
-    (19920103),
-    (19920104),
-    (19920105),
-    (19920106),
-    (19920107),
-    (19920108);
+    ROW(19920101),
+    ROW(19920102),
+    ROW(19920103),
+    ROW(19920104),
+    ROW(19920105),
+    ROW(19920106),
+    ROW(19920107),
+    ROW(19920108);
 
 SELECT
     (
-        SELECT COUNT()
+        SELECT COUNT(*)
         FROM (
             SELECT c_custkey, c_name
             FROM ${case_db}.t_project_projection_customer
@@ -70,7 +68,7 @@ SELECT
         ) x
     ) AS projected_limit_rows,
     (
-        SELECT COUNT()
+        SELECT COUNT(*)
         FROM (
             SELECT C_CUSTKEY
             FROM ${case_db}.t_project_projection_customer
@@ -78,7 +76,7 @@ SELECT
         ) y
     ) AS uppercase_projection_rows,
     (
-        SELECT COUNT()
+        SELECT COUNT(*)
         FROM (
             SELECT *
             FROM ${case_db}.t_project_projection_dates

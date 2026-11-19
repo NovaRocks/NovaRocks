@@ -44,48 +44,48 @@ INSERT INTO ${case_db}.topn_outer_right
     FROM TABLE(generate_series(1, 1000));
 -- This case deliberately plans with persisted ANALYZE statistics. NDV is a
 -- deterministic Theta estimate, so cardinality text need not equal exact NDV.
-ANALYZE TABLE ${case_db}.topn_outer_left;
-ANALYZE TABLE ${case_db}.topn_outer_right;
+ANALYZE ${case_db}.topn_outer_left;
+ANALYZE ${case_db}.topn_outer_right;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.id, l.score, r.payload
 FROM ${case_db}.topn_outer_left l
 LEFT JOIN ${case_db}.topn_outer_right r ON l.id = r.id
 ORDER BY l.score ASC
 LIMIT 5;
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.id, l.score, r.payload
 FROM ${case_db}.topn_outer_left l
 RIGHT JOIN ${case_db}.topn_outer_right r ON l.id = r.id
 ORDER BY r.payload DESC
 LIMIT 5;
 
-SET disable_optimizer_rules = 'PushTopNThroughJoin';
+SET SESSION disable_optimizer_rules = 'PushTopNThroughJoin';
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.id, l.score, r.payload
 FROM ${case_db}.topn_outer_left l
 LEFT JOIN ${case_db}.topn_outer_right r ON l.id = r.id
 ORDER BY l.score ASC
 LIMIT 5;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.id, l.score, r.payload
 FROM ${case_db}.topn_outer_left l
 LEFT JOIN ${case_db}.topn_outer_right r ON l.id = r.id
 ORDER BY r.payload DESC
 LIMIT 5;
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.id, l.score, r.payload
 FROM ${case_db}.topn_outer_left l
 INNER JOIN ${case_db}.topn_outer_right r ON l.id = r.id
 ORDER BY l.score ASC
 LIMIT 5;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

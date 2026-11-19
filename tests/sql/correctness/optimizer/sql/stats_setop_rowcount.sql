@@ -32,33 +32,33 @@ INSERT INTO ${case_db}.oq12_stats_set_l
 INSERT INTO ${case_db}.oq12_stats_set_r
     SELECT generate_series % 60
     FROM TABLE(generate_series(1, 600));
-ANALYZE TABLE ${case_db}.oq12_stats_set_l;
-ANALYZE TABLE ${case_db}.oq12_stats_set_r;
+ANALYZE ${case_db}.oq12_stats_set_l;
+ANALYZE ${case_db}.oq12_stats_set_r;
 
 -- @explain_contains=UNION ALL
 -- @explain_contains=oq12_stats_set_l
 -- @explain_contains=oq12_stats_set_r
-EXPLAIN VERBOSE SELECT k FROM ${case_db}.oq12_stats_set_l
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT k FROM ${case_db}.oq12_stats_set_l
 UNION ALL
 SELECT k FROM ${case_db}.oq12_stats_set_r;
 
 -- @explain_contains=UNION
 -- @explain_contains=oq12_stats_set_l
 -- @explain_contains=oq12_stats_set_r
-EXPLAIN VERBOSE SELECT k FROM ${case_db}.oq12_stats_set_l
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT k FROM ${case_db}.oq12_stats_set_l
 UNION
 SELECT k FROM ${case_db}.oq12_stats_set_r;
 
 -- @explain_contains=INTERSECT
 -- @explain_contains=oq12_stats_set_l
 -- @explain_contains=oq12_stats_set_r
-EXPLAIN VERBOSE SELECT k FROM ${case_db}.oq12_stats_set_l
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT k FROM ${case_db}.oq12_stats_set_l
 INTERSECT
 SELECT k FROM ${case_db}.oq12_stats_set_r;
 
 -- @explain_contains=EXCEPT
 -- @explain_contains=oq12_stats_set_l
 -- @explain_contains=oq12_stats_set_r
-EXPLAIN VERBOSE SELECT k FROM ${case_db}.oq12_stats_set_l
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT k FROM ${case_db}.oq12_stats_set_l
 EXCEPT
 SELECT k FROM ${case_db}.oq12_stats_set_r;

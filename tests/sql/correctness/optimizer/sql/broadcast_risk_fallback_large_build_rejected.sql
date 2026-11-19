@@ -20,11 +20,11 @@
 -- Its first frozen name is generate_series; append_exchange preserves it,
 -- replacing old k imports on both sides without changing the partitioned
 -- join, source/project nodes, 1M/100M inputs, or 1M join estimate.
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
-SET cbo_broadcast_backend_count = 3;
-SET disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
-EXPLAIN COSTS
+SET SESSION cbo_broadcast_backend_count = 3;
+SET SESSION disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
+EXPLAIN WITH SESSION explain_detail = 'COSTS'
 WITH probe_1m AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 1000000))

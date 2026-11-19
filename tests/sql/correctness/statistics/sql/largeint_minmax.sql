@@ -22,7 +22,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0};
+CREATE SCHEMA IF NOT EXISTS statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -33,21 +33,21 @@ CREATE TABLE statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largein
 -- query 3
 -- @skip_result_check=true
 INSERT INTO statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largeint_minmax_${uuid0} VALUES
-    (CAST('-170141183460469231731687303715884105728' AS LARGEINT)),
-    (0),
-    (CAST('170141183460469231731687303715884105727' AS LARGEINT));
+    ROW(CAST('-170141183460469231731687303715884105728' AS LARGEINT)),
+    ROW(0),
+    ROW(CAST('170141183460469231731687303715884105727' AS LARGEINT));
 
 -- query 4
 -- @skip_result_check=true
-ANALYZE TABLE statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largeint_minmax_${uuid0};
+ANALYZE statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largeint_minmax_${uuid0};
 
 -- query 5
 -- @result_contains=min-max stats
 -- @skip_result_check=true
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT DISTINCT k
 FROM statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largeint_minmax_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-DROP TABLE statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largeint_minmax_${uuid0} FORCE;
+DROP TABLE statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largeint_minmax_${uuid0} ;

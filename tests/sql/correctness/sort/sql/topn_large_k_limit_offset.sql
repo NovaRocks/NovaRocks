@@ -28,18 +28,17 @@ DROP TABLE IF EXISTS ${case_db}.t_topn_large_k_limit_offset;
 CREATE TABLE ${case_db}.t_topn_large_k_limit_offset (
   id INT,
   score INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_topn_large_k_limit_offset VALUES
-  (1, 100),
-  (2, 95),
-  (3, 95),
-  (4, 90),
-  (5, 85),
-  (6, 85),
-  (7, 80),
-  (8, 70);
+  ROW(1, 100),
+  ROW(2, 95),
+  ROW(3, 95),
+  ROW(4, 90),
+  ROW(5, 85),
+  ROW(6, 85),
+  ROW(7, 80),
+  ROW(8, 70);
 SELECT id, score
 FROM ${case_db}.t_topn_large_k_limit_offset
 ORDER BY score DESC, id ASC
-LIMIT 1500 OFFSET 2;
+OFFSET 2 LIMIT 1500;

@@ -28,15 +28,14 @@ CREATE TABLE ${case_db}.t_analytic_sum_rows_cumulative (
     grp VARCHAR(10),
     ts INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_sum_rows_cumulative VALUES
-    ('A', 1, 2),
-    ('A', 2, 3),
-    ('A', 3, 5),
-    ('B', 1, 4),
-    ('B', 2, 6);
+    ROW('A', 1, 2),
+    ROW('A', 2, 3),
+    ROW('A', 3, 5),
+    ROW('B', 1, 4),
+    ROW('B', 2, 6);
 
 SELECT
     grp,

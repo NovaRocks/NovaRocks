@@ -36,36 +36,35 @@ CREATE TABLE ${case_db}.map_test (
   map2 MAP<INT, ARRAY<STRING>>,
   map3 MAP<STRING, MAP<INT, VARCHAR(30)>>,
   map4 MAP<INT, JSON>,
-  map5 MAP<INT, STRUCT<c INT, b STRING>>
-)
-TBLPROPERTIES ("format-version" = "3");
+  map5 MAP<INT, ROW(c INT, b STRING)>
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO ${case_db}.map_test VALUES
-  (0, map(0,'ab'), map(0,'ab'), map(0,['1','2']), map('1',map(1,'abc')), map(1,json_object('name','abc','age',23)), map(0, row(1,'a')));
+  (0, map(0,'ab'), map(0,'ab'), map(0,['1','2']), map('1',map(1,'abc')), map(1,json_object('name':'abc','age':23)), map(0, row(1,'a')));
 
 -- query 4
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped null-key entries from map1/map4/map5 (int keys -> empty map)
 INSERT INTO ${case_db}.map_test VALUES
-  (1, map(1, null), map(), map(1,[]), map('11',map(1,'abc'),'', map(2,null)), map(), map());
+  ROW(1, map(1, null), map(), map(1,[]), map('11',map(1,'abc'),'', map(2,null)), map(), map());
 
 -- query 5
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; every entry here had a null key, dropped them all (empty maps)
 INSERT INTO ${case_db}.map_test VALUES
-  (2, map(), map(), map(), map(), map(), map());
+  ROW(2, map(), map(), map(), map(), map(), map());
 
 -- query 6
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped the trailing null-key entry from each map (kept the non-null entry)
 INSERT INTO ${case_db}.map_test VALUES
-  (3, map(3,''), map(3,''), map(3,['3',null]), map('3',map(3,'a33c')), map(1,json_object('name','abc','age',23)), map(3, row(3,'a')));
+  (3, map(3,''), map(3,''), map(3,['3',null]), map('3',map(3,'a33c')), map(1,json_object('name':'abc','age':23)), map(3, row(3,'a')));
 
 -- query 7
 -- @skip_result_check=true
-INSERT INTO ${case_db}.map_test VALUES (4, null, null, null, null, null, null);
+INSERT INTO ${case_db}.map_test VALUES ROW(4, null, null, null, null, null, null);
 
 -- ========== INNER JOIN (same type) ==========
 
@@ -133,7 +132,7 @@ ORDER BY t.pk;
 -- query 16
 -- map3 <=> map3: includes NULL row in result
 SELECT t.map3, s.map3
-FROM ${case_db}.map_test t JOIN ${case_db}.map_test s ON s.map3 <=> t.map3
+FROM ${case_db}.map_test t JOIN ${case_db}.map_test s ON s.map3  IS NOT DISTINCT FROM  t.map3
 ORDER BY t.pk;
 
 -- ========== LEFT / RIGHT JOIN with MAP key ==========
@@ -230,8 +229,8 @@ ORDER BY t.pk;
 
 -- query 32
 -- Empty maps/arrays stay equal; nested NULL leaves stay UNKNOWN.
-SELECT pk, map2 = map2 AS eq, map2 != map2 AS ne, map2 <=> map2 AS safe,
-       map3 = map3 AS nested_eq, map3 <=> map3 AS nested_safe
+SELECT pk, map2 = map2 AS eq, map2 != map2 AS ne, map2  IS NOT DISTINCT FROM  map2 AS safe,
+       map3 = map3 AS nested_eq, map3  IS NOT DISTINCT FROM  map3 AS nested_safe
 FROM ${case_db}.map_test ORDER BY pk;
 
 -- query 33

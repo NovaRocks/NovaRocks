@@ -24,63 +24,36 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_join_agg_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_join_agg_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_join_agg_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_join_agg_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact (
   id BIGINT NOT NULL,
   dim_id BIGINT,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 USE ice_ivm_join_agg_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim VALUES
-  (10, 'east', 7),
-  (20, 'west', 11),
-  (30, 'south', 13);
+  ROW(10, 'east', 7),
+  ROW(20, 'west', 11),
+  ROW(30, 'south', 13);
 INSERT INTO ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact VALUES
-  (1, 10, 100),
-  (2, 10, 200),
-  (3, 20, 50),
-  (4, 30, 70);
-CREATE MATERIALIZED VIEW join_agg_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
+  ROW(1, 10, 100),
+  ROW(2, 10, 200),
+  ROW(3, 20, 50),
+  ROW(4, 30, 70);
+CREATE MATERIALIZED VIEW join_agg_mv_${uuid0} AS SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
 FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region;
-CREATE MATERIALIZED VIEW join_agg_dim_amount_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT d.region, COUNT(*) AS c, SUM(d.amount) AS s
+CREATE MATERIALIZED VIEW join_agg_dim_amount_mv_${uuid0} AS SELECT d.region, COUNT(*) AS c, SUM(d.amount) AS s
 FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region;
@@ -99,7 +72,7 @@ ORDER BY region;
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact VALUES (5, 20, 80);
+INSERT INTO ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact VALUES ROW(5, 20, 80);
 UPDATE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact SET amount = 150 WHERE id = 1;
 UPDATE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim SET region = 'north' WHERE id = 10;
 DELETE FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact WHERE id = 4;
@@ -125,7 +98,7 @@ FROM join_agg_mv_${uuid0}
 ORDER BY region;
 
 -- query 9
-SELECT d.region, COUNT() AS c, SUM(f.amount) AS s
+SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
 FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region
@@ -137,7 +110,7 @@ FROM join_agg_dim_amount_mv_${uuid0}
 ORDER BY region;
 
 -- query 11
-SELECT d.region, COUNT() AS c, SUM(d.amount) AS s
+SELECT d.region, COUNT(*) AS c, SUM(d.amount) AS s
 FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region
@@ -145,7 +118,7 @@ ORDER BY d.region;
 
 -- query 12
 -- @skip_result_check=true
-INSERT INTO ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact VALUES (6, 20, 20);
+INSERT INTO ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact VALUES ROW(6, 20, 20);
 
 -- query 13
 -- @skip_result_check=true
@@ -200,7 +173,7 @@ FROM join_agg_dim_amount_mv_${uuid0}
 ORDER BY region;
 
 -- query 22
-SELECT d.region, COUNT() AS c, SUM(d.amount) AS s
+SELECT d.region, COUNT(*) AS c, SUM(d.amount) AS s
 FROM ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region
@@ -208,8 +181,12 @@ ORDER BY d.region;
 
 -- query 23
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0} FULL;
-REFRESH MATERIALIZED VIEW join_agg_dim_amount_mv_${uuid0} FULL;
+SET SESSION "ice_ivm_join_agg_${uuid0}".incremental_refresh_enabled = false;
+REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
+RESET SESSION "ice_ivm_join_agg_${uuid0}".incremental_refresh_enabled;
+SET SESSION "ice_ivm_join_agg_${uuid0}".incremental_refresh_enabled = false;
+REFRESH MATERIALIZED VIEW join_agg_dim_amount_mv_${uuid0};
+RESET SESSION "ice_ivm_join_agg_${uuid0}".incremental_refresh_enabled;
 
 -- query 24
 SELECT region, c, s
@@ -226,7 +203,7 @@ ORDER BY region;
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW join_agg_dim_amount_mv_${uuid0};
 DROP MATERIALIZED VIEW join_agg_mv_${uuid0};
-DROP TABLE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact FORCE;
-DROP TABLE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim FORCE;
-DROP DATABASE ice_ivm_join_agg_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact ;
+DROP TABLE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim ;
+DROP SCHEMA ice_ivm_join_agg_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_join_agg_${uuid0};

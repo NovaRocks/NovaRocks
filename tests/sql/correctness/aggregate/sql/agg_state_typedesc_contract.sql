@@ -21,15 +21,14 @@ CREATE TABLE ${case_db}.agg_state_typedesc_contract (
     k INT,
     v BIGINT,
     d DOUBLE
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.agg_state_typedesc_contract VALUES
-    (1, 10, 10, 0.10),
-    (1, 11, 20, 0.20),
-    (1, 12, 20, 0.30),
-    (2, 20, 100, 0.40),
-    (2, 21, 200, 0.50),
-    (2, 22, NULL, NULL);
+    ROW(1, 10, 10, 0.10),
+    ROW(1, 11, 20, 0.20),
+    ROW(1, 12, 20, 0.30),
+    ROW(2, 20, 100, 0.40),
+    ROW(2, 21, 200, 0.50),
+    ROW(2, 22, NULL, NULL);
 
 SELECT
        grp,

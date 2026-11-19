@@ -22,17 +22,11 @@
 
 -- query 1
 -- @expect_trino_error=MISSING_COLUMN_NAME,USER_ERROR
-CREATE MATERIALIZED VIEW ${case_db}.trc_m01
-DISTRIBUTED BY HASH(a) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT CAST(1 AS integer);
+CREATE MATERIALIZED VIEW ${case_db}.trc_m01 AS SELECT CAST(1 AS integer);
 
 -- query 2
 -- @expect_trino_error=DUPLICATE_COLUMN_NAME,USER_ERROR
-CREATE MATERIALIZED VIEW ${case_db}.trc_m02
-DISTRIBUTED BY HASH(a) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT CAST(1 AS integer) AS a, CAST(2 AS integer) AS a;
+CREATE MATERIALIZED VIEW ${case_db}.trc_m02 AS SELECT CAST(1 AS integer) AS a, CAST(2 AS integer) AS a;
 
 -- query 3
 -- @cleanup=true

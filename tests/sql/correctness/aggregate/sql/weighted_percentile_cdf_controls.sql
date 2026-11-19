@@ -21,8 +21,8 @@
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE weighted_cdf_control (v DOUBLE, w BIGINT) TBLPROPERTIES ("format-version" = "3");
-INSERT INTO weighted_cdf_control VALUES (2,1),(3,2),(4,3),(NULL,100),(100,NULL),(200,0),(999,0);
+CREATE TABLE weighted_cdf_control (v DOUBLE, w BIGINT) WITH (format_version = 3);
+INSERT INTO weighted_cdf_control VALUES ROW(2,1),ROW(3,2),ROW(4,3),ROW(NULL,100),ROW(100,NULL),ROW(200,0),ROW(999,0);
 
 -- query 2
 SELECT COUNT() AS rows_seen, COUNT(v) AS values_seen, COUNT(w) AS weights_seen FROM weighted_cdf_control;

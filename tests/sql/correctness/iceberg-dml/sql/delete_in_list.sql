@@ -23,7 +23,7 @@ DROP TABLE IF EXISTS ${case_db}.t_delete_in_list;
 CREATE TABLE ${case_db}.t_delete_in_list (
   id INT,
   v INT
-) TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.t_delete_in_list VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.t_delete_in_list VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30), ROW(4, 40);
 DELETE FROM ${case_db}.t_delete_in_list WHERE id IN (1, 3);
 SELECT id, v FROM ${case_db}.t_delete_in_list ORDER BY id;

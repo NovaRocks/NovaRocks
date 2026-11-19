@@ -25,40 +25,19 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_w6_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_w6_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_w6_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_w6_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_w6_${uuid0}.ns_${uuid0}.base_orders (
   order_id INT,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ice_w6_${uuid0}.ns_${uuid0}.base_orders VALUES
-  (1, 10),
-  (2, 20);
+  ROW(1, 10),
+  ROW(2, 20);
 
 USE ice_w6_${uuid0}.ns_${uuid0};
 
-CREATE MATERIALIZED VIEW target_mv
-DISTRIBUTED BY HASH(order_id) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT order_id, amount FROM base_orders;
+CREATE MATERIALIZED VIEW target_mv AS SELECT order_id, amount FROM base_orders;
 
 REFRESH MATERIALIZED VIEW target_mv;
 
@@ -67,7 +46,7 @@ SELECT order_id, amount FROM target_mv ORDER BY order_id;
 
 -- query 3
 -- @expect_error=materialized view
-INSERT INTO target_mv VALUES (3, 30, 3);
+INSERT INTO target_mv VALUES ROW(3, 30, 3);
 
 -- query 4
 -- @expect_error=materialized view
@@ -94,41 +73,41 @@ ALTER TABLE target_mv ADD COLUMN extra INT;
 
 -- query 9
 -- @expect_error=materialized view
-ALTER TABLE target_mv SET TBLPROPERTIES ('comment' = 'blocked');
+ALTER TABLE target_mv SET PROPERTIES extra_properties = MAP(ARRAY['comment'], ARRAY['blocked']);
 
 -- query 10
 -- @expect_error=materialized view
-ALTER TABLE target_mv ADD FILES FROM 's3://blocked/path';
+ALTER TABLE target_mv EXECUTE add_files(location => 's3://blocked/path');
 
 -- query 11
 -- @expect_error=materialized view
-ALTER TABLE target_mv ADD EQUALITY DELETE (order_id) VALUES (1);
+ALTER TABLE target_mv EXECUTE add_equality_delete(columns => ARRAY['order_id'], rows => ARRAY[ROW(1)]);
 
 -- query 12
 -- @expect_error=materialized view
-CALL ice_w6_${uuid0}.system.rewrite_manifests(table => 'ns_${uuid0}.target_mv');
+CALL ice_w6_${uuid0}.system.rewrite_manifests("table" => 'ns_${uuid0}.target_mv');
 
 -- query 13
 -- @expect_error=materialized view
-ALTER TABLE target_mv REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
+ALTER TABLE target_mv EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
 
 -- query 14
 -- @expect_error=materialized view
 CALL ice_w6_${uuid0}.system.remove_orphan_files(
-  table => 'ns_${uuid0}.target_mv',
+  "table" => 'ns_${uuid0}.target_mv',
   older_than => TIMESTAMP '2020-01-01 00:00:00');
 
 -- query 15
 -- @expect_error=materialized view
-DROP TABLE target_mv FORCE;
+DROP TABLE target_mv ;
 
 -- query 16
 -- @expect_error=materialized view
-ALTER TABLE ice_w6_${uuid0}.ns_${uuid0}.target_mv CREATE BRANCH blocked_branch;
+CREATE BRANCH blocked_branch IN TABLE ice_w6_${uuid0}.ns_${uuid0}.target_mv;
 
 -- query 17
 -- @expect_error=materialized view
-DROP DATABASE ice_w6_${uuid0}.ns_${uuid0};
+DROP SCHEMA ice_w6_${uuid0}.ns_${uuid0};
 
 -- query 18
 -- @expect_error=materialized view
@@ -141,6 +120,6 @@ SELECT order_id, amount FROM target_mv ORDER BY order_id;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW target_mv;
-DROP TABLE ice_w6_${uuid0}.ns_${uuid0}.base_orders FORCE;
-DROP DATABASE ice_w6_${uuid0}.ns_${uuid0};
+DROP TABLE ice_w6_${uuid0}.ns_${uuid0}.base_orders ;
+DROP SCHEMA ice_w6_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_w6_${uuid0};

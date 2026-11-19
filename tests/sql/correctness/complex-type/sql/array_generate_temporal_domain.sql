@@ -19,12 +19,11 @@
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE temporal_range (id INT, d DATE, t DATETIME, v VARCHAR(40))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE temporal_range (id INT, d DATE, t DATETIME, v VARCHAR(40)) WITH (format_version = 3);
 INSERT INTO temporal_range VALUES
-(1,DATE '2025-10-01',DATETIME '2025-10-01 01:00:00','2025-10-02'),
-(2,DATE '2025-10-02',DATETIME '2025-10-02 01:00:00','abc'),
-(3,NULL,NULL,NULL);
+ROW(1,DATE '2025-10-01',TIMESTAMP '2025-10-01 01:00:00','2025-10-02'),
+ROW(2,DATE '2025-10-02',TIMESTAMP '2025-10-02 01:00:00','abc'),
+ROW(3,NULL,NULL,NULL);
 
 -- query 2
 USE ${case_db};
@@ -47,7 +46,7 @@ SELECT array_generate('2025-10-01 14:28:31','2025-10-01 14:28:32.800000',500000,
 -- query 5
 USE ${case_db};
 SELECT array_generate(DATE '2025-10-01',DATE '2025-10-02',12, 'hour') AS subday,
-       array_generate(DATE '2025-10-01',DATETIME '2025-10-02 01:00:00',12, 'hour') AS mixed;
+       array_generate(DATE '2025-10-01',TIMESTAMP '2025-10-02 01:00:00',12, 'hour') AS mixed;
 
 -- query 6
 USE ${case_db};

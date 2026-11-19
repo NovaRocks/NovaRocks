@@ -48,7 +48,7 @@ printf 'SPARK_STATISTICS_SOURCE_READY\n'
 -- and independent Spark read below cover execution and the durable artifact.
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
 -- @skip_result_check=true
-ANALYZE TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.puffin_spark_${uuid0};
+ANALYZE statistics_cat_${suite_uuid0}.${suite_uuid0}.puffin_spark_${uuid0};
 
 -- query 3
 -- @result_contains=SPARK_PUFFIN_STATISTICS_OK

@@ -33,9 +33,9 @@ INSERT INTO ${case_db}.t_agg_pd_lo_a
     SELECT generate_series % 100, generate_series FROM TABLE(generate_series(1, 20000));
 INSERT INTO ${case_db}.t_agg_pd_lo_b
     SELECT DISTINCT generate_series % 50 FROM TABLE(generate_series(1, 50));
-ANALYZE TABLE ${case_db}.t_agg_pd_lo_a;
-ANALYZE TABLE ${case_db}.t_agg_pd_lo_b;
-EXPLAIN VERBOSE
+ANALYZE ${case_db}.t_agg_pd_lo_a;
+ANALYZE ${case_db}.t_agg_pd_lo_b;
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.k, SUM(a.v)
 FROM ${case_db}.t_agg_pd_lo_a a
 LEFT OUTER JOIN ${case_db}.t_agg_pd_lo_b b ON a.k = b.k

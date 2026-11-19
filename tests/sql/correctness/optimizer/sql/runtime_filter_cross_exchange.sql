@@ -23,21 +23,21 @@ CREATE TABLE ${case_db}.ra (k INT, v INT);
 CREATE TABLE ${case_db}.customer_demographics (k INT, v INT);
 CREATE TABLE ${case_db}.rf_x_probe (k INT, v INT);
 CREATE TABLE ${case_db}.rf_x_build (k INT, v INT);
-INSERT INTO ${case_db}.ra VALUES (1, 1), (2, 2), (3, 3);
-INSERT INTO ${case_db}.customer_demographics VALUES (1, 1), (2, 2), (3, 3);
+INSERT INTO ${case_db}.ra VALUES ROW(1, 1), ROW(2, 2), ROW(3, 3);
+INSERT INTO ${case_db}.customer_demographics VALUES ROW(1, 1), ROW(2, 2), ROW(3, 3);
 INSERT INTO ${case_db}.rf_x_probe
     SELECT generate_series, generate_series FROM TABLE(generate_series(1, 100000));
-INSERT INTO ${case_db}.rf_x_build VALUES (1, 10), (2, 20), (3, 30);
-ANALYZE TABLE ${case_db}.ra;
-ANALYZE TABLE ${case_db}.customer_demographics;
-ANALYZE TABLE ${case_db}.rf_x_probe;
-ANALYZE TABLE ${case_db}.rf_x_build;
+INSERT INTO ${case_db}.rf_x_build VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30);
+ANALYZE ${case_db}.ra;
+ANALYZE ${case_db}.customer_demographics;
+ANALYZE ${case_db}.rf_x_probe;
+ANALYZE ${case_db}.rf_x_build;
 
-SET global_runtime_filter_build_max_size = 10737418240;
-SET global_runtime_filter_probe_min_selectivity = 0.0;
+SET SESSION global_runtime_filter_build_max_size = 10737418240;
+SET SESSION global_runtime_filter_probe_min_selectivity = 0.0;
 
-EXPLAIN VERBOSE
-SELECT count() AS cnt
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT count(*) AS cnt
 FROM (
     SELECT a.v AS av
     FROM ${case_db}.ra a
@@ -50,7 +50,7 @@ JOIN (
 ) t2
 ON t1.av = t2.cv;
 
-EXPLAIN VERBOSE
-SELECT count() AS cnt
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT count(*) AS cnt
 FROM ${case_db}.rf_x_probe p
 JOIN ${case_db}.rf_x_build b ON p.k = b.k;
